@@ -178,6 +178,19 @@ enum AgentCommand {
         #[arg(long)]
         project: Option<String>,
     },
+    /// Block until workers settle out of running (finished, needs_feedback,
+    /// terminated…), then print them as JSON — `agent list`'s row shape.
+    /// No names means every unarchived worker of the project.
+    Wait {
+        /// Session names to wait on (as shown in the panels).
+        names: Vec<String>,
+        /// Give up after this many seconds (nonzero exit).
+        #[arg(long, default_value_t = 600)]
+        timeout: u64,
+        /// Project name (default: the calling session's project).
+        #[arg(long)]
+        project: Option<String>,
+    },
     /// List agent sessions as JSON (name, kind, status, worktree, path).
     List {
         /// Project name (default: the calling session's project).
@@ -320,6 +333,11 @@ fn main() -> Result<()> {
             AgentCommand::Demote { name, project } => {
                 nebula_tui::run_agent_set_orchestrator(name, project, false)
             }
+            AgentCommand::Wait {
+                names,
+                timeout,
+                project,
+            } => nebula_tui::run_agent_wait(names, timeout, project),
             AgentCommand::List { project, all } => nebula_tui::run_agent_list(project, all),
         },
         Some(Command::Notes { command }) => {

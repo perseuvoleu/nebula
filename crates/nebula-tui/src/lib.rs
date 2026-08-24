@@ -94,6 +94,11 @@ pub fn run_agent_list(project: Option<String>, all: bool) -> Result<()> {
     runtime()?.block_on(ipc::agent_list(project, all))
 }
 
+/// `nebula agent wait` — block until workers settle out of running.
+pub fn run_agent_wait(names: Vec<String>, timeout: u64, project: Option<String>) -> Result<()> {
+    runtime()?.block_on(ipc::agent_wait(names, timeout, project))
+}
+
 /// `nebula agent promote|demote <name>` — flip a session's orchestrator role.
 pub fn run_agent_set_orchestrator(
     name: String,

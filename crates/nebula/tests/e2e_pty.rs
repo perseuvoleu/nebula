@@ -947,6 +947,117 @@ async fn pty_progress_sequence_drives_status_without_any_hook() {
     wait_for_exit(&mut daemon);
 }
 
+/// `nebula agent wait <name>` — the orchestrator's blocking verb: it must
+/// error out (nonzero) while the worker is still running past --timeout,
+/// and unblock with the settled row as JSON the moment the worker leaves
+/// running. Driven end-to-end through the real CLI binary against an
+/// isolated daemon, status moved by the same OSC 9;4 progress bytes Claude
+/// emits.
+#[tokio::test]
+async fn agent_wait_cli_blocks_until_worker_settles() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let mut daemon = env.spawn_daemon();
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let agent_id = create_agent_get_id(&mut c, &worktree.id, "worker", 2).await;
+
+    let sref = SessionRef::Agent(agent_id.clone());
+    write_frame(
+        &mut c,
+        &ClientRequest::Attach {
+            session: sref.clone(),
+            from_seq: None,
+            cols: 120,
+            rows: 30,
+        },
+    )
+    .await
+    .unwrap();
+    let emit = |state: &str| format!("printf '\\033]9;4;{state};\\007'\n").into_bytes();
+
+    // Worker starts its turn: progress indeterminate → running.
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session: sref.clone(),
+            data: emit("3"),
+        },
+    )
+    .await
+    .unwrap();
+    read_events_until(&mut c, Duration::from_secs(10), |evs| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::StatusChanged { agent, status: nebula_core::AgentStatus::Running, .. }
+                if *agent == agent_id)
+        })
+    })
+    .await;
+
+    let wait_cmd = |timeout: &str| {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"));
+        cmd.args(["agent", "wait", "worker", "--project", "repo", "--timeout", timeout])
+            .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        cmd
+    };
+
+    // Still running past the deadline: nonzero exit, a clear message.
+    let timed_out = wait_cmd("1").output().unwrap();
+    assert!(
+        !timed_out.status.success(),
+        "wait must fail while the worker is running: {timed_out:?}"
+    );
+    let stderr = String::from_utf8_lossy(&timed_out.stderr);
+    assert!(
+        stderr.contains("timed out") && stderr.contains("worker"),
+        "timeout message should name the still-running worker: {stderr}"
+    );
+
+    // Now block for real, and settle the worker while the CLI is waiting.
+    let mut waiting = wait_cmd("30").spawn().unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session: sref.clone(),
+            data: emit("0"),
+        },
+    )
+    .await
+    .unwrap();
+    read_events_until(&mut c, Duration::from_secs(10), |evs| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::StatusChanged { agent, status: nebula_core::AgentStatus::Finished, .. }
+                if *agent == agent_id)
+        })
+    })
+    .await;
+
+    let out = tokio::task::spawn_blocking(move || {
+        let status = waiting.wait().unwrap();
+        let mut stdout = Vec::new();
+        use std::io::Read;
+        waiting.stdout.take().unwrap().read_to_end(&mut stdout).unwrap();
+        (status, stdout)
+    })
+    .await
+    .unwrap();
+    assert!(out.0.success(), "wait should exit 0 once the worker settles");
+    let rows: serde_json::Value = serde_json::from_slice(&out.1).unwrap();
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["name"], "worker");
+    assert_eq!(rows[0]["status"], "finished");
+    assert_eq!(rows[0]["project"], "repo");
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
 #[tokio::test]
 async fn hook_cwd_rehomes_agent_to_other_worktree() {
     let env = TestEnv::new();
