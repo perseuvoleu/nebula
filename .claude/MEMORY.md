@@ -14,6 +14,40 @@ about what is worth recording.
 
 ## Entries
 
+### Global Command Palette On ⇧P / ⌘⇧P — 2026-08-24
+
+**Asked:** "un shortcut care sa-mi deschida o fereastra de unde pot face orice comanda — ex: deschid
+direct un worktree si dupa ma intreaba branch-ul si modelul, sau deschid direct un orchestrator, sau
+deschid un agent intr-un worktree existent, sau caut o sesiune; un fuzzy principal care cauta comanda,
+dau Enter si ma arunca in urmatorul nivel, si tot asa."
+
+**Did:** Commit `87372f7` on `command-palette`. New `Action::CommandPalette` (keymap.rs, id
+`command_palette`, defaults `cmd+shift+p, shift+p` — shift+p was free; the plain chord satisfies
+`every_action_ships_with_a_reachable_chord`). `open_command_palette` (event_loop.rs, next to
+`open_new_agent_picker`) builds a **filterable ContextMenu** titled "Commands" — no new overlay type;
+fuzzy + Enter-chaining came free from `MenuFilter`. Rows reuse existing `MenuAction`s where they exist
+(`NewWorktree`, `NewOrchestrator`, `AddProject`) plus new `MenuAction::Command(PaletteCommand)`
+(app.rs): `NewAgentInWorktree` → new `open_worktree_picker_for_agent` (filterable "In worktree" picker
+whose rows are plain `MenuAction::NewAgent(worktree)` → the normal kind → model/effort → name picker),
+`SearchSessions`/`SearchEverything` → the two `Palette` flavors, and `GitDiff`/`Notes`/`Todos`/
+`Settings`/`Workspaces` calling the same `open_*` fns their hotkeys call. Creation rows act on
+`selected_project()` falling back to the first project row, and are simply omitted with no project.
+Also in the locked-terminal SUPER intercept (the ⌘N/⌘D pattern), and
+`~/.config/ghostty/nebula` gained `keybind = super+shift+p=csi:112;10u`. Four regression tests; 449
+nebula-tui + full workspace green.
+
+**Gotchas:**
+- shift+super mods in kitty CSI-u = **10** (1 + shift 1 + super 8), vs the existing `;9u` super-only
+  lines; `KeyChord::from_event` canonicalizes both `Char('P')+SHIFT` and `Char('p')+SUPER|SHIFT`
+  spellings, so the same `csi:112;…u` codepoint (112 = p) serves ⌘P (9) and ⌘⇧P (10) as distinct chords.
+- `run_menu_action` clears `app.overlay` **before** dispatching, so a `MenuAction` arm may open the
+  next overlay directly — that's the whole chaining mechanism; no state machine needed.
+- The `Action::CommandPalette` arm is deliberately NOT gated on `app.focus != Focus::Terminal` (unlike
+  `Action::Palette`): an unlocked pane forwards nothing, and the locked path never reaches the global
+  dispatch — it goes through the SUPER intercept.
+- `ContextMenu::is_workspace_picker()` steals n/r/d only when the menu has `OpenWorkspace` rows, so the
+  command palette (which has none) types those letters into its filter as expected.
+
 ### `nebula agent wait` — Orchestrators Block Instead Of Sleep-Polling — 2026-08-24
 
 **Asked:** "Add a blocking wait verb to the nebula CLI so orchestrator sessions can wait on their
