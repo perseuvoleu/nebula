@@ -14,6 +14,31 @@ about what is worth recording.
 
 ## Entries
 
+### ⌘D Opens The Diff Viewer From Anywhere — 2026-08-24
+
+**Asked:** "Cmd+D should open the git diff viewer for the currently selected worktree regardless of
+which Nebula panel has focus, and it must also work while an agent terminal is input-locked… update
+the Ghostty nebula overlay so Cmd+D reaches Nebula and overrides Ghostty's default split shortcut…
+Keep plain g working."
+
+**Did:** `bc8d58e`. `Action::GitDiff` defaults grew `cmd+d` next to `g` (`keymap.rs`), a `GitDiff`
+arm joined the locked-terminal SUPER intercept in `event_loop.rs` (unlock → Sessions →
+`open_diff_view`, same shape as ⌘N/⌘E/⌘W), and `~/.config/ghostty/nebula` got
+`super+d=csi:100;9u` — which by existing overrides Ghostty's default `new_split:right`, no unbind
+needed. `GitDiff` was already dispatched from the Global scope table, so panel-independence needed
+no dispatch change — only the chord and the locked-mode intercept. Tests:
+`cmd_d_opens_the_diff_viewer_from_any_panel`, `cmd_d_inside_a_locked_session_opens_the_diff_viewer`,
+`plain_d_inside_a_locked_session_still_reaches_the_child`.
+
+**Gotchas:**
+- Adding a second default chord to `GitDiff` broke two hardcoded label assertions in
+  `event_loop.rs` settings tests: one expecting `"g"` (now `"g ⌘d"`) and one expecting `"—"` after
+  `g` is stolen (now `"⌘d"` — the ⌘ chord stays). Same class of breakage the ⌘E entry warned about;
+  it applies to *any* test asserting a keymap label, not just the duplicate-chord one.
+- The `csi:<codepoint>;9u` recipe from the ⌘W entry worked unchanged (`d` = 100). Real repo test
+  fixtures already exist: `test_repo` + `seed_repo_tree` in `event_loop.rs` tests build a git repo
+  a diff test can actually open.
+
 ### ⌘W Closes The Selected Session — 2026-08-24
 
 **Asked:** "ok e ok cand dau cmmd w si s pe un agent vreau sa mi inchida acea sesiune" — followed by "si
