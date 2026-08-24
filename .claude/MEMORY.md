@@ -14,6 +14,16 @@ about what is worth recording.
 
 ## Entries
 
+### Orchestrators And Worktrees Have Independent Focus — 2026-08-24
+
+**Asked:** "secitunile astea ar treb sa fie independete cand dau click pe una sau alt se se faca doar pe cea care dau click albastra si sa aiba propriile n, ctrl n etc"
+
+**Did:** `Focus::Orchestrators` is now separate from `Focus::Worktrees` (`app.rs`), and `ui.rs` styles only the active half's header, rows, and focus tint with the accent color. Mouse clicks and keyboard traversal activate the corresponding half while retaining both independent cursors. `Action::New` and `Action::NewAgent` route `n`, `ctrl+n`, and `cmd+n` by the active half: orchestrator picker above, worktree prompt below. Full `nebula-tui` suite: 430 tests green.
+
+**Gotchas:**
+- `sel_orchestrator` used to double as both cursor and section-focus state (`None` meant WORKTREES). With a real `Focus::Orchestrators`, both cursors must remain populated while inactive; creation and styling must branch on `app.focus`, not cursor presence.
+- Adding a focus enum variant requires auditing every focus cycle, mouse/context-menu dispatch, footer/render branch, and exhaustive match; this is why the change spans `app.rs`, `event_loop.rs`, `keymap.rs`, and `ui.rs` rather than being only a color tweak.
+
 ### Claude Spawns In Yolo Mode Too — 2026-08-24
 
 **Asked:** "vreau cand se face un agent claude/codex sa fie ca in herdr, cu yolo mode ambele"
