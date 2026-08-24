@@ -263,10 +263,10 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::GitDiff,
         id: "git_diff",
         label: "Git diff",
-        hint: "Open the diff viewer for the selected worktree",
+        hint: "Open the diff viewer for the selected worktree (⌘d even inside a locked session)",
         group: "PROJECTS & WORKTREES",
         scope: Scope::Global,
-        defaults: &["g"],
+        defaults: &["g", "cmd+d"],
     },
     ActionSpec {
         action: Action::OpenRepo,
