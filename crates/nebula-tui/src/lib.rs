@@ -19,6 +19,7 @@ pub mod splash;
 pub mod syntax;
 pub mod text_input;
 pub mod theme;
+pub mod transcript;
 pub mod tree_browser;
 pub mod ui;
 pub mod vim_term;
