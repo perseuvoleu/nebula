@@ -21,6 +21,7 @@ const WAIT: Duration = Duration::from_secs(20);
 
 // Distinct footer hints identify the focused panel on screen.
 const FOOTER_PROJECTS: &str = "n/o: add";
+const FOOTER_ORCHESTRATORS: &str = "n: new orchestrator";
 const FOOTER_WORKTREES: &str = "n: new worktree";
 const FOOTER_SESSIONS: &str = "n: agent";
 /// Terminal pane focused but NOT input-locked (attached session).
@@ -395,7 +396,9 @@ fn tui_projects_worktrees_agents_navigation() {
     // First project stays selected; its rows render reversed in the focused panel.
     tui.wait_for_selected("alpha-proj");
 
-    // ---- Tab cycles focus across all four panes and back ----
+    // ---- Tab cycles focus across all five panes and back ----
+    tui.send(b"\t");
+    tui.wait_for_text(FOOTER_ORCHESTRATORS);
     tui.send(b"\t");
     tui.wait_for_text(FOOTER_WORKTREES);
     tui.send(b"\t");
@@ -406,8 +409,11 @@ fn tui_projects_worktrees_agents_navigation() {
     tui.send(b"\t");
     tui.wait_for_text(FOOTER_PROJECTS); // wrapped around
 
-    // ---- Enter drills from Projects into Worktrees ----
+    // ---- Enter drills from Projects into Orchestrators; Tab hops on to
+    // the Worktrees half (the two sections keep independent focus) ----
     tui.send(b"\r");
+    tui.wait_for_text(FOOTER_ORCHESTRATORS);
+    tui.send(b"\t");
     tui.wait_for_text(FOOTER_WORKTREES);
 
     // ---- create two worktrees on alpha-proj ----
@@ -495,7 +501,9 @@ fn tui_projects_worktrees_agents_navigation() {
     // Switching back restores the remembered context: feat-a is the
     // selected worktree again and its agent is back without re-drilling.
     tui.wait_for_text("agent-1");
-    tui.send(b"\r"); // Projects → Worktrees
+    tui.send(b"\r"); // Projects → Orchestrators
+    tui.wait_for_text(FOOTER_ORCHESTRATORS);
+    tui.send(b"\t"); // Orchestrators → Worktrees
     tui.wait_for_text(FOOTER_WORKTREES);
     tui.wait_for_selected("feat-a");
 
@@ -563,7 +571,9 @@ fn tui_note_modal_crud_and_badge() {
 
     // ---- Worktrees focus: t opens the WORKTREE's list — a separate,
     // still-empty set of notes ----
-    tui.send(b"\r"); // Projects → Worktrees
+    tui.send(b"\r"); // Projects → Orchestrators
+    tui.wait_for_text(FOOTER_ORCHESTRATORS);
+    tui.send(b"\t"); // Orchestrators → Worktrees
     tui.wait_for_text(FOOTER_WORKTREES);
     tui.send(b"e");
     tui.wait_for_text("Notes — note-proj/main");
@@ -702,7 +712,9 @@ fn tui_pull_request_row_leads_the_links_group() {
     tui.wait_for_text("#7 Attach links");
 
     // It is not a stored row: d says so instead of opening a confirm.
-    tui.send(b"\r"); // Projects → Worktrees
+    tui.send(b"\r"); // Projects → Orchestrators
+    tui.wait_for_text(FOOTER_ORCHESTRATORS);
+    tui.send(b"\t"); // Orchestrators → Worktrees
     tui.wait_for_text(FOOTER_WORKTREES);
     tui.send(b"\r"); // Worktrees → Sessions
     tui.wait_for_selected("#7 Attach links");
