@@ -54,14 +54,17 @@ project's ORCHESTRATOR. You manage the project by creating worktrees and \
 delegating work to agent sessions via shell commands (pre-authorized):\n\n  \
 nebula worktree new <name> [--from <ref>]\n  \
 nebula agent new --worktree <branch> [--kind claude|codex|cursor|pi] \
-[--model M] [--effort E] --prompt \"<task>\"\n  \
+[--model M] [--effort E] [--name <title>] --prompt \"<task>\"\n  \
 nebula agent list   # your workers, with status, as JSON\n\nRules: stay in \
 the root checkout — never cd into worktrees, spawn workers there instead; \
 split independent work across worktrees so workers don't collide; check \
-`nebula agent list` before reporting progress. Statuses: running = busy, \
-needs_feedback = waiting on a human, finished = turn done. The user watches \
-everything in nebula's panels — keep each worker's task small and \
-well-scoped.";
+`nebula agent list` before reporting progress. Name everything after the \
+task you delegate — these names are how the user finds things in search: \
+the worktree name becomes its branch (\"fix login flow\" → fix-login-flow), \
+and --name gives the session a 3-4 word title (no quotes needed; omitted, \
+it is derived from --prompt). Statuses: running = busy, needs_feedback = \
+waiting on a human, finished = turn done. The user watches everything in \
+nebula's panels — keep each worker's task small and well-scoped.";
 
 /// Instructions as a UserPromptSubmit hook's stdout. Codex only reads
 /// injected context out of this JSON envelope (its hook output schema is
@@ -233,6 +236,16 @@ fn generate_token() -> String {
 mod tests {
     use super::*;
     use nebula_core::{Agent, AgentKind, AgentStatus, Project, ProjectId, Worktree, WorktreeId};
+
+    /// The standing orchestrator brief must keep teaching task-derived
+    /// names — they are what makes delegated worktrees and sessions
+    /// findable in the search palettes.
+    #[test]
+    fn orchestrator_instruction_teaches_task_derived_naming() {
+        assert!(ORCHESTRATOR_INSTRUCTION.contains("--name"));
+        assert!(ORCHESTRATOR_INSTRUCTION.contains("search"));
+        assert!(ORCHESTRATOR_INSTRUCTION.contains("derived from --prompt"));
+    }
 
     /// Minimal raw HTTP/1.1 POST (Connection: close), so the real response
     /// body — what the hook one-liner pipes to the CLI's stdout — is under

@@ -649,6 +649,23 @@ pub struct NewAgentOpts {
     pub prompt: Option<String>,
 }
 
+/// Session name when the caller passed no `--name`: derived from the
+/// delegated task's prompt so the row is findable by search (`/`, ⌘K)
+/// from the moment it appears — auto-title stays pending, so the worker
+/// may still refine it. Numbered fallback when there is no prompt or the
+/// prompt has no meaningful words.
+fn default_agent_name(prompt: Option<&str>, orchestrator: bool, existing: usize) -> String {
+    if let Some(title) = prompt.and_then(crate::branch_name::title_from_prompt) {
+        return title;
+    }
+    let n = existing + 1;
+    if orchestrator {
+        format!("orchestrator-{n}")
+    } else {
+        format!("agent-{n}")
+    }
+}
+
 /// `nebula agent new`: spawn a session — for orchestrators on the root
 /// worktree by default, for workers wherever `--worktree` points.
 pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
@@ -694,16 +711,11 @@ pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
     };
     let auto_title = opts.name.is_none();
     let name = opts.name.unwrap_or_else(|| {
-        let n = agents
-            .iter()
-            .filter(|a| a.worktree_id == target.id)
-            .count()
-            + 1;
-        if opts.orchestrator {
-            format!("orchestrator-{n}")
-        } else {
-            format!("agent-{n}")
-        }
+        default_agent_name(
+            opts.prompt.as_deref(),
+            opts.orchestrator,
+            agents.iter().filter(|a| a.worktree_id == target.id).count(),
+        )
     });
     let req_id = 1u64;
     write_frame(
@@ -998,4 +1010,31 @@ pub async fn agent_set_orchestrator(
         })
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An orchestrator delegating with `--prompt` and no `--name` gets a
+    /// session named after the task, not `agent-N` — the name is what the
+    /// user searches by.
+    #[test]
+    fn unnamed_prompted_agents_are_named_after_the_task() {
+        assert_eq!(
+            default_agent_name(Some("please fix the login redirect flow"), false, 3),
+            "Fix Login Redirect Flow"
+        );
+        assert_eq!(
+            default_agent_name(Some("coordinate the payments epic"), true, 0),
+            "Coordinate Payments Epic"
+        );
+    }
+
+    #[test]
+    fn no_prompt_or_empty_prompt_falls_back_to_numbered_names() {
+        assert_eq!(default_agent_name(None, false, 1), "agent-2");
+        assert_eq!(default_agent_name(None, true, 0), "orchestrator-1");
+        assert_eq!(default_agent_name(Some("the…"), false, 0), "agent-1");
+    }
 }

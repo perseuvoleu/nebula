@@ -1,5 +1,6 @@
-//! Branch names for the new-worktree prompt: slugifying what the user
-//! typed, and inventing a name when they typed nothing.
+//! Names derived from what somebody typed: branch names for the
+//! new-worktree prompt (slugifying, and inventing a name when they typed
+//! nothing), and session titles derived from a delegated task's prompt.
 //!
 //! Git refuses spaces in a ref, but "fix login redirect" is how a branch
 //! gets described out loud — so the prompt takes the sentence and hands
@@ -19,6 +20,42 @@ pub fn slugify(input: &str) -> String {
         .join("-")
         .trim_matches('-')
         .to_string()
+}
+
+/// Words too generic to earn a slot in a derived session title.
+const FILLER: &[&str] = &[
+    "a", "an", "and", "for", "in", "into", "of", "on", "or", "our", "please", "that", "the",
+    "then", "this", "to", "with", "you", "your",
+];
+
+/// A short Title Case session name derived from a delegated task prompt:
+/// the first few meaningful words of its first non-empty line ("please fix
+/// the login redirect on mobile" → "Fix Login Redirect Mobile"). `None`
+/// when nothing survives the filtering — the caller falls back to a
+/// numbered name. This is what makes an orchestrator-spawned session
+/// findable in search from the moment its row appears.
+pub fn title_from_prompt(prompt: &str) -> Option<String> {
+    let line = prompt.lines().find(|l| !l.trim().is_empty())?;
+    let words: Vec<String> = line
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|w| !w.is_empty() && !FILLER.contains(&w.to_lowercase().as_str()))
+        .take(4)
+        .map(|w| {
+            let mut chars = w.chars();
+            // Uppercase only the first letter — the rest keeps its typed
+            // case, so acronyms (API) and an identifier's tail survive.
+            match chars.next() {
+                Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect();
+    if words.is_empty() {
+        None
+    } else {
+        Some(words.join(" "))
+    }
 }
 
 const ADJECTIVES: &[&str] = &[
@@ -141,6 +178,45 @@ mod tests {
     fn whitespace_only_slugifies_to_empty() {
         assert_eq!(slugify("   "), "");
         assert_eq!(slugify(""), "");
+    }
+
+    #[test]
+    fn prompt_titles_keep_the_meaningful_words() {
+        assert_eq!(
+            title_from_prompt("please fix the login redirect on mobile safari"),
+            Some("Fix Login Redirect Mobile".to_string())
+        );
+        assert_eq!(
+            title_from_prompt("Refactor auth middleware"),
+            Some("Refactor Auth Middleware".to_string())
+        );
+    }
+
+    /// Only the first non-empty line names the task — orchestrator prompts
+    /// often carry paragraphs of context below it.
+    #[test]
+    fn prompt_titles_come_from_the_first_line_only() {
+        assert_eq!(
+            title_from_prompt("\n  add dark mode toggle\nContext: the settings panel…"),
+            Some("Add Dark Mode Toggle".to_string())
+        );
+    }
+
+    /// Punctuation is trimmed at word edges but identifiers keep their
+    /// inner dots, and acronyms keep their case.
+    #[test]
+    fn prompt_titles_preserve_identifiers() {
+        assert_eq!(
+            title_from_prompt("fix API drift in ipc.rs, urgently!"),
+            Some("Fix API Drift Ipc.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn empty_or_filler_only_prompts_yield_no_title() {
+        assert_eq!(title_from_prompt(""), None);
+        assert_eq!(title_from_prompt("   \n\n  "), None);
+        assert_eq!(title_from_prompt("please and then the…"), None);
     }
 
     #[test]
