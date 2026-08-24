@@ -736,9 +736,10 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             app.focus = Focus::Sessions;
             return;
         }
-        // "New agent" and "Notes" are the panel chords that still fire
-        // inside a locked session — spawning a sibling agent or jotting a
-        // note shouldn't require unlocking first. Only their ⌘-modified
+        // "New agent", "Notes" and "Git diff" are the panel chords that
+        // still fire inside a locked session — spawning a sibling agent,
+        // jotting a note or reviewing the worktree's changes shouldn't
+        // require unlocking first. Only their ⌘-modified
         // chords qualify: anything a child app could plausibly want
         // (plain N, plain E, ^n, …) keeps forwarding.
         if chord.mods.contains(crossterm::event::KeyModifiers::SUPER) {
@@ -755,6 +756,13 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                     app.term_locked = false;
                     app.focus = Focus::Sessions;
                     open_note_view(app);
+                    return;
+                }
+                Some(crate::keymap::Action::GitDiff) => {
+                    app.collapsed = false;
+                    app.term_locked = false;
+                    app.focus = Focus::Sessions;
+                    open_diff_view(app);
                     return;
                 }
                 Some(crate::keymap::Action::CloseSession) => {
@@ -11676,6 +11684,72 @@ mod tests {
     }
 
     #[test]
+    fn cmd_d_opens_the_diff_viewer_from_any_panel() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo(&dir);
+        std::fs::write(repo.join("a.txt"), "changed\n").unwrap();
+
+        let mut app = App::new();
+        seed_repo_tree(&mut app, &repo);
+        let mut out = Vec::new();
+        // Projects focus, not Worktrees — ⌘d is panel-independent.
+        app.focus = Focus::Projects;
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::SUPER, &mut out);
+        match &app.overlay {
+            Some(Overlay::Diff(v)) => assert_eq!(v.branch, "main"),
+            other => panic!("expected diff overlay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cmd_d_inside_a_locked_session_opens_the_diff_viewer() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo(&dir);
+        std::fs::write(repo.join("a.txt"), "changed\n").unwrap();
+
+        let mut app = App::new();
+        seed_repo_tree(&mut app, &repo);
+        let mut out = Vec::new();
+        app.term = Some(AttachedTerm::new(
+            SessionRef::Agent(AgentId("a1".into())),
+            80,
+            24,
+        ));
+        app.focus = Focus::Terminal;
+        app.term_locked = true;
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::SUPER, &mut out);
+        assert!(!app.term_locked, "⌘d unlocks the pane");
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Diff(_))),
+            "⌘d opens the diff viewer from inside a locked session"
+        );
+        assert!(
+            out.is_empty(),
+            "the press is intercepted, never forwarded to the pty"
+        );
+    }
+
+    #[test]
+    fn plain_d_inside_a_locked_session_still_reaches_the_child() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        app.term = Some(AttachedTerm::new(
+            SessionRef::Agent(AgentId("a1".into())),
+            80,
+            24,
+        ));
+        app.focus = Focus::Terminal;
+        app.term_locked = true;
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::NONE, &mut out);
+        assert!(app.term_locked, "typing d never unlocks");
+        assert!(
+            matches!(out.last(), Some(ClientRequest::Input { data, .. }) if data == b"d"),
+            "plain d is forwarded to the session"
+        );
+    }
+
+    #[test]
     fn g_with_clean_repo_flashes_no_changes() {
         let dir = tempfile::tempdir().unwrap();
         let repo = test_repo(&dir);
@@ -13157,7 +13231,7 @@ mod tests {
 
             // Esc leaves it where it was.
             press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
-            assert_eq!(app.keymap.label(crate::keymap::Action::GitDiff), "g");
+            assert_eq!(app.keymap.label(crate::keymap::Action::GitDiff), "g ⌘d");
             assert_eq!(app.keymap.label(crate::keymap::Action::Notes), "e ⌘e");
         });
     }
@@ -13179,8 +13253,8 @@ mod tests {
             assert_eq!(app.keymap.label(crate::keymap::Action::Notes), "g");
             assert_eq!(
                 app.keymap.label(crate::keymap::Action::GitDiff),
-                "—",
-                "one keystroke can only mean one thing"
+                "⌘d",
+                "one keystroke can only mean one thing — only g moves"
             );
             // The panels agree with the map.
             press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
