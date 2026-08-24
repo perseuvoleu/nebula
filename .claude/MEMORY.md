@@ -59,6 +59,30 @@ no dispatch change — only the chord and the locked-mode intercept. Tests:
 - The `csi:<codepoint>;9u` recipe from the ⌘W entry worked unchanged (`d` = 100). Real repo test
   fixtures already exist: `test_repo` + `seed_repo_tree` in `event_loop.rs` tests build a git repo
   a diff test can actually open.
+### Space Jumps To The Oldest Session Needing Feedback — 2026-08-24
+
+**Asked:** (spec-driven task, `SPEC-attention-queue.md`) One key (default `space`) that jumps straight
+to the session that has been waiting on the user the longest, attaching its terminal — "Today the user
+visually scans red status dots across projects; with this they just hit the key and answer sessions one
+by one."
+
+**Did:** New `Action::NextAttention` (`keymap.rs`, id `next_attention`, NAVIGATE group, default
+`space` — free, no chord collision). `next_attention` in `event_loop.rs` (above `jump_to_target`) picks
+the unarchived `NeedsFeedback` agent in the open workspace with the smallest `status_changed_at` (0 =
+oldest) and calls `jump_to_target(app, PaletteTarget::Session(id), true, out)`; empty queue flashes
+"nothing needs your feedback". Three regression tests
+(`space_jumps_to_the_oldest_session_needing_feedback`, `space_with_nothing_blocked_flashes_and_stays_put`,
+`space_reaches_a_blocked_orchestrator`).
+
+**Gotchas:**
+- `jump_to_target`'s `PaletteTarget::Session` arm was broken for orchestrators all along: they are
+  excluded from `visible_session_rows`, so a palette pick of an orchestrator fell into the
+  "session no longer exists" fallback instead of attaching. Fixed in that arm — an orchestrator pick now
+  lands `app.sel_orchestrator = Some(i)` (its `project_orchestrators()` index) and attaches. This fixes
+  `/` and ⌘K orchestrator picks too, not just the new key.
+- Inside `jump_to_target` the `attach: bool` parameter shadows the free `attach()` fn in the value
+  namespace — call it as `self::attach(…)` there.
+
 ### ⌘W Closes The Selected Session — 2026-08-24
 
 **Asked:** "ok e ok cand dau cmmd w si s pe un agent vreau sa mi inchida acea sesiune" — followed by "si
