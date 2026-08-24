@@ -1833,6 +1833,18 @@ pub struct App {
     /// with a faint accent tint. Off by default; mirrors the config,
     /// refreshed at startup and when the settings overlay applies a change.
     pub focus_tint: bool,
+    /// Whether the terminal window has focus, tracked from crossterm's
+    /// focus-change events. Defaults to true so terminals that never
+    /// report focus behave as before (never notify).
+    pub window_focused: bool,
+    /// The `notifications` setting: post a macOS notification when a
+    /// status flip needs the user while the window isn't focused.
+    /// Mirrors the config, refreshed at startup and when the settings
+    /// overlay applies a change.
+    pub notifications: bool,
+    /// When each agent last posted a notification, so a flapping status
+    /// can't spam the notification center (30s cooldown per agent).
+    pub notified_at: HashMap<AgentId, std::time::Instant>,
 }
 
 impl Default for App {
@@ -1910,6 +1922,9 @@ impl App {
             splash_preview: false,
             animations: true,
             focus_tint: false,
+            window_focused: true,
+            notifications: true,
+            notified_at: HashMap::new(),
         }
     }
 

@@ -18,8 +18,8 @@ use crossterm::event::{
 };
 use futures::StreamExt;
 use nebula_core::{
-    AgentId, AgentKind, ClientRequest, EntityId, LinkId, NoteId, NoteOwner, ServerEvent,
-    SessionRef, WorktreeId,
+    AgentId, AgentKind, AgentStatus, ClientRequest, EntityId, LinkId, NoteId, NoteOwner,
+    ServerEvent, SessionRef, WorktreeId,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -124,6 +124,7 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<BufWriter<Stdout>>>> {
         EnterAlternateScreen,
         crossterm::event::EnableMouseCapture,
         crossterm::event::EnableBracketedPaste,
+        crossterm::event::EnableFocusChange,
     )?;
     // Kitty keyboard protocol on the outer terminal: without it, Cmd-combos
     // never reach us and Option/Esc combos arrive ambiguous. Probe first —
@@ -164,6 +165,7 @@ pub fn restore_terminal() {
         // Hand back the default pointer in case we left it col-resize
         // (OSC 22; terminals without pointer-shape support drop it).
         crossterm::style::Print("\x1b]22;default\x1b\\"),
+        crossterm::event::DisableFocusChange,
         crossterm::event::DisableBracketedPaste,
         crossterm::event::DisableMouseCapture,
         LeaveAlternateScreen,
@@ -184,6 +186,7 @@ async fn main_loop(
     app.theme = cfg.theme();
     app.animations = cfg.animations;
     app.focus_tint = cfg.focus_tint;
+    app.notifications = cfg.notifications;
     app.keymap = cfg.keymap();
     let mut input = crossterm::event::EventStream::new();
     let mut out: Vec<ClientRequest> = Vec::new();
@@ -642,6 +645,8 @@ fn handle_terminal_event(app: &mut App, event: Event, out: &mut Vec<ClientReques
             }
         }
         Event::Resize(_, _) => app.dirty = true,
+        Event::FocusGained => app.window_focused = true,
+        Event::FocusLost => app.window_focused = false,
         _ => {}
     }
 }
@@ -3373,6 +3378,7 @@ fn apply_setting_at(app: &mut App, tab: usize, index: usize, delta: i32) {
     app.theme = cfg.theme();
     app.animations = cfg.animations;
     app.focus_tint = cfg.focus_tint;
+    app.notifications = cfg.notifications;
 }
 
 fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientRequest>) {
@@ -5792,6 +5798,82 @@ fn open_menu_at(app: &mut App, items: Vec<MenuItem>, at: (u16, u16)) {
     open_menu(app, items, at);
 }
 
+/// One agent won't post again within this window, however its status flaps.
+const NOTIFY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Which status flips deserve a macOS notification: only ones that need the
+/// user, and only while the window isn't focused (a focused user is already
+/// watching). Pure so the table test can walk every transition.
+fn should_notify(
+    prev: AgentStatus,
+    next: AgentStatus,
+    focused: bool,
+) -> Option<&'static str> {
+    if focused || prev == next {
+        return None;
+    }
+    match (prev, next) {
+        (_, AgentStatus::NeedsFeedback) => Some("needs feedback"),
+        (AgentStatus::Running, AgentStatus::Finished) => Some("finished"),
+        _ => None,
+    }
+}
+
+/// Rate-limit and resolve "<project>/<agent>" for a flip [`should_notify`]
+/// approved, then hand off to [`post_notification`]. Tests assert against
+/// the `notified_at` map — everything but the spawn runs under test.
+fn notify_status_change(app: &mut App, agent: &AgentId, reason: &'static str) {
+    if !app.notifications {
+        return;
+    }
+    let now = std::time::Instant::now();
+    if let Some(last) = app.notified_at.get(agent) {
+        if now.duration_since(*last) < NOTIFY_COOLDOWN {
+            return;
+        }
+    }
+    let Some(a) = app.tree.agents.iter().find(|a| &a.id == agent) else {
+        return;
+    };
+    let project = app
+        .tree
+        .worktrees
+        .iter()
+        .find(|w| w.id == a.worktree_id)
+        .and_then(|w| app.tree.projects.iter().find(|p| p.id == w.project_id))
+        .map(|p| p.name.as_str())
+        .unwrap_or("?");
+    let body = format!("{project}/{}", a.name);
+    app.notified_at.insert(agent.clone(), now);
+    post_notification(&body, reason);
+}
+
+/// Fire-and-forget `osascript` notification; the child is never waited on.
+/// macOS-only, and inert under test so the suite doesn't pepper the
+/// notification center.
+fn post_notification(body: &str, reason: &str) {
+    if cfg!(test) || !cfg!(target_os = "macos") {
+        return;
+    }
+    let script = format!(
+        "display notification \"{}\" with title \"nebula\" subtitle \"{}\"",
+        escape_osascript(body),
+        escape_osascript(reason),
+    );
+    let _ = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+/// Backslashes and quotes would end the AppleScript string literal.
+fn escape_osascript(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRequest>) {
     match event {
         ServerEvent::Snapshot {
@@ -5872,10 +5954,15 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             // A status flip can pull the agent into the RECENT group and
             // reorder the list; keep the selection on the same session.
             let keep = app.selected_session_row().and_then(|r| r.sref());
+            let mut notify = None;
             if let Some(a) = app.tree.agents.iter_mut().find(|a| a.id == agent) {
+                notify = should_notify(a.status, status, app.window_focused);
                 a.status = status;
                 a.status_changed_at = changed_at;
                 app.dirty = true;
+            }
+            if let Some(reason) = notify {
+                notify_status_change(app, &agent, reason);
             }
             if let Some(keep) = keep {
                 if let Some(i) = app
@@ -8223,6 +8310,95 @@ mod tests {
         assert_eq!(app.session_group_counts(), (0, 0, 2, 0));
         assert_eq!(app.visible_sessions()[0].name, "agent-2");
         assert!(app.next_recent_expiry().is_none());
+    }
+
+    /// The notification gate: fires only unfocused, only for flips the
+    /// user has to act on (any → needs-feedback, running → finished).
+    #[test]
+    fn should_notify_covers_the_transition_table() {
+        use nebula_core::AgentStatus::*;
+        // Unfocused: needs-feedback fires from anywhere, finished only
+        // from a live run.
+        assert_eq!(should_notify(Fresh, NeedsFeedback, false), Some("needs feedback"));
+        assert_eq!(should_notify(Running, NeedsFeedback, false), Some("needs feedback"));
+        assert_eq!(should_notify(Finished, NeedsFeedback, false), Some("needs feedback"));
+        assert_eq!(should_notify(Running, Finished, false), Some("finished"));
+        // Non-events: nothing the user has to act on, or no flip at all.
+        assert_eq!(should_notify(Fresh, Running, false), None);
+        assert_eq!(should_notify(Finished, Running, false), None);
+        assert_eq!(should_notify(NeedsFeedback, Running, false), None);
+        assert_eq!(should_notify(NeedsFeedback, NeedsFeedback, false), None);
+        assert_eq!(should_notify(Fresh, Finished, false), None);
+        assert_eq!(should_notify(Running, Terminated, false), None);
+        // Focused: never, whatever the flip.
+        assert_eq!(should_notify(Fresh, NeedsFeedback, true), None);
+        assert_eq!(should_notify(Running, Finished, true), None);
+    }
+
+    /// With the window unfocused, a needs-feedback flip records its
+    /// notification (the rate-limit map is the observable seam), a repeat
+    /// within the cooldown doesn't, and a focused window never records.
+    #[test]
+    fn status_flip_notifies_only_while_unfocused() {
+        use nebula_core::AgentStatus;
+        let flip = |to: AgentStatus| ServerEvent::StatusChanged {
+            agent: AgentId("a1".into()),
+            status: to,
+            changed_at: crate::app::now_ms(),
+        };
+
+        let mut app = App::new();
+        seed_tree(&mut app); // agent-1: Fresh
+        app.window_focused = false;
+        hse(&mut app, flip(AgentStatus::NeedsFeedback));
+        let first = *app
+            .notified_at
+            .get(&AgentId("a1".into()))
+            .expect("the unfocused needs-feedback flip records a notification");
+
+        // Flapping back within the 30s cooldown stays silent: the recorded
+        // instant doesn't move.
+        hse(&mut app, flip(AgentStatus::Running));
+        hse(&mut app, flip(AgentStatus::NeedsFeedback));
+        assert_eq!(
+            app.notified_at[&AgentId("a1".into())], first,
+            "a repeat inside the cooldown is rate-limited"
+        );
+
+        // Focused, the same flip records nothing.
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.window_focused = true;
+        hse(&mut app, flip(AgentStatus::NeedsFeedback));
+        assert!(app.notified_at.is_empty(), "focused windows never notify");
+
+        // The setting turned off wins over an unfocused window.
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.window_focused = false;
+        app.notifications = false;
+        hse(&mut app, flip(AgentStatus::NeedsFeedback));
+        assert!(app.notified_at.is_empty(), "the toggle disables notifying");
+
+        // Running → Finished is the other notifying flip.
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.window_focused = false;
+        hse(&mut app, flip(AgentStatus::Running));
+        assert!(app.notified_at.is_empty(), "starting a run is not news");
+        hse(&mut app, flip(AgentStatus::Finished));
+        assert!(
+            app.notified_at.contains_key(&AgentId("a1".into())),
+            "an unfocused finished run notifies"
+        );
+    }
+
+    /// AppleScript string literals end at an unescaped quote; the agent
+    /// and project names are user-typed.
+    #[test]
+    fn osascript_escaping_handles_quotes_and_backslashes() {
+        assert_eq!(escape_osascript(r#"a"b\c"#), r#"a\"b\\c"#);
+        assert_eq!(escape_osascript("plain/name"), "plain/name");
     }
 
     /// Confirming a worktree delete drops the row (and its agents)

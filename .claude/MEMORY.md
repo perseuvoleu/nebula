@@ -14,6 +14,28 @@ about what is worth recording.
 
 ## Entries
 
+### macOS Notifications When An Unfocused Window Needs You — 2026-08-24
+
+**Asked:** "Implement the feature specified in SPEC-macos-notifications.md" — post a macOS notification
+("nebula — <project>/<agent> needs feedback") when the window is unfocused and an agent flips to
+needs-feedback or finishes a run.
+
+**Did:** Focus tracking via crossterm `EnableFocusChange` in `setup_terminal`/`restore_terminal` +
+`Event::FocusGained/FocusLost` → `App.window_focused` (default `true`; terminals that never report focus
+stay silent). The gate is the pure `should_notify(prev, next, focused)` in `event_loop.rs` (any →
+NeedsFeedback, Running → Finished), called from the `ServerEvent::StatusChanged` handler;
+`notify_status_change` rate-limits 30s per agent via `App.notified_at: HashMap<AgentId, Instant>`,
+resolves `<project>/<name>` through `app.tree`, and `post_notification` spawns fire-and-forget
+`osascript -e 'display notification …'` (quotes/backslashes escaped). Config toggle `notifications: bool`
+(default on) with a settings row in the Sessions tab, following the `animations` pattern end to end
+(save_to / value_label / cycle / apply_setting_at).
+
+**Gotchas:**
+- `post_notification` is inert under `cfg!(test)` as well as off-macOS — without that, running the suite
+  on this Mac posts real notification-center toasts. The tests' observable seam is the `notified_at` map.
+- In the `StatusChanged` handler, compute `should_notify(a.status, …)` *before* overwriting `a.status`,
+  and call `notify_status_change(app, …)` only after the `iter_mut` borrow ends — it needs `&mut App`.
+
 ### ⌘W Closes The Selected Session — 2026-08-24
 
 **Asked:** "ok e ok cand dau cmmd w si s pe un agent vreau sa mi inchida acea sesiune" — followed by "si
