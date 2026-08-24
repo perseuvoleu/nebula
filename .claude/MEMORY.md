@@ -14,6 +14,26 @@ about what is worth recording.
 
 ## Entries
 
+### Cmd+P Toggles The Attached Terminal Full-Screen — 2026-08-24
+
+**Asked:** "Implement the user's requested Ctrl+Q terminal full-screen toggle in Nebula…" Corrected
+mid-task to "muta pe cmmd + p", then clarified: "indifrente dde unde se da cmmd + p vreau sa fac
+full/sau inapoi la ala cu temrinal/agent".
+
+**Did:** `Action::Zoom` became `ToggleTerminalFullscreen` while retaining config id `zoom`; its defaults
+are now `cmd+p, z`. `toggle_terminal_fullscreen` in `crates/nebula-tui/src/event_loop.rs` drives both
+global-panel and locked-terminal paths: attached sessions collapse/focus/lock, a second press expands
+and unlocks to Sessions, and no attachment flashes instead of showing an empty pane. Help/footer labels
+now describe the toggle and preserve `^q` as an advertised escape. Three focused regressions cover
+panel → full-screen → back, locked terminal → full-screen, and no attachment; all 442 `nebula-tui`
+tests passed. The local `~/.config/ghostty/nebula` overlay now sends `super+p=csi:112;9u`.
+
+**Gotchas:**
+- The Ghostty overlay previously mapped `super+p=text:p`, stripping SUPER so panels ran Pin and locked
+  terminals forwarded `p` to the child. Cmd shortcuts that must work while locked need kitty CSI-u.
+- Terminal.app still cannot deliver Cmd+P. `z` remains the stock-terminal entry fallback, while the
+  hardwired Ctrl+Q and configured Ctrl+]/Ctrl+Esc/Ctrl+Left bindings remain safe exits.
+
 ### E2E Tests Updated For The Split Orchestrator/Worktree Focus — 2026-08-24
 
 **Asked:** "Fix the 3 failing e2e tests in crates/nebula/tests/e2e_tui.rs: tui_note_modal_crud_and_badge,
@@ -1154,8 +1174,8 @@ vt100 `contents_between`, `pbcopy` on mouse-up).
   kitty-keyboard probe, so Cmd-modified keys and Ctrl+Esc never reach the app there.
 - Everything else was eliminated for a reason: Cmd+arrows (no kitty protocol), Ctrl+arrows (Mission
   Control), Ctrl+Esc / Option+Esc (undeliverable), Ctrl+]: vetoed on feel, double-Esc: implemented then
-  reverted because Claude Code owns Esc, Shift+arrows and Ctrl+G/T: Claude Code binds them. **Ctrl+Q is
-  settled — don't relitigate it**; the user's Cmd+Q-adjacency worry lost to familiarity.
+  reverted because Claude Code owns Esc, Shift+arrows and Ctrl+G/T: Claude Code binds them. This was
+  superseded on 2026-08-24: Ctrl+Q remains a hardwired unlock hatch, while Cmd+P toggles full-screen.
 - crossterm collapses a same-read `\x1b\x1b` pair into **one** Esc event (escaped-escape rule), which is
   what made double-Esc unworkable.
 - "Shift+drag selects text" is a lie in Terminal.app — there's no mouse-reporting bypass there, unlike

@@ -89,7 +89,7 @@ pub enum Action {
     Grep,
     TreeBrowser,
     // terminal
-    Zoom,
+    ToggleTerminalFullscreen,
     UnlockTerminal,
     // general
     Workspaces,
@@ -436,13 +436,13 @@ pub const ACTIONS: &[ActionSpec] = &[
     },
     // ---- TERMINAL ----
     ActionSpec {
-        action: Action::Zoom,
+        action: Action::ToggleTerminalFullscreen,
         id: "zoom",
-        label: "Full-screen terminal",
-        hint: "Collapse the sidebars and lock input into the attached session",
+        label: "Toggle full-screen terminal",
+        hint: "Show or hide the panels around the attached terminal",
         group: "TERMINAL",
         scope: Scope::Global,
-        defaults: &["z"],
+        defaults: &["cmd+p", "z"],
     },
     ActionSpec {
         action: Action::UnlockTerminal,
@@ -1172,6 +1172,13 @@ mod tests {
             map.lookup(Scope::Global, &KeyChord::parse("q").unwrap()),
             Some(Action::Quit)
         );
+
+        let cmd_p = KeyChord::parse("cmd+p").unwrap();
+        assert_eq!(
+            map.lookup(Scope::Global, &cmd_p),
+            Some(Action::ToggleTerminalFullscreen)
+        );
+        assert_eq!(map.lookup(Scope::Terminal, &cmd_p), None);
     }
 
     #[test]

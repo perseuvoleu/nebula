@@ -485,7 +485,11 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 (
                     "TERMINAL & MOUSE",
                     &[
-                        (Act(&[Activate, Zoom]), "lock input (2nd: full-screen)"),
+                        (Act(&[Activate]), "lock input"),
+                        (
+                            Act(&[ToggleTerminalFullscreen]),
+                            "toggle full-screen terminal",
+                        ),
                         (Act(&[UnlockTerminal]), "unlock, back to panels"),
                         (Lit("drag"), "select + copy (2×click: word)"),
                         (Lit("⌥click"), "open URL / file under cursor"),
@@ -3745,8 +3749,17 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             Focus::Terminal if app.term.as_ref().is_some_and(|t| t.exited) => {
                 "session exited — Esc: back to sessions".to_string()
             }
+            Focus::Terminal if app.term_locked && app.collapsed => format!(
+                "{}/{}: panels  drag: select+copy  ⌥click: open link",
+                k(Action::ToggleTerminalFullscreen),
+                app.keymap
+                    .first(Action::UnlockTerminal)
+                    .map(|c| c.display())
+                    .unwrap_or_else(|| "^q".into()),
+            ),
             Focus::Terminal if app.term_locked => format!(
-                "{}: panels  drag: select+copy  ⌥click: open link",
+                "{}: full screen  {}: panels  drag: select+copy  ⌥click: open link",
+                k(Action::ToggleTerminalFullscreen),
                 app.keymap
                     .first(Action::UnlockTerminal)
                     .map(|c| c.display())
