@@ -90,7 +90,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.focus_tint {
         let tinted = match app.focus {
             Focus::Projects => shrink_r(projects_a),
-            Focus::Worktrees => shrink_r(worktrees_a),
+            Focus::Orchestrators | Focus::Worktrees => {
+                worktree_section_rects(worktrees_a, app.focus).unwrap()
+            }
             Focus::Sessions => shrink_r(sessions_a),
             Focus::Terminal => term_a,
         };
@@ -2132,6 +2134,30 @@ fn shrink_r(area: Rect) -> Rect {
     }
 }
 
+/// The ORCHESTRATORS and WORKTREES halves share one sidebar column but
+/// have separate focus, hit, and tint rectangles. The split mirrors
+/// `draw_worktrees`: its list area begins three rows below the column top,
+/// then divides at that area's midpoint.
+fn worktree_section_rects(area: Rect, focus: Focus) -> Option<Rect> {
+    let column = shrink_r(area);
+    let list_y = column.y.saturating_add(3).min(column.bottom());
+    let list_h = column.bottom().saturating_sub(list_y);
+    let mid = (list_h / 2).max(PILL_H + 1).min(list_h);
+    let split_y = list_y.saturating_add(mid).min(column.bottom());
+    match focus {
+        Focus::Orchestrators => Some(Rect {
+            height: split_y.saturating_sub(column.y),
+            ..column
+        }),
+        Focus::Worktrees => Some(Rect {
+            y: split_y,
+            height: column.bottom().saturating_sub(split_y),
+            ..column
+        }),
+        _ => None,
+    }
+}
+
 /// Subtle focus cue: fill the whole focused panel with the theme's
 /// `focus_tint` — the accent at ~10% opacity, so the panel reads as a
 /// faintly lit surface. Painted after content, and only onto cells whose
@@ -2628,7 +2654,8 @@ fn divider_spans(label: &str, width: u16, th: Theme) -> Vec<Span<'static>> {
 
 fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     let th = app.theme;
-    let focused = app.focus == Focus::Worktrees;
+    let orchestrators_focused = app.focus == Focus::Orchestrators;
+    let worktrees_focused = app.focus == Focus::Worktrees;
     let wt_count = app.visible_worktrees().len();
     // The column is permanently split in two stacked sections: the
     // project's ORCHESTRATORS on top (the column title doubles as that
@@ -2639,14 +2666,25 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         area,
         "ORCHESTRATORS",
         orch_count_title.filter(|_| !app.divider_focused()),
-        focused,
+        orchestrators_focused,
         th,
     );
+
+    let push_section_backgrounds = |app: &mut App| {
+        if let Some(top) = worktree_section_rects(area, Focus::Orchestrators) {
+            app.hits
+                .push((top, HitTarget::PanelBg(Focus::Orchestrators)));
+        }
+        if let Some(bottom) = worktree_section_rects(area, Focus::Worktrees) {
+            app.hits
+                .push((bottom, HitTarget::PanelBg(Focus::Worktrees)));
+        }
+    };
 
     // A selected separator has nothing underneath it: keep the panel, hide
     // the rows (the terminal pane carries the hint).
     if app.divider_focused() {
-        app.hits.push((inner, HitTarget::PanelBg(Focus::Worktrees)));
+        push_section_backgrounds(app);
         return;
     }
 
@@ -2679,7 +2717,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         .collect();
 
     if worktrees.is_empty() && orchestrators.is_empty() && !app.tree.has_visible_projects() {
-        app.hits.push((inner, HitTarget::PanelBg(Focus::Worktrees)));
+        push_section_backgrounds(app);
         return;
     }
 
@@ -2702,7 +2740,6 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     // The column splits at its vertical middle: the top half belongs to
     // the ORCHESTRATORS section, the bottom half to WORKTREES.
     let mid = (inner.height as usize / 2).max(PILL_H as usize + 1);
-    let in_section = app.sel_orchestrator.is_some();
     if orchestrators.is_empty() && app.tree.has_visible_projects() {
         // Selectable placeholder: walking onto it and pressing n/Enter
         // spawns the project's first orchestrator.
@@ -2711,7 +2748,15 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             Span::styled("new orchestrator", dim),
         ];
         let selected = app.on_orchestrator_placeholder();
-        render_pill(f, inner, screen_row as isize, spans, selected, focused, th);
+        render_pill(
+            f,
+            inner,
+            screen_row as isize,
+            spans,
+            selected,
+            orchestrators_focused,
+            th,
+        );
         if let Some(hit) = rows_rect(inner, screen_row, PILL_H) {
             app.hits.push((hit, HitTarget::Orchestrator(0)));
         }
@@ -2735,8 +2780,17 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             app.sweep_phase(),
         ));
         spans.push(Span::styled(ORCH_BADGE, Style::default().fg(th.accent)));
-        let selected = app.sel_orchestrator == Some(i);
-        render_pill(f, inner, screen_row as isize, spans, selected, focused, th);
+        let selected = app.sel_orchestrator == Some(i)
+            || (orchestrators_focused && app.sel_orchestrator.is_none() && i == 0);
+        render_pill(
+            f,
+            inner,
+            screen_row as isize,
+            spans,
+            selected,
+            orchestrators_focused,
+            th,
+        );
         if let Some(hit) = rows_rect(inner, screen_row, PILL_H) {
             app.hits.push((hit, HitTarget::Orchestrator(i)));
         }
@@ -2746,7 +2800,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     // regardless of how few orchestrators sit above.
     screen_row = mid;
     if let Some(r) = row_rect(inner, screen_row) {
-        let header_style = if focused {
+        let header_style = if worktrees_focused {
             Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(th.muted).add_modifier(Modifier::BOLD)
@@ -2768,7 +2822,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                 r,
             );
         }
-        app.hits.push((inner, HitTarget::PanelBg(Focus::Worktrees)));
+        push_section_backgrounds(app);
         return;
     }
     if grouped {
@@ -2807,22 +2861,24 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         if let Some((text, style)) = note_badge {
             spans.push(Span::styled(text, style));
         }
-        let selected = !in_section && i == app.sel_worktree;
+        let selected = i == app.sel_worktree;
         render_pill(
             f,
             inner,
             screen_row as isize,
             spans,
             selected,
-            focused,
+            worktrees_focused,
             th,
         );
         if let Some(base) = created_from {
             if let Some(r) = row_rect(inner, screen_row + PILL_H as usize) {
                 let style = if selected {
-                    Style::default()
-                        .fg(th.muted)
-                        .bg(if focused { th.sel_bg } else { th.sel_bg_dim })
+                    Style::default().fg(th.muted).bg(if worktrees_focused {
+                        th.sel_bg
+                    } else {
+                        th.sel_bg_dim
+                    })
                 } else {
                     Style::default().fg(th.dim)
                 };
@@ -2841,7 +2897,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                     f.render_widget(
                         Paragraph::new(Span::styled(
                             "▌",
-                            Style::default().fg(if focused { th.accent } else { th.dim }),
+                            Style::default().fg(if worktrees_focused { th.accent } else { th.dim }),
                         )),
                         Rect { width: 1, ..r },
                     );
@@ -2859,7 +2915,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             screen_row += 1;
         }
     }
-    app.hits.push((inner, HitTarget::PanelBg(Focus::Worktrees)));
+    push_section_backgrounds(app);
 }
 
 /// One laid-out entry of the Sessions panel. Group headers and session
@@ -3492,6 +3548,13 @@ fn breadcrumb(app: &App) -> Vec<Span<'static>> {
         return spans;
     };
     spans.push(seg(&project.name, app.focus == Focus::Projects));
+    if app.focus == Focus::Orchestrators {
+        if let Some(orchestrator) = app.selected_orchestrator() {
+            spans.push(sep());
+            spans.push(seg(&orchestrator.name, true));
+        }
+        return spans;
+    }
     if let Some(worktree) = app.selected_worktree() {
         spans.push(sep());
         spans.push(seg(&worktree.branch, app.focus == Focus::Worktrees));
@@ -3694,6 +3757,15 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                     k(Action::Help)
                 ),
             },
+            Focus::Orchestrators => format!(
+                "{}: new orchestrator  {}: attach  {}: rename  {}: delete  {}: menu  {}: help",
+                k(Action::New),
+                k(Action::Activate),
+                k(Action::Rename),
+                k(Action::Delete),
+                k(Action::ContextMenu),
+                k(Action::Help)
+            ),
             Focus::Worktrees => format!(
                 "{}: new worktree  {}/{}: notes/todos  {}: terminal  {}: pin  {}: delete  {}: search  {}: menu  {}: help",
                 k(Action::New),

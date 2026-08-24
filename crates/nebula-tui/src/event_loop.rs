@@ -872,7 +872,8 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         }
         Action::FocusNext => {
             app.focus = match app.focus {
-                Focus::Projects => Focus::Worktrees,
+                Focus::Projects => Focus::Orchestrators,
+                Focus::Orchestrators => Focus::Worktrees,
                 Focus::Worktrees => Focus::Sessions,
                 Focus::Sessions => Focus::Terminal,
                 Focus::Terminal => Focus::Projects,
@@ -881,7 +882,8 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         Action::FocusPrev => {
             app.focus = match app.focus {
                 Focus::Projects => Focus::Terminal,
-                Focus::Worktrees => Focus::Projects,
+                Focus::Orchestrators => Focus::Projects,
+                Focus::Worktrees => Focus::Orchestrators,
                 Focus::Sessions => Focus::Worktrees,
                 Focus::Terminal => Focus::Sessions,
             }
@@ -889,6 +891,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         Action::FocusLeft => {
             app.focus = match app.focus {
                 Focus::Projects => Focus::Projects,
+                Focus::Orchestrators => Focus::Projects,
                 Focus::Worktrees => Focus::Projects,
                 Focus::Sessions => Focus::Worktrees,
                 Focus::Terminal => Focus::Sessions,
@@ -899,7 +902,8 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         // Ctrl+← escape hatch).
         Action::FocusTerminal => {
             app.focus = match app.focus {
-                Focus::Projects => Focus::Worktrees,
+                Focus::Projects => Focus::Orchestrators,
+                Focus::Orchestrators => Focus::Worktrees,
                 Focus::Worktrees => Focus::Sessions,
                 Focus::Sessions => Focus::Terminal,
                 Focus::Terminal => Focus::Terminal,
@@ -910,7 +914,8 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             // chose a session, which is Enter's job — plain focus movement
             // never crosses into the pane (Tab/Ctrl+→ do).
             app.focus = match app.focus {
-                Focus::Projects => Focus::Worktrees,
+                Focus::Projects => Focus::Orchestrators,
+                Focus::Orchestrators => Focus::Sessions,
                 Focus::Worktrees => Focus::Sessions,
                 Focus::Sessions => Focus::Sessions,
                 Focus::Terminal => Focus::Terminal,
@@ -941,13 +946,12 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                     let id = app.tree.projects[project].id.clone();
                     open_prompt(app, PromptKind::DividerLabel { id, before });
                 }
-                _ => app.focus = Focus::Worktrees,
+                _ => app.focus = Focus::Orchestrators,
             },
             // Enter on an orchestrator row walks into its terminal (it is
             // a session, not a container); on the empty section's
-            // "+ new orchestrator" row it creates the first one; a
-            // worktree row drills right.
-            Focus::Worktrees => match app.selected_orchestrator() {
+            // "+ new orchestrator" row it creates the first one.
+            Focus::Orchestrators => match app.selected_orchestrator() {
                 Some(orch) => {
                     let sref = SessionRef::Agent(orch.id.clone());
                     attach(app, sref, out);
@@ -959,8 +963,9 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                         open_new_orchestrator_picker(app, p);
                     }
                 }
-                None => app.focus = Focus::Sessions,
+                None => {}
             },
+            Focus::Worktrees => app.focus = Focus::Sessions,
             Focus::Sessions => attach_selected(app, out),
             Focus::Terminal => {
                 // Lock input into an already-focused live pane.
@@ -975,16 +980,14 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         Action::New if !app.tree.has_visible_projects() => open_prompt(app, PromptKind::AddProject),
         Action::New => match app.focus {
             Focus::Projects => open_prompt(app, PromptKind::AddProject),
-            // `n` follows the panel's split: in the ORCHESTRATORS section
-            // it spawns an orchestrator, on a worktree row a worktree.
+            Focus::Orchestrators => {
+                if let Some(project) = app.selected_project().map(|p| p.id.clone()) {
+                    open_new_orchestrator_picker(app, project);
+                }
+            }
             Focus::Worktrees => {
-                if let Some(p) = app.selected_project() {
-                    let project = p.id.clone();
-                    if app.in_orchestrator_section() {
-                        open_new_orchestrator_picker(app, project);
-                    } else {
-                        open_new_worktree_prompt(app, project);
-                    }
+                if let Some(project) = app.selected_project().map(|p| p.id.clone()) {
+                    open_new_worktree_prompt(app, project);
                 }
             }
             Focus::Sessions => {
@@ -995,8 +998,13 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             }
             Focus::Terminal => {}
         },
-        Action::NewAgent => new_agent_shortcut(app),
+        Action::NewAgent => new_for_section_or_agent(app),
         Action::Rename => match app.focus {
+            Focus::Orchestrators => {
+                if let Some(id) = app.selected_orchestrator().map(|a| a.id.clone()) {
+                    open_prompt(app, PromptKind::RenameAgent { id });
+                }
+            }
             Focus::Sessions => match app.selected_session_row() {
                 Some(SessionRow::Agent(a)) => {
                     open_prompt(app, PromptKind::RenameAgent { id: a.id })
@@ -1912,6 +1920,18 @@ fn open_delete_confirm(app: &mut App) {
                 }));
             }
         }
+        Focus::Orchestrators => {
+            if let Some(a) = app.selected_orchestrator() {
+                app.overlay = Some(Overlay::Confirm(ConfirmDialog {
+                    title: "Delete orchestrator".into(),
+                    message: format!(
+                        "Delete orchestrator '{}'? Its session and history go away.",
+                        a.name
+                    ),
+                    action: PendingAction::DeleteAgent(a.id.clone()),
+                }));
+            }
+        }
         Focus::Worktrees => {
             if let Some(w) = app.selected_worktree() {
                 if w.is_main {
@@ -2014,6 +2034,27 @@ fn bulk_confirm_listing(names: &[String]) -> String {
 /// itemizes the casualties so the blast radius is unmistakable.
 fn open_delete_all_confirm(app: &mut App) {
     match app.focus {
+        Focus::Orchestrators => {
+            let orchestrators = app.project_orchestrators();
+            if orchestrators.is_empty() {
+                app.flash = Some("no orchestrators to delete".into());
+                return;
+            }
+            let names: Vec<String> = orchestrators.iter().map(|a| a.name.clone()).collect();
+            let agents: Vec<AgentId> = orchestrators.iter().map(|a| a.id.clone()).collect();
+            app.overlay = Some(Overlay::Confirm(ConfirmDialog {
+                title: format!("Delete ALL {} orchestrator(s)", agents.len()),
+                message: format!(
+                    "Delete these {} orchestrator(s)? Their history goes away.\n{}",
+                    agents.len(),
+                    bulk_confirm_listing(&names),
+                ),
+                action: PendingAction::DeleteAllSessions {
+                    agents,
+                    terminals: vec![],
+                },
+            }));
+        }
         Focus::Worktrees => {
             let doomed: Vec<&nebula_core::Worktree> = app
                 .visible_worktrees()
@@ -2174,6 +2215,31 @@ fn menu_items_for_session(a: &nebula_core::Agent) -> Vec<MenuItem> {
     }
 }
 
+fn menu_items_for_orchestrator(a: &nebula_core::Agent) -> Vec<MenuItem> {
+    vec![
+        MenuItem {
+            label: "Attach".into(),
+            action: MenuAction::Attach(SessionRef::Agent(a.id.clone())),
+            destructive: false,
+        },
+        MenuItem {
+            label: "Rename".into(),
+            action: MenuAction::RenameAgent(a.id.clone()),
+            destructive: false,
+        },
+        MenuItem {
+            label: "Demote to session".into(),
+            action: MenuAction::SetAgentOrchestrator(a.id.clone(), false),
+            destructive: false,
+        },
+        MenuItem {
+            label: "Delete".into(),
+            action: MenuAction::DeleteAgent(a.id.clone()),
+            destructive: true,
+        },
+    ]
+}
+
 fn menu_items_for_terminal(t: &nebula_core::TerminalTab) -> Vec<MenuItem> {
     vec![
         MenuItem {
@@ -2252,7 +2318,29 @@ fn open_menu(app: &mut App, items: Vec<MenuItem>, at: (u16, u16)) {
 /// Claude/Codex rows expand (→) into model and effort submenus; Enter
 /// anywhere takes the configured defaults for whatever wasn't drilled into.
 /// The dedicated "New agent" chord (cmd+n by default): the new-session
-/// picker for the selected worktree, no matter which panel has focus.
+/// picker for the selected worktree, no matter which ordinary panel has
+/// focus. The two middle-column sections override it with their own create
+/// flows so plain n and cmd/ctrl+n agree there.
+fn new_for_section_or_agent(app: &mut App) {
+    if !app.tree.has_visible_projects() {
+        open_prompt(app, PromptKind::AddProject);
+        return;
+    }
+    match app.focus {
+        Focus::Orchestrators => {
+            if let Some(project) = app.selected_project().map(|p| p.id.clone()) {
+                open_new_orchestrator_picker(app, project);
+            }
+        }
+        Focus::Worktrees => {
+            if let Some(project) = app.selected_project().map(|p| p.id.clone()) {
+                open_new_worktree_prompt(app, project);
+            }
+        }
+        _ => new_agent_shortcut(app),
+    }
+}
+
 fn new_agent_shortcut(app: &mut App) {
     if !app.tree.has_visible_projects() {
         open_prompt(app, PromptKind::AddProject);
@@ -2561,6 +2649,21 @@ fn open_context_menu_for_selection(app: &mut App) {
                 });
             }
             open_menu(app, items, at);
+        }
+        Focus::Orchestrators => {
+            if let Some(a) = app.selected_orchestrator() {
+                open_menu(app, menu_items_for_orchestrator(a), at);
+            } else if let Some(p) = app.selected_project() {
+                open_menu(
+                    app,
+                    vec![MenuItem {
+                        label: "New orchestrator".into(),
+                        action: MenuAction::NewOrchestrator(p.id.clone()),
+                        destructive: false,
+                    }],
+                    at,
+                );
+            }
         }
         Focus::Worktrees => {
             if let Some(w) = app.selected_worktree() {
@@ -4334,7 +4437,10 @@ fn restore_session(app: &mut App, out: &mut Vec<ClientRequest>) {
     schedule_pr_lookup(app);
     // An orchestrator row previews the orchestrator's own terminal — it
     // has no worktree context to restore.
-    if let Some(orch) = app.selected_orchestrator() {
+    if app.focus == Focus::Orchestrators {
+        let Some(orch) = app.selected_orchestrator() else {
+            return;
+        };
         let sref = SessionRef::Agent(orch.id.clone());
         attach(app, sref, out);
         return;
@@ -4424,14 +4530,13 @@ fn select_worktree_by_id(
     let Some(index) = app.worktree_row_index(id) else {
         return false;
     };
-    if app.sel_worktree != index || app.sel_orchestrator.is_some() {
+    app.focus = Focus::Sessions;
+    if app.sel_worktree != index {
         remember_context(app);
-        app.sel_orchestrator = None;
         app.sel_worktree = index;
         restore_session(app, out);
     }
     // Land on the sessions panel so `n` immediately creates a session here.
-    app.focus = Focus::Sessions;
     true
 }
 
@@ -4592,10 +4697,9 @@ fn jump_to_target(
                 app.flash = Some("worktree no longer exists".into());
                 return;
             };
-            app.sel_orchestrator = None;
+            app.focus = Focus::Sessions;
             app.sel_worktree = index;
             restore_session(app, out);
-            app.focus = Focus::Sessions;
         }
         PaletteTarget::Session(id) => {
             let agent = app.tree.agents.iter().find(|a| a.id == id);
@@ -4626,7 +4730,7 @@ fn jump_to_target(
                     app.focus = Focus::Terminal;
                     app.term_locked = true;
                 } else {
-                    app.focus = Focus::Worktrees;
+                    app.focus = Focus::Orchestrators;
                 }
                 return;
             }
@@ -4712,39 +4816,57 @@ fn open_session(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
 }
 
 fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
-    // The Worktrees panel walks two stacked cursors as one list: the
-    // ORCHESTRATORS section above (its own `sel_orchestrator`), the
-    // worktree rows below (`sel_worktree`, unchanged meaning).
-    if app.focus == Focus::Worktrees {
+    // The two vertical halves keep independent cursors, but ↑/↓ still
+    // walks across their shared boundary as one coherent column.
+    if app.focus == Focus::Orchestrators {
         let section = app.orchestrator_section_len();
-        let worktrees = app.visible_worktrees().len();
-        let total = section + worktrees;
-        if total == 0 {
+        if section == 0 {
             return;
         }
-        let current = match app.sel_orchestrator {
-            Some(i) => i as i64,
-            None => (section + app.sel_worktree) as i64,
-        };
-        let new = (current + delta).clamp(0, total as i64 - 1) as usize;
-        if new == current as usize {
+        let current = app.sel_orchestrator.unwrap_or(0).min(section - 1);
+        if delta > 0 && current == section - 1 && !app.visible_worktrees().is_empty() {
+            app.focus = Focus::Worktrees;
+            restore_session(app, out);
             return;
         }
-        app.select_worktree_when_seen = None;
-        remember_context(app);
-        if new < section {
+        let new = (current as i64 + delta).clamp(0, section as i64 - 1) as usize;
+        if new != current || app.sel_orchestrator.is_none() {
+            remember_context(app);
             app.sel_orchestrator = Some(new);
-        } else {
-            app.sel_orchestrator = None;
-            app.sel_worktree = new - section;
+            restore_session(app, out);
         }
-        restore_session(app, out);
+        return;
+    }
+    if app.focus == Focus::Worktrees {
+        let worktrees = app.visible_worktrees().len();
+        if worktrees == 0 {
+            if delta < 0 && app.orchestrator_section_len() > 0 {
+                app.focus = Focus::Orchestrators;
+                app.sel_orchestrator = Some(app.orchestrator_section_len() - 1);
+                restore_session(app, out);
+            }
+            return;
+        }
+        let current = app.sel_worktree.min(worktrees - 1);
+        if delta < 0 && current == 0 && app.orchestrator_section_len() > 0 {
+            app.focus = Focus::Orchestrators;
+            app.sel_orchestrator = Some(app.orchestrator_section_len() - 1);
+            restore_session(app, out);
+            return;
+        }
+        let new = (current as i64 + delta).clamp(0, worktrees as i64 - 1) as usize;
+        if new != current {
+            app.select_worktree_when_seen = None;
+            remember_context(app);
+            app.sel_worktree = new;
+            restore_session(app, out);
+        }
         return;
     }
     let len = match app.focus {
         Focus::Projects => app.project_rows().len(),
         Focus::Sessions => app.visible_session_rows().len(),
-        Focus::Worktrees | Focus::Terminal => return,
+        Focus::Orchestrators | Focus::Worktrees | Focus::Terminal => return,
     };
     if len == 0 {
         return;
@@ -4752,7 +4874,7 @@ fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
     let sel = match app.focus {
         Focus::Projects => app.sel_project,
         Focus::Sessions => app.sel_session,
-        Focus::Worktrees | Focus::Terminal => return,
+        Focus::Orchestrators | Focus::Worktrees | Focus::Terminal => return,
     };
     let new = (sel as i64 + delta).clamp(0, len as i64 - 1) as usize;
     if new == sel {
@@ -4773,7 +4895,8 @@ fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
                 restore_context(app, out);
             }
         }
-        // Handled by the two-cursor walk above.
+        // Handled by the two-section walk above.
+        Focus::Orchestrators => unreachable!("orchestrator navigation returns early"),
         Focus::Worktrees => unreachable!("worktrees navigation returns early"),
         Focus::Sessions => {
             app.sel_session = new;
@@ -5974,18 +6097,19 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     app.focus = Focus::Projects;
                 }
                 Some(HitTarget::Worktree(i)) => {
-                    if app.sel_worktree != i || app.sel_orchestrator.is_some() {
+                    let section_changed = app.focus != Focus::Worktrees;
+                    app.focus = Focus::Worktrees;
+                    if app.sel_worktree != i || section_changed {
                         app.select_worktree_when_seen = None;
                         remember_context(app);
-                        app.sel_orchestrator = None;
                         app.sel_worktree = i;
                         restore_session(app, out);
                     }
-                    app.focus = Focus::Worktrees;
                 }
                 Some(HitTarget::Orchestrator(i)) => {
-                    app.focus = Focus::Worktrees;
-                    if app.sel_orchestrator != Some(i) {
+                    let section_changed = app.focus != Focus::Orchestrators;
+                    app.focus = Focus::Orchestrators;
+                    if app.sel_orchestrator != Some(i) || section_changed {
                         remember_context(app);
                         app.sel_orchestrator = Some(i);
                         restore_session(app, out);
@@ -6221,36 +6345,13 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 }
                 Some(HitTarget::Orchestrator(i)) => {
                     app.sel_orchestrator = Some(i);
-                    app.focus = Focus::Worktrees;
+                    app.focus = Focus::Orchestrators;
                     if let Some(a) = app.selected_orchestrator() {
-                        let (id, sref) = (a.id.clone(), SessionRef::Agent(a.id.clone()));
-                        let items = vec![
-                            MenuItem {
-                                label: "Attach".into(),
-                                action: MenuAction::Attach(sref),
-                                destructive: false,
-                            },
-                            MenuItem {
-                                label: "Rename".into(),
-                                action: MenuAction::RenameAgent(id.clone()),
-                                destructive: false,
-                            },
-                            MenuItem {
-                                label: "Demote to session".into(),
-                                action: MenuAction::SetAgentOrchestrator(id.clone(), false),
-                                destructive: false,
-                            },
-                            MenuItem {
-                                label: "Delete".into(),
-                                action: MenuAction::DeleteAgent(id),
-                                destructive: true,
-                            },
-                        ];
+                        let items = menu_items_for_orchestrator(a);
                         open_menu_at(app, items, at);
                     }
                 }
                 Some(HitTarget::Worktree(i)) => {
-                    app.sel_orchestrator = None;
                     app.sel_worktree = i;
                     app.sel_session = 0;
                     app.focus = Focus::Worktrees;
@@ -6304,6 +6405,16 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                             action: MenuAction::AddProject,
                             destructive: false,
                         }],
+                        Focus::Orchestrators => app
+                            .selected_project()
+                            .map(|p| {
+                                vec![MenuItem {
+                                    label: "New orchestrator".into(),
+                                    action: MenuAction::NewOrchestrator(p.id.clone()),
+                                    destructive: false,
+                                }]
+                            })
+                            .unwrap_or_default(),
                         Focus::Worktrees => app
                             .selected_project()
                             .map(|p| {
@@ -7437,24 +7548,33 @@ mod tests {
         app.sel_worktree = 0;
         let mut out = Vec::new();
         press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE, &mut out);
+        assert_eq!(app.focus, Focus::Orchestrators);
         assert_eq!(app.sel_orchestrator, Some(0));
         assert!(app.selected_orchestrator().is_some());
-        assert!(app.selected_worktree().is_none(), "cursor left the list");
+        assert!(
+            app.selected_worktree().is_some(),
+            "the inactive half keeps its own selection"
+        );
         assert_eq!(app.sel_worktree, 0, "worktree cursor unchanged");
         // Enter walks straight into the orchestrator's terminal.
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
         assert_eq!(app.focus, Focus::Terminal);
         assert!(app.term_locked);
         assert!(
-            app.term.as_ref().is_some_and(
-                |t| t.sref == SessionRef::Agent(AgentId("orch".into()))
-            ),
+            app.term
+                .as_ref()
+                .is_some_and(|t| t.sref == SessionRef::Agent(AgentId("orch".into()))),
             "enter attached the orchestrator"
         );
         // Walking back down returns to the worktree rows.
-        app.focus = Focus::Worktrees;
+        app.focus = Focus::Orchestrators;
         press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
-        assert_eq!(app.sel_orchestrator, None);
+        assert_eq!(app.focus, Focus::Worktrees);
+        assert_eq!(
+            app.sel_orchestrator,
+            Some(0),
+            "orchestrator cursor is retained"
+        );
         assert_eq!(
             app.selected_worktree().map(|w| w.id.clone()),
             Some(nebula_core::WorktreeId("w1".into()))
@@ -7487,6 +7607,133 @@ mod tests {
         assert!(text.contains("ORCHESTRATORS"), "{text}");
         assert!(text.contains("WORKTREES"), "{text}");
         assert!(text.contains("orchestrator-1"), "{text}");
+    }
+
+    #[test]
+    fn clicking_each_middle_half_activates_only_that_section() {
+        use nebula_core::{Agent, AgentStatus, Entity};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(Agent {
+                    id: AgentId("orch".into()),
+                    worktree_id: nebula_core::WorktreeId("w1".into()),
+                    name: "orchestrator-1".into(),
+                    status: AgentStatus::Fresh,
+                    archived: false,
+                    archived_at: 0,
+                    pinned: true,
+                    kind: Default::default(),
+                    model: None,
+                    effort: None,
+                    session_id: None,
+                    sort_order: 0,
+                    status_changed_at: 0,
+                    orchestrator: true,
+                    alive: false,
+                }),
+            },
+        );
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let orch = app
+            .hits
+            .iter()
+            .find_map(|(r, t)| matches!(t, HitTarget::Orchestrator(0)).then_some(*r))
+            .unwrap();
+        let worktree = app
+            .hits
+            .iter()
+            .find_map(|(r, t)| matches!(t, HitTarget::Worktree(0)).then_some(*r))
+            .unwrap();
+        let mut out = Vec::new();
+
+        handle_mouse(
+            &mut app,
+            mev(
+                MouseEventKind::Down(MouseButton::Left),
+                orch.x + orch.width / 2,
+                orch.y + 1,
+            ),
+            &mut out,
+        );
+        assert_eq!(app.focus, Focus::Orchestrators);
+
+        handle_mouse(
+            &mut app,
+            mev(
+                MouseEventKind::Down(MouseButton::Left),
+                worktree.x + worktree.width / 2,
+                worktree.y + 1,
+            ),
+            &mut out,
+        );
+        assert_eq!(app.focus, Focus::Worktrees);
+    }
+
+    #[test]
+    fn plain_and_modified_n_follow_the_active_middle_section() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        for modifiers in [
+            KeyModifiers::NONE,
+            KeyModifiers::CONTROL,
+            KeyModifiers::SUPER,
+        ] {
+            app.focus = Focus::Orchestrators;
+            press(&mut app, KeyCode::Char('n'), modifiers, &mut out);
+            assert!(
+                matches!(&app.overlay, Some(Overlay::Menu(m)) if m.title.as_deref() == Some("New orchestrator")),
+                "{modifiers:?}+n follows the orchestrator half: {:?}",
+                app.overlay
+            );
+            app.overlay = None;
+
+            app.focus = Focus::Worktrees;
+            press(&mut app, KeyCode::Char('n'), modifiers, &mut out);
+            assert!(
+                matches!(&app.overlay, Some(Overlay::Prompt(p)) if matches!(p.kind, crate::app::PromptKind::NewWorktree { .. })),
+                "{modifiers:?}+n follows the worktree half: {:?}",
+                app.overlay
+            );
+            app.overlay = None;
+        }
+    }
+
+    #[test]
+    fn only_the_active_middle_header_uses_focused_styling() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+
+        app.focus = Focus::Orchestrators;
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let (orch_x, orch_y) = find_cell(&terminal, "ORCHESTRATORS");
+        let (wt_x, wt_y) = find_cell(&terminal, "WORKTREES");
+        assert_eq!(
+            terminal.backend().buffer()[(orch_x, orch_y)].fg,
+            app.theme.accent
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(wt_x, wt_y)].fg,
+            app.theme.muted
+        );
+
+        app.focus = Focus::Worktrees;
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let (orch_x, orch_y) = find_cell(&terminal, "ORCHESTRATORS");
+        let (wt_x, wt_y) = find_cell(&terminal, "WORKTREES");
+        assert_eq!(
+            terminal.backend().buffer()[(orch_x, orch_y)].fg,
+            app.theme.muted
+        );
+        assert_eq!(
+            terminal.backend().buffer()[(wt_x, wt_y)].fg,
+            app.theme.accent
+        );
     }
 
     /// Both palettes label orchestrator rows in their searchable text, so
