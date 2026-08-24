@@ -14,6 +14,26 @@ about what is worth recording.
 
 ## Entries
 
+### E2E Tests Updated For The Split Orchestrator/Worktree Focus — 2026-08-24
+
+**Asked:** "Fix the 3 failing e2e tests in crates/nebula/tests/e2e_tui.rs: tui_note_modal_crud_and_badge,
+tui_projects_worktrees_agents_navigation, tui_pull_request_row_leads_the_links_group… Update the tests to
+drive the new two-section focus model… rather than changing the app behavior."
+
+**Did:** Commit `3566f2c` on `fix-e2e-focus-regression`. Added `FOOTER_ORCHESTRATORS` ("n: new
+orchestrator", from ui.rs's Orchestrators footer arm) and, at every Enter-on-a-project site, wait for it
+then Tab to reach Worktrees; the nav test's Tab cycle grew the extra Orchestrators stop. e2e suite and
+full workspace green.
+
+**Gotchas:**
+- The focus cycle is now Projects → Orchestrators → Worktrees → Sessions → Terminal (`event_loop.rs`
+  ~875); Enter on a project lands on Orchestrators, and any e2e script that then presses Enter again
+  hits `Action::Activate`'s Orchestrators arm — on an empty section that's the "+ new orchestrator"
+  placeholder and opens the picker, not the Sessions drill the old flow expected. Tab (or `j` past the
+  section's last row) is the way down to Worktrees.
+- `←` (FocusLeft) still maps Sessions → Worktrees and Worktrees → Projects, so the tests' existing
+  back-navigation needed no changes — only the forward Enter/Tab paths.
+
 ### Orchestrators And Worktrees Have Independent Focus — 2026-08-24
 
 **Asked:** "secitunile astea ar treb sa fie independete cand dau click pe una sau alt se se faca doar pe cea care dau click albastra si sa aiba propriile n, ctrl n etc"
