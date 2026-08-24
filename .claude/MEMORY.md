@@ -38,7 +38,8 @@ resolve them so BOTH features survive… After all five are merged, run 'cargo t
 Follow-up: "Merge the branch todo-notes into merge-train… expect conflicts with the already-merged
 work — resolve so both sides survive."
 
-**Did:** All five merged (`1e2e3b2`, `546b83a`, `d4926e4`, `beb4683`, `b9cdb18`), 593 workspace tests
+**Did:** Landed on main as `e26f173` (via the `merge-train` worktree branch; 601 workspace tests green
+on main after). All five merged (`1e2e3b2`, `546b83a`, `d4926e4`, `beb4683`, `b9cdb18`), 593 workspace tests
 green. Despite all branches touching event_loop.rs/keymap.rs/ui.rs/app.rs, every code file auto-merged —
 the only conflict in all four conflicted merges was `.claude/MEMORY.md`'s entries section (resolved by
 keeping every entry). Then `todo-notes` merged (`5c2abe7`): one code conflict, the `nebula_core` import
@@ -55,6 +56,9 @@ plus the usual MEMORY.md entries clash. 601 workspace tests green after.
   and only todo-notes bumped to 25, so git auto-merged a single correct bump. Sqlite migrations also
   stayed sequential (todos = migration 20). Verify with `git show <ref>:crates/nebula-core/src/protocol.rs`
   against the merge-base before hand-editing anything.
+- The final `git merge merge-train` in the root checkout conflicted only on `.claude/MEMORY.md`
+  (yolo-mode entry vs merge-train entries — keep both); `registry.rs` auto-merged cleanly despite both
+  sides touching `agent_spawn_command`.
 - `e2e_tui::tui_projects_worktrees_agents_navigation` passes now — the long-red `FOOTER_TERMINAL_LOCKED`
   assertion was fixed on main in `67ba923`; earlier entries calling it "still unfixed" are stale.
 
