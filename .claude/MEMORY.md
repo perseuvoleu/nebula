@@ -58,6 +58,32 @@ resolves `<project>/<name>` through `app.tree`, and `post_notification` spawns f
   on this Mac posts real notification-center toasts. The tests' observable seam is the `notified_at` map.
 - In the `StatusChanged` handler, compute `should_notify(a.status, …)` *before* overwriting `a.status`,
   and call `notify_status_change(app, …)` only after the `iter_mut` borrow ends — it needs `&mut App`.
+### Last-Message Preview Under The Selected Session Row — 2026-08-24
+
+**Asked:** (spec-driven task, SPEC-session-message-preview.md) "When a Claude session row is selected in
+the SESSIONS panel, show a dim one-line sub-row under it with the agent's last message (truncated) — so
+the user learns 'what does this agent want from me' without attaching."
+
+**Did:** New `crates/nebula-tui/src/transcript.rs`: `transcript_path` (cwd → `~/.claude/projects/<slug>/
+<sid>.jsonl`) and `last_assistant_text` (tail-reads the last 64 KB, scans lines in reverse for the newest
+`type=="assistant"` turn with non-empty text blocks, collapses whitespace). Cache is
+`App.preview: Option<SessionPreview>` (agent + transcript mtime + text) refreshed by a debounced
+`pending_preview` (`schedule_preview`/`fire_pending_preview` in `event_loop.rs`, the `pending_prewarm`
+idiom; `StatusChanged` on the selected agent re-arms it). `ui.rs::draw_sessions` renders the sub-line
+under the selected agent row only, copying the worktree panel's `created_from` sub-line (selection fill +
+`▌` rail), with the virtual-row layout, scroll bookkeeping, and the row's hit rect all one line taller.
+
+**Gotchas:**
+- The transcript slug flattens **every** non-alphanumeric char of the cwd to `-`, not just `/` — verified
+  in `~/.claude/projects/`, where `/Users/andrei/.herdr-worktrees/…` lands as `-Users-andrei--herdr-…`.
+- `schedule_preview` must not re-arm once a read answered for the selected agent (even a "no transcript"
+  answer), or the loop wakes and stats the file every 250 ms forever; `StatusChanged` is the explicit
+  re-arm for "the turn ended, the line is stale". The early-return for already-armed-same-agent is what
+  keeps that StatusChanged re-arm from being cancelled by the pre-draw scheduler.
+- Sessions-panel pills stack on a `PILL_H`(=2) stride but `SessionEntry::height()` is 3 (pads overlap):
+  the sub-line takes over the selected pill's bottom pad row, so layout advances `PILL_H + 1` for that
+  row and `content_h`/cursor-visibility use an `entry_h` that adds the extra line — using bare
+  `e.height()` there under-scrolls when the selected row is last.
 
 ### ⌘W Closes The Selected Session — 2026-08-24
 
