@@ -349,7 +349,11 @@ fn create_worktree(tui: &mut TuiHarness, branch: &str) {
     tui.wait_for_text("New worktree");
     tui.type_str(branch);
     tui.send(b"\r");
-    tui.wait_for_gone("New worktree");
+    // The name step chains into the base-branch picker; Enter on the
+    // hovered default base keeps the old one-step behavior.
+    tui.wait_for_text("Base branch");
+    tui.send(b"\r");
+    tui.wait_for_gone("Base branch");
     tui.wait_for_text(branch);
     // A fresh worktree auto-focuses the sessions panel (so `n` starts an
     // agent); hop back to Worktrees so callers stay panel-stable.

@@ -185,11 +185,24 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             let hint = menu
                 .is_workspace_picker()
                 .then_some(" n: new  r: rename  d: delete ");
+            // A filterable picker shows its live query in the bottom
+            // border; the bare "/" doubles as the type-to-filter hint.
+            let filter_line = menu
+                .filter
+                .as_ref()
+                .map(|fl| format!(" /{}▏ ", fl.query));
             let width = (label_w + 4 + if any_submenu { 2 } else { 0 })
                 .max(title_width + 2)
                 .max(hint.map_or(0, |h| h.chars().count() + 2))
+                .max(filter_line.as_ref().map_or(0, |l| l.chars().count() + 2))
                 .min(f.area().width as usize) as u16;
-            let height = menu.items.len() as u16 + 2;
+            // A filtered-to-nothing picker keeps one row for "no match".
+            let rows = if menu.items.is_empty() && menu.filter.is_some() {
+                1
+            } else {
+                menu.items.len()
+            };
+            let height = rows as u16 + 2;
             let area = match menu.at {
                 Some((ax, ay)) => {
                     let x = ax.min(f.area().width.saturating_sub(width));
@@ -222,8 +235,27 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 block =
                     block.title_bottom(Line::from(Span::styled(hint, Style::default().fg(th.dim))));
             }
+            if let Some(filter_line) = &filter_line {
+                let style = if menu.filter.as_ref().is_some_and(|fl| !fl.query.is_empty()) {
+                    Style::default().fg(th.accent)
+                } else {
+                    Style::default().fg(th.dim)
+                };
+                block = block.title_bottom(Line::from(Span::styled(filter_line.clone(), style)));
+            }
             let inner = block.inner(area);
             f.render_widget(block, area);
+            if menu.items.is_empty() && menu.filter.is_some() {
+                if let Some(row) = row_rect(inner, 0) {
+                    f.render_widget(
+                        Paragraph::new(Span::styled(
+                            " no match ",
+                            Style::default().fg(th.dim),
+                        )),
+                        row,
+                    );
+                }
+            }
             // A menu with more items than the frame has rows (the branch
             // picker in a busy repo) slides its window to keep the hovered
             // row visible — the offset is derived from the hover, so the

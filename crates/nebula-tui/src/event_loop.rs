@@ -2340,6 +2340,7 @@ fn open_menu(app: &mut App, items: Vec<MenuItem>, at: (u16, u16)) {
         hover: 0,
         area: ratatui::layout::Rect::default(),
         parent: None,
+        filter: None,
     }));
 }
 
@@ -2471,6 +2472,7 @@ fn open_agent_picker(app: &mut App, worktree: WorktreeId, orchestrator: bool) {
         hover: 0,
         area: ratatui::layout::Rect::default(),
         parent: None,
+        filter: None,
     }));
 }
 
@@ -2525,14 +2527,125 @@ fn open_branch_picker(app: &mut App, project: nebula_core::ProjectId, spawn: cra
             destructive: false,
         })
         .collect();
-    app.overlay = Some(Overlay::Menu(ContextMenu {
-        title: Some("From branch".into()),
-        items,
-        at: None,
-        hover: 0,
-        area: ratatui::layout::Rect::default(),
-        parent: None,
-    }));
+    app.overlay = Some(Overlay::Menu(
+        ContextMenu {
+            title: Some("From branch".into()),
+            items,
+            at: None,
+            hover: 0,
+            area: ratatui::layout::Rect::default(),
+            parent: None,
+            filter: None,
+        }
+        .filterable(),
+    ));
+}
+
+/// The manual worktree flow's second step: pick the branch the new
+/// worktree branches FROM. The hover starts on the default base — the
+/// selected worktree's branch, exactly what the one-step flow used — so
+/// Enter-Enter creates what it always did. Type-to-filter narrows the
+/// list; when no branch list can be built at all, the worktree is created
+/// straight away with the default base (the old behavior).
+fn open_base_branch_picker(
+    app: &mut App,
+    project: nebula_core::ProjectId,
+    branch: String,
+    default_base: Option<String>,
+    out: &mut Vec<ClientRequest>,
+) {
+    let repo = app
+        .tree
+        .projects
+        .iter()
+        .find(|p| p.id == project)
+        .map(|p| p.repo_path.clone());
+    let mut branches = repo
+        .as_deref()
+        .map(crate::branches::local_branches)
+        .unwrap_or_default();
+    if branches.is_empty() {
+        branches = app
+            .tree
+            .worktrees
+            .iter()
+            .filter(|w| w.project_id == project && !w.branch.starts_with("detached"))
+            .map(|w| w.branch.clone())
+            .collect();
+    }
+    if branches.is_empty() {
+        let req_id = app.alloc_req_id(PendingIntent::SelectCreatedWorktree);
+        out.push(ClientRequest::CreateWorktree {
+            req_id,
+            project,
+            branch,
+            base: default_base,
+        });
+        return;
+    }
+    let root_branch = app
+        .tree
+        .worktrees
+        .iter()
+        .find(|w| w.project_id == project && w.is_main)
+        .map(|w| w.branch.clone());
+    // No selection in this project means the daemon's default base — the
+    // root checkout's HEAD — so hovering the root branch row is the same
+    // starting point.
+    let hover_target = default_base.clone().or_else(|| root_branch.clone());
+    let hover = hover_target
+        .as_ref()
+        .and_then(|b| branches.iter().position(|x| x == b));
+    let mut items: Vec<MenuItem> = branches
+        .into_iter()
+        .map(|b| MenuItem {
+            label: if Some(&b) == root_branch.as_ref() {
+                format!("{b} ⌂ root")
+            } else {
+                b.clone()
+            },
+            action: MenuAction::CreateWorktreeFrom {
+                project: project.clone(),
+                branch: branch.clone(),
+                base: Some(b),
+            },
+            destructive: false,
+        })
+        .collect();
+    let hover = match hover {
+        Some(i) => i,
+        // A default base the list doesn't carry (a detached HEAD hash)
+        // gets its own leading row so Enter-Enter still uses it.
+        None => {
+            if let Some(base) = &default_base {
+                items.insert(
+                    0,
+                    MenuItem {
+                        label: format!("{base} (selected)"),
+                        action: MenuAction::CreateWorktreeFrom {
+                            project: project.clone(),
+                            branch: branch.clone(),
+                            base: default_base.clone(),
+                        },
+                        destructive: false,
+                    },
+                );
+            }
+            0
+        }
+    };
+    app.overlay = Some(Overlay::Menu(
+        ContextMenu {
+            title: Some("Base branch".into()),
+            items,
+            at: None,
+            hover,
+            area: ratatui::layout::Rect::default(),
+            parent: None,
+            filter: None,
+        }
+        .filterable(),
+    ));
 }
 
 /// Build the submenu a menu row expands into: the model list for a
@@ -2597,6 +2710,7 @@ fn build_submenu(item: &MenuItem) -> Option<ContextMenu> {
         hover,
         area: ratatui::layout::Rect::default(),
         parent: None,
+        filter: None,
     })
 }
 
@@ -2643,6 +2757,7 @@ fn open_move_agent_picker(app: &mut App, agent: AgentId) {
         hover: 0,
         area: ratatui::layout::Rect::default(),
         parent: None,
+        filter: None,
     }));
 }
 
@@ -2695,6 +2810,7 @@ fn open_workspace_picker(app: &mut App) {
         hover,
         area: ratatui::layout::Rect::default(),
         parent: None,
+        filter: None,
     }));
 }
 
@@ -2929,18 +3045,35 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
             }
         }
         Overlay::Menu(menu) => match key.code {
+            // A filterable picker clears its query on the first Esc; the
+            // next one closes as usual.
+            KeyCode::Esc if menu.filter.as_ref().is_some_and(|f| !f.query.is_empty()) => {
+                menu.filter_clear();
+            }
             // Esc in a submenu backs out one level; at the top it closes.
             KeyCode::Esc => match menu.parent.take() {
                 Some(parent) => *menu = *parent,
                 None => app.overlay = None,
             },
+            // Typing in a filterable picker builds the fuzzy query (the
+            // best match ends up hovered); Backspace edits it. Plain
+            // menus never take this arm, so j/k et al. stay theirs.
+            KeyCode::Char(c)
+                if menu.filter.is_some()
+                    && !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) =>
+            {
+                menu.filter_push(c);
+            }
+            KeyCode::Backspace if menu.filter.is_some() => menu.filter_pop(),
             KeyCode::Char('j') | KeyCode::Down => {
-                menu.hover = (menu.hover + 1).min(menu.items.len() - 1)
+                menu.hover = (menu.hover + 1).min(menu.items.len().saturating_sub(1))
             }
             KeyCode::Char('k') | KeyCode::Up => menu.hover = menu.hover.saturating_sub(1),
             // → expands a row marked ▸ into its submenu; ← returns.
             KeyCode::Char('l') | KeyCode::Right => {
-                if let Some(mut sub) = build_submenu(&menu.items[menu.hover]) {
+                if let Some(mut sub) = menu.items.get(menu.hover).and_then(build_submenu) {
                     sub.parent = Some(Box::new(menu.clone()));
                     *menu = sub;
                 }
@@ -2969,9 +3102,13 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 }
             }
             KeyCode::Enter => {
-                let action = menu.items[menu.hover].action.clone();
-                app.overlay = None;
-                run_menu_action(app, action, out);
+                // `.get`: a filter query matching nothing leaves the list
+                // empty — Enter then does nothing rather than panicking.
+                if let Some(item) = menu.items.get(menu.hover) {
+                    let action = item.action.clone();
+                    app.overlay = None;
+                    run_menu_action(app, action, out);
+                }
             }
             _ => {}
         },
@@ -4032,13 +4169,10 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                                 .then(|| worktree.branch.clone())
                         })
                 });
-            let req_id = app.alloc_req_id(PendingIntent::SelectCreatedWorktree);
-            out.push(ClientRequest::CreateWorktree {
-                req_id,
-                project,
-                branch,
-                base,
-            });
+            // The name step chains into the base-branch picker: Enter on
+            // the hovered default row recreates the old implicit choice,
+            // typing fuzzy-picks any other local branch.
+            open_base_branch_picker(app, project, branch, base, out);
         }
         PromptKind::NewAgent {
             worktree,
@@ -4364,6 +4498,19 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             branch,
             spawn,
         } => spawn_on_branch(app, project, branch, spawn, out),
+        MenuAction::CreateWorktreeFrom {
+            project,
+            branch,
+            base,
+        } => {
+            let req_id = app.alloc_req_id(PendingIntent::SelectCreatedWorktree);
+            out.push(ClientRequest::CreateWorktree {
+                req_id,
+                project,
+                branch,
+                base,
+            });
+        }
         MenuAction::NewWorktree(project) => open_new_worktree_prompt(app, project),
         MenuAction::OpenNotes(owner) => open_notes_for_owner(app, owner),
         MenuAction::OpenTodos(owner) => open_todos_for_owner(app, owner),
@@ -8708,6 +8855,7 @@ mod tests {
             hover: 59,
             area: ratatui::layout::Rect::default(),
             parent: None,
+            filter: None,
         }));
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
@@ -8730,6 +8878,165 @@ mod tests {
             matches!(
                 out.first(),
                 Some(ClientRequest::CreateWorktree { branch, .. }) if branch == "branch-59"
+            ),
+            "{out:?}"
+        );
+    }
+
+    /// Typing while the branch picker is open fuzzy-filters the rows: the
+    /// query shows in the bottom border, the best match is hovered, and
+    /// Enter picks it.
+    #[test]
+    fn typing_filters_the_branch_picker_and_enter_picks_the_best_match() {
+        use nebula_core::{Entity, Worktree, WorktreeId};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(Worktree {
+                    id: WorktreeId("w2".into()),
+                    project_id: nebula_core::ProjectId("p1".into()),
+                    path: "/tmp/demo-worktrees/feature".into(),
+                    branch: "feature".into(),
+                    is_main: false,
+                    created_from: None,
+                    pinned: false,
+                    sort_order: 1,
+                }),
+            },
+        );
+        let mut out = Vec::new();
+        run_menu_action(
+            &mut app,
+            MenuAction::PickBranch {
+                project: nebula_core::ProjectId("p1".into()),
+                spawn: crate::app::BranchSpawn::Terminal,
+            },
+            &mut out,
+        );
+        for c in "fea".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        let Some(Overlay::Menu(menu)) = &app.overlay else {
+            panic!("picker stays open while filtering: {:?}", app.overlay);
+        };
+        assert_eq!(menu.items.len(), 1, "only feature matches: {:?}", menu.items);
+        assert_eq!(menu.hover, 0, "the best match is hovered");
+        assert_eq!(menu.items[0].label, "feature");
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(
+            buffer_text(&terminal).contains("/fea"),
+            "the query shows in the border: {}",
+            buffer_text(&terminal)
+        );
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(
+                out.first(),
+                Some(ClientRequest::CreateTerminal { worktree, .. })
+                    if worktree == &WorktreeId("w2".into())
+            ),
+            "enter picks the filtered branch's checkout: {out:?}"
+        );
+    }
+
+    /// A query matching nothing leaves an editable empty picker: Enter is
+    /// inert, Backspace restores rows, the first Esc clears the query and
+    /// only the second closes. Plain (non-filterable) context menus keep
+    /// their single-letter keys.
+    #[test]
+    fn a_no_match_query_is_editable_and_esc_clears_it_first() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        run_menu_action(
+            &mut app,
+            MenuAction::PickBranch {
+                project: nebula_core::ProjectId("p1".into()),
+                spawn: crate::app::BranchSpawn::Terminal,
+            },
+            &mut out,
+        );
+        press(&mut app, KeyCode::Char('z'), KeyModifiers::NONE, &mut out);
+        let Some(Overlay::Menu(menu)) = &app.overlay else {
+            panic!("{:?}", app.overlay);
+        };
+        assert!(menu.items.is_empty(), "{:?}", menu.items);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(buffer_text(&terminal).contains("no match"));
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(out.is_empty(), "enter on no rows sends nothing: {out:?}");
+        assert!(app.overlay.is_some(), "the picker stays open");
+        press(&mut app, KeyCode::Backspace, KeyModifiers::NONE, &mut out);
+        let Some(Overlay::Menu(menu)) = &app.overlay else {
+            panic!("{:?}", app.overlay);
+        };
+        assert_eq!(menu.items.len(), 1, "backspace restores the rows");
+        press(&mut app, KeyCode::Char('m'), KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        let Some(Overlay::Menu(menu)) = &app.overlay else {
+            panic!("first esc only clears the query: {:?}", app.overlay);
+        };
+        assert_eq!(menu.filter.as_ref().map(|f| f.query.as_str()), Some(""));
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none(), "second esc closes");
+    }
+
+    /// The manual worktree flow's base picker: the name prompt chains into
+    /// a fuzzy-searchable branch list hovered on the selected worktree's
+    /// branch (the old implicit base), and typing picks any other base.
+    #[test]
+    fn worktree_base_picker_hovers_the_default_and_fuzzy_picks_others() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo(&dir);
+        run_git(&repo, &["checkout", "-b", "feature"]);
+        // A far-future commit pins `feature` above `main` under
+        // --sort=-committerdate regardless of how fast the fixture ran.
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .env("GIT_COMMITTER_DATE", "2030-01-01T00:00:00")
+            .args(["commit", "--allow-empty", "-m", "newest"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        run_git(&repo, &["checkout", "main"]);
+
+        let mut app = App::new();
+        seed_repo_tree(&mut app, &repo);
+        app.focus = Focus::Worktrees;
+        app.sel_worktree = 0;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+        for c in "my-feat".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        let Some(Overlay::Menu(menu)) = &app.overlay else {
+            panic!("name submit opens the base picker: {:?}", app.overlay);
+        };
+        assert_eq!(menu.title.as_deref(), Some("Base branch"));
+        assert_eq!(
+            menu.items[0].label, "feature",
+            "branches list newest-first"
+        );
+        assert_eq!(
+            menu.items[menu.hover].label, "main ⌂ root",
+            "the selected worktree's branch starts hovered"
+        );
+        // Fuzzy-pick the other base instead of the default.
+        for c in "feat".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(
+                out.last(),
+                Some(ClientRequest::CreateWorktree { branch, base, .. })
+                    if branch == "my-feat" && base.as_deref() == Some("feature")
             ),
             "{out:?}"
         );
@@ -13197,6 +13504,18 @@ mod tests {
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
             &mut out,
         );
+        // The name step chains into the base-branch picker; Enter on the
+        // hovered default base fires the request.
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Menu(m)) if m.title.as_deref() == Some("Base branch")),
+            "name submit opens the base picker: {:?}",
+            app.overlay
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut out,
+        );
         let Some(ClientRequest::CreateWorktree { req_id, .. }) = out.last() else {
             panic!("prompt submit requests a worktree: {out:?}");
         };
@@ -13275,6 +13594,18 @@ mod tests {
             &mut out,
         );
 
+        // The base picker hovers the selected worktree's branch (the old
+        // implicit base), so a second Enter keeps the old behavior.
+        let Some(Overlay::Menu(menu)) = &app.overlay else {
+            panic!("name submit opens the base picker: {:?}", app.overlay);
+        };
+        assert_eq!(menu.title.as_deref(), Some("Base branch"));
+        assert_eq!(menu.items[menu.hover].label, "selected-feature");
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut out,
+        );
         let Some(ClientRequest::CreateWorktree { base, .. }) = out.last() else {
             panic!("prompt submit requests a worktree: {out:?}");
         };
@@ -13310,6 +13641,11 @@ mod tests {
                 &mut out,
             );
         }
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut out,
+        );
         handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
@@ -13354,6 +13690,11 @@ mod tests {
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
             &mut out,
         );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut out,
+        );
         let Some(ClientRequest::CreateWorktree { branch, .. }) = out.last() else {
             panic!("empty submit still requests a worktree: {out:?}");
         };
@@ -13381,6 +13722,11 @@ mod tests {
                 &mut out,
             );
         }
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut out,
+        );
         handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),

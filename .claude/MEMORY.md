@@ -14,6 +14,39 @@ about what is worth recording.
 
 ## Entries
 
+### Branch Picker Fuzzy Search, Base-Branch Pick In Manual Worktree Creation — 2026-08-24
+
+**Asked:** "Add fuzzy search to the TUI branch picker, and offer the same branch picker in the manual
+worktree-creation flow… while the picker is open, typing filters the branch list with crate::fuzzy::rank…
+after the name step let the user pick the base branch… (default = current behavior, so Enter-Enter stays
+fast)."
+
+**Did:** Commit `85753de` on `branch-picker-fuzzy-search`. `ContextMenu` grew `filter:
+Option<MenuFilter>` (app.rs) — `Some` opts a picker into type-to-filter: `filterable()` snapshots the
+full item list into `MenuFilter.all`, and `apply_filter` rebuilds `items` via `crate::fuzzy::rank`
+best-first with `hover = 0`, so draw/click/Enter code needed no changes (they already operate on
+`items`). Key handler (event_loop.rs `Overlay::Menu` arm): Char appends to the query (guarded on
+`filter.is_some()`, so plain menus keep j/k and the workspace picker's n/r/d), Backspace pops, first Esc
+clears a non-empty query. ui.rs shows ` /{query}▏ ` as a bottom border title and a dim "no match" row
+when the filter empties the list. The `From branch` picker is filterable; `PromptKind::NewWorktree`
+submit now computes branch+base as before but chains into new `open_base_branch_picker` ("Base branch",
+filterable, hover on the default base) whose rows carry new `MenuAction::CreateWorktreeFrom { project,
+branch, base }` → `CreateWorktree` with `PendingIntent::SelectCreatedWorktree`. e2e `create_worktree`
+helper gained the extra `wait_for_text("Base branch")` + Enter. 617 workspace tests green.
+
+**Gotchas:**
+- Filtering by rewriting `menu.items` (keeping the full list in `MenuFilter.all`) is what kept the
+  derived-`scroll_offset` draw/click lockstep untouched — no parallel "filtered indices" bookkeeping.
+- An empty filtered list makes three sites panic-prone: Enter's `items[hover]` (→ `.get`), Down's
+  `items.len() - 1` (→ `saturating_sub`), and Right's `items[hover]` (→ `.get`). The wheel arms were
+  already saturating.
+- Five event_loop tests + the e2e helper submit the worktree name prompt and expected an immediate
+  `CreateWorktree`; each needed one extra Enter for the base-picker step.
+- When nothing is selected in the project, the old implicit base was `None` (daemon uses the root HEAD)
+  — the picker hovers the root branch row instead of inventing a "default" row; a detached default
+  (`detached @ <hash>` stripped to the hash) isn't in the branch list, so it gets a leading
+  "<hash> (selected)" row to keep Enter-Enter faithful.
+
 ### Cmd+P Toggles The Attached Terminal Full-Screen — 2026-08-24
 
 **Asked:** "Implement the user's requested Ctrl+Q terminal full-screen toggle in Nebula…" Corrected

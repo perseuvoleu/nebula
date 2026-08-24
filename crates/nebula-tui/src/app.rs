@@ -126,6 +126,14 @@ pub enum MenuAction {
         branch: String,
         spawn: BranchSpawn,
     },
+    /// A base-branch-picker row (manual worktree flow): create the named
+    /// worktree branching from this base. `None` = the daemon's default
+    /// base (the repo root's HEAD).
+    CreateWorktreeFrom {
+        project: ProjectId,
+        branch: String,
+        base: Option<String>,
+    },
     RenameTerminal(TerminalId),
     CloseTerminal(TerminalId),
     NewWorktree(ProjectId),
@@ -214,6 +222,18 @@ pub struct MenuItem {
     pub destructive: bool,
 }
 
+/// Type-to-filter state for a picker-style menu (the branch pickers).
+/// `Some` on `ContextMenu.filter` opts the menu in: typed chars build the
+/// query and `items` is rebuilt from `all` via `crate::fuzzy::rank`, best
+/// match first. Plain context menus leave it `None`, so their single-letter
+/// keys (j/k, the workspace switcher's n/r/d) keep working.
+#[derive(Debug, Clone, Default)]
+pub struct MenuFilter {
+    pub query: String,
+    /// The full unfiltered item list `items` is rebuilt from.
+    pub all: Vec<MenuItem>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ContextMenu {
     /// Optional title rendered in the border (used by picker-style menus).
@@ -227,6 +247,8 @@ pub struct ContextMenu {
     pub area: Rect,
     /// The menu ← returns to when this one is a submenu.
     pub parent: Option<Box<ContextMenu>>,
+    /// `Some` = typing fuzzy-filters the rows (see `MenuFilter`).
+    pub filter: Option<MenuFilter>,
 }
 
 impl ContextMenu {
@@ -255,6 +277,50 @@ impl ContextMenu {
             return self.hover;
         }
         (self.hover + 1).saturating_sub(visible)
+    }
+
+    /// Opt this picker into type-to-filter: typed chars fuzzy-filter the
+    /// rows (best match hovered), Backspace edits the query, Esc clears
+    /// it before it closes.
+    pub fn filterable(mut self) -> Self {
+        self.filter = Some(MenuFilter {
+            query: String::new(),
+            all: self.items.clone(),
+        });
+        self
+    }
+
+    pub fn filter_push(&mut self, c: char) {
+        if let Some(f) = &mut self.filter {
+            f.query.push(c);
+            self.apply_filter();
+        }
+    }
+
+    pub fn filter_pop(&mut self) {
+        if let Some(f) = &mut self.filter {
+            f.query.pop();
+            self.apply_filter();
+        }
+    }
+
+    pub fn filter_clear(&mut self) {
+        if let Some(f) = &mut self.filter {
+            f.query.clear();
+            self.apply_filter();
+        }
+    }
+
+    /// Rebuild `items` from the full list against the query: matching rows
+    /// best-first, so the hovered row (0) is always the best match. An
+    /// empty query restores every row in its original order.
+    fn apply_filter(&mut self) {
+        let Some(f) = &self.filter else { return };
+        self.items = crate::fuzzy::rank(&f.query, f.all.iter().map(|i| i.label.as_str()))
+            .into_iter()
+            .map(|(i, _)| f.all[i].clone())
+            .collect();
+        self.hover = 0;
     }
 }
 
