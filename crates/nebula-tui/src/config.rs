@@ -98,6 +98,7 @@ pub enum SettingKind {
     SkipSessionNaming,
     RecentWindow,
     SessionIdleTimeout,
+    Notifications,
     Theme,
     Animations,
     FocusTint,
@@ -150,6 +151,11 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::SessionIdleTimeout,
                 label: "Idle session timeout",
                 hint: "Kill idle sessions in unviewed worktrees (pinned/busy spared; off disables)",
+            },
+            SettingSpec {
+                kind: SettingKind::Notifications,
+                label: "Notifications",
+                hint: "macOS notification when a session needs you and the window isn't focused",
             },
         ]),
     },
@@ -362,6 +368,10 @@ pub struct Config {
     /// disables. Owned by the daemon (which does the parsing and reaping);
     /// the TUI writes it so the settings overlay can cycle it.
     pub session_idle_timeout: String,
+    /// Post a macOS notification when the window isn't focused and an
+    /// agent flips to needs-feedback or finishes a run. No-op on other
+    /// platforms.
+    pub notifications: bool,
     /// Color theme name (see `theme::THEMES`). Unknown names fall back to
     /// the default theme.
     pub theme: String,
@@ -400,6 +410,7 @@ impl Default for Config {
             skip_session_naming: false,
             recent_window: "30m".into(),
             session_idle_timeout: "5m".into(),
+            notifications: true,
             theme: "default".into(),
             animations: true,
             focus_tint: false,
@@ -460,6 +471,10 @@ impl Config {
         obj.insert(
             "session_idle_timeout".into(),
             serde_json::json!(self.session_idle_timeout),
+        );
+        obj.insert(
+            "notifications".into(),
+            serde_json::json!(self.notifications),
         );
         obj.insert("theme".into(), serde_json::json!(self.theme));
         obj.insert("animations".into(), serde_json::json!(self.animations));
@@ -539,6 +554,7 @@ impl Config {
             SettingKind::SkipSessionNaming => on_off(self.skip_session_naming).into(),
             SettingKind::RecentWindow => self.recent_window.clone(),
             SettingKind::SessionIdleTimeout => self.session_idle_timeout.clone(),
+            SettingKind::Notifications => on_off(self.notifications).into(),
             SettingKind::Theme => self.theme.clone(),
             SettingKind::Animations => on_off(self.animations).into(),
             SettingKind::FocusTint => on_off(self.focus_tint).into(),
@@ -578,6 +594,9 @@ impl Config {
             SettingKind::SessionIdleTimeout => {
                 self.session_idle_timeout =
                     cycle_choice(&self.session_idle_timeout, SESSION_IDLE_TIMEOUTS, step).into();
+            }
+            SettingKind::Notifications => {
+                self.notifications = !self.notifications;
             }
             SettingKind::Theme => {
                 self.theme = cycle_choice(&self.theme, crate::theme::THEMES, step).into();
@@ -844,6 +863,23 @@ mod tests {
         // resolve to the default palette rather than erroring.
         cfg.theme = "sparkle".into();
         assert_eq!(cfg.theme(), crate::theme::Theme::default());
+    }
+
+    #[test]
+    fn notifications_default_on_toggle_and_persist() {
+        let mut cfg = Config::default();
+        assert!(cfg.notifications);
+        let (tab, row) = locate(SettingKind::Notifications).unwrap();
+        cfg.cycle(tab, row, 0);
+        assert!(!cfg.notifications);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        assert!(!load_from(&path).notifications);
+        // A config predating the key keeps notifications on.
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(cfg.notifications);
     }
 
     #[test]
