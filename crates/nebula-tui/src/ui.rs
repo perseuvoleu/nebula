@@ -224,8 +224,13 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             }
             let inner = block.inner(area);
             f.render_widget(block, area);
-            for (i, item) in menu.items.iter().enumerate() {
-                let Some(row) = row_rect(inner, i) else { break };
+            // A menu with more items than the frame has rows (the branch
+            // picker in a busy repo) slides its window to keep the hovered
+            // row visible — the offset is derived from the hover, so the
+            // mouse hit-test recomputes the same value.
+            let offset = menu.scroll_offset(inner.height as usize);
+            for (i, item) in menu.items.iter().enumerate().skip(offset) {
+                let Some(row) = row_rect(inner, i - offset) else { break };
                 let mut style = if item.destructive {
                     Style::default().fg(th.err)
                 } else {
@@ -2710,10 +2715,23 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     // Top section: the project's orchestrators — the managers sit above
     // the checkouts they manage. Always drawn, so the split (and the way
     // to create one) stays discoverable.
-    let orchestrators: Vec<(String, AgentStatus)> = app
+    // Each orchestrator row also names the branch of the worktree it sits
+    // on — they can live on any checkout now, so the branch is the row's
+    // where.
+    let orchestrators: Vec<(String, AgentStatus, Option<String>)> = app
         .project_orchestrators()
         .iter()
-        .map(|a| (a.name.clone(), a.status))
+        .map(|a| {
+            (
+                a.name.clone(),
+                a.status,
+                app.tree
+                    .worktrees
+                    .iter()
+                    .find(|w| w.id == a.worktree_id)
+                    .map(|w| w.branch.clone()),
+            )
+        })
         .collect();
 
     if worktrees.is_empty() && orchestrators.is_empty() && !app.tree.has_visible_projects() {
@@ -2762,7 +2780,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         }
         screen_row += PILL_H as usize;
     }
-    for (i, (name, status)) in orchestrators.iter().enumerate() {
+    for (i, (name, status, branch)) in orchestrators.iter().enumerate() {
         if screen_row + PILL_H as usize > mid
             || row_rect(inner, screen_row + PILL_H as usize - 1).is_none()
         {
@@ -2772,7 +2790,14 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         let ramp = sweep_ramp(roll, th, app.animations);
         let mut spans = vec![status_dot(roll, th)];
         const ORCH_BADGE: &str = " ◆";
-        let max = (inner.width as usize).saturating_sub(2 + ORCH_BADGE.chars().count());
+        let branch_label = branch
+            .as_ref()
+            .map(|b| format!(" {}", truncate(b, 24)))
+            .unwrap_or_default();
+        // 3 = the selection rail + the status dot's two cells; without the
+        // rail in the math the branch label loses its last character.
+        let max = (inner.width as usize)
+            .saturating_sub(3 + ORCH_BADGE.chars().count() + branch_label.chars().count());
         spans.extend(status_name_spans(
             truncate(name, max),
             Style::default(),
@@ -2780,6 +2805,9 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             app.sweep_phase(),
         ));
         spans.push(Span::styled(ORCH_BADGE, Style::default().fg(th.accent)));
+        if !branch_label.is_empty() {
+            spans.push(Span::styled(branch_label, dim));
+        }
         let selected = app.sel_orchestrator == Some(i)
             || (orchestrators_focused && app.sel_orchestrator.is_none() && i == 0);
         render_pill(

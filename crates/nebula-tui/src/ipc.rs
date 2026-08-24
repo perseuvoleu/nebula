@@ -1191,7 +1191,7 @@ pub async fn run_todo(op: TodoOp) -> Result<()> {
 }
 
 /// `nebula agent promote|demote <name>`: flip a session's orchestrator
-/// role. Promotion is refused daemon-side off the root checkout.
+/// role. An orchestrator may live on any of the project's worktrees.
 pub async fn agent_set_orchestrator(
     name: String,
     project_flag: Option<String>,

@@ -215,8 +215,8 @@ pub enum ClientRequest {
         pinned: bool,
     },
     /// Promote a session to project orchestrator (or demote one back).
-    /// The daemon refuses promotion off the root checkout — orchestrators
-    /// live on the main branch by definition. Promotion also pins.
+    /// An orchestrator may live on any of the project's worktrees.
+    /// Promotion also pins.
     SetAgentOrchestrator {
         req_id: u64,
         id: AgentId,
