@@ -14,6 +14,26 @@ about what is worth recording.
 
 ## Entries
 
+### Five Feature Branches Merged Onto merge-train — 2026-08-24
+
+**Asked:** "Merge these five branches into merge-train, one at a time, in this order:
+searchable-session-names, cmd-d-diff, attention-queue, macos-notifications, session-message-preview…
+resolve them so BOTH features survive… After all five are merged, run 'cargo test --workspace'…"
+
+**Did:** All five merged (`1e2e3b2`, `546b83a`, `d4926e4`, `beb4683`, `b9cdb18`), 593 workspace tests
+green. Despite all branches touching event_loop.rs/keymap.rs/ui.rs/app.rs, every code file auto-merged —
+the only conflict in all four conflicted merges was `.claude/MEMORY.md`'s entries section (resolved by
+keeping every entry).
+
+**Gotchas:**
+- `cmd-d-diff`'s code commit `bc8d58e` is byte-identical to main's HEAD `8bee485`
+  (`git diff 8bee485 bc8d58e -- crates/` is empty) — the same work landed on main separately. The merge
+  contributes only the MEMORY.md entry; don't hunt for a second Cmd+D implementation.
+- Concurrent same-day branches conflict on MEMORY.md every time, since each appends at the same spot
+  under `## Entries`. Resolution is mechanical: keep both blocks, drop the markers.
+- `e2e_tui::tui_projects_worktrees_agents_navigation` passes now — the long-red `FOOTER_TERMINAL_LOCKED`
+  assertion was fixed on main in `67ba923`; earlier entries calling it "still unfixed" are stale.
+
 ### Orchestrator-Delegated Sessions Get Task-Derived Names — 2026-08-24
 
 **Asked:** "when a project orchestrator creates a worktree and/or creates agent sessions on that
@@ -407,10 +427,10 @@ in `event_loop.rs`, bound to `Action::OpenRepo` / `shift+g`. `ef56fca` checks in
   on its own branch and `git push origin <branch>:main`. **Never `git add` in the shared tree.**
 - Local `main` stays behind `origin/main` after that push — it is checked out and dirty, so it can't be
   fast-forwarded. Say so explicitly; the next `git pull` has to reconcile.
-- `e2e_tui::tui_projects_worktrees_agents_navigation` **fails at `origin/main` too**:
+- `e2e_tui::tui_projects_worktrees_agents_navigation` **failed at `origin/main` too**:
   `FOOTER_TERMINAL_LOCKED = "Ctrl+q: panels"` (`crates/nebula/tests/e2e_tui.rs:29`) while the footer now
-  renders `^q: panels`. Introduced by `87d2b24` and shipped red in v0.2.0 — not a regression, still
-  unfixed. Always re-run a failing test against `origin/main` before blaming your own diff.
+  renders `^q: panels`. Introduced by `87d2b24`, shipped red in v0.2.0, fixed on main in `67ba923`
+  (passes as of 2026-08-24). Always re-run a failing test against `origin/main` before blaming your own diff.
 - `.github/workflows/release.yml` publishes with `generate_release_notes: true`, which is a bare commit
   list, not a changelog. `gh release edit vX.Y.Z --notes "…"` afterwards is the step that makes it one.
 
