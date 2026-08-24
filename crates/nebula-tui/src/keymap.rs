@@ -60,6 +60,7 @@ pub enum Action {
     Activate,
     Palette,
     SessionPalette,
+    NextAttention,
     // projects & worktrees
     AddProject,
     New,
@@ -203,6 +204,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         group: "NAVIGATE",
         scope: Scope::Global,
         defaults: &["shift+s"],
+    },
+    ActionSpec {
+        action: Action::NextAttention,
+        id: "next_attention",
+        label: "Next needing attention",
+        hint: "Jump to the session that has been waiting on you the longest",
+        group: "NAVIGATE",
+        scope: Scope::Global,
+        defaults: &["space"],
     },
     // ---- PROJECTS & WORKTREES ----
     ActionSpec {
