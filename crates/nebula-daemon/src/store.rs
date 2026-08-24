@@ -5,8 +5,8 @@
 use anyhow::{Context, Result};
 use nebula_core::{
     Agent, AgentId, AgentKind, AgentStatus, Link, LinkId, Note, NoteId, NoteOwner, PrSeen, Project,
-    ProjectId, TerminalId, TerminalTab, Workspace, WorkspaceId, Worktree, WorktreeId,
-    DEFAULT_WORKSPACE_ID,
+    ProjectId, TerminalId, TerminalTab, Todo, TodoId, TodoOwner, Workspace, WorkspaceId, Worktree,
+    WorktreeId, DEFAULT_WORKSPACE_ID,
 };
 use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
@@ -206,6 +206,39 @@ const MIGRATIONS: &[&str] = &[
     // their own group, taught the nebula CLI verbs).
     "
     ALTER TABLE agents ADD COLUMN orchestrator INTEGER NOT NULL DEFAULT 0;
+    ",
+    // 20: first-class todos — a task list scoped to a project or one
+    // worktree, separate from notes; each todo holds its own child notes.
+    // (The `todos` name is free again: migration 15 renamed the old table
+    // to `notes`.) Notes gain a third owner — a todo — so their table is
+    // rebuilt to relax the two-way CHECK into exactly-one-of-three. Runs
+    // with foreign keys off (see migrate()) so the DROP doesn't cascade.
+    "
+    CREATE TABLE todos (
+      id          TEXT PRIMARY KEY,
+      project_id  TEXT REFERENCES projects(id) ON DELETE CASCADE,
+      worktree_id TEXT REFERENCES worktrees(id) ON DELETE CASCADE,
+      text        TEXT NOT NULL,
+      done        INTEGER NOT NULL DEFAULT 0,
+      sort_order  INTEGER NOT NULL DEFAULT 0,
+      created_at  INTEGER NOT NULL,
+      CHECK ((project_id IS NULL) <> (worktree_id IS NULL))
+    );
+    CREATE TABLE notes_new (
+      id          TEXT PRIMARY KEY,
+      project_id  TEXT REFERENCES projects(id) ON DELETE CASCADE,
+      worktree_id TEXT REFERENCES worktrees(id) ON DELETE CASCADE,
+      todo_id     TEXT REFERENCES todos(id) ON DELETE CASCADE,
+      text        TEXT NOT NULL,
+      done        INTEGER NOT NULL DEFAULT 0,
+      sort_order  INTEGER NOT NULL DEFAULT 0,
+      created_at  INTEGER NOT NULL,
+      CHECK ((project_id IS NOT NULL) + (worktree_id IS NOT NULL) + (todo_id IS NOT NULL) = 1)
+    );
+    INSERT INTO notes_new (id, project_id, worktree_id, text, done, sort_order, created_at)
+      SELECT id, project_id, worktree_id, text, done, sort_order, created_at FROM notes;
+    DROP TABLE notes;
+    ALTER TABLE notes_new RENAME TO notes;
     ",
 ];
 
@@ -682,28 +715,35 @@ impl Store {
 
     // ---- notes ----
 
-    /// (project_id, worktree_id) column values for an owner — exactly one
-    /// is Some, mirroring the table's CHECK.
-    fn note_owner_cols(owner: &NoteOwner) -> (Option<&str>, Option<&str>) {
+    /// (project_id, worktree_id, todo_id) column values for an owner —
+    /// exactly one is Some, mirroring the table's CHECK.
+    fn note_owner_cols(owner: &NoteOwner) -> (Option<&str>, Option<&str>, Option<&str>) {
         match owner {
-            NoteOwner::Project(id) => (Some(id.as_str()), None),
-            NoteOwner::Worktree(id) => (None, Some(id.as_str())),
+            NoteOwner::Project(id) => (Some(id.as_str()), None, None),
+            NoteOwner::Worktree(id) => (None, Some(id.as_str()), None),
+            NoteOwner::Todo(id) => (None, None, Some(id.as_str())),
         }
     }
 
-    /// Owner from a row's (project_id, worktree_id) pair.
-    fn note_owner_from(project_id: Option<String>, worktree_id: Option<String>) -> NoteOwner {
-        match (project_id, worktree_id) {
-            (Some(p), _) => NoteOwner::Project(ProjectId(p)),
-            (None, Some(w)) => NoteOwner::Worktree(WorktreeId(w)),
+    /// Owner from a row's (project_id, worktree_id, todo_id) triple.
+    fn note_owner_from(
+        project_id: Option<String>,
+        worktree_id: Option<String>,
+        todo_id: Option<String>,
+    ) -> NoteOwner {
+        match (project_id, worktree_id, todo_id) {
+            (Some(p), _, _) => NoteOwner::Project(ProjectId(p)),
+            (None, Some(w), _) => NoteOwner::Worktree(WorktreeId(w)),
+            (None, None, Some(t)) => NoteOwner::Todo(TodoId(t)),
             // Unreachable per the CHECK constraint.
-            (None, None) => NoteOwner::Worktree(WorktreeId(String::new())),
+            (None, None, None) => NoteOwner::Worktree(WorktreeId(String::new())),
         }
     }
 
     /// Undone notes visible from an agent's seat: its worktree's list plus
     /// the owning project's. Drives the hook-side "this project has open
-    /// notes" context injection; unknown agents count as zero.
+    /// notes" context injection; unknown agents count as zero. Todo-owned
+    /// notes don't count — they surface through the todos instruction.
     pub fn open_note_count_for_agent(&self, id: &AgentId) -> Result<usize> {
         let count: i64 = self.conn.lock().unwrap().query_row(
             "SELECT COUNT(*) FROM notes n, agents a, worktrees w
@@ -716,13 +756,14 @@ impl Store {
     }
 
     pub fn insert_note(&self, t: &Note) -> Result<()> {
-        let (project_id, worktree_id) = Self::note_owner_cols(&t.owner);
+        let (project_id, worktree_id, todo_id) = Self::note_owner_cols(&t.owner);
         self.conn.lock().unwrap().execute(
-            "INSERT INTO notes (id, project_id, worktree_id, text, done, sort_order, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO notes (id, project_id, worktree_id, todo_id, text, done, sort_order, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 t.id.as_str(),
                 project_id,
                 worktree_id,
+                todo_id,
                 t.text,
                 t.done as i64,
                 t.sort_order,
@@ -734,10 +775,10 @@ impl Store {
 
     /// Sort slot for a new note: after everything else in its owner's list.
     pub fn next_note_sort_order(&self, owner: &NoteOwner) -> Result<i64> {
-        let (project_id, worktree_id) = Self::note_owner_cols(owner);
+        let (project_id, worktree_id, todo_id) = Self::note_owner_cols(owner);
         Ok(self.conn.lock().unwrap().query_row(
-            "SELECT COALESCE(MAX(sort_order) + 1, 0) FROM notes WHERE project_id IS ?1 AND worktree_id IS ?2",
-            params![project_id, worktree_id],
+            "SELECT COALESCE(MAX(sort_order) + 1, 0) FROM notes WHERE project_id IS ?1 AND worktree_id IS ?2 AND todo_id IS ?3",
+            params![project_id, worktree_id, todo_id],
             |r| r.get(0),
         )?)
     }
@@ -769,15 +810,15 @@ impl Store {
     pub fn get_note(&self, id: &NoteId) -> Result<Option<Note>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, project_id, worktree_id, text, done, sort_order FROM notes WHERE id = ?1",
+            "SELECT id, project_id, worktree_id, todo_id, text, done, sort_order FROM notes WHERE id = ?1",
         )?;
         let mut rows = stmt.query(params![id.as_str()])?;
         Ok(rows.next()?.map(|r| Note {
             id: NoteId(r.get::<_, String>(0).unwrap()),
-            owner: Self::note_owner_from(r.get(1).unwrap(), r.get(2).unwrap()),
-            text: r.get(3).unwrap(),
-            done: r.get::<_, i64>(4).unwrap() != 0,
-            sort_order: r.get(5).unwrap(),
+            owner: Self::note_owner_from(r.get(1).unwrap(), r.get(2).unwrap(), r.get(3).unwrap()),
+            text: r.get(4).unwrap(),
+            done: r.get::<_, i64>(5).unwrap() != 0,
+            sort_order: r.get(6).unwrap(),
         }))
     }
 
@@ -785,18 +826,137 @@ impl Store {
     pub fn load_notes(&self) -> Result<Vec<Note>> {
         let conn = self.conn.lock().unwrap();
         let notes = conn
-            .prepare("SELECT id, project_id, worktree_id, text, done, sort_order FROM notes ORDER BY COALESCE(project_id, worktree_id), sort_order, created_at")?
+            .prepare("SELECT id, project_id, worktree_id, todo_id, text, done, sort_order FROM notes ORDER BY COALESCE(project_id, worktree_id, todo_id), sort_order, created_at")?
             .query_map([], |r| {
                 Ok(Note {
                     id: NoteId(r.get(0)?),
-                    owner: Self::note_owner_from(r.get(1)?, r.get(2)?),
+                    owner: Self::note_owner_from(r.get(1)?, r.get(2)?, r.get(3)?),
+                    text: r.get(4)?,
+                    done: r.get::<_, i64>(5)? != 0,
+                    sort_order: r.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(notes)
+    }
+
+    // ---- todos ----
+
+    /// (project_id, worktree_id) column values for an owner — exactly one
+    /// is Some, mirroring the table's CHECK.
+    fn todo_owner_cols(owner: &TodoOwner) -> (Option<&str>, Option<&str>) {
+        match owner {
+            TodoOwner::Project(id) => (Some(id.as_str()), None),
+            TodoOwner::Worktree(id) => (None, Some(id.as_str())),
+        }
+    }
+
+    /// Owner from a row's (project_id, worktree_id) pair.
+    fn todo_owner_from(project_id: Option<String>, worktree_id: Option<String>) -> TodoOwner {
+        match (project_id, worktree_id) {
+            (Some(p), _) => TodoOwner::Project(ProjectId(p)),
+            (None, Some(w)) => TodoOwner::Worktree(WorktreeId(w)),
+            // Unreachable per the CHECK constraint.
+            (None, None) => TodoOwner::Worktree(WorktreeId(String::new())),
+        }
+    }
+
+    /// Undone todos visible from an agent's seat: its worktree's list plus
+    /// the owning project's. Drives the hook-side "this project has open
+    /// todos" context injection; unknown agents count as zero.
+    pub fn open_todo_count_for_agent(&self, id: &AgentId) -> Result<usize> {
+        let count: i64 = self.conn.lock().unwrap().query_row(
+            "SELECT COUNT(*) FROM todos t, agents a, worktrees w
+             WHERE a.id = ?1 AND w.id = a.worktree_id AND t.done = 0
+               AND (t.worktree_id = w.id OR t.project_id = w.project_id)",
+            params![id.as_str()],
+            |r| r.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
+    pub fn insert_todo(&self, t: &Todo) -> Result<()> {
+        let (project_id, worktree_id) = Self::todo_owner_cols(&t.owner);
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO todos (id, project_id, worktree_id, text, done, sort_order, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                t.id.as_str(),
+                project_id,
+                worktree_id,
+                t.text,
+                t.done as i64,
+                t.sort_order,
+                now_ms()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Sort slot for a new todo: after everything else in its owner's list.
+    pub fn next_todo_sort_order(&self, owner: &TodoOwner) -> Result<i64> {
+        let (project_id, worktree_id) = Self::todo_owner_cols(owner);
+        Ok(self.conn.lock().unwrap().query_row(
+            "SELECT COALESCE(MAX(sort_order) + 1, 0) FROM todos WHERE project_id IS ?1 AND worktree_id IS ?2",
+            params![project_id, worktree_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn set_todo_text(&self, id: &TodoId, text: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE todos SET text = ?2 WHERE id = ?1",
+            params![id.as_str(), text],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_todo_done(&self, id: &TodoId, done: bool) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE todos SET done = ?2 WHERE id = ?1",
+            params![id.as_str(), done as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_todo(&self, id: &TodoId) -> Result<()> {
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM todos WHERE id = ?1", params![id.as_str()])?;
+        Ok(())
+    }
+
+    pub fn get_todo(&self, id: &TodoId) -> Result<Option<Todo>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, project_id, worktree_id, text, done, sort_order FROM todos WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query(params![id.as_str()])?;
+        Ok(rows.next()?.map(|r| Todo {
+            id: TodoId(r.get::<_, String>(0).unwrap()),
+            owner: Self::todo_owner_from(r.get(1).unwrap(), r.get(2).unwrap()),
+            text: r.get(3).unwrap(),
+            done: r.get::<_, i64>(4).unwrap() != 0,
+            sort_order: r.get(5).unwrap(),
+        }))
+    }
+
+    /// Every todo, in per-owner list order.
+    pub fn load_todos(&self) -> Result<Vec<Todo>> {
+        let conn = self.conn.lock().unwrap();
+        let todos = conn
+            .prepare("SELECT id, project_id, worktree_id, text, done, sort_order FROM todos ORDER BY COALESCE(project_id, worktree_id), sort_order, created_at")?
+            .query_map([], |r| {
+                Ok(Todo {
+                    id: TodoId(r.get(0)?),
+                    owner: Self::todo_owner_from(r.get(1)?, r.get(2)?),
                     text: r.get(3)?,
                     done: r.get::<_, i64>(4)? != 0,
                     sort_order: r.get(5)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(notes)
+        Ok(todos)
     }
 
     // ---- links ----
@@ -1248,6 +1408,247 @@ mod tests {
         store.insert_note(&note).unwrap();
         store.delete_project(&project.id).unwrap();
         assert!(store.load_notes().unwrap().is_empty());
+    }
+
+    #[test]
+    fn todo_crud_roundtrip_and_child_note_cascade() {
+        let store = Store::open_in_memory().unwrap();
+        let project = Project {
+            workspace_id: Default::default(),
+            id: ProjectId::generate(),
+            name: "demo".into(),
+            repo_path: "/tmp/demo".into(),
+            sort_order: 0,
+            divider_after: false,
+            divider_label: None,
+            divider_before: false,
+            divider_before_label: None,
+        };
+        store.insert_project(&project).unwrap();
+        let worktree = Worktree {
+            id: WorktreeId::generate(),
+            project_id: project.id.clone(),
+            path: "/tmp/demo".into(),
+            branch: "main".into(),
+            is_main: true,
+            created_from: None,
+            pinned: false,
+            sort_order: 0,
+        };
+        store.insert_worktree(&worktree).unwrap();
+
+        let wt_owner = TodoOwner::Worktree(worktree.id.clone());
+        let todo = Todo {
+            id: TodoId::generate(),
+            owner: wt_owner.clone(),
+            text: "ship the feature".into(),
+            done: false,
+            sort_order: store.next_todo_sort_order(&wt_owner).unwrap(),
+        };
+        store.insert_todo(&todo).unwrap();
+        assert_eq!(store.next_todo_sort_order(&wt_owner).unwrap(), 1);
+
+        // Project-scoped todos are their own list: separate sort space.
+        let p_owner = TodoOwner::Project(project.id.clone());
+        assert_eq!(store.next_todo_sort_order(&p_owner).unwrap(), 0);
+        let project_todo = Todo {
+            id: TodoId::generate(),
+            owner: p_owner.clone(),
+            text: "plan the quarter".into(),
+            done: false,
+            sort_order: 0,
+        };
+        store.insert_todo(&project_todo).unwrap();
+        let read = store.get_todo(&project_todo.id).unwrap().unwrap();
+        assert_eq!(read.owner, p_owner);
+
+        store.set_todo_text(&todo.id, "ship the WHOLE feature").unwrap();
+        store.set_todo_done(&todo.id, true).unwrap();
+        let read = store.get_todo(&todo.id).unwrap().unwrap();
+        assert_eq!(read.text, "ship the WHOLE feature");
+        assert!(read.done);
+        assert_eq!(read.owner, wt_owner);
+        assert_eq!(store.load_todos().unwrap().len(), 2);
+
+        // Child notes hang off the todo; they are their own list, separate
+        // from the project's/worktree's standalone notes.
+        let child_owner = NoteOwner::Todo(todo.id.clone());
+        assert_eq!(store.next_note_sort_order(&child_owner).unwrap(), 0);
+        let child = Note {
+            id: NoteId::generate(),
+            owner: child_owner.clone(),
+            text: "remembered detail".into(),
+            done: false,
+            sort_order: 0,
+        };
+        store.insert_note(&child).unwrap();
+        let standalone = Note {
+            id: NoteId::generate(),
+            owner: NoteOwner::Worktree(worktree.id.clone()),
+            text: "unrelated note".into(),
+            done: false,
+            sort_order: 0,
+        };
+        store.insert_note(&standalone).unwrap();
+        let read = store.get_note(&child.id).unwrap().unwrap();
+        assert_eq!(read.owner, child_owner);
+
+        // Deleting the todo cascades to its child notes only — standalone
+        // notes stay.
+        store.delete_todo(&todo.id).unwrap();
+        assert!(store.get_todo(&todo.id).unwrap().is_none());
+        assert!(store.get_note(&child.id).unwrap().is_none());
+        assert!(store.get_note(&standalone.id).unwrap().is_some());
+
+        // Deleting the project cascades to its own todos AND (via the
+        // worktree) its worktrees' todos, child notes included.
+        store.insert_todo(&todo).unwrap();
+        store.insert_note(&child).unwrap();
+        store.delete_project(&project.id).unwrap();
+        assert!(store.load_todos().unwrap().is_empty());
+        assert!(store.load_notes().unwrap().is_empty());
+    }
+
+    /// Open-todo visibility from an agent's seat mirrors the notes rule:
+    /// its worktree's undone todos plus the project's; done todos, other
+    /// worktrees' todos and unknown agents count 0.
+    #[test]
+    fn open_todo_count_for_agent_counts_project_and_worktree() {
+        let store = Store::open_in_memory().unwrap();
+        let project = Project {
+            workspace_id: Default::default(),
+            id: ProjectId::generate(),
+            name: "demo".into(),
+            repo_path: "/tmp/demo".into(),
+            sort_order: 0,
+            divider_after: false,
+            divider_label: None,
+            divider_before: false,
+            divider_before_label: None,
+        };
+        store.insert_project(&project).unwrap();
+        let wt = |id: &str, path: &str| Worktree {
+            id: WorktreeId(id.into()),
+            project_id: project.id.clone(),
+            path: path.into(),
+            branch: id.into(),
+            is_main: false,
+            created_from: None,
+            pinned: false,
+            sort_order: 0,
+        };
+        store.insert_worktree(&wt("w1", "/tmp/demo")).unwrap();
+        store.insert_worktree(&wt("w2", "/tmp/demo-b")).unwrap();
+        store
+            .insert_agent(&Agent {
+                id: AgentId("a1".into()),
+                worktree_id: WorktreeId("w1".into()),
+                name: "agent-1".into(),
+                status: AgentStatus::Fresh,
+                archived: false,
+                archived_at: 0,
+                pinned: false,
+                kind: AgentKind::Claude,
+                model: None,
+                effort: None,
+                session_id: None,
+                sort_order: 0,
+                status_changed_at: 0,
+                orchestrator: false,
+                alive: false,
+            })
+            .unwrap();
+
+        let a1 = AgentId("a1".into());
+        assert_eq!(store.open_todo_count_for_agent(&a1).unwrap(), 0);
+        let todo = |owner: TodoOwner, done: bool| Todo {
+            id: TodoId::generate(),
+            owner,
+            text: "t".into(),
+            done,
+            sort_order: 0,
+        };
+        store
+            .insert_todo(&todo(TodoOwner::Project(project.id.clone()), false))
+            .unwrap();
+        store
+            .insert_todo(&todo(TodoOwner::Worktree(WorktreeId("w1".into())), false))
+            .unwrap();
+        store
+            .insert_todo(&todo(TodoOwner::Worktree(WorktreeId("w1".into())), true))
+            .unwrap();
+        store
+            .insert_todo(&todo(TodoOwner::Worktree(WorktreeId("w2".into())), false))
+            .unwrap();
+        assert_eq!(store.open_todo_count_for_agent(&a1).unwrap(), 2);
+        assert_eq!(
+            store
+                .open_todo_count_for_agent(&AgentId("ghost".into()))
+                .unwrap(),
+            0
+        );
+    }
+
+    /// Real upgrade path: a v19 database picks up migration 20's todos
+    /// table and the notes rebuild without losing any existing notes — and
+    /// the rebuilt table takes todo-owned child notes.
+    #[test]
+    fn migration_20_preserves_notes_and_adds_todos() {
+        let path =
+            std::env::temp_dir().join(format!("nebula-mig20-test-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+            for (i, migration) in MIGRATIONS.iter().take(19).enumerate() {
+                conn.execute_batch(&format!(
+                    "BEGIN; {migration}; PRAGMA user_version = {}; COMMIT;",
+                    i + 1
+                ))
+                .unwrap();
+            }
+            conn.execute_batch(
+                "INSERT INTO projects (id, name, repo_path, sort_order, created_at) VALUES ('p1', 'p', '/tmp/p', 0, 0);
+                 INSERT INTO worktrees (id, project_id, path, branch, is_main, sort_order, created_at) VALUES ('w1', 'p1', '/tmp/p', 'main', 1, 0, 0);
+                 INSERT INTO notes (id, project_id, text, done, sort_order, created_at) VALUES ('n1', 'p1', 'project note', 0, 0, 0);
+                 INSERT INTO notes (id, worktree_id, text, done, sort_order, created_at) VALUES ('n2', 'w1', 'worktree note', 1, 2, 0);",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let notes = store.load_notes().unwrap();
+        assert_eq!(notes.len(), 2, "existing notes survive the rebuild");
+        assert_eq!(notes[0].owner, NoteOwner::Project(ProjectId("p1".into())));
+        assert_eq!(notes[0].text, "project note");
+        assert_eq!(notes[1].owner, NoteOwner::Worktree(WorktreeId("w1".into())));
+        assert!(notes[1].done);
+        assert_eq!(notes[1].sort_order, 2);
+
+        // The new table is live: a todo with a child note round-trips.
+        let todo = Todo {
+            id: TodoId::generate(),
+            owner: TodoOwner::Project(ProjectId("p1".into())),
+            text: "fresh todo".into(),
+            done: false,
+            sort_order: 0,
+        };
+        store.insert_todo(&todo).unwrap();
+        store
+            .insert_note(&Note {
+                id: NoteId::generate(),
+                owner: NoteOwner::Todo(todo.id.clone()),
+                text: "child".into(),
+                done: false,
+                sort_order: 0,
+            })
+            .unwrap();
+        assert_eq!(store.load_todos().unwrap().len(), 1);
+        assert_eq!(store.load_notes().unwrap().len(), 3);
+        drop(store);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
+        }
     }
 
     /// Read marks are keyed by PR URL and outlive the worktree they were

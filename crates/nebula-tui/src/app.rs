@@ -5,7 +5,8 @@ use crate::pull_request::PullRequest;
 use crate::text_input::TextInput;
 use nebula_core::{
     Agent, AgentId, AgentKind, AgentStatus, Link, LinkId, Note, NoteId, NoteOwner, Project,
-    ProjectId, SessionRef, TerminalId, TerminalTab, Workspace, WorkspaceId, Worktree, WorktreeId,
+    ProjectId, SessionRef, TerminalId, TerminalTab, Todo, TodoId, TodoOwner, Workspace,
+    WorkspaceId, Worktree, WorktreeId,
 };
 use ratatui::layout::Rect;
 use std::collections::HashMap;
@@ -111,6 +112,8 @@ pub enum MenuAction {
     NewWorktree(ProjectId),
     /// Open the note modal for this owner (project or worktree).
     OpenNotes(NoteOwner),
+    /// Open the todo modal for this owner (project or worktree).
+    OpenTodos(TodoOwner),
     /// Attach a URL to this worktree (prompts for it).
     NewLink(WorktreeId),
     /// Hand a link row's URL to the browser.
@@ -1028,6 +1031,85 @@ impl NoteView {
     }
 }
 
+/// What the todo modal's input is writing: the list's own add/edit, or a
+/// child note's add/edit inside the detail view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TodoInputTarget {
+    /// Creating a new todo (list mode).
+    NewTodo,
+    /// Rewriting this todo's text (list mode).
+    EditTodo(TodoId),
+    /// Creating a child note under the opened todo (detail mode).
+    NewNote,
+    /// Rewriting this child note's text (detail mode).
+    EditNote(NoteId),
+}
+
+/// In-progress add/edit inside the todo modal; keys feed `text` while set.
+#[derive(Debug, Clone)]
+pub struct TodoInput {
+    pub target: TodoInputTarget,
+    pub text: TextInput,
+}
+
+/// First-class todo modal (`E`) for one owner — a project or a worktree,
+/// the same shell as the notes modal plus a drill-in: Enter on a todo opens
+/// its detail, where that todo's child notes live. The rows themselves stay
+/// in `App::tree.todos` / `App::tree.notes` (kept fresh by upserts) — the
+/// view only holds the owner plus cursor/mode/input state.
+#[derive(Debug, Clone)]
+pub struct TodoView {
+    pub owner: TodoOwner,
+    /// `project` or `project/branch`, for the modal title.
+    pub context: String,
+    /// Cursor into the owner's todo rows (list mode).
+    pub selected: usize,
+    /// Some = detail mode: this todo is open and `note_selected` walks its
+    /// child notes; Esc drops back to the list.
+    pub detail: Option<TodoId>,
+    /// Cursor into the opened todo's child notes (detail mode).
+    pub note_selected: usize,
+    /// Active add/edit input, if any (todo text or child-note text, per
+    /// its target).
+    pub input: Option<TodoInput>,
+    /// Whole modal rect, written back during draw so clicks outside close.
+    pub area: Rect,
+    /// Screen rect of the rows, written back during draw so clicks can
+    /// hit-test rows.
+    pub list_area: Rect,
+}
+
+impl TodoView {
+    pub fn new(owner: TodoOwner, context: String) -> Self {
+        Self {
+            owner,
+            context,
+            selected: 0,
+            detail: None,
+            note_selected: 0,
+            input: None,
+            area: Rect::default(),
+            list_area: Rect::default(),
+        }
+    }
+
+    /// The cursor the current mode moves: child notes in detail, todos in
+    /// the list.
+    pub fn cursor(&self) -> usize {
+        if self.detail.is_some() {
+            self.note_selected
+        } else {
+            self.selected
+        }
+    }
+
+    /// First visible row of the list's stateless follow-window for a list
+    /// of `height` rows.
+    pub fn window_start(&self, height: usize) -> usize {
+        (self.cursor() + 1).saturating_sub(height)
+    }
+}
+
 /// Recent-hosts modal (`h`): destinations remembered by `nebula ssh`.
 /// Enter (or a click) quits the TUI and execs a fresh `nebula ssh` at the
 /// selected entry; `a` types a new destination, `d` forgets one. The rows
@@ -1192,6 +1274,7 @@ pub enum Overlay {
     Grep(GrepView),
     Tree(crate::tree_browser::TreeBrowser),
     Notes(NoteView),
+    Todos(TodoView),
     Metrics(MetricsView),
     Hosts(HostsView),
 }
@@ -1221,6 +1304,8 @@ pub enum PendingIntent {
     SelectAddedProject,
     /// Move the note modal's cursor onto the created note.
     SelectCreatedNote,
+    /// Move the todo modal's cursor onto the created todo.
+    SelectCreatedTodo,
     /// Move the Sessions panel's cursor onto the link just created.
     SelectCreatedLink,
     /// Open the workspace this Ack just created (switcher's "New workspace…"
@@ -1484,6 +1569,7 @@ pub struct Tree {
     pub agents: Vec<Agent>,
     pub terminals: Vec<TerminalTab>,
     pub notes: Vec<Note>,
+    pub todos: Vec<Todo>,
     pub links: Vec<Link>,
 }
 
@@ -1704,6 +1790,8 @@ pub struct App {
     pub open_at: Option<std::path::PathBuf>,
     /// Note created by us, awaiting its upsert to land the modal's cursor.
     pub select_note_when_seen: Option<NoteId>,
+    /// Todo created by us, awaiting its upsert to land the modal's cursor.
+    pub select_todo_when_seen: Option<TodoId>,
     /// Link created by us, awaiting its upsert to land the panel cursor on
     /// the new row.
     pub select_link_when_seen: Option<LinkId>,
@@ -1872,6 +1960,7 @@ impl App {
             select_project_when_seen: None,
             open_at: None,
             select_note_when_seen: None,
+            select_todo_when_seen: None,
             select_link_when_seen: None,
             last_worktree_for_project: HashMap::new(),
             last_session_for_worktree: HashMap::new(),
@@ -2489,6 +2578,15 @@ impl App {
             .filter(|t| &t.owner == owner && !t.done)
             .count();
         (open, total)
+    }
+
+    /// An owner's todos, in tree order (snapshot order; new ones append).
+    pub fn todos_for(&self, owner: &TodoOwner) -> Vec<&Todo> {
+        self.tree
+            .todos
+            .iter()
+            .filter(|t| &t.owner == owner)
+            .collect()
     }
 
     /// Aggregate status for a worktree row: red > yellow > green > gray,
