@@ -761,14 +761,16 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             app.focus = Focus::Sessions;
             return;
         }
-        // "New agent", "Notes" and "Git diff" are the panel chords that
-        // still fire inside a locked session — spawning a sibling agent,
-        // jotting a note or reviewing the worktree's changes shouldn't
-        // require unlocking first. Only their ⌘-modified
-        // chords qualify: anything a child app could plausibly want
-        // (plain N, plain E, ^n, …) keeps forwarding.
+        // These panel chords still fire inside a locked session: they are
+        // global operations that should not require unlocking first. Only
+        // their Cmd-modified chords qualify; anything a child app could
+        // plausibly want (plain N, plain E, ^n, …) keeps forwarding.
         if chord.mods.contains(crossterm::event::KeyModifiers::SUPER) {
             match app.keymap.lookup(crate::keymap::Scope::Global, &chord) {
+                Some(crate::keymap::Action::ToggleTerminalFullscreen) => {
+                    toggle_terminal_fullscreen(app);
+                    return;
+                }
                 Some(crate::keymap::Action::NewAgent) => {
                     app.collapsed = false;
                     app.term_locked = false;
@@ -1173,17 +1175,23 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         // (Cmd+T never reaches a TUI — the emulator opens its own tab.)
         Action::NewTerminal => create_terminal_for_context(app, out),
         Action::NewLink => open_new_link_prompt(app),
-        Action::Zoom => {
-            if app.term.is_some() {
-                app.collapsed = true;
-                app.focus = Focus::Terminal;
-                app.term_locked = true;
-            } else {
-                app.flash = Some("attach a session first".into());
-            }
-        }
+        Action::ToggleTerminalFullscreen => toggle_terminal_fullscreen(app),
         // Terminal-scope only; never resolved here.
         Action::UnlockTerminal => {}
+    }
+}
+
+fn toggle_terminal_fullscreen(app: &mut App) {
+    if app.collapsed {
+        app.collapsed = false;
+        app.term_locked = false;
+        app.focus = Focus::Sessions;
+    } else if app.term.is_some() {
+        app.collapsed = true;
+        app.focus = Focus::Terminal;
+        app.term_locked = true;
+    } else {
+        app.flash = Some("attach a terminal or agent first".into());
     }
 }
 
@@ -10899,6 +10907,98 @@ mod tests {
             matches!(out.last(), Some(ClientRequest::ArchiveAgent { id, .. }) if id.0 == "a1"),
             "⌘w closes the attached session"
         );
+    }
+
+    #[test]
+    fn cmd_p_toggles_attached_terminal_full_screen_from_panel_focus() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        app.term = Some(AttachedTerm::new(
+            SessionRef::Agent(AgentId("a1".into())),
+            80,
+            24,
+        ));
+        app.focus = Focus::Projects;
+
+        press(
+            &mut app,
+            KeyCode::Char('p'),
+            KeyModifiers::SUPER,
+            &mut out,
+        );
+        assert!(app.collapsed, "Cmd+P hides the sidebars");
+        assert_eq!(app.focus, Focus::Terminal);
+        assert!(app.term_locked, "Cmd+P locks input into the terminal");
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let screen = buffer_text(&terminal);
+        assert!(
+            screen.contains("⌘p/^q: panels"),
+            "full-screen footer advertises both exits:\n{screen}"
+        );
+
+        press(
+            &mut app,
+            KeyCode::Char('p'),
+            KeyModifiers::SUPER,
+            &mut out,
+        );
+        assert!(!app.collapsed, "a second Cmd+P restores the sidebars");
+        assert_eq!(app.focus, Focus::Sessions);
+        assert!(!app.term_locked, "returning to panels unlocks input");
+        assert!(out.is_empty(), "the toggle never reaches the child PTY");
+    }
+
+    #[test]
+    fn cmd_p_enters_full_screen_from_a_locked_terminal() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        app.term = Some(AttachedTerm::new(
+            SessionRef::Agent(AgentId("a1".into())),
+            80,
+            24,
+        ));
+        app.focus = Focus::Terminal;
+        app.term_locked = true;
+
+        press(
+            &mut app,
+            KeyCode::Char('p'),
+            KeyModifiers::SUPER,
+            &mut out,
+        );
+
+        assert!(app.collapsed, "Cmd+P hides panels around a locked terminal");
+        assert_eq!(app.focus, Focus::Terminal);
+        assert!(app.term_locked, "terminal input remains locked");
+        assert!(out.is_empty(), "Cmd+P does not reach the child PTY");
+    }
+
+    #[test]
+    fn cmd_p_without_an_attached_terminal_keeps_panels_visible() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        app.focus = Focus::Worktrees;
+
+        press(
+            &mut app,
+            KeyCode::Char('p'),
+            KeyModifiers::SUPER,
+            &mut out,
+        );
+
+        assert!(!app.collapsed, "an empty terminal pane is never expanded");
+        assert_eq!(app.focus, Focus::Worktrees, "panel focus stays put");
+        assert!(!app.term_locked);
+        assert_eq!(
+            app.flash.as_deref(),
+            Some("attach a terminal or agent first")
+        );
+        assert!(out.is_empty());
     }
 
     #[test]
