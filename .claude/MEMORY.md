@@ -56,6 +56,10 @@ plus the usual MEMORY.md entries clash. 601 workspace tests green after.
   and only todo-notes bumped to 25, so git auto-merged a single correct bump. Sqlite migrations also
   stayed sequential (todos = migration 20). Verify with `git show <ref>:crates/nebula-core/src/protocol.rs`
   against the merge-base before hand-editing anything.
+- Deleting merged worktrees with raw `git worktree remove` leaves ghost rows in nebula's Worktrees
+  panel — the daemon tracks worktrees in its own sqlite and only forgets them via its delete flow
+  (`d` in the TUI; there is no `nebula worktree delete` CLI verb). Harmless: the daemon's
+  `git.rs::remove_worktree` tolerates an already-gone checkout, so `d` on a ghost row succeeds.
 - The final `git merge merge-train` in the root checkout conflicted only on `.claude/MEMORY.md`
   (yolo-mode entry vs merge-train entries — keep both); `registry.rs` auto-merged cleanly despite both
   sides touching `agent_spawn_command`.
