@@ -343,12 +343,23 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     model,
                     effort,
                     auto_title,
+                    orchestrator,
+                    prompt,
                 } => {
                     reply(
                         &out_tx,
                         req_id,
                         daemon
-                            .create_agent(&worktree, &name, kind, model, effort, auto_title)
+                            .create_agent(
+                                &worktree,
+                                &name,
+                                kind,
+                                model,
+                                effort,
+                                auto_title,
+                                orchestrator,
+                                prompt,
+                            )
                             .await
                             .map(Some),
                     )
@@ -421,6 +432,18 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         &out_tx,
                         req_id,
                         daemon.set_agent_pinned(&id, pinned).map(|_| None),
+                    )
+                    .await;
+                }
+                ClientRequest::SetAgentOrchestrator {
+                    req_id,
+                    id,
+                    orchestrator,
+                } => {
+                    reply(
+                        &out_tx,
+                        req_id,
+                        daemon.set_agent_orchestrator(&id, orchestrator).map(|_| None),
                     )
                     .await;
                 }

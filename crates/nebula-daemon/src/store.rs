@@ -197,6 +197,16 @@ const MIGRATIONS: &[&str] = &[
       seen_at  INTEGER NOT NULL
     );
     ",
+    // 18: source branch or commit recorded when Nebula creates a worktree.
+    // NULL means root checkout or an externally adopted worktree.
+    "
+    ALTER TABLE worktrees ADD COLUMN created_from TEXT;
+    ",
+    // 19: project-level orchestrator agents (spawned pinned, listed in
+    // their own group, taught the nebula CLI verbs).
+    "
+    ALTER TABLE agents ADD COLUMN orchestrator INTEGER NOT NULL DEFAULT 0;
+    ",
 ];
 
 pub struct Store {
@@ -426,8 +436,8 @@ impl Store {
 
     pub fn insert_worktree(&self, w: &Worktree) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO worktrees (id, project_id, path, branch, is_main, pinned, sort_order, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO worktrees (id, project_id, path, branch, is_main, pinned, sort_order, created_from, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 w.id.as_str(),
                 w.project_id.as_str(),
@@ -436,6 +446,7 @@ impl Store {
                 w.is_main as i64,
                 w.pinned as i64,
                 w.sort_order,
+                w.created_from,
                 now_ms()
             ],
         )?;
@@ -477,8 +488,8 @@ impl Store {
     /// clients never see it, they only observe the eventual rename.
     pub fn insert_agent_with_auto_title(&self, a: &Agent, auto_title: bool) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO agents (id, worktree_id, name, status, archived, archived_at, pinned, kind, claude_session_id, sort_order, created_at, status_changed_at, model, effort, auto_title_pending)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            "INSERT INTO agents (id, worktree_id, name, status, archived, archived_at, pinned, kind, claude_session_id, sort_order, created_at, status_changed_at, model, effort, auto_title_pending, orchestrator)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 a.id.as_str(),
                 a.worktree_id.as_str(),
@@ -494,7 +505,8 @@ impl Store {
                 a.status_changed_at,
                 a.model,
                 a.effort,
-                auto_title as i64
+                auto_title as i64,
+                a.orchestrator as i64
             ],
         )?;
         Ok(())
@@ -541,6 +553,27 @@ impl Store {
         Ok(pending == Some(1))
     }
 
+    /// Whether this agent is a project orchestrator — drives the
+    /// orchestration cheat-sheet injection on every prompt. Unknown ids
+    /// answer false (prewarm sessions, stale env).
+    pub fn agent_is_orchestrator(&self, id: &AgentId) -> Result<bool> {
+        let flag: Option<i64> = self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT orchestrator FROM agents WHERE id = ?1",
+                params![id.as_str()],
+                |r| r.get(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                e => Err(e),
+            })?;
+        Ok(flag == Some(1))
+    }
+
     pub fn set_agent_worktree(&self, id: &AgentId, worktree_id: &WorktreeId) -> Result<()> {
         self.conn.lock().unwrap().execute(
             "UPDATE agents SET worktree_id = ?2 WHERE id = ?1",
@@ -556,6 +589,14 @@ impl Store {
         self.conn.lock().unwrap().execute(
             "UPDATE agents SET archived = ?2, archived_at = ?3 WHERE id = ?1",
             params![id.as_str(), archived as i64, archived_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_agent_orchestrator(&self, id: &AgentId, orchestrator: bool) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE agents SET orchestrator = ?2 WHERE id = ?1",
+            params![id.as_str(), orchestrator as i64],
         )?;
         Ok(())
     }
@@ -658,6 +699,20 @@ impl Store {
             // Unreachable per the CHECK constraint.
             (None, None) => NoteOwner::Worktree(WorktreeId(String::new())),
         }
+    }
+
+    /// Undone notes visible from an agent's seat: its worktree's list plus
+    /// the owning project's. Drives the hook-side "this project has open
+    /// notes" context injection; unknown agents count as zero.
+    pub fn open_note_count_for_agent(&self, id: &AgentId) -> Result<usize> {
+        let count: i64 = self.conn.lock().unwrap().query_row(
+            "SELECT COUNT(*) FROM notes n, agents a, worktrees w
+             WHERE a.id = ?1 AND w.id = a.worktree_id AND n.done = 0
+               AND (n.worktree_id = w.id OR n.project_id = w.project_id)",
+            params![id.as_str()],
+            |r| r.get(0),
+        )?;
+        Ok(count as usize)
     }
 
     pub fn insert_note(&self, t: &Note) -> Result<()> {
@@ -866,7 +921,7 @@ impl Store {
     pub fn get_worktree(&self, id: &WorktreeId) -> Result<Option<Worktree>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, project_id, path, branch, is_main, pinned, sort_order FROM worktrees WHERE id = ?1",
+            "SELECT id, project_id, path, branch, is_main, pinned, sort_order, created_from FROM worktrees WHERE id = ?1",
         )?;
         let mut rows = stmt.query(params![id.as_str()])?;
         Ok(rows.next()?.map(|r| Worktree {
@@ -875,6 +930,7 @@ impl Store {
             path: PathBuf::from(r.get::<_, String>(2).unwrap()),
             branch: r.get(3).unwrap(),
             is_main: r.get::<_, i64>(4).unwrap() != 0,
+            created_from: r.get(7).unwrap(),
             pinned: r.get::<_, i64>(5).unwrap() != 0,
             sort_order: r.get(6).unwrap(),
         }))
@@ -883,7 +939,7 @@ impl Store {
     pub fn get_agent(&self, id: &AgentId) -> Result<Option<Agent>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, worktree_id, name, status, archived, pinned, kind, claude_session_id, sort_order, status_changed_at, model, effort, archived_at FROM agents WHERE id = ?1",
+            "SELECT id, worktree_id, name, status, archived, pinned, kind, claude_session_id, sort_order, status_changed_at, model, effort, archived_at, orchestrator FROM agents WHERE id = ?1",
         )?;
         let mut rows = stmt.query(params![id.as_str()])?;
         Ok(rows.next()?.map(|r| Agent {
@@ -898,6 +954,7 @@ impl Store {
             session_id: r.get(7).unwrap(),
             sort_order: r.get(8).unwrap(),
             status_changed_at: r.get(9).unwrap(),
+            orchestrator: r.get::<_, i64>(13).unwrap() != 0,
             model: r.get(10).unwrap(),
             effort: r.get(11).unwrap(),
             archived_at: r.get(12).unwrap(),
@@ -950,7 +1007,7 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let worktrees = conn
-            .prepare("SELECT id, project_id, path, branch, is_main, pinned, sort_order FROM worktrees ORDER BY is_main DESC, sort_order, created_at")?
+            .prepare("SELECT id, project_id, path, branch, is_main, pinned, sort_order, created_from FROM worktrees ORDER BY is_main DESC, sort_order, created_at")?
             .query_map([], |r| {
                 Ok(Worktree {
                     id: WorktreeId(r.get(0)?),
@@ -958,6 +1015,7 @@ impl Store {
                     path: PathBuf::from(r.get::<_, String>(2)?),
                     branch: r.get(3)?,
                     is_main: r.get::<_, i64>(4)? != 0,
+                    created_from: r.get(7)?,
                     pinned: r.get::<_, i64>(5)? != 0,
                     sort_order: r.get(6)?,
                 })
@@ -965,7 +1023,7 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let agents = conn
-            .prepare("SELECT id, worktree_id, name, status, archived, pinned, kind, claude_session_id, sort_order, status_changed_at, model, effort, archived_at FROM agents ORDER BY sort_order, created_at")?
+            .prepare("SELECT id, worktree_id, name, status, archived, pinned, kind, claude_session_id, sort_order, status_changed_at, model, effort, archived_at, orchestrator FROM agents ORDER BY sort_order, created_at")?
             .query_map([], |r| {
                 Ok(Agent {
                     id: AgentId(r.get(0)?),
@@ -978,6 +1036,7 @@ impl Store {
                     session_id: r.get(7)?,
                     sort_order: r.get(8)?,
                     status_changed_at: r.get(9)?,
+                    orchestrator: r.get::<_, i64>(13)? != 0,
                     model: r.get(10)?,
                     effort: r.get(11)?,
                     archived_at: r.get(12)?,
@@ -1043,9 +1102,10 @@ mod tests {
         let worktree = Worktree {
             id: WorktreeId::generate(),
             project_id: project.id.clone(),
-            path: "/tmp/demo".into(),
-            branch: "main".into(),
-            is_main: true,
+            path: "/tmp/demo-feature".into(),
+            branch: "feature".into(),
+            is_main: false,
+            created_from: Some("main".into()),
             pinned: false,
             sort_order: 0,
         };
@@ -1064,6 +1124,7 @@ mod tests {
             session_id: Some("sess-123".into()),
             sort_order: 0,
             status_changed_at: 0,
+            orchestrator: false,
             alive: false,
         };
         store.insert_agent(&agent).unwrap();
@@ -1081,6 +1142,7 @@ mod tests {
             session_id: None,
             sort_order: 1,
             status_changed_at: 0,
+            orchestrator: false,
             alive: false,
         };
         store.insert_agent(&codex_agent).unwrap();
@@ -1098,6 +1160,7 @@ mod tests {
             session_id: None,
             sort_order: 2,
             status_changed_at: 0,
+            orchestrator: false,
             alive: false,
         };
         store.insert_agent(&cursor_agent).unwrap();
@@ -1105,6 +1168,7 @@ mod tests {
         let (projects, worktrees, agents, _terms) = store.load_tree().unwrap();
         assert_eq!(projects.len(), 1);
         assert_eq!(worktrees.len(), 1);
+        assert_eq!(worktrees[0].created_from.as_deref(), Some("main"));
         assert_eq!(agents.len(), 3);
         assert_eq!(agents[0].status, AgentStatus::Running);
         assert_eq!(agents[0].kind, AgentKind::Claude);
@@ -1137,6 +1201,7 @@ mod tests {
             path: "/tmp/demo".into(),
             branch: "main".into(),
             is_main: true,
+            created_from: None,
             pinned: false,
             sort_order: 0,
         };
@@ -1232,6 +1297,7 @@ mod tests {
             path: "/tmp/demo".into(),
             branch: "main".into(),
             is_main: true,
+            created_from: None,
             pinned: false,
             sort_order: 0,
         };
@@ -1515,6 +1581,7 @@ mod tests {
             path: "/tmp/p".into(),
             branch: "main".into(),
             is_main: true,
+            created_from: None,
             pinned: false,
             sort_order: 0,
         };
@@ -1533,6 +1600,7 @@ mod tests {
             session_id: None,
             sort_order: 0,
             status_changed_at: 0,
+            orchestrator: false,
             alive: false,
         };
 
@@ -1575,6 +1643,34 @@ mod tests {
         assert!(!store
             .agent_auto_title_pending(&AgentId("ghost".into()))
             .unwrap());
+
+        // Open-note visibility from an agent's seat: its worktree's undone
+        // notes plus the project's; done notes and unknown agents count 0.
+        let a1 = AgentId("a1".into());
+        assert_eq!(store.open_note_count_for_agent(&a1).unwrap(), 0);
+        let note = |owner: NoteOwner, done: bool| Note {
+            id: NoteId::generate(),
+            owner,
+            text: "n".into(),
+            done,
+            sort_order: 0,
+        };
+        store
+            .insert_note(&note(NoteOwner::Project(project.id.clone()), false))
+            .unwrap();
+        store
+            .insert_note(&note(NoteOwner::Worktree(wt.id.clone()), false))
+            .unwrap();
+        store
+            .insert_note(&note(NoteOwner::Worktree(wt.id.clone()), true))
+            .unwrap();
+        assert_eq!(store.open_note_count_for_agent(&a1).unwrap(), 2);
+        assert_eq!(
+            store
+                .open_note_count_for_agent(&AgentId("ghost".into()))
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -1598,6 +1694,7 @@ mod tests {
             path: "/tmp/demo".into(),
             branch: "main".into(),
             is_main: true,
+            created_from: None,
             pinned: false,
             sort_order: 0,
         };
@@ -1640,6 +1737,7 @@ mod tests {
             path: "/tmp/p".into(),
             branch: "main".into(),
             is_main: true,
+            created_from: None,
             pinned: false,
             sort_order: 0,
         };
@@ -1664,6 +1762,7 @@ mod tests {
                     session_id: None,
                     sort_order: 0,
                     status_changed_at: 0,
+                    orchestrator: false,
                     alive: false,
                 })
                 .unwrap();

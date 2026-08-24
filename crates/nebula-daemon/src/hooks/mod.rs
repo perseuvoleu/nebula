@@ -32,18 +32,53 @@ request, unquoted (example: nebula rename Fix Login Redirect). If it reports \
 the session is already titled, accept that and move on. Then continue with \
 the request. Don't mention the rename to the user.";
 
-/// The instruction as a UserPromptSubmit hook's stdout. Codex only reads
+/// Open-notes pointer, injected on every prompt while the agent's project
+/// or worktree has undone notes. Tells the agent the notes CLI exists —
+/// nothing more; reading or acting on them stays the agent's call.
+pub fn notes_instruction(open: usize) -> String {
+    format!(
+        "[nebula] This project has {open} open note{} — the user's running \
+         to-do list. Read them with `nebula notes`; `nebula notes add <text>` \
+         adds one, `nebula notes done <n>` checks one off (do that when your \
+         work completes one). Bring one up only when it's relevant to the \
+         user's request.",
+        if open == 1 { "" } else { "s" }
+    )
+}
+
+/// Standing instructions for a project orchestrator, injected on every
+/// prompt (so they survive context compaction). Kept compact — this rides
+/// along with the user's message each turn.
+pub const ORCHESTRATOR_INSTRUCTION: &str = "[nebula] This session is the \
+project's ORCHESTRATOR. You manage the project by creating worktrees and \
+delegating work to agent sessions via shell commands (pre-authorized):\n\n  \
+nebula worktree new <name> [--from <ref>]\n  \
+nebula agent new --worktree <branch> [--kind claude|codex|cursor|pi] \
+[--model M] [--effort E] --prompt \"<task>\"\n  \
+nebula agent list   # your workers, with status, as JSON\n\nRules: stay in \
+the root checkout — never cd into worktrees, spawn workers there instead; \
+split independent work across worktrees so workers don't collide; check \
+`nebula agent list` before reporting progress. Statuses: running = busy, \
+needs_feedback = waiting on a human, finished = turn done. The user watches \
+everything in nebula's panels — keep each worker's task small and \
+well-scoped.";
+
+/// Instructions as a UserPromptSubmit hook's stdout. Codex only reads
 /// injected context out of this JSON envelope (its hook output schema is
 /// strict — bare text is discarded); Claude Code documents the same shape
 /// as the equivalent of bare text, so both CLIs share one body.
-pub fn auto_title_injection() -> String {
+pub fn context_injection(parts: &[String]) -> String {
     serde_json::json!({
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
-            "additionalContext": AUTO_TITLE_INSTRUCTION,
+            "additionalContext": parts.join("\n\n"),
         }
     })
     .to_string()
+}
+
+pub fn auto_title_injection() -> String {
+    context_injection(&[AUTO_TITLE_INSTRUCTION.to_string()])
 }
 
 #[derive(Clone)]
@@ -172,6 +207,10 @@ pub async fn start_hook_server(
         .route("/api/hooks/claude", post(receive_injectable_hook))
         .route("/api/hooks/codex", post(receive_injectable_hook))
         .route("/api/hooks/cursor", post(receive_plain_hook))
+        // Pi's nebula extension reads the response body of its
+        // UserPromptSubmit POST and re-injects it as a custom context
+        // message, so it takes the injectable route like claude/codex.
+        .route("/api/hooks/pi", post(receive_injectable_hook))
         .with_state(state);
 
     tokio::spawn(async move {
@@ -242,6 +281,7 @@ mod tests {
                 path: "/tmp/p".into(),
                 branch: "main".into(),
                 is_main: true,
+                created_from: None,
                 pinned: false,
                 sort_order: 0,
             })
@@ -260,6 +300,7 @@ mod tests {
             session_id: None,
             sort_order: 0,
             status_changed_at: 0,
+            orchestrator: false,
             alive: false,
         };
         store
@@ -513,17 +554,34 @@ async fn receive_hook(
         .await;
 
     if injectable {
-        // Prompt submitted on a still-untitled session: hand the CLI the
-        // titling instruction. Unknown ids (prewarm, stale env) and store
-        // errors degrade to no injection.
-        let inject = state
+        // Titling instruction while the session is untitled, plus the
+        // open-notes pointer while the project/worktree has undone notes.
+        // Unknown ids (prewarm, stale env) and store errors degrade to no
+        // injection.
+        let mut parts = Vec::new();
+        if state
             .store
             .agent_auto_title_pending(&agent_id)
-            .unwrap_or(false);
-        let body = if inject {
-            auto_title_injection()
-        } else {
+            .unwrap_or(false)
+        {
+            parts.push(AUTO_TITLE_INSTRUCTION.to_string());
+        }
+        // Orchestrators get their cheat-sheet every prompt: it must
+        // survive context compaction mid-project.
+        if state.store.agent_is_orchestrator(&agent_id).unwrap_or(false) {
+            parts.push(ORCHESTRATOR_INSTRUCTION.to_string());
+        }
+        let open = state
+            .store
+            .open_note_count_for_agent(&agent_id)
+            .unwrap_or(0);
+        if open > 0 {
+            parts.push(notes_instruction(open));
+        }
+        let body = if parts.is_empty() {
             String::new()
+        } else {
+            context_injection(&parts)
         };
         return (StatusCode::OK, body);
     }

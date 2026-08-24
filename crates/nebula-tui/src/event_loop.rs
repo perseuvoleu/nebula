@@ -98,13 +98,15 @@ const SWEEP_FRAME: Duration = crate::app::SWEEP_FRAME;
 
 /// `Some(entry)` = quit via the hosts picker: the caller should exec
 /// `nebula ssh` at it now that the terminal is restored.
-pub async fn run_app() -> Result<Option<crate::hosts::HostEntry>> {
+pub async fn run_app(
+    open_at: Option<std::path::PathBuf>,
+) -> Result<Option<crate::hosts::HostEntry>> {
     let conn = ipc::connect_or_spawn().await?;
     let mut channels = ipc::split_connection(conn);
     channels.tx.send(ClientRequest::Subscribe).await?;
 
     let mut terminal = setup_terminal()?;
-    let result = main_loop(&mut terminal, &mut channels).await;
+    let result = main_loop(&mut terminal, &mut channels, open_at).await;
     restore_terminal();
     result
 }
@@ -172,8 +174,10 @@ pub fn restore_terminal() {
 async fn main_loop(
     terminal: &mut Terminal<CrosstermBackend<BufWriter<Stdout>>>,
     channels: &mut ipc::IpcChannels,
+    open_at: Option<std::path::PathBuf>,
 ) -> Result<Option<crate::hosts::HostEntry>> {
     let mut app = App::new();
+    app.open_at = open_at;
     app.conn = ConnState::Connected;
     let cfg = crate::config::Config::load();
     app.recent_window_ms = cfg.recent_window_ms();
@@ -523,6 +527,7 @@ fn restore_ui_state(app: &mut App, json: &str) {
             .iter()
             .position(|w| w.id.as_str() == wid)
         {
+            app.sel_orchestrator = None;
             app.sel_worktree = i;
         }
     }
@@ -731,6 +736,40 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             app.focus = Focus::Sessions;
             return;
         }
+        // "New agent" and "Notes" are the panel chords that still fire
+        // inside a locked session — spawning a sibling agent or jotting a
+        // note shouldn't require unlocking first. Only their ⌘-modified
+        // chords qualify: anything a child app could plausibly want
+        // (plain N, plain E, ^n, …) keeps forwarding.
+        if chord.mods.contains(crossterm::event::KeyModifiers::SUPER) {
+            match app.keymap.lookup(crate::keymap::Scope::Global, &chord) {
+                Some(crate::keymap::Action::NewAgent) => {
+                    app.collapsed = false;
+                    app.term_locked = false;
+                    app.focus = Focus::Sessions;
+                    new_agent_shortcut(app);
+                    return;
+                }
+                Some(crate::keymap::Action::Notes) => {
+                    app.collapsed = false;
+                    app.term_locked = false;
+                    app.focus = Focus::Sessions;
+                    open_note_view(app);
+                    return;
+                }
+                Some(crate::keymap::Action::CloseSession) => {
+                    let attached = app.term.as_ref().map(|t| t.sref.clone());
+                    app.collapsed = false;
+                    app.term_locked = false;
+                    app.focus = Focus::Sessions;
+                    if let Some(sref) = attached {
+                        close_session(app, sref, out);
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
         let exited = app.term.as_ref().is_some_and(|t| t.exited);
         if !exited {
             if let Some(term) = &mut app.term {
@@ -871,7 +910,24 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 }
                 _ => app.focus = Focus::Worktrees,
             },
-            Focus::Worktrees => app.focus = Focus::Sessions,
+            // Enter on an orchestrator row walks into its terminal (it is
+            // a session, not a container); on the empty section's
+            // "+ new orchestrator" row it creates the first one; a
+            // worktree row drills right.
+            Focus::Worktrees => match app.selected_orchestrator() {
+                Some(orch) => {
+                    let sref = SessionRef::Agent(orch.id.clone());
+                    attach(app, sref, out);
+                    app.focus = Focus::Terminal;
+                    app.term_locked = true;
+                }
+                None if app.on_orchestrator_placeholder() => {
+                    if let Some(p) = app.selected_project().map(|p| p.id.clone()) {
+                        open_new_orchestrator_picker(app, p);
+                    }
+                }
+                None => app.focus = Focus::Sessions,
+            },
             Focus::Sessions => attach_selected(app, out),
             Focus::Terminal => {
                 // Lock input into an already-focused live pane.
@@ -886,10 +942,16 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         Action::New if !app.tree.has_visible_projects() => open_prompt(app, PromptKind::AddProject),
         Action::New => match app.focus {
             Focus::Projects => open_prompt(app, PromptKind::AddProject),
+            // `n` follows the panel's split: in the ORCHESTRATORS section
+            // it spawns an orchestrator, on a worktree row a worktree.
             Focus::Worktrees => {
                 if let Some(p) = app.selected_project() {
                     let project = p.id.clone();
-                    open_new_worktree_prompt(app, project);
+                    if app.in_orchestrator_section() {
+                        open_new_orchestrator_picker(app, project);
+                    } else {
+                        open_new_worktree_prompt(app, project);
+                    }
                 }
             }
             Focus::Sessions => {
@@ -900,6 +962,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             }
             Focus::Terminal => {}
         },
+        Action::NewAgent => new_agent_shortcut(app),
         Action::Rename => match app.focus {
             Focus::Sessions => match app.selected_session_row() {
                 Some(SessionRow::Agent(a)) => {
@@ -919,6 +982,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             }
             _ => {}
         },
+        Action::CloseSession => close_session_shortcut(app, out),
         Action::Archive => {
             if app.focus == Focus::Sessions {
                 match app.selected_session_row() {
@@ -985,9 +1049,13 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         }
         // Workspace switcher: pick which workspace is open. The focus
         // guard keeps it out of an unlocked terminal pane — but under the
-        // splash there is no pane on screen, so it always opens there.
+        // splash preview, or in an empty workspace (no pane to speak of),
+        // it always opens.
         Action::Workspaces => {
-            if app.focus != Focus::Terminal || app.splash_showing() {
+            if app.focus != Focus::Terminal
+                || app.splash_showing()
+                || !app.tree.has_visible_projects()
+            {
                 open_workspace_picker(app);
             }
         }
@@ -999,6 +1067,16 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                     &app.tree,
                     app.show_archived,
                     crate::config::Config::load().palette_enter_attaches,
+                )));
+            }
+        }
+        // Sessions-only flavor (⌘K in the ng Ghostty overlay): search just
+        // the agent sessions; Enter attaches.
+        Action::SessionPalette => {
+            if app.focus != Focus::Terminal {
+                app.overlay = Some(Overlay::Palette(Palette::sessions(
+                    &app.tree,
+                    app.show_archived,
                 )));
             }
         }
@@ -1630,6 +1708,45 @@ fn handle_vim_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+/// ⌘W: close the selected session, from any panel. An agent is archived —
+/// its PTY is released and `u` restores it — so no confirm; a shell
+/// terminal keeps the close confirm (its shell dies for good).
+fn close_session_shortcut(app: &mut App, out: &mut Vec<ClientRequest>) {
+    match app.selected_session_row() {
+        Some(SessionRow::Agent(a)) if !a.archived => {
+            close_session(app, SessionRef::Agent(a.id), out);
+        }
+        Some(SessionRow::Agent(_)) => {
+            app.flash = Some("session already closed (archived)".into());
+        }
+        Some(SessionRow::Terminal(t)) => close_session(app, SessionRef::Terminal(t.id), out),
+        Some(SessionRow::Link(_)) => {
+            app.flash = Some("links aren't sessions — d deletes them".into());
+        }
+        None => {}
+    }
+}
+
+/// Close one session by ref — the shared tail of ⌘W from a panel and ⌘W
+/// inside a locked terminal (which closes the attached session).
+fn close_session(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
+    match sref {
+        SessionRef::Agent(id) => {
+            archive_agent(app, id, out);
+            app.flash = Some("session closed — u restores it".into());
+        }
+        SessionRef::Terminal(id) => {
+            if let Some(t) = app.tree.terminals.iter().find(|t| t.id == id).cloned() {
+                app.overlay = Some(Overlay::Confirm(ConfirmDialog {
+                    title: "Close terminal".into(),
+                    message: format!("Close terminal '{}'? Its shell is killed.", t.name),
+                    action: PendingAction::CloseTerminal(id),
+                }));
+            }
+        }
+    }
+}
+
 /// Archive is cheap to undo (u), so it skips the confirm dialog.
 fn archive_agent(app: &mut App, id: AgentId, out: &mut Vec<ClientRequest>) {
     detach_if_attached(app, &SessionRef::Agent(id.clone()), out);
@@ -1938,6 +2055,13 @@ fn menu_items_for_session(a: &nebula_core::Agent) -> Vec<MenuItem> {
                 action: MenuAction::SetAgentPinned(a.id.clone(), !a.pinned),
                 destructive: false,
             },
+            // Root-checkout sessions can be promoted in place; the daemon
+            // refuses (with a clear flash) for sessions on other worktrees.
+            MenuItem {
+                label: "Make orchestrator".into(),
+                action: MenuAction::SetAgentOrchestrator(a.id.clone(), true),
+                destructive: false,
+            },
             MenuItem {
                 label: "Rename".into(),
                 action: MenuAction::RenameAgent(a.id.clone()),
@@ -2039,7 +2163,43 @@ fn open_menu(app: &mut App, items: Vec<MenuItem>, at: (u16, u16)) {
 /// creates it right there; the terminal is created immediately.
 /// Claude/Codex rows expand (→) into model and effort submenus; Enter
 /// anywhere takes the configured defaults for whatever wasn't drilled into.
+/// The dedicated "New agent" chord (cmd+n by default): the new-session
+/// picker for the selected worktree, no matter which panel has focus.
+fn new_agent_shortcut(app: &mut App) {
+    if !app.tree.has_visible_projects() {
+        open_prompt(app, PromptKind::AddProject);
+        return;
+    }
+    match app.selected_worktree() {
+        Some(w) => {
+            let worktree = w.id.clone();
+            open_new_agent_picker(app, worktree);
+        }
+        None => app.flash = Some("select a worktree first — cmd+n spawns the agent there".into()),
+    }
+}
+
 fn open_new_agent_picker(app: &mut App, worktree: WorktreeId) {
+    open_agent_picker(app, worktree, false)
+}
+
+/// The orchestrator flavor of the same picker: kind → model/effort → name,
+/// identical to sessions, minus the shell-terminal row (an orchestrator is
+/// an agent by definition).
+fn open_new_orchestrator_picker(app: &mut App, project: nebula_core::ProjectId) {
+    let root = app
+        .tree
+        .worktrees
+        .iter()
+        .find(|w| w.project_id == project && w.is_main)
+        .map(|w| w.id.clone());
+    match root {
+        Some(worktree) => open_agent_picker(app, worktree, true),
+        None => app.flash = Some("project has no root checkout".into()),
+    }
+}
+
+fn open_agent_picker(app: &mut App, worktree: WorktreeId, orchestrator: bool) {
     let kind_row = |label: &str, kind: AgentKind| MenuItem {
         label: label.into(),
         action: MenuAction::NewAgentOfKind {
@@ -2047,21 +2207,30 @@ fn open_new_agent_picker(app: &mut App, worktree: WorktreeId) {
             kind,
             model: None,
             effort: None,
+            orchestrator,
         },
         destructive: false,
     };
+    let mut items = vec![
+        kind_row("Claude", AgentKind::Claude),
+        kind_row("Codex", AgentKind::Codex),
+        kind_row("Cursor", AgentKind::Cursor),
+        kind_row("Pi", AgentKind::Pi),
+    ];
+    if !orchestrator {
+        items.push(MenuItem {
+            label: "Terminal (shell)".into(),
+            action: MenuAction::NewTerminal(worktree),
+            destructive: false,
+        });
+    }
     app.overlay = Some(Overlay::Menu(ContextMenu {
-        title: Some("New session".into()),
-        items: vec![
-            kind_row("Claude", AgentKind::Claude),
-            kind_row("Codex", AgentKind::Codex),
-            kind_row("Cursor", AgentKind::Cursor),
-            MenuItem {
-                label: "Terminal (shell)".into(),
-                action: MenuAction::NewTerminal(worktree),
-                destructive: false,
-            },
-        ],
+        title: Some(if orchestrator {
+            "New orchestrator".into()
+        } else {
+            "New session".into()
+        }),
+        items,
         at: None,
         hover: 0,
         area: ratatui::layout::Rect::default(),
@@ -2079,6 +2248,7 @@ fn build_submenu(item: &MenuItem) -> Option<ContextMenu> {
         worktree,
         kind,
         model,
+        orchestrator,
         ..
     } = &item.action
     else {
@@ -2117,6 +2287,7 @@ fn build_submenu(item: &MenuItem) -> Option<ContextMenu> {
                     SubmenuKind::Models => None,
                     SubmenuKind::Efforts => Some((*choice).to_string()),
                 },
+                orchestrator: *orchestrator,
             },
             destructive: false,
         })
@@ -2137,6 +2308,7 @@ fn kind_label(kind: AgentKind) -> &'static str {
         AgentKind::Claude => "Claude",
         AgentKind::Codex => "Codex",
         AgentKind::Cursor => "Cursor",
+        AgentKind::Pi => "Pi",
     }
 }
 
@@ -2272,6 +2444,14 @@ fn open_context_menu_for_selection(app: &mut App) {
                     MenuItem {
                         label: "New worktree".into(),
                         action: MenuAction::NewWorktree(p.id.clone()),
+                        destructive: false,
+                    },
+                );
+                items.insert(
+                    1,
+                    MenuItem {
+                        label: "New orchestrator".into(),
+                        action: MenuAction::NewOrchestrator(p.id.clone()),
                         destructive: false,
                     },
                 );
@@ -2494,10 +2674,23 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
             }
             KeyCode::Enter => {
                 // Enter on a highlighted listing row adds that directory;
-                // on the input row it submits the typed path as before.
+                // on the input row it submits the typed path — unless the
+                // typed text is a fuzzy query rather than a real path, in
+                // which case the best match wins. Without this, searching
+                // "nebula desktop" would offer to *create* that literal
+                // path. Create-a-new-dir still works: a name matching
+                // nothing keeps the typed text and hits the confirm.
                 let mut prompt = prompt.clone();
                 if let Some(path) = prompt.hovered_path() {
                     prompt.input.set_text(path);
+                } else if prompt.completes_paths()
+                    && !shellexpand_home(prompt.input.trim()).exists()
+                {
+                    if let Some(top) = prompt.dirs.first() {
+                        let (parent, _) = crate::completion::split_input(&prompt.input);
+                        let path = format!("{parent}{}", top.name);
+                        prompt.input.set_text(path);
+                    }
                 }
                 app.overlay = None;
                 submit_prompt(app, prompt, out);
@@ -3243,12 +3436,28 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
             } else {
                 branch
             };
+            // Branch from the worktree the user selected, not from the
+            // project's root checkout. Detached worktrees expose their HEAD
+            // as `detached @ <hash>`; Git accepts that hash as the base ref.
+            let base = app
+                .selected_worktree()
+                .filter(|worktree| worktree.project_id == project)
+                .and_then(|worktree| {
+                    worktree
+                        .branch
+                        .strip_prefix("detached @ ")
+                        .map(str::to_owned)
+                        .or_else(|| {
+                            (worktree.branch != "(detached)")
+                                .then(|| worktree.branch.clone())
+                        })
+                });
             let req_id = app.alloc_req_id(PendingIntent::SelectCreatedWorktree);
             out.push(ClientRequest::CreateWorktree {
                 req_id,
                 project,
                 branch,
-                base: None,
+                base,
             });
         }
         PromptKind::NewAgent {
@@ -3256,7 +3465,8 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
             kind,
             model,
             effort,
-        } => create_agent(app, worktree, kind, model, effort, value, out),
+            orchestrator,
+        } => create_agent(app, worktree, kind, model, effort, value, orchestrator, out),
         PromptKind::RenameAgent { id } => {
             let req_id = app.alloc_req_id(PendingIntent::None);
             out.push(ClientRequest::RenameAgent {
@@ -3465,6 +3675,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             kind,
             model,
             effort,
+            orchestrator,
         } => {
             // Resolve the picker's choice against the configured defaults:
             // an unexpanded submenu (None) and the explicit "default" row
@@ -3483,7 +3694,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             // warm slot gets adopted where it matches, and the refill
             // behind the create re-warms it either way.
             if cfg.skip_session_naming {
-                create_agent(app, worktree, kind, model, effort, String::new(), out);
+                create_agent(app, worktree, kind, model, effort, String::new(), orchestrator, out);
                 return;
             }
             // Warm the CLI while the user types the name: the daemon
@@ -3502,6 +3713,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                     kind,
                     model,
                     effort,
+                    orchestrator,
                 },
             )
         }
@@ -3531,6 +3743,15 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                     action: PendingAction::DeleteWorktree(id),
                 }));
             }
+        }
+        MenuAction::NewOrchestrator(project) => open_new_orchestrator_picker(app, project),
+        MenuAction::SetAgentOrchestrator(id, orchestrator) => {
+            let req_id = app.alloc_req_id(PendingIntent::None);
+            out.push(ClientRequest::SetAgentOrchestrator {
+                req_id,
+                id,
+                orchestrator,
+            });
         }
         MenuAction::AddProject => open_prompt(app, PromptKind::AddProject),
         MenuAction::OpenWorkspace(id) => {
@@ -3735,10 +3956,13 @@ fn remember_context(app: &mut App) {
 /// After a project switch: land on the project's remembered worktree (its
 /// main checkout otherwise), then re-show that worktree's session.
 fn restore_context(app: &mut App, out: &mut Vec<ClientRequest>) {
+    // A project switch lands on a worktree row (the remembered one, else
+    // the root checkout), never inside the orchestrator section.
+    app.sel_orchestrator = None;
     app.sel_worktree = 0;
     if let Some(pid) = app.selected_project().map(|p| p.id.clone()) {
         if let Some(wid) = app.last_worktree_for_project.get(&pid).cloned() {
-            if let Some(i) = app.visible_worktrees().iter().position(|w| w.id == wid) {
+            if let Some(i) = app.worktree_row_index(&wid) {
                 app.sel_worktree = i;
             }
         }
@@ -3753,6 +3977,13 @@ fn restore_session(app: &mut App, out: &mut Vec<ClientRequest>) {
     app.sel_session = 0;
     schedule_prewarm(app);
     schedule_pr_lookup(app);
+    // An orchestrator row previews the orchestrator's own terminal — it
+    // has no worktree context to restore.
+    if let Some(orch) = app.selected_orchestrator() {
+        let sref = SessionRef::Agent(orch.id.clone());
+        attach(app, sref, out);
+        return;
+    }
     let remembered = app
         .selected_worktree()
         .and_then(|w| app.last_session_for_worktree.get(&w.id).cloned());
@@ -3835,16 +4066,81 @@ fn select_worktree_by_id(
     id: &nebula_core::WorktreeId,
     out: &mut Vec<ClientRequest>,
 ) -> bool {
-    let Some(index) = app.visible_worktrees().iter().position(|w| &w.id == id) else {
+    let Some(index) = app.worktree_row_index(id) else {
         return false;
     };
-    if app.sel_worktree != index {
+    if app.sel_worktree != index || app.sel_orchestrator.is_some() {
         remember_context(app);
+        app.sel_orchestrator = None;
         app.sel_worktree = index;
         restore_session(app, out);
     }
     // Land on the sessions panel so `n` immediately creates a session here.
     app.focus = Focus::Sessions;
+    true
+}
+
+/// `nebula open <dir>` (the `ng` launcher): land the selection on whatever
+/// owns `dir` — the deepest known worktree containing it, else the project
+/// whose root contains it, else add the repo as a project and select it
+/// when the Ack lands. A directory outside any git repo opens the TUI
+/// as-is with a flash instead of a daemon error.
+fn land_open_at(app: &mut App, dir: &std::path::Path, out: &mut Vec<ClientRequest>) {
+    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let in_open_workspace = |app: &App, id: &nebula_core::ProjectId| {
+        app.tree
+            .projects
+            .iter()
+            .any(|p| &p.id == id && app.tree.in_active_workspace(p))
+    };
+    // Deepest worktree wins — a linked worktree can nest under the root.
+    let worktree = app
+        .tree
+        .worktrees
+        .iter()
+        .filter(|w| dir.starts_with(&w.path) && in_open_workspace(app, &w.project_id))
+        .max_by_key(|w| w.path.as_os_str().len())
+        .map(|w| w.id.clone());
+    if let Some(id) = worktree {
+        jump_to_target(app, PaletteTarget::Worktree(id), false, out);
+        return;
+    }
+    // Projects too: sibling-layout worktrees live outside the root, so a
+    // dir can be in the project without being in any known worktree.
+    let project = app
+        .tree
+        .projects
+        .iter()
+        .filter(|p| app.tree.in_active_workspace(p) && dir.starts_with(&p.repo_path))
+        .max_by_key(|p| p.repo_path.as_os_str().len())
+        .map(|p| p.id.clone());
+    if let Some(id) = project {
+        jump_to_target(app, PaletteTarget::Project(id), false, out);
+        return;
+    }
+    if !dir.ancestors().any(|a| a.join(".git").exists()) {
+        app.flash = Some(format!("{} is not in a git repo", dir.display()));
+        return;
+    }
+    let req_id = app.alloc_req_id(PendingIntent::SelectAddedProject);
+    out.push(ClientRequest::AddProject {
+        req_id,
+        path: dir,
+        name: None,
+        create_missing: false,
+    });
+}
+
+/// Land on a project added by `nebula open` — jump once its row exists.
+fn select_added_project(
+    app: &mut App,
+    id: &nebula_core::ProjectId,
+    out: &mut Vec<ClientRequest>,
+) -> bool {
+    if !app.tree.projects.iter().any(|p| &p.id == id) {
+        return false;
+    }
+    jump_to_target(app, PaletteTarget::Project(id.clone()), false, out);
     true
 }
 
@@ -3908,13 +4204,12 @@ fn jump_to_target(
                 .find(|w| w.id == id)
                 .map(|w| w.project_id.clone())
                 .is_some_and(|pid| select_project_row_by_id(app, &pid));
-            let index = found
-                .then(|| app.visible_worktrees().iter().position(|w| w.id == id))
-                .flatten();
+            let index = found.then(|| app.worktree_row_index(&id)).flatten();
             let Some(index) = index else {
                 app.flash = Some("worktree no longer exists".into());
                 return;
             };
+            app.sel_orchestrator = None;
             app.sel_worktree = index;
             restore_session(app, out);
             app.focus = Focus::Sessions;
@@ -3935,16 +4230,13 @@ fn jump_to_target(
                     .is_some_and(|pid| select_project_row_by_id(app, &pid))
             });
             let wt_index = found
-                .then(|| {
-                    app.visible_worktrees()
-                        .iter()
-                        .position(|w| Some(&w.id) == worktree.as_ref())
-                })
+                .then(|| worktree.as_ref().and_then(|id| app.worktree_row_index(id)))
                 .flatten();
             let Some(wt_index) = wt_index else {
                 app.flash = Some("session no longer exists".into());
                 return;
             };
+            app.sel_orchestrator = None;
             app.sel_worktree = wt_index;
             let Some(index) = app
                 .visible_session_rows()
@@ -3996,16 +4288,13 @@ fn open_session(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
             .is_some_and(|pid| select_project_row_by_id(app, &pid))
     });
     let wt_index = found
-        .then(|| {
-            app.visible_worktrees()
-                .iter()
-                .position(|w| Some(&w.id) == worktree.as_ref())
-        })
+        .then(|| worktree.as_ref().and_then(|id| app.worktree_row_index(id)))
         .flatten();
     let Some(wt_index) = wt_index else {
         app.flash = Some("session no longer exists".into());
         return;
     };
+    app.sel_orchestrator = None;
     app.sel_worktree = wt_index;
     let Some(index) = app
         .visible_session_rows()
@@ -4022,20 +4311,47 @@ fn open_session(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
 }
 
 fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
+    // The Worktrees panel walks two stacked cursors as one list: the
+    // ORCHESTRATORS section above (its own `sel_orchestrator`), the
+    // worktree rows below (`sel_worktree`, unchanged meaning).
+    if app.focus == Focus::Worktrees {
+        let section = app.orchestrator_section_len();
+        let worktrees = app.visible_worktrees().len();
+        let total = section + worktrees;
+        if total == 0 {
+            return;
+        }
+        let current = match app.sel_orchestrator {
+            Some(i) => i as i64,
+            None => (section + app.sel_worktree) as i64,
+        };
+        let new = (current + delta).clamp(0, total as i64 - 1) as usize;
+        if new == current as usize {
+            return;
+        }
+        app.select_worktree_when_seen = None;
+        remember_context(app);
+        if new < section {
+            app.sel_orchestrator = Some(new);
+        } else {
+            app.sel_orchestrator = None;
+            app.sel_worktree = new - section;
+        }
+        restore_session(app, out);
+        return;
+    }
     let len = match app.focus {
         Focus::Projects => app.project_rows().len(),
-        Focus::Worktrees => app.visible_worktrees().len(),
         Focus::Sessions => app.visible_session_rows().len(),
-        Focus::Terminal => return,
+        Focus::Worktrees | Focus::Terminal => return,
     };
     if len == 0 {
         return;
     }
     let sel = match app.focus {
         Focus::Projects => app.sel_project,
-        Focus::Worktrees => app.sel_worktree,
         Focus::Sessions => app.sel_session,
-        Focus::Terminal => return,
+        Focus::Worktrees | Focus::Terminal => return,
     };
     let new = (sel as i64 + delta).clamp(0, len as i64 - 1) as usize;
     if new == sel {
@@ -4056,12 +4372,8 @@ fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
                 restore_context(app, out);
             }
         }
-        Focus::Worktrees => {
-            app.select_worktree_when_seen = None;
-            remember_context(app);
-            app.sel_worktree = new;
-            restore_session(app, out);
-        }
+        // Handled by the two-cursor walk above.
+        Focus::Worktrees => unreachable!("worktrees navigation returns early"),
         Focus::Sessions => {
             app.sel_session = new;
             preview_selected(app, out);
@@ -4211,6 +4523,7 @@ fn fire_pending_prewarm(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// prompt) — that's what accepting an empty name prompt means, and what
 /// the `skip_session_naming` setting does without asking. A typed name is
 /// the user's choice and stays.
+#[allow(clippy::too_many_arguments)]
 fn create_agent(
     app: &mut App,
     worktree: WorktreeId,
@@ -4218,15 +4531,34 @@ fn create_agent(
     model: Option<String>,
     effort: Option<String>,
     name: String,
+    orchestrator: bool,
     out: &mut Vec<ClientRequest>,
 ) {
     let auto_title = name.is_empty();
-    let name = if auto_title {
-        app.default_session_name("agent")
-    } else {
+    let name = if !auto_title {
         name
+    } else if orchestrator {
+        // Orchestrators number within their own section (they are hidden
+        // from the sessions list `default_session_name` scans).
+        let n = app
+            .tree
+            .agents
+            .iter()
+            .filter(|a| a.worktree_id == worktree && a.orchestrator && !a.archived)
+            .count()
+            + 1;
+        format!("orchestrator-{n}")
+    } else {
+        app.default_session_name("agent")
     };
-    let req_id = app.alloc_req_id(PendingIntent::AttachCreated);
+    // An orchestrator's row lives in the Worktrees panel — its Ack lands
+    // the section cursor there instead of the sessions list.
+    let intent = if orchestrator {
+        PendingIntent::AttachCreatedOrchestrator
+    } else {
+        PendingIntent::AttachCreated
+    };
+    let req_id = app.alloc_req_id(intent);
     out.push(ClientRequest::CreateAgent {
         req_id,
         worktree: worktree.clone(),
@@ -4235,6 +4567,8 @@ fn create_agent(
         model,
         effort,
         auto_title,
+        orchestrator,
+        prompt: None,
     });
     // The create consumes (or, off-spec, discards) the worktree's warm
     // Claude slot; refill it so the next create is instant too.
@@ -5080,13 +5414,31 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     app.focus = Focus::Projects;
                 }
                 Some(HitTarget::Worktree(i)) => {
-                    if app.sel_worktree != i {
+                    if app.sel_worktree != i || app.sel_orchestrator.is_some() {
                         app.select_worktree_when_seen = None;
                         remember_context(app);
+                        app.sel_orchestrator = None;
                         app.sel_worktree = i;
                         restore_session(app, out);
                     }
                     app.focus = Focus::Worktrees;
+                }
+                Some(HitTarget::Orchestrator(i)) => {
+                    app.focus = Focus::Worktrees;
+                    if app.sel_orchestrator != Some(i) {
+                        remember_context(app);
+                        app.sel_orchestrator = Some(i);
+                        restore_session(app, out);
+                    }
+                    // "+ new orchestrator" is a button, not a row — a
+                    // click opens the kind → model → name picker (same
+                    // flow as new sessions); a real orchestrator row is
+                    // selected + previewed, and Enter attaches.
+                    if app.on_orchestrator_placeholder() {
+                        if let Some(p) = app.selected_project().map(|p| p.id.clone()) {
+                            open_new_orchestrator_picker(app, p);
+                        }
+                    }
                 }
                 Some(HitTarget::Session(i)) => {
                     app.sel_session = i;
@@ -5307,7 +5659,38 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                         open_menu_at(app, items, at);
                     }
                 }
+                Some(HitTarget::Orchestrator(i)) => {
+                    app.sel_orchestrator = Some(i);
+                    app.focus = Focus::Worktrees;
+                    if let Some(a) = app.selected_orchestrator() {
+                        let (id, sref) = (a.id.clone(), SessionRef::Agent(a.id.clone()));
+                        let items = vec![
+                            MenuItem {
+                                label: "Attach".into(),
+                                action: MenuAction::Attach(sref),
+                                destructive: false,
+                            },
+                            MenuItem {
+                                label: "Rename".into(),
+                                action: MenuAction::RenameAgent(id.clone()),
+                                destructive: false,
+                            },
+                            MenuItem {
+                                label: "Demote to session".into(),
+                                action: MenuAction::SetAgentOrchestrator(id.clone(), false),
+                                destructive: false,
+                            },
+                            MenuItem {
+                                label: "Delete".into(),
+                                action: MenuAction::DeleteAgent(id),
+                                destructive: true,
+                            },
+                        ];
+                        open_menu_at(app, items, at);
+                    }
+                }
                 Some(HitTarget::Worktree(i)) => {
+                    app.sel_orchestrator = None;
                     app.sel_worktree = i;
                     app.sel_session = 0;
                     app.focus = Focus::Worktrees;
@@ -5440,6 +5823,11 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             // Boot the restored worktree's sessions right away — the first
             // thing the user does after launch is walk into one of them.
             schedule_prewarm(app);
+            // `nebula open <dir>`: the first snapshot is the moment the
+            // tree exists to land on. Reconnect snapshots find None here.
+            if let Some(dir) = app.open_at.take() {
+                land_open_at(app, &dir, out);
+            }
             app.dirty = true;
         }
         ServerEvent::Scrollback { session, data, .. } => {
@@ -5517,11 +5905,31 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                         app.term_locked = true;
                     }
                 }
+                (Some(PendingIntent::AttachCreatedOrchestrator), Some(EntityId::Agent(id))) => {
+                    // Its upsert usually precedes the Ack, so the section
+                    // cursor can land on the new ORCHESTRATORS row now.
+                    if let Some(i) = app
+                        .project_orchestrators()
+                        .iter()
+                        .position(|a| a.id == id)
+                    {
+                        app.sel_orchestrator = Some(i);
+                    }
+                    attach(app, SessionRef::Agent(id), out);
+                    app.focus = Focus::Terminal;
+                    app.term_locked = true;
+                }
                 (Some(PendingIntent::SelectCreatedWorktree), Some(EntityId::Worktree(id))) => {
                     // Its upsert usually lands just before this Ack; if not,
                     // stash the id and select once it does.
                     if !select_worktree_by_id(app, &id, out) {
                         app.select_worktree_when_seen = Some(id);
+                    }
+                }
+                (Some(PendingIntent::SelectAddedProject), Some(EntityId::Project(id))) => {
+                    // Same idiom as the worktree above.
+                    if !select_added_project(app, &id, out) {
+                        app.select_project_when_seen = Some(id);
                     }
                 }
                 (Some(PendingIntent::SelectCreatedNote), Some(EntityId::Note(id))) => {
@@ -5561,6 +5969,12 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             if let Some(wt_id) = app.select_worktree_when_seen.clone() {
                 if select_worktree_by_id(app, &wt_id, out) {
                     app.select_worktree_when_seen = None;
+                }
+            }
+            // ...and onto a project `nebula open` just added.
+            if let Some(pid) = app.select_project_when_seen.clone() {
+                if select_added_project(app, &pid, out) {
+                    app.select_project_when_seen = None;
                 }
             }
             // ...and the note modal's cursor onto a note we just created.
@@ -5937,8 +6351,11 @@ fn reconcile_selection(app: &mut App, before: SelectionSnapshot, out: &mut Vec<C
     }
     if let Some(wid) = &before.worktree {
         if app.selected_worktree().map(|w| w.id.clone()).as_ref() != Some(wid) {
-            match app.visible_worktrees().iter().position(|w| &w.id == wid) {
-                Some(i) => app.sel_worktree = i,
+            match app.worktree_row_index(wid) {
+                Some(i) => {
+                    app.sel_orchestrator = None;
+                    app.sel_worktree = i;
+                }
                 None => {
                     restore_session(app, out);
                     return;
@@ -5985,6 +6402,16 @@ fn clamp_selections(app: &mut App) {
     let wt_len = app.visible_worktrees().len();
     if app.sel_worktree >= wt_len {
         app.sel_worktree = wt_len.saturating_sub(1);
+    }
+    // The section cursor survives shrinks too — and empties out entirely
+    // when no project is selected (no placeholder to sit on).
+    if let Some(i) = app.sel_orchestrator {
+        let section = app.orchestrator_section_len();
+        if section == 0 {
+            app.sel_orchestrator = None;
+        } else if i >= section {
+            app.sel_orchestrator = Some(section - 1);
+        }
     }
     let sess_len = app.visible_session_rows().len();
     if app.sel_session >= sess_len {
@@ -6059,6 +6486,7 @@ mod tests {
                     path: "/tmp/demo".into(),
                     branch: "main".into(),
                     is_main: true,
+                    created_from: None,
                     pinned: false,
                     sort_order: 0,
                 }),
@@ -6081,6 +6509,7 @@ mod tests {
                     session_id: None,
                     sort_order: 0,
                     status_changed_at: 0,
+                    orchestrator: false,
                     alive: true,
                 }),
             },
@@ -6091,24 +6520,315 @@ mod tests {
     /// (wordmark + create hint); the first project upsert swaps the normal
     /// columns back in.
     #[test]
-    fn empty_tree_draws_splash_until_first_project() {
+    fn empty_tree_draws_panels_ready_to_add_a_project() {
         let mut app = App::new();
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
-        assert!(text.contains("create your first project"), "{text}");
         assert!(
-            text.contains("your agents keep running"),
-            "tagline on the splash: {text}"
+            text.contains("PROJECTS"),
+            "panels straight away — no first-run splash screen: {text}"
         );
-        assert!(!text.contains("PROJECTS"), "no panel chrome: {text}");
-        assert!(app.splash_active());
+        assert!(text.contains("no projects yet"), "{text}");
+        assert!(!app.splash_active(), "splash only ever shows as N preview");
 
         seed_tree(&mut app);
-        assert!(!app.splash_active());
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
-        assert!(text.contains("PROJECTS"), "columns back: {text}");
+        assert!(text.contains("PROJECTS"), "columns stay: {text}");
+    }
+
+    /// The Worktrees panel's two stacked cursors: the ORCHESTRATORS
+    /// section (`sel_orchestrator`) above, worktree rows (`sel_worktree`,
+    /// unchanged meaning) below. Enter on an orchestrator attaches; `n`
+    /// creates whatever the cursor's section holds.
+    #[test]
+    fn orchestrators_group_tops_the_worktrees_panel_and_enter_attaches() {
+        use nebula_core::{Agent, AgentStatus, Entity};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(Agent {
+                    id: AgentId("orch".into()),
+                    worktree_id: nebula_core::WorktreeId("w1".into()),
+                    name: "orchestrator-1".into(),
+                    status: AgentStatus::Fresh,
+                    archived: false,
+                    archived_at: 0,
+                    pinned: true,
+                    kind: Default::default(),
+                    model: None,
+                    effort: None,
+                    session_id: None,
+                    sort_order: 0,
+                    status_changed_at: 0,
+                    orchestrator: true,
+                    alive: false,
+                }),
+            },
+        );
+        assert_eq!(app.orchestrator_row_count(), 1);
+        // Not double-listed in the sessions panel (it lives on w1 too).
+        assert!(
+            !app.visible_session_rows()
+                .iter()
+                .any(|r| matches!(r, SessionRow::Agent(a) if a.orchestrator)),
+            "orchestrators keep out of the sessions list"
+        );
+        // Walking up from the first worktree row crosses into the section;
+        // `sel_worktree` keeps meaning "worktree row" untouched.
+        app.focus = Focus::Worktrees;
+        app.sel_worktree = 0;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE, &mut out);
+        assert_eq!(app.sel_orchestrator, Some(0));
+        assert!(app.selected_orchestrator().is_some());
+        assert!(app.selected_worktree().is_none(), "cursor left the list");
+        assert_eq!(app.sel_worktree, 0, "worktree cursor unchanged");
+        // Enter walks straight into the orchestrator's terminal.
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert_eq!(app.focus, Focus::Terminal);
+        assert!(app.term_locked);
+        assert!(
+            app.term.as_ref().is_some_and(
+                |t| t.sref == SessionRef::Agent(AgentId("orch".into()))
+            ),
+            "enter attached the orchestrator"
+        );
+        // Walking back down returns to the worktree rows.
+        app.focus = Focus::Worktrees;
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+        assert_eq!(app.sel_orchestrator, None);
+        assert_eq!(
+            app.selected_worktree().map(|w| w.id.clone()),
+            Some(nebula_core::WorktreeId("w1".into()))
+        );
+
+        // `n` follows the section: worktree prompt below, a new
+        // orchestrator above.
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Prompt(p)) if matches!(p.kind, crate::app::PromptKind::NewWorktree { .. })),
+            "n on a worktree row prompts for a worktree: {:?}",
+            app.overlay
+        );
+        app.overlay = None;
+        press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE, &mut out);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Menu(m)) if m.title.as_deref() == Some("New orchestrator")),
+            "n in the section opens the orchestrator picker: {:?}",
+            app.overlay
+        );
+        app.overlay = None;
+
+        // The panel draws both section headers and the ◆ badge.
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("ORCHESTRATORS"), "{text}");
+        assert!(text.contains("WORKTREES"), "{text}");
+        assert!(text.contains("orchestrator-1"), "{text}");
+    }
+
+    /// Both palettes label orchestrator rows in their searchable text, so
+    /// "orch" in ⌘K narrows straight to the project managers.
+    #[test]
+    fn palettes_label_orchestrators_in_the_search_text() {
+        use nebula_core::Entity;
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut orch = app.tree.agents[0].clone();
+        orch.id = AgentId("orch".into());
+        orch.name = "boss".into();
+        orch.orchestrator = true;
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(orch),
+            },
+        );
+        let palette = crate::app::Palette::sessions(&app.tree, false);
+        let texts: Vec<&str> = palette.items.iter().map(|i| i.text.as_str()).collect();
+        assert!(
+            texts.iter().any(|t| t.contains("boss ◆ orchestrator")),
+            "{texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("demo/main/agent-1")),
+            "plain sessions keep the branch path: {texts:?}"
+        );
+    }
+
+    /// Promoting a session flips it into the ORCHESTRATORS section (and
+    /// out of the sessions list) as soon as its upsert lands; demoting
+    /// flips it back.
+    #[test]
+    fn promoting_a_session_moves_it_between_panels() {
+        use nebula_core::Entity;
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let in_sessions = |app: &App| {
+            app.visible_session_rows()
+                .iter()
+                .any(|r| matches!(r, SessionRow::Agent(a) if a.id == AgentId("a1".into())))
+        };
+        assert!(in_sessions(&app) && app.project_orchestrators().is_empty());
+
+        // The context-menu action asks the daemon…
+        let mut out = Vec::new();
+        run_menu_action(
+            &mut app,
+            crate::app::MenuAction::SetAgentOrchestrator(AgentId("a1".into()), true),
+            &mut out,
+        );
+        assert!(
+            matches!(
+                out.as_slice(),
+                [ClientRequest::SetAgentOrchestrator { orchestrator: true, .. }]
+            ),
+            "{out:?}"
+        );
+        // …and the answering upsert moves the row.
+        let mut promoted = app
+            .tree
+            .agents
+            .iter()
+            .find(|a| a.id == AgentId("a1".into()))
+            .cloned()
+            .unwrap();
+        promoted.orchestrator = true;
+        promoted.pinned = true;
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(promoted.clone()),
+            },
+        );
+        assert!(!in_sessions(&app), "left the sessions list");
+        assert_eq!(app.orchestrator_row_count(), 1, "entered the section");
+
+        promoted.orchestrator = false;
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(promoted),
+            },
+        );
+        assert!(in_sessions(&app), "demoted back to the sessions list");
+        assert!(app.project_orchestrators().is_empty());
+    }
+
+    /// The whole mouse path of the "+ new orchestrator" button: a draw
+    /// registers its hit rect, and a left click on it creates right away
+    /// (it reads as a button, so click must act — no Enter needed).
+    #[test]
+    fn clicking_the_orchestrator_placeholder_creates_one() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let rect = app
+            .hits
+            .iter()
+            .find_map(|(r, t)| matches!(t, HitTarget::Orchestrator(0)).then_some(*r))
+            .expect("placeholder registered a click target");
+        let mut out = Vec::new();
+        handle_mouse(
+            &mut app,
+            mev(
+                MouseEventKind::Down(MouseButton::Left),
+                rect.x + rect.width / 2,
+                rect.y,
+            ),
+            &mut out,
+        );
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Menu(m)) if m.title.as_deref() == Some("New orchestrator")),
+            "click on the + row opens the orchestrator picker: {:?}",
+            app.overlay
+        );
+        // No shell-terminal row — an orchestrator is an agent.
+        if let Some(Overlay::Menu(m)) = &app.overlay {
+            assert!(m.items.iter().all(|i| !i.label.contains("Terminal")));
+        }
+    }
+
+    /// An empty ORCHESTRATORS section keeps one selectable
+    /// "+ new orchestrator" row, so the first one is a k + Enter away.
+    #[test]
+    fn empty_orchestrator_section_offers_a_placeholder_row() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.focus = Focus::Worktrees;
+        app.sel_worktree = 0;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE, &mut out);
+        assert!(app.on_orchestrator_placeholder());
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(buffer_text(&terminal).contains("new orchestrator"));
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Menu(m)) if m.title.as_deref() == Some("New orchestrator")),
+            "enter opens the kind picker: {:?}",
+            app.overlay
+        );
+        // Same chain as sessions: Enter on Claude → name prompt → typed
+        // name → CreateAgent flagged as orchestrator.
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Prompt(p)) if matches!(p.kind, crate::app::PromptKind::NewAgent { orchestrator: true, .. })),
+            "name prompt carries the orchestrator flag: {:?}",
+            app.overlay
+        );
+        for c in "boss".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(
+                out.as_slice(),
+                [ClientRequest::CreateAgent { orchestrator: true, name, auto_title: false, .. }, ..]
+                    if name == "boss"
+            ),
+            "named orchestrator created: {out:?}"
+        );
+    }
+
+    #[test]
+    fn open_at_lands_on_the_owning_worktree_or_adds_the_repo() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        land_open_at(&mut app, std::path::Path::new("/tmp/demo/src"), &mut out);
+        assert_eq!(
+            app.selected_worktree().map(|w| w.id.clone()),
+            Some(nebula_core::WorktreeId("w1".into())),
+            "a subdirectory of the seeded worktree jumps straight to it"
+        );
+        assert_eq!(app.focus, Focus::Sessions);
+
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".git")).unwrap();
+        let mut out = Vec::new();
+        land_open_at(&mut app, repo.path(), &mut out);
+        assert!(
+            matches!(out.as_slice(), [ClientRequest::AddProject { .. }]),
+            "an unknown repo is added as a project: {out:?}"
+        );
+
+        let plain = tempfile::tempdir().unwrap();
+        let mut out = Vec::new();
+        land_open_at(&mut app, plain.path(), &mut out);
+        assert!(out.is_empty(), "not a repo, nothing to add: {out:?}");
+        assert!(app.flash.as_deref().unwrap_or("").contains("git repo"));
     }
 
     /// The animations setting is a master off-switch for both repaint
@@ -6116,11 +6836,13 @@ mod tests {
     #[test]
     fn animations_off_stops_sweep_and_splash_ticking() {
         let mut app = App::new();
-        assert!(app.splash_active(), "empty tree splash ticks by default");
+        app.splash_preview = true;
+        assert!(app.splash_active(), "previewed splash ticks by default");
         app.animations = false;
         assert!(!app.splash_active(), "still splash: drawn but not ticked");
 
         app.animations = true;
+        app.splash_preview = false;
         seed_tree(&mut app);
         assert!(!app.status_anim_active(), "fresh agent doesn't animate");
         app.tree.agents[0].status = nebula_core::AgentStatus::Running;
@@ -6168,9 +6890,9 @@ mod tests {
         assert_eq!(p.kind, crate::app::PromptKind::AddProject);
     }
 
-    /// The splash hides the panels, so the footer drops the panel keymap
-    /// for the handful of keys that still fire under it — and in preview,
-    /// for the only one there is.
+    /// An empty workspace's footer swaps the panel keymap for the
+    /// first-run guidance (add project, workspaces, …) — and the splash
+    /// preview for the only key there is.
     #[test]
     fn splash_footer_lists_only_keys_that_work() {
         let mut app = App::new();
@@ -6208,9 +6930,9 @@ mod tests {
         assert!(buffer_text(&terminal).contains("m: menu"));
     }
 
-    /// `w` is one of the splash's advertised keys, so it opens the
-    /// workspace picker from any focus while the splash is up — including
-    /// the terminal focus its guard normally excludes.
+    /// `w` is one of the empty workspace's advertised keys, so it opens
+    /// the workspace picker from any focus while the tree is empty —
+    /// including the terminal focus its guard normally excludes.
     #[test]
     fn w_opens_workspace_picker_from_any_focus_under_splash() {
         let mut app = App::new();
@@ -6563,6 +7285,7 @@ mod tests {
                     path: "/tmp/demo-w2".into(),
                     branch: "feature".into(),
                     is_main: false,
+                    created_from: None,
                     pinned: false,
                     sort_order: 1,
                 }),
@@ -6792,6 +7515,7 @@ mod tests {
                     path: "/tmp/demo-w2".into(),
                     branch: "feature".into(),
                     is_main: false,
+                    created_from: None,
                     pinned: false,
                     sort_order: 1,
                 }),
@@ -6863,6 +7587,7 @@ mod tests {
                     kind: AgentKind::Claude,
                     model: Some("opus".into()),
                     effort: Some("high".into()),
+                    orchestrator: false,
                 },
             )));
             let mut out = Vec::new();
@@ -7002,7 +7727,11 @@ mod tests {
         use nebula_core::{Agent, AgentKind, AgentStatus, Entity};
         let mut app = App::new();
         seed_tree(&mut app); // agent-1, claude
-        for (i, kind) in [(2, AgentKind::Codex), (3, AgentKind::Cursor)] {
+        for (i, kind) in [
+            (2, AgentKind::Codex),
+            (3, AgentKind::Cursor),
+            (4, AgentKind::Pi),
+        ] {
             hse(
                 &mut app,
                 ServerEvent::EntityUpserted {
@@ -7020,6 +7749,7 @@ mod tests {
                         session_id: None,
                         sort_order: i,
                         status_changed_at: 0,
+                        orchestrator: false,
                         alive: true,
                     }),
                 },
@@ -7033,6 +7763,7 @@ mod tests {
             ("agent-1", "claude"),
             ("agent-2", "codex"),
             ("agent-3", "cursor"),
+            ("agent-4", "pi"),
         ] {
             assert!(
                 text.contains(&format!("{name} {kind}")),
@@ -7075,6 +7806,7 @@ mod tests {
                     session_id: None,
                     sort_order: 1,
                     status_changed_at: 0,
+                    orchestrator: false,
                     alive: true,
                 }),
             },
@@ -7107,6 +7839,7 @@ mod tests {
                 path: "/tmp/demo-worktrees/feat".into(),
                 branch: "feat".into(),
                 is_main: false,
+                created_from: None,
                 pinned,
                 sort_order: 0,
             }),
@@ -7174,6 +7907,7 @@ mod tests {
                 session_id: None,
                 sort_order: sort,
                 status_changed_at: changed_at,
+                orchestrator: false,
                 alive: true,
             }),
         };
@@ -7232,6 +7966,7 @@ mod tests {
                     session_id: None,
                     sort_order: sort,
                     status_changed_at: changed_at,
+                    orchestrator: false,
                     alive: true,
                 }),
             }
@@ -7300,6 +8035,7 @@ mod tests {
                     session_id: None,
                     sort_order: sort,
                     status_changed_at: at,
+                    orchestrator: false,
                     alive: true,
                 }),
             }
@@ -7398,6 +8134,7 @@ mod tests {
                     session_id: None,
                     sort_order: 1,
                     status_changed_at: crate::app::now_ms() - 23 * 60_000,
+                    orchestrator: false,
                     alive: true,
                 }),
             },
@@ -7459,6 +8196,7 @@ mod tests {
                     session_id: None,
                     sort_order: 1,
                     status_changed_at: 0,
+                    orchestrator: false,
                     alive: true,
                 }),
             },
@@ -7505,6 +8243,7 @@ mod tests {
                     path: "/tmp/demo-feature".into(),
                     branch: "feature".into(),
                     is_main: false,
+                    created_from: None,
                     pinned: false,
                     sort_order: 0,
                 }),
@@ -7527,6 +8266,7 @@ mod tests {
                     session_id: None,
                     sort_order: 0,
                     status_changed_at: 0,
+                    orchestrator: false,
                     alive: true,
                 }),
             },
@@ -7632,6 +8372,60 @@ mod tests {
         assert_eq!(
             p.input,
             format!("{}/workspace/nebula/", tmp.path().display())
+        );
+    }
+
+    /// A fuzzy query with no hover isn't a path — Enter takes the top
+    /// match instead of offering to create the literal "nebula desktop"
+    /// (the bug: searching used to hit the create-directory confirm).
+    #[test]
+    fn enter_on_a_fuzzy_query_adds_the_top_match_not_a_new_dir() {
+        use crate::app::{Overlay, PromptDialog, PromptKind};
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("Desktop/nebula/.git")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("Desktop/other")).unwrap();
+
+        let mut app = App::new();
+        let mut out = Vec::new();
+        app.overlay = Some(Overlay::Prompt(PromptDialog::new(
+            "Add project",
+            "path",
+            format!("{}/", tmp.path().display()),
+            PromptKind::AddProject,
+        )));
+        for c in "nebula desktop".chars() {
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+                &mut out,
+            );
+        }
+        let Some(Overlay::Prompt(p)) = &app.overlay else {
+            panic!("prompt closed")
+        };
+        assert_eq!(
+            dir_names(p),
+            vec!["Desktop/nebula"],
+            "word order doesn't matter"
+        );
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut out,
+        );
+        assert!(
+            !matches!(&app.overlay, Some(Overlay::Confirm(_))),
+            "no create-dir offer for a query: {:?}",
+            app.overlay
+        );
+        assert!(
+            matches!(
+                out.as_slice(),
+                [ClientRequest::AddProject { path, create_missing: false, .. }]
+                    if path.ends_with("Desktop/nebula")
+            ),
+            "{out:?}"
         );
     }
 
@@ -7762,6 +8556,67 @@ mod tests {
     }
 
     #[test]
+    fn tab_cycles_back_to_projects_from_an_unlocked_pane() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        app.focus = Focus::Terminal;
+        app.term = Some(AttachedTerm::new(
+            SessionRef::Agent(AgentId("a1".into())),
+            80,
+            24,
+        ));
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            &mut out,
+        );
+        assert_eq!(app.focus, Focus::Projects, "Tab wraps Terminal → Projects");
+    }
+
+    #[test]
+    fn cmd_w_closes_the_selected_agent_session() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        app.focus = Focus::Sessions;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::SUPER),
+            &mut out,
+        );
+        assert!(
+            matches!(out.last(), Some(ClientRequest::ArchiveAgent { id, .. }) if id.0 == "a1"),
+            "⌘w archives (closes) the selected agent"
+        );
+    }
+
+    #[test]
+    fn cmd_w_inside_a_locked_session_closes_it_and_returns_to_panels() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        app.term = Some(AttachedTerm::new(
+            SessionRef::Agent(AgentId("a1".into())),
+            80,
+            24,
+        ));
+        app.focus = Focus::Terminal;
+        app.term_locked = true;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::SUPER),
+            &mut out,
+        );
+        assert!(!app.term_locked, "⌘w unlocks the pane");
+        assert_eq!(app.focus, Focus::Sessions);
+        assert!(
+            matches!(out.last(), Some(ClientRequest::ArchiveAgent { id, .. }) if id.0 == "a1"),
+            "⌘w closes the attached session"
+        );
+    }
+
+    #[test]
     fn keys_route_by_focus() {
         let mut app = App::new();
         seed_tree(&mut app);
@@ -7817,11 +8672,12 @@ mod tests {
                 panic!("expected agent-type picker, got {:?}", app.overlay);
             };
             assert_eq!(menu.title.as_deref(), Some("New session"));
-            assert_eq!(menu.items.len(), 4);
+            assert_eq!(menu.items.len(), 5);
             assert_eq!(menu.items[0].label, "Claude");
             assert_eq!(menu.items[1].label, "Codex");
             assert_eq!(menu.items[2].label, "Cursor");
-            assert_eq!(menu.items[3].label, "Terminal (shell)");
+            assert_eq!(menu.items[3].label, "Pi");
+            assert_eq!(menu.items[4].label, "Terminal (shell)");
             assert_eq!(menu.hover, 0, "Claude is the default");
 
             // Enter on the default chains into the name prompt with
@@ -7983,12 +8839,13 @@ mod tests {
             let Some(Overlay::Menu(menu)) = &app.overlay else {
                 panic!("expected picker, got {:?}", app.overlay);
             };
-            // Claude/Codex rows advertise a submenu (the ▸ affordance);
+            // Claude/Codex/Pi rows advertise a submenu (the ▸ affordance);
             // Cursor and Terminal don't.
             assert_eq!(menu.items[0].action.submenu(), Some(SubmenuKind::Models));
             assert_eq!(menu.items[1].action.submenu(), Some(SubmenuKind::Models));
             assert_eq!(menu.items[2].action.submenu(), None);
-            assert_eq!(menu.items[3].action.submenu(), None);
+            assert_eq!(menu.items[3].action.submenu(), Some(SubmenuKind::Models));
+            assert_eq!(menu.items[4].action.submenu(), None);
 
             // → opens the model list; nothing configured, so the "default"
             // row is checked and highlighted, and the parent is kept for ←.
@@ -8212,6 +9069,40 @@ mod tests {
     }
 
     #[test]
+    fn picker_fourth_row_creates_pi_agent() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.focus = Focus::Sessions;
+        let mut out = Vec::new();
+
+        for code in [
+            KeyCode::Char('n'),
+            KeyCode::Char('j'),
+            KeyCode::Char('j'),
+            KeyCode::Char('j'),
+            KeyCode::Enter,
+        ] {
+            handle_key(&mut app, KeyEvent::new(code, KeyModifiers::NONE), &mut out);
+        }
+        assert!(matches!(
+            &app.overlay,
+            Some(Overlay::Prompt(p)) if matches!(&p.kind, PromptKind::NewAgent { kind: AgentKind::Pi, .. })
+        ));
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut out,
+        );
+        assert!(matches!(
+            out.last(),
+            Some(ClientRequest::CreateAgent {
+                kind: AgentKind::Pi,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn esc_cancels_agent_type_picker() {
         let mut app = App::new();
         seed_tree(&mut app);
@@ -8307,6 +9198,7 @@ mod tests {
                     path: "/tmp/demo-worktrees/feat".into(),
                     branch: "feat".into(),
                     is_main: false,
+                    created_from: None,
                     pinned: false,
                     sort_order: 1,
                 }),
@@ -8666,6 +9558,7 @@ mod tests {
                 session_id: None,
                 sort_order: sort,
                 status_changed_at: 0,
+                orchestrator: false,
                 alive: true,
             })
         };
@@ -8736,6 +9629,7 @@ mod tests {
             session_id: None,
             sort_order: sort,
             status_changed_at: 0,
+            orchestrator: false,
             alive: false,
         })
     }
@@ -9622,6 +10516,7 @@ mod tests {
                     path: "/tmp/demo-feat".into(),
                     branch: "feat".into(),
                     is_main: false,
+                    created_from: None,
                     pinned: false,
                     sort_order: 0,
                 }),
@@ -9667,6 +10562,7 @@ mod tests {
                     session_id: None,
                     sort_order: 0,
                     status_changed_at: 0,
+                    orchestrator: false,
                     alive: true,
                 }),
             },
@@ -9930,6 +10826,7 @@ mod tests {
             path: "/tmp/demo-worktrees/feat".into(),
             branch: "feat".into(),
             is_main: false,
+            created_from: None,
             pinned: false,
             sort_order: 0,
         };
@@ -9949,6 +10846,61 @@ mod tests {
         assert_eq!(app.focus, Focus::Sessions);
         assert_eq!(app.selected_worktree().map(|w| w.id.clone()), Some(w2.id));
         assert_eq!(app.sel_session, 0);
+    }
+
+    #[test]
+    fn new_worktree_uses_the_selected_worktree_as_its_base() {
+        use nebula_core::{Entity, Worktree, WorktreeId};
+        let mut app = App::new();
+        seed_tree(&mut app); // p1/w1(main) + agent-1
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(Worktree {
+                    id: WorktreeId("w2".into()),
+                    project_id: nebula_core::ProjectId("p1".into()),
+                    path: "/tmp/demo-worktrees/selected-feature".into(),
+                    branch: "selected-feature".into(),
+                    is_main: false,
+                    created_from: Some("develop".into()),
+                    pinned: false,
+                    sort_order: 0,
+                }),
+            },
+        );
+        app.focus = Focus::Worktrees;
+        app.sel_worktree = 1;
+        let mut out = Vec::new();
+
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            &mut out,
+        );
+        for c in "child-feature".chars() {
+            handle_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+                &mut out,
+            );
+        }
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut out,
+        );
+
+        let Some(ClientRequest::CreateWorktree { base, .. }) = out.last() else {
+            panic!("prompt submit requests a worktree: {out:?}");
+        };
+        assert_eq!(base.as_deref(), Some("selected-feature"));
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(
+            buffer_text(&terminal).contains("from develop"),
+            "worktree row shows its recorded source branch"
+        );
     }
 
     /// A branch is often described as a sentence ("fix login redirect");
@@ -10084,6 +11036,7 @@ mod tests {
                     path: "/tmp/demo-worktrees/other".into(),
                     branch: "other".into(),
                     is_main: false,
+                    created_from: None,
                     pinned: false,
                     sort_order: 1,
                 }),
@@ -10231,6 +11184,7 @@ mod tests {
                     session_id: None,
                     sort_order: 1,
                     status_changed_at: 0,
+                    orchestrator: false,
                     alive: true,
                 }),
             },
@@ -10657,6 +11611,7 @@ mod tests {
                     path: path.to_path_buf(),
                     branch: "main".into(),
                     is_main: true,
+                    created_from: None,
                     pinned: false,
                     sort_order: 0,
                 }),
@@ -11399,6 +12354,7 @@ mod tests {
                     path: "/tmp/nebula".into(),
                     branch: "feat-x".into(),
                     is_main: true,
+                    created_from: None,
                     pinned: false,
                     sort_order: 0,
                 }),
@@ -11421,6 +12377,7 @@ mod tests {
                     session_id: None,
                     sort_order: 0,
                     status_changed_at: 0,
+                    orchestrator: false,
                     alive: true,
                 }),
             },
@@ -11442,6 +12399,7 @@ mod tests {
                     session_id: None,
                     sort_order: 1,
                     status_changed_at: 0,
+                    orchestrator: false,
                     alive: false,
                 }),
             },
@@ -11758,9 +12716,11 @@ mod tests {
             text.contains("type to search"),
             "query placeholder rendered:\n{text}"
         );
-        // Sidebar headers are plain uppercase text (no emoji).
+        // Sidebar headers are plain uppercase text (no emoji). The middle
+        // column titles ORCHESTRATORS (its WORKTREES half-header sits
+        // mid-panel, behind this palette overlay).
         assert!(text.contains("PROJECTS"), "{text}");
-        assert!(text.contains("WORKTREES"), "{text}");
+        assert!(text.contains("ORCHESTRATORS"), "{text}");
         assert!(text.contains("SESSIONS"), "{text}");
         // Palette rows carry per-kind glyphs: ▪ project, ▸ worktree,
         // ● session.
@@ -11802,6 +12762,7 @@ mod tests {
                     session_id: None,
                     sort_order: 0,
                     status_changed_at: 0,
+                    orchestrator: false,
                     alive: true,
                 }),
             },
@@ -12190,14 +13151,14 @@ mod tests {
             assert!(!view.capturing(), "the capture is paused on the warning");
             assert_eq!(
                 app.keymap.label(crate::keymap::Action::Notes),
-                "e",
+                "e ⌘e",
                 "nothing changed yet"
             );
 
             // Esc leaves it where it was.
             press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
             assert_eq!(app.keymap.label(crate::keymap::Action::GitDiff), "g");
-            assert_eq!(app.keymap.label(crate::keymap::Action::Notes), "e");
+            assert_eq!(app.keymap.label(crate::keymap::Action::Notes), "e ⌘e");
         });
     }
 
@@ -13264,6 +14225,7 @@ mod tests {
                         path: format!("/tmp/demo-worktrees/{branch}").into(),
                         branch: branch.into(),
                         is_main: false,
+                        created_from: None,
                         pinned: false,
                         sort_order: 0,
                     }),
@@ -13353,6 +14315,7 @@ mod tests {
                         session_id: None,
                         sort_order: 1,
                         status_changed_at: 0,
+                        orchestrator: false,
                         alive: true,
                     }),
                 },
@@ -13402,6 +14365,7 @@ mod tests {
             path: format!("/tmp/{branch}").into(),
             branch: branch.into(),
             is_main,
+            created_from: None,
             pinned: false,
             sort_order: 0,
         })
@@ -13423,6 +14387,7 @@ mod tests {
             session_id: None,
             sort_order: 1,
             status_changed_at: 0,
+            orchestrator: false,
             alive: true,
         })
     }
@@ -13751,6 +14716,7 @@ mod tests {
                     path: "/tmp/secret".into(),
                     branch: "main".into(),
                     is_main: true,
+                    created_from: None,
                     pinned: false,
                     sort_order: 0,
                 }),
@@ -13853,7 +14819,33 @@ mod tests {
                 .any(|r| matches!(r, ClientRequest::Detach { .. })),
             "old session detached: {out:?}"
         );
-        assert!(app.splash_active(), "empty workspace shows the splash");
+        assert!(
+            !app.splash_showing(),
+            "empty workspace lands on the panels, not the splash"
+        );
+    }
+
+    /// `S` (⌘K through the ng Ghostty overlay) opens the sessions-only
+    /// palette: agent rows only, and Enter attaches regardless of the
+    /// `palette_enter_attaches` config.
+    #[test]
+    fn shift_s_opens_the_sessions_only_palette() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('S'), KeyModifiers::SHIFT, &mut out);
+        let Some(Overlay::Palette(p)) = &app.overlay else {
+            panic!("expected the palette, got {:?}", app.overlay);
+        };
+        assert!(p.sessions_only && p.enter_attaches);
+        assert!(
+            !p.items.is_empty()
+                && p.items
+                    .iter()
+                    .all(|i| matches!(i.target, crate::app::PaletteTarget::Session(_))),
+            "sessions only: {:?}",
+            p.items.iter().map(|i| &i.text).collect::<Vec<_>>()
+        );
     }
 
     /// `w` opens the workspace switcher with the open workspace checked and

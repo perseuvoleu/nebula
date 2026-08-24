@@ -319,6 +319,8 @@ async fn full_crud_attach_and_restart_persistence() {
             model: None,
             effort: None,
             auto_title: false,
+            orchestrator: false,
+            prompt: None,
         },
     )
     .await
@@ -345,7 +347,7 @@ async fn full_crud_attach_and_restart_persistence() {
             req_id: 4,
             project: project_id.clone(),
             branch: "feature-x".into(),
-            base: None,
+            base: Some("main".into()),
         },
     )
     .await
@@ -365,15 +367,17 @@ async fn full_crud_attach_and_restart_persistence() {
         panic!("CreateWorktree failed: {events:#?}");
     };
     let feature_wt_id = feature_wt_id.clone();
-    let feature_wt_path = events
+    let feature_worktree = events
         .iter()
         .find_map(|e| match e {
             ServerEvent::EntityUpserted {
                 entity: Entity::Worktree(w),
-            } if w.id == feature_wt_id => Some(w.path.clone()),
+            } if w.id == feature_wt_id => Some(w.clone()),
             _ => None,
         })
-        .expect("worktree upsert carries its path");
+        .expect("worktree upsert carries its data");
+    assert_eq!(feature_worktree.created_from.as_deref(), Some("main"));
+    let feature_wt_path = feature_worktree.path;
     assert!(feature_wt_path.exists(), "worktree dir created on disk");
 
     // ---- DeleteWorktree removes it from disk ----
@@ -701,6 +705,8 @@ async fn hook_post_from_agent_pty_drives_status() {
             model: None,
             effort: None,
             auto_title: false,
+            orchestrator: false,
+            prompt: None,
         },
     )
     .await
@@ -1032,6 +1038,8 @@ async fn hook_cwd_rehomes_agent_to_other_worktree() {
             model: None,
             effort: None,
             auto_title: false,
+            orchestrator: false,
+            prompt: None,
         },
     )
     .await
@@ -1192,6 +1200,8 @@ async fn move_agent_respawns_live_session_in_target_worktree() {
             model: None,
             effort: None,
             auto_title: false,
+            orchestrator: false,
+            prompt: None,
         },
     )
     .await
@@ -1372,6 +1382,8 @@ async fn codex_hooks_install_and_drive_status() {
             model: None,
             effort: None,
             auto_title: false,
+            orchestrator: false,
+            prompt: None,
         },
     )
     .await
@@ -1968,6 +1980,8 @@ async fn prewarmed_session_is_adopted_by_create_agent() {
             model: None,
             effort: None,
             auto_title: false,
+            orchestrator: false,
+            prompt: None,
         },
     )
     .await
@@ -2096,6 +2110,8 @@ async fn dead_prewarm_falls_back_to_cold_spawn() {
             model: None,
             effort: None,
             auto_title: false,
+            orchestrator: false,
+            prompt: None,
         },
     )
     .await
@@ -2141,6 +2157,7 @@ async fn create_agent_refuses_when_the_cli_is_not_installed() {
         // Cursor's binary is `cursor-agent`; the message must name that, not
         // the kind, or the user goes looking for the wrong thing to install.
         (12, AgentKind::Cursor, "cursor-agent"),
+        (13, AgentKind::Pi, "pi"),
     ] {
         write_frame(
             &mut c,
@@ -2152,6 +2169,8 @@ async fn create_agent_refuses_when_the_cli_is_not_installed() {
                 model: None,
                 effort: None,
                 auto_title: false,
+                orchestrator: false,
+                prompt: None,
             },
         )
         .await
@@ -2243,6 +2262,8 @@ async fn create_agent_succeeds_when_the_cli_is_on_the_login_shell_path() {
             model: None,
             effort: None,
             auto_title: false,
+            orchestrator: false,
+            prompt: None,
         },
     )
     .await
@@ -2311,6 +2332,8 @@ async fn create_agent_get_id(
             model: None,
             effort: None,
             auto_title: false,
+            orchestrator: false,
+            prompt: None,
         },
     )
     .await
@@ -2487,6 +2510,8 @@ async fn archive_sigkills_an_agent_that_ignores_sighup() {
             model: None,
             effort: None,
             auto_title: false,
+            orchestrator: false,
+            prompt: None,
         },
     )
     .await
@@ -2552,6 +2577,8 @@ async fn prewarm_worktree_sessions_boots_dead_sessions() {
             model: None,
             effort: None,
             auto_title: false,
+            orchestrator: false,
+            prompt: None,
         },
     )
     .await
@@ -2602,6 +2629,8 @@ async fn prewarm_worktree_sessions_boots_dead_sessions() {
             model: None,
             effort: None,
             auto_title: false,
+            orchestrator: false,
+            prompt: None,
         },
     )
     .await
@@ -2720,6 +2749,8 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
             model: None,
             effort: None,
             auto_title: false,
+            orchestrator: false,
+            prompt: None,
         },
     )
     .await
@@ -2773,6 +2804,8 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
             model: None,
             effort: None,
             auto_title: false,
+            orchestrator: false,
+            prompt: None,
         },
     )
     .await
@@ -3026,6 +3059,8 @@ async fn auto_title_instruction_and_rename_flow() {
             model: None,
             effort: None,
             auto_title: true,
+            orchestrator: false,
+            prompt: None,
         },
     )
     .await

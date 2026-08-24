@@ -36,8 +36,8 @@ fn runtime() -> Result<tokio::runtime::Runtime> {
 /// binary crate stays a thin arg-parser. `Some(entry)` means the user picked
 /// a recent ssh host — the terminal is restored and the caller should exec
 /// `nebula ssh` at it.
-pub fn run_tui() -> Result<Option<hosts::HostEntry>> {
-    runtime()?.block_on(event_loop::run_app())
+pub fn run_tui(open_at: Option<std::path::PathBuf>) -> Result<Option<hosts::HostEntry>> {
+    runtime()?.block_on(event_loop::run_app(open_at))
 }
 
 /// Phase-2 throwaway raw-mode client (`nebula _raw-attach`).
@@ -62,7 +62,37 @@ pub fn run_add_project(path: String) -> Result<()> {
     runtime()?.block_on(ipc::add_project(path))
 }
 
-pub use ipc::WorkspaceOp;
+pub use ipc::{NewAgentOpts, NotesOp, WorkspaceOp};
+
+/// `nebula notes [list|add|done]` — project/worktree notes from the CLI,
+/// agents included (see `ipc::run_notes`).
+pub fn run_notes(op: NotesOp) -> Result<()> {
+    runtime()?.block_on(ipc::run_notes(op))
+}
+
+/// `nebula worktree new` — agent-facing orchestration verb.
+pub fn run_worktree_new(name: String, from: Option<String>, project: Option<String>) -> Result<()> {
+    runtime()?.block_on(ipc::worktree_new(name, from, project))
+}
+
+/// `nebula agent new` — spawn a session (orchestrators included).
+pub fn run_agent_new(opts: NewAgentOpts) -> Result<()> {
+    runtime()?.block_on(ipc::agent_new(opts))
+}
+
+/// `nebula agent list` — the orchestrator's JSON view of its workers.
+pub fn run_agent_list(project: Option<String>, all: bool) -> Result<()> {
+    runtime()?.block_on(ipc::agent_list(project, all))
+}
+
+/// `nebula agent promote|demote <name>` — flip a session's orchestrator role.
+pub fn run_agent_set_orchestrator(
+    name: String,
+    project: Option<String>,
+    orchestrator: bool,
+) -> Result<()> {
+    runtime()?.block_on(ipc::agent_set_orchestrator(name, project, orchestrator))
+}
 
 /// `nebula workspace <add|open|list|delete|rename>` (see `ipc::run_workspace_op`).
 pub fn run_workspace(op: WorkspaceOp) -> Result<()> {

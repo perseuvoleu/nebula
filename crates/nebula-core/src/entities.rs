@@ -52,18 +52,25 @@ pub enum AgentKind {
     Claude,
     Codex,
     Cursor,
+    Pi,
 }
 
 impl AgentKind {
     /// Every kind, for callers that must cover all of them (menus, the
     /// boot-time CLI probe warm) and should fail to compile if one is added.
-    pub const ALL: [AgentKind; 3] = [AgentKind::Claude, AgentKind::Codex, AgentKind::Cursor];
+    pub const ALL: [AgentKind; 4] = [
+        AgentKind::Claude,
+        AgentKind::Codex,
+        AgentKind::Cursor,
+        AgentKind::Pi,
+    ];
 
     pub fn as_str(&self) -> &'static str {
         match self {
             AgentKind::Claude => "claude",
             AgentKind::Codex => "codex",
             AgentKind::Cursor => "cursor",
+            AgentKind::Pi => "pi",
         }
     }
 
@@ -72,6 +79,7 @@ impl AgentKind {
             "claude" => AgentKind::Claude,
             "codex" => AgentKind::Codex,
             "cursor" => AgentKind::Cursor,
+            "pi" => AgentKind::Pi,
             _ => return None,
         })
     }
@@ -83,6 +91,7 @@ impl AgentKind {
             AgentKind::Claude => "claude",
             AgentKind::Codex => "codex",
             AgentKind::Cursor => "cursor-agent",
+            AgentKind::Pi => "pi",
         }
     }
 }
@@ -125,6 +134,10 @@ pub struct Worktree {
     pub path: PathBuf,
     pub branch: String,
     pub is_main: bool,
+    /// Branch or detached commit used when this worktree was created.
+    /// Unknown for the root checkout and worktrees adopted from outside Nebula.
+    #[serde(default)]
+    pub created_from: Option<String>,
     /// Pinned worktrees sort into their own PINNED group in the worktrees list.
     #[serde(default)]
     pub pinned: bool,
@@ -159,11 +172,16 @@ pub struct Agent {
     /// codex `model_reasoning_effort`); None = the CLI's own default.
     #[serde(default)]
     pub effort: Option<String>,
-    /// CLI session id used for resume (claude, codex, or cursor, per `kind`).
+    /// CLI session id used for resume (claude, codex, cursor, or pi, per `kind`).
     pub session_id: Option<String>,
     pub sort_order: i64,
     /// True when the daemon currently holds a live PTY for this agent.
     pub alive: bool,
+    /// A project-level orchestrator: lives on the root worktree, drives
+    /// `nebula worktree new` / `nebula agent new` to manage the project.
+    /// Always spawned pinned so the idle reaper never touches it.
+    #[serde(default)]
+    pub orchestrator: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 22;
+pub const PROTOCOL_VERSION: u32 = 24;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -141,6 +141,14 @@ pub enum ClientRequest {
         /// the session eligible for one agent-driven auto-title (the CLI
         /// runs `nebula rename` on its first prompt).
         auto_title: bool,
+        /// Project-level orchestrator: spawned pinned, listed in its own
+        /// group, and taught the `nebula worktree new` / `nebula agent new`
+        /// commands via hook-injected context.
+        orchestrator: bool,
+        /// Initial task handed to the CLI as its positional prompt argument
+        /// (`nebula agent new --prompt`). Skips warm-slot adoption — an
+        /// already-booted CLI can't take a launch argument.
+        prompt: Option<String>,
     },
     /// Fire-and-forget: pre-spawn an agent CLI for this (worktree, kind) so
     /// the next CreateAgent adopts an already-booted session. Sent the
@@ -205,6 +213,14 @@ pub enum ClientRequest {
         req_id: u64,
         id: AgentId,
         pinned: bool,
+    },
+    /// Promote a session to project orchestrator (or demote one back).
+    /// The daemon refuses promotion off the root checkout — orchestrators
+    /// live on the main branch by definition. Promotion also pins.
+    SetAgentOrchestrator {
+        req_id: u64,
+        id: AgentId,
+        orchestrator: bool,
     },
     DeleteAgent {
         req_id: u64,

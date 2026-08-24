@@ -59,6 +59,7 @@ pub enum Action {
     MoveUp,
     Activate,
     Palette,
+    SessionPalette,
     // projects & worktrees
     AddProject,
     New,
@@ -70,9 +71,11 @@ pub enum Action {
     OpenRepo,
     Notes,
     // sessions
+    NewAgent,
     NewTerminal,
     NewLink,
     Rename,
+    CloseSession,
     Archive,
     Unarchive,
     ToggleArchived,
@@ -192,6 +195,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         scope: Scope::Global,
         defaults: &["/"],
     },
+    ActionSpec {
+        action: Action::SessionPalette,
+        id: "session_palette",
+        label: "Search sessions",
+        hint: "Fuzzy-search agent sessions only; Enter attaches (⌘K in the ng Ghostty overlay)",
+        group: "NAVIGATE",
+        scope: Scope::Global,
+        defaults: &["shift+s"],
+    },
     // ---- PROJECTS & WORKTREES ----
     ActionSpec {
         action: Action::AddProject,
@@ -269,12 +281,21 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::Notes,
         id: "notes",
         label: "Notes",
-        hint: "Notes for the selected project or worktree",
+        hint: "Notes for the selected project or worktree (⌘e even inside a locked session)",
         group: "PROJECTS & WORKTREES",
         scope: Scope::Global,
-        defaults: &["e"],
+        defaults: &["e", "cmd+e"],
     },
     // ---- SESSIONS ----
+    ActionSpec {
+        action: Action::NewAgent,
+        id: "new_agent",
+        label: "New agent",
+        hint: "Open the new-session picker for the selected worktree, from any panel (⌘n even inside a locked session)",
+        group: "SESSIONS",
+        scope: Scope::Global,
+        defaults: &["cmd+n", "ctrl+n"],
+    },
     ActionSpec {
         action: Action::NewTerminal,
         id: "new_terminal",
@@ -301,6 +322,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         group: "SESSIONS",
         scope: Scope::Global,
         defaults: &["r"],
+    },
+    ActionSpec {
+        action: Action::CloseSession,
+        id: "close_session",
+        label: "Close session",
+        hint: "Close the selected agent session (⌘w even inside a locked session; u restores it)",
+        group: "SESSIONS",
+        scope: Scope::Global,
+        defaults: &["cmd+w", "ctrl+w"],
     },
     ActionSpec {
         action: Action::Archive,

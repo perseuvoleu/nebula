@@ -42,10 +42,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         return;
     }
 
-    // First run (or an empty workspace): no visible projects means three
-    // empty panels, so the whole body becomes the animated nebula splash
-    // until the first project lands. N summons the same splash as a
-    // dismissable preview.
+    // N summons the animated nebula splash as a dismissable preview; an
+    // empty workspace opens straight on the panels instead, so a project
+    // can be added right away.
     if app.splash_showing() {
         crate::splash::draw_splash(f, app, body);
         draw_footer(f, app, footer);
@@ -355,7 +354,6 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     }
                 }
                 let (_, partial) = crate::completion::split_input(&prompt.input);
-                let hit = partial.chars().count();
                 let start = prompt.window_start(list_area.height as usize);
                 for (row, (i, entry)) in prompt.dirs.iter().enumerate().skip(start).enumerate() {
                     let Some(r) = row_rect(list_area, row) else {
@@ -368,7 +366,9 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     };
                     let budget = (inner.width as usize).saturating_sub(5);
                     let shown = truncate(&entry.name, budget);
-                    let positions: Vec<usize> = (0..hit.min(shown.chars().count())).collect();
+                    // Where the (fuzzy) match actually landed — truncation
+                    // can cut matched chars off, so re-derive on `shown`.
+                    let positions = crate::completion::match_positions(&shown, partial);
                     let mut spans = vec![Span::raw(" "), marker];
                     spans.extend(fuzzy_highlight_spans(&shown, &positions, th));
                     spans.push(Span::styled("/", Style::default().fg(th.dim)));
@@ -1138,11 +1138,16 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
         Overlay::Palette(palette) => {
             let area = centered_rect(f.area(), 64, 18);
             f.render_widget(Clear, area);
+            let name = if palette.sessions_only {
+                "Sessions"
+            } else {
+                "Jump to"
+            };
             let title = if palette.query.is_empty() {
-                " Jump to ".to_string()
+                format!(" {name} ")
             } else {
                 format!(
-                    " Jump to ({}/{}) ",
+                    " {name} ({}/{}) ",
                     palette.matches.len(),
                     palette.items.len()
                 )
@@ -2336,8 +2341,18 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     let th = app.theme;
     let focused = app.focus == Focus::Worktrees;
     let wt_count = app.visible_worktrees().len();
-    let count = Some(wt_count).filter(|n| *n > 0 && !app.divider_focused());
-    let inner = draw_column(f, area, "WORKTREES", count, focused, th);
+    // The column is permanently split in two stacked sections: the
+    // project's ORCHESTRATORS on top (the column title doubles as that
+    // section's header), its WORKTREES below.
+    let orch_count_title = Some(app.orchestrator_row_count()).filter(|n| *n > 0);
+    let inner = draw_column(
+        f,
+        area,
+        "ORCHESTRATORS",
+        orch_count_title.filter(|_| !app.divider_focused()),
+        focused,
+        th,
+    );
 
     // A selected separator has nothing underneath it: keep the panel, hide
     // the rows (the terminal pane carries the hint).
@@ -2346,28 +2361,35 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    let worktrees: Vec<(String, bool, Option<AgentStatus>, (usize, usize))> = app
+    let worktrees: Vec<(
+        String,
+        bool,
+        Option<String>,
+        Option<AgentStatus>,
+        (usize, usize),
+    )> = app
         .visible_worktrees()
         .iter()
         .map(|w| {
             (
                 w.branch.clone(),
                 w.is_main,
+                w.created_from.clone(),
                 app.worktree_rollup(&w.id),
                 app.note_stats(&nebula_core::NoteOwner::Worktree(w.id.clone())),
             )
         })
         .collect();
-    if worktrees.is_empty() {
-        if app.tree.has_visible_projects() {
-            f.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled(format!("{ROW_GUTTER}n"), Style::default().fg(th.accent)),
-                    Span::styled(" starts a worktree", Style::default().fg(th.dim)),
-                ])),
-                inner,
-            );
-        }
+    // Top section: the project's orchestrators — the managers sit above
+    // the checkouts they manage. Always drawn, so the split (and the way
+    // to create one) stays discoverable.
+    let orchestrators: Vec<(String, AgentStatus)> = app
+        .project_orchestrators()
+        .iter()
+        .map(|a| (a.name.clone(), a.status))
+        .collect();
+
+    if worktrees.is_empty() && orchestrators.is_empty() && !app.tree.has_visible_projects() {
         app.hits.push((inner, HitTarget::PanelBg(Focus::Worktrees)));
         return;
     }
@@ -2388,14 +2410,87 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             *screen_row += 1;
         }
     };
+    // The column splits at its vertical middle: the top half belongs to
+    // the ORCHESTRATORS section, the bottom half to WORKTREES.
+    let mid = (inner.height as usize / 2).max(PILL_H as usize + 1);
+    let in_section = app.sel_orchestrator.is_some();
+    if orchestrators.is_empty() && app.tree.has_visible_projects() {
+        // Selectable placeholder: walking onto it and pressing n/Enter
+        // spawns the project's first orchestrator.
+        let spans = vec![
+            Span::styled("+ ", Style::default().fg(th.accent)),
+            Span::styled("new orchestrator", dim),
+        ];
+        let selected = app.on_orchestrator_placeholder();
+        render_pill(f, inner, screen_row as isize, spans, selected, focused, th);
+        if let Some(hit) = rows_rect(inner, screen_row, PILL_H) {
+            app.hits.push((hit, HitTarget::Orchestrator(0)));
+        }
+        screen_row += PILL_H as usize;
+    }
+    for (i, (name, status)) in orchestrators.iter().enumerate() {
+        if screen_row + PILL_H as usize > mid
+            || row_rect(inner, screen_row + PILL_H as usize - 1).is_none()
+        {
+            break;
+        }
+        let roll = Some(*status);
+        let ramp = sweep_ramp(roll, th, app.animations);
+        let mut spans = vec![status_dot(roll, th)];
+        const ORCH_BADGE: &str = " ◆";
+        let max = (inner.width as usize).saturating_sub(2 + ORCH_BADGE.chars().count());
+        spans.extend(status_name_spans(
+            truncate(name, max),
+            Style::default(),
+            ramp,
+            app.sweep_phase(),
+        ));
+        spans.push(Span::styled(ORCH_BADGE, Style::default().fg(th.accent)));
+        let selected = app.sel_orchestrator == Some(i);
+        render_pill(f, inner, screen_row as isize, spans, selected, focused, th);
+        if let Some(hit) = rows_rect(inner, screen_row, PILL_H) {
+            app.hits.push((hit, HitTarget::Orchestrator(i)));
+        }
+        screen_row += PILL_H as usize;
+    }
+    // Bottom half: the WORKTREES section starts at the panel's middle
+    // regardless of how few orchestrators sit above.
+    screen_row = mid;
+    if let Some(r) = row_rect(inner, screen_row) {
+        let header_style = if focused {
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(th.muted).add_modifier(Modifier::BOLD)
+        };
+        let mut spans = vec![Span::styled(format!("{ROW_GUTTER}WORKTREES"), header_style)];
+        if wt_count > 0 {
+            spans.push(Span::styled(format!(" · {wt_count}"), dim));
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), r);
+    }
+    screen_row += 2;
+    if worktrees.is_empty() {
+        if let Some(r) = row_rect(inner, screen_row) {
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(format!("{ROW_GUTTER}n"), Style::default().fg(th.accent)),
+                    Span::styled(" starts a worktree", dim),
+                ])),
+                r,
+            );
+        }
+        app.hits.push((inner, HitTarget::PanelBg(Focus::Worktrees)));
+        return;
+    }
     if grouped {
         header(f, "PINNED".into(), &mut screen_row);
     }
-    for (i, (branch, is_main, roll, notes)) in worktrees.iter().enumerate() {
+    for (i, (branch, is_main, created_from, roll, notes)) in worktrees.iter().enumerate() {
         if grouped && i == pinned_count {
             header(f, "UNPINNED".into(), &mut screen_row);
         }
-        if row_rect(inner, screen_row + 1).is_none() {
+        let entry_height = PILL_H as usize + usize::from(created_from.is_some());
+        if row_rect(inner, screen_row + entry_height - 1).is_none() {
             break;
         }
         let note_badge = note_badge(*notes, th);
@@ -2423,19 +2518,51 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         if let Some((text, style)) = note_badge {
             spans.push(Span::styled(text, style));
         }
+        let selected = !in_section && i == app.sel_worktree;
         render_pill(
             f,
             inner,
             screen_row as isize,
             spans,
-            i == app.sel_worktree,
+            selected,
             focused,
             th,
         );
-        if let Some(hit) = rows_rect(inner, screen_row, PILL_H) {
+        if let Some(base) = created_from {
+            if let Some(r) = row_rect(inner, screen_row + PILL_H as usize) {
+                let style = if selected {
+                    Style::default()
+                        .fg(th.muted)
+                        .bg(if focused { th.sel_bg } else { th.sel_bg_dim })
+                } else {
+                    Style::default().fg(th.dim)
+                };
+                f.render_widget(
+                    Paragraph::new(format!(
+                        "{ROW_GUTTER}{}",
+                        truncate(
+                            &format!("from {base}"),
+                            (inner.width as usize).saturating_sub(ROW_GUTTER.len()),
+                        )
+                    ))
+                    .style(style),
+                    r,
+                );
+                if selected {
+                    f.render_widget(
+                        Paragraph::new(Span::styled(
+                            "▌",
+                            Style::default().fg(if focused { th.accent } else { th.dim }),
+                        )),
+                        Rect { width: 1, ..r },
+                    );
+                }
+            }
+        }
+        if let Some(hit) = rows_rect(inner, screen_row, entry_height as u16) {
             app.hits.push((hit, HitTarget::Worktree(i)));
         }
-        screen_row += PILL_H as usize;
+        screen_row += entry_height;
         // An extra quiet row separates the main checkout from the true
         // worktrees below; group headers take over once something is
         // pinned.
@@ -3147,10 +3274,11 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         )
     } else if app.overlay.is_some() {
         Span::styled("Esc: close  Enter: confirm", Style::default().fg(th.dim))
-    } else if app.splash_showing() {
-        // The splash covers the panels, so every panel hotkey is dead here.
-        // List only what actually fires — and in preview, that's one thing:
-        // the next key dismisses it (q included).
+    } else if app.splash_showing() || !app.tree.has_visible_projects() {
+        // Splash preview, or an empty workspace: most panel hotkeys have
+        // nothing to act on, so list the first-run guidance instead — and
+        // in preview, the one thing that fires: the next key dismisses it
+        // (q included).
         Span::styled(
             if app.splash_preview {
                 "any key: back to panels".to_string()

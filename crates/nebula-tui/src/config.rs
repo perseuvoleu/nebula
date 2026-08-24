@@ -35,6 +35,14 @@ pub const CLAUDE_MODELS: &[&str] = &["default", "fable", "opus", "sonnet", "haik
 pub const CLAUDE_EFFORTS: &[&str] = &["default", "low", "medium", "high", "xhigh", "max"];
 pub const CODEX_MODELS: &[&str] = &["default", "gpt-5.6-sol", "gpt-5.5"];
 pub const CODEX_EFFORTS: &[&str] = &["default", "minimal", "low", "medium", "high", "xhigh"];
+/// Pi's `--model` takes a fuzzy pattern resolved against whatever providers
+/// the user configured, so this list is just common picks — hand-edited
+/// configs can name any pattern.
+pub const PI_MODELS: &[&str] = &["default", "gpt-5.6-sol", "gpt-5.5", "fable", "opus"];
+/// Pi calls it "thinking level" (`--thinking`); it plays the effort role.
+pub const PI_EFFORTS: &[&str] = &[
+    "default", "off", "minimal", "low", "medium", "high", "xhigh", "max",
+];
 
 /// Model choices for a session kind; empty = no model submenu (Cursor).
 pub fn model_choices(kind: AgentKind) -> &'static [&'static str] {
@@ -42,6 +50,7 @@ pub fn model_choices(kind: AgentKind) -> &'static [&'static str] {
         AgentKind::Claude => CLAUDE_MODELS,
         AgentKind::Codex => CODEX_MODELS,
         AgentKind::Cursor => &[],
+        AgentKind::Pi => PI_MODELS,
     }
 }
 
@@ -51,6 +60,7 @@ pub fn effort_choices(kind: AgentKind) -> &'static [&'static str] {
         AgentKind::Claude => CLAUDE_EFFORTS,
         AgentKind::Codex => CODEX_EFFORTS,
         AgentKind::Cursor => &[],
+        AgentKind::Pi => PI_EFFORTS,
     }
 }
 
@@ -95,6 +105,8 @@ pub enum SettingKind {
     ClaudeEffort,
     CodexModel,
     CodexEffort,
+    PiModel,
+    PiEffort,
 }
 
 /// The tab strip, left to right. Ordered by how often a setting gets
@@ -183,6 +195,16 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::CodexEffort,
                 label: "Codex effort",
                 hint: "Default reasoning effort for new Codex sessions",
+            },
+            SettingSpec {
+                kind: SettingKind::PiModel,
+                label: "Pi model",
+                hint: "Default model pattern for new Pi sessions (default = CLI's pick)",
+            },
+            SettingSpec {
+                kind: SettingKind::PiEffort,
+                label: "Pi thinking",
+                hint: "Default thinking level for new Pi sessions",
             },
         ]),
     },
@@ -358,6 +380,9 @@ pub struct Config {
     pub claude_effort: String,
     pub codex_model: String,
     pub codex_effort: String,
+    /// Pi's pair: the "effort" is its `--thinking` level.
+    pub pi_model: String,
+    pub pi_effort: String,
     /// Hotkey overrides, keyed by `keymap::ActionSpec::id`; the value is a
     /// comma-separated chord list (`"j, down"`), and an empty string means
     /// deliberately unbound. Only rows that differ from the defaults are
@@ -382,6 +407,8 @@ impl Default for Config {
             claude_effort: "default".into(),
             codex_model: "default".into(),
             codex_effort: "default".into(),
+            pi_model: "default".into(),
+            pi_effort: "default".into(),
             keybindings: BTreeMap::new(),
         }
     }
@@ -444,6 +471,8 @@ impl Config {
         );
         obj.insert("codex_model".into(), serde_json::json!(self.codex_model));
         obj.insert("codex_effort".into(), serde_json::json!(self.codex_effort));
+        obj.insert("pi_model".into(), serde_json::json!(self.pi_model));
+        obj.insert("pi_effort".into(), serde_json::json!(self.pi_effort));
         obj.insert("keybindings".into(), serde_json::json!(self.keybindings));
         let mut bytes = serde_json::to_vec_pretty(&root)
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
@@ -479,6 +508,7 @@ impl Config {
             AgentKind::Claude => &self.claude_model,
             AgentKind::Codex => &self.codex_model,
             AgentKind::Cursor => return None,
+            AgentKind::Pi => &self.pi_model,
         };
         non_default(value)
     }
@@ -490,6 +520,7 @@ impl Config {
             AgentKind::Claude => &self.claude_effort,
             AgentKind::Codex => &self.codex_effort,
             AgentKind::Cursor => return None,
+            AgentKind::Pi => &self.pi_effort,
         };
         non_default(value)
     }
@@ -515,6 +546,8 @@ impl Config {
             SettingKind::ClaudeEffort => self.claude_effort.clone(),
             SettingKind::CodexModel => self.codex_model.clone(),
             SettingKind::CodexEffort => self.codex_effort.clone(),
+            SettingKind::PiModel => self.pi_model.clone(),
+            SettingKind::PiEffort => self.pi_effort.clone(),
         }
     }
 
@@ -566,6 +599,12 @@ impl Config {
             }
             SettingKind::CodexEffort => {
                 self.codex_effort = cycle_choice(&self.codex_effort, CODEX_EFFORTS, step).into();
+            }
+            SettingKind::PiModel => {
+                self.pi_model = cycle_choice(&self.pi_model, PI_MODELS, step).into();
+            }
+            SettingKind::PiEffort => {
+                self.pi_effort = cycle_choice(&self.pi_effort, PI_EFFORTS, step).into();
             }
         }
     }

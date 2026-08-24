@@ -14,6 +14,262 @@ about what is worth recording.
 
 ## Entries
 
+### ⌘W Closes The Selected Session — 2026-08-24
+
+**Asked:** "ok e ok cand dau cmmd w si s pe un agent vreau sa mi inchida acea sesiune" — followed by "si
+daca dau tab imi muta pana la agent e ok dar dupa daca nu sunt in agent sa scriu tab ul ar treb sa fie
+circular sa se duca iar la projects etc". Earlier in the session: does copy-on-select "da alarma UI"?
+(answer: only the footer flash in `copy_selection`, no popup).
+
+**Did:** New `Action::CloseSession` (`keymap.rs`, id `close_session`, defaults `cmd+w, ctrl+w`, SESSIONS
+group). `close_session_shortcut`/`close_session` in `event_loop.rs` (next to `archive_agent`): an agent
+is archived (PTY released, `u` restores — no confirm), a shell terminal gets the existing close-confirm
+dialog, links flash. Also fires inside a locked terminal via the ⌘-intercept block (the ⌘N pattern):
+closes the *attached* session, unlocks, focus → Sessions. Three regression tests
+(`cmd_w_closes_the_selected_agent_session`, `cmd_w_inside_a_locked_session_closes_it_and_returns_to_panels`,
+`tab_cycles_back_to_projects_from_an_unlocked_pane`).
+
+**Gotchas:**
+- "cmmd +w inca nu inchide acea sesiune, de ce?" had two stacked causes, neither in the new code:
+  (a) the running nebula (16:06) predated the built binary (16:11) — check `ps -o lstart= -p <pid>`
+  against the binary's mtime before debugging; (b) the `ng` Ghostty overlay mapped
+  `super+w=text:w`, so ⌘W arrived as plain `w` = Workspaces. Fixed to `super+w=csi:119;9u`
+  (kitty-encoded cmd+w, mods 9 = super+1), which also reaches the locked-session SUPER intercept.
+  **Any ⌘ chord that must arrive AS ⌘ in the ng window needs a `csi:<code>;9u` mapping, not `text:`.**
+  Also: `ghostty +validate-config` and `+show-config` print nothing and exit 1 in the agent sandbox
+  even on an empty file — validate config changes by relaunching, not via the CLI here.
+- The Tab ask needed **no code**: `Action::FocusNext` has wrapped Terminal → Projects since the initial
+  commit, and Tab-focusing the pane never locks input (only Enter/click do). Proven by running the new
+  tab test against unmodified HEAD. If the user still sees Tab stop at the agent, the running binary is
+  stale — `make` + restart (the `~/.cargo/bin` symlink gotcha).
+- The shared tree flipped under this task twice: `cargo test -p nebula-tui event_loop` showed 77 failures
+  and later `worktree_panel_len` missing from `app.rs` — all from another agent's in-flight orchestrator
+  work. Isolating the diff in a `git worktree add <scratchpad>/wt-check HEAD` and re-applying only these
+  edits proved it green (204 event_loop + 18 keymap); the main tree later caught up and passed too.
+- Copy-on-select in the terminal pane already exists (`finish_selection` → `pbcopy` on mouse-up,
+  double-click word via `select_word_at`) — the Herdr-style ask from this session was already built;
+  what nebula does NOT have is text selection outside the terminal pane (lists, diff, notes).
+
+### Pi As A Fourth Agent Kind, Via A Managed Extension — 2026-08-24
+
+**Asked:** "adauga si optiune pentru PI cand faci un agent" — then "vezi ca si herdr poate integra, am
+herdr pe desktop citeste" (herdr on the Desktop already integrates pi; read it).
+
+**Did:** `AgentKind::Pi` end to end. Spawn shapes in `registry.rs::agent_spawn_command`: fresh `pi`,
+resume `pi --session <sid>` (pi's `--resume` is an interactive picker, not an id flag), model
+`--model`, effort maps to `--thinking` (off…max, see `PI_EFFORTS` in `nebula-tui/src/config.rs`); no
+skip-permissions flag — pi has no permission prompts. Status/injection: pi speaks neither hooks
+dialect — it has a TypeScript extension API — so `hooks/nebula_pi.ts` (installed by
+`installer::install_pi_extension` into `$PI_CODING_AGENT_DIR`-or-`~/.pi/agent` under
+`extensions/nebula-agent-state.ts`, global so one install covers all worktrees) maps `session_start`
+→ SessionStart, `before_agent_start` → UserPromptSubmit, `agent_settled` (gated on `ctx.isIdle()`) →
+Stop, POSTed to a new `/api/hooks/pi` route on the **injectable** path: the extension parses the
+response's `hookSpecificOutput.additionalContext` and returns it as `{message: {customType, content,
+display: false}}` from `before_agent_start`, so pi gets auto-title/notes/orchestrator like
+claude/codex. Picker row, kind_label, settings rows (PiModel/PiEffort), and tests updated. Full
+lifecycle verified against a fake hook server driving real `pi` 0.83.0 in tmux: SessionStart with
+real session_id → UserPromptSubmit → Stop, and the injected message didn't fault the turn.
+
+**Gotchas:**
+- Herdr's own pi integration (`~/Desktop/herdr/src/integration/assets/pi/herdr-agent-state.ts`) is
+  the reference for pi's extension API: `pi.on("session_start"|"agent_start"|"agent_settled")`,
+  `ctx.sessionManager.getSessionId()/getSessionFile()`, `ctx.isIdle()`, and the `ctx.mode !== "tui"`
+  gate (RPC mode lies with `hasUI=true`). Event/result types live in
+  `/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/types.d.ts`.
+- `before_agent_start` (not `agent_start`) is the UserPromptSubmit analog — it fires after prompt
+  submit, its async handler is awaited before the loop starts, and its return value is the only
+  context-injection channel (`BeforeAgentStartEventResult.message`).
+- `install_pi_extension` refuses when `~/.pi/agent` doesn't exist (pi never ran) instead of
+  conjuring a config tree; the spawn degrades to "no status", same as other hook-install failures.
+- When smoke-testing pi headlessly: `pi < /dev/null` under `script` never enters TUI mode (no tty on
+  stdin) and the extension stays silent — drive it in tmux like the cursor recipe.
+
+### Project Orchestrators: CLI Verbs, Injected Cheat-Sheet, Own Panel Group — 2026-08-24
+
+**Asked:** "as vrea cumva sa am si niste agenti principali sub un proiect care sa faca ei worktree uri
+etc sau sa managerieze sesiuni, cum face si herdr… si vreau sa fie si un ux/ui bun sa nu mai adaugam un
+rand nou" — refined to "asta ar treb imaprtita sus orchestratori si jos worktrees, si dupa sa faca
+skills pentru panels etc ca la herdr", with "ok dar sa pot sa fac si ca acum wt etc" (manual flows stay).
+
+**Did:** Herdr-style control surface + a first-class role. `Agent.orchestrator` (entities.rs, sqlite
+migration 19, `PROTOCOL_VERSION` 22→23); `CreateAgent` grew `orchestrator` + `prompt` — the prompt rides
+the CLI's positional argv on fresh spawns only (`agent_spawn_command`, resume drops it; prompt also
+forces the cold path since a warm CLI can't take argv). New CLI verbs in `nebula-tui/src/ipc.rs`:
+`nebula worktree new <name> [--from] [--project]`, `nebula agent new [--worktree|--orchestrator]
+[--kind/--model/--effort/--name/--prompt]`, `nebula agent list [--all]` (JSON) — target resolved from
+`NEBULA_AGENT_ID` via one Subscribe/Snapshot, `--project <name>` overrides. Orchestrators spawn pinned
+on the root checkout, get `ORCHESTRATOR_INSTRUCTION` injected on every UserPromptSubmit
+(`hooks/mod.rs`, composes with auto-title + notes via `context_injection`), and Claude gets
+`Bash(nebula worktree:*)`/`Bash(nebula agent:*)` allow rules. UI: the Worktrees panel now shows an
+ORCHESTRATORS group on top — `sel_worktree` indexes orchestrator rows + worktrees
+(`worktree_rows`-family helpers in app.rs: `selected_worktree_index`, `worktree_row_index`,
+`worktree_panel_len`), Enter on an orchestrator attaches+locks, sessions panel excludes them, project
+context menu grew "New orchestrator" (`PendingIntent::AttachCreatedOrchestrator`). Verified end-to-end
+against an isolated daemon: orchestrator → worktree → worker → list, all correct.
+
+**Gotchas:**
+- Every `app.sel_worktree = visible_worktrees().position(...)` site had to move to `worktree_row_index`
+  (offset by `orchestrator_row_count`) — grep for `sel_worktree` before adding any new row group.
+- Two agents worked this tree simultaneously all afternoon; the notes feature and this one merged
+  cleanly file-by-file, but their `context_injection(&[String])` refactor landed while my edit of the
+  same function was mid-flight — re-read before every edit paid off.
+- `worktree new`'s created-path can arrive as an upsert AFTER the Ack — the CLI now keeps reading up to
+  2s for it; without that the printed `path` is null.
+- The e2e_tui boot helper waited for the splash text ("create your first project") — the splash removal
+  broke all 6; they now wait for "no projects yet". Also fixed the long-red
+  `FOOTER_TERMINAL_LOCKED`: the footer spells it `^q: panels`, not `Ctrl+q: panels`.
+- Protocol bumps now fail clean: the v22 daemon + v23 client handshake yields "run `nebula kill` and
+  relaunch" instead of a silent connection drop. Still: any entity/protocol change ⇒ restart the daemon
+  (user approved killing its one live session, twice today).
+- Follow-up ("nu vad in ui tab ul de orchestratori… impartita sectiunea a 2-a in 2 bucati pe
+  verticala", then "vreau sa am select separat pe fiecare… cand dau n sa imi aleaga", then "imparti pe
+  jumate sectiunile"): the column is permanently split at `inner.height/2` — top half ORCHESTRATORS
+  (the `draw_column` title doubles as its header; a selectable "+ new orchestrator" placeholder row
+  when empty), bottom half a "WORKTREES · n" header + the old list. Selection is **two stacked
+  cursors**: new `App.sel_orchestrator: Option<usize>` (Some = cursor in the section) while
+  `sel_worktree` KEPT its worktrees-only meaning — the first attempt offset `sel_worktree` by the
+  section length and broke ~30 tests that set `sel_worktree = 0`; the two-cursor model broke none.
+  j/k walk both sections as one list (`move_selection` has a dedicated Worktrees arm); `n` creates by
+  section (orchestrator above, worktree prompt below); Enter attaches an orchestrator / creates on the
+  placeholder. Every site assigning `sel_worktree` must also clear `sel_orchestrator` — grep both
+  before touching panel selection. New `HitTarget::Orchestrator(usize)` for clicks.
+- "am dat un nou orchestrator… si tot nu apare": clicking "+ new orchestrator" only *selected* the row
+  (list-click semantics), creation was Enter/`n` — the user reasonably expected the click to create.
+  A mouse click on the placeholder now calls `new_orchestrator` directly. Rule: a row that *reads* as
+  a button ("+ …") must act on click. Diagnosed by checking the store first — `sqlite3 …/nebula.db
+  "select name, orchestrator from agents"` showed no orchestrator row, so no request had ever fired,
+  and `nebula agent new --orchestrator --project <name>` against the live daemon proved the whole
+  daemon path fine.
+- Second report ("am facut dar e aratat tot la sesiuni") was the user creating a *normal* session via
+  the sessions picker and expecting it under ORCHESTRATORS — their mental model is "session on main =
+  orchestrator". Accommodated: `SetAgentOrchestrator` request (PROTOCOL_VERSION 24) — session context
+  menu "Make orchestrator" (daemon refuses off-root with a clear error; promotion pins, demotion
+  unpins), right-click on an orchestrator row offers Attach/Rename/"Demote to session"/Delete. The
+  row hops panels live via its upsert. Lesson: when users invent a flow, add a bridge from their flow
+  to the feature instead of only documenting the intended one.
+- Third report ("tot asa mi-l pune in sesiune"): DB forensics showed every new row was a *named*
+  picker creation ("dada", "test") — the user's muscle memory is ⌘S/n + type a name; the orchestrator
+  flows were never touched. Added `nebula agent promote|demote <name> [--project]` (CLI twin of the
+  menu item) and promoted their "test" live. New full-path regression test
+  `clicking_the_orchestrator_placeholder_creates_one` (draw → hit rect → synthetic MouseEvent): note
+  it must click the row's CENTER — the leftmost cell of any panel row belongs to the splitter grab
+  zone (`hits` first-match), which is pre-existing behavior, not a bug.
+- "cand dau n acolo vreau… sa aleg nume… si cu ce claude pi etc ca la sesiuni": orchestrator creation
+  now runs the full session flow — `open_agent_picker(app, worktree, orchestrator)` (title "New
+  orchestrator", no shell-terminal row) → model/effort submenus → name prompt. The flag threads
+  through `MenuAction::NewAgentOfKind`, `PromptKind::NewAgent`, and `create_agent` (which picks
+  `AttachCreatedOrchestrator` and numbers default names `orchestrator-N`). The instant-create
+  `new_orchestrator` fn is gone — every entry point (n, Enter/click on placeholder, project menu)
+  opens the picker. Palette items for orchestrators read "{project}/{name} ◆ orchestrator" so the
+  label is fuzzy-searchable ("orch" narrows to them) in both `/` and ⌘K.
+
+### Agents Can Read And Work The Notes, ⌘E Opens Them Anywhere — 2026-08-24
+
+**Asked:** "vezi ca mai am todo cu notes per proiect, si sa le poata accesa si agentul, vreau sa dau un
+shortcut si sa mi apar fereasra" (per-project notes already existed — the asks were agent access and a
+shortcut that opens the notes window).
+
+**Did:** New `nebula notes [list|add [--worktree]|done <n>]` CLI: `run_notes` in
+`crates/nebula-tui/src/ipc.rs` subscribes for one Snapshot and resolves the target from
+`NEBULA_AGENT_ID` (agent → worktree → project), falling back to cwd (deepest worktree, else project by
+`repo_path` prefix); list shows the project's notes then the worktree's as one numbered list, and
+`done <n>` indexes into that. Agents learn it exists via a UserPromptSubmit injection
+(`notes_instruction` in `hooks/mod.rs`) that fires only while `open_note_count_for_agent` (`store.rs`)
+counts undone notes, plus a `Bash(nebula notes:*)` allow rule in `hooks/installer.rs`. The injection
+branch now builds a `parts: Vec<String>` joined by `context_injection` (auto-title + orchestrator +
+notes compose). `Action::Notes` gained a `cmd+e` default and the locked-terminal ⌘-intercept in
+`event_loop.rs` (the ⌘N one) now also opens the note view.
+
+**Gotchas:**
+- No protocol change was needed — `Subscribe`, `CreateNote`, `SetNoteDone` already existed, so old
+  daemon/new CLI stay MessagePack-compatible. Prefer composing existing requests over new variants.
+- Another agent's orchestrator work was mid-flight in the same files the whole time; their
+  `ORCHESTRATOR_INSTRUCTION` merged into my `parts` vec cleanly, but `cargo test -p nebula-daemon`
+  was left uncompilable by *their* `registry.rs` tests (`agent_spawn_command` grew a 6th `prompt`
+  arg). The new `open_note_count_for_agent` store test is written but couldn't run; the SQL was
+  verified directly against a synthetic sqlite3 schema, and the CLI end-to-end against an isolated
+  daemon (`NEBULA_RUNTIME_DIR=/tmp/<short>`, `NEBULA_AGENT_CMD=/bin/cat`).
+- `event_loop.rs::a_duplicate_chord_warns_before_it_is_taken` hardcodes Notes' default-chord label —
+  adding a second default ("e ⌘e") breaks it. Any new default chord on an existing action needs that
+  test's labels updated.
+
+**Asked:** "cand dau ng sa dewchid nebula ar treb sa mi deschida direct in sesiunea aia ca la herdr, si
+sa fie mai usor de cautat foldere" — then mid-task: "nu mai vreau prima interfata, si mereu sa ramana in
+stadiul ala" (never show the first-run splash; always open on the panels).
+
+**Did:** New `nebula open [dir]` subcommand (`crates/nebula/src/main.rs`, handoff refactored into
+`run_tui_and_handoff`) threads `open_at` through `run_tui`/`run_app` into `App.open_at`; the first
+Snapshot calls `land_open_at` (`event_loop.rs`) — deepest worktree containing the dir wins, else project
+by `repo_path` prefix, else `AddProject` with new `PendingIntent::SelectAddedProject` (+
+`select_project_when_seen`, same when-seen idiom as worktrees). `~/.local/bin/ng` now passes
+`open "${1:-$PWD}"` (with an `ng --plain` escape hatch). The first-run splash is gone:
+`App::splash_showing` is now only the N-key preview; an empty workspace draws the normal panels, keeps
+the first-run guidance footer (`ui.rs` footer arm now fires on `!has_visible_projects()` too), and the
+`Action::Workspaces` terminal-focus guard also opens on an empty tree. `completion::list_dirs` matching
+is now fuzzy (`fuzzy_rank`: prefix < substring < subsequence, case-insensitive, best-first); Tab
+completion stays bash-prefix.
+
+**Gotchas:**
+- `ng` runs `open -na Ghostty.app … -e nebula`, which launches via launchd — **the caller's cwd never
+  reaches nebula**. Any "open at cwd" behavior must pass the directory as an explicit argument.
+- Six tests encoded splash-on-empty-tree; the cheap fix that avoided rewriting the footer assertions was
+  keeping the guidance-footer arm alive for `!has_visible_projects()` rather than deleting it with the
+  splash.
+- `land_open_at` flashes instead of sending `AddProject` when no ancestor has `.git` — otherwise a bare
+  `ng` from a non-repo dir would surface a daemon error on every launch.
+- Follow-up ("cand caut un proiect nu merge cu fuzzy… sa caut mai rpd decat sa ma duc prin foldere"):
+  in-level fuzzy wasn't enough — the Add-project prompt now deep-scans. `completion::scan_parent`
+  (depth 3, 25k-dir budget, hidden + `DEEP_SKIP` pruned, **git repos are leaves**) is cached per typed
+  parent on `PromptDialog.deep`/`deep_parent`; `filter_deep` narrows per keystroke (basename rank,
+  repos first, shallow first). A dotted partial still browses shallow — that's the hidden-dirs opt-in.
+  Slashed entry names ("Desktop/nebula") flow through `hovered_path`/`dive` untouched. The listing
+  highlight in `ui.rs` used to underline the first `partial.len()` chars (a prefix assumption);
+  `completion::match_positions` now computes the real matched positions on the *truncated* name.
+- Bug report ("am cautat nebula desktop dar ma intreaba daca il creeaza pe desktop"): Enter on the
+  input row treated the fuzzy query as a literal path and hit the create-directory confirm. The Enter
+  arm in `event_loop.rs` now falls back to `prompt.dirs.first()` when the typed text doesn't exist as
+  a path — creating a new dir on purpose still works because a fresh name matches nothing. Queries
+  also split on whitespace now (`filter_deep` requires every token to match basename-or-path), so
+  "nebula desktop" finds `Desktop/nebula` in either word order.
+- "Selectez un proiect, dau Enter si nu se intampla nimic" + empty panels was **not** a prompt bug: the
+  footer said `✗ disconnected · daemon connection lost`. A daemon from an older build (it predated the
+  in-flight `created_from` field on `Worktree`) can't decode/encode against a freshly rebuilt TUI —
+  MessagePack structs are positional, so any entity-field change severs the connection, the Snapshot
+  never arrives, and every keypress goes nowhere. Diagnose with `nebula _stale-daemon-note` (prints only
+  when the running daemon's build differs; `/tmp/nebula-501/daemon.build` holds the id); fix is
+  `nebula kill` + relaunch. **Check what dies first**: `pgrep -lP <daemon-pid>` — this time it held one
+  live claude session, and the user okayed killing it.
+- "cmmd k ar treb sa caute printre sesiuni": ⌘K used to be `text:/` in the Ghostty overlay (the
+  everything-palette). New `Action::SessionPalette` (`shift+s`) opens `Palette::sessions` —
+  `sessions_only` on the `Palette` struct filters `build_palette_items` to agent rows and forces
+  `enter_attaches` — and the overlay now maps `super+k=text:S`. `/` still searches everything. Remember:
+  Ghostty ⌘-keybinds in this overlay are just text injections, so any new ⌘ shortcut needs a plain-key
+  action on the nebula side first.
+- The `ng` Ghostty window opened at a small/restored size: the overlay `~/.config/ghostty/nebula` now
+  sets `maximize = true` + `window-save-state = never` (they must sit *after* its `config-file = config`
+  include to win). `ghostty +validate-config --config-file=…` is the cheap check — it flags unknown
+  fields, so a clean exit proves the keys are real.
+
+### Cmd+N Spawns A New Agent From Anywhere — 2026-08-24
+
+**Asked:** "pe nebula vreau cmmd n sa mi fac nou agent mai bine" (cmd+n should create a new agent, better
+than the panel-dependent `n`).
+
+**Did:** New `Action::NewAgent` in `crates/nebula-tui/src/keymap.rs` (id `new_agent`, SESSIONS group,
+defaults `cmd+n, ctrl+n`) opening the new-session picker for the selected worktree from any panel via
+`new_agent_shortcut` in `event_loop.rs`. It also fires inside an input-locked terminal — a guard in the
+locked branch (next to the ^q hatch) intercepts it, unlocks, and opens the picker.
+
+**Gotchas:**
+- The locked-terminal intercept is gated on `chord.mods.contains(SUPER)` on purpose: if a user rebinds
+  `new_agent` to a plain or ctrl chord, intercepting it while locked would steal keys the child app
+  owns (typing `N`, readline's ^n). Keep that guard if the intercept ever grows.
+- `keymap::tests::every_action_ships_with_a_reachable_chord` forbids an action whose only default is a
+  ⌘ chord (host_warning marks all ⌘ as Blocked — Terminal.app swallows them). Hence the `ctrl+n`
+  fallback. First try was `shift+n`, which collides with `splash`.
+- Verified in a scratch worktree at HEAD: the shared tree was mid-flight with another agent's
+  `created_from` field on `Worktree`, breaking `cargo test` for unrelated reasons.
+
 ### Shift+G Opens The Repo's Git Host, Released As v0.3.0 — 2026-08-24
 
 **Asked:** "is there a release skill in this repo?", then "commit and push and do another release", then

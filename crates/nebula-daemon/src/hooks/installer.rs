@@ -105,9 +105,13 @@ fn hook_command(endpoint: &str, event: &str) -> String {
     )
 }
 
-/// Permission rule letting Claude Code run the auto-title command without a
+/// Permission rules letting Claude Code run the auto-title command and the
+/// orchestration verbs (`nebula worktree new`, `nebula agent …`) without a
 /// permission prompt (codex/cursor run with their skip-permissions flags).
 const CLAUDE_ALLOW_RENAME: &str = "Bash(nebula rename:*)";
+const CLAUDE_ALLOW_WORKTREE: &str = "Bash(nebula worktree:*)";
+const CLAUDE_ALLOW_AGENT: &str = "Bash(nebula agent:*)";
+const CLAUDE_ALLOW_NOTES: &str = "Bash(nebula notes:*)";
 
 /// Cursor variant: the payload arrives on stdin like Claude's, but cursor
 /// expects a JSON response on stdout — `{"continue": true}` keeps gating
@@ -173,6 +177,9 @@ pub fn install_claude_hooks(cwd: &Path) -> Result<()> {
     };
     merge_managed_hooks(root_obj, "claude", CLAUDE_EVENTS, &path)?;
     ensure_permission_allow(root_obj, CLAUDE_ALLOW_RENAME, &path)?;
+    ensure_permission_allow(root_obj, CLAUDE_ALLOW_WORKTREE, &path)?;
+    ensure_permission_allow(root_obj, CLAUDE_ALLOW_AGENT, &path)?;
+    ensure_permission_allow(root_obj, CLAUDE_ALLOW_NOTES, &path)?;
     write_hooks_root(&dir, "settings.local.json", &root)
 }
 
@@ -428,6 +435,41 @@ On the first user message of a new conversation:
     )
 }
 
+/// Pi speaks neither hooks dialect — it has a TypeScript extension API
+/// instead. The managed extension below reports status over the same
+/// loopback endpoint (`/api/hooks/pi`) and re-injects the daemon's
+/// UserPromptSubmit response body as a context message, so pi gets the
+/// auto-title/notes/orchestrator channel the injectable CLIs have. It is
+/// env-guarded (inert without NEBULA_* vars) and lives in pi's global
+/// extensions dir, so one install covers every worktree.
+const PI_EXTENSION: &str = include_str!("nebula_pi.ts");
+pub const PI_EXTENSION_FILE: &str = "nebula-agent-state.ts";
+
+/// Pi's agent dir (`$PI_CODING_AGENT_DIR`, else `~/.pi/agent`); extensions
+/// load from `<dir>/extensions`.
+pub fn pi_agent_dir() -> PathBuf {
+    match std::env::var("PI_CODING_AGENT_DIR") {
+        Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => PathBuf::from(std::env::var("HOME").unwrap_or_default())
+            .join(".pi")
+            .join("agent"),
+    }
+}
+
+/// Write nebula's managed pi extension into `<agent_dir>/extensions`. The
+/// file is wholly nebula-owned (namespaced name) and rewritten on every
+/// spawn. A missing agent dir means pi has never run here — refuse rather
+/// than conjure a config tree pi may not read.
+pub fn install_pi_extension(agent_dir: &Path) -> Result<()> {
+    if !agent_dir.is_dir() {
+        bail!(
+            "pi agent dir {} not found — run pi once so it exists",
+            agent_dir.display()
+        );
+    }
+    write_text_atomic(&agent_dir.join("extensions"), PI_EXTENSION_FILE, PI_EXTENSION)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -585,6 +627,32 @@ mod tests {
             Some(v) => std::env::set_var("CODEX_HOME", v),
             None => std::env::remove_var("CODEX_HOME"),
         }
+    }
+
+    #[test]
+    fn pi_extension_installs_and_is_rewritten() {
+        let tmp = tempfile::tempdir().unwrap();
+        install_pi_extension(tmp.path()).unwrap();
+        let path = tmp.path().join("extensions").join(PI_EXTENSION_FILE);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("managed by nebula"));
+        assert!(text.contains("/api/hooks/pi"));
+        assert!(text.contains("NEBULA_AGENT_ID"), "must be env-guarded");
+
+        // A user edit is overwritten on the next spawn — the file is ours.
+        std::fs::write(&path, "// edited").unwrap();
+        install_pi_extension(tmp.path()).unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("managed by nebula"));
+    }
+
+    /// No `~/.pi/agent` means pi has never run — refuse instead of
+    /// creating a config tree pi may not read.
+    #[test]
+    fn pi_extension_refuses_missing_agent_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("nope");
+        assert!(install_pi_extension(&missing).is_err());
+        assert!(!missing.exists(), "refusal must not create the dir");
     }
 
     /// Migration off the old per-worktree install: our groups go, foreign

@@ -583,6 +583,7 @@ impl Daemon {
                 path: entry.path.clone(),
                 branch: entry.branch,
                 is_main: first,
+                created_from: None,
                 pinned: false,
                 sort_order: 0,
             };
@@ -900,6 +901,7 @@ impl Daemon {
             path,
             branch: branch.to_string(),
             is_main: false,
+            created_from: base.map(str::to_owned),
             pinned: false,
             sort_order: 0,
         };
@@ -1000,6 +1002,7 @@ impl Daemon {
                 path: entry.path.clone(),
                 branch: entry.branch.clone(),
                 is_main: false,
+                created_from: None,
                 pinned: false,
                 sort_order: 0,
             };
@@ -1028,6 +1031,7 @@ impl Daemon {
 
     // ---- agents ----
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_agent(
         self: &Arc<Self>,
         worktree_id: &WorktreeId,
@@ -1036,6 +1040,8 @@ impl Daemon {
         model: Option<String>,
         effort: Option<String>,
         auto_title: bool,
+        orchestrator: bool,
+        prompt: Option<String>,
     ) -> Result<EntityId> {
         let worktree = self
             .store
@@ -1043,8 +1049,13 @@ impl Daemon {
             .context("worktree not found")?;
         // A warm session for this (worktree, kind) hands over its PTY and
         // its pre-generated id — the CLI booted while the user typed the
-        // name, so the create feels instant.
-        let adopted = self.take_prewarmed(worktree_id, kind, &model, &effort);
+        // name, so the create feels instant. An initial prompt forces the
+        // cold path: it rides the CLI's argv, which a booted CLI can't take.
+        let adopted = if prompt.is_some() {
+            None
+        } else {
+            self.take_prewarmed(worktree_id, kind, &model, &effort)
+        };
         // Only the cold path needs asking: an adopted warm session is proof
         // the CLI runs. Without this, a missing CLI still "succeeds" — the
         // login shell prints `command not found` into a PTY that dies at
@@ -1066,20 +1077,24 @@ impl Daemon {
             status: AgentStatus::Fresh,
             archived: false,
             archived_at: 0,
-            pinned: false,
+            // Orchestrators are always pinned: the idle reaper never
+            // touches pinned sessions, and a project's manager must not
+            // be reaped out from under its workers.
+            pinned: orchestrator,
             kind,
             model,
             effort,
             session_id: None,
             sort_order: 0,
             status_changed_at: epoch_ms(),
+            orchestrator,
             alive: false,
         };
         self.store
             .insert_agent_with_auto_title(&agent, auto_title)?;
         if adopted.is_none() {
             // Cold path: boot the CLI right away.
-            self.spawn_agent_session(&agent, &worktree, 80, 24)?;
+            self.spawn_agent_session_with_prompt(&agent, &worktree, 80, 24, prompt.as_deref())?;
         }
         let mut broadcast_agent = agent.clone();
         broadcast_agent.alive = true;
@@ -1153,6 +1168,7 @@ impl Daemon {
             session_id: None,
             sort_order: 0,
             status_changed_at: 0,
+            orchestrator: false,
             alive: false,
         };
         self.spawn_agent_session(&agent, &worktree, 80, 24)?;
@@ -1569,6 +1585,38 @@ impl Daemon {
         Ok(())
     }
 
+    /// Promote a session to project orchestrator, or demote one back to a
+    /// plain session. Promotion requires the root checkout (orchestrators
+    /// live on the main branch by definition) and pins the row; demotion
+    /// unpins it.
+    pub fn set_agent_orchestrator(
+        self: &Arc<Self>,
+        id: &AgentId,
+        orchestrator: bool,
+    ) -> Result<()> {
+        if orchestrator {
+            let agent = self.agent_entity(id)?;
+            let worktree = self
+                .store
+                .get_worktree(&agent.worktree_id)?
+                .context("worktree not found")?;
+            if !worktree.is_main {
+                bail!(
+                    "only a session on the root checkout can become the orchestrator \
+                     (this one is on {})",
+                    worktree.branch
+                );
+            }
+        }
+        self.store.set_agent_orchestrator(id, orchestrator)?;
+        self.store.set_agent_pinned(id, orchestrator)?;
+        let agent = self.agent_entity(id)?;
+        self.broadcast(ServerEvent::EntityUpserted {
+            entity: Entity::Agent(agent),
+        });
+        Ok(())
+    }
+
     pub fn delete_agent(self: &Arc<Self>, id: &AgentId) -> Result<()> {
         self.kill_session(&SessionRef::Agent(id.clone()));
         self.last_cwd.lock().unwrap().remove(id);
@@ -1840,6 +1888,20 @@ impl Daemon {
         cols: u16,
         rows: u16,
     ) -> Result<Arc<PtySession>> {
+        self.spawn_agent_session_with_prompt(agent, worktree, cols, rows, None)
+    }
+
+    /// `initial_prompt` rides the CLI's positional prompt argument, so it
+    /// only applies to a fresh spawn — respawns resume by session id and
+    /// never repeat it (`agent_spawn_command` drops it when resuming).
+    fn spawn_agent_session_with_prompt(
+        self: &Arc<Self>,
+        agent: &Agent,
+        worktree: &Worktree,
+        cols: u16,
+        rows: u16,
+        initial_prompt: Option<&str>,
+    ) -> Result<Arc<PtySession>> {
         // Managed status hooks; a failure here degrades to "no status
         // updates", never blocks the spawn.
         let install_result = match agent.kind {
@@ -1855,6 +1917,11 @@ impl Daemon {
             // hook dialect has no context-injection channel.
             AgentKind::Cursor => hooks::installer::install_cursor_hooks(&worktree.path)
                 .and_then(|()| hooks::installer::install_cursor_title_rule(&worktree.path)),
+            // Pi has no hooks — a managed extension in its global
+            // extensions dir phones the same endpoints home.
+            AgentKind::Pi => {
+                hooks::installer::install_pi_extension(&hooks::installer::pi_agent_dir())
+            }
         };
         if let Err(e) = install_result {
             tracing::warn!(error = %e, cwd = %worktree.path.display(), "hook install failed");
@@ -1868,6 +1935,7 @@ impl Daemon {
             agent.model.as_deref(),
             agent.effort.as_deref(),
             cmd_override.as_deref(),
+            initial_prompt,
         );
         // Run the agent through the user's login+interactive shell so it sees
         // the same env as a Terminal.app tab (~/.zprofile, ~/.zshrc,
@@ -2068,18 +2136,22 @@ impl Daemon {
 
 /// Program + args for an agent PTY. An override (tests) is used verbatim —
 /// no resume args. Otherwise the kind picks the CLI and its resume shape:
-/// `claude --resume <sid>` and `cursor-agent --resume <sid>` (flag) vs
+/// `claude --resume <sid>` and `cursor-agent --resume <sid>` (flag),
+/// `pi --session <sid>` (flag, takes a full or partial session id) vs
 /// `codex resume <sid>` (subcommand, so resume args must lead). Codex and
 /// cursor always get their skip-permissions flag (`--yolo` / `--force`),
 /// appended after the resume args — same convention as Mission Control.
-/// Model/effort choices trail everything: `claude --model m --effort e`,
-/// `codex -m m -c model_reasoning_effort=e` (cursor has neither knob).
+/// Pi needs none: it has no permission prompts. Model/effort choices trail
+/// everything: `claude --model m --effort e`, `codex -m m -c
+/// model_reasoning_effort=e`, `pi --model m --thinking e` (pi's "effort" is
+/// its thinking level); cursor has neither knob.
 fn agent_spawn_command(
     kind: AgentKind,
     session_id: Option<&str>,
     model: Option<&str>,
     effort: Option<&str>,
     cmd_override: Option<&str>,
+    initial_prompt: Option<&str>,
 ) -> (String, Vec<String>, bool) {
     if let Some(cmd) = cmd_override {
         let mut parts = cmd.split_whitespace().map(String::from).collect::<Vec<_>>();
@@ -2094,12 +2166,13 @@ fn agent_spawn_command(
         (AgentKind::Claude, Some(sid)) => (vec!["--resume".to_string(), sid.to_string()], true),
         (AgentKind::Codex, Some(sid)) => (vec!["resume".to_string(), sid.to_string()], true),
         (AgentKind::Cursor, Some(sid)) => (vec!["--resume".to_string(), sid.to_string()], true),
+        (AgentKind::Pi, Some(sid)) => (vec!["--session".to_string(), sid.to_string()], true),
         (_, None) => (Vec::new(), false),
     };
     match kind {
         AgentKind::Codex => args.push("--yolo".to_string()),
         AgentKind::Cursor => args.push("--force".to_string()),
-        AgentKind::Claude => {}
+        AgentKind::Claude | AgentKind::Pi => {}
     }
     match kind {
         AgentKind::Claude => {
@@ -2119,6 +2192,20 @@ fn agent_spawn_command(
             }
         }
         AgentKind::Cursor => {}
+        AgentKind::Pi => {
+            if let Some(m) = model {
+                args.extend(["--model".to_string(), m.to_string()]);
+            }
+            if let Some(e) = effort {
+                args.extend(["--thinking".to_string(), e.to_string()]);
+            }
+        }
+    }
+    // All the CLIs take the initial task as a positional argument. Only
+    // on a fresh spawn — a resume continues the old conversation and must
+    // not re-submit the prompt.
+    if let Some(p) = initial_prompt.filter(|_| !resumed) {
+        args.push(p.to_string());
     }
     (program, args, resumed)
 }
@@ -2251,22 +2338,40 @@ mod tests {
     fn spawn_command_per_kind_resume_shapes() {
         // Fresh sessions: bare CLI.
         assert_eq!(
-            agent_spawn_command(AgentKind::Claude, None, None, None, None),
+            agent_spawn_command(AgentKind::Claude, None, None, None, None, None),
             ("claude".into(), vec![], false)
+        );
+        // An initial prompt rides as the positional arg on a fresh spawn —
+        // and is dropped on a resume, which continues the old conversation.
+        assert_eq!(
+            agent_spawn_command(AgentKind::Claude, None, None, None, None, Some("do the task")),
+            ("claude".into(), vec!["do the task".to_string()], false)
+        );
+        let (_, resumed_args, resumed) =
+            agent_spawn_command(AgentKind::Claude, Some("sid"), None, None, None, Some("do it"));
+        assert!(resumed);
+        assert!(
+            !resumed_args.contains(&"do it".to_string()),
+            "resume must not re-submit the prompt: {resumed_args:?}"
         );
         // Codex/cursor always run in skip-permissions mode.
         assert_eq!(
-            agent_spawn_command(AgentKind::Codex, None, None, None, None),
+            agent_spawn_command(AgentKind::Codex, None, None, None, None, None),
             ("codex".into(), vec!["--yolo".to_string()], false)
         );
         // Cursor's agent CLI is `cursor-agent`, not `cursor` (the editor).
         assert_eq!(
-            agent_spawn_command(AgentKind::Cursor, None, None, None, None),
+            agent_spawn_command(AgentKind::Cursor, None, None, None, None, None),
             ("cursor-agent".into(), vec!["--force".to_string()], false)
+        );
+        // Pi has no permission prompts, so no skip flag either.
+        assert_eq!(
+            agent_spawn_command(AgentKind::Pi, None, None, None, None, None),
+            ("pi".into(), vec![], false)
         );
         // Claude resumes with a flag; codex with a subcommand (order matters).
         assert_eq!(
-            agent_spawn_command(AgentKind::Claude, Some("sid-1"), None, None, None),
+            agent_spawn_command(AgentKind::Claude, Some("sid-1"), None, None, None, None),
             (
                 "claude".into(),
                 vec!["--resume".to_string(), "sid-1".to_string()],
@@ -2275,7 +2380,7 @@ mod tests {
         );
         // Skip-permissions flags trail the resume args.
         assert_eq!(
-            agent_spawn_command(AgentKind::Codex, Some("sid-2"), None, None, None),
+            agent_spawn_command(AgentKind::Codex, Some("sid-2"), None, None, None, None),
             (
                 "codex".into(),
                 vec![
@@ -2287,7 +2392,7 @@ mod tests {
             )
         );
         assert_eq!(
-            agent_spawn_command(AgentKind::Cursor, Some("sid-3"), None, None, None),
+            agent_spawn_command(AgentKind::Cursor, Some("sid-3"), None, None, None, None),
             (
                 "cursor-agent".into(),
                 vec![
@@ -2298,6 +2403,16 @@ mod tests {
                 true
             )
         );
+        // Pi resumes with `--session <id>` (its `--resume` is an
+        // interactive picker, not an id flag).
+        assert_eq!(
+            agent_spawn_command(AgentKind::Pi, Some("sid-4"), None, None, None, None),
+            (
+                "pi".into(),
+                vec!["--session".to_string(), "sid-4".to_string()],
+                true
+            )
+        );
         // Override wins for both kinds and never gets resume args.
         assert_eq!(
             agent_spawn_command(
@@ -2305,12 +2420,13 @@ mod tests {
                 Some("sid"),
                 None,
                 None,
-                Some("/bin/sh -i")
+                Some("/bin/sh -i"),
+                None
             ),
             ("/bin/sh".into(), vec!["-i".to_string()], false)
         );
         assert_eq!(
-            agent_spawn_command(AgentKind::Codex, Some("sid"), None, None, Some("/bin/sh")),
+            agent_spawn_command(AgentKind::Codex, Some("sid"), None, None, Some("/bin/sh"), None),
             ("/bin/sh".into(), vec![], false)
         );
     }
@@ -2319,7 +2435,7 @@ mod tests {
     fn spawn_command_model_and_effort_flags() {
         // Claude gets --model/--effort; either alone works.
         assert_eq!(
-            agent_spawn_command(AgentKind::Claude, None, Some("opus"), Some("high"), None),
+            agent_spawn_command(AgentKind::Claude, None, Some("opus"), Some("high"), None, None),
             (
                 "claude".into(),
                 vec![
@@ -2332,7 +2448,7 @@ mod tests {
             )
         );
         assert_eq!(
-            agent_spawn_command(AgentKind::Claude, None, None, Some("max"), None),
+            agent_spawn_command(AgentKind::Claude, None, None, Some("max"), None, None),
             (
                 "claude".into(),
                 vec!["--effort".to_string(), "max".to_string()],
@@ -2341,7 +2457,7 @@ mod tests {
         );
         // Codex takes --model plus a config override for effort, after --yolo.
         assert_eq!(
-            agent_spawn_command(AgentKind::Codex, None, Some("gpt-5.5"), Some("high"), None),
+            agent_spawn_command(AgentKind::Codex, None, Some("gpt-5.5"), Some("high"), None, None),
             (
                 "codex".into(),
                 vec![
@@ -2357,7 +2473,7 @@ mod tests {
         // Resume keeps the model/effort flags (a fallback fresh spawn needs
         // them, and the CLIs accept them alongside resume).
         assert_eq!(
-            agent_spawn_command(AgentKind::Claude, Some("sid"), Some("sonnet"), None, None),
+            agent_spawn_command(AgentKind::Claude, Some("sid"), Some("sonnet"), None, None, None),
             (
                 "claude".into(),
                 vec![
@@ -2371,12 +2487,26 @@ mod tests {
         );
         // Cursor has no model/effort knobs — choices are ignored.
         assert_eq!(
-            agent_spawn_command(AgentKind::Cursor, None, Some("m"), Some("e"), None),
+            agent_spawn_command(AgentKind::Cursor, None, Some("m"), Some("e"), None, None),
             ("cursor-agent".into(), vec!["--force".to_string()], false)
+        );
+        // Pi's effort rides its --thinking flag.
+        assert_eq!(
+            agent_spawn_command(AgentKind::Pi, None, Some("gpt-5.5"), Some("high"), None, None),
+            (
+                "pi".into(),
+                vec![
+                    "--model".to_string(),
+                    "gpt-5.5".to_string(),
+                    "--thinking".to_string(),
+                    "high".to_string()
+                ],
+                false
+            )
         );
         // Override still wins over everything.
         assert_eq!(
-            agent_spawn_command(AgentKind::Claude, None, Some("opus"), None, Some("/bin/sh")),
+            agent_spawn_command(AgentKind::Claude, None, Some("opus"), None, Some("/bin/sh"), None),
             ("/bin/sh".into(), vec![], false)
         );
     }
@@ -2737,6 +2867,7 @@ mod tests {
                 path: path.into(),
                 branch: id.into(),
                 is_main,
+                created_from: None,
                 pinned: false,
                 sort_order: 0,
             })
@@ -2760,6 +2891,7 @@ mod tests {
                 session_id: session_id.map(str::to_string),
                 sort_order: 0,
                 status_changed_at: 0,
+                orchestrator: false,
                 alive: false,
             })
             .unwrap();
@@ -2820,6 +2952,7 @@ mod tests {
                     session_id: None,
                     sort_order: 0,
                     status_changed_at: 0,
+                    orchestrator: false,
                     alive: false,
                 },
                 true,
@@ -3133,6 +3266,7 @@ mod tests {
         assert!(cli_missing_message(AgentKind::Cursor).starts_with("cursor-agent was not found"));
         assert!(cli_missing_message(AgentKind::Claude).starts_with("claude was not found"));
         assert!(cli_missing_message(AgentKind::Codex).starts_with("codex was not found"));
+        assert!(cli_missing_message(AgentKind::Pi).starts_with("pi was not found"));
         // No "restart nebula": agent CLIs are spawned through the user's
         // login shell, so a fresh install is picked up on the next try.
         for kind in AgentKind::ALL {

@@ -26,7 +26,9 @@ const FOOTER_SESSIONS: &str = "n: agent";
 /// Terminal pane focused but NOT input-locked (attached session).
 const FOOTER_TERMINAL_FOCUSED: &str = "Enter: type into terminal";
 /// Terminal pane input-locked: keys forward to the PTY.
-const FOOTER_TERMINAL_LOCKED: &str = "Ctrl+q: panels";
+// The footer abbreviates the unlock chord: "^q", not "Ctrl+q" (87d2b24
+// shipped this test red against the new spelling; fixed 2026-08-24).
+const FOOTER_TERMINAL_LOCKED: &str = "^q: panels";
 
 struct TuiHarness {
     writer: Box<dyn Write + Send>,
@@ -362,7 +364,7 @@ fn tui_projects_worktrees_agents_navigation() {
     let beta = tui.make_repo("beta-proj");
 
     // ---- boot: empty state, Projects focused ----
-    tui.wait_for_text("create your first project");
+    tui.wait_for_text("no projects yet");
     tui.wait_for_text(FOOTER_PROJECTS);
 
     // ---- add the first project via bash-style Tab completion ----
@@ -515,7 +517,7 @@ fn tui_projects_worktrees_agents_navigation() {
 #[test]
 fn tui_help_modal_grouped_keymap() {
     let mut tui = TuiHarness::spawn();
-    tui.wait_for_text("create your first project");
+    tui.wait_for_text("no projects yet");
 
     // The grouped two-column keymap: every section header on screen at
     // once, including the note hotkey (the old single list clipped its
@@ -539,7 +541,7 @@ fn tui_note_modal_crud_and_badge() {
     let mut tui = TuiHarness::spawn();
     let repo = tui.make_repo("note-proj");
 
-    tui.wait_for_text("create your first project");
+    tui.wait_for_text("no projects yet");
     add_project(&mut tui, &repo, "note-proj");
     // The root worktree row must exist before e has a list to open.
     tui.wait_for_text("⌂ root");
@@ -629,7 +631,7 @@ fn tui_link_crud_in_sessions_panel() {
     let mut tui = TuiHarness::spawn();
     let repo = tui.make_repo("link-proj");
 
-    tui.wait_for_text("create your first project");
+    tui.wait_for_text("no projects yet");
     add_project(&mut tui, &repo, "link-proj");
     // The root worktree row must exist before a link has an owner.
     tui.wait_for_text("⌂ root");
@@ -691,7 +693,7 @@ fn tui_pull_request_row_leads_the_links_group() {
 
     let mut tui = TuiHarness::spawn_with_env(&[("PATH", path)]);
     let repo = tui.make_repo("pr-proj");
-    tui.wait_for_text("create your first project");
+    tui.wait_for_text("no projects yet");
     add_project(&mut tui, &repo, "pr-proj");
     tui.wait_for_text("⌂ root");
 
@@ -721,7 +723,7 @@ fn tui_git_diff_modal() {
     let mut tui = TuiHarness::spawn();
     let repo = tui.make_repo("diff-proj");
 
-    tui.wait_for_text("create your first project");
+    tui.wait_for_text("no projects yet");
     add_project(&mut tui, &repo, "diff-proj");
     // The root worktree row must exist before g has anything to diff.
     tui.wait_for_text("⌂ root");

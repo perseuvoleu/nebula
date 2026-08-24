@@ -38,6 +38,9 @@ pub enum HitTarget {
     /// Row index into `App::project_rows()` (projects and dividers both).
     Project(usize),
     Worktree(usize),
+    /// Row in the Worktrees panel's ORCHESTRATORS section (the
+    /// "+ new orchestrator" placeholder is row 0 of an empty section).
+    Orchestrator(usize),
     Session(usize),
     /// The ARCHIVED group header (either form); a click toggles the group
     /// open/closed, same as the A key.
@@ -79,8 +82,14 @@ pub enum MenuAction {
     ArchiveAgent(AgentId),
     UnarchiveAgent(AgentId),
     SetAgentPinned(AgentId, bool),
+    /// Promote a root-checkout session into the ORCHESTRATORS section, or
+    /// demote an orchestrator back to a plain session.
+    SetAgentOrchestrator(AgentId, bool),
     DeleteAgent(AgentId),
     NewAgent(WorktreeId),
+    /// Spawn a project orchestrator: a pinned Claude session on the root
+    /// checkout, listed in the Worktrees panel's ORCHESTRATORS group.
+    NewOrchestrator(ProjectId),
     /// Picker result: create an agent of this kind (chains into the name
     /// prompt). `model`/`effort` are submenu choices: None means the row
     /// hasn't drilled into that submenu (its configured default applies);
@@ -90,6 +99,9 @@ pub enum MenuAction {
         kind: AgentKind,
         model: Option<String>,
         effort: Option<String>,
+        /// The picked session becomes a project orchestrator (root
+        /// checkout, ORCHESTRATORS section) instead of a plain session.
+        orchestrator: bool,
     },
     /// Shell terminal in the worktree's directory; created immediately with
     /// a default name (no prompt), renameable later.
@@ -249,6 +261,8 @@ pub enum PromptKind {
         /// None = the CLI's own default.
         model: Option<String>,
         effort: Option<String>,
+        /// Name prompt for a new orchestrator, not a plain session.
+        orchestrator: bool,
     },
     RenameAgent {
         id: AgentId,
@@ -282,6 +296,12 @@ pub struct PromptDialog {
     pub dirs: Vec<crate::completion::DirEntry>,
     /// Listing row highlighted by ↓↑; None = the typed path itself.
     pub hover: Option<usize>,
+    /// Recursive scan below the typed parent, backing the fuzzy finder —
+    /// computed once per parent (the key is `deep_parent`) and narrowed
+    /// per keystroke, so typing stays cheap.
+    pub deep: Vec<crate::completion::DirEntry>,
+    /// Typed parent `deep` was scanned under; a different parent rescans.
+    pub deep_parent: Option<String>,
     /// Screen rect of the listing rows, written during draw for click
     /// hit-testing.
     pub list_area: Rect,
@@ -301,6 +321,8 @@ impl PromptDialog {
             kind,
             dirs: Vec::new(),
             hover: None,
+            deep: Vec::new(),
+            deep_parent: None,
             list_area: Rect::default(),
         };
         prompt.refresh_dirs();
@@ -317,14 +339,27 @@ impl PromptDialog {
     }
 
     /// Recompute `dirs` from `input` after any edit; the hover returns to
-    /// the input row. Non-path prompts keep an empty listing.
+    /// the input row. Non-path prompts keep an empty listing. An empty (or
+    /// dotted — the hidden-dirs opt-in) partial browses the parent level;
+    /// anything else fuzzy-searches the whole scanned tree below it, so
+    /// "neb" finds Desktop/nebula without walking folders.
     pub fn refresh_dirs(&mut self) {
         self.hover = None;
-        self.dirs = if self.completes_paths() {
-            crate::completion::list_dirs(&self.input, Self::home().as_deref())
-        } else {
-            Vec::new()
-        };
+        if !self.completes_paths() {
+            self.dirs = Vec::new();
+            return;
+        }
+        let home = Self::home();
+        let (typed_parent, partial) = crate::completion::split_input(&self.input);
+        if partial.is_empty() || partial.starts_with('.') {
+            self.dirs = crate::completion::list_dirs(&self.input, home.as_deref());
+            return;
+        }
+        if self.deep_parent.as_deref() != Some(typed_parent) {
+            self.deep_parent = Some(typed_parent.to_string());
+            self.deep = crate::completion::scan_parent(&self.input, home.as_deref());
+        }
+        self.dirs = crate::completion::filter_deep(&self.deep, partial);
     }
 
     /// Full path of the hovered listing row (typed parent + entry name).
@@ -628,6 +663,9 @@ pub struct Palette {
     /// lands on its Sessions-panel row. Snapshot of the config setting at
     /// open time; Ctrl+O / Ctrl+F pick explicitly either way.
     pub enter_attaches: bool,
+    /// The Cmd+K flavor: list only agent sessions (no project/worktree
+    /// rows), for jumping straight into one.
+    pub sessions_only: bool,
     /// Whole modal rect, written back during draw so clicks outside close.
     pub area: Rect,
     /// Screen rect of the result rows (query row excluded), written back
@@ -637,12 +675,28 @@ pub struct Palette {
 
 impl Palette {
     pub fn new(tree: &Tree, show_archived: bool, enter_attaches: bool) -> Self {
+        Self::build(tree, show_archived, enter_attaches, false)
+    }
+
+    /// The Cmd+K flavor: only agent sessions, and Enter always attaches —
+    /// jumping into a session is the whole point of searching one.
+    pub fn sessions(tree: &Tree, show_archived: bool) -> Self {
+        Self::build(tree, show_archived, true, true)
+    }
+
+    fn build(
+        tree: &Tree,
+        show_archived: bool,
+        enter_attaches: bool,
+        sessions_only: bool,
+    ) -> Self {
         let mut palette = Self {
-            items: build_palette_items(tree, show_archived),
+            items: build_palette_items(tree, show_archived, sessions_only),
             query: TextInput::new(),
             matches: Vec::new(),
             selected: 0,
             enter_attaches,
+            sessions_only,
             area: Rect::default(),
             list_area: Rect::default(),
         };
@@ -657,7 +711,7 @@ impl Palette {
     /// only a vanished target falls back to the best match.
     pub fn rebuild(&mut self, tree: &Tree, show_archived: bool) {
         let keep = self.selected_target().cloned();
-        self.items = build_palette_items(tree, show_archived);
+        self.items = build_palette_items(tree, show_archived, self.sessions_only);
         self.apply_filter();
         if let Some(target) = keep {
             if let Some(row) = self
@@ -707,29 +761,35 @@ impl Palette {
 /// worktrees, then each worktree's sessions. Archived sessions appear only
 /// when the archived toggle is on (the Sessions panel rule). Scoped to the
 /// open workspace — `/` never searches across other workspaces.
-fn build_palette_items(tree: &Tree, show_archived: bool) -> Vec<PaletteItem> {
+fn build_palette_items(
+    tree: &Tree,
+    show_archived: bool,
+    sessions_only: bool,
+) -> Vec<PaletteItem> {
     let projects: Vec<&Project> = tree
         .projects
         .iter()
         .filter(|p| tree.in_active_workspace(p))
         .collect();
     let mut items = Vec::new();
-    for p in &projects {
-        items.push(PaletteItem {
-            target: PaletteTarget::Project(p.id.clone()),
-            text: p.name.clone(),
-            archived: false,
-            status: project_rollup(tree, &p.id),
-        });
-    }
-    for p in &projects {
-        for w in tree.worktrees.iter().filter(|w| w.project_id == p.id) {
+    if !sessions_only {
+        for p in &projects {
             items.push(PaletteItem {
-                target: PaletteTarget::Worktree(w.id.clone()),
-                text: format!("{}/{}", p.name, w.branch),
+                target: PaletteTarget::Project(p.id.clone()),
+                text: p.name.clone(),
                 archived: false,
-                status: worktree_rollup(tree, &w.id),
+                status: project_rollup(tree, &p.id),
             });
+        }
+        for p in &projects {
+            for w in tree.worktrees.iter().filter(|w| w.project_id == p.id) {
+                items.push(PaletteItem {
+                    target: PaletteTarget::Worktree(w.id.clone()),
+                    text: format!("{}/{}", p.name, w.branch),
+                    archived: false,
+                    status: worktree_rollup(tree, &w.id),
+                });
+            }
         }
     }
     for p in &projects {
@@ -738,9 +798,16 @@ fn build_palette_items(tree: &Tree, show_archived: bool) -> Vec<PaletteItem> {
                 if a.archived && !show_archived {
                     continue;
                 }
+                // Orchestrators carry their label in the searchable text
+                // itself, so typing "orch" narrows straight to them.
+                let text = if a.orchestrator {
+                    format!("{}/{} ◆ orchestrator", p.name, a.name)
+                } else {
+                    format!("{}/{}/{}", p.name, w.branch, a.name)
+                };
                 items.push(PaletteItem {
                     target: PaletteTarget::Session(a.id.clone()),
-                    text: format!("{}/{}/{}", p.name, w.branch, a.name),
+                    text,
                     archived: a.archived,
                     status: Some(a.status),
                 });
@@ -1145,8 +1212,13 @@ pub struct WorktreeRollback {
 pub enum PendingIntent {
     /// Attach the created session and focus the terminal.
     AttachCreated,
+    /// Same, for an orchestrator — its row lives in the Worktrees panel,
+    /// so the cursor lands there instead of the Sessions list.
+    AttachCreatedOrchestrator,
     /// Select the created worktree in the Worktrees panel.
     SelectCreatedWorktree,
+    /// Project added by `nebula open <dir>`: land the selection on it.
+    SelectAddedProject,
     /// Move the note modal's cursor onto the created note.
     SelectCreatedNote,
     /// Move the Sessions panel's cursor onto the link just created.
@@ -1577,6 +1649,12 @@ pub struct App {
     /// interleaves projects and their dividers.
     pub sel_project: usize,
     pub sel_worktree: usize,
+    /// Separate cursor for the Worktrees panel's ORCHESTRATORS section:
+    /// Some(i) = the cursor sits on orchestrator row i (or the
+    /// "+ new orchestrator" placeholder when the section is empty);
+    /// None = it sits on worktree row `sel_worktree`. `sel_worktree`
+    /// keeps indexing worktrees only.
+    pub sel_orchestrator: Option<usize>,
     pub sel_session: usize,
     /// First visible row of the Sessions panel, in panel rows (not list
     /// indices — group headers and pill pads take rows too). The wheel
@@ -1617,6 +1695,13 @@ pub struct App {
     pub select_divider_when_seen: Option<(ProjectId, bool)>,
     /// Worktree created by us, awaiting its upsert to fix the selection.
     pub select_worktree_when_seen: Option<WorktreeId>,
+    /// Project added by `nebula open`, awaiting its upsert to land the
+    /// selection on it.
+    pub select_project_when_seen: Option<ProjectId>,
+    /// Directory handed to `nebula open <dir>`: the first snapshot lands
+    /// the selection on whichever project/worktree owns it (adding the
+    /// repo as a project when nebula doesn't know it yet), then clears.
+    pub open_at: Option<std::path::PathBuf>,
     /// Note created by us, awaiting its upsert to land the modal's cursor.
     pub select_note_when_seen: Option<NoteId>,
     /// Link created by us, awaiting its upsert to land the panel cursor on
@@ -1763,6 +1848,7 @@ impl App {
             focus: Focus::Projects,
             sel_project: 0,
             sel_worktree: 0,
+            sel_orchestrator: None,
             sel_session: 0,
             sessions_scroll: 0,
             sessions_anchor: None,
@@ -1783,6 +1869,8 @@ impl App {
             select_when_seen: None,
             select_divider_when_seen: None,
             select_worktree_when_seen: None,
+            select_project_when_seen: None,
+            open_at: None,
             select_note_when_seen: None,
             select_link_when_seen: None,
             last_worktree_for_project: HashMap::new(),
@@ -1844,12 +1932,13 @@ impl App {
         }
     }
 
-    /// The splash is what the body is showing: nothing in the tree yet
-    /// (first run) or summoned with N, and the panels aren't collapsed
-    /// away. True whether it's animating or drawn as a still frame, so the
+    /// The splash is what the body is showing: only when summoned with N
+    /// (and the panels aren't collapsed away). An empty workspace no longer
+    /// opens on it — the panels always show, so projects can be added right
+    /// there. True whether it's animating or drawn as a still frame, so the
     /// footer can key its hints off it.
     pub fn splash_showing(&self) -> bool {
-        !self.collapsed && (!self.tree.has_visible_projects() || self.splash_preview)
+        !self.collapsed && self.splash_preview
     }
 
     /// The animated splash is on screen and should be ticking: nothing in
@@ -1977,9 +2066,83 @@ impl App {
         self.tree.projects.get(row.project_index())
     }
 
+    /// The selected project's orchestrator agents — they live on the root
+    /// checkout, flagged, and render as their own group at the top of the
+    /// Worktrees panel. Unarchived only.
+    pub fn project_orchestrators(&self) -> Vec<&Agent> {
+        let Some(project) = self.selected_project() else {
+            return vec![];
+        };
+        let Some(root) = self
+            .tree
+            .worktrees
+            .iter()
+            .find(|w| w.project_id == project.id && w.is_main)
+        else {
+            return vec![];
+        };
+        self.tree
+            .agents
+            .iter()
+            .filter(|a| a.orchestrator && !a.archived && a.worktree_id == root.id)
+            .collect()
+    }
+
+    /// Orchestrator rows sit above the worktree rows in the Worktrees
+    /// panel; `sel_worktree` indexes the combined list.
+    pub fn orchestrator_row_count(&self) -> usize {
+        self.project_orchestrators().len()
+    }
+
+    /// Rows the ORCHESTRATORS section occupies: its agents — or the one
+    /// selectable "+ new orchestrator" placeholder while there are none,
+    /// so the section can be entered (and `n`/Enter create the first one)
+    /// before it has any. Zero only when no project is selected.
+    pub fn orchestrator_section_len(&self) -> usize {
+        if self.selected_project().is_none() {
+            return 0;
+        }
+        self.orchestrator_row_count().max(1)
+    }
+
+    /// Is the cursor on the empty section's "+ new orchestrator" row?
+    pub fn on_orchestrator_placeholder(&self) -> bool {
+        self.sel_orchestrator == Some(0)
+            && self.selected_project().is_some()
+            && self.project_orchestrators().is_empty()
+    }
+
+    /// Is the cursor anywhere in the ORCHESTRATORS section (a real row or
+    /// the placeholder)? Drives what `n` creates.
+    pub fn in_orchestrator_section(&self) -> bool {
+        self.sel_orchestrator.is_some()
+    }
+
+    /// Index into `visible_worktrees()` when the panel cursor is on a
+    /// worktree row; None while it sits in the ORCHESTRATORS section.
+    pub fn selected_worktree_index(&self) -> Option<usize> {
+        self.sel_orchestrator.is_none().then_some(self.sel_worktree)
+    }
+
+    /// The orchestrator under the cursor, when the Worktrees-panel cursor
+    /// is inside the ORCHESTRATORS section.
+    pub fn selected_orchestrator(&self) -> Option<&Agent> {
+        let index = self.sel_orchestrator?;
+        self.project_orchestrators().get(index).copied()
+    }
+
+    /// Row index of worktree `id` in `visible_worktrees()` — assigns
+    /// straight to `sel_worktree` (callers leave the orchestrator section
+    /// by clearing `sel_orchestrator`; see `set_worktree_row`).
+    pub fn worktree_row_index(&self, id: &WorktreeId) -> Option<usize> {
+        self.visible_worktrees().iter().position(|w| &w.id == id)
+    }
+
     pub fn selected_worktree(&self) -> Option<&Worktree> {
+        // None while the cursor sits in the ORCHESTRATORS section.
+        let index = self.selected_worktree_index()?;
         let worktrees = self.visible_worktrees();
-        worktrees.get(self.sel_worktree).copied()
+        worktrees.get(index).copied()
     }
 
     /// The cached changed-file count when it belongs to the selected
@@ -2026,7 +2189,10 @@ impl App {
     /// twice.
     pub fn visible_links(&self) -> Vec<LinkRow> {
         let worktrees = self.visible_worktrees();
-        let Some(wt) = worktrees.get(self.sel_worktree) else {
+        let Some(wt) = self
+            .selected_worktree_index()
+            .and_then(|i| worktrees.get(i))
+        else {
             return vec![];
         };
         let saved: Vec<&Link> = self
@@ -2084,7 +2250,10 @@ impl App {
     /// Shell terminals of the selected worktree, in tree order.
     pub fn visible_terminals(&self) -> Vec<TerminalTab> {
         let worktrees = self.visible_worktrees();
-        let Some(wt) = worktrees.get(self.sel_worktree) else {
+        let Some(wt) = self
+            .selected_worktree_index()
+            .and_then(|i| worktrees.get(i))
+        else {
             return vec![];
         };
         self.tree
@@ -2178,18 +2347,23 @@ impl App {
     /// long the turn has taken.
     pub fn visible_sessions(&self) -> Vec<Agent> {
         let worktrees = self.visible_worktrees();
-        let Some(wt) = worktrees.get(self.sel_worktree) else {
+        let Some(wt) = self
+            .selected_worktree_index()
+            .and_then(|i| worktrees.get(i))
+        else {
             return vec![];
         };
         let now = now_ms();
         // Stable throughout, so ties — never-run rows especially, which all
         // stamp 0 — keep tree order instead of shuffling between frames.
+        // Orchestrators are excluded: they have their own rows in the
+        // Worktrees panel, not a second one under the root checkout.
         let collect = |keep: &dyn Fn(&Agent) -> bool| {
             let mut group: Vec<Agent> = self
                 .tree
                 .agents
                 .iter()
-                .filter(|a| a.worktree_id == wt.id && keep(a))
+                .filter(|a| a.worktree_id == wt.id && !a.orchestrator && keep(a))
                 .cloned()
                 .collect();
             group.sort_by_key(|a| recency_key(a, now));
@@ -2203,7 +2377,7 @@ impl App {
                 .tree
                 .agents
                 .iter()
-                .filter(|a| a.worktree_id == wt.id && a.archived)
+                .filter(|a| a.worktree_id == wt.id && !a.orchestrator && a.archived)
                 .cloned()
                 .collect();
             // Most recently archived first; pre-`archived_at` rows (stamp 0)
@@ -2217,7 +2391,10 @@ impl App {
     /// (pinned, recent, unpinned, archived-total) for the selected worktree.
     pub fn session_group_counts(&self) -> (usize, usize, usize, usize) {
         let worktrees = self.visible_worktrees();
-        let Some(wt) = worktrees.get(self.sel_worktree) else {
+        let Some(wt) = self
+            .selected_worktree_index()
+            .and_then(|i| worktrees.get(i))
+        else {
             return (0, 0, 0, 0);
         };
         let pinned = self
@@ -2254,7 +2431,7 @@ impl App {
     /// would otherwise wake the loop on every pass.
     pub fn next_recent_expiry(&self) -> Option<std::time::Duration> {
         let worktrees = self.visible_worktrees();
-        let wt = worktrees.get(self.sel_worktree)?;
+        let wt = worktrees.get(self.selected_worktree_index()?)?;
         let now = now_ms();
         self.tree
             .agents
@@ -2361,6 +2538,7 @@ mod tests {
             path: "/tmp/demo".into(),
             branch: "main".into(),
             is_main: true,
+            created_from: None,
             pinned: false,
             sort_order: 0,
         });
@@ -2455,6 +2633,7 @@ mod tests {
             archived_at: 0,
             pinned: false,
             status_changed_at: 0,
+            orchestrator: false,
             kind: AgentKind::Claude,
             model: None,
             effort: None,
