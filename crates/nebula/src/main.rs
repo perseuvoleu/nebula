@@ -78,6 +78,13 @@ enum Command {
         #[command(subcommand)]
         command: Option<NotesCommand>,
     },
+    /// Read or edit the todos for the current project/worktree — a task
+    /// list separate from notes, each todo holding its own notes (agents
+    /// can too — inside a session the target is the session's own project).
+    Todo {
+        #[command(subcommand)]
+        command: Option<TodoCommand>,
+    },
     /// Open nebula on a remote host over ssh (installs it there if missing).
     Ssh {
         /// ssh destination, passed verbatim (e.g. user@server).
@@ -143,9 +150,10 @@ enum AgentCommand {
         /// Reasoning effort the CLI launches with (default: the CLI's own).
         #[arg(long)]
         effort: Option<String>,
-        /// Session name (default: generated; the session then titles itself).
-        #[arg(long)]
-        name: Option<String>,
+        /// Session name; multiple words need no quotes (default: derived
+        /// from --prompt, else generated; the session then titles itself).
+        #[arg(long, num_args = 1..)]
+        name: Option<Vec<String>>,
         /// Project-level orchestrator: root checkout, pinned, own group.
         #[arg(long)]
         orchestrator: bool,
@@ -196,6 +204,42 @@ enum NotesCommand {
     },
     /// Check a note off, by its number in `nebula notes`.
     Done { index: usize },
+}
+
+#[derive(Subcommand)]
+enum TodoCommand {
+    /// List the project's todos, then the current worktree's (the default).
+    List,
+    /// Add a todo to the project's list (--worktree for the checkout's own).
+    Add {
+        /// The todo; multiple words need no quotes.
+        #[arg(required = true, num_args = 1..)]
+        text: Vec<String>,
+        /// Add to the current worktree's list instead of the project's.
+        #[arg(long)]
+        worktree: bool,
+    },
+    /// Check a todo off, by its number in `nebula todo list`.
+    Done { index: usize },
+    /// Bring a checked-off todo back.
+    Reopen { index: usize },
+    /// One todo with its notes, by its number in `nebula todo list`.
+    Show { index: usize },
+    /// Add a note under a todo.
+    Note {
+        /// The todo's number in `nebula todo list`.
+        index: usize,
+        /// The note; multiple words need no quotes.
+        #[arg(required = true, num_args = 1..)]
+        text: Vec<String>,
+    },
+    /// Check a todo's note off (numbers from `nebula todo show <n>`).
+    NoteDone {
+        /// The todo's number in `nebula todo list`.
+        index: usize,
+        /// The note's number in `nebula todo show <index>`.
+        note: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -266,7 +310,7 @@ fn main() -> Result<()> {
                 kind,
                 model,
                 effort,
-                name,
+                name: name.map(|words| words.join(" ")),
                 orchestrator,
                 prompt,
             }),
@@ -289,6 +333,25 @@ fn main() -> Result<()> {
                 Some(NotesCommand::Done { index }) => NotesOp::Done { index },
             };
             nebula_tui::run_notes(op)
+        }
+        Some(Command::Todo { command }) => {
+            use nebula_tui::TodoOp;
+            let op = match command {
+                None | Some(TodoCommand::List) => TodoOp::List,
+                Some(TodoCommand::Add { text, worktree }) => TodoOp::Add {
+                    text: text.join(" "),
+                    worktree,
+                },
+                Some(TodoCommand::Done { index }) => TodoOp::Done { index },
+                Some(TodoCommand::Reopen { index }) => TodoOp::Reopen { index },
+                Some(TodoCommand::Show { index }) => TodoOp::Show { index },
+                Some(TodoCommand::Note { index, text }) => TodoOp::NoteAdd {
+                    index,
+                    text: text.join(" "),
+                },
+                Some(TodoCommand::NoteDone { index, note }) => TodoOp::NoteDone { index, note },
+            };
+            nebula_tui::run_todo(op)
         }
         Some(Command::Kill) => nebula_tui::run_kill(),
         Some(Command::Rename { title, force }) => nebula_tui::run_rename(title.join(" "), force),

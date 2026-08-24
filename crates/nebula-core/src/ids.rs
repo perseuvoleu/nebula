@@ -37,6 +37,7 @@ id_newtype!(WorktreeId);
 id_newtype!(AgentId);
 id_newtype!(TerminalId);
 id_newtype!(NoteId);
+id_newtype!(TodoId);
 id_newtype!(LinkId);
 
 /// Id of the built-in workspace every install starts with (and the home of

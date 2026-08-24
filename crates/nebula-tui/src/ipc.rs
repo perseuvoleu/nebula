@@ -649,6 +649,23 @@ pub struct NewAgentOpts {
     pub prompt: Option<String>,
 }
 
+/// Session name when the caller passed no `--name`: derived from the
+/// delegated task's prompt so the row is findable by search (`/`, ⌘K)
+/// from the moment it appears — auto-title stays pending, so the worker
+/// may still refine it. Numbered fallback when there is no prompt or the
+/// prompt has no meaningful words.
+fn default_agent_name(prompt: Option<&str>, orchestrator: bool, existing: usize) -> String {
+    if let Some(title) = prompt.and_then(crate::branch_name::title_from_prompt) {
+        return title;
+    }
+    let n = existing + 1;
+    if orchestrator {
+        format!("orchestrator-{n}")
+    } else {
+        format!("agent-{n}")
+    }
+}
+
 /// `nebula agent new`: spawn a session — for orchestrators on the root
 /// worktree by default, for workers wherever `--worktree` points.
 pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
@@ -694,16 +711,11 @@ pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
     };
     let auto_title = opts.name.is_none();
     let name = opts.name.unwrap_or_else(|| {
-        let n = agents
-            .iter()
-            .filter(|a| a.worktree_id == target.id)
-            .count()
-            + 1;
-        if opts.orchestrator {
-            format!("orchestrator-{n}")
-        } else {
-            format!("agent-{n}")
-        }
+        default_agent_name(
+            opts.prompt.as_deref(),
+            opts.orchestrator,
+            agents.iter().filter(|a| a.worktree_id == target.id).count(),
+        )
     });
     let req_id = 1u64;
     write_frame(
@@ -940,6 +952,244 @@ pub async fn run_notes(op: NotesOp) -> Result<()> {
     }
 }
 
+pub enum TodoOp {
+    List,
+    Add { text: String, worktree: bool },
+    Done { index: usize },
+    Reopen { index: usize },
+    Show { index: usize },
+    NoteAdd { index: usize, text: String },
+    NoteDone { index: usize, note: usize },
+}
+
+/// `nebula todo [list|add|done|reopen|show|note|note-done]` — the todo
+/// lists (project + current worktree) from the CLI, so agents can read and
+/// work the user's task list, including each todo's own notes. Target
+/// resolution mirrors `nebula notes`: the caller's session
+/// (NEBULA_AGENT_ID) when run inside one, else whatever project/worktree
+/// owns the current directory.
+pub async fn run_todo(op: TodoOp) -> Result<()> {
+    use nebula_core::{Note, NoteOwner, Todo, TodoOwner};
+    let sock = paths::socket_path();
+    let Ok(stream) = try_connect(&sock).await else {
+        bail!("no nebula daemon is running");
+    };
+    let mut conn = handshake(stream).await?;
+    write_frame(&mut conn.stream, &ClientRequest::Subscribe).await?;
+    let (projects, worktrees, agents, notes, todos) = loop {
+        match read_frame::<ServerEvent, _>(&mut conn.stream).await? {
+            Some(ServerEvent::Snapshot {
+                projects,
+                worktrees,
+                agents,
+                notes,
+                todos,
+                ..
+            }) => break (projects, worktrees, agents, notes, todos),
+            Some(_) => continue,
+            None => bail!("daemon closed the connection before the snapshot"),
+        }
+    };
+
+    // Whose todos: the session's worktree when inside one, else the deepest
+    // worktree (or failing that, the project) holding the cwd.
+    let by_agent = std::env::var("NEBULA_AGENT_ID")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .and_then(|id| agents.iter().find(|a| a.id.as_str() == id))
+        .and_then(|a| worktrees.iter().find(|w| w.id == a.worktree_id));
+    let worktree = by_agent.or_else(|| {
+        let cwd = std::env::current_dir().ok()?;
+        worktrees
+            .iter()
+            .filter(|w| cwd.starts_with(&w.path))
+            .max_by_key(|w| w.path.components().count())
+    });
+    let project = match worktree {
+        Some(w) => projects
+            .iter()
+            .find(|p| p.id == w.project_id)
+            .context("this worktree's project is gone from the daemon")?,
+        None => {
+            let cwd = std::env::current_dir().context("resolve current directory")?;
+            projects
+                .iter()
+                .find(|p| cwd.starts_with(&p.repo_path))
+                .context(
+                    "not inside a nebula agent session or a known project — \
+                     run from a project directory",
+                )?
+        }
+    };
+
+    // One numbered list: the project's todos, then the worktree's. Indices
+    // are what done/reopen/show/note take, recomputed per invocation.
+    let mut visible: Vec<&Todo> = todos
+        .iter()
+        .filter(|t| t.owner == TodoOwner::Project(project.id.clone()))
+        .collect();
+    let project_count = visible.len();
+    if let Some(w) = worktree {
+        visible.extend(
+            todos
+                .iter()
+                .filter(|t| t.owner == TodoOwner::Worktree(w.id.clone())),
+        );
+    }
+    // A todo's child notes, in snapshot (per-owner list) order.
+    let notes_of = |todo: &Todo| -> Vec<&Note> {
+        notes
+            .iter()
+            .filter(|n| n.owner == NoteOwner::Todo(todo.id.clone()))
+            .collect()
+    };
+    let nth = |index: usize| -> Result<&&Todo> {
+        index
+            .checked_sub(1)
+            .and_then(|i| visible.get(i))
+            .with_context(|| {
+                format!(
+                    "no todo {index} — `nebula todo list` lists {} todo{}",
+                    visible.len(),
+                    if visible.len() == 1 { "" } else { "s" }
+                )
+            })
+    };
+
+    let req_id = 1u64;
+    match op {
+        TodoOp::List => {
+            if visible.is_empty() {
+                println!(
+                    "no todos for {} — add one with `nebula todo add <text>`",
+                    project.name
+                );
+                return Ok(());
+            }
+            for (i, t) in visible.iter().enumerate() {
+                if i == 0 && project_count > 0 {
+                    println!("{} — project todos", project.name);
+                }
+                if i == project_count {
+                    // Reachable only when a worktree was resolved.
+                    println!(
+                        "{}/{} — worktree todos",
+                        project.name,
+                        worktree.map(|w| w.branch.as_str()).unwrap_or("?")
+                    );
+                }
+                let mark = if t.done { "x" } else { " " };
+                let child = notes_of(t).len();
+                let suffix = match child {
+                    0 => String::new(),
+                    1 => "  (1 note)".to_string(),
+                    n => format!("  ({n} notes)"),
+                };
+                println!("  {}. [{mark}] {}{suffix}", i + 1, t.text);
+            }
+            Ok(())
+        }
+        TodoOp::Add {
+            text,
+            worktree: to_worktree,
+        } => {
+            let owner = if to_worktree {
+                let w = worktree.context(
+                    "--worktree needs a current worktree (run inside a session or a checkout)",
+                )?;
+                TodoOwner::Worktree(w.id.clone())
+            } else {
+                TodoOwner::Project(project.id.clone())
+            };
+            write_frame(
+                &mut conn.stream,
+                &ClientRequest::CreateTodo {
+                    req_id,
+                    owner,
+                    text: text.clone(),
+                },
+            )
+            .await?;
+            await_ack(&mut conn, req_id, &mut Vec::new()).await?;
+            println!("todo added: {text}");
+            Ok(())
+        }
+        TodoOp::Done { index } | TodoOp::Reopen { index } => {
+            let done = matches!(op, TodoOp::Done { .. });
+            let t = nth(index)?;
+            write_frame(
+                &mut conn.stream,
+                &ClientRequest::SetTodoDone {
+                    req_id,
+                    id: t.id.clone(),
+                    done,
+                },
+            )
+            .await?;
+            await_ack(&mut conn, req_id, &mut Vec::new()).await?;
+            println!(
+                "todo {index} {}: {}",
+                if done { "done" } else { "reopened" },
+                t.text
+            );
+            Ok(())
+        }
+        TodoOp::Show { index } => {
+            let t = nth(index)?;
+            let mark = if t.done { "x" } else { " " };
+            println!("{index}. [{mark}] {}", t.text);
+            let child = notes_of(t);
+            if child.is_empty() {
+                println!("   no notes — add one with `nebula todo note {index} <text>`");
+            } else {
+                for (i, n) in child.iter().enumerate() {
+                    let mark = if n.done { "x" } else { " " };
+                    println!("   {}. [{mark}] {}", i + 1, n.text);
+                }
+            }
+            Ok(())
+        }
+        TodoOp::NoteAdd { index, text } => {
+            let t = nth(index)?;
+            write_frame(
+                &mut conn.stream,
+                &ClientRequest::CreateNote {
+                    req_id,
+                    owner: NoteOwner::Todo(t.id.clone()),
+                    text: text.clone(),
+                },
+            )
+            .await?;
+            await_ack(&mut conn, req_id, &mut Vec::new()).await?;
+            println!("note added under todo {index}: {text}");
+            Ok(())
+        }
+        TodoOp::NoteDone { index, note } => {
+            let t = nth(index)?;
+            let child = notes_of(t);
+            let n = note.checked_sub(1).and_then(|i| child.get(i)).with_context(|| {
+                format!(
+                    "no note {note} under todo {index} — `nebula todo show {index}` lists {} note{}",
+                    child.len(),
+                    if child.len() == 1 { "" } else { "s" }
+                )
+            })?;
+            write_frame(
+                &mut conn.stream,
+                &ClientRequest::SetNoteDone {
+                    req_id,
+                    id: n.id.clone(),
+                    done: true,
+                },
+            )
+            .await?;
+            await_ack(&mut conn, req_id, &mut Vec::new()).await?;
+            println!("todo {index} note {note} done: {}", n.text);
+            Ok(())
+        }
+    }
+}
+
 /// `nebula agent promote|demote <name>`: flip a session's orchestrator
 /// role. Promotion is refused daemon-side off the root checkout.
 pub async fn agent_set_orchestrator(
@@ -998,4 +1248,31 @@ pub async fn agent_set_orchestrator(
         })
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An orchestrator delegating with `--prompt` and no `--name` gets a
+    /// session named after the task, not `agent-N` — the name is what the
+    /// user searches by.
+    #[test]
+    fn unnamed_prompted_agents_are_named_after_the_task() {
+        assert_eq!(
+            default_agent_name(Some("please fix the login redirect flow"), false, 3),
+            "Fix Login Redirect Flow"
+        );
+        assert_eq!(
+            default_agent_name(Some("coordinate the payments epic"), true, 0),
+            "Coordinate Payments Epic"
+        );
+    }
+
+    #[test]
+    fn no_prompt_or_empty_prompt_falls_back_to_numbered_names() {
+        assert_eq!(default_agent_name(None, false, 1), "agent-2");
+        assert_eq!(default_agent_name(None, true, 0), "orchestrator-1");
+        assert_eq!(default_agent_name(Some("the…"), false, 0), "agent-1");
+    }
 }

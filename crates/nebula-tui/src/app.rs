@@ -5,7 +5,8 @@ use crate::pull_request::PullRequest;
 use crate::text_input::TextInput;
 use nebula_core::{
     Agent, AgentId, AgentKind, AgentStatus, Link, LinkId, Note, NoteId, NoteOwner, Project,
-    ProjectId, SessionRef, TerminalId, TerminalTab, Workspace, WorkspaceId, Worktree, WorktreeId,
+    ProjectId, SessionRef, TerminalId, TerminalTab, Todo, TodoId, TodoOwner, Workspace,
+    WorkspaceId, Worktree, WorktreeId,
 };
 use ratatui::layout::Rect;
 use std::collections::HashMap;
@@ -111,6 +112,8 @@ pub enum MenuAction {
     NewWorktree(ProjectId),
     /// Open the note modal for this owner (project or worktree).
     OpenNotes(NoteOwner),
+    /// Open the todo modal for this owner (project or worktree).
+    OpenTodos(TodoOwner),
     /// Attach a URL to this worktree (prompts for it).
     NewLink(WorktreeId),
     /// Hand a link row's URL to the browser.
@@ -1028,6 +1031,85 @@ impl NoteView {
     }
 }
 
+/// What the todo modal's input is writing: the list's own add/edit, or a
+/// child note's add/edit inside the detail view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TodoInputTarget {
+    /// Creating a new todo (list mode).
+    NewTodo,
+    /// Rewriting this todo's text (list mode).
+    EditTodo(TodoId),
+    /// Creating a child note under the opened todo (detail mode).
+    NewNote,
+    /// Rewriting this child note's text (detail mode).
+    EditNote(NoteId),
+}
+
+/// In-progress add/edit inside the todo modal; keys feed `text` while set.
+#[derive(Debug, Clone)]
+pub struct TodoInput {
+    pub target: TodoInputTarget,
+    pub text: TextInput,
+}
+
+/// First-class todo modal (`E`) for one owner — a project or a worktree,
+/// the same shell as the notes modal plus a drill-in: Enter on a todo opens
+/// its detail, where that todo's child notes live. The rows themselves stay
+/// in `App::tree.todos` / `App::tree.notes` (kept fresh by upserts) — the
+/// view only holds the owner plus cursor/mode/input state.
+#[derive(Debug, Clone)]
+pub struct TodoView {
+    pub owner: TodoOwner,
+    /// `project` or `project/branch`, for the modal title.
+    pub context: String,
+    /// Cursor into the owner's todo rows (list mode).
+    pub selected: usize,
+    /// Some = detail mode: this todo is open and `note_selected` walks its
+    /// child notes; Esc drops back to the list.
+    pub detail: Option<TodoId>,
+    /// Cursor into the opened todo's child notes (detail mode).
+    pub note_selected: usize,
+    /// Active add/edit input, if any (todo text or child-note text, per
+    /// its target).
+    pub input: Option<TodoInput>,
+    /// Whole modal rect, written back during draw so clicks outside close.
+    pub area: Rect,
+    /// Screen rect of the rows, written back during draw so clicks can
+    /// hit-test rows.
+    pub list_area: Rect,
+}
+
+impl TodoView {
+    pub fn new(owner: TodoOwner, context: String) -> Self {
+        Self {
+            owner,
+            context,
+            selected: 0,
+            detail: None,
+            note_selected: 0,
+            input: None,
+            area: Rect::default(),
+            list_area: Rect::default(),
+        }
+    }
+
+    /// The cursor the current mode moves: child notes in detail, todos in
+    /// the list.
+    pub fn cursor(&self) -> usize {
+        if self.detail.is_some() {
+            self.note_selected
+        } else {
+            self.selected
+        }
+    }
+
+    /// First visible row of the list's stateless follow-window for a list
+    /// of `height` rows.
+    pub fn window_start(&self, height: usize) -> usize {
+        (self.cursor() + 1).saturating_sub(height)
+    }
+}
+
 /// Recent-hosts modal (`h`): destinations remembered by `nebula ssh`.
 /// Enter (or a click) quits the TUI and execs a fresh `nebula ssh` at the
 /// selected entry; `a` types a new destination, `d` forgets one. The rows
@@ -1192,6 +1274,7 @@ pub enum Overlay {
     Grep(GrepView),
     Tree(crate::tree_browser::TreeBrowser),
     Notes(NoteView),
+    Todos(TodoView),
     Metrics(MetricsView),
     Hosts(HostsView),
 }
@@ -1221,6 +1304,8 @@ pub enum PendingIntent {
     SelectAddedProject,
     /// Move the note modal's cursor onto the created note.
     SelectCreatedNote,
+    /// Move the todo modal's cursor onto the created todo.
+    SelectCreatedTodo,
     /// Move the Sessions panel's cursor onto the link just created.
     SelectCreatedLink,
     /// Open the workspace this Ack just created (switcher's "New workspace…"
@@ -1305,6 +1390,18 @@ pub fn pretty_url(url: &str) -> String {
         .unwrap_or(url);
     let bare = bare.strip_prefix("www.").unwrap_or(bare);
     bare.strip_suffix('/').unwrap_or(bare).to_string()
+}
+
+/// Cached last-message preview for the sessions panel (`App::preview`):
+/// what one tail-read of an agent's transcript came back with.
+#[derive(Debug, Clone)]
+pub struct SessionPreview {
+    pub agent: AgentId,
+    /// Transcript mtime at read time (None = file missing), so a re-fire
+    /// for an unchanged file skips the read.
+    pub mtime: Option<std::time::SystemTime>,
+    /// Collapsed message text; None = no assistant text found.
+    pub text: Option<String>,
 }
 
 /// One row in the Sessions panel: agents (pinned / recent / unpinned), then
@@ -1484,6 +1581,7 @@ pub struct Tree {
     pub agents: Vec<Agent>,
     pub terminals: Vec<TerminalTab>,
     pub notes: Vec<Note>,
+    pub todos: Vec<Todo>,
     pub links: Vec<Link>,
 }
 
@@ -1704,6 +1802,8 @@ pub struct App {
     pub open_at: Option<std::path::PathBuf>,
     /// Note created by us, awaiting its upsert to land the modal's cursor.
     pub select_note_when_seen: Option<NoteId>,
+    /// Todo created by us, awaiting its upsert to land the modal's cursor.
+    pub select_todo_when_seen: Option<TodoId>,
     /// Link created by us, awaiting its upsert to land the panel cursor on
     /// the new row.
     pub select_link_when_seen: Option<LinkId>,
@@ -1722,6 +1822,15 @@ pub struct App {
     /// warm default-spec Claude session, so one is always ready to adopt.
     /// Re-armed after every send; disarmed when nothing is selected.
     pub next_keepwarm: Option<std::time::Instant>,
+    /// Last assistant message of the selected Claude session's transcript,
+    /// the dim sub-line under its row in the sessions panel. Kept until
+    /// another agent's read replaces it, so the panel never shows one
+    /// agent's words under another's row (`preview_text` matches on id).
+    pub preview: Option<SessionPreview>,
+    /// Debounced preview refresh: the agent whose transcript tail to read
+    /// once the session selection has rested on it past the deadline —
+    /// same idiom as `pending_prewarm`.
+    pub pending_preview: Option<(AgentId, std::time::Instant)>,
     /// Mouse drag-selection over the terminal pane, if any.
     pub term_selection: Option<TermSelection>,
     /// Last left-click on the terminal pane (time + pane-relative cell), for
@@ -1833,6 +1942,18 @@ pub struct App {
     /// with a faint accent tint. Off by default; mirrors the config,
     /// refreshed at startup and when the settings overlay applies a change.
     pub focus_tint: bool,
+    /// Whether the terminal window has focus, tracked from crossterm's
+    /// focus-change events. Defaults to true so terminals that never
+    /// report focus behave as before (never notify).
+    pub window_focused: bool,
+    /// The `notifications` setting: post a macOS notification when a
+    /// status flip needs the user while the window isn't focused.
+    /// Mirrors the config, refreshed at startup and when the settings
+    /// overlay applies a change.
+    pub notifications: bool,
+    /// When each agent last posted a notification, so a flapping status
+    /// can't spam the notification center (30s cooldown per agent).
+    pub notified_at: HashMap<AgentId, std::time::Instant>,
 }
 
 impl Default for App {
@@ -1872,11 +1993,14 @@ impl App {
             select_project_when_seen: None,
             open_at: None,
             select_note_when_seen: None,
+            select_todo_when_seen: None,
             select_link_when_seen: None,
             last_worktree_for_project: HashMap::new(),
             last_session_for_worktree: HashMap::new(),
             pending_prewarm: None,
             next_keepwarm: None,
+            preview: None,
+            pending_preview: None,
             term_selection: None,
             last_term_click: None,
             last_session_click: None,
@@ -1910,6 +2034,9 @@ impl App {
             splash_preview: false,
             animations: true,
             focus_tint: false,
+            window_focused: true,
+            notifications: true,
+            notified_at: HashMap::new(),
         }
     }
 
@@ -2449,6 +2576,21 @@ impl App {
         Some(at.saturating_duration_since(std::time::Instant::now()))
     }
 
+    /// Delay until the pending transcript-preview read is due, so the
+    /// event loop can wake up and fire it. None when nothing is armed.
+    pub fn preview_delay(&self) -> Option<std::time::Duration> {
+        let (_, at) = self.pending_preview.as_ref()?;
+        Some(at.saturating_duration_since(std::time::Instant::now()))
+    }
+
+    /// The cached preview text, when it belongs to this agent.
+    pub fn preview_text(&self, agent: &AgentId) -> Option<&str> {
+        self.preview
+            .as_ref()
+            .filter(|p| &p.agent == agent)
+            .and_then(|p| p.text.as_deref())
+    }
+
     /// Whether `gh` should be asked about this worktree now: not while an
     /// answer is in flight, and not before the timer the last answer armed.
     /// A found PR no longer retires the worktree — the PR doesn't change,
@@ -2489,6 +2631,15 @@ impl App {
             .filter(|t| &t.owner == owner && !t.done)
             .count();
         (open, total)
+    }
+
+    /// An owner's todos, in tree order (snapshot order; new ones append).
+    pub fn todos_for(&self, owner: &TodoOwner) -> Vec<&Todo> {
+        self.tree
+            .todos
+            .iter()
+            .filter(|t| &t.owner == owner)
+            .collect()
     }
 
     /// Aggregate status for a worktree row: red > yellow > green > gray,

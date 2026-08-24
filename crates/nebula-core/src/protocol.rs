@@ -1,14 +1,14 @@
 use crate::entities::{
     Agent, AgentKind, AgentStatus, Entity, EntityId, Link, Note, NoteOwner, Project, TerminalTab,
-    Workspace, Worktree,
+    Todo, TodoOwner, Workspace, Worktree,
 };
-use crate::ids::{AgentId, LinkId, NoteId, ProjectId, TerminalId, WorkspaceId, WorktreeId};
+use crate::ids::{AgentId, LinkId, NoteId, ProjectId, TerminalId, TodoId, WorkspaceId, WorktreeId};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 24;
+pub const PROTOCOL_VERSION: u32 = 25;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -257,6 +257,27 @@ pub enum ClientRequest {
         req_id: u64,
         id: NoteId,
     },
+    CreateTodo {
+        req_id: u64,
+        owner: TodoOwner,
+        text: String,
+    },
+    /// Rewrite a todo's text.
+    UpdateTodo {
+        req_id: u64,
+        id: TodoId,
+        text: String,
+    },
+    SetTodoDone {
+        req_id: u64,
+        id: TodoId,
+        done: bool,
+    },
+    /// Delete a todo; its child notes go with it (DB cascade).
+    DeleteTodo {
+        req_id: u64,
+        id: TodoId,
+    },
     /// Pin a URL to a worktree. `url` is normalized daemon-side (a bare
     /// `github.com/...` gains an https:// scheme) and refused if it can't be
     /// made into an http(s) URL.
@@ -362,6 +383,7 @@ pub enum ServerEvent {
         agents: Vec<Agent>,
         terminals: Vec<TerminalTab>,
         notes: Vec<Note>,
+        todos: Vec<Todo>,
         links: Vec<Link>,
         /// How far the user has read into each pull request they've opened.
         pr_seen: Vec<PrSeen>,

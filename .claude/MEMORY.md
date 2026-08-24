@@ -30,6 +30,194 @@ restart pending on the user's `nebula kill`).
 - The flag composes fine with `--resume <sid>` and `--model/--effort`; it goes right after the resume
   args, same slot as codex's `--yolo`.
 
+### Six Feature Branches Merged Onto merge-train — 2026-08-24
+
+**Asked:** "Merge these five branches into merge-train, one at a time, in this order:
+searchable-session-names, cmd-d-diff, attention-queue, macos-notifications, session-message-preview…
+resolve them so BOTH features survive… After all five are merged, run 'cargo test --workspace'…"
+Follow-up: "Merge the branch todo-notes into merge-train… expect conflicts with the already-merged
+work — resolve so both sides survive."
+
+**Did:** All five merged (`1e2e3b2`, `546b83a`, `d4926e4`, `beb4683`, `b9cdb18`), 593 workspace tests
+green. Despite all branches touching event_loop.rs/keymap.rs/ui.rs/app.rs, every code file auto-merged —
+the only conflict in all four conflicted merges was `.claude/MEMORY.md`'s entries section (resolved by
+keeping every entry). Then `todo-notes` merged (`5c2abe7`): one code conflict, the `nebula_core` import
+list at the top of `event_loop.rs` (HEAD added `AgentStatus`, todos added `TodoId, TodoOwner` — union),
+plus the usual MEMORY.md entries clash. 601 workspace tests green after.
+
+**Gotchas:**
+- `cmd-d-diff`'s code commit `bc8d58e` is byte-identical to main's HEAD `8bee485`
+  (`git diff 8bee485 bc8d58e -- crates/` is empty) — the same work landed on main separately. The merge
+  contributes only the MEMORY.md entry; don't hunt for a second Cmd+D implementation.
+- Concurrent same-day branches conflict on MEMORY.md every time, since each appends at the same spot
+  under `## Entries`. Resolution is mechanical: keep both blocks, drop the markers.
+- The feared double `PROTOCOL_VERSION` bump never materialized: base and merge-train HEAD were both 24
+  and only todo-notes bumped to 25, so git auto-merged a single correct bump. Sqlite migrations also
+  stayed sequential (todos = migration 20). Verify with `git show <ref>:crates/nebula-core/src/protocol.rs`
+  against the merge-base before hand-editing anything.
+- `e2e_tui::tui_projects_worktrees_agents_navigation` passes now — the long-red `FOOTER_TERMINAL_LOCKED`
+  assertion was fixed on main in `67ba923`; earlier entries calling it "still unfixed" are stale.
+
+### Orchestrator-Delegated Sessions Get Task-Derived Names — 2026-08-24
+
+**Asked:** "when a project orchestrator creates a worktree and/or creates agent sessions on that
+worktree through the injected Nebula orchestration CLI, it should be able to assign meaningful names
+derived from the delegated session/task so those worktrees and sessions are easy to find via search."
+
+**Did:** Commit `802aaea`. `title_from_prompt` in `crates/nebula-tui/src/branch_name.rs` (first
+non-empty line, filler words dropped, first 4 words Title Cased) feeds `default_agent_name` in
+`ipc.rs::agent_new`: an unnamed `--prompt` spawn is now named after its task instead of `agent-N`.
+`--name` on `nebula agent new` takes multiple words unquoted (`num_args = 1..`, joined in `main.rs`),
+and `ORCHESTRATOR_INSTRUCTION` (`hooks/mod.rs`) now teaches naming worktrees/sessions after the
+delegated task. Worktree naming needed no code — `worktree new <name>` was already free-text→branch,
+and the palettes already search `{project}/{branch}/{name}`.
+
+**Gotchas:**
+- Deliberate: a prompt-derived name does NOT clear `auto_title` — only an explicit `--name` counts as
+  an assignment, so the worker may still retitle itself from the same prompt. Don't "fix" that as a bug.
+- This also changes the manual flow `nebula agent new --prompt … ` (no `--name`): humans get the
+  derived title too, same code path — intended, not creep.
+- `hooks::tests::orchestrator_instruction_teaches_task_derived_naming` pins prose substrings
+  (`--name`, `search`, `derived from --prompt`) — copyediting the brief means updating it.
+### ⌘D Opens The Diff Viewer From Anywhere — 2026-08-24
+
+**Asked:** "Cmd+D should open the git diff viewer for the currently selected worktree regardless of
+which Nebula panel has focus, and it must also work while an agent terminal is input-locked… update
+the Ghostty nebula overlay so Cmd+D reaches Nebula and overrides Ghostty's default split shortcut…
+Keep plain g working."
+
+**Did:** `bc8d58e`. `Action::GitDiff` defaults grew `cmd+d` next to `g` (`keymap.rs`), a `GitDiff`
+arm joined the locked-terminal SUPER intercept in `event_loop.rs` (unlock → Sessions →
+`open_diff_view`, same shape as ⌘N/⌘E/⌘W), and `~/.config/ghostty/nebula` got
+`super+d=csi:100;9u` — which by existing overrides Ghostty's default `new_split:right`, no unbind
+needed. `GitDiff` was already dispatched from the Global scope table, so panel-independence needed
+no dispatch change — only the chord and the locked-mode intercept. Tests:
+`cmd_d_opens_the_diff_viewer_from_any_panel`, `cmd_d_inside_a_locked_session_opens_the_diff_viewer`,
+`plain_d_inside_a_locked_session_still_reaches_the_child`.
+
+**Gotchas:**
+- Adding a second default chord to `GitDiff` broke two hardcoded label assertions in
+  `event_loop.rs` settings tests: one expecting `"g"` (now `"g ⌘d"`) and one expecting `"—"` after
+  `g` is stolen (now `"⌘d"` — the ⌘ chord stays). Same class of breakage the ⌘E entry warned about;
+  it applies to *any* test asserting a keymap label, not just the duplicate-chord one.
+- The `csi:<codepoint>;9u` recipe from the ⌘W entry worked unchanged (`d` = 100). Real repo test
+  fixtures already exist: `test_repo` + `seed_repo_tree` in `event_loop.rs` tests build a git repo
+  a diff test can actually open.
+### Space Jumps To The Oldest Session Needing Feedback — 2026-08-24
+
+**Asked:** (spec-driven task, `SPEC-attention-queue.md`) One key (default `space`) that jumps straight
+to the session that has been waiting on the user the longest, attaching its terminal — "Today the user
+visually scans red status dots across projects; with this they just hit the key and answer sessions one
+by one."
+
+**Did:** New `Action::NextAttention` (`keymap.rs`, id `next_attention`, NAVIGATE group, default
+`space` — free, no chord collision). `next_attention` in `event_loop.rs` (above `jump_to_target`) picks
+the unarchived `NeedsFeedback` agent in the open workspace with the smallest `status_changed_at` (0 =
+oldest) and calls `jump_to_target(app, PaletteTarget::Session(id), true, out)`; empty queue flashes
+"nothing needs your feedback". Three regression tests
+(`space_jumps_to_the_oldest_session_needing_feedback`, `space_with_nothing_blocked_flashes_and_stays_put`,
+`space_reaches_a_blocked_orchestrator`).
+
+**Gotchas:**
+- `jump_to_target`'s `PaletteTarget::Session` arm was broken for orchestrators all along: they are
+  excluded from `visible_session_rows`, so a palette pick of an orchestrator fell into the
+  "session no longer exists" fallback instead of attaching. Fixed in that arm — an orchestrator pick now
+  lands `app.sel_orchestrator = Some(i)` (its `project_orchestrators()` index) and attaches. This fixes
+  `/` and ⌘K orchestrator picks too, not just the new key.
+- Inside `jump_to_target` the `attach: bool` parameter shadows the free `attach()` fn in the value
+  namespace — call it as `self::attach(…)` there.
+### macOS Notifications When An Unfocused Window Needs You — 2026-08-24
+
+**Asked:** "Implement the feature specified in SPEC-macos-notifications.md" — post a macOS notification
+("nebula — <project>/<agent> needs feedback") when the window is unfocused and an agent flips to
+needs-feedback or finishes a run.
+
+**Did:** Focus tracking via crossterm `EnableFocusChange` in `setup_terminal`/`restore_terminal` +
+`Event::FocusGained/FocusLost` → `App.window_focused` (default `true`; terminals that never report focus
+stay silent). The gate is the pure `should_notify(prev, next, focused)` in `event_loop.rs` (any →
+NeedsFeedback, Running → Finished), called from the `ServerEvent::StatusChanged` handler;
+`notify_status_change` rate-limits 30s per agent via `App.notified_at: HashMap<AgentId, Instant>`,
+resolves `<project>/<name>` through `app.tree`, and `post_notification` spawns fire-and-forget
+`osascript -e 'display notification …'` (quotes/backslashes escaped). Config toggle `notifications: bool`
+(default on) with a settings row in the Sessions tab, following the `animations` pattern end to end
+(save_to / value_label / cycle / apply_setting_at).
+
+**Gotchas:**
+- `post_notification` is inert under `cfg!(test)` as well as off-macOS — without that, running the suite
+  on this Mac posts real notification-center toasts. The tests' observable seam is the `notified_at` map.
+- In the `StatusChanged` handler, compute `should_notify(a.status, …)` *before* overwriting `a.status`,
+  and call `notify_status_change(app, …)` only after the `iter_mut` borrow ends — it needs `&mut App`.
+### Last-Message Preview Under The Selected Session Row — 2026-08-24
+
+**Asked:** (spec-driven task, SPEC-session-message-preview.md) "When a Claude session row is selected in
+the SESSIONS panel, show a dim one-line sub-row under it with the agent's last message (truncated) — so
+the user learns 'what does this agent want from me' without attaching."
+
+**Did:** New `crates/nebula-tui/src/transcript.rs`: `transcript_path` (cwd → `~/.claude/projects/<slug>/
+<sid>.jsonl`) and `last_assistant_text` (tail-reads the last 64 KB, scans lines in reverse for the newest
+`type=="assistant"` turn with non-empty text blocks, collapses whitespace). Cache is
+`App.preview: Option<SessionPreview>` (agent + transcript mtime + text) refreshed by a debounced
+`pending_preview` (`schedule_preview`/`fire_pending_preview` in `event_loop.rs`, the `pending_prewarm`
+idiom; `StatusChanged` on the selected agent re-arms it). `ui.rs::draw_sessions` renders the sub-line
+under the selected agent row only, copying the worktree panel's `created_from` sub-line (selection fill +
+`▌` rail), with the virtual-row layout, scroll bookkeeping, and the row's hit rect all one line taller.
+
+**Gotchas:**
+- The transcript slug flattens **every** non-alphanumeric char of the cwd to `-`, not just `/` — verified
+  in `~/.claude/projects/`, where `/Users/andrei/.herdr-worktrees/…` lands as `-Users-andrei--herdr-…`.
+- `schedule_preview` must not re-arm once a read answered for the selected agent (even a "no transcript"
+  answer), or the loop wakes and stats the file every 250 ms forever; `StatusChanged` is the explicit
+  re-arm for "the turn ended, the line is stale". The early-return for already-armed-same-agent is what
+  keeps that StatusChanged re-arm from being cancelled by the pre-draw scheduler.
+- Sessions-panel pills stack on a `PILL_H`(=2) stride but `SessionEntry::height()` is 3 (pads overlap):
+  the sub-line takes over the selected pill's bottom pad row, so layout advances `PILL_H + 1` for that
+  row and `content_h`/cursor-visibility use an `entry_h` that adds the extra line — using bare
+  `e.height()` there under-scrolls when the selected row is last.
+### First-Class Todos With Per-Todo Notes — 2026-08-24
+
+**Asked:** "Implementează un sistem first-class de TODO-uri în Nebula, separat de Notes existente.
+Cerința utilizatorului: TODO-uri scoped per proiect și/sau worktree, afișate într-un UI navigabil
+sus/jos; Enter pe TODO să deschidă/selecteze detaliul lui, unde utilizatorul poate adăuga și vedea
+Notes copil sub acel TODO. … Agenții trebuie să poată accesa și modifica TODO-urile și notele lor
+printr-un CLI clar (list/add/done/reopen și comenzi pentru notes asociate…) …"
+
+**Did:** `Todo`/`TodoOwner`/`TodoId` (entities.rs, ids.rs), child notes as `NoteOwner::Todo(TodoId)` —
+notes CRUD/protocol reused wholesale for them. Migration 20 (store.rs): new `todos` table + a `notes`
+rebuild adding `todo_id`; PROTOCOL_VERSION 24→25 with `CreateTodo`/`UpdateTodo`/`SetTodoDone`/
+`DeleteTodo` and `Snapshot.todos`. Store fns mirror notes (`open_todo_count_for_agent` drives a new
+`todos_instruction` in hooks/mod.rs, composing with the notes one; installer adds
+`Bash(nebula todo:*)`). TUI: `Action::Todos` on `shift+e` (next to Notes' `e`), `Overlay::Todos`
+(app.rs `TodoView` — `detail: Option<TodoId>` is the drill-in mode, `note_selected` its own cursor;
+event_loop.rs handler, ui.rs draw with a pinned bold todo header and the panels' ✎/✓ badge for child
+notes), "Todos" rows in the project/worktree context menus, click-on-selected-row opens detail (the
+settings idiom). CLI `nebula todo list|add|done|reopen|show|note|note-done` (ipc.rs `run_todo`) with
+`run_notes`' exact target resolution. Tests: store CRUD/cascade/count/migration-20, hook injection,
+4 event_loop modal tests; verified live against an isolated daemon + tmux TUI capture.
+
+**Gotchas:**
+- The old `notes` CHECK (`(project_id IS NULL) <> (worktree_id IS NULL)`) can't take a third owner
+  column — migration 20 rebuilds the table with `(a IS NOT NULL)+(b IS NOT NULL)+(c IS NOT NULL)=1`
+  (FK-off rebuild window, the migration-14 procedure). The `todos` table NAME is free again only
+  because migration 15 renamed the original one to `notes` — a fresh DB replays both, which reads
+  odd but is correct.
+- Extending `NoteOwner` fans out further than the store: exhaustive matches in event_loop.rs
+  (`apply_removal` — project/worktree removal must prune todos FIRST and then notes via the collected
+  todo ids, a two-step cascade — plus the notes-modal owner-gone check) and `open_notes_for_owner`.
+  Grep `NoteOwner::` before touching that enum again.
+- `open_note_count_for_agent` needed no change to exclude todo-owned child notes: its
+  `(n.worktree_id = w.id OR n.project_id = w.project_id)` is false when both are NULL. Asserted in
+  `user_prompt_submit_injects_todos_instruction_while_open` so nobody "fixes" it into counting them.
+- The Projects footer at 140 cols was ALREADY over budget in the disconnected state; adding
+  "⇧E: todos" pushed "m: menu" off-screen and failed `splash_footer_lists_only_keys_that_work`.
+  Reclaimed width by folding "e/⇧E: notes/todos" and dropping "-: divider" from that footer (still in
+  the m menu, help, and the divider row's own footer). Any new footer verb needs this width math.
+- `shift+t` was taken (NewTerminal's second default) — todos went to `shift+e`, deliberately adjacent
+  to Notes' `e`.
+- zsh in the Bash tool does not word-split `T="tmux -L sock"; $T cmd` — spell tmux invocations out in
+  the screenshot harness.
+- Protocol/entity change ⇒ the running daemon must be restarted (`nebula kill`, kills live sessions)
+  before a rebuilt TUI/CLI can talk to it; the v24/v25 handshake refusal is clean and says so.
+
 ### ⌘W Closes The Selected Session — 2026-08-24
 
 **Asked:** "ok e ok cand dau cmmd w si s pe un agent vreau sa mi inchida acea sesiune" — followed by "si
@@ -307,10 +495,10 @@ in `event_loop.rs`, bound to `Action::OpenRepo` / `shift+g`. `ef56fca` checks in
   on its own branch and `git push origin <branch>:main`. **Never `git add` in the shared tree.**
 - Local `main` stays behind `origin/main` after that push — it is checked out and dirty, so it can't be
   fast-forwarded. Say so explicitly; the next `git pull` has to reconcile.
-- `e2e_tui::tui_projects_worktrees_agents_navigation` **fails at `origin/main` too**:
+- `e2e_tui::tui_projects_worktrees_agents_navigation` **failed at `origin/main` too**:
   `FOOTER_TERMINAL_LOCKED = "Ctrl+q: panels"` (`crates/nebula/tests/e2e_tui.rs:29`) while the footer now
-  renders `^q: panels`. Introduced by `87d2b24` and shipped red in v0.2.0 — not a regression, still
-  unfixed. Always re-run a failing test against `origin/main` before blaming your own diff.
+  renders `^q: panels`. Introduced by `87d2b24`, shipped red in v0.2.0, fixed on main in `67ba923`
+  (passes as of 2026-08-24). Always re-run a failing test against `origin/main` before blaming your own diff.
 - `.github/workflows/release.yml` publishes with `generate_release_notes: true`, which is a bare commit
   list, not a changelog. `gh release edit vX.Y.Z --notes "…"` afterwards is the step that makes it one.
 
