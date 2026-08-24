@@ -1,5 +1,6 @@
 pub mod app;
 pub mod branch_name;
+pub mod branches;
 pub mod completion;
 pub mod config;
 pub mod event_loop;

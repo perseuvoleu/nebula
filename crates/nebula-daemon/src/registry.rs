@@ -1587,28 +1587,14 @@ impl Daemon {
     }
 
     /// Promote a session to project orchestrator, or demote one back to a
-    /// plain session. Promotion requires the root checkout (orchestrators
-    /// live on the main branch by definition) and pins the row; demotion
-    /// unpins it.
+    /// plain session. An orchestrator may live on any of the project's
+    /// worktrees (the TUI's branch picker decides which); promotion pins
+    /// the row, demotion unpins it.
     pub fn set_agent_orchestrator(
         self: &Arc<Self>,
         id: &AgentId,
         orchestrator: bool,
     ) -> Result<()> {
-        if orchestrator {
-            let agent = self.agent_entity(id)?;
-            let worktree = self
-                .store
-                .get_worktree(&agent.worktree_id)?
-                .context("worktree not found")?;
-            if !worktree.is_main {
-                bail!(
-                    "only a session on the root checkout can become the orchestrator \
-                     (this one is on {})",
-                    worktree.branch
-                );
-            }
-        }
         self.store.set_agent_orchestrator(id, orchestrator)?;
         self.store.set_agent_pinned(id, orchestrator)?;
         let agent = self.agent_entity(id)?;
@@ -2993,6 +2979,38 @@ mod tests {
             .unwrap()
             .worktree_id
             .to_string()
+    }
+
+    /// Orchestrators may live on any worktree now (the TUI's branch picker
+    /// decides which): promotion off the root checkout succeeds, pins, and
+    /// demotion unpins — the old root-only refusal is gone.
+    #[test]
+    fn promotion_works_off_the_root_checkout() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]);
+        seed_worktree(&daemon, "p", "root", "/nebula-test/p", true);
+        seed_worktree(&daemon, "p", "feat", "/nebula-test/p-feat", false);
+        seed_agent(&daemon, "a1", "feat", None);
+
+        daemon
+            .set_agent_orchestrator(&AgentId("a1".into()), true)
+            .unwrap();
+        let a = daemon
+            .store
+            .get_agent(&AgentId("a1".into()))
+            .unwrap()
+            .unwrap();
+        assert!(a.orchestrator && a.pinned, "promoted and pinned off-root");
+
+        daemon
+            .set_agent_orchestrator(&AgentId("a1".into()), false)
+            .unwrap();
+        let a = daemon
+            .store
+            .get_agent(&AgentId("a1".into()))
+            .unwrap()
+            .unwrap();
+        assert!(!a.orchestrator && !a.pinned, "demotion unpins");
     }
 
     #[test]

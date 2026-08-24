@@ -83,13 +83,14 @@ pub enum MenuAction {
     ArchiveAgent(AgentId),
     UnarchiveAgent(AgentId),
     SetAgentPinned(AgentId, bool),
-    /// Promote a root-checkout session into the ORCHESTRATORS section, or
-    /// demote an orchestrator back to a plain session.
+    /// Promote a session (on any worktree) into the ORCHESTRATORS section,
+    /// or demote an orchestrator back to a plain session.
     SetAgentOrchestrator(AgentId, bool),
     DeleteAgent(AgentId),
     NewAgent(WorktreeId),
-    /// Spawn a project orchestrator: a pinned Claude session on the root
-    /// checkout, listed in the Worktrees panel's ORCHESTRATORS group.
+    /// Spawn a project orchestrator: a pinned agent session on a checkout
+    /// of a picked branch, listed in the Worktrees panel's ORCHESTRATORS
+    /// group.
     NewOrchestrator(ProjectId),
     /// Picker result: create an agent of this kind (chains into the name
     /// prompt). `model`/`effort` are submenu choices: None means the row
@@ -100,13 +101,30 @@ pub enum MenuAction {
         kind: AgentKind,
         model: Option<String>,
         effort: Option<String>,
-        /// The picked session becomes a project orchestrator (root
-        /// checkout, ORCHESTRATORS section) instead of a plain session.
+        /// The picked session becomes a project orchestrator (its row in
+        /// the ORCHESTRATORS section) instead of a plain session — and its
+        /// activation detours through the branch picker.
         orchestrator: bool,
     },
     /// Shell terminal in the worktree's directory; created immediately with
     /// a default name (no prompt), renameable later.
     NewTerminal(WorktreeId),
+    /// Open the branch picker (the orchestrator flow's extra step): pick
+    /// which local branch the new session's checkout starts from. The
+    /// terminal row of the orchestrator picker reaches it directly; agent
+    /// rows reach it through `NewAgentOfKind` once model/effort resolve.
+    PickBranch {
+        project: ProjectId,
+        spawn: BranchSpawn,
+    },
+    /// A branch-picker row: run the spawn on a checkout of this branch —
+    /// the worktree that already has it checked out (the root included),
+    /// or a fresh worktree checking out the existing branch.
+    SpawnOnBranch {
+        project: ProjectId,
+        branch: String,
+        spawn: BranchSpawn,
+    },
     RenameTerminal(TerminalId),
     CloseTerminal(TerminalId),
     NewWorktree(ProjectId),
@@ -135,6 +153,22 @@ pub enum MenuAction {
     },
     LabelDivider(ProjectId, bool),
     ToggleArchived,
+}
+
+/// What the branch picker spawns once a branch is picked. Model/effort are
+/// already resolved against the configured defaults by the time the picker
+/// opens — a branch row is past the submenus.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BranchSpawn {
+    /// Shell terminal, created right away (no name prompt).
+    Terminal,
+    /// Agent session; chains into the name prompt as usual.
+    Agent {
+        kind: AgentKind,
+        model: Option<String>,
+        effort: Option<String>,
+        orchestrator: bool,
+    },
 }
 
 /// Which submenu → (right arrow) opens from a menu row.
@@ -210,6 +244,17 @@ impl ContextMenu {
             _ => None,
         }
     }
+
+    /// First item drawn when only `visible` rows fit: the window slides
+    /// just enough to keep the hovered row on screen. Derived from `hover`
+    /// alone (no stored scroll state), so the draw and the click hit-test
+    /// always agree.
+    pub fn scroll_offset(&self, visible: usize) -> usize {
+        if visible == 0 {
+            return self.hover;
+        }
+        (self.hover + 1).saturating_sub(visible)
+    }
 }
 
 /// Destructive action waiting behind a confirmation.
@@ -265,6 +310,17 @@ pub enum PromptKind {
         model: Option<String>,
         effort: Option<String>,
         /// Name prompt for a new orchestrator, not a plain session.
+        orchestrator: bool,
+    },
+    /// Name prompt for an agent whose picked branch has no checkout yet:
+    /// submit creates the worktree first (checking out the existing
+    /// branch), then spawns the agent there once the Ack lands.
+    NewAgentOnBranch {
+        project: ProjectId,
+        branch: String,
+        kind: AgentKind,
+        model: Option<String>,
+        effort: Option<String>,
         orchestrator: bool,
     },
     RenameAgent {
@@ -1313,7 +1369,25 @@ pub enum PendingIntent {
     OpenCreatedWorkspace,
     /// Worktree removed optimistically; restore these rows on Error.
     DeleteWorktree(WorktreeRollback),
+    /// Branch picker picked a branch with no checkout: once the worktree's
+    /// Ack lands, create this session on it (a second request cycle).
+    SpawnOnCreatedWorktree(DeferredSpawn),
     None,
+}
+
+/// Session to create once a branch-picked worktree's Ack lands.
+#[derive(Debug, Clone)]
+pub enum DeferredSpawn {
+    Terminal,
+    Agent {
+        kind: AgentKind,
+        model: Option<String>,
+        effort: Option<String>,
+        /// Typed name; empty takes the generated default (and opts into
+        /// auto-titling), same as the direct create path.
+        name: String,
+        orchestrator: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2193,25 +2267,25 @@ impl App {
         self.tree.projects.get(row.project_index())
     }
 
-    /// The selected project's orchestrator agents — they live on the root
-    /// checkout, flagged, and render as their own group at the top of the
-    /// Worktrees panel. Unarchived only.
+    /// The selected project's orchestrator agents — flagged sessions on any
+    /// of the project's worktrees (root or branch checkout), rendered as
+    /// their own group at the top of the Worktrees panel. Unarchived only.
     pub fn project_orchestrators(&self) -> Vec<&Agent> {
         let Some(project) = self.selected_project() else {
-            return vec![];
-        };
-        let Some(root) = self
-            .tree
-            .worktrees
-            .iter()
-            .find(|w| w.project_id == project.id && w.is_main)
-        else {
             return vec![];
         };
         self.tree
             .agents
             .iter()
-            .filter(|a| a.orchestrator && !a.archived && a.worktree_id == root.id)
+            .filter(|a| {
+                a.orchestrator
+                    && !a.archived
+                    && self
+                        .tree
+                        .worktrees
+                        .iter()
+                        .any(|w| w.id == a.worktree_id && w.project_id == project.id)
+            })
             .collect()
     }
 

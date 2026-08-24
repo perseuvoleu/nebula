@@ -1260,6 +1260,30 @@ fn open_prompt(app: &mut App, kind: PromptKind) {
                 String::new(),
             )
         }
+        PromptKind::NewAgentOnBranch {
+            branch,
+            model,
+            effort,
+            ..
+        } => {
+            // Same shape as NewAgent's title, with the picked branch in it
+            // so the pending worktree creation is visible.
+            let opts: Vec<&str> = model
+                .as_deref()
+                .into_iter()
+                .chain(effort.as_deref())
+                .collect();
+            let title = if opts.is_empty() {
+                format!("New agent on {branch}")
+            } else {
+                format!("New agent on {branch} ({})", opts.join(" · "))
+            };
+            (
+                title,
+                "name (empty = generated)".to_string(),
+                String::new(),
+            )
+        }
         PromptKind::RenameAgent { id } => {
             let current = app
                 .tree
@@ -2143,8 +2167,8 @@ fn menu_items_for_session(a: &nebula_core::Agent) -> Vec<MenuItem> {
                 action: MenuAction::SetAgentPinned(a.id.clone(), !a.pinned),
                 destructive: false,
             },
-            // Root-checkout sessions can be promoted in place; the daemon
-            // refuses (with a clear flash) for sessions on other worktrees.
+            // Any session can be promoted in place — an orchestrator may
+            // live on whichever worktree its session runs on.
             MenuItem {
                 label: "Make orchestrator".into(),
                 action: MenuAction::SetAgentOrchestrator(a.id.clone(), true),
@@ -2258,6 +2282,14 @@ fn new_agent_shortcut(app: &mut App) {
         open_prompt(app, PromptKind::AddProject);
         return;
     }
+    // Context-aware: with the Worktrees-panel cursor in the ORCHESTRATORS
+    // section, the chord means "new orchestrator" — same as `n` there.
+    if app.in_orchestrator_section() {
+        if let Some(p) = app.selected_project().map(|p| p.id.clone()) {
+            open_new_orchestrator_picker(app, p);
+        }
+        return;
+    }
     match app.selected_worktree() {
         Some(w) => {
             let worktree = w.id.clone();
@@ -2271,9 +2303,9 @@ fn open_new_agent_picker(app: &mut App, worktree: WorktreeId) {
     open_agent_picker(app, worktree, false)
 }
 
-/// The orchestrator flavor of the same picker: kind → model/effort → name,
-/// identical to sessions, minus the shell-terminal row (an orchestrator is
-/// an agent by definition).
+/// The orchestrator flavor of the same picker: kind → model/effort →
+/// branch → name, identical to sessions plus the branch-picker step (the
+/// terminal row skips the name, same as sessions).
 fn open_new_orchestrator_picker(app: &mut App, project: nebula_core::ProjectId) {
     let root = app
         .tree
@@ -2305,7 +2337,27 @@ fn open_agent_picker(app: &mut App, worktree: WorktreeId, orchestrator: bool) {
         kind_row("Cursor", AgentKind::Cursor),
         kind_row("Pi", AgentKind::Pi),
     ];
-    if !orchestrator {
+    if orchestrator {
+        // The orchestrator flavor offers a shell too — but its checkout is
+        // the branch picker's to decide, so the row detours through it
+        // instead of creating on the carried (root) worktree.
+        if let Some(project) = app
+            .tree
+            .worktrees
+            .iter()
+            .find(|w| w.id == worktree)
+            .map(|w| w.project_id.clone())
+        {
+            items.push(MenuItem {
+                label: "Terminal (shell)".into(),
+                action: MenuAction::PickBranch {
+                    project,
+                    spawn: crate::app::BranchSpawn::Terminal,
+                },
+                destructive: false,
+            });
+        }
+    } else {
         items.push(MenuItem {
             label: "Terminal (shell)".into(),
             action: MenuAction::NewTerminal(worktree),
@@ -2318,6 +2370,67 @@ fn open_agent_picker(app: &mut App, worktree: WorktreeId, orchestrator: bool) {
         } else {
             "New session".into()
         }),
+        items,
+        at: None,
+        hover: 0,
+        area: ratatui::layout::Rect::default(),
+        parent: None,
+    }));
+}
+
+/// The orchestrator flow's branch picker: every local branch of the
+/// project's repo, newest commit first, the first row hovered. The root
+/// checkout's branch carries a dim `⌂ root` hint but keeps its
+/// newest-first slot. Falls back to the branches nebula already knows from
+/// the project's worktrees when git can't list (deleted repo, missing git).
+fn open_branch_picker(app: &mut App, project: nebula_core::ProjectId, spawn: crate::app::BranchSpawn) {
+    let Some(repo) = app
+        .tree
+        .projects
+        .iter()
+        .find(|p| p.id == project)
+        .map(|p| p.repo_path.clone())
+    else {
+        return;
+    };
+    let root_branch = app
+        .tree
+        .worktrees
+        .iter()
+        .find(|w| w.project_id == project && w.is_main)
+        .map(|w| w.branch.clone());
+    let mut branches = crate::branches::local_branches(&repo);
+    if branches.is_empty() {
+        branches = app
+            .tree
+            .worktrees
+            .iter()
+            .filter(|w| w.project_id == project)
+            .map(|w| w.branch.clone())
+            .collect();
+    }
+    if branches.is_empty() {
+        app.flash = Some("no local branches found".into());
+        return;
+    }
+    let items: Vec<MenuItem> = branches
+        .into_iter()
+        .map(|branch| MenuItem {
+            label: if Some(&branch) == root_branch.as_ref() {
+                format!("{branch} ⌂ root")
+            } else {
+                branch.clone()
+            },
+            action: MenuAction::SpawnOnBranch {
+                project: project.clone(),
+                branch,
+                spawn: spawn.clone(),
+            },
+            destructive: false,
+        })
+        .collect();
+    app.overlay = Some(Overlay::Menu(ContextMenu {
+        title: Some("From branch".into()),
         items,
         at: None,
         hover: 0,
@@ -3748,7 +3861,9 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
     if value.is_empty()
         && !matches!(
             prompt.kind,
-            PromptKind::NewAgent { .. } | PromptKind::NewWorktree { .. }
+            PromptKind::NewAgent { .. }
+                | PromptKind::NewAgentOnBranch { .. }
+                | PromptKind::NewWorktree { .. }
         )
     {
         app.flash = Some("cancelled: empty input".into());
@@ -3821,6 +3936,42 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
             effort,
             orchestrator,
         } => create_agent(app, worktree, kind, model, effort, value, orchestrator, out),
+        PromptKind::NewAgentOnBranch {
+            project,
+            branch,
+            kind,
+            model,
+            effort,
+            orchestrator,
+        } => {
+            // The branch may have gained a checkout while the user typed
+            // (another client, an agent's `nebula worktree new`) — use it.
+            if let Some(worktree) = app
+                .tree
+                .worktrees
+                .iter()
+                .find(|w| w.project_id == project && w.branch == branch)
+                .map(|w| w.id.clone())
+            {
+                create_agent(app, worktree, kind, model, effort, value, orchestrator, out);
+                return;
+            }
+            let req_id = app.alloc_req_id(PendingIntent::SpawnOnCreatedWorktree(
+                crate::app::DeferredSpawn::Agent {
+                    kind,
+                    model,
+                    effort,
+                    name: value,
+                    orchestrator,
+                },
+            ));
+            out.push(ClientRequest::CreateWorktree {
+                req_id,
+                project,
+                branch,
+                base: None,
+            });
+        }
         PromptKind::RenameAgent { id } => {
             let req_id = app.alloc_req_id(PendingIntent::None);
             out.push(ClientRequest::RenameAgent {
@@ -4043,6 +4194,31 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             };
             let model = resolve(model, cfg.default_model(kind));
             let effort = resolve(effort, cfg.default_effort(kind));
+            // The orchestrator flow inserts its branch-picker step here —
+            // which checkout the session runs on is a pick, not the carried
+            // (root) worktree. Prewarm waits until the branch resolves to a
+            // worktree that actually exists.
+            if orchestrator {
+                if let Some(project) = app
+                    .tree
+                    .worktrees
+                    .iter()
+                    .find(|w| w.id == worktree)
+                    .map(|w| w.project_id.clone())
+                {
+                    open_branch_picker(
+                        app,
+                        project,
+                        crate::app::BranchSpawn::Agent {
+                            kind,
+                            model,
+                            effort,
+                            orchestrator: true,
+                        },
+                    );
+                }
+                return;
+            }
             // No name prompt means no typing window to warm through, so
             // create straight from the picker: the standing default-spec
             // warm slot gets adopted where it matches, and the refill
@@ -4071,6 +4247,12 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                 },
             )
         }
+        MenuAction::PickBranch { project, spawn } => open_branch_picker(app, project, spawn),
+        MenuAction::SpawnOnBranch {
+            project,
+            branch,
+            spawn,
+        } => spawn_on_branch(app, project, branch, spawn, out),
         MenuAction::NewWorktree(project) => open_new_worktree_prompt(app, project),
         MenuAction::OpenNotes(owner) => open_notes_for_owner(app, owner),
         MenuAction::OpenTodos(owner) => open_todos_for_owner(app, owner),
@@ -4991,6 +5173,121 @@ fn fire_pending_preview(app: &mut App) {
     app.dirty = true;
 }
 
+/// A branch-picker row was chosen: run the spawn on a checkout of that
+/// branch. A worktree (the root included) that already has the branch
+/// checked out is used as-is; otherwise the daemon creates a worktree
+/// checking out the EXISTING branch — CreateWorktree's `-b` fails on an
+/// existing name and git.rs falls back to a plain checkout — and the
+/// session spawn waits on its Ack (`PendingIntent::SpawnOnCreatedWorktree`).
+fn spawn_on_branch(
+    app: &mut App,
+    project: nebula_core::ProjectId,
+    branch: String,
+    spawn: crate::app::BranchSpawn,
+    out: &mut Vec<ClientRequest>,
+) {
+    use crate::app::{BranchSpawn, DeferredSpawn};
+    let existing = app
+        .tree
+        .worktrees
+        .iter()
+        .find(|w| w.project_id == project && w.branch == branch)
+        .map(|w| w.id.clone());
+    match (spawn, existing) {
+        (BranchSpawn::Terminal, Some(worktree)) => {
+            let req_id = app.alloc_req_id(PendingIntent::AttachCreated);
+            out.push(ClientRequest::CreateTerminal {
+                req_id,
+                worktree,
+                name: None,
+            });
+        }
+        (
+            BranchSpawn::Agent {
+                kind,
+                model,
+                effort,
+                orchestrator,
+            },
+            Some(worktree),
+        ) => {
+            // From here the flow is the session picker's: warm the CLI
+            // while the user types the name — or skip the prompt entirely.
+            if crate::config::Config::load().skip_session_naming {
+                create_agent(app, worktree, kind, model, effort, String::new(), orchestrator, out);
+                return;
+            }
+            out.push(ClientRequest::PrewarmAgent {
+                worktree: worktree.clone(),
+                kind,
+                model: model.clone(),
+                effort: effort.clone(),
+            });
+            open_prompt(
+                app,
+                PromptKind::NewAgent {
+                    worktree,
+                    kind,
+                    model,
+                    effort,
+                    orchestrator,
+                },
+            );
+        }
+        (BranchSpawn::Terminal, None) => {
+            let req_id = app.alloc_req_id(PendingIntent::SpawnOnCreatedWorktree(
+                DeferredSpawn::Terminal,
+            ));
+            out.push(ClientRequest::CreateWorktree {
+                req_id,
+                project,
+                branch,
+                base: None,
+            });
+        }
+        (
+            BranchSpawn::Agent {
+                kind,
+                model,
+                effort,
+                orchestrator,
+            },
+            None,
+        ) => {
+            // No checkout to warm a CLI in yet, so no prewarm here.
+            if crate::config::Config::load().skip_session_naming {
+                let req_id = app.alloc_req_id(PendingIntent::SpawnOnCreatedWorktree(
+                    DeferredSpawn::Agent {
+                        kind,
+                        model,
+                        effort,
+                        name: String::new(),
+                        orchestrator,
+                    },
+                ));
+                out.push(ClientRequest::CreateWorktree {
+                    req_id,
+                    project,
+                    branch,
+                    base: None,
+                });
+                return;
+            }
+            open_prompt(
+                app,
+                PromptKind::NewAgentOnBranch {
+                    project,
+                    branch,
+                    kind,
+                    model,
+                    effort,
+                    orchestrator,
+                },
+            );
+        }
+    }
+}
+
 /// Ask the daemon for a new agent session and attach it once the Ack lands.
 /// An empty `name` takes the generated default (agent-1, …) and opts the
 /// session into agent-driven auto-titling (`nebula rename` on the first
@@ -5013,12 +5310,26 @@ fn create_agent(
         name
     } else if orchestrator {
         // Orchestrators number within their own section (they are hidden
-        // from the sessions list `default_session_name` scans).
+        // from the sessions list `default_session_name` scans) — across the
+        // whole project, since the section now spans every worktree.
+        let project = app
+            .tree
+            .worktrees
+            .iter()
+            .find(|w| w.id == worktree)
+            .map(|w| w.project_id.clone());
         let n = app
             .tree
             .agents
             .iter()
-            .filter(|a| a.worktree_id == worktree && a.orchestrator && !a.archived)
+            .filter(|a| {
+                a.orchestrator
+                    && !a.archived
+                    && (a.worktree_id == worktree
+                        || app.tree.worktrees.iter().any(|w| {
+                            w.id == a.worktree_id && Some(&w.project_id) == project.as_ref()
+                        }))
+            })
             .count()
             + 1;
         format!("orchestrator-{n}")
@@ -5301,24 +5612,49 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
     }
     // An open context menu owns the mouse: click inside activates, outside
     // closes (and swallows the click).
-    if let Some(Overlay::Menu(menu)) = &app.overlay {
-        if let MouseEventKind::Down(_) = mouse.kind {
-            let area = menu.area;
-            let inside = mouse.column > area.x
-                && mouse.column < area.x + area.width
-                && mouse.row > area.y
-                && mouse.row < area.y + area.height.saturating_sub(1);
-            if inside {
-                let index = (mouse.row - area.y - 1) as usize;
-                if let Some(item) = menu.items.get(index) {
-                    let action = item.action.clone();
+    if matches!(&app.overlay, Some(Overlay::Menu(_))) {
+        match mouse.kind {
+            MouseEventKind::Down(_) => {
+                let Some(Overlay::Menu(menu)) = &app.overlay else {
+                    unreachable!("checked above");
+                };
+                let area = menu.area;
+                let inside = mouse.column > area.x
+                    && mouse.column < area.x + area.width
+                    && mouse.row > area.y
+                    && mouse.row < area.y + area.height.saturating_sub(1);
+                if inside {
+                    // A menu taller than the screen scrolls to keep the
+                    // hovered row visible; the click's row maps back
+                    // through the same derived offset the draw used.
+                    let visible = area.height.saturating_sub(2) as usize;
+                    let index =
+                        (mouse.row - area.y - 1) as usize + menu.scroll_offset(visible);
+                    if let Some(item) = menu.items.get(index) {
+                        let action = item.action.clone();
+                        app.overlay = None;
+                        run_menu_action(app, action, out);
+                    }
+                } else {
                     app.overlay = None;
-                    run_menu_action(app, action, out);
                 }
-            } else {
-                app.overlay = None;
+                app.dirty = true;
             }
-            app.dirty = true;
+            // The wheel walks the hover, so long pickers (the branch list)
+            // scroll without the keyboard.
+            MouseEventKind::ScrollDown => {
+                if let Some(Overlay::Menu(menu)) = &mut app.overlay {
+                    menu.hover = (menu.hover + 1).min(menu.items.len().saturating_sub(1));
+                    app.dirty = true;
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                if let Some(Overlay::Menu(menu)) = &mut app.overlay {
+                    menu.hover = menu.hover.saturating_sub(1);
+                    app.dirty = true;
+                }
+            }
+            _ => {}
         }
         return;
     }
@@ -6568,6 +6904,35 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                     app.focus = Focus::Terminal;
                     app.term_locked = true;
                 }
+                (
+                    Some(PendingIntent::SpawnOnCreatedWorktree(spec)),
+                    Some(EntityId::Worktree(id)),
+                ) => {
+                    // The branch-picked checkout exists now: land the panel
+                    // cursor on it (when-seen idiom) and fire the session
+                    // create it was made for — a second Ack cycle whose
+                    // intent attaches as usual.
+                    if !select_worktree_by_id(app, &id, out) {
+                        app.select_worktree_when_seen = Some(id.clone());
+                    }
+                    match spec {
+                        crate::app::DeferredSpawn::Terminal => {
+                            let req_id = app.alloc_req_id(PendingIntent::AttachCreated);
+                            out.push(ClientRequest::CreateTerminal {
+                                req_id,
+                                worktree: id,
+                                name: None,
+                            });
+                        }
+                        crate::app::DeferredSpawn::Agent {
+                            kind,
+                            model,
+                            effort,
+                            name,
+                            orchestrator,
+                        } => create_agent(app, id, kind, model, effort, name, orchestrator, out),
+                    }
+                }
                 (Some(PendingIntent::SelectCreatedWorktree), Some(EntityId::Worktree(id))) => {
                     // Its upsert usually lands just before this Ack; if not,
                     // stash the id and select once it does.
@@ -7480,13 +7845,17 @@ mod tests {
         );
         app.overlay = None;
 
-        // The panel draws both section headers and the ◆ badge.
-        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        // The panel draws both section headers, the ◆ badge, and the
+        // branch of the worktree the orchestrator sits on.
+        let mut terminal = Terminal::new(TestBackend::new(160, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
         assert!(text.contains("ORCHESTRATORS"), "{text}");
         assert!(text.contains("WORKTREES"), "{text}");
-        assert!(text.contains("orchestrator-1"), "{text}");
+        // The name may truncate at the panel's default width, but the ◆
+        // badge and the row's branch always survive.
+        assert!(text.contains("orchestra"), "{text}");
+        assert!(text.contains("◆ main"), "{text}");
     }
 
     /// Both palettes label orchestrator rows in their searchable text, so
@@ -7724,10 +8093,391 @@ mod tests {
             "click on the + row opens the orchestrator picker: {:?}",
             app.overlay
         );
-        // No shell-terminal row — an orchestrator is an agent.
+        // The orchestrator picker offers a shell too — its row detours
+        // through the branch picker instead of creating on the root.
         if let Some(Overlay::Menu(m)) = &app.overlay {
-            assert!(m.items.iter().all(|i| !i.label.contains("Terminal")));
+            let terminal = m
+                .items
+                .iter()
+                .find(|i| i.label.contains("Terminal"))
+                .expect("terminal row present");
+            assert!(
+                matches!(
+                    &terminal.action,
+                    crate::app::MenuAction::PickBranch {
+                        spawn: crate::app::BranchSpawn::Terminal,
+                        ..
+                    }
+                ),
+                "{:?}",
+                terminal.action
+            );
         }
+    }
+
+    /// The new-agent chord (⌘N/^N) follows the Worktrees-panel split the
+    /// way `n` does: in the ORCHESTRATORS section it opens the
+    /// orchestrator picker instead of flashing "select a worktree first".
+    #[test]
+    fn cmd_n_in_the_orchestrator_section_opens_the_orchestrator_picker() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.focus = Focus::Worktrees;
+        app.sel_worktree = 0;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE, &mut out);
+        assert!(app.in_orchestrator_section());
+        press(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL, &mut out);
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Menu(m)) if m.title.as_deref() == Some("New orchestrator")),
+            "^n in the section opens the orchestrator picker: {:?}",
+            app.overlay
+        );
+    }
+
+    /// The orchestrator flow's branch picker lists the repo's LOCAL
+    /// branches newest-committed first (not worktrees), hovers the first
+    /// row, and hints the root checkout's branch without reordering it.
+    #[test]
+    fn orchestrator_branch_picker_lists_branches_newest_first_with_root_hint() {
+        with_default_config(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let repo = test_repo(&dir);
+            // `feature` gets a commit far in the future, so it outranks
+            // `main` under --sort=-committerdate no matter how fast the
+            // fixture ran.
+            run_git(&repo, &["checkout", "-b", "feature"]);
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .env("GIT_COMMITTER_DATE", "2030-01-01T00:00:00")
+                .args(["commit", "--allow-empty", "-m", "newest"])
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+            run_git(&repo, &["checkout", "main"]);
+
+            let mut app = App::new();
+            seed_repo_tree(&mut app, &repo);
+            let mut out = Vec::new();
+            run_menu_action(
+                &mut app,
+                MenuAction::NewAgentOfKind {
+                    worktree: nebula_core::WorktreeId("w1".into()),
+                    kind: AgentKind::Claude,
+                    model: None,
+                    effort: None,
+                    orchestrator: true,
+                },
+                &mut out,
+            );
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("expected the branch picker, got {:?}", app.overlay);
+            };
+            assert_eq!(menu.title.as_deref(), Some("From branch"));
+            assert_eq!(menu.hover, 0, "focus starts on the newest branch");
+            assert_eq!(menu.items[0].label, "feature");
+            assert_eq!(menu.items[1].label, "main ⌂ root");
+            assert!(
+                out.is_empty(),
+                "nothing fires until a branch is picked: {out:?}"
+            );
+        })
+    }
+
+    /// Picking a branch some worktree (here the root) already has checked
+    /// out reuses that worktree: prewarm + name prompt aim at it, and the
+    /// create lands there — no CreateWorktree involved.
+    #[test]
+    fn picking_a_branch_with_a_checkout_reuses_that_worktree() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            let mut out = Vec::new();
+            run_menu_action(
+                &mut app,
+                MenuAction::SpawnOnBranch {
+                    project: nebula_core::ProjectId("p1".into()),
+                    branch: "main".into(),
+                    spawn: crate::app::BranchSpawn::Agent {
+                        kind: AgentKind::Claude,
+                        model: None,
+                        effort: None,
+                        orchestrator: true,
+                    },
+                },
+                &mut out,
+            );
+            assert!(matches!(
+                out.as_slice(),
+                [ClientRequest::PrewarmAgent { worktree, .. }]
+                    if worktree == &nebula_core::WorktreeId("w1".into())
+            ));
+            assert!(
+                matches!(
+                    &app.overlay,
+                    Some(Overlay::Prompt(p)) if matches!(
+                        &p.kind,
+                        PromptKind::NewAgent { worktree, orchestrator: true, .. }
+                            if worktree == &nebula_core::WorktreeId("w1".into())
+                    )
+                ),
+                "{:?}",
+                app.overlay
+            );
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(
+                matches!(
+                    out.first(),
+                    Some(ClientRequest::CreateAgent { worktree, orchestrator: true, .. })
+                        if worktree == &nebula_core::WorktreeId("w1".into())
+                ),
+                "{out:?}"
+            );
+            assert!(
+                !out.iter()
+                    .any(|r| matches!(r, ClientRequest::CreateWorktree { .. })),
+                "no worktree creation for an existing checkout: {out:?}"
+            );
+        })
+    }
+
+    /// Picking a branch with no checkout creates a worktree that checks
+    /// out the EXISTING branch (no base — git.rs falls back past `-b`),
+    /// then the worktree's Ack fires the deferred agent create on it.
+    #[test]
+    fn picking_a_branch_without_a_checkout_creates_the_worktree_then_spawns() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            let mut out = Vec::new();
+            run_menu_action(
+                &mut app,
+                MenuAction::SpawnOnBranch {
+                    project: nebula_core::ProjectId("p1".into()),
+                    branch: "feature".into(),
+                    spawn: crate::app::BranchSpawn::Agent {
+                        kind: AgentKind::Claude,
+                        model: None,
+                        effort: None,
+                        orchestrator: true,
+                    },
+                },
+                &mut out,
+            );
+            assert!(out.is_empty(), "the name comes first: {out:?}");
+            assert!(
+                matches!(
+                    &app.overlay,
+                    Some(Overlay::Prompt(p)) if matches!(
+                        &p.kind,
+                        PromptKind::NewAgentOnBranch { branch, orchestrator: true, .. }
+                            if branch == "feature"
+                    )
+                ),
+                "{:?}",
+                app.overlay
+            );
+            for c in "boss".chars() {
+                press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+            }
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            let Some(ClientRequest::CreateWorktree {
+                req_id,
+                branch,
+                base,
+                ..
+            }) = out.first()
+            else {
+                panic!("expected CreateWorktree, got {out:?}");
+            };
+            assert_eq!(branch, "feature");
+            assert_eq!(base, &None, "an existing branch is checked out, not re-based");
+            // The daemon answers with the created worktree; the deferred
+            // create fires on it, still carrying the typed name and flag.
+            let req_id = *req_id;
+            let mut out = Vec::new();
+            handle_server_event(
+                &mut app,
+                ServerEvent::Ack {
+                    req_id,
+                    created: Some(nebula_core::EntityId::Worktree(nebula_core::WorktreeId(
+                        "w-feature".into(),
+                    ))),
+                },
+                &mut out,
+            );
+            assert!(
+                matches!(
+                    out.first(),
+                    Some(ClientRequest::CreateAgent { worktree, name, orchestrator: true, .. })
+                        if worktree == &nebula_core::WorktreeId("w-feature".into()) && name == "boss"
+                ),
+                "{out:?}"
+            );
+        })
+    }
+
+    /// The orchestrator picker's terminal row goes through the branch
+    /// picker too: an existing checkout gets the terminal directly, a
+    /// missing one is created first and the terminal follows its Ack.
+    #[test]
+    fn orchestrator_terminal_row_spawns_on_the_picked_branch() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        run_menu_action(
+            &mut app,
+            MenuAction::PickBranch {
+                project: nebula_core::ProjectId("p1".into()),
+                spawn: crate::app::BranchSpawn::Terminal,
+            },
+            &mut out,
+        );
+        // /tmp/demo isn't a repo, so the picker falls back to the branches
+        // nebula knows from the project's worktrees.
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Menu(m)) if m.title.as_deref() == Some("From branch")),
+            "{:?}",
+            app.overlay
+        );
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(
+                out.first(),
+                Some(ClientRequest::CreateTerminal { worktree, .. })
+                    if worktree == &nebula_core::WorktreeId("w1".into())
+            ),
+            "{out:?}"
+        );
+
+        // The deferred path: no checkout for the branch yet.
+        let mut out = Vec::new();
+        run_menu_action(
+            &mut app,
+            MenuAction::SpawnOnBranch {
+                project: nebula_core::ProjectId("p1".into()),
+                branch: "feature".into(),
+                spawn: crate::app::BranchSpawn::Terminal,
+            },
+            &mut out,
+        );
+        let Some(ClientRequest::CreateWorktree { req_id, .. }) = out.first() else {
+            panic!("expected CreateWorktree, got {out:?}");
+        };
+        let req_id = *req_id;
+        let mut out = Vec::new();
+        handle_server_event(
+            &mut app,
+            ServerEvent::Ack {
+                req_id,
+                created: Some(nebula_core::EntityId::Worktree(nebula_core::WorktreeId(
+                    "w-feature".into(),
+                ))),
+            },
+            &mut out,
+        );
+        assert!(
+            matches!(
+                out.first(),
+                Some(ClientRequest::CreateTerminal { worktree, .. })
+                    if worktree == &nebula_core::WorktreeId("w-feature".into())
+            ),
+            "{out:?}"
+        );
+    }
+
+    /// An orchestrator on a non-root worktree still shows in the section
+    /// (the daemon no longer refuses off-root), with its branch on the row.
+    #[test]
+    fn orchestrators_on_branch_worktrees_list_with_their_branch() {
+        use nebula_core::{Entity, Worktree, WorktreeId};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(Worktree {
+                    id: WorktreeId("w2".into()),
+                    project_id: nebula_core::ProjectId("p1".into()),
+                    path: "/tmp/demo-worktrees/feature".into(),
+                    branch: "feature".into(),
+                    is_main: false,
+                    created_from: None,
+                    pinned: false,
+                    sort_order: 1,
+                }),
+            },
+        );
+        let mut orch = app.tree.agents[0].clone();
+        orch.id = AgentId("orch".into());
+        orch.name = "boss".into();
+        orch.worktree_id = WorktreeId("w2".into());
+        orch.orchestrator = true;
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(orch),
+            },
+        );
+        assert_eq!(app.orchestrator_row_count(), 1, "off-root still listed");
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("boss ◆ feature") || text.contains("◆ feature"), "{text}");
+    }
+
+    /// A menu taller than the frame slides its window to keep the hovered
+    /// row visible (the branch picker in a branch-heavy repo).
+    #[test]
+    fn a_tall_menu_scrolls_to_keep_the_hover_visible() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let items: Vec<crate::app::MenuItem> = (0..60)
+            .map(|i| crate::app::MenuItem {
+                label: format!("branch-{i:02}"),
+                action: MenuAction::SpawnOnBranch {
+                    project: nebula_core::ProjectId("p1".into()),
+                    branch: format!("branch-{i:02}"),
+                    spawn: crate::app::BranchSpawn::Terminal,
+                },
+                destructive: false,
+            })
+            .collect();
+        app.overlay = Some(Overlay::Menu(crate::app::ContextMenu {
+            title: Some("From branch".into()),
+            items,
+            at: None,
+            hover: 59,
+            area: ratatui::layout::Rect::default(),
+            parent: None,
+        }));
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("branch-59"), "hovered row visible: {text}");
+        assert!(
+            !text.contains("branch-00"),
+            "the top scrolled out of the window: {text}"
+        );
+        // A click on the hovered (bottom) row activates that row, not the
+        // one the unscrolled index math would pick.
+        let (x, y) = find_cell(&terminal, "branch-59");
+        let mut out = Vec::new();
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Down(MouseButton::Left), x, y),
+            &mut out,
+        );
+        assert!(
+            matches!(
+                out.first(),
+                Some(ClientRequest::CreateWorktree { branch, .. }) if branch == "branch-59"
+            ),
+            "{out:?}"
+        );
     }
 
     /// An empty ORCHESTRATORS section keeps one selectable
@@ -7751,8 +8501,15 @@ mod tests {
             "enter opens the kind picker: {:?}",
             app.overlay
         );
-        // Same chain as sessions: Enter on Claude → name prompt → typed
-        // name → CreateAgent flagged as orchestrator.
+        // Same chain as sessions plus the branch step: Enter on Claude →
+        // branch picker → name prompt → typed name → CreateAgent flagged
+        // as orchestrator.
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Menu(m)) if m.title.as_deref() == Some("From branch")),
+            "the kind pick detours through the branch picker: {:?}",
+            app.overlay
+        );
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
         assert!(
             matches!(&app.overlay, Some(Overlay::Prompt(p)) if matches!(p.kind, crate::app::PromptKind::NewAgent { orchestrator: true, .. })),
