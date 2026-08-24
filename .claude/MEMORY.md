@@ -14,6 +14,28 @@ about what is worth recording.
 
 ## Entries
 
+### Orchestrator-Delegated Sessions Get Task-Derived Names — 2026-08-24
+
+**Asked:** "when a project orchestrator creates a worktree and/or creates agent sessions on that
+worktree through the injected Nebula orchestration CLI, it should be able to assign meaningful names
+derived from the delegated session/task so those worktrees and sessions are easy to find via search."
+
+**Did:** Commit `802aaea`. `title_from_prompt` in `crates/nebula-tui/src/branch_name.rs` (first
+non-empty line, filler words dropped, first 4 words Title Cased) feeds `default_agent_name` in
+`ipc.rs::agent_new`: an unnamed `--prompt` spawn is now named after its task instead of `agent-N`.
+`--name` on `nebula agent new` takes multiple words unquoted (`num_args = 1..`, joined in `main.rs`),
+and `ORCHESTRATOR_INSTRUCTION` (`hooks/mod.rs`) now teaches naming worktrees/sessions after the
+delegated task. Worktree naming needed no code — `worktree new <name>` was already free-text→branch,
+and the palettes already search `{project}/{branch}/{name}`.
+
+**Gotchas:**
+- Deliberate: a prompt-derived name does NOT clear `auto_title` — only an explicit `--name` counts as
+  an assignment, so the worker may still retitle itself from the same prompt. Don't "fix" that as a bug.
+- This also changes the manual flow `nebula agent new --prompt … ` (no `--name`): humans get the
+  derived title too, same code path — intended, not creep.
+- `hooks::tests::orchestrator_instruction_teaches_task_derived_naming` pins prose substrings
+  (`--name`, `search`, `derived from --prompt`) — copyediting the brief means updating it.
+
 ### ⌘W Closes The Selected Session — 2026-08-24
 
 **Asked:** "ok e ok cand dau cmmd w si s pe un agent vreau sa mi inchida acea sesiune" — followed by "si
