@@ -14,6 +14,26 @@ about what is worth recording.
 
 ## Entries
 
+### Orchestrators Must Stay In A Polling Loop Until Workers Settle — 2026-08-24
+
+**Asked:** "adauga undeva in memorie in nebula ca daca esti orchestrator tre sa ramai in loop, gen sa
+ti dau cu timeout sleep ca sa verifici mereu" + "ceva de genul are herdr, cauta intai".
+
+**Did:** Recorded as a standing working rule (no code changed). **If you are a nebula orchestrator
+session, do not end your turn after delegating** — a finished turn means nobody watches the workers.
+Stay in a blocking poll loop instead: `sleep <seconds>` then `nebula agent list`, repeated until every
+delegated worker leaves `running` (→ `finished` or `needs_feedback`), then report/act. Use generous
+sleeps (30–60s; the Bash timeout allows up to 600s per call) so the loop is cheap. On
+`needs_feedback`, surface what the worker is blocked on to the user instead of waiting forever.
+
+**Gotchas:**
+- This mirrors herdr's model, where waiting is first-class and blocking: `herdr agent prompt …
+  --wait --timeout 120000` and `herdr wait agent-status <pane> --status done --timeout 120000`
+  (`~/.claude/skills/herdr/SKILL.md`, also `~/Desktop/herdr/skills/herdr/SKILL.md`). Nebula has no
+  `nebula agent wait` verb — until one exists, `sleep` + `nebula agent list` is the substitute.
+- Herdr's rule "inspect before waiting" applies here too: check `nebula agent list` once before the
+  first sleep — a worker can finish faster than your first interval.
+
 ### E2E Tests Updated For The Split Orchestrator/Worktree Focus — 2026-08-24
 
 **Asked:** "Fix the 3 failing e2e tests in crates/nebula/tests/e2e_tui.rs: tui_note_modal_crud_and_badge,
