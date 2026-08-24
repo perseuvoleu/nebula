@@ -14,6 +14,47 @@ about what is worth recording.
 
 ## Entries
 
+### Branch-Aware Orchestrator Creation With A Scrolling Branch Picker — 2026-08-24
+
+**Asked:** "cand sunt pe orchestrator si dau n / ctrl+n vreau sa pot sa aleg si terminal (ca la
+sesiuni) dar in plus vreau sa pot sa pun de la ce branch sa plece, o lista scrolabila ordonata dupa
+branch-urile cele mai noi (nu worktrees) si sa fie focus pe primul" + "in lista de orchestratori
+trebuie sa zica si pe ce branch e".
+
+**Did:** Commit `7efafac` on `orchestrator-branch-picker`. Orchestrator flow is now kind →
+model/effort → **branch** → name: new `crates/nebula-tui/src/branches.rs::local_branches` (git
+`for-each-ref --sort=-committerdate refs/heads/`), `open_branch_picker`/`spawn_on_branch` in
+event_loop.rs, `MenuAction::PickBranch`/`SpawnOnBranch` + `BranchSpawn`, `PromptKind::NewAgentOnBranch`,
+and `PendingIntent::SpawnOnCreatedWorktree(DeferredSpawn)` (name prompt first, worktree create on
+submit, session create on the worktree's Ack). Orchestrator picker gained the "Terminal (shell)" row
+(routed through the branch step); `new_agent_shortcut` (⌘N/^N) opens the orchestrator picker when
+`in_orchestrator_section()`. ContextMenu draws/clicks through a derived `scroll_offset(visible)`
+(no stored state — ui.rs draw and the mouse handler recompute the same value; wheel moves hover).
+`project_orchestrators()` (app.rs) now spans every worktree of the project, orchestrator rows render
+their worktree's branch dim after the ◆ badge, and daemon `set_agent_orchestrator` (registry.rs)
+dropped the root-checkout refusal. No PROTOCOL_VERSION bump. 611 workspace tests green.
+
+**Gotchas:**
+- **No protocol change was needed for "check out an existing branch":** `git.rs::add_worktree`
+  already falls back from `-b <branch>` to a plain `git worktree add <path> <branch>` when the branch
+  exists — so `CreateWorktree { branch: <existing>, base: None }` checks the existing branch out. The
+  TUI must still prefer a worktree that already has the branch (git refuses double-checkout).
+- The relaxation of `SetAgentOrchestrator` is daemon-side behavior: a running old daemon still
+  refuses promotion off-root until `nebula kill` + relaunch. Everything else in this feature is
+  TUI-only and works against the old daemon (v25 handshake unchanged).
+- ContextMenu never scrolled before — items past the frame were silently clipped and clicks used
+  `row - area.y - 1` raw. Any scroll scheme must keep draw and click in lockstep; deriving the offset
+  from `hover` alone avoids adding a field to the widely-literal-constructed `ContextMenu`.
+- In the orchestrator pill row the name-truncation math must subtract 3 (selection rail `▌` + the
+  2-cell status dot), not the 2 the neighboring worktree rows use — with 2 the trailing branch label
+  loses its last character. Panels have fixed default widths, so screen tests should assert a name
+  prefix + "◆ <branch>", not the full string, even on a 160-col backend.
+- Prewarm in the branch flow fires only once the branch resolves to an existing worktree
+  (`spawn_on_branch`); a not-yet-created checkout has nothing to warm, and the Esc-restores-prewarm
+  arm only matches `PromptKind::NewAgent`, which is correct for that reason.
+- Test committer-date ordering with `GIT_COMMITTER_DATE` env on the commit — two commits in the same
+  second sort unpredictably under `--sort=-committerdate`.
+
 ### Claude Spawns In Yolo Mode Too — 2026-08-24
 
 **Asked:** "vreau cand se face un agent claude/codex sa fie ca in herdr, cu yolo mode ambele"
