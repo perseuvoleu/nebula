@@ -18,8 +18,8 @@ use crossterm::event::{
 };
 use futures::StreamExt;
 use nebula_core::{
-    AgentId, AgentKind, ClientRequest, EntityId, LinkId, NoteId, NoteOwner, ServerEvent,
-    SessionRef, WorktreeId,
+    AgentId, AgentKind, AgentStatus, ClientRequest, EntityId, LinkId, NoteId, NoteOwner,
+    ServerEvent, SessionRef, WorktreeId,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -1088,6 +1088,9 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 )));
             }
         }
+        // Answer sessions in the order they started waiting: jump to the
+        // oldest needs-feedback session and attach it.
+        Action::NextAttention => next_attention(app, out),
         Action::ToggleDivider => {
             if app.focus == Focus::Projects {
                 match app.selected_project_row() {
@@ -4171,6 +4174,34 @@ fn select_project_row_by_id(app: &mut App, id: &nebula_core::ProjectId) -> bool 
     true
 }
 
+/// Space: jump to the session that has been waiting on the user the
+/// longest — the oldest unarchived needs-feedback agent (orchestrators
+/// included) in the open workspace — and attach it, exactly like a palette
+/// session pick. Hitting the key repeatedly answers sessions oldest-first.
+fn next_attention(app: &mut App, out: &mut Vec<ClientRequest>) {
+    let in_open_workspace = |a: &nebula_core::Agent| {
+        app.tree
+            .worktrees
+            .iter()
+            .find(|w| w.id == a.worktree_id)
+            .and_then(|w| app.tree.projects.iter().find(|p| p.id == w.project_id))
+            .is_some_and(|p| app.tree.in_active_workspace(p))
+    };
+    let target = app
+        .tree
+        .agents
+        .iter()
+        .filter(|a| !a.archived && a.status == AgentStatus::NeedsFeedback)
+        .filter(|a| in_open_workspace(a))
+        // Never-run rows stamp 0, which correctly sorts as oldest.
+        .min_by_key(|a| a.status_changed_at)
+        .map(|a| a.id.clone());
+    match target {
+        Some(id) => jump_to_target(app, PaletteTarget::Session(id), true, out),
+        None => app.flash = Some("nothing needs your feedback".into()),
+    }
+}
+
 /// Land the panel selections on a `/` palette pick. A project or worktree
 /// pick moves the selection (restoring remembered child rows, like a manual
 /// switch), then hands focus one column right — a project pick lands in its
@@ -4223,12 +4254,9 @@ fn jump_to_target(
             app.focus = Focus::Sessions;
         }
         PaletteTarget::Session(id) => {
-            let worktree = app
-                .tree
-                .agents
-                .iter()
-                .find(|a| a.id == id)
-                .map(|a| a.worktree_id.clone());
+            let agent = app.tree.agents.iter().find(|a| a.id == id);
+            let orchestrator = agent.is_some_and(|a| a.orchestrator);
+            let worktree = agent.map(|a| a.worktree_id.clone());
             let found = worktree.as_ref().is_some_and(|wid| {
                 app.tree
                     .worktrees
@@ -4237,6 +4265,27 @@ fn jump_to_target(
                     .map(|w| w.project_id.clone())
                     .is_some_and(|pid| select_project_row_by_id(app, &pid))
             });
+            // An orchestrator's row lives in the Worktrees panel's
+            // ORCHESTRATORS section, not the sessions list — land the
+            // section cursor on it instead of a session row.
+            if orchestrator {
+                let index = found
+                    .then(|| app.project_orchestrators().iter().position(|a| a.id == id))
+                    .flatten();
+                let Some(index) = index else {
+                    app.flash = Some("session no longer exists".into());
+                    return;
+                };
+                app.sel_orchestrator = Some(index);
+                self::attach(app, SessionRef::Agent(id), out);
+                if attach {
+                    app.focus = Focus::Terminal;
+                    app.term_locked = true;
+                } else {
+                    app.focus = Focus::Worktrees;
+                }
+                return;
+            }
             let wt_index = found
                 .then(|| worktree.as_ref().and_then(|id| app.worktree_row_index(id)))
                 .flatten();
@@ -6669,6 +6718,124 @@ mod tests {
         assert!(
             texts.iter().any(|t| t.contains("demo/main/agent-1")),
             "plain sessions keep the branch path: {texts:?}"
+        );
+    }
+
+    /// Space answers the queue oldest-first: with two needs-feedback
+    /// sessions and a running one, it attaches the one waiting longest;
+    /// once that one is answered, the next press moves on to the
+    /// next-oldest.
+    #[test]
+    fn space_jumps_to_the_oldest_session_needing_feedback() {
+        use nebula_core::{AgentStatus, Entity};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let template = app.tree.agents[0].clone();
+        let mk = |id: &str, status: AgentStatus, changed_at: i64| {
+            let mut a = template.clone();
+            a.id = AgentId(id.into());
+            a.name = id.into();
+            a.status = status;
+            a.status_changed_at = changed_at;
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(a),
+            }
+        };
+        let now = crate::app::now_ms();
+        hse(
+            &mut app,
+            mk("blocked-new", AgentStatus::NeedsFeedback, now - 1_000),
+        );
+        hse(
+            &mut app,
+            mk("blocked-old", AgentStatus::NeedsFeedback, now - 60_000),
+        );
+        hse(&mut app, mk("busy", AgentStatus::Running, now - 120_000));
+
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE, &mut out);
+        assert_eq!(app.focus, Focus::Terminal);
+        assert!(app.term_locked);
+        assert!(
+            app.term
+                .as_ref()
+                .is_some_and(|t| t.sref == SessionRef::Agent(AgentId("blocked-old".into()))),
+            "space attaches the longest-waiting session: {:?}",
+            app.term.as_ref().map(|t| &t.sref)
+        );
+
+        // Answering it flips its status; the next press moves down the
+        // queue to the remaining blocked session.
+        hse(
+            &mut app,
+            ServerEvent::StatusChanged {
+                agent: AgentId("blocked-old".into()),
+                status: AgentStatus::Running,
+                changed_at: now,
+            },
+        );
+        app.term_locked = false;
+        app.focus = Focus::Sessions;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE, &mut out);
+        assert_eq!(app.focus, Focus::Terminal);
+        assert!(app.term_locked);
+        assert!(
+            app.term
+                .as_ref()
+                .is_some_and(|t| t.sref == SessionRef::Agent(AgentId("blocked-new".into()))),
+            "the answered session left the queue: {:?}",
+            app.term.as_ref().map(|t| &t.sref)
+        );
+    }
+
+    /// With no session waiting on feedback, space flashes and moves
+    /// nothing.
+    #[test]
+    fn space_with_nothing_blocked_flashes_and_stays_put() {
+        let mut app = App::new();
+        seed_tree(&mut app); // agent-1 is Fresh, not blocked
+        app.focus = Focus::Sessions;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE, &mut out);
+        assert_eq!(app.flash.as_deref(), Some("nothing needs your feedback"));
+        assert_eq!(app.focus, Focus::Sessions);
+        assert!(app.term.is_none(), "nothing attached");
+        assert!(out.is_empty(), "no requests sent");
+    }
+
+    /// Orchestrators are sessions too: when the longest-waiting agent is
+    /// an orchestrator, space lands the Worktrees-panel section cursor on
+    /// its row and attaches it.
+    #[test]
+    fn space_reaches_a_blocked_orchestrator() {
+        use nebula_core::{AgentStatus, Entity};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut orch = app.tree.agents[0].clone();
+        orch.id = AgentId("orch".into());
+        orch.name = "boss".into();
+        orch.orchestrator = true;
+        orch.status = AgentStatus::NeedsFeedback;
+        orch.status_changed_at = 1;
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(orch),
+            },
+        );
+
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE, &mut out);
+        assert_eq!(app.sel_orchestrator, Some(0), "cursor on the section row");
+        assert_eq!(app.focus, Focus::Terminal);
+        assert!(app.term_locked);
+        assert!(
+            app.term
+                .as_ref()
+                .is_some_and(|t| t.sref == SessionRef::Agent(AgentId("orch".into()))),
+            "space attached the orchestrator: {:?}",
+            app.term.as_ref().map(|t| &t.sref)
         );
     }
 
