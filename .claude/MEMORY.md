@@ -14,6 +14,38 @@ about what is worth recording.
 
 ## Entries
 
+### `nebula agent wait` — Orchestrators Block Instead Of Sleep-Polling — 2026-08-24
+
+**Asked:** "Add a blocking wait verb to the nebula CLI so orchestrator sessions can wait on their
+workers instead of hand-rolling sleep loops, and teach orchestrators to use it." (Supersedes the
+earlier 'Orchestrators Must Stay In A Polling Loop Until Workers Settle' guidance from another
+branch: the sleep+poll `nebula agent list` loop is now the fallback, `nebula agent wait` the
+primary.)
+
+**Did:** `nebula agent wait [<name>...] [--timeout <secs>] [--project <name>]` — `agent_wait` in
+`crates/nebula-tui/src/ipc.rs`, dispatched from `crates/nebula/src/main.rs`'s `AgentCommand::Wait`
+(default timeout 600s). With names it blocks until each named worker settles; without, until every
+unarchived non-orchestrator worker of the project (self excluded via `NEBULA_AGENT_ID`) does.
+Settled = not Fresh and not Running — Fresh counts as pending on purpose, so waiting right after
+`agent new --prompt` doesn't return before the worker's first turn starts. Prints the settled rows
+as JSON in `agent list`'s exact shape; nonzero exit naming the still-running workers on timeout.
+No new protocol variant: it holds the `Subscribe` connection open past the snapshot and consumes
+`StatusChanged`/`EntityUpserted`/`EntityRemoved` deltas, so no `PROTOCOL_VERSION` bump and it works
+against an already-running daemon. `ORCHESTRATOR_INSTRUCTION` (`crates/nebula-daemon/src/hooks/mod.rs`)
+now teaches: after delegating run `nebula agent wait`, do NOT end the turn or hand-roll sleep loops;
+on needs_feedback, surface what the worker is blocked on. Tests:
+`orchestrator_instruction_teaches_blocking_wait` (hooks) and
+`agent_wait_cli_blocks_until_worker_settles` (`crates/nebula/tests/e2e_pty.rs`) — the latter drives
+the real CLI binary against an isolated daemon and moves status with the OSC `9;4` progress bytes.
+
+**Gotchas:**
+- The installer's `Bash(nebula agent:*)` allow rule (`hooks/installer.rs:113`) is a prefix match and
+  already covers the new verb — verified, no installer change needed.
+- The e2e recipe for settling a worker without any hook: attach and have the PTY shell
+  `printf '\033]9;4;3;\007'` (→ running) then `…9;4;0;…` (→ finished) — same as
+  `pty_progress_sequence_drives_status_without_any_hook`. No race in the test: wait's snapshot
+  covers a status flip that lands before the CLI subscribes.
+
 ### Branch Picker Fuzzy Search, Base-Branch Pick In Manual Worktree Creation — 2026-08-24
 
 **Asked:** "Add fuzzy search to the TUI branch picker, and offer the same branch picker in the manual

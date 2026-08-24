@@ -71,10 +71,19 @@ delegating work to agent sessions via shell commands (pre-authorized):\n\n  \
 nebula worktree new <name> [--from <ref>]\n  \
 nebula agent new --worktree <branch> [--kind claude|codex|cursor|pi] \
 [--model M] [--effort E] [--name <title>] --prompt \"<task>\"\n  \
-nebula agent list   # your workers, with status, as JSON\n\nRules: stay in \
+nebula agent list   # your workers, with status, as JSON\n  \
+nebula agent wait [<name>...] [--timeout <secs>]   # block until workers \
+settle\n\nRules: stay in \
 the root checkout — never cd into worktrees, spawn workers there instead; \
-split independent work across worktrees so workers don't collide; check \
-`nebula agent list` before reporting progress. Name everything after the \
+split independent work across worktrees so workers don't collide. After \
+delegating, do NOT end your turn and do NOT hand-roll sleep loops: run \
+`nebula agent wait` (all your workers) or `nebula agent wait <name>...` \
+(specific ones) — it blocks until each leaves running and prints their \
+final rows as JSON (default --timeout 600, nonzero exit on timeout, then \
+wait again if work is still legitimately going). When a worker comes back \
+needs_feedback, it is blocked on a human — find out what it needs and \
+surface that to the user; when finished, verify its result before \
+reporting progress. Name everything after the \
 task you delegate — these names are how the user finds things in search: \
 the worktree name becomes its branch (\"fix login flow\" → fix-login-flow), \
 and --name gives the session a 3-4 word title (no quotes needed; omitted, \
@@ -261,6 +270,19 @@ mod tests {
         assert!(ORCHESTRATOR_INSTRUCTION.contains("--name"));
         assert!(ORCHESTRATOR_INSTRUCTION.contains("search"));
         assert!(ORCHESTRATOR_INSTRUCTION.contains("derived from --prompt"));
+    }
+
+    /// The brief must keep teaching the blocking wait: delegate, then
+    /// `nebula agent wait` — never end the turn or hand-roll sleep loops —
+    /// and surface what a needs_feedback worker is blocked on.
+    #[test]
+    fn orchestrator_instruction_teaches_blocking_wait() {
+        assert!(ORCHESTRATOR_INSTRUCTION.contains("nebula agent wait"));
+        assert!(ORCHESTRATOR_INSTRUCTION.contains("--timeout"));
+        assert!(ORCHESTRATOR_INSTRUCTION.contains("do NOT end your turn"));
+        assert!(ORCHESTRATOR_INSTRUCTION.contains("sleep loops"));
+        assert!(ORCHESTRATOR_INSTRUCTION.contains("needs_feedback"));
+        assert!(ORCHESTRATOR_INSTRUCTION.contains("surface that to the user"));
     }
 
     /// Minimal raw HTTP/1.1 POST (Connection: close), so the real response

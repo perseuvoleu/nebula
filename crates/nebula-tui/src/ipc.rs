@@ -795,6 +795,161 @@ pub async fn agent_list(project_flag: Option<String>, all: bool) -> Result<()> {
     Ok(())
 }
 
+/// A worker has settled once it is out of the busy states: `fresh` (spawned,
+/// first turn not started) and `running` both mean "still working" from the
+/// orchestrator's seat; everything else (finished, needs_feedback,
+/// terminated, disconnected) is something to act on.
+fn agent_settled(status: nebula_core::AgentStatus) -> bool {
+    !matches!(
+        status,
+        nebula_core::AgentStatus::Fresh | nebula_core::AgentStatus::Running
+    )
+}
+
+/// `nebula agent wait [<name>...] [--timeout <secs>] [--project <name>]`:
+/// block until the named workers settle — or, with no names, until every
+/// unarchived worker of the target project has. Prints the waited agents as
+/// JSON (same shape as `agent list`) on success; errors out past --timeout.
+/// Composes the existing Subscribe stream (snapshot + StatusChanged /
+/// EntityUpserted deltas), so no protocol bump — works against a running
+/// daemon.
+pub async fn agent_wait(
+    names: Vec<String>,
+    timeout_secs: u64,
+    project_flag: Option<String>,
+) -> Result<()> {
+    let sock = paths::socket_path();
+    let Ok(stream) = try_connect(&sock).await else {
+        bail!("no nebula daemon is running");
+    };
+    let mut conn = handshake(stream).await?;
+    let (projects, mut worktrees, mut agents) = subscribe_snapshot(&mut conn).await?;
+    let project = resolve_project(&projects, &worktrees, &agents, project_flag.as_deref())?;
+    let self_id = std::env::var("NEBULA_AGENT_ID").ok().filter(|v| !v.is_empty());
+
+    let in_project = |a: &nebula_core::Agent, worktrees: &[nebula_core::Worktree]| {
+        worktrees
+            .iter()
+            .any(|w| w.id == a.worktree_id && w.project_id == project.id)
+    };
+    // Which agents to wait on: the named ones, or every unarchived worker of
+    // the project (the caller's own session and other orchestrators excluded).
+    let targets: Vec<nebula_core::AgentId> = if names.is_empty() {
+        agents
+            .iter()
+            .filter(|a| {
+                in_project(a, &worktrees)
+                    && !a.archived
+                    && !a.orchestrator
+                    && self_id.as_deref() != Some(a.id.as_str())
+            })
+            .map(|a| a.id.clone())
+            .collect()
+    } else {
+        names
+            .iter()
+            .map(|name| {
+                agents
+                    .iter()
+                    .find(|a| a.name == *name && in_project(a, &worktrees))
+                    .map(|a| a.id.clone())
+                    .with_context(|| {
+                        format!(
+                            "no agent named \"{name}\" in {} (have: {})",
+                            project.name,
+                            agents
+                                .iter()
+                                .filter(|a| in_project(a, &worktrees))
+                                .map(|a| a.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    })
+            })
+            .collect::<Result<_>>()?
+    };
+
+    // Keep the subscription's view of the world current until every target
+    // settles (a removed row counts as settled — there is nothing left to
+    // wait for). StatusChanged is the signal that matters; upserts keep
+    // names/worktrees fresh for the final JSON.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+    let pending = |agents: &[nebula_core::Agent]| -> Vec<String> {
+        targets
+            .iter()
+            .filter_map(|id| agents.iter().find(|a| &a.id == id))
+            .filter(|a| !agent_settled(a.status))
+            .map(|a| a.name.clone())
+            .collect()
+    };
+    while !pending(&agents).is_empty() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            bail!(
+                "timed out after {timeout_secs}s waiting for: {}",
+                pending(&agents).join(", ")
+            );
+        }
+        let event = match tokio::time::timeout(
+            remaining,
+            read_frame::<ServerEvent, _>(&mut conn.stream),
+        )
+        .await
+        {
+            Ok(read) => read?,
+            Err(_) => continue, // deadline hit — reported at the top of the loop
+        };
+        match event {
+            Some(ServerEvent::StatusChanged { agent, status, .. }) => {
+                if let Some(a) = agents.iter_mut().find(|a| a.id == agent) {
+                    a.status = status;
+                }
+            }
+            Some(ServerEvent::EntityUpserted { entity }) => match entity {
+                nebula_core::Entity::Agent(a) => {
+                    match agents.iter_mut().find(|old| old.id == a.id) {
+                        Some(old) => *old = a,
+                        None => agents.push(a),
+                    }
+                }
+                nebula_core::Entity::Worktree(w) => {
+                    match worktrees.iter_mut().find(|old| old.id == w.id) {
+                        Some(old) => *old = w,
+                        None => worktrees.push(w),
+                    }
+                }
+                _ => {}
+            },
+            Some(ServerEvent::EntityRemoved {
+                id: nebula_core::EntityId::Agent(id),
+            }) => agents.retain(|a| a.id != id),
+            Some(_) => {}
+            None => bail!("daemon closed the connection while waiting"),
+        }
+    }
+
+    let rows: Vec<serde_json::Value> = targets
+        .iter()
+        .filter_map(|id| {
+            let a = agents.iter().find(|a| &a.id == id)?;
+            let worktree = worktrees.iter().find(|w| w.id == a.worktree_id)?;
+            Some(serde_json::json!({
+                "id": a.id.to_string(),
+                "name": a.name,
+                "kind": a.kind.as_str(),
+                "status": a.status.as_str(),
+                "project": project.name,
+                "worktree": worktree.branch,
+                "path": worktree.path.display().to_string(),
+                "orchestrator": a.orchestrator,
+                "archived": a.archived,
+            }))
+        })
+        .collect();
+    println!("{}", serde_json::Value::Array(rows));
+    Ok(())
+}
+
 pub enum NotesOp {
     List,
     Add { text: String, worktree: bool },
