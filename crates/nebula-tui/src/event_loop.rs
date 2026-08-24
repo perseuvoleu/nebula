@@ -2408,7 +2408,7 @@ fn new_agent_shortcut(app: &mut App) {
     }
 }
 
-/// The global command palette (⇧P / ⌘⇧P): a fuzzy list of COMMANDS, each
+/// The global command palette (⇧P / ⌘K): a fuzzy list of COMMANDS, each
 /// chaining into the flow that already exists for it — pickers stay
 /// pickers, prompts stay prompts. Creation rows act on the selected
 /// project (or the first one when nothing is selected yet); with no
@@ -14623,13 +14623,8 @@ mod tests {
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
         assert!(app.overlay.is_none(), "Esc closes the palette");
 
-        // The ⌘⇧P spelling (the ng Ghostty overlay's chord) works too.
-        press(
-            &mut app,
-            KeyCode::Char('p'),
-            KeyModifiers::SUPER | KeyModifiers::SHIFT,
-            &mut out,
-        );
+        // The ⌘K spelling (the ng Ghostty overlay's chord) works too.
+        press(&mut app, KeyCode::Char('k'), KeyModifiers::SUPER, &mut out);
         assert!(
             matches!(&app.overlay, Some(Overlay::Menu(m)) if m.title.as_deref() == Some("Commands")),
             "{:?}",
@@ -14639,7 +14634,7 @@ mod tests {
     }
 
     #[test]
-    fn cmd_shift_p_inside_a_locked_session_opens_the_command_palette() {
+    fn cmd_k_inside_a_locked_session_opens_the_command_palette() {
         let mut app = App::new();
         seed_tree(&mut app);
         let mut out = Vec::new();
@@ -14650,16 +14645,11 @@ mod tests {
         ));
         app.focus = Focus::Terminal;
         app.term_locked = true;
-        press(
-            &mut app,
-            KeyCode::Char('p'),
-            KeyModifiers::SUPER | KeyModifiers::SHIFT,
-            &mut out,
-        );
-        assert!(!app.term_locked, "⌘⇧p unlocks the pane");
+        press(&mut app, KeyCode::Char('k'), KeyModifiers::SUPER, &mut out);
+        assert!(!app.term_locked, "⌘k unlocks the pane");
         assert!(
             matches!(&app.overlay, Some(Overlay::Menu(m)) if m.title.as_deref() == Some("Commands")),
-            "⌘⇧p opens the command palette from inside a locked session: {:?}",
+            "⌘k opens the command palette from inside a locked session: {:?}",
             app.overlay
         );
         assert!(

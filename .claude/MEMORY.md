@@ -14,15 +14,16 @@ about what is worth recording.
 
 ## Entries
 
-### Global Command Palette On ⇧P / ⌘⇧P — 2026-08-24
+### Global Command Palette On ⇧P / ⌘K — 2026-08-24
 
 **Asked:** "un shortcut care sa-mi deschida o fereastra de unde pot face orice comanda — ex: deschid
 direct un worktree si dupa ma intreaba branch-ul si modelul, sau deschid direct un orchestrator, sau
 deschid un agent intr-un worktree existent, sau caut o sesiune; un fuzzy principal care cauta comanda,
 dau Enter si ma arunca in urmatorul nivel, si tot asa."
 
-**Did:** Commit `87372f7` on `command-palette`. New `Action::CommandPalette` (keymap.rs, id
-`command_palette`, defaults `cmd+shift+p, shift+p` — shift+p was free; the plain chord satisfies
+**Did:** Commit `87372f7` on `command-palette` (chord later moved to ⌘K in a follow-up commit on the
+same branch). New `Action::CommandPalette` (keymap.rs, id
+`command_palette`, defaults `cmd+k, shift+p` — shift+p was free; the plain chord satisfies
 `every_action_ships_with_a_reachable_chord`). `open_command_palette` (event_loop.rs, next to
 `open_new_agent_picker`) builds a **filterable ContextMenu** titled "Commands" — no new overlay type;
 fuzzy + Enter-chaining came free from `MenuFilter`. Rows reuse existing `MenuAction`s where they exist
@@ -33,13 +34,16 @@ whose rows are plain `MenuAction::NewAgent(worktree)` → the normal kind → mo
 `Settings`/`Workspaces` calling the same `open_*` fns their hotkeys call. Creation rows act on
 `selected_project()` falling back to the first project row, and are simply omitted with no project.
 Also in the locked-terminal SUPER intercept (the ⌘N/⌘D pattern), and
-`~/.config/ghostty/nebula` gained `keybind = super+shift+p=csi:112;10u`. Four regression tests; 449
-nebula-tui + full workspace green.
+`~/.config/ghostty/nebula` now maps `keybind = super+k=csi:107;9u` (107 = k, 9 = super) — this
+**replaced** the old `super+k=text:S` session-search mapping, and the interim
+`super+shift+p=csi:112;10u` line was removed; SessionPalette keeps its `shift+s` default and its
+command-palette row ("Search sessions"). ⌘P stays the terminal full-screen toggle (`zoom`). Four
+regression tests; 449 nebula-tui + full workspace green.
 
 **Gotchas:**
-- shift+super mods in kitty CSI-u = **10** (1 + shift 1 + super 8), vs the existing `;9u` super-only
-  lines; `KeyChord::from_event` canonicalizes both `Char('P')+SHIFT` and `Char('p')+SUPER|SHIFT`
-  spellings, so the same `csi:112;…u` codepoint (112 = p) serves ⌘P (9) and ⌘⇧P (10) as distinct chords.
+- kitty CSI-u mods: super-only = **9** (1 + super 8), shift+super = 10; the overlay's `csi:107;9u`
+  delivers ⌘K as a real `Char('k')+SUPER` chord. `KeyChord::from_event` canonicalizes shifted
+  spellings, so `Char('P')+SHIFT` and lowercase-with-mods forms land on the same chord.
 - `run_menu_action` clears `app.overlay` **before** dispatching, so a `MenuAction` arm may open the
   next overlay directly — that's the whole chaining mechanism; no state machine needed.
 - The `Action::CommandPalette` arm is deliberately NOT gated on `app.focus != Focus::Terminal` (unlike
@@ -663,9 +667,10 @@ completion stays bash-prefix.
 - "cmmd k ar treb sa caute printre sesiuni": ⌘K used to be `text:/` in the Ghostty overlay (the
   everything-palette). New `Action::SessionPalette` (`shift+s`) opens `Palette::sessions` —
   `sessions_only` on the `Palette` struct filters `build_palette_items` to agent rows and forces
-  `enter_attaches` — and the overlay now maps `super+k=text:S`. `/` still searches everything. Remember:
-  Ghostty ⌘-keybinds in this overlay are just text injections, so any new ⌘ shortcut needs a plain-key
-  action on the nebula side first.
+  `enter_attaches` — and the overlay mapped `super+k=text:S`. `/` still searches everything.
+  (**Stale since 2026-08-24:** ⌘K now opens the *command* palette via `super+k=csi:107;9u`; session
+  search is `shift+s` or the palette's "Search sessions" row.) Remember: plain-text Ghostty ⌘-keybinds
+  are just text injections; use kitty `csi:<code>;9u` when the chord must survive a locked terminal.
 - The `ng` Ghostty window opened at a small/restored size: the overlay `~/.config/ghostty/nebula` now
   sets `maximize = true` + `window-save-state = never` (they must sit *after* its `config-file = config`
   include to win). `ghostty +validate-config --config-file=…` is the cheap check — it flags unknown
