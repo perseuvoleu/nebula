@@ -143,9 +143,10 @@ enum AgentCommand {
         /// Reasoning effort the CLI launches with (default: the CLI's own).
         #[arg(long)]
         effort: Option<String>,
-        /// Session name (default: generated; the session then titles itself).
-        #[arg(long)]
-        name: Option<String>,
+        /// Session name; multiple words need no quotes (default: derived
+        /// from --prompt, else generated; the session then titles itself).
+        #[arg(long, num_args = 1..)]
+        name: Option<Vec<String>>,
         /// Project-level orchestrator: root checkout, pinned, own group.
         #[arg(long)]
         orchestrator: bool,
@@ -266,7 +267,7 @@ fn main() -> Result<()> {
                 kind,
                 model,
                 effort,
-                name,
+                name: name.map(|words| words.join(" ")),
                 orchestrator,
                 prompt,
             }),
