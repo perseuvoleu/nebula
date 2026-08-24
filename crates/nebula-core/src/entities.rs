@@ -1,4 +1,4 @@
-use crate::ids::{AgentId, LinkId, NoteId, ProjectId, TerminalId, WorkspaceId, WorktreeId};
+use crate::ids::{AgentId, LinkId, NoteId, ProjectId, TerminalId, TodoId, WorkspaceId, WorktreeId};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -195,12 +195,15 @@ pub struct TerminalTab {
 }
 
 /// Who a note list hangs off: a project (high-level notes spanning its
-/// worktrees) or one worktree (notes for that checkout). The two are
-/// separate lists — a project's notes never mix into its worktrees'.
+/// worktrees), one worktree (notes for that checkout), or one todo (the
+/// notes recorded under that task). The lists are separate — a project's
+/// notes never mix into its worktrees', and a todo's notes show only in
+/// that todo's detail.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum NoteOwner {
     Project(ProjectId),
     Worktree(WorktreeId),
+    Todo(TodoId),
 }
 
 /// One note.
@@ -208,6 +211,26 @@ pub enum NoteOwner {
 pub struct Note {
     pub id: NoteId,
     pub owner: NoteOwner,
+    pub text: String,
+    pub done: bool,
+    pub sort_order: i64,
+}
+
+/// Who a todo list hangs off — the same project/worktree split as
+/// standalone notes, and the two scopes stay separate lists. (Unlike
+/// `NoteOwner` there is no third variant: todos don't nest.)
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TodoOwner {
+    Project(ProjectId),
+    Worktree(WorktreeId),
+}
+
+/// One todo — a first-class task, separate from notes. Its child notes are
+/// plain `Note` rows whose owner is `NoteOwner::Todo(id)`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Todo {
+    pub id: TodoId,
+    pub owner: TodoOwner,
     pub text: String,
     pub done: bool,
     pub sort_order: i64,
@@ -237,6 +260,7 @@ pub enum Entity {
     Terminal(TerminalTab),
     Note(Note),
     Link(Link),
+    Todo(Todo),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -248,4 +272,5 @@ pub enum EntityId {
     Terminal(TerminalId),
     Note(NoteId),
     Link(LinkId),
+    Todo(TodoId),
 }

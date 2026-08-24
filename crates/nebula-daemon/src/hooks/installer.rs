@@ -112,6 +112,7 @@ const CLAUDE_ALLOW_RENAME: &str = "Bash(nebula rename:*)";
 const CLAUDE_ALLOW_WORKTREE: &str = "Bash(nebula worktree:*)";
 const CLAUDE_ALLOW_AGENT: &str = "Bash(nebula agent:*)";
 const CLAUDE_ALLOW_NOTES: &str = "Bash(nebula notes:*)";
+const CLAUDE_ALLOW_TODO: &str = "Bash(nebula todo:*)";
 
 /// Cursor variant: the payload arrives on stdin like Claude's, but cursor
 /// expects a JSON response on stdout — `{"continue": true}` keeps gating
@@ -180,6 +181,7 @@ pub fn install_claude_hooks(cwd: &Path) -> Result<()> {
     ensure_permission_allow(root_obj, CLAUDE_ALLOW_WORKTREE, &path)?;
     ensure_permission_allow(root_obj, CLAUDE_ALLOW_AGENT, &path)?;
     ensure_permission_allow(root_obj, CLAUDE_ALLOW_NOTES, &path)?;
+    ensure_permission_allow(root_obj, CLAUDE_ALLOW_TODO, &path)?;
     write_hooks_root(&dir, "settings.local.json", &root)
 }
 

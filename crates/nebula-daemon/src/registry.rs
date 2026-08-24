@@ -9,8 +9,8 @@ use crate::store::Store;
 use anyhow::{bail, Context, Result};
 use nebula_core::{
     Agent, AgentId, AgentKind, AgentStatus, Entity, EntityId, Link, LinkId, Note, NoteId,
-    NoteOwner, Project, ProjectId, ServerEvent, SessionRef, TerminalId, TerminalTab, Workspace,
-    WorkspaceId, Worktree, WorktreeId,
+    NoteOwner, Project, ProjectId, ServerEvent, SessionRef, TerminalId, TerminalTab, Todo, TodoId,
+    TodoOwner, Workspace, WorkspaceId, Worktree, WorktreeId,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -401,6 +401,7 @@ impl Daemon {
             agents,
             terminals,
             notes: self.store.load_notes()?,
+            todos: self.store.load_todos()?,
             links: self.store.load_links()?,
             pr_seen: self.store.load_pr_seen()?,
             ui_state: self.store.load_ui_state()?,
@@ -1713,6 +1714,9 @@ impl Daemon {
             NoteOwner::Worktree(id) => {
                 self.store.get_worktree(id)?.context("worktree not found")?;
             }
+            NoteOwner::Todo(id) => {
+                self.store.get_todo(id)?.context("todo not found")?;
+            }
         }
         let note = Note {
             id: NoteId::generate(),
@@ -1754,6 +1758,67 @@ impl Daemon {
         self.store.delete_note(id)?;
         self.broadcast(ServerEvent::EntityRemoved {
             id: EntityId::Note(id.clone()),
+        });
+        Ok(())
+    }
+
+    // ---- todos ----
+
+    pub fn create_todo(self: &Arc<Self>, owner: &TodoOwner, text: &str) -> Result<EntityId> {
+        let text = text.trim();
+        if text.is_empty() {
+            bail!("todo text is empty");
+        }
+        match owner {
+            TodoOwner::Project(id) => {
+                self.store.get_project(id)?.context("project not found")?;
+            }
+            TodoOwner::Worktree(id) => {
+                self.store.get_worktree(id)?.context("worktree not found")?;
+            }
+        }
+        let todo = Todo {
+            id: TodoId::generate(),
+            owner: owner.clone(),
+            text: text.to_string(),
+            done: false,
+            sort_order: self.store.next_todo_sort_order(owner)?,
+        };
+        self.store.insert_todo(&todo)?;
+        self.broadcast(ServerEvent::EntityUpserted {
+            entity: Entity::Todo(todo.clone()),
+        });
+        Ok(EntityId::Todo(todo.id))
+    }
+
+    pub fn update_todo(self: &Arc<Self>, id: &TodoId, text: &str) -> Result<()> {
+        let text = text.trim();
+        if text.is_empty() {
+            bail!("todo text is empty");
+        }
+        self.store.set_todo_text(id, text)?;
+        let todo = self.store.get_todo(id)?.context("todo not found")?;
+        self.broadcast(ServerEvent::EntityUpserted {
+            entity: Entity::Todo(todo),
+        });
+        Ok(())
+    }
+
+    pub fn set_todo_done(self: &Arc<Self>, id: &TodoId, done: bool) -> Result<()> {
+        self.store.set_todo_done(id, done)?;
+        let todo = self.store.get_todo(id)?.context("todo not found")?;
+        self.broadcast(ServerEvent::EntityUpserted {
+            entity: Entity::Todo(todo),
+        });
+        Ok(())
+    }
+
+    /// Child notes cascade away in the store; clients mirror that pruning
+    /// off this one removal event, so none is broadcast per note.
+    pub fn delete_todo(self: &Arc<Self>, id: &TodoId) -> Result<()> {
+        self.store.delete_todo(id)?;
+        self.broadcast(ServerEvent::EntityRemoved {
+            id: EntityId::Todo(id.clone()),
         });
         Ok(())
     }

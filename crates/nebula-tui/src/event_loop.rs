@@ -4,8 +4,8 @@ use crate::app::{
     App, AttachedTerm, ConfirmDialog, ConnState, ContextMenu, DiffView, FileFinder, Focus,
     GrepView, HitTarget, LinkRow, MenuAction, MenuItem, MetricsView, NoteInput, NoteView, Overlay,
     Palette, PaletteTarget, PendingAction, PendingIntent, PointerShape, ProjectRow, PromptDialog,
-    PromptKind, SessionRow, SettingsView, SplitterDrag, SubmenuKind, TermSelection,
-    WorktreeRollback,
+    PromptKind, SessionRow, SettingsView, SplitterDrag, SubmenuKind, TermSelection, TodoInput,
+    TodoInputTarget, TodoView, WorktreeRollback,
 };
 use crate::pull_request::PullRequest;
 use crate::text_input::TextInput;
@@ -19,7 +19,7 @@ use crossterm::event::{
 use futures::StreamExt;
 use nebula_core::{
     AgentId, AgentKind, AgentStatus, ClientRequest, EntityId, LinkId, NoteId, NoteOwner,
-    ServerEvent, SessionRef, WorktreeId,
+    ServerEvent, SessionRef, TodoId, TodoOwner, WorktreeId,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -701,8 +701,12 @@ fn paste_into_overlay(app: &mut App, text: &str) -> bool {
                 crate::git_diff::load_selected_diff(view);
             }
         }
-        // These two only type while their add/edit input is open.
+        // These only type while their add/edit input is open.
         Overlay::Notes(view) => match &mut view.input {
+            Some(input) => input.text.insert_str(text),
+            None => return false,
+        },
+        Overlay::Todos(view) => match &mut view.input {
             Some(input) => input.text.insert_str(text),
             None => return false,
         },
@@ -1155,6 +1159,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         Action::FindFile => open_file_finder(app),
         Action::Grep => open_grep_view(app),
         Action::Notes => open_note_view(app),
+        Action::Todos => open_todo_view(app),
         Action::TreeBrowser => open_tree_browser(app),
         // New shell terminal, spawned in the worktree's directory.
         // (Cmd+T never reaches a TUI — the emulator opens its own tab.)
@@ -1443,8 +1448,59 @@ fn open_notes_for_owner(app: &mut App, owner: NoteOwner) {
                 worktree.branch
             )
         }
+        // A todo's notes open inside the todo modal, never here.
+        NoteOwner::Todo(_) => return,
     };
     app.overlay = Some(Overlay::Notes(NoteView::new(owner, context)));
+}
+
+/// Open the todo modal (`E`): the project's own todos from the Projects
+/// panel, the selected worktree's elsewhere (falling back to the project
+/// when it has no worktrees yet) — the notes modal's owner rule.
+fn open_todo_view(app: &mut App) {
+    let owner = if app.focus == Focus::Projects {
+        app.selected_project()
+            .map(|p| TodoOwner::Project(p.id.clone()))
+    } else {
+        app.selected_worktree()
+            .map(|w| TodoOwner::Worktree(w.id.clone()))
+            .or_else(|| {
+                app.selected_project()
+                    .map(|p| TodoOwner::Project(p.id.clone()))
+            })
+    };
+    let Some(owner) = owner else {
+        app.flash = Some("select a project or worktree first".into());
+        return;
+    };
+    open_todos_for_owner(app, owner);
+}
+
+fn open_todos_for_owner(app: &mut App, owner: TodoOwner) {
+    let context = match &owner {
+        TodoOwner::Project(id) => {
+            let Some(project) = app.tree.projects.iter().find(|p| &p.id == id) else {
+                return;
+            };
+            project.name.clone()
+        }
+        TodoOwner::Worktree(id) => {
+            let Some(worktree) = app.tree.worktrees.iter().find(|w| &w.id == id) else {
+                return;
+            };
+            let project = app
+                .tree
+                .projects
+                .iter()
+                .find(|p| p.id == worktree.project_id);
+            format!(
+                "{}/{}",
+                project.map(|p| p.name.as_str()).unwrap_or("?"),
+                worktree.branch
+            )
+        }
+    };
+    app.overlay = Some(Overlay::Todos(TodoView::new(owner, context)));
 }
 
 /// `h`: destinations remembered by `nebula ssh`, newest first. Opens even
@@ -2492,6 +2548,11 @@ fn open_context_menu_for_selection(app: &mut App) {
                     action: MenuAction::OpenNotes(NoteOwner::Project(p.id.clone())),
                     destructive: false,
                 });
+                items.push(MenuItem {
+                    label: "Todos".into(),
+                    action: MenuAction::OpenTodos(TodoOwner::Project(p.id.clone())),
+                    destructive: false,
+                });
                 items.push(divider_menu_item(p));
                 items.push(MenuItem {
                     label: "Remove from list".into(),
@@ -2517,6 +2578,11 @@ fn open_context_menu_for_selection(app: &mut App) {
                     MenuItem {
                         label: "Notes".into(),
                         action: MenuAction::OpenNotes(NoteOwner::Worktree(w.id.clone())),
+                        destructive: false,
+                    },
+                    MenuItem {
+                        label: "Todos".into(),
+                        action: MenuAction::OpenTodos(TodoOwner::Worktree(w.id.clone())),
                         destructive: false,
                     },
                     MenuItem {
@@ -3121,6 +3187,261 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                     out.push(ClientRequest::SetNoteDone { req_id, id, done });
                 }
                 NoteCmd::Delete(id) => {
+                    let req_id = app.alloc_req_id(PendingIntent::None);
+                    out.push(ClientRequest::DeleteNote { req_id, id });
+                }
+            }
+        }
+        Overlay::Todos(view) => {
+            // Same command-first shape as the notes modal, with a second
+            // mode: Enter on a todo opens its detail, where the cursor and
+            // the CRUD keys work the todo's child notes instead.
+            enum TodoCmd {
+                Nothing,
+                Close,
+                /// Detail → list (Esc inside a detail).
+                Back,
+                Move(i64),
+                OpenDetail(TodoId),
+                StartCreateTodo,
+                StartEditTodo(TodoId, String),
+                StartCreateNote,
+                StartEditNote(NoteId, String),
+                CancelInput,
+                CreateTodo(String),
+                UpdateTodo(TodoId, String),
+                ToggleTodo(TodoId, bool),
+                DeleteTodo(TodoId),
+                CreateNote(TodoId, String),
+                UpdateNote(NoteId, String),
+                ToggleNote(NoteId, bool),
+                DeleteNote(NoteId),
+            }
+            let cmd = if let Some(todo_id) = view.detail.clone() {
+                // Detail mode: rows are the opened todo's child notes, in
+                // draw order.
+                let rows: Vec<(NoteId, String, bool)> = app
+                    .tree
+                    .notes
+                    .iter()
+                    .filter(|n| n.owner == NoteOwner::Todo(todo_id.clone()))
+                    .map(|n| (n.id.clone(), n.text.clone(), n.done))
+                    .collect();
+                let selected = view.note_selected.min(rows.len().saturating_sub(1));
+                view.note_selected = selected;
+                if let Some(input) = &mut view.input {
+                    match key.code {
+                        KeyCode::Esc => TodoCmd::CancelInput,
+                        // Nothing typed = cancel; edits and adds both no-op.
+                        KeyCode::Enter => match (&input.target, input.text.trim()) {
+                            (_, "") => TodoCmd::CancelInput,
+                            (TodoInputTarget::EditNote(id), text) => {
+                                TodoCmd::UpdateNote(id.clone(), text.to_string())
+                            }
+                            (_, text) => TodoCmd::CreateNote(todo_id.clone(), text.to_string()),
+                        },
+                        _ => {
+                            input.text.handle_key(&key);
+                            TodoCmd::Nothing
+                        }
+                    }
+                } else {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') => TodoCmd::Back,
+                        KeyCode::Char('j') | KeyCode::Down => TodoCmd::Move(1),
+                        KeyCode::Char('k') | KeyCode::Up => TodoCmd::Move(-1),
+                        KeyCode::Char('e') | KeyCode::Char('a') | KeyCode::Char('n') => {
+                            TodoCmd::StartCreateNote
+                        }
+                        KeyCode::Enter | KeyCode::Char('r') => match rows.get(selected) {
+                            Some((id, text, _)) => {
+                                TodoCmd::StartEditNote(id.clone(), text.clone())
+                            }
+                            // Empty list: Enter starts the first note.
+                            None => TodoCmd::StartCreateNote,
+                        },
+                        KeyCode::Char(' ') | KeyCode::Char('x') => match rows.get(selected) {
+                            Some((id, _, done)) => TodoCmd::ToggleNote(id.clone(), !done),
+                            None => TodoCmd::Nothing,
+                        },
+                        KeyCode::Char('d') | KeyCode::Backspace | KeyCode::Delete => {
+                            match rows.get(selected) {
+                                Some((id, _, _)) => TodoCmd::DeleteNote(id.clone()),
+                                None => TodoCmd::Nothing,
+                            }
+                        }
+                        _ => TodoCmd::Nothing,
+                    }
+                }
+            } else {
+                // List mode: rows are the owner's todos, in draw order.
+                let rows: Vec<(TodoId, String, bool)> = app
+                    .tree
+                    .todos
+                    .iter()
+                    .filter(|t| t.owner == view.owner)
+                    .map(|t| (t.id.clone(), t.text.clone(), t.done))
+                    .collect();
+                let selected = view.selected.min(rows.len().saturating_sub(1));
+                view.selected = selected;
+                if let Some(input) = &mut view.input {
+                    match key.code {
+                        KeyCode::Esc => TodoCmd::CancelInput,
+                        KeyCode::Enter => match (&input.target, input.text.trim()) {
+                            (_, "") => TodoCmd::CancelInput,
+                            (TodoInputTarget::EditTodo(id), text) => {
+                                TodoCmd::UpdateTodo(id.clone(), text.to_string())
+                            }
+                            (_, text) => TodoCmd::CreateTodo(text.to_string()),
+                        },
+                        _ => {
+                            input.text.handle_key(&key);
+                            TodoCmd::Nothing
+                        }
+                    }
+                } else {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('q') => TodoCmd::Close,
+                        KeyCode::Char('j') | KeyCode::Down => TodoCmd::Move(1),
+                        KeyCode::Char('k') | KeyCode::Up => TodoCmd::Move(-1),
+                        // `E` mirrors the key that opened the modal; a/n
+                        // and e match the notes modal's add keys.
+                        KeyCode::Char('e')
+                        | KeyCode::Char('E')
+                        | KeyCode::Char('a')
+                        | KeyCode::Char('n') => TodoCmd::StartCreateTodo,
+                        // Enter drills into the todo's notes — editing the
+                        // text stays on r, like a session rename.
+                        KeyCode::Enter => match rows.get(selected) {
+                            Some((id, _, _)) => TodoCmd::OpenDetail(id.clone()),
+                            // Empty list: Enter starts the first todo.
+                            None => TodoCmd::StartCreateTodo,
+                        },
+                        KeyCode::Char('r') => match rows.get(selected) {
+                            Some((id, text, _)) => {
+                                TodoCmd::StartEditTodo(id.clone(), text.clone())
+                            }
+                            None => TodoCmd::StartCreateTodo,
+                        },
+                        KeyCode::Char(' ') | KeyCode::Char('x') => match rows.get(selected) {
+                            Some((id, _, done)) => TodoCmd::ToggleTodo(id.clone(), !done),
+                            None => TodoCmd::Nothing,
+                        },
+                        KeyCode::Char('d') | KeyCode::Backspace | KeyCode::Delete => {
+                            match rows.get(selected) {
+                                Some((id, _, _)) => TodoCmd::DeleteTodo(id.clone()),
+                                None => TodoCmd::Nothing,
+                            }
+                        }
+                        _ => TodoCmd::Nothing,
+                    }
+                }
+            };
+            match cmd {
+                TodoCmd::Nothing => {}
+                TodoCmd::Close => app.overlay = None,
+                TodoCmd::Back => {
+                    view.detail = None;
+                    view.input = None;
+                }
+                TodoCmd::Move(delta) => {
+                    // Recount here: the row vecs above live in the mode
+                    // branches. Same clamp semantics as the notes modal.
+                    if let Some(todo_id) = &view.detail {
+                        let max = app
+                            .tree
+                            .notes
+                            .iter()
+                            .filter(|n| n.owner == NoteOwner::Todo(todo_id.clone()))
+                            .count()
+                            .saturating_sub(1) as i64;
+                        view.note_selected =
+                            (view.note_selected as i64 + delta).clamp(0, max) as usize;
+                    } else {
+                        let max = app
+                            .tree
+                            .todos
+                            .iter()
+                            .filter(|t| t.owner == view.owner)
+                            .count()
+                            .saturating_sub(1) as i64;
+                        view.selected = (view.selected as i64 + delta).clamp(0, max) as usize;
+                    }
+                }
+                TodoCmd::OpenDetail(id) => {
+                    view.detail = Some(id);
+                    view.note_selected = 0;
+                    view.input = None;
+                }
+                TodoCmd::StartCreateTodo => {
+                    view.input = Some(TodoInput {
+                        target: TodoInputTarget::NewTodo,
+                        text: TextInput::new(),
+                    });
+                }
+                TodoCmd::StartEditTodo(id, text) => {
+                    view.input = Some(TodoInput {
+                        target: TodoInputTarget::EditTodo(id),
+                        // Cursor lands at the end, ready for ⌥← to step
+                        // back through the existing text.
+                        text: TextInput::with_text(text),
+                    });
+                }
+                TodoCmd::StartCreateNote => {
+                    view.input = Some(TodoInput {
+                        target: TodoInputTarget::NewNote,
+                        text: TextInput::new(),
+                    });
+                }
+                TodoCmd::StartEditNote(id, text) => {
+                    view.input = Some(TodoInput {
+                        target: TodoInputTarget::EditNote(id),
+                        text: TextInput::with_text(text),
+                    });
+                }
+                TodoCmd::CancelInput => view.input = None,
+                TodoCmd::CreateTodo(text) => {
+                    view.input = None;
+                    let owner = view.owner.clone();
+                    let req_id = app.alloc_req_id(PendingIntent::SelectCreatedTodo);
+                    out.push(ClientRequest::CreateTodo {
+                        req_id,
+                        owner,
+                        text,
+                    });
+                }
+                TodoCmd::UpdateTodo(id, text) => {
+                    view.input = None;
+                    let req_id = app.alloc_req_id(PendingIntent::None);
+                    out.push(ClientRequest::UpdateTodo { req_id, id, text });
+                }
+                TodoCmd::ToggleTodo(id, done) => {
+                    let req_id = app.alloc_req_id(PendingIntent::None);
+                    out.push(ClientRequest::SetTodoDone { req_id, id, done });
+                }
+                TodoCmd::DeleteTodo(id) => {
+                    let req_id = app.alloc_req_id(PendingIntent::None);
+                    out.push(ClientRequest::DeleteTodo { req_id, id });
+                }
+                TodoCmd::CreateNote(todo, text) => {
+                    view.input = None;
+                    let req_id = app.alloc_req_id(PendingIntent::SelectCreatedNote);
+                    out.push(ClientRequest::CreateNote {
+                        req_id,
+                        owner: NoteOwner::Todo(todo),
+                        text,
+                    });
+                }
+                TodoCmd::UpdateNote(id, text) => {
+                    view.input = None;
+                    let req_id = app.alloc_req_id(PendingIntent::None);
+                    out.push(ClientRequest::UpdateNote { req_id, id, text });
+                }
+                TodoCmd::ToggleNote(id, done) => {
+                    let req_id = app.alloc_req_id(PendingIntent::None);
+                    out.push(ClientRequest::SetNoteDone { req_id, id, done });
+                }
+                TodoCmd::DeleteNote(id) => {
                     let req_id = app.alloc_req_id(PendingIntent::None);
                     out.push(ClientRequest::DeleteNote { req_id, id });
                 }
@@ -3752,6 +4073,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
         }
         MenuAction::NewWorktree(project) => open_new_worktree_prompt(app, project),
         MenuAction::OpenNotes(owner) => open_notes_for_owner(app, owner),
+        MenuAction::OpenTodos(owner) => open_todos_for_owner(app, owner),
         MenuAction::NewLink(worktree) => open_prompt(app, PromptKind::NewLink { worktree }),
         MenuAction::OpenLink(url) => open_link(app, &url, out),
         MenuAction::EditLink(id) => open_prompt(app, PromptKind::EditLink { id }),
@@ -5365,6 +5687,92 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
         }
         return;
     }
+    // Todo modal: same wheel/click grammar as the notes modal; in list
+    // mode a click on the already-selected todo opens its detail (the
+    // settings-rows idiom: select first, activate second).
+    if let Some(Overlay::Todos(view)) = &mut app.overlay {
+        // Rows the current mode shows: child notes in detail (offset by the
+        // todo header row the draw pins on top), todos in the list.
+        let (count, row_offset) = match &view.detail {
+            Some(todo_id) => (
+                app.tree
+                    .notes
+                    .iter()
+                    .filter(|n| n.owner == NoteOwner::Todo(todo_id.clone()))
+                    .count(),
+                1u16,
+            ),
+            None => (
+                app.tree
+                    .todos
+                    .iter()
+                    .filter(|t| t.owner == view.owner)
+                    .count(),
+                0u16,
+            ),
+        };
+        let max = count.saturating_sub(1) as i64;
+        let step = |view: &mut TodoView, delta: i64| {
+            if view.detail.is_some() {
+                view.note_selected = (view.note_selected as i64 + delta).clamp(0, max) as usize;
+            } else {
+                view.selected = (view.selected as i64 + delta).clamp(0, max) as usize;
+            }
+        };
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                step(view, -1);
+                app.dirty = true;
+            }
+            MouseEventKind::ScrollDown => {
+                step(view, 1);
+                app.dirty = true;
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let list = view.list_area;
+                let rows_y = list.y + row_offset;
+                let inside_rows = list.width > 0
+                    && mouse.column >= list.x
+                    && mouse.column < list.x + list.width
+                    && mouse.row >= rows_y
+                    && mouse.row < list.y + list.height;
+                let area = view.area;
+                let inside_modal = mouse.column >= area.x
+                    && mouse.column < area.x + area.width
+                    && mouse.row >= area.y
+                    && mouse.row < area.y + area.height;
+                if inside_rows {
+                    let height = (list.height.saturating_sub(row_offset)) as usize;
+                    let start = view.window_start(height);
+                    let index = start + (mouse.row - rows_y) as usize;
+                    if index < count {
+                        match &view.detail {
+                            Some(_) => view.note_selected = index,
+                            None if view.selected == index && view.input.is_none() => {
+                                // Second click on the selected todo = Enter.
+                                if let Some(todo) = app
+                                    .tree
+                                    .todos
+                                    .iter()
+                                    .filter(|t| t.owner == view.owner)
+                                    .nth(index)
+                                {
+                                    view.detail = Some(todo.id.clone());
+                                    view.note_selected = 0;
+                                }
+                            }
+                            None => view.selected = index,
+                        }
+                    }
+                } else if !inside_modal {
+                    app.overlay = None;
+                }
+                app.dirty = true;
+            }
+            _ => {}
+        }
+        return;
+    }
     // Settings: click a tab to switch, a row to select (or activate it if
     // it was already selected), outside to close; everything else is
     // swallowed. While a hotkey capture is live the mouse is inert — the
@@ -6030,6 +6438,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             agents,
             terminals,
             notes,
+            todos,
             links,
             pr_seen,
             ui_state,
@@ -6041,6 +6450,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             app.tree.agents = agents;
             app.tree.terminals = terminals;
             app.tree.notes = notes;
+            app.tree.todos = todos;
             app.tree.links = links;
             app.pr_seen = pr_seen.into_iter().map(|s| (s.url, s.marker)).collect();
             if let Some(json) = ui_state {
@@ -6178,6 +6588,11 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                         app.select_note_when_seen = Some(id);
                     }
                 }
+                (Some(PendingIntent::SelectCreatedTodo), Some(EntityId::Todo(id))) => {
+                    if !select_todo_by_id(app, &id) {
+                        app.select_todo_when_seen = Some(id);
+                    }
+                }
                 (Some(PendingIntent::SelectCreatedLink), Some(EntityId::Link(id))) => {
                     if !select_link_by_id(app, &id) {
                         app.select_link_when_seen = Some(id);
@@ -6220,6 +6635,12 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             if let Some(note_id) = app.select_note_when_seen.clone() {
                 if select_note_by_id(app, &note_id) {
                     app.select_note_when_seen = None;
+                }
+            }
+            // ...and the todo modal's cursor onto a todo we just created.
+            if let Some(todo_id) = app.select_todo_when_seen.clone() {
+                if select_todo_by_id(app, &todo_id) {
+                    app.select_todo_when_seen = None;
                 }
             }
             // ...and the panel cursor onto a link we just added.
@@ -6355,6 +6776,10 @@ fn apply_upsert(app: &mut App, entity: nebula_core::Entity) {
             Some(existing) => *existing = t,
             None => app.tree.notes.push(t),
         },
+        Entity::Todo(t) => match app.tree.todos.iter_mut().find(|x| x.id == t.id) {
+            Some(existing) => *existing = t,
+            None => app.tree.todos.push(t),
+        },
         Entity::Link(l) => match app.tree.links.iter_mut().find(|x| x.id == l.id) {
             Some(existing) => *existing = l,
             None => app.tree.links.push(l),
@@ -6379,8 +6804,9 @@ fn select_link_by_id(app: &mut App, id: &LinkId) -> bool {
     }
 }
 
-/// Land the note modal's cursor on `id`; false when the modal isn't open on
-/// that note's owner or the note hasn't arrived in the tree yet.
+/// Land the note modal's cursor on `id` — or, for a todo's child note, the
+/// todo detail's cursor; false when no modal is open on that note's owner
+/// or the note hasn't arrived in the tree yet.
 fn select_note_by_id(app: &mut App, id: &NoteId) -> bool {
     let pos = match &app.overlay {
         Some(Overlay::Notes(view)) => app
@@ -6389,10 +6815,44 @@ fn select_note_by_id(app: &mut App, id: &NoteId) -> bool {
             .iter()
             .filter(|t| t.owner == view.owner)
             .position(|t| &t.id == id),
+        Some(Overlay::Todos(view)) => match &view.detail {
+            Some(todo_id) => app
+                .tree
+                .notes
+                .iter()
+                .filter(|t| t.owner == NoteOwner::Todo(todo_id.clone()))
+                .position(|t| &t.id == id),
+            None => return false,
+        },
         _ => return false,
     };
     match (pos, &mut app.overlay) {
         (Some(i), Some(Overlay::Notes(view))) => {
+            view.selected = i;
+            true
+        }
+        (Some(i), Some(Overlay::Todos(view))) => {
+            view.note_selected = i;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Land the todo modal's cursor on `id`; false when the modal isn't open on
+/// that todo's owner or the todo hasn't arrived in the tree yet.
+fn select_todo_by_id(app: &mut App, id: &TodoId) -> bool {
+    let pos = match &app.overlay {
+        Some(Overlay::Todos(view)) if view.detail.is_none() => app
+            .tree
+            .todos
+            .iter()
+            .filter(|t| t.owner == view.owner)
+            .position(|t| &t.id == id),
+        _ => return false,
+    };
+    match (pos, &mut app.overlay) {
+        (Some(i), Some(Overlay::Todos(view))) => {
             view.selected = i;
             true
         }
@@ -6422,9 +6882,23 @@ fn apply_removal(app: &mut App, id: &nebula_core::EntityId) {
             app.tree
                 .terminals
                 .retain(|t| !wt_ids.contains(&t.worktree_id));
+            // Todos go first so their ids can prune the notes hanging off
+            // them (project → todo → note is a two-step cascade).
+            let todo_ids: Vec<_> = app
+                .tree
+                .todos
+                .iter()
+                .filter(|t| match &t.owner {
+                    TodoOwner::Project(p) => p == id,
+                    TodoOwner::Worktree(w) => wt_ids.contains(w),
+                })
+                .map(|t| t.id.clone())
+                .collect();
+            app.tree.todos.retain(|t| !todo_ids.contains(&t.id));
             app.tree.notes.retain(|t| match &t.owner {
                 NoteOwner::Project(p) => p != id,
                 NoteOwner::Worktree(w) => !wt_ids.contains(w),
+                NoteOwner::Todo(t) => !todo_ids.contains(t),
             });
             app.tree.links.retain(|l| !wt_ids.contains(&l.worktree_id));
             app.pull_requests.retain(|w, _| !wt_ids.contains(w));
@@ -6435,9 +6909,19 @@ fn apply_removal(app: &mut App, id: &nebula_core::EntityId) {
         EntityId::Worktree(id) => {
             app.tree.agents.retain(|a| &a.worktree_id != id);
             app.tree.terminals.retain(|t| &t.worktree_id != id);
-            app.tree
-                .notes
-                .retain(|t| t.owner != NoteOwner::Worktree(id.clone()));
+            let todo_ids: Vec<_> = app
+                .tree
+                .todos
+                .iter()
+                .filter(|t| t.owner == TodoOwner::Worktree(id.clone()))
+                .map(|t| t.id.clone())
+                .collect();
+            app.tree.todos.retain(|t| !todo_ids.contains(&t.id));
+            app.tree.notes.retain(|t| match &t.owner {
+                NoteOwner::Worktree(w) => w != id,
+                NoteOwner::Todo(t) => !todo_ids.contains(t),
+                NoteOwner::Project(_) => true,
+            });
             app.tree.links.retain(|l| &l.worktree_id != id);
             app.pull_requests.remove(id);
             app.pr_recheck.remove(id);
@@ -6446,6 +6930,13 @@ fn apply_removal(app: &mut App, id: &nebula_core::EntityId) {
         EntityId::Agent(id) => app.tree.agents.retain(|a| &a.id != id),
         EntityId::Terminal(id) => app.tree.terminals.retain(|t| &t.id != id),
         EntityId::Note(id) => app.tree.notes.retain(|t| &t.id != id),
+        EntityId::Todo(id) => {
+            // Child notes cascade in the store off this one event.
+            app.tree.todos.retain(|t| &t.id != id);
+            app.tree
+                .notes
+                .retain(|n| n.owner != NoteOwner::Todo(id.clone()));
+        }
         EntityId::Link(id) => app.tree.links.retain(|l| &l.id != id),
     }
     // A note modal aimed at a vanished owner has nothing left to show.
@@ -6453,6 +6944,24 @@ fn apply_removal(app: &mut App, id: &nebula_core::EntityId) {
         let gone = match &view.owner {
             NoteOwner::Project(id) => !app.tree.projects.iter().any(|p| &p.id == id),
             NoteOwner::Worktree(id) => !app.tree.worktrees.iter().any(|w| &w.id == id),
+            NoteOwner::Todo(id) => !app.tree.todos.iter().any(|t| &t.id == id),
+        };
+        if gone {
+            app.overlay = None;
+        }
+    }
+    // Same for the todo modal — and a detail whose todo vanished falls
+    // back to the (still valid) list.
+    if let Some(Overlay::Todos(view)) = &mut app.overlay {
+        if let Some(todo_id) = &view.detail {
+            if !app.tree.todos.iter().any(|t| &t.id == todo_id) {
+                view.detail = None;
+                view.input = None;
+            }
+        }
+        let gone = match &view.owner {
+            TodoOwner::Project(id) => !app.tree.projects.iter().any(|p| &p.id == id),
+            TodoOwner::Worktree(id) => !app.tree.worktrees.iter().any(|w| &w.id == id),
         };
         if gone {
             app.overlay = None;
@@ -7688,6 +8197,225 @@ mod tests {
         assert!(out.is_empty(), "no DeleteNote leaked out, got {out:?}");
     }
 
+    /// `E` opens the todo modal for the current selection: the worktree's
+    /// list from the Worktrees panel, the project's from Projects.
+    #[test]
+    fn shift_e_opens_todos_for_selection() {
+        use nebula_core::{ProjectId, TodoOwner, WorktreeId};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.focus = Focus::Worktrees;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('E'), KeyModifiers::SHIFT, &mut out);
+        match &app.overlay {
+            Some(Overlay::Todos(view)) => {
+                assert_eq!(view.owner, TodoOwner::Worktree(WorktreeId("w1".into())));
+                assert_eq!(view.context, "demo/main");
+            }
+            other => panic!("expected todos overlay, got {other:?}"),
+        }
+        app.overlay = None;
+        app.focus = Focus::Projects;
+        press(&mut app, KeyCode::Char('E'), KeyModifiers::SHIFT, &mut out);
+        match &app.overlay {
+            Some(Overlay::Todos(view)) => {
+                assert_eq!(view.owner, TodoOwner::Project(ProjectId("p1".into())));
+                assert_eq!(view.context, "demo");
+            }
+            other => panic!("expected todos overlay, got {other:?}"),
+        }
+    }
+
+    /// The todo modal's whole grammar: `a` adds a todo, Enter drills into
+    /// its notes, `a` there adds a child note (owned by the todo, not the
+    /// worktree), Space/d work the note, Esc steps back out level by level.
+    #[test]
+    fn todo_modal_flow_add_drill_in_and_note_it() {
+        use nebula_core::{Entity, Note, NoteId, NoteOwner, Todo, TodoId, TodoOwner, WorktreeId};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.focus = Focus::Worktrees;
+        let owner = TodoOwner::Worktree(WorktreeId("w1".into()));
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('E'), KeyModifiers::SHIFT, &mut out);
+
+        // a + text + Enter sends CreateTodo for the modal's owner.
+        press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE, &mut out);
+        for c in "ship it".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        out.clear();
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(&out[..], [ClientRequest::CreateTodo { owner: o, text, .. }]
+                if *o == owner && text == "ship it"),
+            "expected CreateTodo, got {out:?}"
+        );
+
+        // The daemon's echo lands the row; Enter opens its detail.
+        let todo_id = TodoId("todo1".into());
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Todo(Todo {
+                    id: todo_id.clone(),
+                    owner: owner.clone(),
+                    text: "ship it".into(),
+                    done: false,
+                    sort_order: 0,
+                }),
+            },
+        );
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        match &app.overlay {
+            Some(Overlay::Todos(view)) => {
+                assert_eq!(view.detail, Some(todo_id.clone()), "Enter opens the detail")
+            }
+            other => panic!("todos overlay gone: {other:?}"),
+        }
+
+        // a + text + Enter inside the detail creates a note owned by the
+        // todo — never by the worktree.
+        press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE, &mut out);
+        for c in "check ci".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        out.clear();
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(&out[..], [ClientRequest::CreateNote { owner: NoteOwner::Todo(t), text, .. }]
+                if *t == todo_id && text == "check ci"),
+            "expected CreateNote under the todo, got {out:?}"
+        );
+
+        // Space toggles the child note, d deletes it.
+        let note_id = NoteId("note1".into());
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Note(Note {
+                    id: note_id.clone(),
+                    owner: NoteOwner::Todo(todo_id.clone()),
+                    text: "check ci".into(),
+                    done: false,
+                    sort_order: 0,
+                }),
+            },
+        );
+        out.clear();
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(&out[..], [ClientRequest::SetNoteDone { id, done: true, .. }] if *id == note_id),
+            "expected SetNoteDone, got {out:?}"
+        );
+        out.clear();
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(&out[..], [ClientRequest::DeleteNote { id, .. }] if *id == note_id),
+            "expected DeleteNote, got {out:?}"
+        );
+
+        // Esc: detail → list → closed.
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        match &app.overlay {
+            Some(Overlay::Todos(view)) => assert_eq!(view.detail, None, "Esc backs out"),
+            other => panic!("todos overlay gone: {other:?}"),
+        }
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none(), "second Esc closes");
+    }
+
+    /// List-mode verbs: Space toggles a todo, r edits its text, d deletes.
+    #[test]
+    fn todo_list_toggle_edit_and_delete_send_requests() {
+        use crate::app::TodoView;
+        use nebula_core::{Todo, TodoId, TodoOwner, WorktreeId};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let owner = TodoOwner::Worktree(WorktreeId("w1".into()));
+        let id = TodoId("todo1".into());
+        app.tree.todos.push(Todo {
+            id: id.clone(),
+            owner: owner.clone(),
+            text: "fix login".into(),
+            done: false,
+            sort_order: 0,
+        });
+        app.overlay = Some(Overlay::Todos(TodoView::new(owner, "demo/main".into())));
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(&out[..], [ClientRequest::SetTodoDone { id: i, done: true, .. }] if *i == id),
+            "expected SetTodoDone, got {out:?}"
+        );
+
+        // r edits the text like a session rename; Enter saves.
+        out.clear();
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::NONE, &mut out);
+        for c in " flow".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        out.clear();
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(&out[..], [ClientRequest::UpdateTodo { id: i, text, .. }]
+                if *i == id && text == "fix login flow"),
+            "expected UpdateTodo, got {out:?}"
+        );
+
+        out.clear();
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(&out[..], [ClientRequest::DeleteTodo { id: i, .. }] if *i == id),
+            "expected DeleteTodo, got {out:?}"
+        );
+    }
+
+    /// A todo's removal prunes its child notes from the tree, and a detail
+    /// view opened on it falls back to the list instead of dangling.
+    #[test]
+    fn removing_a_todo_prunes_child_notes_and_closes_its_detail() {
+        use crate::app::TodoView;
+        use nebula_core::{EntityId, Note, NoteId, NoteOwner, Todo, TodoId, TodoOwner, WorktreeId};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let owner = TodoOwner::Worktree(WorktreeId("w1".into()));
+        let id = TodoId("todo1".into());
+        app.tree.todos.push(Todo {
+            id: id.clone(),
+            owner: owner.clone(),
+            text: "fix login".into(),
+            done: false,
+            sort_order: 0,
+        });
+        app.tree.notes.push(Note {
+            id: NoteId("n1".into()),
+            owner: NoteOwner::Todo(id.clone()),
+            text: "child".into(),
+            done: false,
+            sort_order: 0,
+        });
+        let mut view = TodoView::new(owner, "demo/main".into());
+        view.detail = Some(id.clone());
+        app.overlay = Some(Overlay::Todos(view));
+
+        hse(
+            &mut app,
+            ServerEvent::EntityRemoved {
+                id: EntityId::Todo(id),
+            },
+        );
+        assert!(app.tree.todos.is_empty());
+        assert!(app.tree.notes.is_empty(), "child notes pruned with the todo");
+        match &app.overlay {
+            Some(Overlay::Todos(view)) => {
+                assert_eq!(view.detail, None, "detail falls back to the list")
+            }
+            other => panic!("todos overlay gone: {other:?}"),
+        }
+    }
+
     /// The always-live search fields edit the same way — and ⌥←/⌥→ move the
     /// caret rather than typing a literal "b"/"f" into the query.
     #[test]
@@ -8087,6 +8815,7 @@ mod tests {
                 agents: tree.agents,
                 terminals: tree.terminals,
                 notes: tree.notes,
+                todos: tree.todos,
                 links: tree.links,
                 pr_seen: Vec::new(),
                 ui_state: None,

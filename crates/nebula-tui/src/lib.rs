@@ -63,12 +63,19 @@ pub fn run_add_project(path: String) -> Result<()> {
     runtime()?.block_on(ipc::add_project(path))
 }
 
-pub use ipc::{NewAgentOpts, NotesOp, WorkspaceOp};
+pub use ipc::{NewAgentOpts, NotesOp, TodoOp, WorkspaceOp};
 
 /// `nebula notes [list|add|done]` — project/worktree notes from the CLI,
 /// agents included (see `ipc::run_notes`).
 pub fn run_notes(op: NotesOp) -> Result<()> {
     runtime()?.block_on(ipc::run_notes(op))
+}
+
+/// `nebula todo [list|add|done|reopen|show|note|note-done]` —
+/// project/worktree todos and their child notes from the CLI, agents
+/// included (see `ipc::run_todo`).
+pub fn run_todo(op: TodoOp) -> Result<()> {
+    runtime()?.block_on(ipc::run_todo(op))
 }
 
 /// `nebula worktree new` — agent-facing orchestration verb.

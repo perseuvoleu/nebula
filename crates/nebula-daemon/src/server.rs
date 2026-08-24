@@ -94,6 +94,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         agents: vec![],
                         terminals: vec![],
                         notes: vec![],
+                        todos: vec![],
                         links: vec![],
                         pr_seen: vec![],
                         ui_state: None,
@@ -490,6 +491,32 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 }
                 ClientRequest::DeleteNote { req_id, id } => {
                     reply(&out_tx, req_id, daemon.delete_note(&id).map(|_| None)).await;
+                }
+                ClientRequest::CreateTodo {
+                    req_id,
+                    owner,
+                    text,
+                } => {
+                    reply(&out_tx, req_id, daemon.create_todo(&owner, &text).map(Some)).await;
+                }
+                ClientRequest::UpdateTodo { req_id, id, text } => {
+                    reply(
+                        &out_tx,
+                        req_id,
+                        daemon.update_todo(&id, &text).map(|_| None),
+                    )
+                    .await;
+                }
+                ClientRequest::SetTodoDone { req_id, id, done } => {
+                    reply(
+                        &out_tx,
+                        req_id,
+                        daemon.set_todo_done(&id, done).map(|_| None),
+                    )
+                    .await;
+                }
+                ClientRequest::DeleteTodo { req_id, id } => {
+                    reply(&out_tx, req_id, daemon.delete_todo(&id).map(|_| None)).await;
                 }
                 ClientRequest::CreateLink {
                     req_id,

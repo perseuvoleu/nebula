@@ -71,6 +71,7 @@ pub enum Action {
     GitDiff,
     OpenRepo,
     Notes,
+    Todos,
     // sessions
     NewAgent,
     NewTerminal,
@@ -295,6 +296,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         group: "PROJECTS & WORKTREES",
         scope: Scope::Global,
         defaults: &["e", "cmd+e"],
+    },
+    ActionSpec {
+        action: Action::Todos,
+        id: "todos",
+        label: "Todos",
+        hint: "Todos for the selected project or worktree (Enter on one opens its notes)",
+        group: "PROJECTS & WORKTREES",
+        scope: Scope::Global,
+        defaults: &["shift+e"],
     },
     // ---- SESSIONS ----
     ActionSpec {

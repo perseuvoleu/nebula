@@ -46,6 +46,22 @@ pub fn notes_instruction(open: usize) -> String {
     )
 }
 
+/// Open-todos pointer, injected on every prompt while the agent's project
+/// or worktree has undone todos. Same contract as the notes pointer: it
+/// only tells the agent the CLI exists; acting on a todo stays its call.
+pub fn todos_instruction(open: usize) -> String {
+    format!(
+        "[nebula] This project has {open} open todo{} — the user's task \
+         list, separate from notes. `nebula todo list` reads them, `nebula \
+         todo show <n>` includes a todo's own notes, `nebula todo done <n>` \
+         checks one off (do that when your work completes it; `reopen <n>` \
+         undoes), `nebula todo add <text>` adds one, and `nebula todo note \
+         <n> <text>` records progress under one. Bring one up only when \
+         it's relevant to the user's request.",
+        if open == 1 { "" } else { "s" }
+    )
+}
+
 /// Standing instructions for a project orchestrator, injected on every
 /// prompt (so they survive context compaction). Kept compact — this rides
 /// along with the user's message each turn.
@@ -411,6 +427,84 @@ mod tests {
         assert_eq!((status, body.as_str()), (401, ""));
     }
 
+    /// The todos pointer rides UserPromptSubmit while the agent's project
+    /// or worktree has undone todos — and composes with the notes pointer
+    /// when both lists are open. Todo-owned child notes never count as
+    /// standalone notes.
+    #[tokio::test]
+    async fn user_prompt_submit_injects_todos_instruction_while_open() {
+        use nebula_core::{Note, NoteId, NoteOwner, Todo, TodoId, TodoOwner};
+        let store = seeded_store();
+        let (env, _rx) = start_hook_server(store.clone()).await.unwrap();
+        let payload = r#"{"session_id":"s1"}"#;
+
+        // Two open todos (project + worktree) and one done one.
+        let todo = |owner: TodoOwner, done: bool| Todo {
+            id: TodoId::generate(),
+            owner,
+            text: "t".into(),
+            done,
+            sort_order: 0,
+        };
+        store
+            .insert_todo(&todo(TodoOwner::Project(ProjectId("p1".into())), false))
+            .unwrap();
+        let open_wt = todo(TodoOwner::Worktree(WorktreeId("w1".into())), false);
+        store.insert_todo(&open_wt).unwrap();
+        store
+            .insert_todo(&todo(TodoOwner::Worktree(WorktreeId("w1".into())), true))
+            .unwrap();
+        // A child note under a todo is todo-scoped: it must NOT wake the
+        // standalone-notes pointer.
+        store
+            .insert_note(&Note {
+                id: NoteId::generate(),
+                owner: NoteOwner::Todo(open_wt.id.clone()),
+                text: "child".into(),
+                done: false,
+                sort_order: 0,
+            })
+            .unwrap();
+
+        let (status, body) = http_post(
+            env.port,
+            "/api/hooks/claude?agentId=titled&hookEvent=UserPromptSubmit",
+            &env.token,
+            payload,
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body, context_injection(&[todos_instruction(2)]));
+        assert!(body.contains("2 open todos"), "count: {body}");
+        assert!(body.contains("nebula todo list"), "cli pointer: {body}");
+        assert!(
+            !body.contains("nebula notes"),
+            "todo child notes must not trigger the notes pointer: {body}"
+        );
+
+        // With a standalone note open too, the pointers compose.
+        store
+            .insert_note(&Note {
+                id: NoteId::generate(),
+                owner: NoteOwner::Project(ProjectId("p1".into())),
+                text: "standalone".into(),
+                done: false,
+                sort_order: 0,
+            })
+            .unwrap();
+        let (_, body) = http_post(
+            env.port,
+            "/api/hooks/claude?agentId=titled&hookEvent=UserPromptSubmit",
+            &env.token,
+            payload,
+        )
+        .await;
+        assert_eq!(
+            body,
+            context_injection(&[notes_instruction(1), todos_instruction(2)])
+        );
+    }
+
     #[tokio::test]
     async fn bash_tool_use_carries_cwd_but_subagent_traffic_does_not() {
         let store = seeded_store();
@@ -590,6 +684,13 @@ async fn receive_hook(
             .unwrap_or(0);
         if open > 0 {
             parts.push(notes_instruction(open));
+        }
+        let open_todos = state
+            .store
+            .open_todo_count_for_agent(&agent_id)
+            .unwrap_or(0);
+        if open_todos > 0 {
+            parts.push(todos_instruction(open_todos));
         }
         let body = if parts.is_empty() {
             String::new()

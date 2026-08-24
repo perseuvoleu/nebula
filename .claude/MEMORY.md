@@ -149,6 +149,50 @@ under the selected agent row only, copying the worktree panel's `created_from` s
   the sub-line takes over the selected pill's bottom pad row, so layout advances `PILL_H + 1` for that
   row and `content_h`/cursor-visibility use an `entry_h` that adds the extra line — using bare
   `e.height()` there under-scrolls when the selected row is last.
+### First-Class Todos With Per-Todo Notes — 2026-08-24
+
+**Asked:** "Implementează un sistem first-class de TODO-uri în Nebula, separat de Notes existente.
+Cerința utilizatorului: TODO-uri scoped per proiect și/sau worktree, afișate într-un UI navigabil
+sus/jos; Enter pe TODO să deschidă/selecteze detaliul lui, unde utilizatorul poate adăuga și vedea
+Notes copil sub acel TODO. … Agenții trebuie să poată accesa și modifica TODO-urile și notele lor
+printr-un CLI clar (list/add/done/reopen și comenzi pentru notes asociate…) …"
+
+**Did:** `Todo`/`TodoOwner`/`TodoId` (entities.rs, ids.rs), child notes as `NoteOwner::Todo(TodoId)` —
+notes CRUD/protocol reused wholesale for them. Migration 20 (store.rs): new `todos` table + a `notes`
+rebuild adding `todo_id`; PROTOCOL_VERSION 24→25 with `CreateTodo`/`UpdateTodo`/`SetTodoDone`/
+`DeleteTodo` and `Snapshot.todos`. Store fns mirror notes (`open_todo_count_for_agent` drives a new
+`todos_instruction` in hooks/mod.rs, composing with the notes one; installer adds
+`Bash(nebula todo:*)`). TUI: `Action::Todos` on `shift+e` (next to Notes' `e`), `Overlay::Todos`
+(app.rs `TodoView` — `detail: Option<TodoId>` is the drill-in mode, `note_selected` its own cursor;
+event_loop.rs handler, ui.rs draw with a pinned bold todo header and the panels' ✎/✓ badge for child
+notes), "Todos" rows in the project/worktree context menus, click-on-selected-row opens detail (the
+settings idiom). CLI `nebula todo list|add|done|reopen|show|note|note-done` (ipc.rs `run_todo`) with
+`run_notes`' exact target resolution. Tests: store CRUD/cascade/count/migration-20, hook injection,
+4 event_loop modal tests; verified live against an isolated daemon + tmux TUI capture.
+
+**Gotchas:**
+- The old `notes` CHECK (`(project_id IS NULL) <> (worktree_id IS NULL)`) can't take a third owner
+  column — migration 20 rebuilds the table with `(a IS NOT NULL)+(b IS NOT NULL)+(c IS NOT NULL)=1`
+  (FK-off rebuild window, the migration-14 procedure). The `todos` table NAME is free again only
+  because migration 15 renamed the original one to `notes` — a fresh DB replays both, which reads
+  odd but is correct.
+- Extending `NoteOwner` fans out further than the store: exhaustive matches in event_loop.rs
+  (`apply_removal` — project/worktree removal must prune todos FIRST and then notes via the collected
+  todo ids, a two-step cascade — plus the notes-modal owner-gone check) and `open_notes_for_owner`.
+  Grep `NoteOwner::` before touching that enum again.
+- `open_note_count_for_agent` needed no change to exclude todo-owned child notes: its
+  `(n.worktree_id = w.id OR n.project_id = w.project_id)` is false when both are NULL. Asserted in
+  `user_prompt_submit_injects_todos_instruction_while_open` so nobody "fixes" it into counting them.
+- The Projects footer at 140 cols was ALREADY over budget in the disconnected state; adding
+  "⇧E: todos" pushed "m: menu" off-screen and failed `splash_footer_lists_only_keys_that_work`.
+  Reclaimed width by folding "e/⇧E: notes/todos" and dropping "-: divider" from that footer (still in
+  the m menu, help, and the divider row's own footer). Any new footer verb needs this width math.
+- `shift+t` was taken (NewTerminal's second default) — todos went to `shift+e`, deliberately adjacent
+  to Notes' `e`.
+- zsh in the Bash tool does not word-split `T="tmux -L sock"; $T cmd` — spell tmux invocations out in
+  the screenshot harness.
+- Protocol/entity change ⇒ the running daemon must be restarted (`nebula kill`, kills live sessions)
+  before a rebuilt TUI/CLI can talk to it; the v24/v25 handshake refusal is clean and says so.
 
 ### ⌘W Closes The Selected Session — 2026-08-24
 
