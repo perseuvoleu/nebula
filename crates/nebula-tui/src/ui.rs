@@ -2636,6 +2636,19 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
     let link_count = rows.iter().filter(|r| r.as_link().is_some()).count();
     let dim = Style::default().fg(th.dim);
 
+    // The selected agent row grows a dim sub-line with the agent's last
+    // transcript message, when the cache holds one for it (same shape as
+    // the worktree panel's `from <base>` sub-line).
+    let preview: Option<String> = match rows.get(app.sel_session) {
+        Some(SessionRow::Agent(a)) => app.preview_text(&a.id).map(str::to_string),
+        _ => None,
+    };
+    let sel = app.sel_session;
+    let has_preview = preview.is_some();
+    let sub_line = move |i: usize| has_preview && i == sel;
+    let entry_h =
+        move |e: &SessionEntry| e.height() + matches!(e, SessionEntry::Row(i) if sub_line(*i)) as usize;
+
     // ---- lay the column out in virtual rows ----
     let mut layout: Vec<(usize, SessionEntry)> = Vec::new();
     let mut vrow: usize = 0;
@@ -2653,7 +2666,9 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
         |layout: &mut Vec<(usize, SessionEntry)>, vrow: &mut usize, start: usize, len: usize| {
             for i in start..(start + len).min(rows.len()) {
                 layout.push((*vrow, SessionEntry::Row(i)));
-                *vrow += PILL_H as usize;
+                // The preview sub-line takes over the selected pill's pad
+                // row, pushing everything below down one.
+                *vrow += PILL_H as usize + usize::from(sub_line(i));
             }
         };
 
@@ -2726,7 +2741,7 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
 
     // ---- resolve the scroll offset ----
     let view_h = inner.height as usize;
-    let content_h = layout.last().map_or(0, |(top, e)| top + e.height());
+    let content_h = layout.last().map_or(0, |(top, e)| top + entry_h(e));
     // The cursor pulls the viewport, but only on the frames where it
     // actually moved — otherwise a wheel scroll would snap straight back.
     let anchor = (app.sel_worktree, app.sel_session);
@@ -2743,7 +2758,7 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
                 Some((h, SessionEntry::Header(_) | SessionEntry::ArchivedHeader(_))) => *h,
                 _ => *top,
             };
-            let bottom = top + entry.height();
+            let bottom = top + entry_h(entry);
             if up_to < app.sessions_scroll {
                 app.sessions_scroll = up_to;
             } else if bottom > app.sessions_scroll + view_h {
@@ -2776,7 +2791,36 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
                     app.hits.push((r, HitTarget::ArchivedHeader));
                 }
             }
-            SessionEntry::Row(i) => draw_session_row(f, app, inner, y, *i, &rows[*i], focused),
+            SessionEntry::Row(i) => {
+                draw_session_row(f, app, inner, y, *i, &rows[*i], focused, sub_line(*i));
+                if sub_line(*i) {
+                    // Always under the selected row, so it always wears the
+                    // selection fill (the worktree sub-line's pattern).
+                    if let Some(r) = row_rect_at(inner, y + PILL_H as isize) {
+                        let style = Style::default()
+                            .fg(th.muted)
+                            .bg(if focused { th.sel_bg } else { th.sel_bg_dim });
+                        f.render_widget(
+                            Paragraph::new(format!(
+                                "{ROW_GUTTER}{}",
+                                truncate(
+                                    preview.as_deref().unwrap_or_default(),
+                                    (inner.width as usize).saturating_sub(ROW_GUTTER.len()),
+                                )
+                            ))
+                            .style(style),
+                            r,
+                        );
+                        f.render_widget(
+                            Paragraph::new(Span::styled(
+                                "▌",
+                                Style::default().fg(if focused { th.accent } else { th.dim }),
+                            )),
+                            Rect { width: 1, ..r },
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -2784,6 +2828,7 @@ fn draw_sessions(f: &mut Frame, app: &mut App, area: Rect) {
     app.hits.push((inner, HitTarget::PanelBg(Focus::Sessions)));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_session_row(
     f: &mut Frame,
     app: &mut App,
@@ -2792,6 +2837,7 @@ fn draw_session_row(
     index: usize,
     row: &SessionRow,
     focused: bool,
+    sub_line: bool,
 ) {
     let th = app.theme;
     let width = inner.width;
@@ -2896,7 +2942,9 @@ fn draw_session_row(
         }
     };
     render_pill(f, inner, top, spans, index == app.sel_session, focused, th);
-    if let Some(hit) = rows_rect_at(inner, top, PILL_H) {
+    // The preview sub-line clicks as part of its row, like the worktree
+    // panel's `from <base>` line.
+    if let Some(hit) = rows_rect_at(inner, top, PILL_H + u16::from(sub_line)) {
         app.hits.push((hit, HitTarget::Session(index)));
     }
 }

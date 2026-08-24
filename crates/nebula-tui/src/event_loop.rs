@@ -49,6 +49,11 @@ const AGO_REFRESH: Duration = Duration::from_secs(30);
 /// booting well before the user picks one.
 const PREWARM_DEBOUNCE: Duration = Duration::from_millis(250);
 
+/// How long the session selection must rest on a Claude row before its
+/// transcript tail is read for the last-message sub-line — walking the
+/// list with j/k must not read a file per row passed.
+const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(250);
+
 /// How often the standing keep-warm request for the selected worktree's
 /// default-spec Claude session is re-sent. Must stay comfortably under the
 /// daemon's reap window minus its recycle threshold, so the warm slot is
@@ -215,6 +220,10 @@ async fn main_loop(
             if app.git_changes_stale() {
                 refresh_git_changes(&mut app);
             }
+            // Selection changes always dirty, so riding the draw catches
+            // every landing on a Claude row without touching each site
+            // that moves `sel_session`.
+            schedule_preview(&mut app);
             terminal.draw(|f| ui::draw(f, &mut app))?;
             app.dirty = false;
             next_draw = tokio::time::Instant::now() + FRAME_INTERVAL;
@@ -302,6 +311,13 @@ async fn main_loop(
                 if app.pending_prewarm.is_some() =>
             {
                 fire_pending_prewarm(&mut app, &mut out);
+            }
+            // The session selection rested on a Claude row past the
+            // debounce: tail its transcript for the last-message sub-line.
+            _ = tokio::time::sleep(app.preview_delay().unwrap_or_default()),
+                if app.pending_preview.is_some() =>
+            {
+                fire_pending_preview(&mut app);
             }
             // Standing keep-warm: periodically re-assert the selected
             // worktree's warm default-spec Claude session so the daemon's
@@ -4580,6 +4596,79 @@ fn fire_pending_prewarm(app: &mut App, out: &mut Vec<ClientRequest>) {
     app.next_keepwarm = Some(std::time::Instant::now() + KEEPWARM_REFRESH);
 }
 
+/// Arm the debounced transcript preview when the session selection sits on
+/// a resumable Claude row whose preview isn't cached yet; runs before every
+/// draw. Once a read has answered for the agent, resting there re-arms
+/// nothing — `StatusChanged` re-arms explicitly when a turn ends, which is
+/// when the line actually goes stale.
+fn schedule_preview(app: &mut App) {
+    let target = app
+        .selected_session()
+        .filter(|a| a.kind == AgentKind::Claude && a.session_id.is_some())
+        .map(|a| a.id);
+    let Some(agent) = target else {
+        app.pending_preview = None;
+        return;
+    };
+    if app
+        .pending_preview
+        .as_ref()
+        .is_some_and(|(a, _)| *a == agent)
+    {
+        return;
+    }
+    if app.preview.as_ref().is_some_and(|p| p.agent == agent) {
+        app.pending_preview = None;
+    } else {
+        app.pending_preview = Some((agent, std::time::Instant::now() + PREVIEW_DEBOUNCE));
+    }
+}
+
+/// Read the armed agent's transcript tail into the preview cache — a
+/// synchronous 64 KB read at debounce time, off the input hot path (the
+/// git_diff.rs precedent). The selection may have moved since arming;
+/// only the row still selected is worth the read. An unchanged mtime
+/// keeps the cached text without re-reading.
+fn fire_pending_preview(app: &mut App) {
+    let Some((agent_id, _)) = app.pending_preview.take() else {
+        return;
+    };
+    let Some(agent) = app.selected_session().filter(|a| a.id == agent_id) else {
+        return;
+    };
+    let Some(cwd) = app
+        .tree
+        .worktrees
+        .iter()
+        .find(|w| w.id == agent.worktree_id)
+        .map(|w| w.path.clone())
+    else {
+        return;
+    };
+    let Some(path) = agent
+        .session_id
+        .as_deref()
+        .and_then(|sid| crate::transcript::transcript_path(&cwd, sid))
+    else {
+        return;
+    };
+    let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+    if mtime.is_some()
+        && app
+            .preview
+            .as_ref()
+            .is_some_and(|p| p.agent == agent_id && p.mtime == mtime)
+    {
+        return;
+    }
+    app.preview = Some(crate::app::SessionPreview {
+        agent: agent_id,
+        mtime,
+        text: crate::transcript::last_assistant_text(&path),
+    });
+    app.dirty = true;
+}
+
 /// Ask the daemon for a new agent session and attach it once the Ack lands.
 /// An empty `name` takes the generated default (agent-1, …) and opts the
 /// session into agent-driven auto-titling (`nebula rename` on the first
@@ -6030,6 +6119,12 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                     app.sel_session = i;
                 }
             }
+            // A turn ending under the cursor is exactly when the preview
+            // sub-line goes stale; re-arm the read the cache would skip.
+            if app.selected_session().is_some_and(|a| a.id == agent) {
+                app.pending_preview =
+                    Some((agent, std::time::Instant::now() + PREVIEW_DEBOUNCE));
+            }
         }
         ServerEvent::Ack { req_id, created } => {
             match (app.pending.remove(&req_id), created) {
@@ -6658,6 +6753,112 @@ mod tests {
                 }),
             },
         );
+    }
+
+    /// The selected Claude row grows a dim sub-line with the agent's last
+    /// transcript message; every other row stays a bare pill, and moving
+    /// the cursor takes the line along (the cache is per-agent).
+    #[test]
+    fn selected_session_row_previews_the_last_transcript_message() {
+        use nebula_core::{Agent, AgentStatus, Entity};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(Agent {
+                    id: AgentId("a2".into()),
+                    worktree_id: nebula_core::WorktreeId("w1".into()),
+                    name: "agent-2".into(),
+                    status: AgentStatus::Fresh,
+                    archived: false,
+                    archived_at: 0,
+                    pinned: false,
+                    kind: nebula_core::AgentKind::Claude,
+                    model: None,
+                    effort: None,
+                    session_id: None,
+                    sort_order: 1,
+                    status_changed_at: 0,
+                    orchestrator: false,
+                    alive: true,
+                }),
+            },
+        );
+        app.focus = Focus::Sessions;
+        app.sel_session = 0;
+        app.preview = Some(crate::app::SessionPreview {
+            agent: AgentId("a1".into()),
+            mtime: None,
+            text: Some("ready for your review".into()),
+        });
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("ready for your review"), "{text}");
+        // Directly under the selected pill's text row, not floating below
+        // the list.
+        let (_, name_y) = find_cell(&terminal, "agent-1");
+        let (_, preview_y) = find_cell(&terminal, "ready for your review");
+        assert_eq!(preview_y, name_y + 1, "sub-line hugs its row: {text}");
+
+        // The cursor moves to agent-2: the cached line belongs to agent-1
+        // and must not render under anyone else.
+        app.sel_session = 1;
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            !text.contains("ready for your review"),
+            "no sub-line under an agent the cache doesn't match: {text}"
+        );
+    }
+
+    /// The debounced preview only ever arms for a Claude row that has a
+    /// session id, and an answered read isn't re-armed by resting there —
+    /// otherwise the loop would stat the transcript forever.
+    #[test]
+    fn preview_arms_once_for_resumable_claude_rows_only() {
+        use nebula_core::{Agent, AgentStatus, Entity};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        // seed_tree's agent has no session id: nothing to tail.
+        schedule_preview(&mut app);
+        assert!(app.pending_preview.is_none());
+
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(Agent {
+                    id: AgentId("a1".into()),
+                    worktree_id: nebula_core::WorktreeId("w1".into()),
+                    name: "agent-1".into(),
+                    status: AgentStatus::Fresh,
+                    archived: false,
+                    archived_at: 0,
+                    pinned: false,
+                    kind: nebula_core::AgentKind::Claude,
+                    model: None,
+                    effort: None,
+                    session_id: Some("00000000-none".into()),
+                    sort_order: 0,
+                    status_changed_at: 0,
+                    orchestrator: false,
+                    alive: true,
+                }),
+            },
+        );
+        schedule_preview(&mut app);
+        assert!(app.pending_preview.is_some(), "resumable Claude row arms");
+
+        // Firing on a missing transcript still answers (text None), and
+        // resting on the row afterwards stays quiet.
+        fire_pending_preview(&mut app);
+        assert!(app.pending_preview.is_none());
+        let cached = app.preview.as_ref().expect("read answered");
+        assert_eq!(cached.agent, AgentId("a1".into()));
+        assert_eq!(cached.text, None);
+        schedule_preview(&mut app);
+        assert!(app.pending_preview.is_none(), "answered read isn't re-armed");
     }
 
     /// An empty tree replaces the panel columns with the animated splash

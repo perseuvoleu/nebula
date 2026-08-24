@@ -1307,6 +1307,18 @@ pub fn pretty_url(url: &str) -> String {
     bare.strip_suffix('/').unwrap_or(bare).to_string()
 }
 
+/// Cached last-message preview for the sessions panel (`App::preview`):
+/// what one tail-read of an agent's transcript came back with.
+#[derive(Debug, Clone)]
+pub struct SessionPreview {
+    pub agent: AgentId,
+    /// Transcript mtime at read time (None = file missing), so a re-fire
+    /// for an unchanged file skips the read.
+    pub mtime: Option<std::time::SystemTime>,
+    /// Collapsed message text; None = no assistant text found.
+    pub text: Option<String>,
+}
+
 /// One row in the Sessions panel: agents (pinned / recent / unpinned), then
 /// shell terminals, then the worktree's links, then archived agents.
 #[derive(Debug, Clone)]
@@ -1722,6 +1734,15 @@ pub struct App {
     /// warm default-spec Claude session, so one is always ready to adopt.
     /// Re-armed after every send; disarmed when nothing is selected.
     pub next_keepwarm: Option<std::time::Instant>,
+    /// Last assistant message of the selected Claude session's transcript,
+    /// the dim sub-line under its row in the sessions panel. Kept until
+    /// another agent's read replaces it, so the panel never shows one
+    /// agent's words under another's row (`preview_text` matches on id).
+    pub preview: Option<SessionPreview>,
+    /// Debounced preview refresh: the agent whose transcript tail to read
+    /// once the session selection has rested on it past the deadline —
+    /// same idiom as `pending_prewarm`.
+    pub pending_preview: Option<(AgentId, std::time::Instant)>,
     /// Mouse drag-selection over the terminal pane, if any.
     pub term_selection: Option<TermSelection>,
     /// Last left-click on the terminal pane (time + pane-relative cell), for
@@ -1889,6 +1910,8 @@ impl App {
             last_session_for_worktree: HashMap::new(),
             pending_prewarm: None,
             next_keepwarm: None,
+            preview: None,
+            pending_preview: None,
             term_selection: None,
             last_term_click: None,
             last_session_click: None,
@@ -2462,6 +2485,21 @@ impl App {
     pub fn prewarm_delay(&self) -> Option<std::time::Duration> {
         let (_, at) = self.pending_prewarm.as_ref()?;
         Some(at.saturating_duration_since(std::time::Instant::now()))
+    }
+
+    /// Delay until the pending transcript-preview read is due, so the
+    /// event loop can wake up and fire it. None when nothing is armed.
+    pub fn preview_delay(&self) -> Option<std::time::Duration> {
+        let (_, at) = self.pending_preview.as_ref()?;
+        Some(at.saturating_duration_since(std::time::Instant::now()))
+    }
+
+    /// The cached preview text, when it belongs to this agent.
+    pub fn preview_text(&self, agent: &AgentId) -> Option<&str> {
+        self.preview
+            .as_ref()
+            .filter(|p| &p.agent == agent)
+            .and_then(|p| p.text.as_deref())
     }
 
     /// Whether `gh` should be asked about this worktree now: not while an
