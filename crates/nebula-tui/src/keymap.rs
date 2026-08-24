@@ -60,6 +60,7 @@ pub enum Action {
     Activate,
     Palette,
     SessionPalette,
+    CommandPalette,
     NextAttention,
     // projects & worktrees
     AddProject,
@@ -205,6 +206,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         group: "NAVIGATE",
         scope: Scope::Global,
         defaults: &["shift+s"],
+    },
+    ActionSpec {
+        action: Action::CommandPalette,
+        id: "command_palette",
+        label: "Command palette",
+        hint: "Fuzzy launcher over every command; Enter chains into the existing flows (⌘⇧P in the ng Ghostty overlay)",
+        group: "NAVIGATE",
+        scope: Scope::Global,
+        defaults: &["cmd+shift+p", "shift+p"],
     },
     ActionSpec {
         action: Action::NextAttention,

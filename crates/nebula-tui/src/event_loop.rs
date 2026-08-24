@@ -792,6 +792,13 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                     open_diff_view(app);
                     return;
                 }
+                Some(crate::keymap::Action::CommandPalette) => {
+                    app.collapsed = false;
+                    app.term_locked = false;
+                    app.focus = Focus::Sessions;
+                    open_command_palette(app);
+                    return;
+                }
                 Some(crate::keymap::Action::CloseSession) => {
                     let attached = app.term.as_ref().map(|t| t.sref.clone());
                     app.collapsed = false;
@@ -1123,6 +1130,11 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 )));
             }
         }
+        // The command launcher: a fuzzy list of commands, each chaining
+        // into the existing flow (picker, prompt, palette, or modal). No
+        // terminal-focus guard — an unlocked pane forwards nothing, and
+        // the locked path has its own SUPER intercept.
+        Action::CommandPalette => open_command_palette(app),
         // Answer sessions in the order they started waiting: jump to the
         // oldest needs-feedback session and attach it.
         Action::NextAttention => next_attention(app, out),
@@ -2394,6 +2406,107 @@ fn new_agent_shortcut(app: &mut App) {
         }
         None => app.flash = Some("select a worktree first — cmd+n spawns the agent there".into()),
     }
+}
+
+/// The global command palette (⇧P / ⌘⇧P): a fuzzy list of COMMANDS, each
+/// chaining into the flow that already exists for it — pickers stay
+/// pickers, prompts stay prompts. Creation rows act on the selected
+/// project (or the first one when nothing is selected yet); with no
+/// project at all only the always-available rows appear.
+fn open_command_palette(app: &mut App) {
+    use crate::app::PaletteCommand;
+    let row = |label: &str, action: MenuAction| MenuItem {
+        label: label.into(),
+        action,
+        destructive: false,
+    };
+    let project = app.selected_project().map(|p| p.id.clone()).or_else(|| {
+        app.project_rows()
+            .first()
+            .and_then(|r| app.tree.projects.get(r.project_index()))
+            .map(|p| p.id.clone())
+    });
+    let mut items = Vec::new();
+    if let Some(p) = project {
+        items.push(row("New worktree…", MenuAction::NewWorktree(p.clone())));
+        items.push(row(
+            "New orchestrator…",
+            MenuAction::NewOrchestrator(p.clone()),
+        ));
+        items.push(row(
+            "New agent in worktree…",
+            MenuAction::Command(PaletteCommand::NewAgentInWorktree(p)),
+        ));
+    }
+    items.push(row(
+        "Search sessions",
+        MenuAction::Command(PaletteCommand::SearchSessions),
+    ));
+    items.push(row(
+        "Search everything",
+        MenuAction::Command(PaletteCommand::SearchEverything),
+    ));
+    items.push(row("Git diff", MenuAction::Command(PaletteCommand::GitDiff)));
+    items.push(row("Notes", MenuAction::Command(PaletteCommand::Notes)));
+    items.push(row("Todos", MenuAction::Command(PaletteCommand::Todos)));
+    items.push(row(
+        "Settings",
+        MenuAction::Command(PaletteCommand::Settings),
+    ));
+    items.push(row(
+        "Workspaces",
+        MenuAction::Command(PaletteCommand::Workspaces),
+    ));
+    items.push(row("Add project…", MenuAction::AddProject));
+    app.overlay = Some(Overlay::Menu(
+        ContextMenu {
+            title: Some("Commands".into()),
+            items,
+            at: None,
+            hover: 0,
+            area: ratatui::layout::Rect::default(),
+            parent: None,
+            filter: None,
+        }
+        .filterable(),
+    ));
+}
+
+/// The command palette's "New agent in worktree…" step: a filterable
+/// picker over the project's existing worktrees; Enter chains into the
+/// normal new-session picker on the pick.
+fn open_worktree_picker_for_agent(app: &mut App, project: nebula_core::ProjectId) {
+    let items: Vec<MenuItem> = app
+        .tree
+        .worktrees
+        .iter()
+        .filter(|w| w.project_id == project)
+        .map(|w| MenuItem {
+            label: if w.is_main {
+                format!("{} ⌂ root", w.branch)
+            } else {
+                w.branch.clone()
+            },
+            action: MenuAction::NewAgent(w.id.clone()),
+            destructive: false,
+        })
+        .collect();
+    if items.is_empty() {
+        app.flash = Some("no worktrees in this project yet".into());
+        return;
+    }
+    app.overlay = Some(Overlay::Menu(
+        ContextMenu {
+            title: Some("In worktree".into()),
+            items,
+            at: None,
+            hover: 0,
+            area: ratatui::layout::Rect::default(),
+            parent: None,
+            filter: None,
+        }
+        .filterable(),
+    ));
 }
 
 fn open_new_agent_picker(app: &mut App, worktree: WorktreeId) {
@@ -4586,6 +4699,38 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             open_prompt(app, PromptKind::DividerLabel { id, before })
         }
         MenuAction::ToggleArchived => toggle_archived(app, out),
+        MenuAction::Command(cmd) => {
+            use crate::app::PaletteCommand;
+            match cmd {
+                PaletteCommand::NewAgentInWorktree(project) => {
+                    open_worktree_picker_for_agent(app, project)
+                }
+                PaletteCommand::SearchSessions => {
+                    app.overlay = Some(Overlay::Palette(Palette::sessions(
+                        &app.tree,
+                        app.show_archived,
+                    )));
+                }
+                PaletteCommand::SearchEverything => {
+                    app.overlay = Some(Overlay::Palette(Palette::new(
+                        &app.tree,
+                        app.show_archived,
+                        crate::config::Config::load().palette_enter_attaches,
+                    )));
+                }
+                PaletteCommand::GitDiff => open_diff_view(app),
+                PaletteCommand::Notes => open_note_view(app),
+                PaletteCommand::Todos => open_todo_view(app),
+                PaletteCommand::Settings => {
+                    let tab = app.settings_tab;
+                    app.overlay = Some(Overlay::Settings(SettingsView::new(
+                        tab,
+                        app.settings_row(tab),
+                    )));
+                }
+                PaletteCommand::Workspaces => open_workspace_picker(app),
+            }
+        }
     }
 }
 
@@ -14450,6 +14595,178 @@ mod tests {
             out.is_empty(),
             "the press is intercepted, never forwarded to the pty"
         );
+    }
+
+    #[test]
+    fn shift_p_opens_the_command_palette_from_any_panel() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        // Projects focus, not Sessions — the palette is panel-independent.
+        app.focus = Focus::Projects;
+        press(&mut app, KeyCode::Char('P'), KeyModifiers::SHIFT, &mut out);
+        let Some(Overlay::Menu(menu)) = &app.overlay else {
+            panic!("expected the command palette, got {:?}", app.overlay);
+        };
+        assert_eq!(menu.title.as_deref(), Some("Commands"));
+        assert!(menu.filter.is_some(), "the palette is type-to-filter");
+        let labels: Vec<&str> = menu.items.iter().map(|i| i.label.as_str()).collect();
+        for expected in [
+            "New worktree…",
+            "New orchestrator…",
+            "New agent in worktree…",
+            "Search sessions",
+            "Search everything",
+        ] {
+            assert!(labels.contains(&expected), "{labels:?}");
+        }
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none(), "Esc closes the palette");
+
+        // The ⌘⇧P spelling (the ng Ghostty overlay's chord) works too.
+        press(
+            &mut app,
+            KeyCode::Char('p'),
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+            &mut out,
+        );
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Menu(m)) if m.title.as_deref() == Some("Commands")),
+            "{:?}",
+            app.overlay
+        );
+        assert!(out.is_empty(), "opening the palette sends nothing");
+    }
+
+    #[test]
+    fn cmd_shift_p_inside_a_locked_session_opens_the_command_palette() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        app.term = Some(AttachedTerm::new(
+            SessionRef::Agent(AgentId("a1".into())),
+            80,
+            24,
+        ));
+        app.focus = Focus::Terminal;
+        app.term_locked = true;
+        press(
+            &mut app,
+            KeyCode::Char('p'),
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+            &mut out,
+        );
+        assert!(!app.term_locked, "⌘⇧p unlocks the pane");
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Menu(m)) if m.title.as_deref() == Some("Commands")),
+            "⌘⇧p opens the command palette from inside a locked session: {:?}",
+            app.overlay
+        );
+        assert!(
+            out.is_empty(),
+            "the press is intercepted, never forwarded to the pty"
+        );
+    }
+
+    #[test]
+    fn command_palette_new_worktree_reaches_the_prompt_then_the_base_picker() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('P'), KeyModifiers::SHIFT, &mut out);
+        // Typing fuzzy-filters the command list; the best match is hovered.
+        for c in "new worktree".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        let Some(Overlay::Menu(menu)) = &app.overlay else {
+            panic!("expected the command palette, got {:?}", app.overlay);
+        };
+        assert!(
+            menu.items.len() < 5,
+            "the filter narrows the commands: {:?}",
+            menu.items.iter().map(|i| &i.label).collect::<Vec<_>>()
+        );
+        assert_eq!(menu.items[menu.hover].label, "New worktree…");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Prompt(p)) if matches!(p.kind, crate::app::PromptKind::NewWorktree { .. })),
+            "Enter chains into the existing name prompt: {:?}",
+            app.overlay
+        );
+        for c in "feat".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Menu(m)) if m.title.as_deref() == Some("Base branch")),
+            "the name step chains into the base-branch picker: {:?}",
+            app.overlay
+        );
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(out.last(), Some(ClientRequest::CreateWorktree { branch, .. }) if branch == "feat"),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn command_palette_new_agent_in_worktree_reaches_the_agent_picker() {
+        use nebula_core::{Entity, Worktree, WorktreeId};
+        let mut app = App::new();
+        seed_tree(&mut app); // p1/w1(main)
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(Worktree {
+                    id: WorktreeId("w2".into()),
+                    project_id: nebula_core::ProjectId("p1".into()),
+                    path: "/tmp/demo-worktrees/feat".into(),
+                    branch: "feat".into(),
+                    is_main: false,
+                    created_from: None,
+                    pinned: false,
+                    sort_order: 0,
+                }),
+            },
+        );
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('P'), KeyModifiers::SHIFT, &mut out);
+        for c in "agent".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        {
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("expected the command palette, got {:?}", app.overlay);
+            };
+            assert_eq!(menu.items[menu.hover].label, "New agent in worktree…");
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        // The worktree picker lists the project's checkouts; it filters too.
+        {
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("expected the worktree picker, got {:?}", app.overlay);
+            };
+            assert_eq!(menu.title.as_deref(), Some("In worktree"));
+            assert!(menu.filter.is_some());
+        }
+        for c in "feat".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        // …and lands in the normal new-session picker, aimed at the pick.
+        let Some(Overlay::Menu(menu)) = &app.overlay else {
+            panic!("expected the session picker, got {:?}", app.overlay);
+        };
+        assert_eq!(menu.title.as_deref(), Some("New session"));
+        assert!(
+            matches!(
+                &menu.items[0].action,
+                MenuAction::NewAgentOfKind { worktree, .. } if worktree == &WorktreeId("w2".into())
+            ),
+            "{:?}",
+            menu.items[0].action
+        );
+        assert!(out.is_empty(), "nothing is created before the final steps");
     }
 
     #[test]

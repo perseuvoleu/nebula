@@ -162,6 +162,25 @@ pub enum MenuAction {
     },
     LabelDivider(ProjectId, bool),
     ToggleArchived,
+    /// A command-palette row (the ⇧P launcher): a global command that
+    /// either runs directly or chains into an existing picker/prompt.
+    Command(PaletteCommand),
+}
+
+/// Everything the command palette can launch. Creation commands carry the
+/// project they act on; the rest reuse the same code their hotkey runs.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PaletteCommand {
+    /// Filterable picker over the project's worktrees, then the normal
+    /// new-session picker (kind → model/effort → name) on the pick.
+    NewAgentInWorktree(ProjectId),
+    SearchSessions,
+    SearchEverything,
+    GitDiff,
+    Notes,
+    Todos,
+    Settings,
+    Workspaces,
 }
 
 /// What the branch picker spawns once a branch is picked. Model/effort are
