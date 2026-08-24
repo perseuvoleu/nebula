@@ -28,6 +28,7 @@ pub fn now_ms() -> i64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Projects,
+    Orchestrators,
     Worktrees,
     Sessions,
     Terminal,
@@ -2234,7 +2235,8 @@ impl App {
 
     /// Is the cursor on the empty section's "+ new orchestrator" row?
     pub fn on_orchestrator_placeholder(&self) -> bool {
-        self.sel_orchestrator == Some(0)
+        self.focus == Focus::Orchestrators
+            && self.sel_orchestrator.unwrap_or(0) == 0
             && self.selected_project().is_some()
             && self.project_orchestrators().is_empty()
     }
@@ -2242,31 +2244,29 @@ impl App {
     /// Is the cursor anywhere in the ORCHESTRATORS section (a real row or
     /// the placeholder)? Drives what `n` creates.
     pub fn in_orchestrator_section(&self) -> bool {
-        self.sel_orchestrator.is_some()
+        self.focus == Focus::Orchestrators
     }
 
-    /// Index into `visible_worktrees()` when the panel cursor is on a
-    /// worktree row; None while it sits in the ORCHESTRATORS section.
+    /// Index into `visible_worktrees()`. The worktree cursor remains valid
+    /// while the independently focused ORCHESTRATORS section is active.
     pub fn selected_worktree_index(&self) -> Option<usize> {
-        self.sel_orchestrator.is_none().then_some(self.sel_worktree)
+        Some(self.sel_worktree)
     }
 
-    /// The orchestrator under the cursor, when the Worktrees-panel cursor
-    /// is inside the ORCHESTRATORS section.
+    /// The orchestrator under that section's independent cursor.
     pub fn selected_orchestrator(&self) -> Option<&Agent> {
-        let index = self.sel_orchestrator?;
+        let index = self
+            .sel_orchestrator
+            .or_else(|| (self.focus == Focus::Orchestrators).then_some(0))?;
         self.project_orchestrators().get(index).copied()
     }
 
-    /// Row index of worktree `id` in `visible_worktrees()` — assigns
-    /// straight to `sel_worktree` (callers leave the orchestrator section
-    /// by clearing `sel_orchestrator`; see `set_worktree_row`).
+    /// Row index of worktree `id` in `visible_worktrees()`.
     pub fn worktree_row_index(&self, id: &WorktreeId) -> Option<usize> {
         self.visible_worktrees().iter().position(|w| &w.id == id)
     }
 
     pub fn selected_worktree(&self) -> Option<&Worktree> {
-        // None while the cursor sits in the ORCHESTRATORS section.
         let index = self.selected_worktree_index()?;
         let worktrees = self.visible_worktrees();
         worktrees.get(index).copied()

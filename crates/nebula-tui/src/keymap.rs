@@ -28,7 +28,7 @@ use std::fmt;
 /// things in each, so conflicts are only conflicts within one scope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
-    /// Panel navigation: the three sidebars and an unlocked terminal pane.
+    /// Panel navigation: the sidebar sections and an unlocked terminal pane.
     Global,
     /// Input-locked terminal pane, where every other key is forwarded to
     /// the child process.
@@ -120,7 +120,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::FocusNext,
         id: "focus_next",
         label: "Next panel",
-        hint: "Cycle focus forward: projects → worktrees → sessions → terminal",
+        hint: "Cycle focus forward: projects → orchestrators → worktrees → sessions → terminal",
         group: "NAVIGATE",
         scope: Scope::Global,
         defaults: &["tab"],
@@ -229,7 +229,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::New,
         id: "new",
         label: "New (in focused panel)",
-        hint: "New project / worktree / agent, depending on which panel has focus",
+        hint: "New project / orchestrator / worktree / agent, depending on which section has focus",
         group: "PROJECTS & WORKTREES",
         scope: Scope::Global,
         defaults: &["n"],
@@ -311,7 +311,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::NewAgent,
         id: "new_agent",
         label: "New agent",
-        hint: "Open the new-session picker for the selected worktree, from any panel (⌘n even inside a locked session)",
+        hint: "Create in the focused orchestrator/worktree section, or open the new-session picker elsewhere (⌘n also works inside a locked session)",
         group: "SESSIONS",
         scope: Scope::Global,
         defaults: &["cmd+n", "ctrl+n"],
