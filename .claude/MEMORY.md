@@ -14,6 +14,22 @@ about what is worth recording.
 
 ## Entries
 
+### Claude Spawns In Yolo Mode Too — 2026-08-24
+
+**Asked:** "vreau cand se face un agent claude/codex sa fie ca in herdr, cu yolo mode ambele"
+
+**Did:** `agent_spawn_command` in `crates/nebula-daemon/src/registry.rs` now appends
+`--dangerously-skip-permissions` for `AgentKind::Claude` on every spawn (fresh and resume), matching
+codex's `--yolo` and cursor's `--force`. Both spawn-shape tests updated; `make install` run (daemon
+restart pending on the user's `nebula kill`).
+
+**Gotchas:**
+- Herdr has no yolo machinery of its own — its manifests only *detect* permission prompts; agents run
+  yolo there because the launch command carries the flag. So "like herdr" here just means "spawn with
+  the skip-permissions flag".
+- The flag composes fine with `--resume <sid>` and `--model/--effort`; it goes right after the resume
+  args, same slot as codex's `--yolo`.
+
 ### ⌘W Closes The Selected Session — 2026-08-24
 
 **Asked:** "ok e ok cand dau cmmd w si s pe un agent vreau sa mi inchida acea sesiune" — followed by "si

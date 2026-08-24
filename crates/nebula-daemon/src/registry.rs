@@ -2138,9 +2138,10 @@ impl Daemon {
 /// no resume args. Otherwise the kind picks the CLI and its resume shape:
 /// `claude --resume <sid>` and `cursor-agent --resume <sid>` (flag),
 /// `pi --session <sid>` (flag, takes a full or partial session id) vs
-/// `codex resume <sid>` (subcommand, so resume args must lead). Codex and
-/// cursor always get their skip-permissions flag (`--yolo` / `--force`),
-/// appended after the resume args — same convention as Mission Control.
+/// `codex resume <sid>` (subcommand, so resume args must lead). Claude,
+/// codex and cursor always get their skip-permissions flag
+/// (`--dangerously-skip-permissions` / `--yolo` / `--force`), appended
+/// after the resume args — yolo mode for everything, same as Herdr.
 /// Pi needs none: it has no permission prompts. Model/effort choices trail
 /// everything: `claude --model m --effort e`, `codex -m m -c
 /// model_reasoning_effort=e`, `pi --model m --thinking e` (pi's "effort" is
@@ -2170,9 +2171,10 @@ fn agent_spawn_command(
         (_, None) => (Vec::new(), false),
     };
     match kind {
+        AgentKind::Claude => args.push("--dangerously-skip-permissions".to_string()),
         AgentKind::Codex => args.push("--yolo".to_string()),
         AgentKind::Cursor => args.push("--force".to_string()),
-        AgentKind::Claude | AgentKind::Pi => {}
+        AgentKind::Pi => {}
     }
     match kind {
         AgentKind::Claude => {
@@ -2336,16 +2338,27 @@ mod tests {
 
     #[test]
     fn spawn_command_per_kind_resume_shapes() {
-        // Fresh sessions: bare CLI.
+        // Fresh sessions: CLI plus its skip-permissions flag.
         assert_eq!(
             agent_spawn_command(AgentKind::Claude, None, None, None, None, None),
-            ("claude".into(), vec![], false)
+            (
+                "claude".into(),
+                vec!["--dangerously-skip-permissions".to_string()],
+                false
+            )
         );
         // An initial prompt rides as the positional arg on a fresh spawn —
         // and is dropped on a resume, which continues the old conversation.
         assert_eq!(
             agent_spawn_command(AgentKind::Claude, None, None, None, None, Some("do the task")),
-            ("claude".into(), vec!["do the task".to_string()], false)
+            (
+                "claude".into(),
+                vec![
+                    "--dangerously-skip-permissions".to_string(),
+                    "do the task".to_string()
+                ],
+                false
+            )
         );
         let (_, resumed_args, resumed) =
             agent_spawn_command(AgentKind::Claude, Some("sid"), None, None, None, Some("do it"));
@@ -2354,7 +2367,7 @@ mod tests {
             !resumed_args.contains(&"do it".to_string()),
             "resume must not re-submit the prompt: {resumed_args:?}"
         );
-        // Codex/cursor always run in skip-permissions mode.
+        // Codex/cursor run in skip-permissions mode too.
         assert_eq!(
             agent_spawn_command(AgentKind::Codex, None, None, None, None, None),
             ("codex".into(), vec!["--yolo".to_string()], false)
@@ -2374,7 +2387,11 @@ mod tests {
             agent_spawn_command(AgentKind::Claude, Some("sid-1"), None, None, None, None),
             (
                 "claude".into(),
-                vec!["--resume".to_string(), "sid-1".to_string()],
+                vec![
+                    "--resume".to_string(),
+                    "sid-1".to_string(),
+                    "--dangerously-skip-permissions".to_string()
+                ],
                 true
             )
         );
@@ -2439,6 +2456,7 @@ mod tests {
             (
                 "claude".into(),
                 vec![
+                    "--dangerously-skip-permissions".to_string(),
                     "--model".to_string(),
                     "opus".to_string(),
                     "--effort".to_string(),
@@ -2451,7 +2469,11 @@ mod tests {
             agent_spawn_command(AgentKind::Claude, None, None, Some("max"), None, None),
             (
                 "claude".into(),
-                vec!["--effort".to_string(), "max".to_string()],
+                vec![
+                    "--dangerously-skip-permissions".to_string(),
+                    "--effort".to_string(),
+                    "max".to_string()
+                ],
                 false
             )
         );
@@ -2479,6 +2501,7 @@ mod tests {
                 vec![
                     "--resume".to_string(),
                     "sid".to_string(),
+                    "--dangerously-skip-permissions".to_string(),
                     "--model".to_string(),
                     "sonnet".to_string()
                 ],
