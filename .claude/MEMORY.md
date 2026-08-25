@@ -24,15 +24,20 @@ but nothing implemented; implemented on that follow-up).
 **Did:** Commit `e857abb`. Palette rows in `open_command_palette` (event_loop.rs) are labeled
 `"<alias> · <name>"` and `ContextMenu::apply_filter` (app.rs) pins the row whose label's
 `split_once(" · ")` alias equals the trimmed query — a convention on the label, deliberately NOT a
-new MenuItem field (MenuItem is literal-constructed everywhere). Aliases: a/aw/w/o/t/s/e/g/n/td/st/ws/p.
-New `a` flow (branch-FIRST, mirror of the orchestrator's kind-first order):
+new MenuItem field (MenuItem is literal-constructed everywhere). Aliases after the `3e24d77`
+refinement ("vreau sa am a care e default la primary, sa am si acc,ac,ap… ab o sa ma puna sa aleg
+branch"): `a` = session picker straight on the PRIMARY checkout, `acc`/`ac`/`acu`/`ap` = kind-fixed
+(Claude/Codex/Cursor/Pi) name prompt on primary via `MenuAction::NewAgentOfKind` rows (prewarm
+fires), `ab` = the branch-pick flow, plus aw/w/o/t/s/e/g/n/td/st/ws/p/r.
+The `ab` flow (branch-FIRST, mirror of the orchestrator's kind-first order):
 `PaletteCommand::NewAgentOnBranch` → `open_agent_branch_picker` ("Agent branch") → rows
 `MenuAction::AgentOnBranch { project, branch }` → existing checkout opens `open_new_agent_picker`,
 missing one sends CreateWorktree with new `PendingIntent::PickAgentOnCreatedWorktree` whose Ack opens
 the picker. `PaletteCommand::NewTerminal` → `create_terminal_for_context`. Branch listing factored
 into `project_local_branches` (shared with `open_branch_picker`). Tests:
-`command_palette_alias_a_runs_agent_on_branch`,
-`agent_on_branch_without_checkout_creates_worktree_then_opens_picker`; 458 nebula-tui + workspace
+`command_palette_alias_ab_runs_agent_on_branch`, `…alias_a_opens_the_session_picker_on_primary`,
+`…alias_ac_starts_a_codex_agent_on_primary`,
+`agent_on_branch_without_checkout_creates_worktree_then_opens_picker`; 461 nebula-tui + workspace
 green; `make install` run.
 
 Follow-up in the same session ("da nu poti da tu reload la asta fara sa inchid sa dau ng iar?"):
