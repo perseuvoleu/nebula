@@ -636,6 +636,78 @@ pub async fn worktree_new(
     Ok(())
 }
 
+/// `nebula worktree delete <name> [--force] [--project <name>]` — the
+/// daemon's delete flow, so the checkout AND nebula's row go together
+/// (raw `git worktree remove` leaves a ghost row in the Worktrees panel).
+pub async fn worktree_delete(
+    sel: String,
+    force: bool,
+    project_flag: Option<String>,
+) -> Result<()> {
+    let sock = paths::socket_path();
+    let Ok(stream) = try_connect(&sock).await else {
+        bail!("no nebula daemon is running");
+    };
+    let mut conn = handshake(stream).await?;
+    let (projects, worktrees, agents) = subscribe_snapshot(&mut conn).await?;
+    let project = resolve_project(&projects, &worktrees, &agents, project_flag.as_deref())?;
+    let of_project: Vec<&nebula_core::Worktree> = worktrees
+        .iter()
+        .filter(|w| w.project_id == project.id)
+        .collect();
+    // Match by branch or directory name — the same selectors `agent new
+    // --worktree` takes, minus "root"/"primary" (the main checkout is
+    // never deletable).
+    let worktree = of_project
+        .iter()
+        .find(|w| w.branch == sel || w.path.file_name().is_some_and(|n| n == sel.as_str()))
+        .with_context(|| {
+            format!(
+                "no worktree \"{sel}\" in {} (have: {})",
+                project.name,
+                of_project
+                    .iter()
+                    .map(|w| w.branch.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
+    if worktree.is_main {
+        bail!("cannot delete the primary checkout — remove the project instead");
+    }
+    // Deleting the worktree kills every session on it — refuse to saw off
+    // the branch the caller itself sits on.
+    if let Ok(agent_id) = std::env::var("NEBULA_AGENT_ID") {
+        if agents
+            .iter()
+            .any(|a| a.id.as_str() == agent_id && a.worktree_id == worktree.id)
+        {
+            bail!("that is this session's own worktree — a delete would kill this session");
+        }
+    }
+    let req_id = 1u64;
+    write_frame(
+        &mut conn.stream,
+        &ClientRequest::DeleteWorktree {
+            req_id,
+            id: worktree.id.clone(),
+            force,
+        },
+    )
+    .await?;
+    let mut upserts = Vec::new();
+    await_ack(&mut conn, req_id, &mut upserts).await?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "project": project.name,
+            "branch": worktree.branch,
+            "deleted": true,
+        })
+    );
+    Ok(())
+}
+
 /// `nebula agent new` flags, bundled — the CLI surface mirrors the TUI's
 /// new-session picker plus the orchestration extras.
 pub struct NewAgentOpts {

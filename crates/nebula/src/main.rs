@@ -127,6 +127,19 @@ enum WorktreeCommand {
         #[arg(long)]
         project: Option<String>,
     },
+    /// Delete a worktree through the daemon so the checkout and nebula's
+    /// row go together (raw `git worktree remove` leaves a ghost row).
+    /// Sessions living on it are killed.
+    Delete {
+        /// Branch or directory name of the worktree.
+        name: String,
+        /// Remove even with uncommitted changes.
+        #[arg(long)]
+        force: bool,
+        /// Project name (default: the calling session's project).
+        #[arg(long)]
+        project: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -311,6 +324,11 @@ fn main() -> Result<()> {
                 from,
                 project,
             } => nebula_tui::run_worktree_new(name.join(" "), from, project),
+            WorktreeCommand::Delete {
+                name,
+                force,
+                project,
+            } => nebula_tui::run_worktree_delete(name, force, project),
         },
         Some(Command::Agent { command }) => match command {
             AgentCommand::New {

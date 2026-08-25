@@ -69,6 +69,9 @@ pub const ORCHESTRATOR_INSTRUCTION: &str = "[nebula] This session is the \
 project's ORCHESTRATOR. You manage the project by creating worktrees and \
 delegating work to agent sessions via shell commands (pre-authorized):\n\n  \
 nebula worktree new <name> [--from <ref>]\n  \
+nebula worktree delete <branch> [--force]   # removes the checkout AND \
+nebula's row (kills its sessions); never raw `git worktree remove` — \
+that leaves a ghost row in nebula\n  \
 nebula agent new --worktree <branch> [--kind claude|codex|cursor|pi] \
 [--model M] [--effort E] [--name <title>] --prompt \"<task>\"\n  \
 nebula agent list   # your workers, with status, as JSON\n  \
@@ -271,6 +274,15 @@ mod tests {
         assert!(ORCHESTRATOR_INSTRUCTION.contains("--name"));
         assert!(ORCHESTRATOR_INSTRUCTION.contains("search"));
         assert!(ORCHESTRATOR_INSTRUCTION.contains("derived from --prompt"));
+    }
+
+    /// The brief must keep teaching the daemon-side worktree delete —
+    /// raw `git worktree remove` leaves a ghost row in the panel.
+    #[test]
+    fn orchestrator_instruction_teaches_worktree_delete() {
+        assert!(ORCHESTRATOR_INSTRUCTION.contains("nebula worktree delete"));
+        assert!(ORCHESTRATOR_INSTRUCTION.contains("git worktree remove"));
+        assert!(ORCHESTRATOR_INSTRUCTION.contains("ghost row"));
     }
 
     /// The brief must keep teaching the blocking wait: delegate, then

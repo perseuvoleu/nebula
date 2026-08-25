@@ -3244,6 +3244,71 @@ async fn auto_title_instruction_and_rename_flow() {
     wait_for_exit(&mut daemon);
 }
 
+/// `nebula worktree delete` — the CLI must go through the daemon's delete
+/// flow so the git checkout and nebula's worktree row disappear together
+/// (raw `git worktree remove` leaves a ghost row in the Worktrees panel).
+#[tokio::test]
+async fn worktree_delete_cli_removes_checkout_and_row() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let mut daemon = env.spawn_daemon();
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let _main = add_project_get_main_worktree(&mut c, &repo).await;
+
+    let run_cli = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+            .args(args)
+            .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
+            .output()
+            .unwrap()
+    };
+
+    let out = run_cli(&["worktree", "new", "scratch", "--project", "repo"]);
+    assert!(out.status.success(), "worktree new failed: {out:?}");
+    let events = read_events_until(&mut c, Duration::from_secs(10), |evs| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Worktree(w) }
+                if w.branch == "scratch")
+        })
+    })
+    .await;
+    let path = events
+        .iter()
+        .find_map(|e| match e {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(w),
+            } if w.branch == "scratch" => Some(w.path.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(path.exists(), "checkout should exist at {path:?}");
+
+    let out = run_cli(&["worktree", "delete", "scratch", "--project", "repo"]);
+    assert!(out.status.success(), "worktree delete failed: {out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("\"deleted\":true"), "stdout: {stdout}");
+    read_events_until(&mut c, Duration::from_secs(10), |evs| {
+        evs.iter()
+            .any(|e| matches!(e, ServerEvent::EntityRemoved { id: EntityId::Worktree(_) }))
+    })
+    .await;
+    assert!(!path.exists(), "checkout should be gone from {path:?}");
+
+    // The primary checkout is refused with a clear message.
+    let out = run_cli(&["worktree", "delete", "main", "--project", "repo"]);
+    assert!(!out.status.success(), "deleting main must fail: {out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("primary checkout"),
+        "stderr should explain the refusal: {stderr}"
+    );
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
 /// `nebula add <dir>` and the bare `nebula <dir>` shorthand: the one-shot CLI
 /// resolves the path against its own cwd (the daemon's differs), registers
 /// the repo over IPC, and surfaces daemon rejections as nonzero exits.

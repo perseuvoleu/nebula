@@ -14,6 +14,227 @@ about what is worth recording.
 
 ## Entries
 
+### Draw-Path CPU: Link Scan Memoized, `git status` Off-Loop — 2026-08-25
+
+**Asked:** "putem face mai eficienta aplicatia sa nu consume asa mult sa fie mai fluid totul ?"
+
+**Did:** Profiled the live TUI with `/usr/bin/sample <pid> 5 -f out.txt` (the bare `sample` on PATH is
+a broken homebrew python shim). Two real hotspots on the main thread: (1)
+`links::visible_links`/`visible_file_links` rescanned every visible cell on every frame — ~40% of
+`draw_terminal` at 60fps while an agent streams; (2) `refresh_git_changes` ran `git status`
+**synchronously inside the draw gate** (`Command::output` blocking the select loop every `GIT_POLL`
+tick — the micro-freeze). Fixes: `AttachedTerm` (app.rs) grew `screen_gen` + a private `links_cache`
+memo with `feed()`/`touch()`/`links()` — gen bumps on `feed` (both `ServerEvent::Output`/`Scrollback`
+sites now call `term.feed`), `reset`, `set_scroll`, and `sync_pty_size`'s `set_size`; both draw sites
+(`draw_terminal`, `draw_quick_terminal` in ui.rs) consume `term.links()`. Git: new
+`spawn_git_changes(app, &git_tx)` (event_loop.rs) runs `changed_files` on `spawn_blocking`, answer
+lands on a `git_rx` select arm (the `pr_tx`/`pr_rx` pattern), guarded by `App.git_inflight`; the arm
+re-spawns if the selection moved mid-flight. The old sync `refresh_git_changes` survives `#[cfg(test)]`
+as the reference impl its two tests drive. Tests: `link_scan_memo_invalidates_on_new_output` (app.rs);
+469 nebula-tui + full workspace green; `make install` (TUI-only, old daemon fine).
+
+**Gotchas:**
+- Tests that call `term.parser.process(...)` directly bypass the gen bump — safe only because they
+  also call `links::visible_links(screen)` directly, never the memo. New code must feed PTY bytes
+  through `term.feed()` or the underlines/⌥click go stale.
+- `selected_worktree_changes` was already keyed by worktree id, so the async badge can never paint
+  another checkout's count — the draw-gate "refresh before drawing" invariant relaxed to "kick a read
+  and draw blank" without any render change.
+- Idle CPU was already fine (~0% daemon, TUI repaints only on dirty); the waste was per-frame work
+  while streaming, so measure with an agent producing output.
+
+### Branch Pickers Lead With The Primary Branch — 2026-08-25
+
+**Asked:** "cand fac un orchestrator tre sa fie primul branch primary default si dupa sa ma pot da
+in jos"
+
+**Did:** `project_local_branches` (event_loop.rs) now hoists the primary checkout's branch to index
+0; the rest keep newest-commit-first order. Both consumers change together: the orchestrator's
+"Orchestrator branch" picker AND the `ab` alias's "Agent branch" picker now open with `<branch> ⌂
+primary` hovered — Enter takes the default, j walks down. Test
+`orchestrator_branch_picker_lists_branches_newest_first_with_root_hint` renamed to
+`…_leads_with_primary_then_newest_first`. 468 nebula-tui + workspace green; `make install`
+(TUI-only, old daemon fine).
+
+**Gotchas:**
+- This deliberately reverses the earlier "primary keeps its newest-first slot" decision from the
+  branch-picker entry below — the user asked for primary-first; don't restore newest-first.
+- The worktree-creation "Base branch" picker is untouched on purpose: it hovers the selected
+  worktree's branch (the old implicit base), not primary, and builds its own list.
+
+### Sidebar Sections Scroll When They Overflow — 2026-08-25
+
+**Asked:** "as vrea sa la toate sectiuniile cand se atinge maximul de elemente sa se poata scrola"
+
+**Did:** New `scroll_skip(heights, selected, avail)` (ui.rs, above `render_pill`) — derives how many
+leading entries to skip so the selected one stays visible (the ContextMenu derived-offset idiom, no
+stored state). Applied to the PROJECTS half (`draw_projects`), the ORCHESTRATORS half, and the
+WORKTREES half (`draw_worktrees` — group headers/primary-gap folded into their entry's height so
+skipping an entry skips them too; the PINNED header moved inside the loop, gated `i == 0`). The
+global SESSIONS section has no cursor, so it got real state: `App.global_sessions_scroll`,
+wheel-driven, clamped+written-back in `draw_global_sessions`, "… N above" hint on the blank row
+under the header, and a new `HitTarget::GlobalSessionsBg` rect (pushed AFTER the rows) for wheel/
+click over its empty space. Wheel over the other sidebar sections takes that section's focus and
+calls `move_selection(±1)` — j/k semantics; the selection-following draw is the scroll. Tests:
+`{worktrees,orchestrators,projects}_section_scrolls_to_keep_the_selection_visible`,
+`wheel_over_the_worktrees_section_walks_rows`, `global_sessions_wheel_scrolls_the_list`. 468
+nebula-tui + full workspace green; `make install` (TUI-only).
+
+**Gotchas:**
+- `hit_at` is first-match and the splitter grip rect covers the worktree panel's leftmost column:
+  a mouse test aiming at a row's hit rect must use `rect.x + 2`, not `rect.x`, or it hits
+  `Splitter(0)`.
+- Orchestrator names also render in the Projects column's global SESSIONS list — a screen test
+  asserting an orchestrator row scrolled OUT must pin the row shape (`"boss-0 ◆"`), not the bare
+  name.
+- Adding a `HitTarget` variant breaks the exhaustive click match at the top of `handle_mouse`'s
+  `Down(Left)` arm — the compiler finds it, but budget for it.
+
+### First Visit To A Worktree Attaches Its First Session — 2026-08-25
+
+**Asked:** "cand dau pe un wt ar treb sa mi de aload autoamt la ultimul panel de agent/terminal in
+care am fost sau daca nu prima daca e pt prima data"
+
+**Did:** Half of this already existed: `restore_session` (event_loop.rs) re-attached the
+worktree's remembered session (`App.last_session_for_worktree`) on every worktree switch. Only the
+first-visit case was missing — the `None` arm blanked the pane. Added an `.or_else` fallback that
+picks the first `visible_session_rows()` row with a live `sref()` (skips links and archived
+agents) and attaches it; the pane now blanks only when the worktree truly has nothing attachable.
+Tests: new `first_visit_to_a_worktree_attaches_its_first_session`;
+`palette_enter_on_worktree_navigates_without_attaching` pinned the OLD blank-pane behavior and was
+rewritten as `palette_enter_on_worktree_previews_its_first_session_unlocked`. 463 nebula-tui +
+full workspace green; `make install` (TUI-only, old daemon fine).
+
+**Gotchas:**
+- `restore_session` is the single funnel for worktree/project switches from every entry point
+  (click, j/k, palette jumps, `select_worktree_by_id`) — changing its fallback changes them all;
+  the palette-Enter test was the only one that noticed.
+- `switching_contexts_restores_the_remembered_session` still passes untouched because its sibling
+  worktree/project have no sessions at all — "blanks" remains correct for genuinely empty targets.
+
+### `nebula worktree delete` CLI Verb; ⌘1–⌘5 Ghostty Overlay Binds — 2026-08-25
+
+**Asked:** "as vrea cand ii zic sa steaerga un wt sa stearga si din nebula wt din lista" — plus
+mid-task: "si cmmd 1 cmmd 2 inca nu schimba tab ul de panels".
+
+**Did:** New `nebula worktree delete <branch> [--force] [--project]` — `worktree_delete` in
+`crates/nebula-tui/src/ipc.rs` (resolves by branch or directory name, refuses the main checkout and
+the caller's own worktree, sends the EXISTING `ClientRequest::DeleteWorktree` — no protocol change,
+works against the running old daemon), `WorktreeCommand::Delete` in `crates/nebula/src/main.rs`,
+`run_worktree_delete` in lib.rs. The daemon's `delete_worktree` (registry.rs) already did everything
+(kill sessions, `git worktree remove`, drop the sqlite row, broadcast) — only the CLI verb was
+missing, exactly as the merge-train entry's ghost-row gotcha predicted. `ORCHESTRATOR_INSTRUCTION`
+(hooks/mod.rs) now lists the verb and forbids raw `git worktree remove`. Tests:
+`orchestrator_instruction_teaches_worktree_delete`, e2e
+`worktree_delete_cli_removes_checkout_and_row` (e2e_pty.rs). The ⌘1/⌘2 complaint was NOT a code bug:
+the keymap/intercept work from the previous entry was fine, but `~/.config/ghostty/nebula` had no
+digit binds — added `keybind = super+digit_1=csi:49;9u` … `digit_5=csi:53;9u` (codepoints 49–53,
+mods 9 = super). Full workspace green; `make install` run (instruction text is daemon-side — needs
+`nebula kill` to take; the delete verb itself works against the old daemon).
+
+**Gotchas:**
+- Ghostty spells digit keys `digit_1`, not `one`/`1` — the herdr overlay (`~/.config/ghostty/herdr`)
+  is the reference for digit binds. Overlay changes only load on the next `ng` launch.
+- The self-delete guard matters: the daemon kills every session on the worktree before removing it,
+  so an agent deleting its own checkout would kill itself mid-command.
+- `Bash(nebula worktree:*)` in the installer is a prefix match — the new verb needed no allow-rule
+  change (same as the `agent wait` entry found).
+
+### ⌘1–⌘5 Panel Jumps; ⌘T Always Makes A Terminal Tab — 2026-08-25
+
+**Asked:** "si pune cand dau cmmd + 1, cmmd 2 etc sa mi dea switch pe pannels" — plus mid-task, after
+trying the previous ⌘T change: "ok dar cmmd t tot nu mi face temrinal nou acolo in tabs".
+
+**Did:** Five new keymap actions `FocusProjectsPanel`…`FocusTerminalPanel` (ids
+`focus_*_panel`, NAVIGATE group) bound `cmd+1`…`cmd+5` with plain `1`…`5` as the
+terminal-reachable alternates; dispatched via `focus_panel` (event_loop.rs) — closes the quick
+terminal, expands collapsed sidebars, drops the lock, except ⌘5 which enters the pane and LOCKS
+input when a live session is attached. The chords also fire inside a locked terminal (added to the
+SUPER intercept block). ⌘T (`quick_terminal_shortcut`) is now unconditional: it always creates an
+unnamed terminal tab via `create_terminal_for_context` (the earlier focus==Worktrees gate was why
+the user said "tot nu mi face terminal") — the floating quick terminal now opens ONLY from the
+palette's `t` alias, and ⌘T with the window up closes it. Tests: `cmd_digits_jump_between_panels`,
+`cmd_t_creates_an_unnamed_terminal_tab`, and the four quick-terminal tests reworked to open via
+`toggle_quick_terminal` directly. 462 nebula-tui + workspace green; `make install`.
+
+**Gotchas:**
+- `keymap::tests::every_action_ships_with_a_reachable_chord` rejects actions whose only bindings
+  are ⌘/⌥ chords (host_warning marks both Blocked/Risky) — plain digits `1`–`5` were free and pass.
+- Hotkey settings tests assume ACTIONS row 0 is "Next panel" — new NAVIGATE specs must be inserted
+  AFTER the FocusNext spec, not before.
+
+### Projects Column Split: Compact Pills + Global SESSIONS Section; ⌘T Context-Aware — 2026-08-25
+
+**Asked:** "aici la projects trebuie sa facem ca la orchestratori si workerees trebuie spart in 2
+secituni, sa ma ifie una cu sesiuni, si sa fie toate de pe toate proiectele cu statusuri in timp real
+si jos sa scris si acum cat timp a terminat, si mai scoate din spatii dintre elemente" — plus mid-task:
+"vreau sa mutam cmmd + t cand sunt pe un worktree si dau cmmd t sa mi faca un terminal nou direct
+fara nume".
+
+**Did:** The Projects column now splits at its vertical middle like the ORCHESTRATORS/WORKTREES
+column: projects on top as compact 2-row pills (the 3-row `render_button` + `PROJECT_BTN_H` are
+gone — that was the "spatii dintre elemente"), and a `SESSIONS · N` section below listing
+`App::global_sessions()` — every non-archived agent across all projects of the ACTIVE WORKSPACE
+(workspace filter is mandatory: without it the `switching_workspace_refilters…` test catches the
+leak), working sessions first, each a pill with a `project · 2m ago` sub-line
+(`crate::hosts::ago_label`). Rows are click-to-jump via the existing `jump_to_target(app,
+PaletteTarget::Session(id), false, out)` — no new Focus variant; the section holds no keyboard
+focus. New `HitTarget::GlobalSession(usize)`; overflow renders "… N more". ⌘T
+(`quick_terminal_shortcut` wrapping `toggle_quick_terminal`): on `Focus::Worktrees` it calls
+`create_terminal_for_context` (unnamed CreateTerminal, auto-attach) instead of the floating quick
+terminal; everywhere else unchanged. Tests:
+`global_sessions_section_lists_all_projects_and_click_jumps`,
+`cmd_t_on_a_worktree_creates_an_unnamed_terminal`; 461 nebula-tui + workspace green; `make install`.
+
+**Gotchas:**
+- On a selected divider the global section must blank too (`divider_focused` gate in
+  `draw_projects`) — `selected_divider_blanks_the_panes_with_a_hint` asserts "agent-1" appears
+  NOWHERE on screen.
+- A project divider row now overwrites the pill's bottom pad row (pills stack on the 2-row stride),
+  so `divider_renders_under_project_row` asserts lines 3/4/5 = cap/text/divider, not the old 3/4/5/6.
+- `global_sessions()` must scope to `tree.in_active_workspace(project_of_agent(a))` — agents carry
+  no workspace id themselves; resolve worktree → project → workspace.
+
+### Sessions Column Replaced By Tabs In The Terminal Header — 2026-08-25
+
+**Asked:** "m ise pare ux ui cam greu as vrea cumvasa compactez simplific ma ganeam sesiuile sa fie
+deasupra agentului ca tab uri ca la ghsoty/herdr, si orchestratoarele worktree urile compactate cumva,
+d ami mai multe optiuni" — from the options offered, the user picked "doar A: session tabs" (tabs only;
+the PROJECTS and ORCHESTRATORS/WORKTREES columns stay as they are).
+
+**Did:** The SESSIONS column is gone; sessions render as tabs in the terminal pane's header row
+(4 columns → 3). `ui.rs`: `draw_sessions`/`draw_session_row`/`SessionEntry` deleted, new
+`session_tab` + `draw_session_tabs` (tab bar with per-kind glyphs `●`/`❯`/`↗`, selected-tab
+harness/PR badge, `⊘ N` archived chip on the right that click-toggles like the old ARCHIVED header,
+left-trim with `‹`/`›` so the selected tab always fits); `terminal_frame` kept for the divider/
+quick-term states, rule split into `terminal_rule`. `panel_widths` is `[u16; 2]` now
+(`DEFAULT_PANEL_WIDTHS = [20, 22]`), `UiState.panel_widths` became `Option<Vec<u16>>` so old 3-wide
+blobs still deserialize (extras ignored). **The whole `Focus::Sessions` keyboard model is untouched**
+— the tab bar IS the Sessions focus; j/k/wheel walk tabs (wheel over the bar moves selection without
+stealing focus), Enter attaches, A/p/d/r work as before. Also removed: the transcript-preview
+subsystem (`SessionPreview`, `pending_preview`, `schedule_preview`/`fire_pending_preview`,
+`preview_delay`) — its sub-line had nowhere to render, and tab selection previews the live PTY
+anyway; and the per-row "23m ago" badge (`ago_badge`). 459 nebula-tui + 8 e2e + full workspace
+green; `make install` run.
+
+Follow-up in the same session ("sub fiecare as vrea sa scrie si modelul"): the bar is two rows tall —
+name row plus a dim model row (`model · effort`, "default" when unset, blank for Cursor/terminals/
+links) — `session_tab` returns `(top, bottom, w)` with `w = max` of the two rows, the rule moved to
+header row 3 and the PTY content starts at `area.y + 4` (both `terminal_frame` and the tabs path,
+so the pane never resizes when crossing a divider row).
+
+**Gotchas:**
+- Tab labels truncate to 14 chars unselected / 24 selected — any test (unit or e2e) asserting a
+  session/link name longer than 14 chars must either select the row first or assert the truncated
+  prefix (e2e now waits for "#7 Attach li" once the PR tab is unselected).
+- The e2e harness's `row_is_selected` (bg 237/235 anywhere in the needle's row) works unchanged for
+  tabs — the selected tab's `sel_bg` fill satisfies it.
+- A python `str.replace` rewriting the sessions PINNED/UNPINNED render assertions clobbered the
+  *worktrees* pinned-group test too (identical block) — the worktree panel still has those headers;
+  only the sessions ones died.
+- `splitter_x`/grip/hit loops hardcoded `0..3` in three places (`draw` hits, `draw_splitter_grips`,
+  test `seed_splitters`) — all had to drop to `0..2` or every draw panicked on the `[u16; 2]` index.
+
 ### Vim-Style Aliases In The ⌘K Command Palette — 2026-08-25
 
 **Asked:** "cand dau cmmd k as vrea sa le pot da din comenzi ca vim simplificate gen sa scriu a sa mi

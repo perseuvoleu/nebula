@@ -44,6 +44,12 @@ pub enum HitTarget {
     /// "+ new orchestrator" placeholder is row 0 of an empty section).
     Orchestrator(usize),
     Session(usize),
+    /// Row in the Projects panel's all-projects SESSIONS section — an
+    /// index into `App::global_sessions()`; a click jumps to the session.
+    GlobalSession(usize),
+    /// The SESSIONS section's background (registered after its rows, so
+    /// rows win) — the wheel scrolls the list here.
+    GlobalSessionsBg,
     /// The ARCHIVED group header (either form); a click toggles the group
     /// open/closed, same as the A key.
     ArchivedHeader,
@@ -51,13 +57,13 @@ pub enum HitTarget {
     PanelBg(Focus),
     TerminalPane,
     /// Draggable vertical boundary between panels, left to right:
-    /// 0 = projects|worktrees, 1 = worktrees|sessions, 2 = sessions|terminal.
+    /// 0 = projects|worktrees, 1 = worktrees|terminal.
     Splitter(usize),
 }
 
-/// Default widths of the Projects / Worktrees / Sessions panels. Sessions
-/// is the widest because its rows carry the most: name, "23m ago", harness.
-pub const DEFAULT_PANEL_WIDTHS: [u16; 3] = [20, 22, 32];
+/// Default widths of the Projects / Worktrees panels (sessions render as
+/// tabs in the terminal header, not as a column).
+pub const DEFAULT_PANEL_WIDTHS: [u16; 2] = [20, 22];
 /// A panel can't be dragged narrower than this.
 pub const MIN_PANEL_W: u16 = 10;
 /// The terminal pane always keeps at least this much width.
@@ -1595,18 +1601,6 @@ pub fn pretty_url(url: &str) -> String {
     bare.strip_suffix('/').unwrap_or(bare).to_string()
 }
 
-/// Cached last-message preview for the sessions panel (`App::preview`):
-/// what one tail-read of an agent's transcript came back with.
-#[derive(Debug, Clone)]
-pub struct SessionPreview {
-    pub agent: AgentId,
-    /// Transcript mtime at read time (None = file missing), so a re-fire
-    /// for an unchanged file skips the read.
-    pub mtime: Option<std::time::SystemTime>,
-    /// Collapsed message text; None = no assistant text found.
-    pub text: Option<String>,
-}
-
 /// One row in the Sessions panel: agents (pinned / recent / unpinned), then
 /// shell terminals, then the worktree's links, then archived agents.
 #[derive(Debug, Clone)]
@@ -1831,6 +1825,16 @@ pub struct AttachedTerm {
     /// The child's kitty keyboard flags (daemon-tracked); picks the key
     /// encoding dialect. 0 = legacy.
     pub kitty_flags: u8,
+    /// Bumped whenever the visible screen may have changed (output, replay,
+    /// resize, scrollback), so screen-derived work can be memoized per
+    /// change instead of per frame.
+    pub screen_gen: u64,
+    /// Link-scan memo: the generation it was computed at, plus the scan.
+    links_cache: Option<(
+        u64,
+        Vec<crate::links::TermLink>,
+        Vec<crate::links::FileLink>,
+    )>,
 }
 
 impl AttachedTerm {
@@ -1843,6 +1847,8 @@ impl AttachedTerm {
             rows,
             scroll: 0,
             kitty_flags: 0,
+            screen_gen: 0,
+            links_cache: None,
         }
     }
 
@@ -1851,11 +1857,41 @@ impl AttachedTerm {
         self.parser = vt100::Parser::new(self.rows, self.cols, 10_000);
         self.exited = false;
         self.scroll = 0;
+        self.touch();
     }
 
     pub fn set_scroll(&mut self, scroll: usize) {
         self.scroll = scroll;
         self.parser.screen_mut().set_scrollback(scroll);
+        self.touch();
+    }
+
+    /// Feed PTY bytes to the parser, invalidating screen-derived memos.
+    pub fn feed(&mut self, data: &[u8]) {
+        self.parser.process(data);
+        self.touch();
+    }
+
+    /// Mark the screen changed: the next [`Self::links`] call rescans.
+    pub fn touch(&mut self) {
+        self.screen_gen = self.screen_gen.wrapping_add(1);
+    }
+
+    /// The visible URL and file links, rescanned only when the screen
+    /// changed since the last call — the scan walks every visible cell,
+    /// far too much to repeat on every 60fps frame of a streaming agent.
+    pub fn links(&mut self) -> (Vec<crate::links::TermLink>, Vec<crate::links::FileLink>) {
+        let fresh = matches!(&self.links_cache, Some((g, ..)) if *g == self.screen_gen);
+        if !fresh {
+            let screen = self.parser.screen();
+            self.links_cache = Some((
+                self.screen_gen,
+                crate::links::visible_links(screen),
+                crate::links::visible_file_links(screen),
+            ));
+        }
+        let (_, links, files) = self.links_cache.as_ref().unwrap();
+        (links.clone(), files.clone())
     }
 }
 
@@ -1867,9 +1903,11 @@ pub struct UiState {
     pub session_agent: Option<String>,
     pub show_archived: bool,
     pub collapsed: bool,
-    /// Panel widths (projects, worktrees, sessions); absent in older blobs.
+    /// Panel widths (projects, worktrees); absent in older blobs. Kept as a
+    /// Vec so blobs written when Sessions was still a third column (3 wide)
+    /// keep deserializing — extras are ignored on restore.
     #[serde(default)]
-    pub panel_widths: Option<[u16; 3]>,
+    pub panel_widths: Option<Vec<u16>>,
     /// Diff modal file-list width; absent in older blobs.
     #[serde(default)]
     pub diff_files_width: Option<u16>,
@@ -1957,16 +1995,6 @@ pub struct App {
     /// keeps indexing worktrees only.
     pub sel_orchestrator: Option<usize>,
     pub sel_session: usize,
-    /// First visible row of the Sessions panel, in panel rows (not list
-    /// indices — group headers and pill pads take rows too). The wheel
-    /// moves it freely; the draw clamps it to the content height and
-    /// re-anchors it on the selected row whenever `sessions_anchor` shows
-    /// the selection moved (so arrows follow the cursor but the wheel
-    /// doesn't fight it).
-    pub sessions_scroll: usize,
-    /// `(sel_worktree, sel_session)` as of the last draw — the draw
-    /// re-anchors `sessions_scroll` only when this changes.
-    pub sessions_anchor: Option<(usize, usize)>,
     pub term: Option<AttachedTerm>,
     /// Input lock: keys forward to the attached PTY. Focusing the terminal
     /// pane alone (Tab / arrows) does NOT lock — Enter, a click, or `z` does.
@@ -2029,6 +2057,10 @@ pub struct App {
     /// Last selected session per worktree — switching back to a worktree
     /// re-shows the session the user left it on.
     pub last_session_for_worktree: HashMap<WorktreeId, SessionRef>,
+    /// Wheel scroll of the Projects column's SESSIONS section (rows to
+    /// skip from the top). The section has no cursor, so this is real
+    /// state; the draw clamps it to the list.
+    pub global_sessions_scroll: usize,
     /// Debounced session prewarm: the worktree whose dead sessions the
     /// daemon should pre-spawn once the selection has rested on it past the
     /// deadline — armed on every worktree context switch, so walking the
@@ -2038,15 +2070,6 @@ pub struct App {
     /// warm default-spec Claude session, so one is always ready to adopt.
     /// Re-armed after every send; disarmed when nothing is selected.
     pub next_keepwarm: Option<std::time::Instant>,
-    /// Last assistant message of the selected Claude session's transcript,
-    /// the dim sub-line under its row in the sessions panel. Kept until
-    /// another agent's read replaces it, so the panel never shows one
-    /// agent's words under another's row (`preview_text` matches on id).
-    pub preview: Option<SessionPreview>,
-    /// Debounced preview refresh: the agent whose transcript tail to read
-    /// once the session selection has rested on it past the deadline —
-    /// same idiom as `pending_prewarm`.
-    pub pending_preview: Option<(AgentId, std::time::Instant)>,
     /// Mouse drag-selection over the terminal pane, if any.
     pub term_selection: Option<TermSelection>,
     /// Last left-click on the terminal pane (time + pane-relative cell), for
@@ -2063,7 +2086,7 @@ pub struct App {
     pub term_file_links: Vec<crate::links::FileLink>,
     /// Widths of the Projects / Worktrees / Sessions panels; the terminal
     /// pane takes the remainder.
-    pub panel_widths: [u16; 3],
+    pub panel_widths: [u16; 2],
     /// File-list width of the diff modal, remembered across opens.
     pub diff_files_width: u16,
     /// Selected tab of the settings modal, remembered across opens.
@@ -2114,6 +2137,9 @@ pub struct App {
     /// the inner `None` means the checkout wasn't readable. The event loop
     /// refreshes it on a slow poll and before drawing a changed selection.
     pub git_changes: Option<(WorktreeId, Option<usize>)>,
+    /// A changed-file read is running off-loop; don't stack another. The
+    /// answer lands on the event loop's git channel.
+    pub git_inflight: bool,
     /// What `gh pr view` last said about each worktree's branch: `Some(pr)`
     /// when one exists, `None` when the lookup came back empty (no PR, no
     /// `gh`, no remote). A missing key means "not looked up yet". An empty
@@ -2187,8 +2213,6 @@ impl App {
             sel_worktree: 0,
             sel_orchestrator: None,
             sel_session: 0,
-            sessions_scroll: 0,
-            sessions_anchor: None,
             term: None,
             term_locked: false,
             quick_term: false,
@@ -2216,10 +2240,9 @@ impl App {
             select_link_when_seen: None,
             last_worktree_for_project: HashMap::new(),
             last_session_for_worktree: HashMap::new(),
+            global_sessions_scroll: 0,
             pending_prewarm: None,
             next_keepwarm: None,
-            preview: None,
-            pending_preview: None,
             term_selection: None,
             last_term_click: None,
             last_session_click: None,
@@ -2243,6 +2266,7 @@ impl App {
             vim_tx: None,
             vim_generation: 0,
             git_changes: None,
+            git_inflight: false,
             pull_requests: HashMap::new(),
             pr_seen: HashMap::new(),
             pr_inflight: std::collections::HashSet::new(),
@@ -2341,7 +2365,7 @@ impl App {
     /// `MIN_TERM_W` whenever the screen allows it at all.
     pub fn normalize_panel_widths(&mut self, body_w: u16) {
         let budget = body_w.saturating_sub(MIN_TERM_W);
-        for i in (0..3).rev() {
+        for i in (0..2).rev() {
             let others: u16 = self
                 .panel_widths
                 .iter()
@@ -2719,6 +2743,42 @@ impl App {
     /// reads as a history of what you have been doing. Working sessions
     /// count as interacting now, which keeps them heading RECENT however
     /// long the turn has taken.
+    /// Every live (non-archived) session across every project of the open
+    /// workspace, most recent activity first — working sessions lead.
+    /// Feeds the Projects panel's all-projects SESSIONS section;
+    /// orchestrators are included, they are sessions too.
+    pub fn global_sessions(&self) -> Vec<Agent> {
+        let now = now_ms();
+        let mut working: Vec<Agent> = Vec::new();
+        let mut rest: Vec<Agent> = Vec::new();
+        for a in self.tree.agents.iter().filter(|a| {
+            !a.archived
+                && self
+                    .project_of_agent(a)
+                    .is_some_and(|p| self.tree.in_active_workspace(p))
+        }) {
+            if matches!(
+                a.status,
+                AgentStatus::Running | AgentStatus::NeedsFeedback
+            ) {
+                working.push(a.clone());
+            } else {
+                rest.push(a.clone());
+            }
+        }
+        working.sort_by_key(|a| recency_key(a, now));
+        rest.sort_by_key(|a| recency_key(a, now));
+        working.extend(rest);
+        working
+    }
+
+    /// The project a session's worktree belongs to, for the global list's
+    /// sub-line.
+    pub fn project_of_agent(&self, a: &Agent) -> Option<&Project> {
+        let wt = self.tree.worktrees.iter().find(|w| w.id == a.worktree_id)?;
+        self.tree.projects.iter().find(|p| p.id == wt.project_id)
+    }
+
     pub fn visible_sessions(&self) -> Vec<Agent> {
         let worktrees = self.visible_worktrees();
         let Some(wt) = self
@@ -2821,21 +2881,6 @@ impl App {
     pub fn prewarm_delay(&self) -> Option<std::time::Duration> {
         let (_, at) = self.pending_prewarm.as_ref()?;
         Some(at.saturating_duration_since(std::time::Instant::now()))
-    }
-
-    /// Delay until the pending transcript-preview read is due, so the
-    /// event loop can wake up and fire it. None when nothing is armed.
-    pub fn preview_delay(&self) -> Option<std::time::Duration> {
-        let (_, at) = self.pending_preview.as_ref()?;
-        Some(at.saturating_duration_since(std::time::Instant::now()))
-    }
-
-    /// The cached preview text, when it belongs to this agent.
-    pub fn preview_text(&self, agent: &AgentId) -> Option<&str> {
-        self.preview
-            .as_ref()
-            .filter(|p| &p.agent == agent)
-            .and_then(|p| p.text.as_deref())
     }
 
     /// Whether `gh` should be asked about this worktree now: not while an
@@ -3137,6 +3182,30 @@ mod tests {
             0,
             "alternate screen must not accumulate scrollback"
         );
+    }
+
+    /// The link scan is memoized per screen generation; new PTY bytes must
+    /// invalidate it, or a URL printed after the first scan never gets its
+    /// underline (and ⌥click misses it).
+    #[test]
+    fn link_scan_memo_invalidates_on_new_output() {
+        let sref = SessionRef::Agent(AgentId::from("test-agent".to_string()));
+        let mut term = AttachedTerm::new(sref, 80, 24);
+
+        term.feed(b"plain text, no links here");
+        let (links, files) = term.links();
+        assert!(links.is_empty() && files.is_empty(), "nothing to find yet");
+
+        // Served from the memo: same generation, same (empty) answer.
+        let (links, _) = term.links();
+        assert!(links.is_empty());
+
+        term.feed(b"\r\nsee https://example.com and src/app.rs:12");
+        let (links, files) = term.links();
+        assert_eq!(links.len(), 1, "new output must be rescanned");
+        assert_eq!(links[0].url, "https://example.com");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "src/app.rs");
     }
 
     #[test]

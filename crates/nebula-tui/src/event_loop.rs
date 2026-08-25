@@ -28,7 +28,6 @@ use std::time::Duration;
 
 /// Rows the Sessions column scrolls per wheel notch — one pill's stride,
 /// so the list steps by whole rows instead of drifting half a pill.
-const SESSIONS_WHEEL_STEP: usize = 2;
 
 /// Redraw cap (~60fps). Output bursts coalesce into one frame; input events
 /// are still handled immediately between frames.
@@ -52,7 +51,6 @@ const PREWARM_DEBOUNCE: Duration = Duration::from_millis(250);
 /// How long the session selection must rest on a Claude row before its
 /// transcript tail is read for the last-message sub-line — walking the
 /// list with j/k must not read a file per row passed.
-const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(250);
 
 /// How often the standing keep-warm request for the selected worktree's
 /// default-spec Claude session is re-sent. Must stay comfortably under the
@@ -218,6 +216,10 @@ async fn main_loop(
     // come back here and land in `app.pull_requests`.
     let (pr_tx, mut pr_rx) =
         tokio::sync::mpsc::unbounded_channel::<(WorktreeId, Option<PullRequest>)>();
+    // Changed-file counts read off-loop; `git status` can take tens of
+    // milliseconds on a big checkout, and a blocked draw is a visible hitch.
+    let (git_tx, mut git_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(WorktreeId, Option<usize>)>();
     let mut next_metrics_poll = tokio::time::Instant::now();
     let mut next_splash_frame = tokio::time::Instant::now();
     let mut next_sweep_frame = tokio::time::Instant::now();
@@ -233,15 +235,12 @@ async fn main_loop(
 
     loop {
         if app.dirty && tokio::time::Instant::now() >= next_draw {
-            // A selection change must never paint another checkout's badge;
-            // between selections the slow poll keeps the count fresh.
+            // A selection change kicks a fresh read right away; the badge
+            // stays blank (never another checkout's count — the getter is
+            // keyed by worktree) until the answer lands on `git_rx`.
             if app.git_changes_stale() {
-                refresh_git_changes(&mut app);
+                spawn_git_changes(&mut app, &git_tx);
             }
-            // Selection changes always dirty, so riding the draw catches
-            // every landing on a Claude row without touching each site
-            // that moves `sel_session`.
-            schedule_preview(&mut app);
             terminal.draw(|f| ui::draw(f, &mut app))?;
             app.dirty = false;
             next_draw = tokio::time::Instant::now() + FRAME_INTERVAL;
@@ -263,7 +262,7 @@ async fn main_loop(
             // Fixed deadline (not a fresh sleep per iteration) so heavy PTY
             // traffic can't starve the badge refresh.
             _ = tokio::time::sleep_until(next_git_poll) => {
-                refresh_git_changes(&mut app);
+                spawn_git_changes(&mut app, &git_tx);
                 // Rides the git tick rather than the repaint, so walking the
                 // worktree list with j/k can't spawn a `gh` per row passed —
                 // only whatever the selection is resting on when it fires.
@@ -329,13 +328,6 @@ async fn main_loop(
                 if app.pending_prewarm.is_some() =>
             {
                 fire_pending_prewarm(&mut app, &mut out);
-            }
-            // The session selection rested on a Claude row past the
-            // debounce: tail its transcript for the last-message sub-line.
-            _ = tokio::time::sleep(app.preview_delay().unwrap_or_default()),
-                if app.pending_preview.is_some() =>
-            {
-                fire_pending_preview(&mut app);
             }
             // Standing keep-warm: periodically re-assert the selected
             // worktree's warm default-spec Claude session so the daemon's
@@ -403,6 +395,22 @@ async fn main_loop(
                     handle_vim_event(&mut app, ev);
                 }
             }
+            answer = git_rx.recv() => {
+                // Never None: `git_tx` lives as long as the loop.
+                if let Some((worktree, count)) = answer {
+                    app.git_inflight = false;
+                    let next = Some((worktree, count));
+                    if app.git_changes != next {
+                        app.git_changes = next;
+                        app.dirty = true;
+                    }
+                    // The selection moved while the read ran: ask again for
+                    // where the cursor is now.
+                    if app.git_changes_stale() {
+                        spawn_git_changes(&mut app, &git_tx);
+                    }
+                }
+            }
             answer = pr_rx.recv() => {
                 // Never None: `pr_tx` lives as long as the loop.
                 if let Some((worktree, pr)) = answer {
@@ -468,9 +476,37 @@ async fn main_loop(
     }
 }
 
-/// Recompute the changed-file count behind the worktree panel's badge.
-/// Synchronous `git status` on purpose (the git_diff.rs precedent): it runs
-/// once per `GIT_POLL` plus on selection changes, off the input hot path.
+/// Kick a changed-file count read for the worktree panel's badge, off the
+/// loop — `git status` takes tens of milliseconds on a big checkout, and
+/// running it on the draw path was a visible hitch on every `GIT_POLL`
+/// tick. One read runs at a time; the answer lands on the loop's `git_rx`.
+fn spawn_git_changes(
+    app: &mut App,
+    git_tx: &tokio::sync::mpsc::UnboundedSender<(WorktreeId, Option<usize>)>,
+) {
+    let Some((id, path)) = app
+        .selected_worktree()
+        .map(|w| (w.id.clone(), w.path.clone()))
+    else {
+        if app.git_changes.take().is_some() {
+            app.dirty = true;
+        }
+        return;
+    };
+    if app.git_inflight {
+        return;
+    }
+    app.git_inflight = true;
+    let git_tx = git_tx.clone();
+    tokio::task::spawn_blocking(move || {
+        let count = crate::git_diff::changed_files(&path).ok().map(|f| f.len());
+        let _ = git_tx.send((id, count));
+    });
+}
+
+/// The synchronous reference for `spawn_git_changes` — same read, same
+/// cache write, minus the off-loop hop; tests drive the cache through it.
+#[cfg(test)]
 fn refresh_git_changes(app: &mut App) {
     let next = app
         .selected_worktree()
@@ -574,7 +610,7 @@ fn ui_state_json(app: &App) -> String {
         session_agent: app.selected_session().map(|a| a.id.to_string()),
         show_archived: app.show_archived,
         collapsed: app.collapsed,
-        panel_widths: Some(app.panel_widths),
+        panel_widths: Some(app.panel_widths.to_vec()),
         diff_files_width: Some(app.diff_files_width),
     };
     serde_json::to_string(&state).unwrap_or_else(|_| "{}".into())
@@ -588,8 +624,11 @@ fn restore_ui_state(app: &mut App, json: &str) {
     app.show_archived = state.show_archived;
     if let Some(w) = state.panel_widths {
         // Coarse sanity clamp; normalize_panel_widths re-fits to the actual
-        // screen on the next draw.
-        app.panel_widths = w.map(|v| v.clamp(crate::app::MIN_PANEL_W, 300));
+        // screen on the next draw. Older blobs carry a third (sessions)
+        // width — ignored now that sessions render as tabs.
+        for (slot, v) in app.panel_widths.iter_mut().zip(w) {
+            *slot = v.clamp(crate::app::MIN_PANEL_W, 300);
+        }
     }
     if let Some(w) = state.diff_files_width {
         // Coarse sanity clamp; the draw re-caps it to the actual modal width.
@@ -637,6 +676,7 @@ fn sync_pty_size(app: &mut App, out: &mut Vec<ClientRequest>) {
             term.cols = area.width;
             term.rows = area.height;
             term.parser.screen_mut().set_size(area.height, area.width);
+            term.touch();
             out.push(ClientRequest::Resize {
                 session: term.sref.clone(),
                 cols: area.width,
@@ -854,7 +894,24 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             }
             match app.keymap.lookup(crate::keymap::Scope::Global, &chord) {
                 Some(crate::keymap::Action::QuickTerminal) => {
-                    toggle_quick_terminal(app, out);
+                    quick_terminal_shortcut(app, out);
+                    return;
+                }
+                Some(
+                    action @ (crate::keymap::Action::FocusProjectsPanel
+                    | crate::keymap::Action::FocusOrchestratorsPanel
+                    | crate::keymap::Action::FocusWorktreesPanel
+                    | crate::keymap::Action::FocusSessionsPanel
+                    | crate::keymap::Action::FocusTerminalPanel),
+                ) => {
+                    let focus = match action {
+                        crate::keymap::Action::FocusProjectsPanel => Focus::Projects,
+                        crate::keymap::Action::FocusOrchestratorsPanel => Focus::Orchestrators,
+                        crate::keymap::Action::FocusWorktreesPanel => Focus::Worktrees,
+                        crate::keymap::Action::FocusSessionsPanel => Focus::Sessions,
+                        _ => Focus::Terminal,
+                    };
+                    focus_panel(app, focus, out);
                     return;
                 }
                 Some(crate::keymap::Action::ToggleTerminalFullscreen) => {
@@ -969,6 +1026,11 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             app.splash_preview = true;
             app.collapsed = false;
         }
+        Action::FocusProjectsPanel => focus_panel(app, Focus::Projects, out),
+        Action::FocusOrchestratorsPanel => focus_panel(app, Focus::Orchestrators, out),
+        Action::FocusWorktreesPanel => focus_panel(app, Focus::Worktrees, out),
+        Action::FocusSessionsPanel => focus_panel(app, Focus::Sessions, out),
+        Action::FocusTerminalPanel => focus_panel(app, Focus::Terminal, out),
         Action::FocusNext => {
             app.focus = match app.focus {
                 Focus::Projects => Focus::Orchestrators,
@@ -1279,7 +1341,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         // Floating shell on the current branch, no picker. Like the command
         // palette, no terminal-focus guard: an unlocked pane forwards
         // nothing, and the locked path has its own SUPER intercept.
-        Action::QuickTerminal => toggle_quick_terminal(app, out),
+        Action::QuickTerminal => quick_terminal_shortcut(app, out),
         Action::NewLink => open_new_link_prompt(app),
         Action::ToggleTerminalFullscreen => toggle_terminal_fullscreen(app),
         // Terminal-scope only; never resolved here.
@@ -2047,6 +2109,34 @@ const QUICK_TERMINAL_NAME: &str = "quick";
 /// checkout, opened without any picker. "Current" is the attached session's
 /// worktree when input is locked there, otherwise the selection (Projects
 /// focus → the project's main checkout, the same rule `t` uses).
+/// ⌘1–⌘5: jump straight to a panel. Expands collapsed sidebars, closes
+/// the floating quick terminal, and drops the input lock — except ⌘5,
+/// which enters the terminal pane and locks input when a session is
+/// attached (that is what jumping there is for).
+fn focus_panel(app: &mut App, focus: Focus, out: &mut Vec<ClientRequest>) {
+    if app.quick_term {
+        close_quick_terminal(app, out);
+    }
+    if focus != Focus::Terminal {
+        app.collapsed = false;
+    }
+    app.focus = focus;
+    app.term_locked = focus == Focus::Terminal && app.term.as_ref().is_some_and(|t| !t.exited);
+}
+
+/// ⌘T: spawn a fresh unnamed shell terminal in the current worktree — a
+/// new tab in the session bar, no name prompt (the daemon numbers it, and
+/// it auto-attaches). The floating quick terminal lives on the palette's
+/// `t` alias instead; when that window is up, ⌘T closes it.
+fn quick_terminal_shortcut(app: &mut App, out: &mut Vec<ClientRequest>) {
+    if app.quick_term {
+        close_quick_terminal(app, out);
+        return;
+    }
+    app.collapsed = false;
+    create_terminal_for_context(app, out);
+}
+
 fn toggle_quick_terminal(app: &mut App, out: &mut Vec<ClientRequest>) {
     if app.quick_term {
         close_quick_terminal(app, out);
@@ -2861,10 +2951,11 @@ fn open_agent_picker(app: &mut App, worktree: WorktreeId, orchestrator: bool) {
 
 /// The orchestrator flow's branch picker: every local branch of the
 /// project's repo (develop, main, feature branches — an orchestrator may
-/// run on any of them), newest commit first, the first row hovered. The
-/// primary checkout's branch carries a dim `⌂ primary` hint but keeps its
-/// newest-first slot. Falls back to the branches nebula already knows from
-/// the project's worktrees when git can't list (deleted repo, missing git).
+/// run on any of them). The primary checkout's branch leads the list and
+/// starts hovered — Enter takes the default, j walks down into the rest,
+/// which stay newest commit first. Falls back to the branches nebula
+/// already knows from the project's worktrees when git can't list
+/// (deleted repo, missing git).
 fn open_branch_picker(app: &mut App, project: nebula_core::ProjectId, spawn: crate::app::BranchSpawn) {
     let Some((branches, root_branch)) = project_local_branches(app, &project) else {
         app.flash = Some("no local branches found".into());
@@ -2900,10 +2991,11 @@ fn open_branch_picker(app: &mut App, project: nebula_core::ProjectId, spawn: cra
     ));
 }
 
-/// The project's local branches (newest commit first) and the primary
-/// checkout's branch; falls back to the branches nebula already knows
-/// from the project's worktrees when git can't list. None = nothing at
-/// all to offer.
+/// The project's local branches and the primary checkout's branch. The
+/// primary branch is hoisted to the front so pickers default to it; the
+/// rest keep their newest-commit-first order. Falls back to the branches
+/// nebula already knows from the project's worktrees when git can't
+/// list. None = nothing at all to offer.
 fn project_local_branches(
     app: &App,
     project: &nebula_core::ProjectId,
@@ -2932,6 +3024,12 @@ fn project_local_branches(
     }
     if branches.is_empty() {
         return None;
+    }
+    if let Some(root) = &root_branch {
+        if let Some(pos) = branches.iter().position(|b| b == root) {
+            let root = branches.remove(pos);
+            branches.insert(0, root);
+        }
     }
     Some((branches, root_branch))
 }
@@ -5278,8 +5376,9 @@ fn restore_context(app: &mut App, out: &mut Vec<ClientRequest>) {
 }
 
 /// After a worktree switch: select and re-attach the worktree's remembered
-/// session; with nothing to restore (or it's gone/archived), blank the pane
-/// rather than keep showing the previous context's session.
+/// session; on a first visit (or when the remembered one is gone/archived)
+/// fall back to the worktree's first live session, and only blank the pane
+/// when there is nothing attachable at all.
 fn restore_session(app: &mut App, out: &mut Vec<ClientRequest>) {
     app.sel_session = 0;
     schedule_prewarm(app);
@@ -5297,12 +5396,22 @@ fn restore_session(app: &mut App, out: &mut Vec<ClientRequest>) {
     let remembered = app
         .selected_worktree()
         .and_then(|w| app.last_session_for_worktree.get(&w.id).cloned());
-    let target = remembered.and_then(|sref| {
-        app.visible_session_rows()
-            .iter()
-            .position(|r| r.sref().as_ref() == Some(&sref) && !r.is_archived_agent())
-            .map(|i| (i, sref))
-    });
+    let target = remembered
+        .and_then(|sref| {
+            app.visible_session_rows()
+                .iter()
+                .position(|r| r.sref().as_ref() == Some(&sref) && !r.is_archived_agent())
+                .map(|i| (i, sref))
+        })
+        .or_else(|| {
+            app.visible_session_rows()
+                .iter()
+                .enumerate()
+                .find_map(|(i, r)| match r.sref() {
+                    Some(sref) if !r.is_archived_agent() => Some((i, sref)),
+                    _ => None,
+                })
+        });
     match target {
         Some((index, sref)) => {
             app.sel_session = index;
@@ -5888,79 +5997,6 @@ fn fire_pending_prewarm(app: &mut App, out: &mut Vec<ClientRequest>) {
     // creating a session there adopts an already-booted CLI.
     out.push(default_claude_prewarm(worktree));
     app.next_keepwarm = Some(std::time::Instant::now() + KEEPWARM_REFRESH);
-}
-
-/// Arm the debounced transcript preview when the session selection sits on
-/// a resumable Claude row whose preview isn't cached yet; runs before every
-/// draw. Once a read has answered for the agent, resting there re-arms
-/// nothing — `StatusChanged` re-arms explicitly when a turn ends, which is
-/// when the line actually goes stale.
-fn schedule_preview(app: &mut App) {
-    let target = app
-        .selected_session()
-        .filter(|a| a.kind == AgentKind::Claude && a.session_id.is_some())
-        .map(|a| a.id);
-    let Some(agent) = target else {
-        app.pending_preview = None;
-        return;
-    };
-    if app
-        .pending_preview
-        .as_ref()
-        .is_some_and(|(a, _)| *a == agent)
-    {
-        return;
-    }
-    if app.preview.as_ref().is_some_and(|p| p.agent == agent) {
-        app.pending_preview = None;
-    } else {
-        app.pending_preview = Some((agent, std::time::Instant::now() + PREVIEW_DEBOUNCE));
-    }
-}
-
-/// Read the armed agent's transcript tail into the preview cache — a
-/// synchronous 64 KB read at debounce time, off the input hot path (the
-/// git_diff.rs precedent). The selection may have moved since arming;
-/// only the row still selected is worth the read. An unchanged mtime
-/// keeps the cached text without re-reading.
-fn fire_pending_preview(app: &mut App) {
-    let Some((agent_id, _)) = app.pending_preview.take() else {
-        return;
-    };
-    let Some(agent) = app.selected_session().filter(|a| a.id == agent_id) else {
-        return;
-    };
-    let Some(cwd) = app
-        .tree
-        .worktrees
-        .iter()
-        .find(|w| w.id == agent.worktree_id)
-        .map(|w| w.path.clone())
-    else {
-        return;
-    };
-    let Some(path) = agent
-        .session_id
-        .as_deref()
-        .and_then(|sid| crate::transcript::transcript_path(&cwd, sid))
-    else {
-        return;
-    };
-    let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-    if mtime.is_some()
-        && app
-            .preview
-            .as_ref()
-            .is_some_and(|p| p.agent == agent_id && p.mtime == mtime)
-    {
-        return;
-    }
-    app.preview = Some(crate::app::SessionPreview {
-        agent: agent_id,
-        mtime,
-        text: crate::transcript::last_assistant_text(&path),
-    });
-    app.dirty = true;
 }
 
 /// A branch-picker row was chosen: spawn the agent on a checkout of that
@@ -7141,9 +7177,24 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                         None => {}
                     }
                 }
+                Some(HitTarget::GlobalSession(i)) => {
+                    // A row of the all-projects SESSIONS section: jump to
+                    // that session wherever it lives (the palette's session
+                    // jump — project, worktree, and row selection follow),
+                    // previewing without stealing the input lock.
+                    if let Some(agent) = app.global_sessions().get(i) {
+                        let id = agent.id.clone();
+                        jump_to_target(app, PaletteTarget::Session(id), false, out);
+                    }
+                }
                 Some(HitTarget::ArchivedHeader) => {
                     app.focus = Focus::Sessions;
                     toggle_archived(app, out);
+                }
+                Some(HitTarget::GlobalSessionsBg) => {
+                    // The section's empty space: just take the column's
+                    // focus, like the panel background under it.
+                    app.focus = Focus::Projects;
                 }
                 Some(HitTarget::PanelBg(focus)) => {
                     // Empty projects list: left click opens the obvious
@@ -7217,26 +7268,28 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
             let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
             let over = app.hit_at(mouse.column, mouse.row);
-            // The Sessions column scrolls under the wheel/trackpad — with
-            // the ARCHIVED group expanded its list routinely outgrows the
-            // panel. The offset moves without touching the selection; the
-            // draw clamps it to the content.
-            let over_sessions = !app.collapsed
-                && matches!(
-                    over,
-                    Some(
-                        HitTarget::Session(_)
-                            | HitTarget::ArchivedHeader
-                            | HitTarget::PanelBg(Focus::Sessions)
-                    )
-                );
+            // The wheel over the session tab bar walks the tabs (each step
+            // previews, same as ↑/↓ did in the old column).
+            let over_sessions = matches!(
+                over,
+                Some(
+                    HitTarget::Session(_)
+                        | HitTarget::ArchivedHeader
+                        | HitTarget::PanelBg(Focus::Sessions)
+                )
+            );
             let in_term = matches!(over, Some(HitTarget::TerminalPane)) || app.collapsed;
             if over_sessions {
-                app.sessions_scroll = if up {
-                    app.sessions_scroll.saturating_sub(SESSIONS_WHEEL_STEP)
-                } else {
-                    app.sessions_scroll.saturating_add(SESSIONS_WHEEL_STEP)
-                };
+                // Selection only — no focus steal from wherever the user is.
+                let len = app.visible_session_rows().len();
+                if len > 0 {
+                    let delta: i64 = if up { -1 } else { 1 };
+                    let new = (app.sel_session as i64 + delta).clamp(0, len as i64 - 1) as usize;
+                    if new != app.sel_session {
+                        app.sel_session = new;
+                        preview_selected(app, out);
+                    }
+                }
                 app.dirty = true;
             } else if in_term {
                 if let Some(term) = &mut app.term {
@@ -7293,6 +7346,40 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                         };
                         term.set_scroll(new_scroll);
                     }
+                    app.dirty = true;
+                }
+            } else if matches!(
+                over,
+                Some(HitTarget::GlobalSession(_) | HitTarget::GlobalSessionsBg)
+            ) {
+                // The Projects column's SESSIONS section has no cursor:
+                // the wheel scrolls the list directly (draw clamps).
+                app.global_sessions_scroll = if up {
+                    app.global_sessions_scroll.saturating_sub(1)
+                } else {
+                    app.global_sessions_scroll.saturating_add(1)
+                };
+                app.dirty = true;
+            } else {
+                // The wheel over a sidebar section walks its rows, same
+                // as j/k there — the draw keeps the moved selection
+                // visible, which is what scrolls an overflowing section.
+                let section = match &over {
+                    Some(HitTarget::Project(_)) | Some(HitTarget::PanelBg(Focus::Projects)) => {
+                        Some(Focus::Projects)
+                    }
+                    Some(HitTarget::Orchestrator(_))
+                    | Some(HitTarget::PanelBg(Focus::Orchestrators)) => {
+                        Some(Focus::Orchestrators)
+                    }
+                    Some(HitTarget::Worktree(_)) | Some(HitTarget::PanelBg(Focus::Worktrees)) => {
+                        Some(Focus::Worktrees)
+                    }
+                    _ => None,
+                };
+                if let Some(section) = section {
+                    app.focus = section;
+                    move_selection(app, if up { -1 } else { 1 }, out);
                     app.dirty = true;
                 }
             }
@@ -7572,7 +7659,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                     // Full replay: the screen is rebuilt from scratch.
                     app.term_selection = None;
                     term.reset();
-                    term.parser.process(&data);
+                    term.feed(&data);
                     app.dirty = true;
                 }
             }
@@ -7580,7 +7667,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
         ServerEvent::Output { session, data, .. } => {
             if let Some(term) = &mut app.term {
                 if term.sref == session {
-                    term.parser.process(&data);
+                    term.feed(&data);
                     app.dirty = true;
                 }
             }
@@ -7626,12 +7713,6 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                 {
                     app.sel_session = i;
                 }
-            }
-            // A turn ending under the cursor is exactly when the preview
-            // sub-line goes stale; re-arm the read the cache would skip.
-            if app.selected_session().is_some_and(|a| a.id == agent) {
-                app.pending_preview =
-                    Some((agent, std::time::Instant::now() + PREVIEW_DEBOUNCE));
             }
         }
         ServerEvent::Ack { req_id, created } => {
@@ -8393,112 +8474,6 @@ mod tests {
         );
     }
 
-    /// The selected Claude row grows a dim sub-line with the agent's last
-    /// transcript message; every other row stays a bare pill, and moving
-    /// the cursor takes the line along (the cache is per-agent).
-    #[test]
-    fn selected_session_row_previews_the_last_transcript_message() {
-        use nebula_core::{Agent, AgentStatus, Entity};
-        let mut app = App::new();
-        seed_tree(&mut app);
-        hse(
-            &mut app,
-            ServerEvent::EntityUpserted {
-                entity: Entity::Agent(Agent {
-                    id: AgentId("a2".into()),
-                    worktree_id: nebula_core::WorktreeId("w1".into()),
-                    name: "agent-2".into(),
-                    status: AgentStatus::Fresh,
-                    archived: false,
-                    archived_at: 0,
-                    pinned: false,
-                    kind: nebula_core::AgentKind::Claude,
-                    model: None,
-                    effort: None,
-                    session_id: None,
-                    sort_order: 1,
-                    status_changed_at: 0,
-                    orchestrator: false,
-                    alive: true,
-                }),
-            },
-        );
-        app.focus = Focus::Sessions;
-        app.sel_session = 0;
-        app.preview = Some(crate::app::SessionPreview {
-            agent: AgentId("a1".into()),
-            mtime: None,
-            text: Some("ready for your review".into()),
-        });
-        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
-        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
-        let text = buffer_text(&terminal);
-        assert!(text.contains("ready for your review"), "{text}");
-        // Directly under the selected pill's text row, not floating below
-        // the list.
-        let (_, name_y) = find_cell(&terminal, "agent-1");
-        let (_, preview_y) = find_cell(&terminal, "ready for your review");
-        assert_eq!(preview_y, name_y + 1, "sub-line hugs its row: {text}");
-
-        // The cursor moves to agent-2: the cached line belongs to agent-1
-        // and must not render under anyone else.
-        app.sel_session = 1;
-        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
-        let text = buffer_text(&terminal);
-        assert!(
-            !text.contains("ready for your review"),
-            "no sub-line under an agent the cache doesn't match: {text}"
-        );
-    }
-
-    /// The debounced preview only ever arms for a Claude row that has a
-    /// session id, and an answered read isn't re-armed by resting there —
-    /// otherwise the loop would stat the transcript forever.
-    #[test]
-    fn preview_arms_once_for_resumable_claude_rows_only() {
-        use nebula_core::{Agent, AgentStatus, Entity};
-        let mut app = App::new();
-        seed_tree(&mut app);
-        // seed_tree's agent has no session id: nothing to tail.
-        schedule_preview(&mut app);
-        assert!(app.pending_preview.is_none());
-
-        hse(
-            &mut app,
-            ServerEvent::EntityUpserted {
-                entity: Entity::Agent(Agent {
-                    id: AgentId("a1".into()),
-                    worktree_id: nebula_core::WorktreeId("w1".into()),
-                    name: "agent-1".into(),
-                    status: AgentStatus::Fresh,
-                    archived: false,
-                    archived_at: 0,
-                    pinned: false,
-                    kind: nebula_core::AgentKind::Claude,
-                    model: None,
-                    effort: None,
-                    session_id: Some("00000000-none".into()),
-                    sort_order: 0,
-                    status_changed_at: 0,
-                    orchestrator: false,
-                    alive: true,
-                }),
-            },
-        );
-        schedule_preview(&mut app);
-        assert!(app.pending_preview.is_some(), "resumable Claude row arms");
-
-        // Firing on a missing transcript still answers (text None), and
-        // resting on the row afterwards stays quiet.
-        fire_pending_preview(&mut app);
-        assert!(app.pending_preview.is_none());
-        let cached = app.preview.as_ref().expect("read answered");
-        assert_eq!(cached.agent, AgentId("a1".into()));
-        assert_eq!(cached.text, None);
-        schedule_preview(&mut app);
-        assert!(app.pending_preview.is_none(), "answered read isn't re-armed");
-    }
-
     /// An empty tree replaces the panel columns with the animated splash
     /// (wordmark + create hint); the first project upsert swaps the normal
     /// columns back in.
@@ -9025,11 +9000,11 @@ mod tests {
         );
     }
 
-    /// The orchestrator flow's branch picker lists the repo's LOCAL
-    /// branches newest-committed first (not worktrees), hovers the first
-    /// row, and hints the root checkout's branch without reordering it.
+    /// The orchestrator flow's branch picker leads with the primary
+    /// checkout's branch (hovered, Enter takes the default) and lists the
+    /// repo's remaining LOCAL branches newest-committed first below it.
     #[test]
-    fn orchestrator_branch_picker_lists_branches_newest_first_with_root_hint() {
+    fn orchestrator_branch_picker_leads_with_primary_then_newest_first() {
         with_default_config(|| {
             let dir = tempfile::tempdir().unwrap();
             let repo = test_repo(&dir);
@@ -9066,14 +9041,17 @@ mod tests {
                 panic!("expected the branch picker, got {:?}", app.overlay);
             };
             assert_eq!(menu.title.as_deref(), Some("Orchestrator branch"));
-            assert_eq!(menu.hover, 0, "focus starts on the newest branch");
-            assert_eq!(menu.items[0].label, "feature");
+            assert_eq!(menu.hover, 0, "focus starts on the primary branch");
+            assert_eq!(menu.items[0].label, "main ⌂ primary");
+            assert_eq!(
+                menu.items[1].label, "feature",
+                "the rest stay newest-first"
+            );
             let labels: Vec<&str> = menu.items.iter().map(|i| i.label.as_str()).collect();
             assert!(
                 labels.contains(&"develop"),
                 "every local branch is offered, develop included: {labels:?}"
             );
-            assert!(labels.contains(&"main ⌂ primary"), "{labels:?}");
             assert!(
                 out.is_empty(),
                 "nothing fires until a branch is picked: {out:?}"
@@ -10880,67 +10858,83 @@ mod tests {
         );
     }
 
-    /// Every session row names its harness in a dim badge after the title —
-    /// claude included, so the column doesn't read as "codex/cursor are the
-    /// odd ones out".
+    /// The selected tab names its harness in a dim badge after the title;
+    /// unselected tabs stay bare (the bar only has room to badge one), and
+    /// the badge follows the selection. Every tab carries its model (and
+    /// effort) on the bar's second row — "default" when the CLI picks.
     #[test]
-    fn session_rows_badge_their_harness() {
+    fn the_selected_tab_badges_its_harness() {
         use nebula_core::{Agent, AgentKind, AgentStatus, Entity};
         let mut app = App::new();
         seed_tree(&mut app); // agent-1, claude
-        for (i, kind) in [
-            (2, AgentKind::Codex),
-            (3, AgentKind::Cursor),
-            (4, AgentKind::Pi),
-        ] {
-            hse(
-                &mut app,
-                ServerEvent::EntityUpserted {
-                    entity: Entity::Agent(Agent {
-                        id: AgentId(format!("a{i}")),
-                        worktree_id: WorktreeId("w1".into()),
-                        name: format!("agent-{i}"),
-                        status: AgentStatus::Fresh,
-                        archived: false,
-                        archived_at: 0,
-                        pinned: false,
-                        kind,
-                        model: None,
-                        effort: None,
-                        session_id: None,
-                        sort_order: i,
-                        status_changed_at: 0,
-                        orchestrator: false,
-                        alive: true,
-                    }),
-                },
-            );
-        }
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(Agent {
+                    id: AgentId("a2".into()),
+                    worktree_id: WorktreeId("w1".into()),
+                    name: "agent-2".into(),
+                    status: AgentStatus::Fresh,
+                    archived: false,
+                    archived_at: 0,
+                    pinned: false,
+                    kind: AgentKind::Codex,
+                    model: Some("gpt-5.5".into()),
+                    effort: Some("high".into()),
+                    session_id: None,
+                    sort_order: 2,
+                    status_changed_at: 0,
+                    orchestrator: false,
+                    alive: true,
+                }),
+            },
+        );
 
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
-        for (name, kind) in [
-            ("agent-1", "claude"),
-            ("agent-2", "codex"),
-            ("agent-3", "cursor"),
-            ("agent-4", "pi"),
-        ] {
-            assert!(
-                text.contains(&format!("{name} {kind}")),
-                "{name} badged {kind}:\n{text}"
-            );
-        }
+        assert!(
+            text.contains("agent-1 claude"),
+            "selected tab badged claude:\n{text}"
+        );
+        assert!(
+            !text.contains("agent-2 codex"),
+            "unselected tab stays bare:\n{text}"
+        );
 
-        // The badge is dim, the name isn't — it has to read as secondary.
-        // (Checked on an unselected row: the selection bar brightens dim
-        // spans to muted.)
+        // The badge is dim, the name isn't — it reads as secondary.
         let th = app.theme;
         let buffer = terminal.backend().buffer();
-        let (x, y) = find_cell(&terminal, "agent-2 codex");
-        assert_eq!(buffer[(x, y)].fg, th.muted, "name stays muted");
-        let badge_x = x + "agent-2 ".chars().count() as u16;
+        let (x, y) = find_cell(&terminal, "agent-1 claude");
+        let badge_x = x + "agent-1 ".chars().count() as u16;
         assert_eq!(buffer[(badge_x, y)].fg, th.dim, "badge is dim");
+
+        // The model row sits directly under the names: an unset model says
+        // "default", a set one names model · effort under its own tab.
+        let text = buffer_text(&terminal);
+        let (_, names_y) = find_cell(&terminal, "agent-1 claude");
+        let model_line = text.lines().nth(names_y as usize + 1).unwrap();
+        assert!(
+            model_line.contains("default"),
+            "unset model reads default:\n{text}"
+        );
+        assert!(
+            model_line.contains("gpt-5.5 · high"),
+            "set model · effort under its tab:\n{text}"
+        );
+        let (a2_x, _) = find_cell(&terminal, "agent-2");
+        let m_col = model_line.find("gpt-5.5").map(|b| model_line[..b].chars().count()).unwrap() as u16;
+        assert_eq!(m_col, a2_x, "the model aligns under its tab's name");
+
+        // Selection moves: so does the badge.
+        app.sel_session = 1;
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("agent-2 codex"),
+            "newly selected tab badged codex:\n{text}"
+        );
+        assert!(!text.contains("agent-1 claude"), "old badge gone:\n{text}");
     }
 
     /// Pinning an agent splits the sessions panel into PINNED and UNPINNED
@@ -10979,11 +10973,14 @@ mod tests {
 
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
-        let text = buffer_text(&terminal);
-        assert!(text.contains("PINNED"), "pinned header rendered:\n{text}");
+        let line = buffer_text(&terminal)
+            .lines()
+            .find(|l| l.contains("agent-2"))
+            .expect("the tab bar row")
+            .to_string();
         assert!(
-            text.contains("UNPINNED"),
-            "unpinned header rendered:\n{text}"
+            line.find("agent-2") < line.find("agent-1"),
+            "the pinned tab leads the bar:\n{line}"
         );
     }
 
@@ -11090,14 +11087,17 @@ mod tests {
         assert_eq!(app.session_group_counts(), (1, 1, 2, 0));
         assert!(app.next_recent_expiry().is_some());
 
-        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
-        let text = buffer_text(&terminal);
-        assert!(text.contains("PINNED"), "pinned header rendered:\n{text}");
-        assert!(text.contains("RECENT"), "recent header rendered:\n{text}");
+        let line = buffer_text(&terminal)
+            .lines()
+            .find(|l| l.contains("pinned-fresh"))
+            .expect("the tab bar row")
+            .to_string();
+        let pos = |n: &str| line.find(n).unwrap_or_else(|| panic!("{n} missing:\n{line}"));
         assert!(
-            text.contains("UNPINNED"),
-            "unpinned header rendered:\n{text}"
+            pos("pinned-fresh") < pos("recent-1") && pos("recent-1") < pos("stale-1"),
+            "tabs keep the pinned → recent → rest order:\n{line}"
         );
     }
 
@@ -11268,69 +11268,6 @@ mod tests {
             "the cold row joined RECENT at the top, behind only the live turn \
              it ties with"
         );
-    }
-
-    /// Session rows carry how long since they last did anything, sat
-    /// between the name and the harness badge. Never-run sessions have
-    /// nothing to say, and a narrow panel spends its columns on the name.
-    #[test]
-    fn session_rows_show_time_since_last_interaction() {
-        use nebula_core::{Agent, AgentStatus, Entity};
-        let mut app = App::new();
-        seed_tree(&mut app); // agent-1: never run
-        hse(
-            &mut app,
-            ServerEvent::EntityUpserted {
-                entity: Entity::Agent(Agent {
-                    id: AgentId("a2".into()),
-                    worktree_id: WorktreeId("w1".into()),
-                    name: "alpha".into(),
-                    status: AgentStatus::Finished,
-                    archived: false,
-                    archived_at: 0,
-                    pinned: false,
-                    kind: nebula_core::AgentKind::Claude,
-                    model: None,
-                    effort: None,
-                    session_id: None,
-                    sort_order: 1,
-                    status_changed_at: crate::app::now_ms() - 23 * 60_000,
-                    orchestrator: false,
-                    alive: true,
-                }),
-            },
-        );
-
-        let row_with = |app: &mut App, needle: &str| -> String {
-            let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
-            terminal.draw(|f| ui::draw(f, app)).unwrap();
-            buffer_text(&terminal)
-                .lines()
-                .find(|l| l.contains(needle))
-                .unwrap_or_default()
-                .to_string()
-        };
-
-        let row = row_with(&mut app, "alpha");
-        let name = row.find("alpha").expect("the session name");
-        let ago = row
-            .find("23m ago")
-            .unwrap_or_else(|| panic!("no ago label:\n{row}"));
-        let harness = row.find("claude").expect("the harness badge");
-        assert!(
-            name < ago && ago < harness,
-            "name, then how long ago, then the harness:\n{row}"
-        );
-
-        // A session that has never run has no interaction to report.
-        let row = row_with(&mut app, "agent-1");
-        assert!(!row.contains("ago"), "never-run row stays bare:\n{row}");
-
-        // Squeeze the panel: the label drops rather than eat the name.
-        app.panel_widths[2] = 20;
-        let row = row_with(&mut app, "alpha");
-        assert!(row.contains("claude"), "harness badge survives:\n{row}");
-        assert!(!row.contains("ago"), "ago label yields to the name:\n{row}");
     }
 
     /// A StatusChanged delta stamps the agent's timestamp, pulls it into
@@ -11866,18 +11803,16 @@ mod tests {
         );
     }
 
+    /// The floating quick terminal opens from the palette's `t` alias
+    /// (⌘T makes a terminal tab now).
     #[test]
-    fn cmd_t_opens_the_floating_quick_terminal_creating_the_shell() {
+    fn palette_t_opens_the_floating_quick_terminal_creating_the_shell() {
         let mut app = App::new();
         seed_tree(&mut app);
         let mut out = Vec::new();
         app.focus = Focus::Sessions;
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::SUPER),
-            &mut out,
-        );
-        assert!(app.quick_term, "⌘t opens the floating quick terminal");
+        toggle_quick_terminal(&mut app, &mut out);
+        assert!(app.quick_term, "the floating quick terminal opens");
         assert!(
             matches!(
                 out.last(),
@@ -11921,7 +11856,7 @@ mod tests {
     }
 
     #[test]
-    fn cmd_t_reuses_the_existing_quick_shell() {
+    fn quick_terminal_reuses_the_existing_quick_shell() {
         let mut app = App::new();
         seed_tree(&mut app);
         hse(
@@ -11938,11 +11873,7 @@ mod tests {
         );
         let mut out = Vec::new();
         app.focus = Focus::Sessions;
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::SUPER),
-            &mut out,
-        );
+        toggle_quick_terminal(&mut app, &mut out);
         assert!(
             !out.iter()
                 .any(|r| matches!(r, ClientRequest::CreateTerminal { .. })),
@@ -11954,13 +11885,13 @@ mod tests {
                 Some(ClientRequest::Attach { session, .. })
                     if *session == SessionRef::Terminal(nebula_core::TerminalId("t-quick".into()))
             ),
-            "⌘t attaches the worktree's quick shell: {out:?}"
+            "the worktree's quick shell is attached: {out:?}"
         );
         assert!(app.quick_term && app.term_locked);
     }
 
     #[test]
-    fn cmd_t_inside_a_locked_session_toggles_and_restores_it() {
+    fn quick_terminal_in_a_locked_session_closes_via_cmd_t_and_restores_it() {
         let mut app = App::new();
         seed_tree(&mut app);
         hse(
@@ -11975,8 +11906,8 @@ mod tests {
                 }),
             },
         );
-        // Locked inside agent a1: ⌘t opens the quick terminal on a1's
-        // worktree without any picker.
+        // Locked inside agent a1: the palette's quick terminal opens on
+        // a1's worktree without any picker.
         app.term = Some(AttachedTerm::new(
             SessionRef::Agent(AgentId("a1".into())),
             80,
@@ -11985,17 +11916,14 @@ mod tests {
         app.focus = Focus::Terminal;
         app.term_locked = true;
         let mut out = Vec::new();
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::SUPER),
-            &mut out,
-        );
-        assert!(app.quick_term, "⌘t fires through the locked SUPER intercept");
+        toggle_quick_terminal(&mut app, &mut out);
+        assert!(app.quick_term, "the floating window opens over the lock");
         assert!(
             matches!(&app.term, Some(t) if t.sref == SessionRef::Terminal(nebula_core::TerminalId("t-quick".into()))),
             "the quick shell replaced the agent in the attachment"
         );
-        // Second ⌘t closes the window and puts the agent back, still locked.
+        // ⌘t with the window up is the close, and puts the agent back,
+        // still locked (fires through the locked SUPER intercept).
         let mut out = Vec::new();
         handle_key(
             &mut app,
@@ -12029,11 +11957,7 @@ mod tests {
         );
         let mut out = Vec::new();
         app.focus = Focus::Sessions;
-        handle_key(
-            &mut app,
-            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::SUPER),
-            &mut out,
-        );
+        toggle_quick_terminal(&mut app, &mut out);
         assert!(app.quick_term);
         let mut out = Vec::new();
         handle_key(
@@ -12781,7 +12705,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_rows_render_under_terminals_header() {
+    fn terminal_rows_render_as_prompt_tabs() {
         let mut app = App::new();
         seed_tree(&mut app);
         seed_terminal(&mut app, "t1", "term-1");
@@ -12789,12 +12713,20 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
-        assert!(text.contains("TERMINALS"), "terminals header:\n{text}");
-        assert!(text.contains("term-1"), "terminal row rendered:\n{text}");
+        assert!(text.contains("❯ term-1"), "terminal tab rendered:\n{text}");
+        // Agents lead the bar, terminals trail it.
+        let line = text
+            .lines()
+            .find(|l| l.contains("term-1"))
+            .expect("the tab bar row");
+        assert!(
+            line.find("agent-1") < line.find("term-1"),
+            "agent tabs before terminal tabs:\n{line}"
+        );
     }
 
     #[test]
-    fn link_rows_render_under_a_links_header() {
+    fn link_rows_render_as_arrow_tabs() {
         let mut app = App::new();
         seed_tree(&mut app);
         seed_link(&mut app, "https://example.dev/spec");
@@ -12810,21 +12742,17 @@ mod tests {
             }),
         );
 
-        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(140, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
-        assert!(text.contains("LINKS"), "links header:\n{text}");
         assert!(
-            text.contains("#7 Attach links"),
-            "pull request row:\n{text}"
+            text.contains("↗ #7 Attach lin"),
+            "pull request tab:\n{text}"
         );
         assert!(
-            text.contains("example.dev/spec"),
-            "saved link row (scheme stripped):\n{text}"
+            text.contains("↗ example.dev/s"),
+            "saved link tab (scheme stripped):\n{text}"
         );
-        // The panel's count is a session count; the two link rows don't
-        // inflate it.
-        assert!(text.contains("SESSIONS · 1"), "session count:\n{text}");
     }
 
     #[test]
@@ -13215,12 +13143,12 @@ mod tests {
         );
     }
 
-    /// An ARCHIVED group taller than the panel scrolls: the wheel moves the
-    /// viewport without touching the cursor, and walking the cursor down
-    /// drags the viewport along so the selected row never falls off the
-    /// bottom edge.
+    /// The session tabs live in the terminal header: a bar wider than the
+    /// pane trims from the left so the selected tab stays visible, and the
+    /// wheel over the bar walks the selection (each step previews, like
+    /// ↑/↓ did in the old column).
     #[test]
-    fn archived_list_scrolls_by_wheel_and_follows_the_cursor() {
+    fn session_tabs_trim_to_selection_and_wheel_walks_them() {
         let mut app = App::new();
         seed_tree(&mut app);
         for i in 0..20i64 {
@@ -13243,53 +13171,41 @@ mod tests {
 
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
+        assert!(text.contains("agent-1"), "first tab visible: {text}");
         assert!(
-            text.contains("archived-00"),
-            "list starts at the top: {text}"
+            !text.contains("archived-19"),
+            "tail tabs are clipped: {text}"
         );
-        assert!(!text.contains("archived-19"), "tail overflows: {text}");
 
-        // Wheel over the Sessions column: the list moves, the cursor stays.
-        for _ in 0..12 {
-            handle_mouse(&mut app, mev(MouseEventKind::ScrollDown, 50, 10), &mut out);
-            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
-        }
-        let text = buffer_text(&terminal);
-        assert!(
-            text.contains("archived-19"),
-            "wheel reaches the tail: {text}"
-        );
-        assert!(!text.contains("archived-00"), "top scrolled away: {text}");
-        assert_eq!(app.sel_session, 0, "the wheel never moves the cursor");
+        // Wheel over the tab bar (terminal header row): selection moves,
+        // one step per notch, and each step previews the session.
+        handle_mouse(&mut app, mev(MouseEventKind::ScrollDown, 50, 1), &mut out);
+        assert_eq!(app.sel_session, 1, "wheel-down walks to the next tab");
+        handle_mouse(&mut app, mev(MouseEventKind::ScrollUp, 50, 1), &mut out);
+        assert_eq!(app.sel_session, 0, "wheel-up walks back");
 
-        // Scrolling back up stops at the top instead of running away.
-        for _ in 0..40 {
-            handle_mouse(&mut app, mev(MouseEventKind::ScrollUp, 50, 10), &mut out);
-            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
-        }
-        assert_eq!(app.sessions_scroll, 0, "wheel-up clamps at the top");
-
-        // ↓ to the last archived row pulls the viewport down with it.
+        // ↓ to the last tab: the bar trims from the left (dim ‹) so the
+        // selected tab is always drawn.
         for _ in 0..20 {
             press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
         }
-        assert_eq!(app.sel_session, 20, "cursor walks onto the last row");
+        assert_eq!(app.sel_session, 20, "cursor walks onto the last tab");
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
         assert!(
             text.contains("archived-19"),
-            "the selected row is on screen: {text}"
+            "the selected tab is on screen: {text}"
         );
+        assert!(text.contains("‹"), "the trimmed bar leads with ‹: {text}");
 
-        // …and ↑ back to the first row pulls it back.
+        // …and ↑ back to the first tab brings the head back.
         for _ in 0..20 {
             press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
         }
         assert_eq!(app.sel_session, 0);
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
-        assert!(text.contains("agent-1"), "back at the top: {text}");
-        assert_eq!(app.sessions_scroll, 0);
+        assert!(text.contains("agent-1"), "back at the head: {text}");
     }
 
     /// Clicking the ARCHIVED header toggles the group open/closed, same as
@@ -13728,7 +13644,7 @@ mod tests {
     /// default panel widths (splitters at x = 20, 42, 68).
     fn seed_splitters(app: &mut App) {
         app.body_area = ratatui::layout::Rect::new(0, 0, 120, 35);
-        for i in 0..3 {
+        for i in 0..2 {
             let x = app.splitter_x(i);
             app.hits.push((
                 ratatui::layout::Rect::new(x - 1, 0, 2, 35),
@@ -13827,10 +13743,7 @@ mod tests {
             mev(MouseEventKind::Drag(MouseButton::Left), 30, 5),
             &mut out,
         );
-        assert_eq!(
-            app.panel_widths,
-            [30, 22, crate::app::DEFAULT_PANEL_WIDTHS[2]]
-        );
+        assert_eq!(app.panel_widths, [30, 22]);
 
         handle_mouse(
             &mut app,
@@ -13869,11 +13782,7 @@ mod tests {
         );
         let total: u16 = app.panel_widths.iter().sum();
         assert_eq!(app.body_area.width - total, MIN_TERM_W);
-        assert_eq!(
-            app.panel_widths[1..],
-            [22, crate::app::DEFAULT_PANEL_WIDTHS[2]],
-            "only panel 0 moved"
-        );
+        assert_eq!(app.panel_widths[1..], [22], "only panel 0 moved");
     }
 
     #[test]
@@ -13973,12 +13882,12 @@ mod tests {
     #[test]
     fn normalize_panel_widths_shrinks_rightmost_first() {
         let mut app = App::new();
-        app.panel_widths = [40, 40, 40];
+        app.panel_widths = [50, 50];
         app.normalize_panel_widths(100);
         assert_eq!(
             app.panel_widths,
-            [40, 30, 10],
-            "sessions floors first, then worktrees gives way"
+            [50, 30],
+            "worktrees gives way first"
         );
         let total: u16 = app.panel_widths.iter().sum();
         assert_eq!(100 - total, crate::app::MIN_TERM_W);
@@ -13987,12 +13896,21 @@ mod tests {
     #[test]
     fn ui_state_roundtrip_includes_panel_widths() {
         let mut app = App::new();
-        app.panel_widths = [33, 44, 55];
+        app.panel_widths = [33, 44];
         let json = ui_state_json(&app);
 
         let mut restored = App::new();
         restore_ui_state(&mut restored, &json);
-        assert_eq!(restored.panel_widths, [33, 44, 55]);
+        assert_eq!(restored.panel_widths, [33, 44]);
+
+        // Blobs from the three-column era carry a sessions width; the
+        // extra entry is ignored.
+        let mut old = App::new();
+        restore_ui_state(
+            &mut old,
+            r#"{"project":null,"worktree":null,"session_agent":null,"show_archived":false,"collapsed":false,"panel_widths":[21,23,32]}"#,
+        );
+        assert_eq!(old.panel_widths, [21, 23]);
 
         // Old blobs without the field keep the defaults.
         let mut legacy = App::new();
@@ -14022,6 +13940,163 @@ mod tests {
             divider_before: false,
             divider_before_label: None,
         })
+    }
+
+    /// ⌘1–⌘5 jump straight to a panel — from anywhere, a locked terminal
+    /// included; ⌘5 enters the pane and locks input.
+    #[test]
+    fn cmd_digits_jump_between_panels() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        for (digit, focus) in [
+            ('2', Focus::Orchestrators),
+            ('3', Focus::Worktrees),
+            ('4', Focus::Sessions),
+            ('1', Focus::Projects),
+        ] {
+            press(&mut app, KeyCode::Char(digit), KeyModifiers::SUPER, &mut out);
+            assert_eq!(app.focus, focus, "⌘{digit}");
+            assert!(!app.term_locked, "⌘{digit} leaves input unlocked");
+        }
+
+        // ⌘5 enters the pane and locks input onto the attached session.
+        press(&mut app, KeyCode::Char('\r'), KeyModifiers::NONE, &mut out); // noop guard
+        app.focus = Focus::Sessions;
+        attach(&mut app, SessionRef::Agent(AgentId("a1".into())), &mut out);
+        press(&mut app, KeyCode::Char('5'), KeyModifiers::SUPER, &mut out);
+        assert_eq!(app.focus, Focus::Terminal);
+        assert!(app.term_locked, "⌘5 locks input on the attached session");
+
+        // …and ⌘1 escapes the locked terminal without unlocking by hand.
+        press(&mut app, KeyCode::Char('1'), KeyModifiers::SUPER, &mut out);
+        assert_eq!(app.focus, Focus::Projects, "⌘1 works while locked");
+        assert!(!app.term_locked);
+    }
+
+    /// The Projects column's bottom half lists every project's live
+    /// sessions (workspace-scoped), working rows first, each with
+    /// `project · how long ago` under it; clicking a row jumps to that
+    /// session — project, worktree, and session selection follow.
+    #[test]
+    fn global_sessions_section_lists_all_projects_and_click_jumps() {
+        use nebula_core::{Agent, AgentStatus, Entity, Worktree, WorktreeId};
+        let mut app = App::new();
+        seed_tree(&mut app); // p1 "demo" / w1 / agent-1 (fresh)
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: project("p2", "other", 1, false, None),
+            },
+        );
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(Worktree {
+                    id: WorktreeId("w2".into()),
+                    project_id: nebula_core::ProjectId("p2".into()),
+                    path: "/tmp/other".into(),
+                    branch: "main".into(),
+                    is_main: true,
+                    created_from: None,
+                    pinned: false,
+                    sort_order: 0,
+                }),
+            },
+        );
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(Agent {
+                    id: AgentId("a9".into()),
+                    worktree_id: WorktreeId("w2".into()),
+                    name: "runner".into(),
+                    status: AgentStatus::Running,
+                    archived: false,
+                    archived_at: 0,
+                    pinned: false,
+                    kind: nebula_core::AgentKind::Claude,
+                    model: None,
+                    effort: None,
+                    session_id: None,
+                    sort_order: 0,
+                    status_changed_at: crate::app::now_ms() - 2 * 60_000,
+                    orchestrator: false,
+                    alive: true,
+                }),
+            },
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("SESSIONS · 2"), "section header:\n{text}");
+        let (rx, ry) = find_cell(&terminal, "runner");
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(
+            lines[ry as usize + 1].contains("other · 2m ago"),
+            "project and ago under the row:\n{text}"
+        );
+        // The other project's session (never run) lists too, below the
+        // working one.
+        let a1_row = lines
+            .iter()
+            .position(|l| l.contains("SESSIONS"))
+            .map(|h| {
+                lines[h..]
+                    .iter()
+                    .position(|l| l.contains("agent-1"))
+                    .map(|i| h + i)
+            })
+            .flatten()
+            .expect("agent-1 in the global section");
+        assert!(a1_row > ry as usize, "working session leads the list");
+
+        // Click the runner row: the selection jumps into "other".
+        let mut out = Vec::new();
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Down(MouseButton::Left), rx, ry),
+            &mut out,
+        );
+        assert_eq!(
+            app.selected_project().map(|p| p.name.clone()),
+            Some("other".into()),
+            "click jumps to the session's project"
+        );
+        assert_eq!(
+            app.selected_session().map(|a| a.name),
+            Some("runner".into()),
+            "…and lands on the session row"
+        );
+    }
+
+    /// ⌘T spawns a fresh unnamed terminal tab in the current worktree, no
+    /// name prompt, whatever panel is focused; when the floating quick
+    /// terminal (palette `t`) is up, ⌘T closes it instead.
+    #[test]
+    fn cmd_t_creates_an_unnamed_terminal_tab() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        for focus in [Focus::Worktrees, Focus::Sessions, Focus::Projects] {
+            app.focus = focus;
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Char('t'), KeyModifiers::SUPER, &mut out);
+            assert!(
+                matches!(
+                    out.last(),
+                    Some(ClientRequest::CreateTerminal { name: None, .. })
+                ),
+                "{focus:?}: a fresh unnamed terminal, no prompt: {out:?}"
+            );
+            assert!(!app.quick_term, "the floating window stays closed");
+        }
+
+        // With the floating window up, ⌘T is the close.
+        app.quick_term = true;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::SUPER, &mut out);
+        assert!(!app.quick_term, "⌘T closes the floating quick terminal");
     }
 
     #[test]
@@ -14667,6 +14742,247 @@ mod tests {
         );
     }
 
+    /// First visit to a worktree that already has sessions: no remembered
+    /// row yet, so the first live session attaches instead of a blank pane.
+    #[test]
+    fn first_visit_to_a_worktree_attaches_its_first_session() {
+        use nebula_core::{Agent, AgentStatus, Entity, Worktree, WorktreeId};
+        let mut app = App::new();
+        seed_tree(&mut app); // p1/w1(main) + agent-1
+        let mut out = Vec::new();
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(Worktree {
+                    id: WorktreeId("w2".into()),
+                    project_id: nebula_core::ProjectId("p1".into()),
+                    path: "/tmp/demo-worktrees/other".into(),
+                    branch: "other".into(),
+                    is_main: false,
+                    created_from: None,
+                    pinned: false,
+                    sort_order: 1,
+                }),
+            },
+        );
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(Agent {
+                    id: AgentId("a2".into()),
+                    worktree_id: WorktreeId("w2".into()),
+                    name: "agent-2".into(),
+                    status: AgentStatus::Fresh,
+                    archived: false,
+                    archived_at: 0,
+                    pinned: false,
+                    kind: nebula_core::AgentKind::Claude,
+                    model: None,
+                    effort: None,
+                    session_id: None,
+                    sort_order: 0,
+                    status_changed_at: 0,
+                    orchestrator: false,
+                    alive: true,
+                }),
+            },
+        );
+
+        app.focus = Focus::Worktrees;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            &mut out,
+        );
+        let expected = SessionRef::Agent(AgentId("a2".into()));
+        assert!(
+            matches!(out.last(), Some(ClientRequest::Attach { session, .. }) if *session == expected),
+            "first visit attaches w2's first session: {out:?}"
+        );
+        assert_eq!(app.sel_session, 0);
+        assert_eq!(app.term.as_ref().map(|t| t.sref.clone()), Some(expected));
+    }
+
+    fn seed_extra_worktrees(app: &mut App, from: usize, to: usize) {
+        use nebula_core::{Entity, Worktree, WorktreeId};
+        for i in from..=to {
+            hse(
+                app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Worktree(Worktree {
+                        id: WorktreeId(format!("w{i}")),
+                        project_id: nebula_core::ProjectId("p1".into()),
+                        path: format!("/tmp/demo-worktrees/wt-{i}").into(),
+                        branch: format!("wt-{i}"),
+                        is_main: false,
+                        created_from: None,
+                        pinned: false,
+                        sort_order: i as i64,
+                    }),
+                },
+            );
+        }
+    }
+
+    /// An overflowing WORKTREES section scrolls to the selected row
+    /// instead of clipping the tail off-screen.
+    #[test]
+    fn worktrees_section_scrolls_to_keep_the_selection_visible() {
+        let mut app = App::new();
+        seed_tree(&mut app); // p1/w1(main)
+        seed_extra_worktrees(&mut app, 2, 8);
+        app.focus = Focus::Worktrees;
+        app.sel_worktree = 7; // wt-8, the last row
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("wt-8"), "selected last row visible: {text}");
+        assert!(!text.contains("wt-2"), "top rows scrolled out: {text}");
+    }
+
+    /// Same for the ORCHESTRATORS half above the worktrees.
+    #[test]
+    fn orchestrators_section_scrolls_to_keep_the_selection_visible() {
+        use nebula_core::{Agent, AgentStatus, Entity};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        for i in 0..6 {
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Agent(Agent {
+                        id: AgentId(format!("o{i}")),
+                        worktree_id: nebula_core::WorktreeId("w1".into()),
+                        name: format!("boss-{i}"),
+                        status: AgentStatus::Fresh,
+                        archived: false,
+                        archived_at: 0,
+                        pinned: false,
+                        kind: Default::default(),
+                        model: None,
+                        effort: None,
+                        session_id: None,
+                        sort_order: i,
+                        status_changed_at: 0,
+                        orchestrator: true,
+                        alive: false,
+                    }),
+                },
+            );
+        }
+        app.focus = Focus::Orchestrators;
+        app.sel_orchestrator = Some(5);
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        // "boss-0 ◆" pins the ORCHESTRATORS row shape — the bare name also
+        // shows up in the Projects column's global SESSIONS section.
+        assert!(text.contains("boss-5 ◆"), "selected last row visible: {text}");
+        assert!(!text.contains("boss-0 ◆"), "top rows scrolled out: {text}");
+    }
+
+    /// And for the projects half of the PROJECTS column.
+    #[test]
+    fn projects_section_scrolls_to_keep_the_selection_visible() {
+        let mut app = App::new();
+        seed_tree(&mut app); // p1 "demo"
+        for i in 2..=8 {
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: project(&format!("p{i}"), &format!("proj-{i}"), i as i64, false, None),
+                },
+            );
+        }
+        app.sel_project = 7; // proj-8, the last row
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("proj-8"), "selected last row visible: {text}");
+        assert!(!text.contains("proj-2"), "top rows scrolled out: {text}");
+    }
+
+    /// The wheel over the sidebar sections walks their rows like j/k, which
+    /// (with the selection-following draw) is what scrolls them.
+    #[test]
+    fn wheel_over_the_worktrees_section_walks_rows() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_extra_worktrees(&mut app, 2, 3);
+        let mut out = Vec::new();
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let rect = app
+            .hits
+            .iter()
+            .find_map(|(r, t)| matches!(t, HitTarget::Worktree(0)).then_some(*r))
+            .expect("worktree row 0 has a hit rect");
+        assert_eq!(app.sel_worktree, 0);
+        // rect.x itself is the splitter grip column — aim inside the row.
+        let (x, y) = (rect.x + 2, rect.y);
+        handle_mouse(&mut app, mev(MouseEventKind::ScrollDown, x, y), &mut out);
+        assert_eq!(app.sel_worktree, 1, "wheel-down walks to the next row");
+        assert_eq!(app.focus, Focus::Worktrees);
+        handle_mouse(&mut app, mev(MouseEventKind::ScrollUp, x, y), &mut out);
+        assert_eq!(app.sel_worktree, 0, "wheel-up walks back");
+    }
+
+    /// The global SESSIONS section has no cursor: the wheel scrolls it
+    /// directly, the draw clamps, and a scrolled list says what's above.
+    #[test]
+    fn global_sessions_wheel_scrolls_the_list() {
+        use nebula_core::{Agent, AgentStatus, Entity};
+        let mut app = App::new();
+        seed_tree(&mut app); // agent-1 on w1
+        for i in 2..=8 {
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Agent(Agent {
+                        id: AgentId(format!("a{i}")),
+                        worktree_id: nebula_core::WorktreeId("w1".into()),
+                        name: format!("agent-{i}"),
+                        status: AgentStatus::Fresh,
+                        archived: false,
+                        archived_at: 0,
+                        pinned: false,
+                        kind: nebula_core::AgentKind::Claude,
+                        model: None,
+                        effort: None,
+                        session_id: None,
+                        sort_order: i as i64,
+                        status_changed_at: 0,
+                        orchestrator: false,
+                        alive: true,
+                    }),
+                },
+            );
+        }
+        let mut out = Vec::new();
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let rect = app
+            .hits
+            .iter()
+            .find_map(|(r, t)| matches!(t, HitTarget::GlobalSessionsBg).then_some(*r))
+            .expect("the sessions section has a background hit rect");
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::ScrollDown, rect.x, rect.y),
+            &mut out,
+        );
+        assert_eq!(app.global_sessions_scroll, 1);
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("… 1 above"), "scrolled list says so: {text}");
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::ScrollUp, rect.x, rect.y),
+            &mut out,
+        );
+        assert_eq!(app.global_sessions_scroll, 0, "wheel-up scrolls back");
+    }
+
     #[test]
     fn divider_renders_under_project_row() {
         let mut app = App::new();
@@ -14682,24 +14998,25 @@ mod tests {
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
         // Borderless column: row 0 a top-padding spacer, row 1 the header,
-        // row 2 a spacer, rows 3-5 the 3-tall project button (selected in
-        // the focused panel → accent ▌ rail down its edge, name on the
-        // middle row), row 6 the divider behind a 1-cell gutter.
+        // row 2 a spacer, rows 3-4 the project pill (selected in the
+        // focused panel → accent rail cap on the pad, ▌ on the text row),
+        // row 5 the divider behind a 1-cell gutter (it overwrites the
+        // pill's bottom pad, same as a following pill would).
         let lines: Vec<&str> = text.lines().collect();
         assert!(
             lines[1].starts_with("   PROJECTS"),
             "column header first:\n{text}"
         );
         assert!(
-            lines[3].starts_with("▌ ") && lines[5].starts_with("▌ "),
-            "selection rail spans the project button:\n{text}"
+            lines[3].starts_with("▖"),
+            "selection rail caps the pill's pad:\n{text}"
         );
         assert!(
             lines[4].starts_with("▌● demo"),
-            "project name centered in the button:\n{text}"
+            "project name on the pill's text row:\n{text}"
         );
         assert!(
-            lines[6].starts_with(&format!(" {}", "─".repeat(10))),
+            lines[5].starts_with(&format!(" {}", "─".repeat(10))),
             "divider row under the project:\n{text}"
         );
 
@@ -14713,43 +15030,18 @@ mod tests {
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
         assert!(
-            text.lines().nth(6).unwrap().starts_with(" ─ work ──"),
+            text.lines().nth(5).unwrap().starts_with(" ─ work ──"),
             "labeled divider row:\n{text}"
         );
     }
 
-    /// The selection rail on a worktree/session pill runs the pill's full
-    /// visual height — quadrant caps on the half-block pad rows, `▌` on
-    /// the text row — and sessions share the worktrees' 2-row pill stride
-    /// so the two lists read uniformly.
+    /// The selection rail on a worktree pill runs the pill's full visual
+    /// height — quadrant caps on the half-block pad rows, `▌` on the text
+    /// row.
     #[test]
-    fn pill_rail_spans_pads_and_sessions_match_worktree_stride() {
-        use nebula_core::{Agent, AgentStatus, Entity, WorktreeId};
+    fn pill_rail_spans_the_pads() {
         let mut app = App::new();
         seed_tree(&mut app);
-        // A second session proves the stride between session rows.
-        hse(
-            &mut app,
-            ServerEvent::EntityUpserted {
-                entity: Entity::Agent(Agent {
-                    id: AgentId("a2".into()),
-                    worktree_id: WorktreeId("w1".into()),
-                    name: "agent-2".into(),
-                    status: AgentStatus::Fresh,
-                    archived: false,
-                    archived_at: 0,
-                    pinned: false,
-                    kind: nebula_core::AgentKind::Claude,
-                    model: None,
-                    effort: None,
-                    session_id: None,
-                    sort_order: 1,
-                    status_changed_at: 0,
-                    orchestrator: false,
-                    alive: true,
-                }),
-            },
-        );
         app.focus = Focus::Worktrees;
         let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
@@ -14762,43 +15054,22 @@ mod tests {
             |line: &str, needle: &str| line.find(needle).map(|b| line[..b].chars().count());
         let at = |row: usize, col: usize| lines[row].chars().nth(col);
         // rail col ▌, then dot + name: the rail sits one cell left of the dot.
-        let rail_check = |name: &str, text: &str, lines: &Vec<&str>| {
-            let dot = format!("● {name}");
-            let row = lines
-                .iter()
-                .position(|l| l.contains(&dot))
-                .unwrap_or_else(|| panic!("row {name:?} not on screen:\n{text}"));
-            let col = char_col(lines[row], &dot).unwrap() - 1;
-            assert_eq!(
-                at(row, col),
-                Some('▌'),
-                "rail on {name}'s text row:\n{text}"
-            );
-            assert_eq!(
-                at(row - 1, col),
-                Some('▖'),
-                "rail cap on {name}'s top pad:\n{text}"
-            );
-            assert_eq!(
-                at(row + 1, col),
-                Some('▘'),
-                "rail cap on {name}'s bottom pad:\n{text}"
-            );
-            row
-        };
-        rail_check("main", &text, &lines);
-
-        // Sessions panel (unfocused, still selected → dim rail, same caps),
-        // and the second row sits exactly one pill stride below the first.
-        let a1_row = rail_check("agent-1", &text, &lines);
-        let a2_row = lines
+        let dot = "● main";
+        let row = lines
             .iter()
-            .position(|l| l.contains("● agent-2"))
-            .unwrap_or_else(|| panic!("agent-2 row not on screen:\n{text}"));
+            .position(|l| l.contains(dot))
+            .unwrap_or_else(|| panic!("row \"main\" not on screen:\n{text}"));
+        let col = char_col(lines[row], dot).unwrap() - 1;
+        assert_eq!(at(row, col), Some('▌'), "rail on the text row:\n{text}");
         assert_eq!(
-            a2_row,
-            a1_row + 2,
-            "session rows stack on the 2-row pill stride:\n{text}"
+            at(row - 1, col),
+            Some('▖'),
+            "rail cap on the top pad:\n{text}"
+        );
+        assert_eq!(
+            at(row + 1, col),
+            Some('▘'),
+            "rail cap on the bottom pad:\n{text}"
         );
     }
 
@@ -16630,7 +16901,7 @@ mod tests {
     }
 
     #[test]
-    fn palette_enter_on_worktree_navigates_without_attaching() {
+    fn palette_enter_on_worktree_previews_its_first_session_unlocked() {
         let mut app = App::new();
         seed_tree(&mut app);
         seed_second_project(&mut app);
@@ -16650,11 +16921,14 @@ mod tests {
             "a worktree pick lands in its Sessions panel, not the Worktrees column"
         );
         assert!(!app.term_locked);
+        // No remembered session on the target worktree: the first live
+        // session previews (attached, unlocked) instead of a blank pane.
         assert!(
-            !out.iter()
+            out.iter()
                 .any(|r| matches!(r, ClientRequest::Attach { .. })),
-            "no remembered session on the target worktree, so nothing attaches: {out:?}"
+            "first visit previews the worktree's first session: {out:?}"
         );
+        assert_eq!(app.sel_session, 0);
     }
 
     #[test]
@@ -16747,7 +17021,6 @@ mod tests {
         // mid-panel, behind this palette overlay).
         assert!(text.contains("PROJECTS"), "{text}");
         assert!(text.contains("ORCHESTRATORS"), "{text}");
-        assert!(text.contains("SESSIONS"), "{text}");
         // Palette rows carry per-kind glyphs: ▪ project, ▸ worktree,
         // ● session.
         assert!(text.contains("▪ demo"), "project glyph row:\n{text}");

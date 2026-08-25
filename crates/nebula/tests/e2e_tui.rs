@@ -469,8 +469,7 @@ fn tui_projects_worktrees_agents_navigation() {
 
     // ---- Shift+T: a shell terminal in the worktree dir, auto-attached ----
     tui.send(b"T");
-    tui.wait_for_text("TERMINALS");
-    tui.wait_for_text("term-1");
+    tui.wait_for_text("❯ term-1");
     tui.wait_for_text(FOOTER_TERMINAL_LOCKED);
     tui.send(&[0x11]); // Ctrl+q back to panels
     tui.wait_for_text(FOOTER_SESSIONS);
@@ -655,10 +654,8 @@ fn tui_link_crud_in_sessions_panel() {
     tui.wait_for_text("Add link");
     tui.type_str("https://example.dev/spec");
     tui.send(b"\r");
-    tui.wait_for_text("LINKS");
-    // Rows show the URL without the scheme.
-    tui.wait_for_text("example.dev/spec");
-    // The cursor followed the new row into the Sessions panel.
+    // The tab shows the URL without the scheme, and the cursor followed
+    // the new row (the selected tab renders the full label).
     tui.wait_for_selected("example.dev/spec");
 
     // ---- update: r prefills the URL, so typing appends to it ----
@@ -682,8 +679,8 @@ fn tui_link_crud_in_sessions_panel() {
     tui.wait_for_text("Delete link");
     tui.send(b"y");
     tui.wait_for_sessions_row_gone("docs.dev/design");
-    // The other link is untouched.
-    tui.wait_for_text("example.dev/spec/v2");
+    // The other link is untouched (unselected tabs truncate the label).
+    tui.wait_for_text("example.dev/s");
 }
 
 /// The pull request nebula finds on the branch leads the LINKS group. A
@@ -711,8 +708,8 @@ fn tui_pull_request_row_leads_the_links_group() {
     add_project(&mut tui, &repo, "pr-proj");
     tui.wait_for_text("⌂ primary");
 
-    // The lookup rides the git poll, so the row shows up on its own.
-    tui.wait_for_text("LINKS");
+    // The lookup rides the git poll, so the tab shows up on its own (it
+    // is row 0, so it is selected and carries its full label).
     tui.wait_for_text("#7 Attach links");
 
     // It is not a stored row: d says so instead of opening a confirm.
@@ -730,8 +727,9 @@ fn tui_pull_request_row_leads_the_links_group() {
     tui.wait_for_text("Add link");
     tui.type_str("example.dev/spec");
     tui.send(b"\r");
-    tui.wait_for_text("example.dev/spec");
-    tui.wait_for_text("#7 Attach links");
+    tui.wait_for_selected("example.dev/spec");
+    // The PR tab is unselected now: truncated label, still leading.
+    tui.wait_for_text("#7 Attach li");
 }
 
 #[test]

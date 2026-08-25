@@ -84,6 +84,11 @@ pub fn run_worktree_new(name: String, from: Option<String>, project: Option<Stri
     runtime()?.block_on(ipc::worktree_new(name, from, project))
 }
 
+/// `nebula worktree delete` — the daemon's delete flow (checkout + row).
+pub fn run_worktree_delete(name: String, force: bool, project: Option<String>) -> Result<()> {
+    runtime()?.block_on(ipc::worktree_delete(name, force, project))
+}
+
 /// `nebula agent new` — spawn a session (orchestrators included).
 pub fn run_agent_new(opts: NewAgentOpts) -> Result<()> {
     runtime()?.block_on(ipc::agent_new(opts))
