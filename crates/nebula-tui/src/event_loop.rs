@@ -2642,38 +2642,52 @@ fn open_command_palette(app: &mut App) {
             .and_then(|r| app.tree.projects.get(r.project_index()))
             .map(|p| p.id.clone())
     });
+    // Labels follow the `"<alias> · <name>"` convention: the visible alias
+    // doubles as a vim-style shortcut — typing exactly it pins the row to
+    // the top (see `apply_filter`), so `⌘K a Enter` is two keys to a flow.
     let mut items = Vec::new();
     if let Some(p) = project {
-        items.push(row("New worktree…", MenuAction::NewWorktree(p.clone())));
         items.push(row(
-            "New orchestrator…",
-            MenuAction::NewOrchestrator(p.clone()),
+            "a · New agent on branch…",
+            MenuAction::Command(PaletteCommand::NewAgentOnBranch(p.clone())),
         ));
         items.push(row(
-            "New agent in worktree…",
-            MenuAction::Command(PaletteCommand::NewAgentInWorktree(p)),
+            "aw · New agent in worktree…",
+            MenuAction::Command(PaletteCommand::NewAgentInWorktree(p.clone())),
+        ));
+        items.push(row("w · New worktree…", MenuAction::NewWorktree(p.clone())));
+        items.push(row(
+            "o · New orchestrator…",
+            MenuAction::NewOrchestrator(p),
+        ));
+        items.push(row(
+            "t · New terminal",
+            MenuAction::Command(PaletteCommand::NewTerminal),
         ));
     }
     items.push(row(
-        "Search sessions",
+        "s · Search sessions",
         MenuAction::Command(PaletteCommand::SearchSessions),
     ));
     items.push(row(
-        "Search everything",
+        "e · Search everything",
         MenuAction::Command(PaletteCommand::SearchEverything),
     ));
-    items.push(row("Git diff", MenuAction::Command(PaletteCommand::GitDiff)));
-    items.push(row("Notes", MenuAction::Command(PaletteCommand::Notes)));
-    items.push(row("Todos", MenuAction::Command(PaletteCommand::Todos)));
     items.push(row(
-        "Settings",
+        "g · Git diff",
+        MenuAction::Command(PaletteCommand::GitDiff),
+    ));
+    items.push(row("n · Notes", MenuAction::Command(PaletteCommand::Notes)));
+    items.push(row("td · Todos", MenuAction::Command(PaletteCommand::Todos)));
+    items.push(row(
+        "st · Settings",
         MenuAction::Command(PaletteCommand::Settings),
     ));
     items.push(row(
-        "Workspaces",
+        "ws · Workspaces",
         MenuAction::Command(PaletteCommand::Workspaces),
     ));
-    items.push(row("Add project…", MenuAction::AddProject));
+    items.push(row("p · Add project…", MenuAction::AddProject));
     app.overlay = Some(Overlay::Menu(
         ContextMenu {
             title: Some("Commands".into()),
@@ -2798,35 +2812,10 @@ fn open_agent_picker(app: &mut App, worktree: WorktreeId, orchestrator: bool) {
 /// newest-first slot. Falls back to the branches nebula already knows from
 /// the project's worktrees when git can't list (deleted repo, missing git).
 fn open_branch_picker(app: &mut App, project: nebula_core::ProjectId, spawn: crate::app::BranchSpawn) {
-    let Some(repo) = app
-        .tree
-        .projects
-        .iter()
-        .find(|p| p.id == project)
-        .map(|p| p.repo_path.clone())
-    else {
-        return;
-    };
-    let root_branch = app
-        .tree
-        .worktrees
-        .iter()
-        .find(|w| w.project_id == project && w.is_main)
-        .map(|w| w.branch.clone());
-    let mut branches = crate::branches::local_branches(&repo);
-    if branches.is_empty() {
-        branches = app
-            .tree
-            .worktrees
-            .iter()
-            .filter(|w| w.project_id == project)
-            .map(|w| w.branch.clone())
-            .collect();
-    }
-    if branches.is_empty() {
+    let Some((branches, root_branch)) = project_local_branches(app, &project) else {
         app.flash = Some("no local branches found".into());
         return;
-    }
+    };
     let items: Vec<MenuItem> = branches
         .into_iter()
         .map(|branch| MenuItem {
@@ -2846,6 +2835,79 @@ fn open_branch_picker(app: &mut App, project: nebula_core::ProjectId, spawn: cra
     app.overlay = Some(Overlay::Menu(
         ContextMenu {
             title: Some("Orchestrator branch".into()),
+            items,
+            at: None,
+            hover: 0,
+            area: ratatui::layout::Rect::default(),
+            parent: None,
+            filter: None,
+        }
+        .filterable(),
+    ));
+}
+
+/// The project's local branches (newest commit first) and the primary
+/// checkout's branch; falls back to the branches nebula already knows
+/// from the project's worktrees when git can't list. None = nothing at
+/// all to offer.
+fn project_local_branches(
+    app: &App,
+    project: &nebula_core::ProjectId,
+) -> Option<(Vec<String>, Option<String>)> {
+    let repo = app
+        .tree
+        .projects
+        .iter()
+        .find(|p| &p.id == project)
+        .map(|p| p.repo_path.clone())?;
+    let root_branch = app
+        .tree
+        .worktrees
+        .iter()
+        .find(|w| &w.project_id == project && w.is_main)
+        .map(|w| w.branch.clone());
+    let mut branches = crate::branches::local_branches(&repo);
+    if branches.is_empty() {
+        branches = app
+            .tree
+            .worktrees
+            .iter()
+            .filter(|w| &w.project_id == project)
+            .map(|w| w.branch.clone())
+            .collect();
+    }
+    if branches.is_empty() {
+        return None;
+    }
+    Some((branches, root_branch))
+}
+
+/// The `a` palette command: pick a local branch FIRST, then run the
+/// normal new-session picker on its checkout — the mirror of the
+/// orchestrator flow's kind-first order, for plain sessions.
+fn open_agent_branch_picker(app: &mut App, project: nebula_core::ProjectId) {
+    let Some((branches, root_branch)) = project_local_branches(app, &project) else {
+        app.flash = Some("no local branches found".into());
+        return;
+    };
+    let items: Vec<MenuItem> = branches
+        .into_iter()
+        .map(|branch| MenuItem {
+            label: if Some(&branch) == root_branch.as_ref() {
+                format!("{branch} ⌂ primary")
+            } else {
+                branch.clone()
+            },
+            action: MenuAction::AgentOnBranch {
+                project: project.clone(),
+                branch,
+            },
+            destructive: false,
+        })
+        .collect();
+    app.overlay = Some(Overlay::Menu(
+        ContextMenu {
+            title: Some("Agent branch".into()),
             items,
             at: None,
             hover: 0,
@@ -4810,6 +4872,28 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             branch,
             spawn,
         } => spawn_on_branch(app, project, branch, spawn, out),
+        MenuAction::AgentOnBranch { project, branch } => {
+            // Existing checkout (the primary included): straight into the
+            // session picker. No checkout: create the worktree checking
+            // out the existing branch, picker follows its Ack.
+            if let Some(worktree) = app
+                .tree
+                .worktrees
+                .iter()
+                .find(|w| w.project_id == project && w.branch == branch)
+                .map(|w| w.id.clone())
+            {
+                open_new_agent_picker(app, worktree);
+            } else {
+                let req_id = app.alloc_req_id(PendingIntent::PickAgentOnCreatedWorktree);
+                out.push(ClientRequest::CreateWorktree {
+                    req_id,
+                    project,
+                    branch,
+                    base: None,
+                });
+            }
+        }
         MenuAction::CreateWorktreeFrom {
             project,
             branch,
@@ -4901,9 +4985,13 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
         MenuAction::Command(cmd) => {
             use crate::app::PaletteCommand;
             match cmd {
+                PaletteCommand::NewAgentOnBranch(project) => {
+                    open_agent_branch_picker(app, project)
+                }
                 PaletteCommand::NewAgentInWorktree(project) => {
                     open_worktree_picker_for_agent(app, project)
                 }
+                PaletteCommand::NewTerminal => create_terminal_for_context(app, out),
                 PaletteCommand::SearchSessions => {
                     app.overlay = Some(Overlay::Palette(Palette::sessions(
                         &app.tree,
@@ -7523,6 +7611,17 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                         orchestrator,
                     } = spec;
                     create_agent(app, id, kind, model, effort, name, orchestrator, out);
+                }
+                (
+                    Some(PendingIntent::PickAgentOnCreatedWorktree),
+                    Some(EntityId::Worktree(id)),
+                ) => {
+                    // The `a` flow's branch had no checkout: it exists now —
+                    // land the cursor on it and open the session picker.
+                    if !select_worktree_by_id(app, &id, out) {
+                        app.select_worktree_when_seen = Some(id.clone());
+                    }
+                    open_new_agent_picker(app, id);
                 }
                 (Some(PendingIntent::SelectCreatedWorktree), Some(EntityId::Worktree(id))) => {
                     // Its upsert usually lands just before this Ack; if not,
@@ -15114,11 +15213,13 @@ mod tests {
         assert!(menu.filter.is_some(), "the palette is type-to-filter");
         let labels: Vec<&str> = menu.items.iter().map(|i| i.label.as_str()).collect();
         for expected in [
-            "New worktree…",
-            "New orchestrator…",
-            "New agent in worktree…",
-            "Search sessions",
-            "Search everything",
+            "w · New worktree…",
+            "o · New orchestrator…",
+            "a · New agent on branch…",
+            "aw · New agent in worktree…",
+            "t · New terminal",
+            "s · Search sessions",
+            "e · Search everything",
         ] {
             assert!(labels.contains(&expected), "{labels:?}");
         }
@@ -15178,7 +15279,7 @@ mod tests {
             "the filter narrows the commands: {:?}",
             menu.items.iter().map(|i| &i.label).collect::<Vec<_>>()
         );
-        assert_eq!(menu.items[menu.hover].label, "New worktree…");
+        assert_eq!(menu.items[menu.hover].label, "w · New worktree…");
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
         assert!(
             matches!(&app.overlay, Some(Overlay::Prompt(p)) if matches!(p.kind, crate::app::PromptKind::NewWorktree { .. })),
@@ -15223,14 +15324,16 @@ mod tests {
         );
         let mut out = Vec::new();
         press(&mut app, KeyCode::Char('P'), KeyModifiers::SHIFT, &mut out);
-        for c in "agent".chars() {
+        // The exact alias pins its command to the top even though "aw"
+        // also fuzzy-matches "a · New agent on branch…".
+        for c in "aw".chars() {
             press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
         }
         {
             let Some(Overlay::Menu(menu)) = &app.overlay else {
                 panic!("expected the command palette, got {:?}", app.overlay);
             };
-            assert_eq!(menu.items[menu.hover].label, "New agent in worktree…");
+            assert_eq!(menu.items[menu.hover].label, "aw · New agent in worktree…");
         }
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
         // The worktree picker lists the project's checkouts; it filters too.
@@ -15259,6 +15362,100 @@ mod tests {
             menu.items[0].action
         );
         assert!(out.is_empty(), "nothing is created before the final steps");
+    }
+
+    /// `⌘K a Enter` — the vim-style alias pins "New agent on branch…"
+    /// first (plain "a" fuzzy-matches almost every command), and the flow
+    /// chains branch picker → normal session picker on the checkout.
+    #[test]
+    fn command_palette_alias_a_runs_agent_on_branch() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('k'), KeyModifiers::SUPER, &mut out);
+        press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE, &mut out);
+        {
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("expected the command palette, got {:?}", app.overlay);
+            };
+            assert_eq!(
+                menu.items[menu.hover].label, "a · New agent on branch…",
+                "the exact alias is pinned to the top"
+            );
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        // /tmp/demo isn't a repo, so the branch list falls back to the
+        // project's worktree branches (main, checked out on w1).
+        {
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("expected the branch picker, got {:?}", app.overlay);
+            };
+            assert_eq!(menu.title.as_deref(), Some("Agent branch"));
+            assert_eq!(menu.items[0].label, "main ⌂ primary");
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        let Some(Overlay::Menu(menu)) = &app.overlay else {
+            panic!("expected the session picker, got {:?}", app.overlay);
+        };
+        assert_eq!(menu.title.as_deref(), Some("New session"));
+        assert!(
+            matches!(
+                &menu.items[0].action,
+                MenuAction::NewAgentOfKind { worktree, orchestrator: false, .. }
+                    if worktree == &nebula_core::WorktreeId("w1".into())
+            ),
+            "{:?}",
+            menu.items[0].action
+        );
+        assert!(out.is_empty(), "nothing is created before the final steps");
+    }
+
+    /// The `a` flow on a branch with no checkout: the worktree is created
+    /// first (checking out the existing branch), and its Ack opens the
+    /// session picker on the fresh checkout.
+    #[test]
+    fn agent_on_branch_without_checkout_creates_worktree_then_opens_picker() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        run_menu_action(
+            &mut app,
+            MenuAction::AgentOnBranch {
+                project: nebula_core::ProjectId("p1".into()),
+                branch: "feature".into(),
+            },
+            &mut out,
+        );
+        let Some(ClientRequest::CreateWorktree { req_id, branch, base, .. }) = out.first() else {
+            panic!("expected CreateWorktree, got {out:?}");
+        };
+        assert_eq!(branch, "feature");
+        assert_eq!(base, &None, "the existing branch is checked out, not re-based");
+        let req_id = *req_id;
+        let mut out = Vec::new();
+        handle_server_event(
+            &mut app,
+            ServerEvent::Ack {
+                req_id,
+                created: Some(nebula_core::EntityId::Worktree(nebula_core::WorktreeId(
+                    "w-feature".into(),
+                ))),
+            },
+            &mut out,
+        );
+        let Some(Overlay::Menu(menu)) = &app.overlay else {
+            panic!("expected the session picker, got {:?}", app.overlay);
+        };
+        assert_eq!(menu.title.as_deref(), Some("New session"));
+        assert!(
+            matches!(
+                &menu.items[0].action,
+                MenuAction::NewAgentOfKind { worktree, .. }
+                    if worktree == &nebula_core::WorktreeId("w-feature".into())
+            ),
+            "{:?}",
+            menu.items[0].action
+        );
     }
 
     #[test]

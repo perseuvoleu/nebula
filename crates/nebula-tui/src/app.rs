@@ -118,6 +118,13 @@ pub enum MenuAction {
         branch: String,
         spawn: BranchSpawn,
     },
+    /// The `a` palette command's branch row: open the normal new-session
+    /// picker on this branch's checkout, creating the worktree first when
+    /// the branch has none (kind is picked AFTER the branch here).
+    AgentOnBranch {
+        project: ProjectId,
+        branch: String,
+    },
     /// A base-branch-picker row (manual worktree flow): create the named
     /// worktree branching from this base. `None` = the daemon's default
     /// base (the repo root's HEAD).
@@ -163,9 +170,15 @@ pub enum MenuAction {
 /// project they act on; the rest reuse the same code their hotkey runs.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PaletteCommand {
+    /// Filterable picker over the project's LOCAL BRANCHES, then the
+    /// normal new-session picker on the picked branch's checkout (created
+    /// first when the branch has none).
+    NewAgentOnBranch(ProjectId),
     /// Filterable picker over the project's worktrees, then the normal
     /// new-session picker (kind → model/effort → name) on the pick.
     NewAgentInWorktree(ProjectId),
+    /// Shell terminal in the current context's checkout (the `t` rule).
+    NewTerminal,
     SearchSessions,
     SearchEverything,
     GitDiff,
@@ -321,12 +334,31 @@ impl ContextMenu {
     /// Rebuild `items` from the full list against the query: matching rows
     /// best-first, so the hovered row (0) is always the best match. An
     /// empty query restores every row in its original order.
+    ///
+    /// Vim-style aliases: a row labeled `"<alias> · <name>"` (the command
+    /// palette's convention) is pinned to the top when the query IS its
+    /// alias, so `⌘K a Enter` runs one deterministic command regardless of
+    /// how the fuzzy scores land. The alias always fuzzy-matches its own
+    /// row (it's the label's prefix), so pinning only reorders.
     fn apply_filter(&mut self) {
         let Some(f) = &self.filter else { return };
-        self.items = crate::fuzzy::rank(&f.query, f.all.iter().map(|i| i.label.as_str()))
-            .into_iter()
-            .map(|(i, _)| f.all[i].clone())
-            .collect();
+        let mut items: Vec<MenuItem> =
+            crate::fuzzy::rank(&f.query, f.all.iter().map(|i| i.label.as_str()))
+                .into_iter()
+                .map(|(i, _)| f.all[i].clone())
+                .collect();
+        let q = f.query.trim();
+        if !q.is_empty() {
+            if let Some(pos) = items.iter().position(|i| {
+                i.label
+                    .split_once(" · ")
+                    .is_some_and(|(alias, _)| alias.eq_ignore_ascii_case(q))
+            }) {
+                let pinned = items.remove(pos);
+                items.insert(0, pinned);
+            }
+        }
+        self.items = items;
         self.hover = 0;
     }
 }
@@ -1455,6 +1487,9 @@ pub enum PendingIntent {
     /// Branch picker picked a branch with no checkout: once the worktree's
     /// Ack lands, create this session on it (a second request cycle).
     SpawnOnCreatedWorktree(DeferredSpawn),
+    /// The `a` palette flow picked a branch with no checkout: once the
+    /// worktree's Ack lands, open the new-session picker on it.
+    PickAgentOnCreatedWorktree,
     None,
 }
 
