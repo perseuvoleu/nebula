@@ -2677,15 +2677,15 @@ fn open_command_palette(app: &mut App) {
                 "a · New agent (primary)",
                 MenuAction::NewAgent(main.clone()),
             ));
+            // Kind-fixed = fully decided: no name prompt either — the
+            // generated default + auto-title (the agent renames itself
+            // from its first prompt) make Enter the last keystroke.
             let kind_row = |alias: &str, name: &str, kind: AgentKind| MenuItem {
                 label: format!("{alias} · New {name} agent (primary)"),
-                action: MenuAction::NewAgentOfKind {
+                action: MenuAction::Command(PaletteCommand::NewAgentNow {
                     worktree: main.clone(),
                     kind,
-                    model: None,
-                    effort: None,
-                    orchestrator: false,
-                },
+                }),
                 destructive: false,
             };
             items.push(kind_row("acc", "Claude", AgentKind::Claude));
@@ -2707,7 +2707,11 @@ fn open_command_palette(app: &mut App) {
             MenuAction::NewOrchestrator(p),
         ));
         items.push(row(
-            "t · New terminal",
+            "t · Quick terminal (⌘T window)",
+            MenuAction::Command(PaletteCommand::QuickTerminal),
+        ));
+        items.push(row(
+            "tn · New terminal tab",
             MenuAction::Command(PaletteCommand::NewTerminal),
         ));
     }
@@ -5042,6 +5046,19 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                     open_worktree_picker_for_agent(app, project)
                 }
                 PaletteCommand::NewTerminal => create_terminal_for_context(app, out),
+                // Same toggle ⌘T runs. Always an OPEN in practice: ⌘K
+                // inside the window closes it before the palette shows.
+                PaletteCommand::QuickTerminal => toggle_quick_terminal(app, out),
+                PaletteCommand::NewAgentNow { worktree, kind } => {
+                    // Straight to CreateAgent at the configured defaults;
+                    // the empty name means generated + auto-title, and the
+                    // Ack attaches as usual (the create adopts the warm
+                    // slot when the spec matches).
+                    let cfg = crate::config::Config::load();
+                    let model = cfg.default_model(kind);
+                    let effort = cfg.default_effort(kind);
+                    create_agent(app, worktree, kind, model, effort, String::new(), false, out);
+                }
                 PaletteCommand::ReloadUi => {
                     // Quit + re-exec the binary on disk (main.rs does the
                     // exec once the terminal is restored). Selection is
@@ -15279,7 +15296,8 @@ mod tests {
             "ap · New Pi agent (primary)",
             "ab · New agent on branch…",
             "aw · New agent in worktree…",
-            "t · New terminal",
+            "t · Quick terminal (⌘T window)",
+            "tn · New terminal tab",
             "s · Search sessions",
             "e · Search everything",
         ] {
@@ -15461,10 +15479,11 @@ mod tests {
     }
 
     /// `⌘K ac Enter` — the kind-fixed spellings (acc/ac/acu/ap) skip the
-    /// kind picker too: straight to the name prompt for that CLI on the
-    /// primary checkout, prewarm already fired.
+    /// kind picker AND the name prompt: the agent is created right away
+    /// with the generated default name and auto-title on (it renames
+    /// itself from its first prompt).
     #[test]
-    fn command_palette_alias_ac_starts_a_codex_agent_on_primary() {
+    fn command_palette_alias_ac_creates_a_codex_agent_on_primary_no_prompt() {
         with_default_config(|| {
             let mut app = App::new();
             seed_tree(&mut app);
@@ -15484,30 +15503,56 @@ mod tests {
             }
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
             assert!(
-                matches!(
-                    &app.overlay,
-                    Some(Overlay::Prompt(p)) if matches!(
-                        &p.kind,
-                        PromptKind::NewAgent {
-                            target: crate::app::SpawnTarget::Worktree(w),
-                            kind: AgentKind::Codex,
-                            orchestrator: false,
-                            ..
-                        } if w == &nebula_core::WorktreeId("w1".into())
-                    )
-                ),
-                "{:?}",
+                app.overlay.is_none(),
+                "no name prompt, no picker: {:?}",
                 app.overlay
             );
             assert!(
                 matches!(
-                    out.last(),
-                    Some(ClientRequest::PrewarmAgent { worktree, kind: AgentKind::Codex, .. })
-                        if worktree == &nebula_core::WorktreeId("w1".into())
+                    out.first(),
+                    Some(ClientRequest::CreateAgent {
+                        worktree,
+                        kind: AgentKind::Codex,
+                        name,
+                        auto_title: true,
+                        orchestrator: false,
+                        ..
+                    }) if worktree == &nebula_core::WorktreeId("w1".into()) && name == "agent-2"
                 ),
-                "{out:?}"
+                "created immediately with the generated default: {out:?}"
             );
         })
+    }
+
+    /// `⌘K t Enter` — the alias opens the same floating quick terminal
+    /// ⌘T does, on the current context's checkout.
+    #[test]
+    fn command_palette_alias_t_opens_the_quick_terminal_window() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.focus = Focus::Sessions;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('k'), KeyModifiers::SUPER, &mut out);
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::NONE, &mut out);
+        {
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("expected the command palette, got {:?}", app.overlay);
+            };
+            assert_eq!(
+                menu.items[menu.hover].label, "t · Quick terminal (⌘T window)",
+                "the exact alias is pinned above \"tn\""
+            );
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(app.quick_term, "the floating window is up");
+        assert!(
+            matches!(
+                out.last(),
+                Some(ClientRequest::CreateTerminal { worktree, name: Some(n), .. })
+                    if worktree == &nebula_core::WorktreeId("w1".into()) && n == "quick"
+            ),
+            "the per-worktree quick shell is created: {out:?}"
+        );
     }
 
     /// `⌘K ab Enter` — the branch-pick spelling: the flow chains branch

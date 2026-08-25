@@ -177,8 +177,19 @@ pub enum PaletteCommand {
     /// Filterable picker over the project's worktrees, then the normal
     /// new-session picker (kind → model/effort → name) on the pick.
     NewAgentInWorktree(ProjectId),
-    /// Shell terminal in the current context's checkout (the `t` rule).
+    /// Shell terminal TAB in the current context's checkout (the `t`
+    /// hotkey's rule).
     NewTerminal,
+    /// The ⌘T floating quick terminal, opened from the palette (`t`).
+    QuickTerminal,
+    /// The kind-fixed aliases (acc/ac/acu/ap): create the agent RIGHT NOW
+    /// on this worktree — configured default model/effort, generated name,
+    /// auto-title on (the agent renames itself from its first prompt). No
+    /// prompt, no picker.
+    NewAgentNow {
+        worktree: WorktreeId,
+        kind: AgentKind,
+    },
     /// Quit and re-exec the binary on disk in the same window — picks up
     /// a freshly `make install`ed build without closing anything.
     ReloadUi,
