@@ -2663,8 +2663,38 @@ fn open_command_palette(app: &mut App) {
     // the top (see `apply_filter`), so `⌘K a Enter` is two keys to a flow.
     let mut items = Vec::new();
     if let Some(p) = project {
+        // `a` and the kind-fixed spellings act on the primary checkout —
+        // the zero-decision default; `ab` inserts the branch pick, `aw`
+        // the worktree pick.
+        let primary = app
+            .tree
+            .worktrees
+            .iter()
+            .find(|w| w.project_id == p && w.is_main)
+            .map(|w| w.id.clone());
+        if let Some(main) = primary {
+            items.push(row(
+                "a · New agent (primary)",
+                MenuAction::NewAgent(main.clone()),
+            ));
+            let kind_row = |alias: &str, name: &str, kind: AgentKind| MenuItem {
+                label: format!("{alias} · New {name} agent (primary)"),
+                action: MenuAction::NewAgentOfKind {
+                    worktree: main.clone(),
+                    kind,
+                    model: None,
+                    effort: None,
+                    orchestrator: false,
+                },
+                destructive: false,
+            };
+            items.push(kind_row("acc", "Claude", AgentKind::Claude));
+            items.push(kind_row("ac", "Codex", AgentKind::Codex));
+            items.push(kind_row("acu", "Cursor", AgentKind::Cursor));
+            items.push(kind_row("ap", "Pi", AgentKind::Pi));
+        }
         items.push(row(
-            "a · New agent on branch…",
+            "ab · New agent on branch…",
             MenuAction::Command(PaletteCommand::NewAgentOnBranch(p.clone())),
         ));
         items.push(row(
@@ -15242,7 +15272,12 @@ mod tests {
         for expected in [
             "w · New worktree…",
             "o · New orchestrator…",
-            "a · New agent on branch…",
+            "a · New agent (primary)",
+            "acc · New Claude agent (primary)",
+            "ac · New Codex agent (primary)",
+            "acu · New Cursor agent (primary)",
+            "ap · New Pi agent (primary)",
+            "ab · New agent on branch…",
             "aw · New agent in worktree…",
             "t · New terminal",
             "s · Search sessions",
@@ -15391,11 +15426,10 @@ mod tests {
         assert!(out.is_empty(), "nothing is created before the final steps");
     }
 
-    /// `⌘K a Enter` — the vim-style alias pins "New agent on branch…"
-    /// first (plain "a" fuzzy-matches almost every command), and the flow
-    /// chains branch picker → normal session picker on the checkout.
+    /// `⌘K a Enter` — the zero-decision default: the session picker opens
+    /// straight on the PRIMARY checkout, no branch/worktree step.
     #[test]
-    fn command_palette_alias_a_runs_agent_on_branch() {
+    fn command_palette_alias_a_opens_the_session_picker_on_primary() {
         let mut app = App::new();
         seed_tree(&mut app);
         let mut out = Vec::new();
@@ -15406,7 +15440,93 @@ mod tests {
                 panic!("expected the command palette, got {:?}", app.overlay);
             };
             assert_eq!(
-                menu.items[menu.hover].label, "a · New agent on branch…",
+                menu.items[menu.hover].label, "a · New agent (primary)",
+                "the exact alias is pinned to the top"
+            );
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        let Some(Overlay::Menu(menu)) = &app.overlay else {
+            panic!("expected the session picker, got {:?}", app.overlay);
+        };
+        assert_eq!(menu.title.as_deref(), Some("New session"));
+        assert!(
+            matches!(
+                &menu.items[0].action,
+                MenuAction::NewAgentOfKind { worktree, orchestrator: false, .. }
+                    if worktree == &nebula_core::WorktreeId("w1".into())
+            ),
+            "{:?}",
+            menu.items[0].action
+        );
+    }
+
+    /// `⌘K ac Enter` — the kind-fixed spellings (acc/ac/acu/ap) skip the
+    /// kind picker too: straight to the name prompt for that CLI on the
+    /// primary checkout, prewarm already fired.
+    #[test]
+    fn command_palette_alias_ac_starts_a_codex_agent_on_primary() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Char('k'), KeyModifiers::SUPER, &mut out);
+            for c in "ac".chars() {
+                press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+            }
+            {
+                let Some(Overlay::Menu(menu)) = &app.overlay else {
+                    panic!("expected the command palette, got {:?}", app.overlay);
+                };
+                assert_eq!(
+                    menu.items[menu.hover].label, "ac · New Codex agent (primary)",
+                    "\"ac\" pins Codex even though it prefixes \"acc\"/\"acu\""
+                );
+            }
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(
+                matches!(
+                    &app.overlay,
+                    Some(Overlay::Prompt(p)) if matches!(
+                        &p.kind,
+                        PromptKind::NewAgent {
+                            target: crate::app::SpawnTarget::Worktree(w),
+                            kind: AgentKind::Codex,
+                            orchestrator: false,
+                            ..
+                        } if w == &nebula_core::WorktreeId("w1".into())
+                    )
+                ),
+                "{:?}",
+                app.overlay
+            );
+            assert!(
+                matches!(
+                    out.last(),
+                    Some(ClientRequest::PrewarmAgent { worktree, kind: AgentKind::Codex, .. })
+                        if worktree == &nebula_core::WorktreeId("w1".into())
+                ),
+                "{out:?}"
+            );
+        })
+    }
+
+    /// `⌘K ab Enter` — the branch-pick spelling: the flow chains branch
+    /// picker → normal session picker on the picked checkout.
+    #[test]
+    fn command_palette_alias_ab_runs_agent_on_branch() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('k'), KeyModifiers::SUPER, &mut out);
+        for c in "ab".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        {
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("expected the command palette, got {:?}", app.overlay);
+            };
+            assert_eq!(
+                menu.items[menu.hover].label, "ab · New agent on branch…",
                 "the exact alias is pinned to the top"
             );
         }
