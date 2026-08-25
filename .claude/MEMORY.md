@@ -14,6 +14,44 @@ about what is worth recording.
 
 ## Entries
 
+### ⌘D Splits The Terminal Pane With A Fresh Shell; Diff Keeps g/⌘G — 2026-08-25
+
+**Asked:** "Implement the corrected Cmd+D behavior in Nebula… Cmd+D currently opens the Git diff
+viewer. Instead: Cmd+D must split the terminal/agent display area into two panes… keep the currently
+attached agent or terminal visible in the left pane… create a fresh shell terminal in the right pane,
+in the same selected/current worktree… move focus/input lock to the new right-hand terminal… Keep
+plain g as the Git diff viewer shortcut; remove Cmd+D from GitDiff."
+
+**Did:** Commit `fa4815e`. New `Action::SplitTerminal` (keymap.rs, id `split_terminal`, SESSIONS
+group, defaults `cmd+d, |`); `GitDiff` defaults are now `g, cmd+g` (⌘G was already the Ghostty
+overlay's diff bind — `super+g=csi:103;9u` — so the locked-session diff chord follows it). App state:
+`split_term: Option<AttachedTerm>` + `split_term_area` + `split_focused` (app.rs). Flow:
+`toggle_split_terminal` (event_loop.rs, next to the quick-terminal fns) reuses
+`quick_terminal_worktree` for context and sends `CreateTerminal { name: None }` with new
+`PendingIntent::AttachCreatedSplit`, whose Ack runs `attach_split` (right pane + input lock); a
+second ⌘D runs `close_split_terminal` (Detach only — the shell stays a normal tab; lock returns to
+the left pane). `draw_terminal` (ui.rs) carves the pane into two halves with a rule that turns
+accent while the right pane holds the lock; `sync_pty_size` resizes both PTYs to their own rects
+(shared `resize_term` helper). Output/Scrollback/SessionExited/KittyFlags route to whichever pane's
+sref matches; locked-key input routes by `split_focused`; new `HitTarget::SplitTerminalPane` gives
+the right pane click-to-lock and wheel scrollback; `detach_if_attached` drops the split when its
+shell dies; the daemon-reconnect arm re-attaches the split too. `~/.config/ghostty/nebula` gained
+`super+d=csi:100;9u` (overrides Ghostty's native `new_split:right`). Tests:
+`cmd_d_splits_with_a_fresh_shell_then_toggles_closed`, `cmd_d_from_the_panels_creates_the_split_shell`,
+`split_panes_render_and_resize_independently`, `cmd_d_belongs_to_the_split_and_g_keeps_the_diff`
+(keymap); the two old `cmd_d_*_diff_viewer` tests were rewritten as `cmd_g_*`. 473 nebula-tui + full
+workspace green; `make install` run (TUI-only, no protocol change — old daemon fine).
+
+**Gotchas:**
+- The reachable-chord keymap test rejects ⌘-only defaults — `SplitTerminal` needed the plain `|`
+  alternate alongside `cmd+d`.
+- The locked-terminal guard was `app.term.is_some() && app.term_locked`; with a split the left pane
+  can be empty while the right shell holds the lock, so it's now `term || split_term`.
+- The wheel's `in_term` shortcut `|| app.collapsed` would swallow scrolls aimed at the split pane in
+  collapsed mode — the `in_split` check must win first.
+- `close_split_terminal` must reset `split_term_area` to `Rect::default()`, or a stale rect makes the
+  next split's pre-draw `split_pane_size` lie about the pane.
+
 ### Merge Audit: Duplicate-Commit False Conflict, Batch Commit, Push — 2026-08-25
 
 **Asked:** "uita te in orchestratori , toate sunt pe main merge ?" → clarified: "ma refer daca
@@ -705,7 +743,10 @@ and the palettes already search `{project}/{branch}/{name}`.
   derived title too, same code path — intended, not creep.
 - `hooks::tests::orchestrator_instruction_teaches_task_derived_naming` pins prose substrings
   (`--name`, `search`, `derived from --prompt`) — copyediting the brief means updating it.
-### ⌘D Opens The Diff Viewer From Anywhere — 2026-08-24
+### ⌘D Opens The Diff Viewer From Anywhere — 2026-08-24 — SUPERSEDED 2026-08-25
+
+> Superseded by "⌘D Splits The Terminal Pane…" above: ⌘D now opens the split terminal; the diff's
+> locked-session chord moved to ⌘G (plain `g` unchanged). Kept for the gotchas, which still apply.
 
 **Asked:** "Cmd+D should open the git diff viewer for the currently selected worktree regardless of
 which Nebula panel has focus, and it must also work while an agent terminal is input-locked… update
