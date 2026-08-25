@@ -38,7 +38,7 @@ fn runtime() -> Result<tokio::runtime::Runtime> {
 /// binary crate stays a thin arg-parser. `Some(entry)` means the user picked
 /// a recent ssh host — the terminal is restored and the caller should exec
 /// `nebula ssh` at it.
-pub fn run_tui(open_at: Option<std::path::PathBuf>) -> Result<Option<hosts::HostEntry>> {
+pub fn run_tui(open_at: Option<std::path::PathBuf>) -> Result<event_loop::Handoff> {
     runtime()?.block_on(event_loop::run_app(open_at))
 }
 

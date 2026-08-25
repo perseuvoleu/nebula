@@ -106,11 +106,20 @@ const SWEEP_FRAME: Duration = crate::app::SWEEP_FRAME;
 /// (`connect_or_spawn`), so the effective cadence is retry + boot-poll.
 const RECONNECT_RETRY: Duration = Duration::from_secs(2);
 
-/// `Some(entry)` = quit via the hosts picker: the caller should exec
-/// `nebula ssh` at it now that the terminal is restored.
-pub async fn run_app(
-    open_at: Option<std::path::PathBuf>,
-) -> Result<Option<crate::hosts::HostEntry>> {
+/// What the TUI asks its caller to do after teardown (the terminal is
+/// already restored when this is returned).
+#[derive(Debug)]
+pub enum Handoff {
+    /// Plain quit.
+    None,
+    /// The hosts picker chose a destination: exec `nebula ssh` at it.
+    Ssh(crate::hosts::HostEntry),
+    /// `⌘K r`: re-exec the binary on disk over this process, so a freshly
+    /// installed build takes over the same window.
+    Reload,
+}
+
+pub async fn run_app(open_at: Option<std::path::PathBuf>) -> Result<Handoff> {
     let conn = ipc::connect_or_spawn().await?;
     let mut channels = ipc::split_connection(conn);
     channels.tx.send(ClientRequest::Subscribe).await?;
@@ -187,7 +196,7 @@ async fn main_loop(
     terminal: &mut Terminal<CrosstermBackend<BufWriter<Stdout>>>,
     channels: &mut ipc::IpcChannels,
     open_at: Option<std::path::PathBuf>,
-) -> Result<Option<crate::hosts::HostEntry>> {
+) -> Result<Handoff> {
     let mut app = App::new();
     app.open_at = open_at;
     app.conn = ConnState::Connected;
@@ -447,7 +456,14 @@ async fn main_loop(
                     json: ui_state_json(&app),
                 })
                 .await;
-            return Ok(app.pending_ssh.take());
+            return Ok(if app.pending_reload {
+                Handoff::Reload
+            } else {
+                match app.pending_ssh.take() {
+                    Some(entry) => Handoff::Ssh(entry),
+                    None => Handoff::None,
+                }
+            });
         }
     }
 }
@@ -2688,6 +2704,10 @@ fn open_command_palette(app: &mut App) {
         MenuAction::Command(PaletteCommand::Workspaces),
     ));
     items.push(row("p · Add project…", MenuAction::AddProject));
+    items.push(row(
+        "r · Reload nebula",
+        MenuAction::Command(PaletteCommand::ReloadUi),
+    ));
     app.overlay = Some(Overlay::Menu(
         ContextMenu {
             title: Some("Commands".into()),
@@ -4992,6 +5012,13 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                     open_worktree_picker_for_agent(app, project)
                 }
                 PaletteCommand::NewTerminal => create_terminal_for_context(app, out),
+                PaletteCommand::ReloadUi => {
+                    // Quit + re-exec the binary on disk (main.rs does the
+                    // exec once the terminal is restored). Selection is
+                    // saved on the way out; daemon and sessions stay up.
+                    app.pending_reload = true;
+                    app.should_quit = true;
+                }
                 PaletteCommand::SearchSessions => {
                     app.overlay = Some(Overlay::Palette(Palette::sessions(
                         &app.tree,
@@ -15408,6 +15435,27 @@ mod tests {
             menu.items[0].action
         );
         assert!(out.is_empty(), "nothing is created before the final steps");
+    }
+
+    /// `⌘K r Enter`: the pinned reload command quits with the reload flag
+    /// set, so main.rs re-execs the binary on disk over this process.
+    #[test]
+    fn command_palette_alias_r_requests_an_in_place_reload() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('k'), KeyModifiers::SUPER, &mut out);
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::NONE, &mut out);
+        {
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("expected the command palette, got {:?}", app.overlay);
+            };
+            assert_eq!(menu.items[menu.hover].label, "r · Reload nebula");
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(app.should_quit, "reload quits the loop");
+        assert!(app.pending_reload, "…with the re-exec flag set");
+        assert!(out.is_empty(), "nothing goes to the daemon: {out:?}");
     }
 
     /// The `a` flow on a branch with no checkout: the worktree is created

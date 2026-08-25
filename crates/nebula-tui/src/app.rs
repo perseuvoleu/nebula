@@ -179,6 +179,9 @@ pub enum PaletteCommand {
     NewAgentInWorktree(ProjectId),
     /// Shell terminal in the current context's checkout (the `t` rule).
     NewTerminal,
+    /// Quit and re-exec the binary on disk in the same window — picks up
+    /// a freshly `make install`ed build without closing anything.
+    ReloadUi,
     SearchSessions,
     SearchEverything,
     GitDiff,
@@ -1975,6 +1978,11 @@ pub struct App {
     /// after teardown the binary execs `nebula ssh` at it, replacing this
     /// process with a fresh connection.
     pub pending_ssh: Option<crate::hosts::HostEntry>,
+    /// Set with `should_quit` by the palette's `r · Reload nebula`: after
+    /// teardown the process re-execs the binary on disk, so a freshly
+    /// installed build takes over this same window (state restored via
+    /// SaveUiState; the daemon and its sessions stay up).
+    pub pending_reload: bool,
     pub flash: Option<String>,
     pub overlay: Option<Overlay>,
     pub show_archived: bool,
@@ -2180,6 +2188,7 @@ impl App {
             dirty: true,
             should_quit: false,
             pending_ssh: None,
+            pending_reload: false,
             flash: None,
             overlay: None,
             show_archived: false,

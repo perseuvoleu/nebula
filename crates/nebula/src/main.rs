@@ -398,20 +398,34 @@ fn main() -> Result<()> {
 }
 
 /// Launch the TUI (optionally landing on `open_at`'s project) and honor a
-/// hosts-picker handoff: the TUI quit and restored the terminal so a fresh
-/// `nebula ssh` can exec over us (the local daemon and its sessions stay up).
+/// handoff: the TUI quit and restored the terminal so a fresh process can
+/// exec over us — `nebula ssh` for the hosts picker, or the binary on
+/// disk for `⌘K r` reload (the local daemon and its sessions stay up).
 fn run_tui_and_handoff(open_at: Option<std::path::PathBuf>) -> Result<()> {
+    use nebula_tui::event_loop::Handoff;
     init_tui_logging()?;
     let handoff = log_fatal(
         nebula_tui::run_tui(open_at),
         nebula_core::paths::tui_log_path(),
     )?;
     match handoff {
-        Some(entry) => {
+        Handoff::Ssh(entry) => {
             eprintln!("nebula: connecting to {}…", entry.host);
             ssh::run_ssh(&entry.host, entry.path.as_deref())
         }
-        None => Ok(()),
+        Handoff::Reload => {
+            // Same argv against the launch path: after `make install` the
+            // path holds the new build (cp + mv replaces the file, so the
+            // running image was never touched).
+            use anyhow::Context as _;
+            use std::os::unix::process::CommandExt;
+            let exe = std::env::current_exe().context("resolve current executable")?;
+            let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+            eprintln!("nebula: reloading…");
+            let err = std::process::Command::new(&exe).args(&args).exec();
+            Err(anyhow::anyhow!("re-exec of {} failed: {err}", exe.display()))
+        }
+        Handoff::None => Ok(()),
     }
 }
 

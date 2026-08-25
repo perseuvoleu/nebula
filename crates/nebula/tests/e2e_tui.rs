@@ -839,3 +839,25 @@ fn tui_reconnects_after_the_daemon_is_killed() {
     tui.wait_for_gone("✗ disconnected");
     tui.wait_for_text("proj");
 }
+
+/// `⌘K r` (typed here as ⇧P + the alias): the TUI quits and re-execs the
+/// binary on disk in the SAME window — the process survives, the tree
+/// comes back, and the reloaded UI still answers input.
+#[test]
+fn tui_reloads_in_place_from_the_palette() {
+    let mut tui = TuiHarness::spawn();
+    let repo = tui.make_repo("proj");
+    add_project(&mut tui, &repo, "proj");
+
+    tui.send(b"P");
+    tui.wait_for_text("Commands");
+    tui.type_str("r");
+    tui.send(b"\r");
+
+    // exec() keeps the pid; give the fresh image a moment to boot, then
+    // prove the reloaded UI is alive by opening the help modal.
+    std::thread::sleep(Duration::from_millis(2000));
+    tui.wait_for_text("proj");
+    tui.send(b"?");
+    tui.wait_for_text("NAVIGATE & SEARCH");
+}
