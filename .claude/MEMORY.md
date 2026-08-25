@@ -14,6 +14,25 @@ about what is worth recording.
 
 ## Entries
 
+### Merge Audit: Duplicate-Commit False Conflict, Batch Commit, Push — 2026-08-25
+
+**Asked:** "uita te in orchestratori , toate sunt pe main merge ?" → clarified: "ma refer daca
+modificarile lor sunt mergeuite pe main"
+
+**Did:** Committed ~5 finished-but-uncommitted orchestrator tasks sitting in the working tree as one
+batch commit (`d23fbd6`), merged the leftover `independent-orchestrator-worktree-sections` branch,
+deleted it, and pushed main (was 5+ commits ahead of origin). 469 tests green before push.
+
+**Gotchas:**
+- Orchestrators finish tasks, run `make install`, and log to MEMORY.md **without committing** — a
+  clean-looking session list does not mean the work is on main; check `git status` and
+  `git branch --no-merged main` when auditing.
+- `independent-orchestrator-worktree-sections`'s only commit `7dee97b` was tree-identical to main's
+  `1e45e87` (same change landed twice under different hashes), so git reported it unmerged and the
+  merge "conflicted" in ui.rs against code that had since evolved. Resolution: `git checkout HEAD --`
+  on every touched file (an ours-merge), yielding a zero-diff merge commit — never replay the branch
+  side of such a conflict.
+
 ### Draw-Path CPU: Link Scan Memoized, `git status` Off-Loop — 2026-08-25
 
 **Asked:** "putem face mai eficienta aplicatia sa nu consume asa mult sa fie mai fluid totul ?"
