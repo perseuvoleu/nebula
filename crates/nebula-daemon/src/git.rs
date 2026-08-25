@@ -6,6 +6,13 @@ use anyhow::{anyhow, bail, Result};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 
+const PACKAGE_MANAGER_LOCKFILES: [&str; 4] = [
+    "pnpm-lock.yaml",
+    "package-lock.json",
+    "yarn.lock",
+    "bun.lockb",
+];
+
 /// Shown when the `git` binary itself is missing. Every other git failure
 /// carries git's own stderr; this one git never gets to print, so spelling out
 /// the fix is on us — otherwise the user sees "No such file or directory" and
@@ -154,6 +161,137 @@ pub async fn add_worktree(repo: &Path, branch: &str, base: Option<&str>) -> Resu
             Ok(path)
         }
         Err(e) => Err(e),
+    }
+}
+
+/// Best-effort clone of a primary checkout's top-level `node_modules` into a
+/// new worktree when their first package-manager lockfile matches exactly.
+/// The blocking filesystem work runs detached so worktree creation can reply
+/// immediately; failures are logged and any partial destination is removed.
+pub fn seed_node_modules_in_background(primary: &Path, worktree: &Path) {
+    let primary = primary.to_path_buf();
+    let worktree = worktree.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut lockfile = None;
+        for name in PACKAGE_MANAGER_LOCKFILES {
+            let path = primary.join(name);
+            match std::fs::metadata(&path) {
+                Ok(metadata) if metadata.is_file() => {
+                    lockfile = Some(name);
+                    break;
+                }
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        path = %path.display(),
+                        "node_modules seed skipped: lockfile lookup failed"
+                    );
+                    return;
+                }
+            }
+        }
+        let Some(lockfile) = lockfile else {
+            return;
+        };
+        let primary_lockfile = primary.join(lockfile);
+        let worktree_lockfile = worktree.join(lockfile);
+        let primary_bytes = match std::fs::read(&primary_lockfile) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    path = %primary_lockfile.display(),
+                    "node_modules seed skipped: lockfile read failed"
+                );
+                return;
+            }
+        };
+        let worktree_bytes = match std::fs::read(&worktree_lockfile) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    path = %worktree_lockfile.display(),
+                    "node_modules seed skipped: lockfile read failed"
+                );
+                return;
+            }
+        };
+        if primary_bytes != worktree_bytes {
+            return;
+        }
+
+        let source = primary.join("node_modules");
+        let destination = worktree.join("node_modules");
+        match std::fs::metadata(&source) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    path = %source.display(),
+                    "node_modules seed skipped: source lookup failed"
+                );
+                return;
+            }
+        }
+        match destination.try_exists() {
+            Ok(false) => {}
+            Ok(true) => return,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    path = %destination.display(),
+                    "node_modules seed skipped: destination lookup failed"
+                );
+                return;
+            }
+        }
+
+        let output = std::process::Command::new("cp")
+            .arg("-Rc")
+            .arg(&source)
+            .arg(&destination)
+            .output();
+        match output {
+            Ok(output) if output.status.success() => tracing::info!(
+                source = %source.display(),
+                destination = %destination.display(),
+                "seeded worktree node_modules"
+            ),
+            Ok(output) => {
+                let cleanup_error = cleanup_partial_node_modules(&destination);
+                tracing::warn!(
+                    status = %output.status,
+                    stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                    source = %source.display(),
+                    destination = %destination.display(),
+                    cleanup_error,
+                    "node_modules seed skipped: copy-on-write clone failed"
+                );
+            }
+            Err(error) => {
+                let cleanup_error = cleanup_partial_node_modules(&destination);
+                tracing::warn!(
+                    error = %error,
+                    source = %source.display(),
+                    destination = %destination.display(),
+                    cleanup_error,
+                    "node_modules seed skipped: could not run cp"
+                );
+            }
+        }
+    });
+}
+
+fn cleanup_partial_node_modules(path: &Path) -> Option<String> {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => Some(error.to_string()),
     }
 }
 

@@ -895,7 +895,32 @@ impl Daemon {
             .store
             .get_project(project_id)?
             .context("project not found")?;
+        let seed_primary = if crate::config::Config::load().seed_node_modules {
+            match self.store.get_primary_worktree_path(project_id) {
+                Ok(Some(primary)) => Some(primary),
+                Ok(None) => {
+                    tracing::warn!(
+                        project = %project.name,
+                        "node_modules seed skipped: primary checkout is not registered"
+                    );
+                    None
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        project = %project.name,
+                        error = %error,
+                        "node_modules seed skipped: could not read primary checkout"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let path = git::add_worktree(&project.repo_path, branch, base).await?;
+        if let Some(primary) = seed_primary {
+            git::seed_node_modules_in_background(&primary, &path);
+        }
         let worktree = Worktree {
             id: WorktreeId::generate(),
             project_id: project_id.clone(),
