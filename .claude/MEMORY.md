@@ -63,6 +63,23 @@ restored via the SaveUiState-on-quit path, daemon untouched. e2e
   (target/release/nebula for `ng`, the ~/.cargo/bin path otherwise) holds the NEW build while the
   running image is never touched — `current_exe()` re-resolves to fresh code.
 
+### Orchestrator Rows Trail A Harness Badge (claude/codex/cursor/pi) — 2026-08-25
+
+**Asked:** "aici sub agenti vreau sa scrie daca e cursor pi codex etc" (screenshot of the SESSIONS
+panel — which already shows the kind; the only agent rows missing it were the ORCHESTRATORS section).
+
+**Did:** Commit `021d864`. ui.rs orchestrator rows now read `name ◆ branch kind` — the tuple grew
+`a.kind.as_str()` and a dim trailing `kind_label`. Priority mirrors the sessions panel: the harness
+badge ALWAYS renders; when the panel is too narrow to keep the name ≥ `MIN_SESSION_NAME_W` (8), the
+BRANCH label drops whole (never clipped).
+
+**Gotchas:**
+- First attempt dropped the KIND on narrow panels — but the default worktrees-panel width is narrow,
+  so the badge the user asked for would never have shown; branch is the right thing to sacrifice.
+- Two screen tests pin this row's exact text (`orchestrators_group_tops…` at default width →
+  "orchest" + "◆ claude"; `orchestrators_on_branch…` at `app.panel_widths[1] = 40` →
+  "boss ◆ feature claude") — any change to the row's badge order or drop rule lands in both.
+
 ### TUI Auto-Reconnects After The Daemon Dies (Frozen/Truncated Screen Diagnosis) — 2026-08-25
 
 **Asked:** "eu cand deschid ceva fereastra se face resize la nebula si dupa terminalul imi ramane cu
