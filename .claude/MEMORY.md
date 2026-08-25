@@ -14,6 +14,34 @@ about what is worth recording.
 
 ## Entries
 
+### Vim-Style Aliases In The ⌘K Command Palette — 2026-08-25
+
+**Asked:** "cand dau cmmd k as vrea sa le pot da din comenzi ca vim simplificate gen sa scriu a sa mi
+faca agent de la branch ul existent, sau aw, agent de la worktree, sau w worktree nou, toate
+combinatiile astea" — later "nu vad nimic diferit in cmmd k" (the list of suggestions had been given
+but nothing implemented; implemented on that follow-up).
+
+**Did:** Commit `e857abb`. Palette rows in `open_command_palette` (event_loop.rs) are labeled
+`"<alias> · <name>"` and `ContextMenu::apply_filter` (app.rs) pins the row whose label's
+`split_once(" · ")` alias equals the trimmed query — a convention on the label, deliberately NOT a
+new MenuItem field (MenuItem is literal-constructed everywhere). Aliases: a/aw/w/o/t/s/e/g/n/td/st/ws/p.
+New `a` flow (branch-FIRST, mirror of the orchestrator's kind-first order):
+`PaletteCommand::NewAgentOnBranch` → `open_agent_branch_picker` ("Agent branch") → rows
+`MenuAction::AgentOnBranch { project, branch }` → existing checkout opens `open_new_agent_picker`,
+missing one sends CreateWorktree with new `PendingIntent::PickAgentOnCreatedWorktree` whose Ack opens
+the picker. `PaletteCommand::NewTerminal` → `create_terminal_for_context`. Branch listing factored
+into `project_local_branches` (shared with `open_branch_picker`). Tests:
+`command_palette_alias_a_runs_agent_on_branch`,
+`agent_on_branch_without_checkout_creates_worktree_then_opens_picker`; 458 nebula-tui + workspace
+green; `make install` run.
+
+**Gotchas:**
+- The pin is REQUIRED, not cosmetic: plain "a" fuzzy-matches nearly every command, and "agent"
+  matches both agent rows with the on-branch row winning on original order — the old
+  `command_palette_new_agent_in_worktree…` test had to switch to typing the "aw" alias.
+- Any test asserting palette labels asserts the alias prefix now ("w · New worktree…", not
+  "New worktree…").
+
 ### TUI Auto-Reconnects After The Daemon Dies (Frozen/Truncated Screen Diagnosis) — 2026-08-25
 
 **Asked:** "eu cand deschid ceva fereastra se face resize la nebula si dupa terminalul imi ramane cu
