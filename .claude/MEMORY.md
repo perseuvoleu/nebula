@@ -27,7 +27,7 @@ about what is worth recording.
   always-running orchestrator itself, and times out forever even though the worker finished. The
   self-exclusion via `NEBULA_AGENT_ID` applies only to the no-names form. Either give the worker a
   distinct name or wait/verify by id via `nebula agent list`.
- The Terminal Pane With A Fresh Shell; Diff Keeps g/⌘G — 2026-08-25
+### ⌘D Splits The Terminal Pane With A Fresh Shell; Diff Keeps g/⌘G — 2026-08-25
 
 **Asked:** "Implement the corrected Cmd+D behavior in Nebula… Cmd+D currently opens the Git diff
 viewer. Instead: Cmd+D must split the terminal/agent display area into two panes… keep the currently
@@ -54,6 +54,13 @@ shell dies; the daemon-reconnect arm re-attaches the split too. `~/.config/ghost
 `split_panes_render_and_resize_independently`, `cmd_d_belongs_to_the_split_and_g_keeps_the_diff`
 (keymap); the two old `cmd_d_*_diff_viewer` tests were rewritten as `cmd_g_*`. 473 nebula-tui + full
 workspace green; `make install` run (TUI-only, no protocol change — old daemon fine).
+
+Follow-up ("daca dau cmmd+w ar treb sa-l stearga pe cel pe care sunt focus, acum nu merge", commit
+`810f2c7`): the locked-terminal SUPER intercept's `CloseSession` arm always closed `app.term` — with
+the split up and `split_focused`, ⌘W now `close_session`s the split shell instead and returns early
+WITHOUT dropping the lock: the close confirm → `PendingAction::CloseTerminal` →
+`detach_if_attached` → `close_split_terminal` chain hands the lock back to the left pane on its own.
+Test `cmd_w_closes_the_focused_split_pane` (477 green).
 
 **Gotchas:**
 - The reachable-chord keymap test rejects ⌘-only defaults — `SplitTerminal` needed the plain `|`
