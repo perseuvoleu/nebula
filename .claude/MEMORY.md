@@ -35,12 +35,23 @@ into `project_local_branches` (shared with `open_branch_picker`). Tests:
 `agent_on_branch_without_checkout_creates_worktree_then_opens_picker`; 458 nebula-tui + workspace
 green; `make install` run.
 
+Follow-up in the same session ("da nu poti da tu reload la asta fara sa inchid sa dau ng iar?"):
+commit `dfa581a` added `r · Reload nebula` — `PaletteCommand::ReloadUi` sets
+`App.pending_reload` + `should_quit`, `run_app` now returns `Handoff::{None,Ssh,Reload}` (replacing
+the `Option<HostEntry>` hosts-picker return), and main.rs's `run_tui_and_handoff` execs
+`std::env::current_exe()` with the original argv over the running process — same window, selection
+restored via the SaveUiState-on-quit path, daemon untouched. e2e
+`tui_reloads_in_place_from_the_palette` proves the pid survives exec and the reloaded UI answers.
+
 **Gotchas:**
 - The pin is REQUIRED, not cosmetic: plain "a" fuzzy-matches nearly every command, and "agent"
   matches both agent rows with the on-branch row winning on original order — the old
   `command_palette_new_agent_in_worktree…` test had to switch to typing the "aw" alias.
 - Any test asserting palette labels asserts the alias prefix now ("w · New worktree…", not
   "New worktree…").
+- Re-exec works because `make install` replaces the file via cp-to-temp + mv: the launch path
+  (target/release/nebula for `ng`, the ~/.cargo/bin path otherwise) holds the NEW build while the
+  running image is never touched — `current_exe()` re-resolves to fresh code.
 
 ### TUI Auto-Reconnects After The Daemon Dies (Frozen/Truncated Screen Diagnosis) — 2026-08-25
 
