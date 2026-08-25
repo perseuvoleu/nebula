@@ -2459,12 +2459,14 @@ impl App {
 
     /// The selected project's orchestrator agents — flagged sessions on any
     /// of the project's worktrees (root or branch checkout), rendered as
-    /// their own group at the top of the Worktrees panel. Unarchived only.
+    /// their own group at the top of the Worktrees panel. Unarchived only;
+    /// active rows lead while each status rank keeps tree order.
     pub fn project_orchestrators(&self) -> Vec<&Agent> {
         let Some(project) = self.selected_project() else {
             return vec![];
         };
-        self.tree
+        let mut rows: Vec<&Agent> = self
+            .tree
             .agents
             .iter()
             .filter(|a| {
@@ -2476,7 +2478,9 @@ impl App {
                         .iter()
                         .any(|w| w.id == a.worktree_id && w.project_id == project.id)
             })
-            .collect()
+            .collect();
+        rows.sort_by_key(|agent| !is_active_status(agent.status));
+        rows
     }
 
     /// Orchestrator rows sit above the worktree rows in the Worktrees
@@ -2591,6 +2595,12 @@ impl App {
                 .map(SessionRow::Link),
         );
         rows.extend(agents[active..].iter().cloned().map(SessionRow::Agent));
+        // Tabs and worktree sublists share this composite row funnel. Hoist
+        // active agents over every other row, then retain the existing
+        // pinned/recent/terminal/link/archived order for everything else.
+        rows.sort_by_key(
+            |row| !matches!(row, SessionRow::Agent(agent) if is_active_status(agent.status)),
+        );
         // The ⌘D split owns its shell: it lives in the right pane, never as
         // a tab/row — selecting it as a row would mount the same PTY in
         // both halves and rebind its daemon-side attach.
@@ -2733,25 +2743,48 @@ impl App {
         }
     }
 
-    /// Worktrees of the selected project: pinned first, then the rest,
-    /// each group in tree order (mirrors the sessions list).
+    /// Worktrees of the selected project: pinned first, then the rest.
+    /// Within each group, worktrees with active sessions lead while stable
+    /// tree order and the primary checkout's existing placement are kept.
     pub fn visible_worktrees(&self) -> Vec<&Worktree> {
         let Some(project) = self.selected_project() else {
             return vec![];
         };
-        let mut rows: Vec<&Worktree> = self
+        let mut pinned: Vec<&Worktree> = self
             .tree
             .worktrees
             .iter()
             .filter(|w| w.project_id == project.id && w.pinned)
             .collect();
-        rows.extend(
-            self.tree
-                .worktrees
-                .iter()
-                .filter(|w| w.project_id == project.id && !w.pinned),
-        );
-        rows
+        let mut unpinned: Vec<&Worktree> = self
+            .tree
+            .worktrees
+            .iter()
+            .filter(|w| w.project_id == project.id && !w.pinned)
+            .collect();
+        let running_first = |rows: &mut [&Worktree]| {
+            let is_running = |worktree: &&Worktree| {
+                self.tree.agents.iter().any(|agent| {
+                    agent.worktree_id == worktree.id
+                        && !agent.archived
+                        && is_active_status(agent.status)
+                })
+            };
+            let primary = rows.iter().position(|worktree| worktree.is_main);
+            let (before, after) = match primary {
+                Some(index) => {
+                    let (before, primary_and_after) = rows.split_at_mut(index);
+                    (before, &mut primary_and_after[1..])
+                }
+                None => (rows, &mut [][..]),
+            };
+            before.sort_by_key(|worktree| !is_running(worktree));
+            after.sort_by_key(|worktree| !is_running(worktree));
+        };
+        running_first(&mut pinned);
+        running_first(&mut unpinned);
+        pinned.extend(unpinned);
+        pinned
     }
 
     /// (pinned, unpinned) worktree counts for the selected project.
@@ -3167,6 +3200,64 @@ mod tests {
     }
 
     #[test]
+    fn session_tabs_and_worktree_sublists_put_running_rows_first_stably() {
+        let (mut app, worktree) = link_app();
+        for (id, status, pinned) in [
+            ("pinned-idle", AgentStatus::Fresh, true),
+            ("running", AgentStatus::Running, false),
+            ("blocked", AgentStatus::NeedsFeedback, false),
+        ] {
+            app.tree.agents.push(Agent {
+                id: AgentId(id.into()),
+                worktree_id: worktree.clone(),
+                name: id.into(),
+                status,
+                archived: false,
+                archived_at: 0,
+                pinned,
+                status_changed_at: 0,
+                orchestrator: false,
+                kind: AgentKind::Claude,
+                model: None,
+                effort: None,
+                session_id: None,
+                sort_order: 0,
+                alive: true,
+            });
+        }
+        app.tree.terminals.push(TerminalTab {
+            id: TerminalId("t1".into()),
+            worktree_id: worktree.clone(),
+            name: "shell".into(),
+            sort_order: 0,
+            alive: true,
+        });
+        app.tree
+            .links
+            .push(link("l1", &worktree, "https://a.dev/spec", 0));
+
+        let visible: Vec<String> = app
+            .visible_session_rows()
+            .iter()
+            .map(|row| row.name().to_string())
+            .collect();
+        let sublist: Vec<String> = app
+            .worktree_session_rows(&worktree)
+            .iter()
+            .map(|row| row.name().to_string())
+            .collect();
+        let expected = [
+            "running",
+            "blocked",
+            "pinned-idle",
+            "shell",
+            "https://a.dev/spec",
+        ];
+        assert_eq!(visible, expected, "terminal-header tab order");
+        assert_eq!(sublist, expected, "worktree session sublist order");
+    }
+
+    #[test]
     fn link_rows_have_no_session_to_attach() {
         let (mut app, wt) = link_app();
         app.tree
@@ -3188,6 +3279,99 @@ mod tests {
         assert_eq!(pretty_url("https://x.dev"), "x.dev");
         // Not a URL shape we produce, but the function must not panic.
         assert_eq!(pretty_url(""), "");
+    }
+
+    #[test]
+    fn visible_worktrees_put_running_work_first_within_existing_groups() {
+        let (mut app, _main) = link_app();
+        let project = app.tree.projects[0].id.clone();
+        let mut add_worktree = |id: &str, branch: &str, pinned: bool| {
+            app.tree.worktrees.push(Worktree {
+                id: WorktreeId(id.into()),
+                project_id: project.clone(),
+                path: format!("/tmp/demo-worktrees/{branch}").into(),
+                branch: branch.into(),
+                is_main: false,
+                created_from: None,
+                pinned,
+                sort_order: app.tree.worktrees.len() as i64,
+            });
+        };
+        add_worktree("p-idle", "pinned-idle", true);
+        add_worktree("p-run", "pinned-running", true);
+        add_worktree("idle", "idle", false);
+        add_worktree("run", "running", false);
+
+        let add_agent = |app: &mut App, id: &str, worktree: &str, status: AgentStatus| {
+            app.tree.agents.push(Agent {
+                id: AgentId(id.into()),
+                worktree_id: WorktreeId(worktree.into()),
+                name: id.into(),
+                status,
+                archived: false,
+                archived_at: 0,
+                pinned: false,
+                status_changed_at: 0,
+                orchestrator: false,
+                kind: AgentKind::Claude,
+                model: None,
+                effort: None,
+                session_id: None,
+                sort_order: 0,
+                alive: true,
+            });
+        };
+        add_agent(&mut app, "p-idle-agent", "p-idle", AgentStatus::Fresh);
+        add_agent(&mut app, "p-run-agent", "p-run", AgentStatus::Running);
+        add_agent(&mut app, "idle-agent", "idle", AgentStatus::Fresh);
+        add_agent(&mut app, "run-agent", "run", AgentStatus::Running);
+
+        let branches: Vec<&str> = app
+            .visible_worktrees()
+            .iter()
+            .map(|worktree| worktree.branch.as_str())
+            .collect();
+        assert_eq!(
+            branches,
+            ["pinned-running", "pinned-idle", "main", "running", "idle"],
+            "running-first stays inside pinned/primary placement constraints"
+        );
+    }
+
+    #[test]
+    fn project_orchestrators_put_running_rows_first_stably() {
+        let (mut app, worktree) = link_app();
+        for (id, status) in [
+            ("idle-1", AgentStatus::Fresh),
+            ("running", AgentStatus::Running),
+            ("blocked", AgentStatus::NeedsFeedback),
+            ("idle-2", AgentStatus::Finished),
+        ] {
+            app.tree.agents.push(Agent {
+                id: AgentId(id.into()),
+                worktree_id: worktree.clone(),
+                name: id.into(),
+                status,
+                archived: false,
+                archived_at: 0,
+                pinned: false,
+                status_changed_at: 0,
+                orchestrator: true,
+                kind: AgentKind::Claude,
+                model: None,
+                effort: None,
+                session_id: None,
+                sort_order: 0,
+                alive: true,
+            });
+        }
+
+        let names: Vec<&str> = app
+            .project_orchestrators()
+            .iter()
+            .map(|agent| agent.name.as_str())
+            .collect();
+        assert_eq!(names, ["running", "blocked", "idle-1", "idle-2"]);
     }
 
     /// Codex (ratatui inline viewport) inserts chat history by scrolling a

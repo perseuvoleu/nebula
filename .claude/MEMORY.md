@@ -14,6 +14,24 @@ about what is worth recording.
 
 ## Entries
 
+### Sidebar Rows Put Running Work First — 2026-08-25
+
+**Asked:** "la worktree uri ar treb ordonate dupa cele care ruleaza acum, la fel si la orchestratori sesiuni"
+
+**Did:** `App::visible_worktrees` now stably hoists worktrees with running/needs-feedback agents inside
+the existing pinned and unpinned groups while anchoring the primary checkout; `project_orchestrators`
+stably hoists active orchestrators; and `session_rows_for_worktree` hoists active agent rows in the one
+composite list shared by terminal-header tabs and WORKTREES sublists. `StatusChanged` now uses the
+existing selection snapshot/reconciliation path, extended with the orchestrator id, so every cursor
+follows its entity across activity-driven reordering. Added focused regressions in `app.rs` and
+`event_loop.rs`; 483 nebula-tui tests, the full workspace suite, and `make install` passed.
+
+**Gotchas:**
+- Sorting only the draw-time tuples would desynchronize keyboard indices and hit targets; the ordering
+  belongs in `visible_worktrees`, `project_orchestrators`, and `session_rows_for_worktree`.
+- `StatusChanged` previously re-anchored only `sel_session`; once worktree/orchestrator order depends on
+  status, it must snapshot all three entity selections before applying the delta.
+
 ### `nebula agent wait <name>` Can Match The Orchestrator Itself — 2026-08-25
 
 **Asked:** (orchestration side of "as vrea sub fiecare worktree sa vad sesiunile cu mic una sub alta"

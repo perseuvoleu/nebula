@@ -7913,9 +7913,9 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             status,
             changed_at,
         } => {
-            // A status flip can pull the agent into the RECENT group and
-            // reorder the list; keep the selection on the same session.
-            let keep = app.selected_session_row().and_then(|r| r.sref());
+            // A status flip can reorder worktrees, orchestrators, and
+            // sessions; keep every cursor on the entity it already held.
+            let before = selection_snapshot(app);
             let mut notify = None;
             if let Some(a) = app.tree.agents.iter_mut().find(|a| a.id == agent) {
                 notify = should_notify(a.status, status, app.window_focused);
@@ -7926,15 +7926,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             if let Some(reason) = notify {
                 notify_status_change(app, &agent, reason);
             }
-            if let Some(keep) = keep {
-                if let Some(i) = app
-                    .visible_session_rows()
-                    .iter()
-                    .position(|r| r.sref().as_ref() == Some(&keep))
-                {
-                    app.sel_session = i;
-                }
-            }
+            reconcile_selection(app, before, out);
         }
         ServerEvent::Ack { req_id, created } => {
             match (app.pending.remove(&req_id), created) {
@@ -8467,6 +8459,7 @@ struct SelectionSnapshot {
     /// A divider move was in flight — its landing is apply_upsert's to
     /// chase, so the project cursor is left alone.
     divider_chase: bool,
+    orchestrator: Option<AgentId>,
     worktree: Option<WorktreeId>,
     session: Option<SessionRef>,
     /// Whether the selected session row was already in the archived group —
@@ -8490,6 +8483,7 @@ fn selection_snapshot(app: &App) -> SelectionSnapshot {
             .as_ref()
             .and_then(project_row_kind),
         divider_chase: app.select_divider_when_seen.is_some(),
+        orchestrator: app.selected_orchestrator().map(|agent| agent.id.clone()),
         worktree: app.selected_worktree().map(|w| w.id.clone()),
         session_archived: row.as_ref().is_some_and(|r| r.is_archived_agent()),
         session: row.and_then(|r| r.sref()),
@@ -8528,6 +8522,17 @@ fn reconcile_selection(app: &mut App, before: SelectionSnapshot, out: &mut Vec<C
             });
             if let Some(i) = found {
                 app.sel_project = i;
+            }
+        }
+    }
+    if let Some(oid) = &before.orchestrator {
+        if app.selected_orchestrator().map(|agent| &agent.id) != Some(oid) {
+            if let Some(index) = app
+                .project_orchestrators()
+                .iter()
+                .position(|agent| &agent.id == oid)
+            {
+                app.sel_orchestrator = Some(index);
             }
         }
     }
@@ -11545,6 +11550,78 @@ mod tests {
         assert_eq!(app.session_group_counts(), (0, 0, 2, 0));
         assert_eq!(app.visible_sessions()[0].name, "agent-2");
         assert!(app.next_recent_expiry().is_none());
+    }
+
+    #[test]
+    fn status_change_reorders_sidebar_rows_without_moving_entity_selection() {
+        use nebula_core::{Agent, AgentStatus, Entity};
+        let mut app = App::new();
+        seed_tree(&mut app); // main/w1 + a1
+        seed_extra_worktrees(&mut app, 2, 3);
+        for (id, worktree, orchestrator) in [
+            ("a2", "w2", false),
+            ("a3", "w3", false),
+            ("o1", "w1", true),
+            ("o2", "w1", true),
+        ] {
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Agent(Agent {
+                        id: AgentId(id.into()),
+                        worktree_id: WorktreeId(worktree.into()),
+                        name: id.into(),
+                        status: AgentStatus::Fresh,
+                        archived: false,
+                        archived_at: 0,
+                        pinned: false,
+                        kind: nebula_core::AgentKind::Claude,
+                        model: None,
+                        effort: None,
+                        session_id: None,
+                        sort_order: 0,
+                        status_changed_at: 0,
+                        orchestrator,
+                        alive: true,
+                    }),
+                },
+            );
+        }
+
+        app.focus = Focus::Worktrees;
+        app.sel_worktree = app.worktree_row_index(&WorktreeId("w3".into())).unwrap();
+        hse(
+            &mut app,
+            ServerEvent::StatusChanged {
+                agent: AgentId("a3".into()),
+                status: AgentStatus::Running,
+                changed_at: crate::app::now_ms(),
+            },
+        );
+        assert_eq!(
+            app.selected_worktree().map(|worktree| worktree.id.as_str()),
+            Some("w3"),
+            "the worktree cursor follows the row that became active"
+        );
+
+        app.focus = Focus::Orchestrators;
+        app.sel_orchestrator = app
+            .project_orchestrators()
+            .iter()
+            .position(|agent| agent.id.as_str() == "o1");
+        hse(
+            &mut app,
+            ServerEvent::StatusChanged {
+                agent: AgentId("o2".into()),
+                status: AgentStatus::Running,
+                changed_at: crate::app::now_ms(),
+            },
+        );
+        assert_eq!(
+            app.selected_orchestrator().map(|agent| agent.id.as_str()),
+            Some("o1"),
+            "the orchestrator cursor stays on the same entity"
+        );
     }
 
     /// The notification gate: fires only unfocused, only for flips the
