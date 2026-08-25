@@ -14,7 +14,20 @@ about what is worth recording.
 
 ## Entries
 
-### ⌘D Splits The Terminal Pane With A Fresh Shell; Diff Keeps g/⌘G — 2026-08-25
+### `nebula agent wait <name>` Can Match The Orchestrator Itself — 2026-08-25
+
+**Asked:** (orchestration side of "as vrea sub fiecare worktree sa vad sesiunile cu mic una sub alta"
+— the feature itself is the "Worktree Rows Show Their Session Sublists" entry.)
+
+**Did:** Nothing code-side; recorded a CLI behavior found while waiting on the worker.
+
+**Gotchas:**
+- The nebula rename hook titles the orchestrator session after the task, and `agent new --name` gives
+  the worker the same title — then `nebula agent wait "<that name>"` matches BOTH rows, including the
+  always-running orchestrator itself, and times out forever even though the worker finished. The
+  self-exclusion via `NEBULA_AGENT_ID` applies only to the no-names form. Either give the worker a
+  distinct name or wait/verify by id via `nebula agent list`.
+ The Terminal Pane With A Fresh Shell; Diff Keeps g/⌘G — 2026-08-25
 
 **Asked:** "Implement the corrected Cmd+D behavior in Nebula… Cmd+D currently opens the Git diff
 viewer. Instead: Cmd+D must split the terminal/agent display area into two panes… keep the currently
