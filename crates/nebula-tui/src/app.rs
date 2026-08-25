@@ -2591,7 +2591,18 @@ impl App {
                 .map(SessionRow::Link),
         );
         rows.extend(agents[active..].iter().cloned().map(SessionRow::Agent));
+        // The ⌘D split owns its shell: it lives in the right pane, never as
+        // a tab/row — selecting it as a row would mount the same PTY in
+        // both halves and rebind its daemon-side attach.
+        if let Some(split) = self.split_sref() {
+            rows.retain(|r| r.sref().as_ref() != Some(split));
+        }
         rows
+    }
+
+    /// The session mounted in the ⌘D split's right pane, when one is open.
+    pub fn split_sref(&self) -> Option<&SessionRef> {
+        self.split_term.as_ref().map(|t| &t.sref)
     }
 
     /// The selected worktree's LINKS group: the pull request on its branch

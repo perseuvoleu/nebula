@@ -2240,11 +2240,13 @@ fn toggle_quick_terminal(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// the left pane and creates a fresh unnamed shell — in the same worktree
 /// context as what's attached (or selected) — for the right pane; its Ack
 /// attaches there and moves the input lock onto it, so the user can type
-/// straight away. A second ⌘D closes the split, the shell keeps running in
-/// the daemon as a normal terminal tab.
+/// straight away. The split owns that shell (it never shows as a session
+/// tab), so a second ⌘D closes it for real: the usual close confirm, then
+/// CloseTerminal → detach_if_attached → close_split_terminal — same as ⌘W
+/// on the focused split — leaving no orphan terminal tab behind.
 fn toggle_split_terminal(app: &mut App, out: &mut Vec<ClientRequest>) {
-    if app.split_term.is_some() {
-        close_split_terminal(app, out);
+    if let Some(sref) = app.split_term.as_ref().map(|t| t.sref.clone()) {
+        close_session(app, sref, out);
         return;
     }
     let Some(worktree) = quick_terminal_worktree(app) else {
@@ -2259,9 +2261,11 @@ fn toggle_split_terminal(app: &mut App, out: &mut Vec<ClientRequest>) {
     });
 }
 
-/// Close the ⌘D split: detach the right pane's shell (it keeps running as
-/// a normal terminal tab) and hand the input lock back to the left pane —
-/// or drop out of the terminal when nothing is attached there.
+/// Tear down the ⌘D split pane state: detach the right pane's shell and
+/// hand the input lock back to the left pane — or drop out of the terminal
+/// when nothing is attached there. This is the local teardown only; the
+/// shell's session is closed by the confirm flow that gets here (via
+/// `detach_if_attached`), or is already gone (worktree deleted, exited).
 fn close_split_terminal(app: &mut App, out: &mut Vec<ClientRequest>) {
     if let Some(t) = app.split_term.take() {
         out.push(ClientRequest::Detach { session: t.sref });
@@ -6080,6 +6084,15 @@ fn mark_pr_seen(app: &mut App, url: &str, out: &mut Vec<ClientRequest>) {
 }
 
 fn attach(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
+    // The ⌘D split's shell never mounts as the left/primary pane: that
+    // would show the same PTY in both halves, and the second Attach
+    // rebinds the daemon-side forward task out from under the split.
+    // Whatever tried to reach it lands on the split pane instead.
+    if app.split_term.as_ref().is_some_and(|t| t.sref == sref) {
+        app.split_focused = true;
+        app.dirty = true;
+        return;
+    }
     if let Some(existing) = &app.term {
         if existing.sref == sref && !existing.exited {
             return; // already attached
@@ -14339,7 +14352,9 @@ mod tests {
             other => panic!("expected a fresh unnamed shell in w1: {other:?}"),
         };
 
-        // The Ack attaches the shell on the right and locks input onto it.
+        // The daemon upserts the terminal entity just before the Ack; the
+        // Ack attaches the shell on the right and locks input onto it.
+        seed_terminal(&mut app, "t9", "term-2");
         hse(
             &mut app,
             ServerEvent::Ack {
@@ -14389,21 +14404,44 @@ mod tests {
         attach(&mut app, SessionRef::Agent(AgentId("a2".into())), &mut out);
         assert!(app.split_term.is_some(), "split survives a session switch");
 
-        // A second ⌘D closes the split: the shell detaches (it keeps
-        // running as a normal tab) and the lock returns to the left pane.
+        // A second ⌘D closes the split for real: the split owns its shell,
+        // so the usual terminal-close confirm comes up (same as ⌘W on the
+        // focused split) instead of quietly leaking the shell as a tab.
         out.clear();
         press(&mut app, KeyCode::Char('d'), KeyModifiers::SUPER, &mut out);
-        assert!(app.split_term.is_none(), "⌘d again closes the split");
         assert!(
             matches!(
-                out.as_slice(),
-                [ClientRequest::Detach { session }]
-                    if session == &SessionRef::Terminal(TerminalId("t9".into()))
+                &app.overlay,
+                Some(Overlay::Confirm(c))
+                    if matches!(&c.action, PendingAction::CloseTerminal(id)
+                        if id == &TerminalId("t9".into()))
             ),
-            "the split shell is detached, not killed: {out:?}"
+            "⌘d again confirms closing the split shell: {:?}",
+            app.overlay
+        );
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE, &mut out);
+        assert!(app.split_term.is_none(), "confirming closes the split");
+        assert!(
+            out.iter().any(|r| matches!(r,
+                ClientRequest::CloseTerminal { id, .. } if id == &TerminalId("t9".into()))),
+            "the shell session is closed daemon-side, not left behind: {out:?}"
         );
         assert_eq!(app.focus, Focus::Terminal);
         assert!(app.term_locked, "the left pane keeps the input lock");
+
+        // Once the daemon confirms the removal, no `term-N` tab survives.
+        hse(
+            &mut app,
+            ServerEvent::EntityRemoved {
+                id: EntityId::Terminal(TerminalId("t9".into())),
+            },
+        );
+        assert!(
+            app.visible_session_rows()
+                .iter()
+                .all(|r| r.sref() != Some(SessionRef::Terminal(TerminalId("t9".into())))),
+            "the split shell leaves no session tab behind"
+        );
     }
 
     /// ⌘W inside the ⌘D split targets whichever pane holds the lock: the
@@ -14493,6 +14531,111 @@ mod tests {
                     if worktree == &WorktreeId("w1".into())
             ),
             "⌘d from the panels creates the split shell: {out:?}"
+        );
+    }
+
+    /// The ⌘D shell belongs to the split, not the tab strip: while the
+    /// split is up its terminal renders in the right pane only — no
+    /// `term-N` tab appears next to the normal sessions (the screenshot
+    /// bug), and no session row can re-attach it as the left pane.
+    #[test]
+    fn split_shell_is_not_a_session_tab() {
+        use nebula_core::TerminalId;
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_terminal(&mut app, "t9", "term-2");
+        let mut out = Vec::new();
+        attach(&mut app, SessionRef::Agent(AgentId("a1".into())), &mut out);
+        app.focus = Focus::Terminal;
+        app.term_locked = true;
+        attach_split(
+            &mut app,
+            SessionRef::Terminal(TerminalId("t9".into())),
+            &mut out,
+        );
+
+        // Row lists — the tab strip, Sessions navigation, and the
+        // worktree sub-lists all read these — exclude the split's shell.
+        let split = SessionRef::Terminal(TerminalId("t9".into()));
+        assert!(
+            app.visible_session_rows()
+                .iter()
+                .all(|r| r.sref().as_ref() != Some(&split)),
+            "the split shell is not a session row"
+        );
+        assert!(
+            app.worktree_session_rows(&nebula_core::WorktreeId("w1".into()))
+                .iter()
+                .all(|r| r.sref().as_ref() != Some(&split)),
+            "the split shell is not in the worktree sub-list"
+        );
+
+        // Screenshot-level: the tab bar shows the normal tabs, no term-2.
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("agent-1"),
+            "the normal session tab still renders:\n{text}"
+        );
+        assert!(
+            !text.contains("term-2"),
+            "the split shell renders no top-level tab:\n{text}"
+        );
+    }
+
+    /// While a split is open, attaching sessions normally keeps working:
+    /// a normal tab mounts as the left pane and the split survives — but
+    /// no path can mount the split's own shell as the left pane too (the
+    /// duplicate-sref half of the screenshot bug); reaching for it just
+    /// focuses the split.
+    #[test]
+    fn selecting_tabs_cannot_duplicate_the_split_shell() {
+        use nebula_core::TerminalId;
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_terminal(&mut app, "t2", "other");
+        seed_terminal(&mut app, "t9", "term-2");
+        let mut out = Vec::new();
+        attach(&mut app, SessionRef::Agent(AgentId("a1".into())), &mut out);
+        attach_split(
+            &mut app,
+            SessionRef::Terminal(TerminalId("t9".into())),
+            &mut out,
+        );
+
+        // Attaching the split's own sref (any navigation path) is a no-op
+        // on the left pane: no Attach request, focus lands on the split.
+        app.split_focused = false;
+        out.clear();
+        attach(&mut app, SessionRef::Terminal(TerminalId("t9".into())), &mut out);
+        assert!(out.is_empty(), "no re-attach of the split sref: {out:?}");
+        assert_eq!(
+            app.term.as_ref().map(|t| t.sref.clone()),
+            Some(SessionRef::Agent(AgentId("a1".into()))),
+            "the left pane keeps its own attachment"
+        );
+        assert!(app.split_focused, "the split takes the focus instead");
+
+        // A normal tab still attaches as the left pane; the split stays.
+        let rows = app.visible_session_rows();
+        let other = rows
+            .iter()
+            .position(|r| r.sref() == Some(SessionRef::Terminal(TerminalId("t2".into()))))
+            .expect("the unrelated terminal is a normal tab");
+        app.sel_session = other;
+        app.focus = Focus::Sessions;
+        out.clear();
+        attach_selected(&mut app, &mut out);
+        assert_eq!(
+            app.term.as_ref().map(|t| t.sref.clone()),
+            Some(SessionRef::Terminal(TerminalId("t2".into()))),
+            "a normal tab mounts as the left pane"
+        );
+        assert_eq!(
+            app.split_term.as_ref().map(|t| t.sref.clone()),
+            Some(SessionRef::Terminal(TerminalId("t9".into()))),
+            "the split survives selecting a normal tab"
         );
     }
 
