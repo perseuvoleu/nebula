@@ -14,6 +14,27 @@ about what is worth recording.
 
 ## Entries
 
+### Worktree Rows Show Their Session Sublists — 2026-08-25
+
+**Asked:** "as vrea sub fiecare worktree sa vad sesiunile cu mic una sub alta"
+
+**Did:** `App::worktree_session_rows` (app.rs) now exposes the same ordered agent/terminal/link rows
+as `visible_session_rows`, forced non-archived for any worktree. `draw_worktrees` (ui.rs) renders them
+as one-line dim `●`/`❯`/`↗` rows under each worktree and folds their count into `scroll_skip` entry
+heights. New `HitTarget::WorktreeSession` rows attach agents/terminals or open links through the
+existing jump/session actions. Screen tests cover mixed row rendering, archived exclusion,
+cross-worktree click-to-attach, and oversized grouped scrolling. 472 nebula-tui tests and the full
+workspace suite passed; `make install` installed the release binary.
+
+**Gotchas:**
+- The first sub-row occupies the selected pill's overlapping bottom-pad line; keep the `▘` rail cap
+  in that sub-row or `pill_rail_spans_the_pads` regresses.
+- Session/worktree names also appear in tabs, the global SESSIONS list, and the footer; scrolling
+  tests must slice the narrow Worktrees column (default x=20, width=22) and assert prefixes.
+- For a session group taller than the viewport, the draw guard must require only the worktree's own
+  rows to fit; requiring the entire entry to fit makes the selected worktree disappear instead of
+  clipping the sub-list tail.
+
 ### Merge Audit: Duplicate-Commit False Conflict, Batch Commit, Push — 2026-08-25
 
 **Asked:** "uita te in orchestratori , toate sunt pe main merge ?" → clarified: "ma refer daca
