@@ -2902,6 +2902,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         Option<String>,
         Option<AgentStatus>,
         (usize, usize),
+        Vec<SessionRow>,
     )> = app
         .visible_worktrees()
         .iter()
@@ -2912,6 +2913,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                 w.created_from.clone(),
                 app.worktree_rollup(&w.id),
                 app.note_stats(&nebula_core::NoteOwner::Worktree(w.id.clone())),
+                app.worktree_session_rows(&w.id),
             )
         })
         .collect();
@@ -3088,8 +3090,8 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     let wt_heights: Vec<usize> = worktrees
         .iter()
         .enumerate()
-        .map(|(i, (_, is_main, created_from, _, _))| {
-            let mut h = PILL_H as usize + usize::from(created_from.is_some());
+        .map(|(i, (_, is_main, created_from, _, _, sessions))| {
+            let mut h = PILL_H as usize + usize::from(created_from.is_some()) + sessions.len();
             if grouped && (i == 0 || i == pinned_count) {
                 h += 1;
             }
@@ -3101,7 +3103,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         .collect();
     let avail = (inner.height as usize).saturating_sub(screen_row);
     let wt_skip = scroll_skip(&wt_heights, app.sel_worktree, avail);
-    for (i, (branch, is_main, created_from, roll, notes)) in
+    for (i, (branch, is_main, created_from, roll, notes, sessions)) in
         worktrees.iter().enumerate().skip(wt_skip)
     {
         if grouped && i == 0 {
@@ -3110,8 +3112,9 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         if grouped && i == pinned_count {
             header(f, "UNPINNED".into(), &mut screen_row);
         }
-        let entry_height = PILL_H as usize + usize::from(created_from.is_some());
-        if row_rect(inner, screen_row + entry_height - 1).is_none() {
+        let worktree_height = PILL_H as usize + usize::from(created_from.is_some());
+        let entry_height = worktree_height + sessions.len();
+        if row_rect(inner, screen_row + worktree_height - 1).is_none() {
             break;
         }
         let note_badge = note_badge(*notes, th);
@@ -3182,8 +3185,55 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                 }
             }
         }
-        if let Some(hit) = rows_rect(inner, screen_row, entry_height as u16) {
+        if let Some(hit) = rows_rect(inner, screen_row, worktree_height as u16) {
             app.hits.push((hit, HitTarget::Worktree(i)));
+        }
+        for (session_index, session) in sessions.iter().enumerate() {
+            let Some(r) = row_rect(inner, screen_row + worktree_height + session_index) else {
+                break;
+            };
+            let (glyph, detail, name) = match session {
+                SessionRow::Agent(agent) => (
+                    status_dot(Some(agent.status), th),
+                    Some(agent.kind.as_str()),
+                    agent.name.as_str().to_string(),
+                ),
+                SessionRow::Terminal(terminal) => (
+                    Span::styled(
+                        "❯ ",
+                        Style::default().fg(if terminal.alive { th.ok } else { th.dim }),
+                    ),
+                    None,
+                    terminal.name.clone(),
+                ),
+                SessionRow::Link(link) => (
+                    Span::styled("↗ ", Style::default().fg(th.dim)),
+                    None,
+                    link.label(),
+                ),
+            };
+            let indent = if selected && session_index == 0 {
+                Span::styled(
+                    format!("{} ", PILL_RAIL_CAPS.1),
+                    Style::default().fg(if worktrees_focused { th.accent } else { th.dim }),
+                )
+            } else {
+                Span::raw("  ")
+            };
+            let detail = detail.map(|label| format!("{label} "));
+            let name = truncate(
+                &name,
+                (inner.width as usize)
+                    .saturating_sub(4 + detail.as_ref().map_or(0, |label| label.chars().count())),
+            );
+            let mut spans = vec![indent, glyph];
+            if let Some(detail) = detail {
+                spans.push(Span::styled(detail, dim));
+            }
+            spans.push(Span::styled(name, dim));
+            f.render_widget(Paragraph::new(Line::from(spans)), r);
+            app.hits
+                .push((r, HitTarget::WorktreeSession(i, session_index)));
         }
         screen_row += entry_height;
         // An extra quiet row separates the main checkout from the true

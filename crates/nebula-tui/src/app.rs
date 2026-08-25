@@ -40,6 +40,9 @@ pub enum HitTarget {
     /// Row index into `App::project_rows()` (projects and dividers both).
     Project(usize),
     Worktree(usize),
+    /// A compact session row nested under a worktree: worktree index, then
+    /// row index into `App::worktree_session_rows` for that worktree.
+    WorktreeSession(usize, usize),
     /// Row in the Worktrees panel's ORCHESTRATORS section (the
     /// "+ new orchestrator" placeholder is row 0 of an empty section).
     Orchestrator(usize),
@@ -2551,8 +2554,26 @@ impl App {
 
     /// The full row list the panel shows — `sel_session` indexes this.
     pub fn visible_session_rows(&self) -> Vec<SessionRow> {
-        let agents = self.visible_sessions();
-        let (pinned, recent, unpinned, _) = self.session_group_counts();
+        let Some(worktree) = self.selected_worktree() else {
+            return vec![];
+        };
+        self.session_rows_for_worktree(&worktree.id, self.show_archived)
+    }
+
+    /// The compact session sub-list for a worktree row. It uses the same
+    /// ordering and row kinds as [`Self::visible_session_rows`], but never
+    /// includes archived agents.
+    pub fn worktree_session_rows(&self, worktree: &WorktreeId) -> Vec<SessionRow> {
+        self.session_rows_for_worktree(worktree, false)
+    }
+
+    fn session_rows_for_worktree(
+        &self,
+        worktree: &WorktreeId,
+        show_archived: bool,
+    ) -> Vec<SessionRow> {
+        let agents = self.sessions_for_worktree(worktree, show_archived);
+        let (pinned, recent, unpinned, _) = self.session_group_counts_for_worktree(worktree);
         let active = (pinned + recent + unpinned).min(agents.len());
         let mut rows: Vec<SessionRow> = agents[..active]
             .iter()
@@ -2560,11 +2581,15 @@ impl App {
             .map(SessionRow::Agent)
             .collect();
         rows.extend(
-            self.visible_terminals()
+            self.terminals_for_worktree(worktree)
                 .into_iter()
                 .map(SessionRow::Terminal),
         );
-        rows.extend(self.visible_links().into_iter().map(SessionRow::Link));
+        rows.extend(
+            self.links_for_worktree(worktree)
+                .into_iter()
+                .map(SessionRow::Link),
+        );
         rows.extend(agents[active..].iter().cloned().map(SessionRow::Agent));
         rows
     }
@@ -2575,20 +2600,20 @@ impl App {
     /// pull-request row — a duplicate would just be the same destination
     /// twice.
     pub fn visible_links(&self) -> Vec<LinkRow> {
-        let worktrees = self.visible_worktrees();
-        let Some(wt) = self
-            .selected_worktree_index()
-            .and_then(|i| worktrees.get(i))
-        else {
+        let Some(worktree) = self.selected_worktree() else {
             return vec![];
         };
+        self.links_for_worktree(&worktree.id)
+    }
+
+    fn links_for_worktree(&self, worktree: &WorktreeId) -> Vec<LinkRow> {
         let saved: Vec<&Link> = self
             .tree
             .links
             .iter()
-            .filter(|l| l.worktree_id == wt.id)
+            .filter(|l| &l.worktree_id == worktree)
             .collect();
-        let pr = self.pull_requests.get(&wt.id).cloned().flatten();
+        let pr = self.pull_requests.get(worktree).cloned().flatten();
         let matched = pr
             .as_ref()
             .and_then(|p| saved.iter().position(|l| l.url == p.url));
@@ -2636,17 +2661,17 @@ impl App {
 
     /// Shell terminals of the selected worktree, in tree order.
     pub fn visible_terminals(&self) -> Vec<TerminalTab> {
-        let worktrees = self.visible_worktrees();
-        let Some(wt) = self
-            .selected_worktree_index()
-            .and_then(|i| worktrees.get(i))
-        else {
+        let Some(worktree) = self.selected_worktree() else {
             return vec![];
         };
+        self.terminals_for_worktree(&worktree.id)
+    }
+
+    fn terminals_for_worktree(&self, worktree: &WorktreeId) -> Vec<TerminalTab> {
         self.tree
             .terminals
             .iter()
-            .filter(|t| t.worktree_id == wt.id)
+            .filter(|t| &t.worktree_id == worktree)
             .cloned()
             .collect()
     }
@@ -2798,13 +2823,13 @@ impl App {
     }
 
     pub fn visible_sessions(&self) -> Vec<Agent> {
-        let worktrees = self.visible_worktrees();
-        let Some(wt) = self
-            .selected_worktree_index()
-            .and_then(|i| worktrees.get(i))
-        else {
+        let Some(worktree) = self.selected_worktree() else {
             return vec![];
         };
+        self.sessions_for_worktree(&worktree.id, self.show_archived)
+    }
+
+    fn sessions_for_worktree(&self, worktree: &WorktreeId, show_archived: bool) -> Vec<Agent> {
         let now = now_ms();
         // Stable throughout, so ties — never-run rows especially, which all
         // stamp 0 — keep tree order instead of shuffling between frames.
@@ -2815,7 +2840,7 @@ impl App {
                 .tree
                 .agents
                 .iter()
-                .filter(|a| a.worktree_id == wt.id && !a.orchestrator && keep(a))
+                .filter(|a| &a.worktree_id == worktree && !a.orchestrator && keep(a))
                 .cloned()
                 .collect();
             group.sort_by_key(|a| recency_key(a, now));
@@ -2824,12 +2849,12 @@ impl App {
         let mut rows = collect(&|a| !a.archived && a.pinned);
         rows.extend(collect(&|a| self.is_recent(a)));
         rows.extend(collect(&|a| !a.archived && !a.pinned && !self.is_recent(a)));
-        if self.show_archived {
+        if show_archived {
             let mut archived: Vec<Agent> = self
                 .tree
                 .agents
                 .iter()
-                .filter(|a| a.worktree_id == wt.id && !a.orchestrator && a.archived)
+                .filter(|a| &a.worktree_id == worktree && !a.orchestrator && a.archived)
                 .cloned()
                 .collect();
             // Most recently archived first; pre-`archived_at` rows (stamp 0)
@@ -2842,36 +2867,41 @@ impl App {
 
     /// (pinned, recent, unpinned, archived-total) for the selected worktree.
     pub fn session_group_counts(&self) -> (usize, usize, usize, usize) {
-        let worktrees = self.visible_worktrees();
-        let Some(wt) = self
-            .selected_worktree_index()
-            .and_then(|i| worktrees.get(i))
-        else {
+        let Some(worktree) = self.selected_worktree() else {
             return (0, 0, 0, 0);
         };
+        self.session_group_counts_for_worktree(&worktree.id)
+    }
+
+    fn session_group_counts_for_worktree(
+        &self,
+        worktree: &WorktreeId,
+    ) -> (usize, usize, usize, usize) {
         let pinned = self
             .tree
             .agents
             .iter()
-            .filter(|a| a.worktree_id == wt.id && !a.archived && a.pinned)
+            .filter(|a| &a.worktree_id == worktree && !a.archived && a.pinned)
             .count();
         let recent = self
             .tree
             .agents
             .iter()
-            .filter(|a| a.worktree_id == wt.id && self.is_recent(a))
+            .filter(|a| &a.worktree_id == worktree && self.is_recent(a))
             .count();
         let unpinned = self
             .tree
             .agents
             .iter()
-            .filter(|a| a.worktree_id == wt.id && !a.archived && !a.pinned && !self.is_recent(a))
+            .filter(|a| {
+                &a.worktree_id == worktree && !a.archived && !a.pinned && !self.is_recent(a)
+            })
             .count();
         let archived = self
             .tree
             .agents
             .iter()
-            .filter(|a| a.worktree_id == wt.id && a.archived)
+            .filter(|a| &a.worktree_id == worktree && a.archived)
             .count();
         (pinned, recent, unpinned, archived)
     }

@@ -7257,6 +7257,44 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                         restore_session(app, out);
                     }
                 }
+                Some(HitTarget::WorktreeSession(worktree_index, session_index)) => {
+                    let target = app
+                        .visible_worktrees()
+                        .get(worktree_index)
+                        .map(|worktree| worktree.id.clone())
+                        .and_then(|worktree| {
+                            app.worktree_session_rows(&worktree)
+                                .get(session_index)
+                                .cloned()
+                                .map(|row| (worktree, row))
+                        });
+                    match target {
+                        Some((_, SessionRow::Agent(agent))) => {
+                            jump_to_target(app, PaletteTarget::Session(agent.id), true, out);
+                        }
+                        Some((_, SessionRow::Terminal(terminal))) => {
+                            open_session(app, SessionRef::Terminal(terminal.id), out);
+                        }
+                        Some((worktree, SessionRow::Link(link))) => {
+                            let key = SessionRow::Link(link).click_key();
+                            jump_to_target(
+                                app,
+                                PaletteTarget::Worktree(worktree),
+                                false,
+                                out,
+                            );
+                            if let Some(index) = app
+                                .visible_session_rows()
+                                .iter()
+                                .position(|row| row.click_key() == key)
+                            {
+                                app.sel_session = index;
+                                attach_selected(app, out);
+                            }
+                        }
+                        None => {}
+                    }
+                }
                 Some(HitTarget::Orchestrator(i)) => {
                     let section_changed = app.focus != Focus::Orchestrators;
                     app.focus = Focus::Orchestrators;
@@ -7528,6 +7566,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     Some(HitTarget::Worktree(_)) | Some(HitTarget::PanelBg(Focus::Worktrees)) => {
                         Some(Focus::Worktrees)
                     }
+                    Some(HitTarget::WorktreeSession(_, _)) => Some(Focus::Worktrees),
                     _ => None,
                 };
                 if let Some(section) = section {
@@ -7610,6 +7649,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                         open_menu_at(app, items, at);
                     }
                 }
+                Some(HitTarget::WorktreeSession(_, _)) => {}
                 Some(HitTarget::Session(i)) => {
                     app.sel_session = i;
                     app.focus = Focus::Sessions;
@@ -15190,6 +15230,164 @@ mod tests {
         }
     }
 
+    /// Each worktree keeps its sessions visible as compact, indented rows
+    /// directly underneath the worktree itself.
+    #[test]
+    fn worktree_sessions_render_as_an_indented_sublist() {
+        use nebula_core::{Agent, AgentStatus, Entity, TerminalTab};
+        let mut app = App::new();
+        seed_tree(&mut app); // main + agent-1
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Terminal(TerminalTab {
+                    id: nebula_core::TerminalId("t1".into()),
+                    worktree_id: nebula_core::WorktreeId("w1".into()),
+                    name: "shell-1".into(),
+                    sort_order: 0,
+                    alive: true,
+                }),
+            },
+        );
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Link(nebula_core::Link {
+                    id: LinkId("l1".into()),
+                    worktree_id: nebula_core::WorktreeId("w1".into()),
+                    url: "https://example.com/ticket".into(),
+                    sort_order: 0,
+                }),
+            },
+        );
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(Agent {
+                    id: AgentId("archived".into()),
+                    worktree_id: nebula_core::WorktreeId("w1".into()),
+                    name: "archived-hidden".into(),
+                    status: AgentStatus::Finished,
+                    archived: true,
+                    archived_at: 1,
+                    pinned: false,
+                    kind: nebula_core::AgentKind::Claude,
+                    model: None,
+                    effort: None,
+                    session_id: None,
+                    sort_order: 1,
+                    status_changed_at: 0,
+                    orchestrator: false,
+                    alive: false,
+                }),
+            },
+        );
+        app.show_archived = true;
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        let worktree = app
+            .hits
+            .iter()
+            .find_map(|(rect, target)| matches!(target, HitTarget::Worktree(0)).then_some(*rect))
+            .expect("main worktree row has a hit rect");
+        let worktree_column = |y: u16| {
+            text.lines()
+                .nth(y as usize)
+                .map(|line| {
+                    line.chars()
+                        .skip(worktree.x as usize)
+                        .take(worktree.width as usize)
+                        .collect::<String>()
+                })
+                .unwrap_or_default()
+        };
+        assert!(
+            worktree_column(worktree.y + 1).contains("● main"),
+            "main worktree row is visible:\n{text}"
+        );
+        assert!(
+            worktree_column(worktree.y + worktree.height).contains("▘ ● claude "),
+            "session is indented directly under its worktree:\n{text}"
+        );
+        assert!(
+            worktree_column(worktree.y + worktree.height + 1).contains("  ❯ shell-1"),
+            "terminal follows the agent:\n{text}"
+        );
+        assert!(
+            worktree_column(worktree.y + worktree.height + 2).contains("  ↗ example.com"),
+            "link follows the terminal:\n{text}"
+        );
+        assert!(
+            !text
+                .lines()
+                .map(|line| {
+                    line.chars()
+                        .skip(worktree.x as usize)
+                        .take(worktree.width as usize)
+                        .collect::<String>()
+                })
+                .any(|line| line.contains("archived-h")),
+            "archived agents stay out of worktree sub-lists:\n{text}"
+        );
+    }
+
+    /// A session sub-row is a direct shortcut into that session, even when
+    /// it belongs to a worktree other than the current selection.
+    #[test]
+    fn clicking_a_worktree_session_subrow_attaches_it() {
+        use nebula_core::{Agent, AgentStatus, Entity};
+        let mut app = App::new();
+        seed_tree(&mut app); // selected main + agent-1
+        seed_extra_worktrees(&mut app, 2, 2);
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(Agent {
+                    id: AgentId("a2".into()),
+                    worktree_id: nebula_core::WorktreeId("w2".into()),
+                    name: "agent-2".into(),
+                    status: AgentStatus::Fresh,
+                    archived: false,
+                    archived_at: 0,
+                    pinned: false,
+                    kind: nebula_core::AgentKind::Codex,
+                    model: None,
+                    effort: None,
+                    session_id: None,
+                    sort_order: 0,
+                    status_changed_at: 0,
+                    orchestrator: false,
+                    alive: true,
+                }),
+            },
+        );
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let rect = app
+            .hits
+            .iter()
+            .find_map(|(rect, target)| {
+                matches!(target, HitTarget::WorktreeSession(1, 0)).then_some(*rect)
+            })
+            .expect("agent-2 sub-row has a hit rect");
+        let mut out = Vec::new();
+        // rect.x itself is the splitter grip column — aim inside the row.
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Down(MouseButton::Left), rect.x + 2, rect.y),
+            &mut out,
+        );
+        let expected = SessionRef::Agent(AgentId("a2".into()));
+        assert!(
+            matches!(out.last(), Some(ClientRequest::Attach { session, .. }) if *session == expected),
+            "sub-row click attaches its session: {out:?}"
+        );
+        assert_eq!(app.sel_worktree, 1);
+        assert_eq!(app.focus, Focus::Terminal);
+        assert!(app.term_locked);
+    }
+
     /// An overflowing WORKTREES section scrolls to the selected row
     /// instead of clipping the tail off-screen.
     #[test]
@@ -15204,6 +15402,62 @@ mod tests {
         let text = buffer_text(&terminal);
         assert!(text.contains("wt-8"), "selected last row visible: {text}");
         assert!(!text.contains("wt-2"), "top rows scrolled out: {text}");
+    }
+
+    /// Session sub-rows count toward a worktree entry's scroll height, but
+    /// an entry taller than the viewport still keeps its worktree row visible.
+    #[test]
+    fn worktree_section_scrolls_tall_session_groups_with_their_worktree() {
+        use nebula_core::{Agent, AgentStatus, Entity};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_extra_worktrees(&mut app, 2, 8);
+        for i in 0..20 {
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Agent(Agent {
+                        id: AgentId(format!("tall-{i}")),
+                        worktree_id: nebula_core::WorktreeId("w8".into()),
+                        name: format!("session-{i}"),
+                        status: AgentStatus::Fresh,
+                        archived: false,
+                        archived_at: 0,
+                        pinned: false,
+                        kind: nebula_core::AgentKind::Claude,
+                        model: None,
+                        effort: None,
+                        session_id: None,
+                        sort_order: i,
+                        status_changed_at: 0,
+                        orchestrator: false,
+                        alive: true,
+                    }),
+                },
+            );
+        }
+        app.focus = Focus::Worktrees;
+        app.sel_worktree = 7; // wt-8, with a sub-list taller than the section
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        let worktree_column: String = text
+            .lines()
+            .map(|line| line.chars().skip(20).take(22).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            worktree_column.contains("wt-8"),
+            "selected worktree stays visible: {text}"
+        );
+        assert!(
+            worktree_column.contains("session-"),
+            "the visible part of its sub-list follows it: {text}"
+        );
+        assert!(
+            !worktree_column.contains("wt-2"),
+            "earlier groups scroll out: {text}"
+        );
     }
 
     /// Same for the ORCHESTRATORS half above the worktrees.
