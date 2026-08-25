@@ -28,7 +28,12 @@ new MenuItem field (MenuItem is literal-constructed everywhere). Aliases after t
 refinement ("vreau sa am a care e default la primary, sa am si acc,ac,ap… ab o sa ma puna sa aleg
 branch"): `a` = session picker straight on the PRIMARY checkout, `acc`/`ac`/`acu`/`ap` = kind-fixed
 (Claude/Codex/Cursor/Pi) name prompt on primary via `MenuAction::NewAgentOfKind` rows (prewarm
-fires), `ab` = the branch-pick flow, plus aw/w/o/t/s/e/g/n/td/st/ws/p/r.
+fires), `ab` = the branch-pick flow, plus aw/w/o/t/tn/s/e/g/n/td/st/ws/p/r. After `34fedbd`
+("nu vreau sa mi mai ceara nume de agent" + "sa dau t si sa mi puna ala de cmmd t"): the kind-fixed
+spellings skip the name prompt too — `PaletteCommand::NewAgentNow` goes straight to `create_agent`
+with an empty name (generated default + auto-title, agent renames itself from its first prompt) —
+and `t` opens the ⌘T floating quick terminal (`toggle_quick_terminal`); the plain terminal tab
+moved to `tn`.
 The `ab` flow (branch-FIRST, mirror of the orchestrator's kind-first order):
 `PaletteCommand::NewAgentOnBranch` → `open_agent_branch_picker` ("Agent branch") → rows
 `MenuAction::AgentOnBranch { project, branch }` → existing checkout opens `open_new_agent_picker`,
