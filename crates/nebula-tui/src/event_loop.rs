@@ -979,6 +979,17 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                     return;
                 }
                 Some(crate::keymap::Action::CloseSession) => {
+                    // With the ⌘D split up, ⌘W targets whichever pane holds
+                    // the lock. Closing the right shell hands the lock back
+                    // to the left pane (confirm → CloseTerminal →
+                    // detach_if_attached → close_split_terminal), so stay
+                    // locked instead of dropping to the session list.
+                    if app.split_focused {
+                        if let Some(sref) = app.split_term.as_ref().map(|t| t.sref.clone()) {
+                            close_session(app, sref, out);
+                        }
+                        return;
+                    }
                     let attached = app.term.as_ref().map(|t| t.sref.clone());
                     app.collapsed = false;
                     app.term_locked = false;
@@ -14393,6 +14404,76 @@ mod tests {
         );
         assert_eq!(app.focus, Focus::Terminal);
         assert!(app.term_locked, "the left pane keeps the input lock");
+    }
+
+    /// ⌘W inside the ⌘D split targets whichever pane holds the lock: the
+    /// right shell gets the close confirm and the lock returns to the left
+    /// pane on confirm; with the left pane focused, ⌘W keeps closing the
+    /// attachment as before.
+    #[test]
+    fn cmd_w_closes_the_focused_split_pane() {
+        use nebula_core::TerminalId;
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_terminal(&mut app, "t9", "term-9");
+        let mut out = Vec::new();
+        attach(&mut app, SessionRef::Agent(AgentId("a1".into())), &mut out);
+        app.focus = Focus::Terminal;
+        app.term_locked = true;
+        attach_split(
+            &mut app,
+            SessionRef::Terminal(TerminalId("t9".into())),
+            &mut out,
+        );
+        assert!(app.split_focused, "the split shell holds the lock");
+
+        // ⌘W with the right pane focused confirms closing the split
+        // shell — not the left attachment.
+        out.clear();
+        press(&mut app, KeyCode::Char('w'), KeyModifiers::SUPER, &mut out);
+        assert!(
+            matches!(
+                &app.overlay,
+                Some(Overlay::Confirm(c))
+                    if matches!(&c.action, PendingAction::CloseTerminal(id)
+                        if id == &TerminalId("t9".into()))
+            ),
+            "the confirm targets the split shell: {:?}",
+            app.overlay
+        );
+        assert!(app.term_locked, "still locked while the confirm is up");
+        assert!(app.term.is_some(), "the left attachment is untouched");
+
+        // Confirming kills the shell, drops the split, and hands the lock
+        // back to the left pane.
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE, &mut out);
+        assert!(
+            out.iter().any(|r| matches!(r,
+                ClientRequest::CloseTerminal { id, .. } if id == &TerminalId("t9".into()))),
+            "the shell is killed on confirm: {out:?}"
+        );
+        assert!(app.split_term.is_none(), "the split pane is gone");
+        assert_eq!(app.focus, Focus::Terminal);
+        assert!(app.term_locked, "the left pane takes the lock back");
+        assert_eq!(
+            app.term.as_ref().map(|t| t.sref.clone()),
+            Some(SessionRef::Agent(AgentId("a1".into())))
+        );
+
+        // With the left pane focused, ⌘W closes the left attachment.
+        attach_split(
+            &mut app,
+            SessionRef::Terminal(TerminalId("t9".into())),
+            &mut out,
+        );
+        app.split_focused = false;
+        out.clear();
+        press(&mut app, KeyCode::Char('w'), KeyModifiers::SUPER, &mut out);
+        assert!(
+            out.iter().any(|r| matches!(r,
+                ClientRequest::ArchiveAgent { id, .. } if id == &AgentId("a1".into()))),
+            "⌘w on the left pane archives the attached agent: {out:?}"
+        );
     }
 
     /// ⌘D from the panels (nothing locked) opens the split on the
