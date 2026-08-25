@@ -18,6 +18,10 @@ pub struct Config {
     /// booting shell. Costs idle shell/CLI processes for sessions the user
     /// may never open.
     pub prewarm_sessions: bool,
+    /// Clone a matching primary checkout's top-level `node_modules` into new
+    /// worktrees with APFS copy-on-write. Failures are ignored and Nebula
+    /// never runs a package-manager install.
+    pub seed_node_modules: bool,
     /// Kill idle session PTYs in worktrees no client is looking at once
     /// they've gone unwatched this long: "1m" | "5m" | "15m" | "30m" | "1h"
     /// ("off" disables reaping entirely; any `<n>s`/`<n>m`/`<n>h` works).
@@ -35,6 +39,7 @@ impl Default for Config {
             git_init_on_create: true,
             prewarm_agents: true,
             prewarm_sessions: true,
+            seed_node_modules: true,
             session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT.into(),
         }
     }
@@ -141,5 +146,14 @@ mod tests {
         assert!(cfg.prewarm_sessions);
         let cfg: Config = serde_json::from_str(r#"{"prewarm_sessions": false}"#).unwrap();
         assert!(!cfg.prewarm_sessions);
+    }
+
+    #[test]
+    fn defaults_enable_node_modules_seeding_and_allow_opt_out() {
+        assert!(Config::default().seed_node_modules);
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert!(cfg.seed_node_modules);
+        let cfg: Config = serde_json::from_str(r#"{"seed_node_modules": false}"#).unwrap();
+        assert!(!cfg.seed_node_modules);
     }
 }

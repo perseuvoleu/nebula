@@ -1096,6 +1096,18 @@ impl Store {
         }))
     }
 
+    /// Return the original checkout path for a project, if it is registered.
+    pub fn get_primary_worktree_path(&self, project_id: &ProjectId) -> Result<Option<PathBuf>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT path FROM worktrees WHERE project_id = ?1 AND is_main = 1 LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![project_id.as_str()])?;
+        Ok(rows
+            .next()?
+            .map(|row| PathBuf::from(row.get::<_, String>(0).unwrap())))
+    }
+
     pub fn get_agent(&self, id: &AgentId) -> Result<Option<Agent>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(

@@ -113,6 +113,26 @@ impl TestEnv {
     }
 }
 
+fn commit_file(repo: &Path, path: &str, contents: &str) {
+    std::fs::write(repo.join(path), contents).unwrap();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    };
+    assert!(git(&["add", path]), "git add {path} failed");
+    assert!(
+        git(&["commit", "-m", "add test fixture"]),
+        "git commit failed"
+    );
+}
+
 async fn connect(sock: &Path) -> UnixStream {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
@@ -3307,6 +3327,112 @@ async fn worktree_delete_cli_removes_checkout_and_row() {
 
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
     wait_for_exit(&mut daemon);
+}
+
+/// A fresh checkout with the same package-manager lockfile should reuse the
+/// primary checkout's top-level dependencies without running an install.
+#[tokio::test]
+async fn worktree_new_seeds_node_modules_when_lockfile_matches() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    commit_file(&repo, "pnpm-lock.yaml", "lockfileVersion: '9.0'\n");
+    std::fs::create_dir(repo.join("node_modules")).unwrap();
+    std::fs::write(repo.join("node_modules/seeded-package"), "from primary\n").unwrap();
+
+    let mut daemon = env.spawn_daemon();
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let _main = add_project_get_main_worktree(&mut c, &repo).await;
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        .args(["worktree", "new", "seeded", "--project", "repo"])
+        .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "worktree new failed: {out:?}");
+
+    let seeded = repo
+        .parent()
+        .unwrap()
+        .join("repo-worktrees/seeded/node_modules/seeded-package");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !seeded.exists() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(std::fs::read_to_string(&seeded).unwrap(), "from primary\n");
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
+/// Dependency state from a different lockfile must never leak into the new
+/// checkout, even when the primary checkout has `node_modules` available.
+#[tokio::test]
+async fn worktree_new_skips_node_modules_when_lockfile_differs() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    commit_file(&repo, "pnpm-lock.yaml", "lockfileVersion: '8.0'\n");
+    std::fs::write(repo.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+    std::fs::create_dir(repo.join("node_modules")).unwrap();
+    std::fs::write(repo.join("node_modules/primary-only"), "must not copy\n").unwrap();
+
+    let mut daemon = env.spawn_daemon();
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let _main = add_project_get_main_worktree(&mut c, &repo).await;
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        .args(["worktree", "new", "mismatch", "--project", "repo"])
+        .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "worktree new failed: {out:?}");
+
+    let node_modules = repo
+        .parent()
+        .unwrap()
+        .join("repo-worktrees/mismatch/node_modules");
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+    assert!(
+        !node_modules.exists(),
+        "different lockfiles must leave node_modules absent"
+    );
+}
+
+/// Users can disable dependency seeding globally without changing normal
+/// worktree creation behavior.
+#[tokio::test]
+async fn worktree_new_skips_node_modules_when_seeding_is_disabled() {
+    let env = TestEnv::new();
+    env.write_config(r#"{"seed_node_modules": false}"#);
+    let repo = env.make_repo();
+    commit_file(&repo, "pnpm-lock.yaml", "lockfileVersion: '9.0'\n");
+    std::fs::create_dir(repo.join("node_modules")).unwrap();
+    std::fs::write(repo.join("node_modules/primary-only"), "must not copy\n").unwrap();
+
+    let mut daemon = env.spawn_daemon();
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let _main = add_project_get_main_worktree(&mut c, &repo).await;
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        .args(["worktree", "new", "disabled", "--project", "repo"])
+        .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "worktree new failed: {out:?}");
+
+    let node_modules = repo
+        .parent()
+        .unwrap()
+        .join("repo-worktrees/disabled/node_modules");
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+    assert!(
+        !node_modules.exists(),
+        "disabled seeding must leave node_modules absent"
+    );
 }
 
 /// `nebula add <dir>` and the bare `nebula <dir>` shorthand: the one-shot CLI

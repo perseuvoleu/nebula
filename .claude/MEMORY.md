@@ -51,6 +51,30 @@ workspace green; `make install` run (TUI-only, no protocol change — old daemon
   collapsed mode — the `in_split` check must win first.
 - `close_split_terminal` must reset `split_term_area` to `Rect::default()`, or a stale rect makes the
   next split's pre-draw `split_pane_size` lie about the pane.
+### Worktree Creation Seeds Root `node_modules` From Primary Lockfile Match — 2026-08-25
+
+**Asked:** "Task: post-create node_modules seeding for `nebula worktree new`… A fresh worktree of a
+JS project has no node_modules, so every agent re-installs. Add an optional, fast, SAFE seeding step
+that runs right after a worktree is created."
+
+**Did:** Added daemon config `seed_node_modules` defaulting true in
+`crates/nebula-daemon/src/config.rs`, then wired `Daemon::create_worktree` in
+`crates/nebula-daemon/src/registry.rs` to resolve the registered primary worktree and kick off
+`git::seed_node_modules_in_background` after `git worktree add` succeeds.
+`crates/nebula-daemon/src/git.rs` now checks root lockfiles in package-manager priority order and runs
+`cp -Rc <primary>/node_modules <worktree>/node_modules` inside `tokio::task::spawn_blocking`, logging
+and removing partial destinations on failure instead of failing worktree creation. Added CLI e2e
+coverage in `crates/nebula/tests/e2e_pty.rs` for the seed, lockfile-mismatch skip, and config-off skip.
+
+**Gotchas:**
+- The seed must stay detached from the create-worktree request path: the daemon returns immediately
+  after scheduling `spawn_blocking`, so e2e checks have to poll the filesystem instead of assuming
+  `nebula worktree new` waited for the clone.
+- The lockfile decision is rooted in the primary checkout only, with first-match-wins ordering; a
+  dirty primary lockfile versus the committed branch copy proves the mismatch skip path without a
+  private test seam.
+- `Project.repo_path` can name a linked checkout when the project was added from there; use the stored
+  `is_main` worktree row to find the actual primary checkout.
 
 ### Merge Audit: Duplicate-Commit False Conflict, Batch Commit, Push — 2026-08-25
 
