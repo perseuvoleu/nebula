@@ -356,6 +356,17 @@ async fn main_loop(
                             if let Some(sref) = app.term.take().map(|t| t.sref) {
                                 attach(&mut app, sref, &mut out);
                             }
+                            // The ⌘D split's shell comes back too (its
+                            // attach keeps the lock where it was).
+                            if let Some(sref) = app.split_term.take().map(|t| t.sref) {
+                                let focused = app.split_focused;
+                                let locked = app.term_locked;
+                                let focus = app.focus;
+                                attach_split(&mut app, sref, &mut out);
+                                app.split_focused = focused;
+                                app.term_locked = locked;
+                                app.focus = focus;
+                            }
                             app.dirty = true;
                         }
                     }
@@ -663,27 +674,40 @@ fn restore_ui_state(app: &mut App, json: &str) {
     }
 }
 
-/// Keep the vt100 parser and the daemon PTY sized to the drawn pane.
+/// Keep the vt100 parser and the daemon PTY sized to the drawn pane —
+/// both panes when the ⌘D split is open, each to its own rect.
 fn sync_pty_size(app: &mut App, out: &mut Vec<ClientRequest>) {
     let area = app.term_area;
-    if area.width < 2 || area.height < 2 {
-        return;
-    }
-    if let Some(term) = &mut app.term {
-        if (term.cols, term.rows) != (area.width, area.height) {
-            // The grid reflows; a screen-anchored selection would drift.
-            app.term_selection = None;
-            term.cols = area.width;
-            term.rows = area.height;
-            term.parser.screen_mut().set_size(area.height, area.width);
-            term.touch();
-            out.push(ClientRequest::Resize {
-                session: term.sref.clone(),
-                cols: area.width,
-                rows: area.height,
-            });
+    if area.width >= 2 && area.height >= 2 {
+        if let Some(term) = &mut app.term {
+            if (term.cols, term.rows) != (area.width, area.height) {
+                // The grid reflows; a screen-anchored selection would drift.
+                app.term_selection = None;
+                resize_term(term, area, out);
+            }
         }
     }
+    let area = app.split_term_area;
+    if area.width >= 2 && area.height >= 2 {
+        if let Some(term) = &mut app.split_term {
+            if (term.cols, term.rows) != (area.width, area.height) {
+                resize_term(term, area, out);
+            }
+        }
+    }
+}
+
+/// Resize one attached parser + its daemon PTY to a drawn rect.
+fn resize_term(term: &mut AttachedTerm, area: ratatui::layout::Rect, out: &mut Vec<ClientRequest>) {
+    term.cols = area.width;
+    term.rows = area.height;
+    term.parser.screen_mut().set_size(area.height, area.width);
+    term.touch();
+    out.push(ClientRequest::Resize {
+        session: term.sref.clone(),
+        cols: area.width,
+        rows: area.height,
+    });
 }
 
 /// Keep the editor modal's PTY and parser sized to the drawn inner rect
@@ -841,7 +865,10 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     // the escape hatches. Merely focusing the pane (Tab / Ctrl+arrows) does
     // not lock — Enter does — so an unlocked pane falls through to panel
     // navigation and the user is never trapped.
-    if app.focus == Focus::Terminal && app.term.is_some() && app.term_locked {
+    if app.focus == Focus::Terminal
+        && (app.term.is_some() || app.split_term.is_some())
+        && app.term_locked
+    {
         // Ctrl+q is the primary hatch: a plain control byte (0x11) that
         // every emulator delivers — Terminal.app included, no kitty protocol
         // needed — unbound in macOS and unused by Claude Code. The inner
@@ -886,6 +913,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                             | crate::keymap::Action::NewAgent
                             | crate::keymap::Action::Notes
                             | crate::keymap::Action::GitDiff
+                            | crate::keymap::Action::SplitTerminal
                             | crate::keymap::Action::CommandPalette
                     )
                 )
@@ -895,6 +923,10 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             match app.keymap.lookup(crate::keymap::Scope::Global, &chord) {
                 Some(crate::keymap::Action::QuickTerminal) => {
                     quick_terminal_shortcut(app, out);
+                    return;
+                }
+                Some(crate::keymap::Action::SplitTerminal) => {
+                    toggle_split_terminal(app, out);
                     return;
                 }
                 Some(
@@ -959,12 +991,27 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 _ => {}
             }
         }
-        let exited = app.term.as_ref().is_some_and(|t| t.exited);
+        // The ⌘D split routes keys to whichever pane holds the lock: the
+        // fresh shell on the right, or the main attachment on the left.
+        let split_active = app.split_focused && app.split_term.is_some();
+        let exited = if split_active {
+            app.split_term.as_ref().is_some_and(|t| t.exited)
+        } else {
+            app.term.as_ref().is_some_and(|t| t.exited)
+        };
         if !exited {
-            if let Some(term) = &mut app.term {
+            if !split_active {
                 // Typing changes the content under a persisted selection
-                // highlight — drop it.
+                // highlight — drop it. (The selection lives on the left
+                // pane, so typing into the split leaves it alone.)
                 app.term_selection = None;
+            }
+            let term = if split_active {
+                app.split_term.as_mut()
+            } else {
+                app.term.as_mut()
+            };
+            if let Some(term) = term {
                 // Typing exits scroll mode (tmux behavior).
                 if term.scroll > 0 {
                     term.set_scroll(0);
@@ -1326,6 +1373,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         Action::DeleteAll => open_delete_all_confirm(app),
         Action::ContextMenu => open_context_menu_for_selection(app),
         Action::GitDiff => open_diff_view(app),
+        Action::SplitTerminal => toggle_split_terminal(app, out),
         Action::OpenRepo => open_repo_in_browser(app),
         // AddProject adds a project from ANY panel — unlike New it never
         // changes meaning with focus, matching the "open a repo" instinct.
@@ -2175,6 +2223,81 @@ fn toggle_quick_terminal(app: &mut App, out: &mut Vec<ClientRequest>) {
             });
         }
     }
+}
+
+/// ⌘D: toggle the split terminal. Opening keeps the current attachment in
+/// the left pane and creates a fresh unnamed shell — in the same worktree
+/// context as what's attached (or selected) — for the right pane; its Ack
+/// attaches there and moves the input lock onto it, so the user can type
+/// straight away. A second ⌘D closes the split, the shell keeps running in
+/// the daemon as a normal terminal tab.
+fn toggle_split_terminal(app: &mut App, out: &mut Vec<ClientRequest>) {
+    if app.split_term.is_some() {
+        close_split_terminal(app, out);
+        return;
+    }
+    let Some(worktree) = quick_terminal_worktree(app) else {
+        app.flash = Some("select a project or worktree first".into());
+        return;
+    };
+    let req_id = app.alloc_req_id(PendingIntent::AttachCreatedSplit);
+    out.push(ClientRequest::CreateTerminal {
+        req_id,
+        worktree,
+        name: None,
+    });
+}
+
+/// Close the ⌘D split: detach the right pane's shell (it keeps running as
+/// a normal terminal tab) and hand the input lock back to the left pane —
+/// or drop out of the terminal when nothing is attached there.
+fn close_split_terminal(app: &mut App, out: &mut Vec<ClientRequest>) {
+    if let Some(t) = app.split_term.take() {
+        out.push(ClientRequest::Detach { session: t.sref });
+    }
+    app.split_focused = false;
+    app.split_term_area = ratatui::layout::Rect::default();
+    if app.focus == Focus::Terminal && app.term.is_none() {
+        app.term_locked = false;
+        app.focus = Focus::Sessions;
+    }
+    app.dirty = true;
+}
+
+/// Attach the ⌘D-created shell in the split's right pane and lock input
+/// onto it. The left pane's attachment is untouched.
+fn attach_split(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
+    if let Some(existing) = app.split_term.take() {
+        if existing.sref != sref {
+            out.push(ClientRequest::Detach {
+                session: existing.sref,
+            });
+        }
+    }
+    let (cols, rows) = split_pane_size(app);
+    app.split_term = Some(AttachedTerm::new(sref.clone(), cols, rows));
+    out.push(ClientRequest::Attach {
+        session: sref,
+        from_seq: None,
+        cols,
+        rows,
+    });
+    app.split_focused = true;
+    app.focus = Focus::Terminal;
+    app.term_locked = true;
+    app.dirty = true;
+}
+
+/// Grid for the split's right pane. Before its first draw the pane rect is
+/// unknown, so fall back to half of the main pane — the post-draw
+/// `sync_pty_size` corrects it a frame later.
+fn split_pane_size(app: &App) -> (u16, u16) {
+    let area = app.split_term_area;
+    if area.width >= 2 && area.height >= 2 {
+        return (area.width, area.height);
+    }
+    let (cols, rows) = pane_size(app);
+    ((cols / 2).max(2), rows)
 }
 
 /// The checkout the quick terminal should open on.
@@ -5194,6 +5317,11 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
 }
 
 fn detach_if_attached(app: &mut App, sref: &SessionRef, out: &mut Vec<ClientRequest>) {
+    // The ⌘D split's shell can be closed/deleted out from under it: drop
+    // the right pane rather than render a dead screen.
+    if app.split_term.as_ref().is_some_and(|t| &t.sref == sref) {
+        close_split_terminal(app, out);
+    }
     if let Some(term) = &app.term {
         if &term.sref == sref {
             out.push(ClientRequest::Detach {
@@ -7204,10 +7332,22 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                         open_prompt(app, PromptKind::AddProject);
                     }
                 }
+                Some(HitTarget::SplitTerminalPane) => {
+                    // A click into the ⌘D split's right pane locks input
+                    // onto its shell.
+                    if let Some(t) = &app.split_term {
+                        app.focus = Focus::Terminal;
+                        app.split_focused = true;
+                        if !t.exited {
+                            app.term_locked = true;
+                        }
+                    }
+                }
                 Some(HitTarget::TerminalPane) => {
                     // A click into the pane is deliberate — lock input too.
                     if let Some(t) = &app.term {
                         app.focus = Focus::Terminal;
+                        app.split_focused = false;
                         if !t.exited {
                             app.term_locked = true;
                         }
@@ -7278,8 +7418,21 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                         | HitTarget::PanelBg(Focus::Sessions)
                 )
             );
-            let in_term = matches!(over, Some(HitTarget::TerminalPane)) || app.collapsed;
-            if over_sessions {
+            let in_split = matches!(over, Some(HitTarget::SplitTerminalPane));
+            let in_term = matches!(over, Some(HitTarget::TerminalPane)) || (app.collapsed && !in_split);
+            if in_split {
+                // Wheel over the ⌘D split's right pane walks that shell's
+                // scrollback (no mouse-protocol forwarding — it's a shell).
+                if let Some(term) = &mut app.split_term {
+                    let new_scroll = if up {
+                        term.scroll.saturating_add(3)
+                    } else {
+                        term.scroll.saturating_sub(3)
+                    };
+                    term.set_scroll(new_scroll);
+                    app.dirty = true;
+                }
+            } else if over_sessions {
                 // Selection only — no focus steal from wherever the user is.
                 let len = app.visible_session_rows().len();
                 if len > 0 {
@@ -7654,37 +7807,41 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             app.dirty = true;
         }
         ServerEvent::Scrollback { session, data, .. } => {
-            if let Some(term) = &mut app.term {
-                if term.sref == session {
-                    // Full replay: the screen is rebuilt from scratch.
-                    app.term_selection = None;
-                    term.reset();
-                    term.feed(&data);
-                    app.dirty = true;
-                }
+            if let Some(term) = app.term.as_mut().filter(|t| t.sref == session) {
+                // Full replay: the screen is rebuilt from scratch.
+                app.term_selection = None;
+                term.reset();
+                term.feed(&data);
+                app.dirty = true;
+            } else if let Some(term) = app.split_term.as_mut().filter(|t| t.sref == session) {
+                term.reset();
+                term.feed(&data);
+                app.dirty = true;
             }
         }
         ServerEvent::Output { session, data, .. } => {
-            if let Some(term) = &mut app.term {
-                if term.sref == session {
-                    term.feed(&data);
-                    app.dirty = true;
-                }
+            if let Some(term) = app.term.as_mut().filter(|t| t.sref == session) {
+                term.feed(&data);
+                app.dirty = true;
+            } else if let Some(term) = app.split_term.as_mut().filter(|t| t.sref == session) {
+                term.feed(&data);
+                app.dirty = true;
             }
         }
         ServerEvent::SessionExited { session, .. } => {
-            if let Some(term) = &mut app.term {
-                if term.sref == session {
-                    term.exited = true;
-                    app.dirty = true;
-                }
+            if let Some(term) = app.term.as_mut().filter(|t| t.sref == session) {
+                term.exited = true;
+                app.dirty = true;
+            } else if let Some(term) = app.split_term.as_mut().filter(|t| t.sref == session) {
+                term.exited = true;
+                app.dirty = true;
             }
         }
         ServerEvent::KittyFlags { session, flags } => {
-            if let Some(term) = &mut app.term {
-                if term.sref == session {
-                    term.kitty_flags = flags;
-                }
+            if let Some(term) = app.term.as_mut().filter(|t| t.sref == session) {
+                term.kitty_flags = flags;
+            } else if let Some(term) = app.split_term.as_mut().filter(|t| t.sref == session) {
+                term.kitty_flags = flags;
             }
         }
         ServerEvent::StatusChanged {
@@ -7732,6 +7889,9 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                         app.focus = Focus::Terminal;
                         app.term_locked = true;
                     }
+                }
+                (Some(PendingIntent::AttachCreatedSplit), Some(EntityId::Terminal(id))) => {
+                    attach_split(app, SessionRef::Terminal(id), out);
                 }
                 (Some(PendingIntent::AttachCreatedOrchestrator), Some(EntityId::Agent(id))) => {
                     // Its upsert usually precedes the Ack, so the section
@@ -14099,6 +14259,212 @@ mod tests {
         assert!(!app.quick_term, "⌘T closes the floating quick terminal");
     }
 
+    /// ⌘D splits the terminal pane: the current attachment stays in the
+    /// left pane, a fresh unnamed shell is created in the same worktree,
+    /// and its Ack attaches it in the right pane with the input lock —
+    /// ready to type. Keys follow the pane focus, the split survives a
+    /// left-pane session switch, and a second ⌘D closes it.
+    #[test]
+    fn cmd_d_splits_with_a_fresh_shell_then_toggles_closed() {
+        use nebula_core::{EntityId, TerminalId, WorktreeId};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        attach(&mut app, SessionRef::Agent(AgentId("a1".into())), &mut out);
+        app.focus = Focus::Terminal;
+        app.term_locked = true;
+
+        // ⌘D fires through the locked-terminal SUPER intercept: not
+        // forwarded to the PTY, and no diff viewer (that moved to ⌘G/g).
+        out.clear();
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::SUPER, &mut out);
+        assert!(app.overlay.is_none(), "⌘d no longer opens the git diff");
+        let req_id = match out.as_slice() {
+            [ClientRequest::CreateTerminal {
+                req_id,
+                worktree,
+                name: None,
+            }] if worktree == &WorktreeId("w1".into()) => *req_id,
+            other => panic!("expected a fresh unnamed shell in w1: {other:?}"),
+        };
+
+        // The Ack attaches the shell on the right and locks input onto it.
+        hse(
+            &mut app,
+            ServerEvent::Ack {
+                req_id,
+                created: Some(EntityId::Terminal(TerminalId("t9".into()))),
+            },
+        );
+        assert_eq!(
+            app.split_term.as_ref().map(|t| t.sref.clone()),
+            Some(SessionRef::Terminal(TerminalId("t9".into())))
+        );
+        assert!(app.split_focused, "the new shell holds the input lock");
+        assert!(app.term_locked);
+        assert_eq!(app.focus, Focus::Terminal);
+        assert_eq!(
+            app.term.as_ref().map(|t| t.sref.clone()),
+            Some(SessionRef::Agent(AgentId("a1".into()))),
+            "the left pane keeps the current attachment"
+        );
+
+        // Keys route to the right-hand shell…
+        out.clear();
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(
+                out.as_slice(),
+                [ClientRequest::Input { session, .. }]
+                    if session == &SessionRef::Terminal(TerminalId("t9".into()))
+            ),
+            "typing lands in the split shell: {out:?}"
+        );
+
+        // …and back to the left pane once it takes the lock again.
+        app.split_focused = false;
+        out.clear();
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(
+                out.as_slice(),
+                [ClientRequest::Input { session, .. }]
+                    if session == &SessionRef::Agent(AgentId("a1".into()))
+            ),
+            "typing lands in the left pane: {out:?}"
+        );
+
+        // Switching the left attachment leaves the split alone.
+        attach(&mut app, SessionRef::Agent(AgentId("a2".into())), &mut out);
+        assert!(app.split_term.is_some(), "split survives a session switch");
+
+        // A second ⌘D closes the split: the shell detaches (it keeps
+        // running as a normal tab) and the lock returns to the left pane.
+        out.clear();
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::SUPER, &mut out);
+        assert!(app.split_term.is_none(), "⌘d again closes the split");
+        assert!(
+            matches!(
+                out.as_slice(),
+                [ClientRequest::Detach { session }]
+                    if session == &SessionRef::Terminal(TerminalId("t9".into()))
+            ),
+            "the split shell is detached, not killed: {out:?}"
+        );
+        assert_eq!(app.focus, Focus::Terminal);
+        assert!(app.term_locked, "the left pane keeps the input lock");
+    }
+
+    /// ⌘D from the panels (nothing locked) opens the split on the
+    /// selected worktree too.
+    #[test]
+    fn cmd_d_from_the_panels_creates_the_split_shell() {
+        use nebula_core::WorktreeId;
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.focus = Focus::Worktrees;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::SUPER, &mut out);
+        assert!(
+            matches!(
+                out.as_slice(),
+                [ClientRequest::CreateTerminal { worktree, name: None, .. }]
+                    if worktree == &WorktreeId("w1".into())
+            ),
+            "⌘d from the panels creates the split shell: {out:?}"
+        );
+    }
+
+    /// The split renders both PTYs side by side — each pane gets its own
+    /// rect, output routes to the right parser, and the post-draw sync
+    /// resizes each PTY to its own half.
+    #[test]
+    fn split_panes_render_and_resize_independently() {
+        use nebula_core::{EntityId, TerminalId};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        attach(&mut app, SessionRef::Agent(AgentId("a1".into())), &mut out);
+        app.focus = Focus::Terminal;
+        app.term_locked = true;
+        out.clear();
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::SUPER, &mut out);
+        let req_id = match out.as_slice() {
+            [ClientRequest::CreateTerminal { req_id, .. }] => *req_id,
+            other => panic!("expected CreateTerminal: {other:?}"),
+        };
+        hse(
+            &mut app,
+            ServerEvent::Ack {
+                req_id,
+                created: Some(EntityId::Terminal(TerminalId("t9".into()))),
+            },
+        );
+        hse(
+            &mut app,
+            ServerEvent::Output {
+                session: SessionRef::Agent(AgentId("a1".into())),
+                seq: 1,
+                data: b"LEFTSIDE".to_vec(),
+            },
+        );
+        hse(
+            &mut app,
+            ServerEvent::Output {
+                session: SessionRef::Terminal(TerminalId("t9".into())),
+                seq: 1,
+                data: b"RIGHTSIDE".to_vec(),
+            },
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        let (lx, _) = find_cell(&terminal, "LEFTSIDE");
+        let (rx, _) = find_cell(&terminal, "RIGHTSIDE");
+        assert!(rx > lx, "panes render side by side:\n{text}");
+
+        // Each pane holds its own non-overlapping rect.
+        let (l, r) = (app.term_area, app.split_term_area);
+        assert!(l.width >= 2 && r.width >= 2, "both panes drawn: {l:?} {r:?}");
+        assert!(r.x > l.x + l.width, "right pane starts past the rule");
+
+        // The sync resizes each PTY to its own half, not the full pane.
+        out.clear();
+        sync_pty_size(&mut app, &mut out);
+        assert!(
+            matches!(
+                out.as_slice(),
+                [
+                    ClientRequest::Resize { session: s1, cols: c1, rows: r1 },
+                    ClientRequest::Resize { session: s2, cols: c2, rows: r2 },
+                ] if s1 == &SessionRef::Agent(AgentId("a1".into()))
+                    && s2 == &SessionRef::Terminal(TerminalId("t9".into()))
+                    && (*c1, *r1) == (l.width, l.height)
+                    && (*c2, *r2) == (r.width, r.height)
+            ),
+            "one Resize per pane, each to its own rect: {out:?}"
+        );
+
+        // Clicking a pane moves the input lock to it (the drawn hit rects
+        // route the click; +2 keeps clear of the splitter grab zone).
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        app.split_focused = false;
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Down(MouseButton::Left), r.x + 2, r.y + 1),
+            &mut out,
+        );
+        assert!(app.split_focused, "click on the right pane focuses it");
+        assert!(app.term_locked);
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Down(MouseButton::Left), l.x + 2, l.y + 1),
+            &mut out,
+        );
+        assert!(!app.split_focused, "click on the left pane focuses it back");
+    }
+
     #[test]
     fn move_agent_menu_requests_move_and_selection_follows_the_upsert() {
         use nebula_core::{Agent, AgentStatus, Entity, Worktree};
@@ -15508,7 +15874,7 @@ mod tests {
     }
 
     #[test]
-    fn cmd_d_opens_the_diff_viewer_from_any_panel() {
+    fn cmd_g_opens_the_diff_viewer_from_any_panel() {
         let dir = tempfile::tempdir().unwrap();
         let repo = test_repo(&dir);
         std::fs::write(repo.join("a.txt"), "changed\n").unwrap();
@@ -15516,9 +15882,9 @@ mod tests {
         let mut app = App::new();
         seed_repo_tree(&mut app, &repo);
         let mut out = Vec::new();
-        // Projects focus, not Worktrees — ⌘d is panel-independent.
+        // Projects focus, not Worktrees — ⌘g is panel-independent.
         app.focus = Focus::Projects;
-        press(&mut app, KeyCode::Char('d'), KeyModifiers::SUPER, &mut out);
+        press(&mut app, KeyCode::Char('g'), KeyModifiers::SUPER, &mut out);
         match &app.overlay {
             Some(Overlay::Diff(v)) => assert_eq!(v.branch, "main"),
             other => panic!("expected diff overlay, got {other:?}"),
@@ -15526,7 +15892,7 @@ mod tests {
     }
 
     #[test]
-    fn cmd_d_inside_a_locked_session_opens_the_diff_viewer() {
+    fn cmd_g_inside_a_locked_session_opens_the_diff_viewer() {
         let dir = tempfile::tempdir().unwrap();
         let repo = test_repo(&dir);
         std::fs::write(repo.join("a.txt"), "changed\n").unwrap();
@@ -15541,11 +15907,11 @@ mod tests {
         ));
         app.focus = Focus::Terminal;
         app.term_locked = true;
-        press(&mut app, KeyCode::Char('d'), KeyModifiers::SUPER, &mut out);
-        assert!(!app.term_locked, "⌘d unlocks the pane");
+        press(&mut app, KeyCode::Char('g'), KeyModifiers::SUPER, &mut out);
+        assert!(!app.term_locked, "⌘g unlocks the pane");
         assert!(
             matches!(&app.overlay, Some(Overlay::Diff(_))),
-            "⌘d opens the diff viewer from inside a locked session"
+            "⌘g opens the diff viewer from inside a locked session"
         );
         assert!(
             out.is_empty(),
@@ -17456,7 +17822,7 @@ mod tests {
 
             // Esc leaves it where it was.
             press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
-            assert_eq!(app.keymap.label(crate::keymap::Action::GitDiff), "g ⌘d");
+            assert_eq!(app.keymap.label(crate::keymap::Action::GitDiff), "g ⌘g");
             assert_eq!(app.keymap.label(crate::keymap::Action::Notes), "e ⌘e");
         });
     }
@@ -17478,7 +17844,7 @@ mod tests {
             assert_eq!(app.keymap.label(crate::keymap::Action::Notes), "g");
             assert_eq!(
                 app.keymap.label(crate::keymap::Action::GitDiff),
-                "⌘d",
+                "⌘g",
                 "one keystroke can only mean one thing — only g moves"
             );
             // The panels agree with the map.

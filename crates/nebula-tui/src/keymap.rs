@@ -82,6 +82,7 @@ pub enum Action {
     NewAgent,
     NewTerminal,
     QuickTerminal,
+    SplitTerminal,
     NewLink,
     Rename,
     CloseSession,
@@ -335,10 +336,10 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::GitDiff,
         id: "git_diff",
         label: "Git diff",
-        hint: "Open the diff viewer for the selected worktree (⌘d even inside a locked session)",
+        hint: "Open the diff viewer for the selected worktree (⌘g even inside a locked session)",
         group: "PROJECTS & WORKTREES",
         scope: Scope::Global,
-        defaults: &["g", "cmd+d"],
+        defaults: &["g", "cmd+g"],
     },
     ActionSpec {
         action: Action::OpenRepo,
@@ -394,6 +395,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         group: "SESSIONS",
         scope: Scope::Global,
         defaults: &["cmd+t", "ctrl+t"],
+    },
+    ActionSpec {
+        action: Action::SplitTerminal,
+        id: "split_terminal",
+        label: "Split terminal",
+        hint: "Split the pane and open a fresh shell in the current worktree on the right (⌘d again closes the split; works inside a locked session)",
+        group: "SESSIONS",
+        scope: Scope::Global,
+        defaults: &["cmd+d", "|"],
     },
     ActionSpec {
         action: Action::NewLink,
@@ -1249,6 +1259,23 @@ mod tests {
             Some(Action::ToggleTerminalFullscreen)
         );
         assert_eq!(map.lookup(Scope::Terminal, &cmd_p), None);
+    }
+
+    #[test]
+    fn cmd_d_belongs_to_the_split_and_g_keeps_the_diff() {
+        let map = Keymap::default();
+        assert_eq!(
+            map.lookup(Scope::Global, &KeyChord::parse("cmd+d").unwrap()),
+            Some(Action::SplitTerminal)
+        );
+        assert_eq!(
+            map.lookup(Scope::Global, &KeyChord::parse("g").unwrap()),
+            Some(Action::GitDiff)
+        );
+        assert_eq!(
+            map.lookup(Scope::Global, &KeyChord::parse("cmd+g").unwrap()),
+            Some(Action::GitDiff)
+        );
     }
 
     #[test]

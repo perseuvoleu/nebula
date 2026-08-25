@@ -3591,8 +3591,48 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
         width: inner.width.saturating_sub(1),
         ..inner
     };
+    // ⌘D split: the pane divides into two half-width terminals — the
+    // current attachment on the left, the fresh shell on the right, a
+    // one-column rule between them. Each pane keeps its own rect so the
+    // post-draw sync sizes each PTY independently.
+    let split_inner = if app.split_term.is_some() && inner.width >= 3 {
+        let lw = inner.width.saturating_sub(1) / 2;
+        let left = Rect { width: lw, ..inner };
+        let rule_x = inner.x + lw;
+        let right = Rect {
+            x: rule_x + 1,
+            width: inner.width - lw - 1,
+            ..inner
+        };
+        // The rule doubles as the focus cue: accent while the input lock
+        // feeds the right-hand shell.
+        let rule_style = if app.split_focused && app.term_locked {
+            Style::default().fg(th.accent)
+        } else {
+            Style::default().fg(th.edge)
+        };
+        for y in inner.y..inner.y + inner.height {
+            f.buffer_mut()[(rule_x, y)]
+                .set_symbol("│")
+                .set_style(rule_style);
+        }
+        Some((left, right))
+    } else {
+        None
+    };
+    let inner = split_inner.map(|(l, _)| l).unwrap_or(inner);
     app.term_area = inner;
     app.hits.push((inner, HitTarget::TerminalPane));
+    if let Some((_, right)) = split_inner {
+        app.split_term_area = right;
+        app.hits.push((right, HitTarget::SplitTerminalPane));
+        if let Some(split) = &app.split_term {
+            f.render_widget(
+                tui_term::widget::PseudoTerminal::new(split.parser.screen()),
+                right,
+            );
+        }
+    }
 
     let links = match &mut app.term {
         Some(term) => {

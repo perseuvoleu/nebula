@@ -56,6 +56,8 @@ pub enum HitTarget {
     /// Panel background (registered after rows, so rows win).
     PanelBg(Focus),
     TerminalPane,
+    /// The ⌘D split's right-hand pane; a click locks input onto its shell.
+    SplitTerminalPane,
     /// Draggable vertical boundary between panels, left to right:
     /// 0 = projects|worktrees, 1 = worktrees|terminal.
     Splitter(usize),
@@ -1486,6 +1488,9 @@ pub struct WorktreeRollback {
 pub enum PendingIntent {
     /// Attach the created session and focus the terminal.
     AttachCreated,
+    /// ⌘D: attach the created shell in the split's right pane and move the
+    /// input lock onto it (the left pane keeps the current attachment).
+    AttachCreatedSplit,
     /// Same, for an orchestrator — its row lives in the Worktrees panel,
     /// so the cursor lands there instead of the Sessions list.
     AttachCreatedOrchestrator,
@@ -1996,6 +2001,16 @@ pub struct App {
     pub sel_orchestrator: Option<usize>,
     pub sel_session: usize,
     pub term: Option<AttachedTerm>,
+    /// ⌘D split: a fresh shell rendered in the right half of the terminal
+    /// pane, alongside whatever `term` shows on the left. `None` = no split.
+    pub split_term: Option<AttachedTerm>,
+    /// Which split pane the input lock feeds: `true` = the ⌘D shell on the
+    /// right, `false` = the main attachment on the left. Meaningless while
+    /// `split_term` is `None`.
+    pub split_focused: bool,
+    /// Inner rect of the split's right pane from the last draw, so the
+    /// post-draw `sync_pty_size` keeps its PTY sized to it.
+    pub split_term_area: Rect,
     /// Input lock: keys forward to the attached PTY. Focusing the terminal
     /// pane alone (Tab / arrows) does NOT lock — Enter, a click, or `z` does.
     pub term_locked: bool,
@@ -2214,6 +2229,9 @@ impl App {
             sel_orchestrator: None,
             sel_session: 0,
             term: None,
+            split_term: None,
+            split_focused: false,
+            split_term_area: Rect::default(),
             term_locked: false,
             quick_term: false,
             quick_term_restore: None,
