@@ -2759,7 +2759,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     // Each orchestrator row also names the branch of the worktree it sits
     // on — they can live on any checkout now, so the branch is the row's
     // where.
-    let orchestrators: Vec<(String, AgentStatus, Option<String>)> = app
+    let orchestrators: Vec<(String, AgentStatus, Option<String>, &'static str)> = app
         .project_orchestrators()
         .iter()
         .map(|a| {
@@ -2771,6 +2771,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                     .iter()
                     .find(|w| w.id == a.worktree_id)
                     .map(|w| w.branch.clone()),
+                a.kind.as_str(),
             )
         })
         .collect();
@@ -2823,7 +2824,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         }
         screen_row += PILL_H as usize;
     }
-    for (i, (name, status, branch)) in orchestrators.iter().enumerate() {
+    for (i, (name, status, branch, kind)) in orchestrators.iter().enumerate() {
         if screen_row + PILL_H as usize > mid
             || row_rect(inner, screen_row + PILL_H as usize - 1).is_none()
         {
@@ -2837,10 +2838,25 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             .as_ref()
             .map(|b| format!(" {}", truncate(b, 24)))
             .unwrap_or_default();
+        // The CLI behind the orchestrator, trailing like the sessions
+        // panel's harness badge — same "name · where · harness" read. The
+        // badge always shows (the sessions-panel rule); on a narrow panel
+        // the BRANCH label is what drops, whole, so the name keeps its
+        // columns.
+        let kind_label = format!(" {kind}");
+        let mut branch_label = branch_label;
         // 3 = the selection rail + the status dot's two cells; without the
         // rail in the math the branch label loses its last character.
-        let max = (inner.width as usize)
-            .saturating_sub(3 + ORCH_BADGE.chars().count() + branch_label.chars().count());
+        let mut max = (inner.width as usize).saturating_sub(
+            3 + ORCH_BADGE.chars().count()
+                + branch_label.chars().count()
+                + kind_label.chars().count(),
+        );
+        if max < MIN_SESSION_NAME_W {
+            branch_label.clear();
+            max = (inner.width as usize)
+                .saturating_sub(3 + ORCH_BADGE.chars().count() + kind_label.chars().count());
+        }
         spans.extend(status_name_spans(
             truncate(name, max),
             Style::default(),
@@ -2851,6 +2867,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         if !branch_label.is_empty() {
             spans.push(Span::styled(branch_label, dim));
         }
+        spans.push(Span::styled(kind_label, dim));
         let selected = app.sel_orchestrator == Some(i)
             || (orchestrators_focused && app.sel_orchestrator.is_none() && i == 0);
         render_pill(

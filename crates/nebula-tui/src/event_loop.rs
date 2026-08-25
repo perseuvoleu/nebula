@@ -8625,10 +8625,11 @@ mod tests {
         let text = buffer_text(&terminal);
         assert!(text.contains("ORCHESTRATORS"), "{text}");
         assert!(text.contains("WORKTREES"), "{text}");
-        // The name may truncate at the panel's default width, but the ◆
-        // badge and the row's branch always survive.
-        assert!(text.contains("orchestra"), "{text}");
-        assert!(text.contains("◆ main"), "{text}");
+        // The name may truncate at the panel's default width; the ◆ and
+        // harness badges always survive, and the branch label drops whole
+        // when the panel is too narrow to hold all three.
+        assert!(text.contains("orchest"), "{text}");
+        assert!(text.contains("◆ claude"), "{text}");
     }
 
     #[test]
@@ -9442,10 +9443,19 @@ mod tests {
             },
         );
         assert_eq!(app.orchestrator_row_count(), 1, "off-root still listed");
+        // At the default (narrow) width the branch label drops whole so
+        // the name and the harness badge keep their columns.
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
-        assert!(text.contains("boss ◆ feature") || text.contains("◆ feature"), "{text}");
+        assert!(text.contains("boss ◆ claude"), "{text}");
+        // Wide enough, the row reads "name ◆ branch kind" — where it
+        // lives AND what CLI drives it.
+        app.panel_widths[1] = 40;
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("boss ◆ feature claude"), "{text}");
     }
 
     /// A menu taller than the frame slides its window to keep the hovered
