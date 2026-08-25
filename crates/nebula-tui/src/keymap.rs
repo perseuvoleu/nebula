@@ -76,6 +76,7 @@ pub enum Action {
     // sessions
     NewAgent,
     NewTerminal,
+    QuickTerminal,
     NewLink,
     Rename,
     CloseSession,
@@ -334,6 +335,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         group: "SESSIONS",
         scope: Scope::Global,
         defaults: &["t", "shift+t"],
+    },
+    ActionSpec {
+        action: Action::QuickTerminal,
+        id: "quick_terminal",
+        label: "Quick terminal",
+        hint: "Floating shell on the current branch's checkout; press again to close (⌘T in the ng Ghostty overlay)",
+        group: "SESSIONS",
+        scope: Scope::Global,
+        defaults: &["cmd+t", "ctrl+t"],
     },
     ActionSpec {
         action: Action::NewLink,

@@ -37,6 +37,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             draw_focus_tint(f.buffer_mut(), body, app.theme);
         }
         draw_footer(f, app, footer);
+        draw_quick_terminal(f, app);
         draw_overlay(f, app);
         draw_vim(f, app);
         return;
@@ -99,6 +100,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_focus_tint(f.buffer_mut(), tinted, app.theme);
     }
     draw_footer(f, app, footer);
+    // The ⌘T floating terminal sits above the panels but below overlays
+    // (a confirm or palette opened from inside it must stay visible) and
+    // below the editor modal.
+    draw_quick_terminal(f, app);
     draw_overlay(f, app);
     draw_vim(f, app);
 }
@@ -2775,10 +2780,12 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    // The main checkout renders as `branch ⌂ root` (dim badge — the branch
-    // is live, the badge marks root-ness) with a rule separating it from the
-    // true worktrees below, so rows after it sit one screen line lower.
-    const ROOT_BADGE: &str = " ⌂ root";
+    // The primary checkout (the original clone, whatever branch it has
+    // checked out) renders as `branch ⌂ primary` (dim badge — the branch
+    // is live, the badge marks the primary checkout) with a rule separating
+    // it from the true worktrees below, so rows after it sit one screen
+    // line lower.
+    const ROOT_BADGE: &str = " ⌂ primary";
     // Group headers only appear once something is pinned; otherwise the
     // list stays flat (same idiom as the sessions panel).
     let (pinned_count, _) = app.worktree_group_counts();
@@ -3433,6 +3440,29 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
         app.term_file_links = Vec::new();
         return;
     }
+    // While the ⌘T floating terminal is up, the pane behind it must not
+    // render the same screen at pane size (the PTY is sized to the window)
+    // nor claim `term_area`/hits — the window owns both.
+    if app.quick_term {
+        let inner = terminal_frame(f, area, Vec::new(), None, focused, th);
+        let msg = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "quick terminal open",
+                Style::default().fg(th.muted).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "⌘T or Ctrl+q closes it",
+                Style::default().fg(th.dim),
+            )),
+        ])
+        .centered();
+        f.render_widget(msg, inner);
+        app.term_links = Vec::new();
+        app.term_file_links = Vec::new();
+        return;
+    }
     // Name the attached session in the header so it's clear what you're
     // looking at (and typing into) even with the sidebars collapsed.
     let mut left = Vec::new();
@@ -3556,6 +3586,109 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
     }
     app.term_links = links;
     app.term_file_links = file_links;
+}
+
+/// The ⌘T quick terminal: a centered floating window (noticeably larger
+/// than the command palette) holding the attached shell. `term_area` is
+/// written back to its inner rect, so the post-draw `sync_pty_size` keeps
+/// the PTY sized to the window, and its hit rect goes in FIRST so clicks
+/// inside beat the panel rects underneath (`hit_at` is first-match).
+fn draw_quick_terminal(f: &mut Frame, app: &mut App) {
+    if !app.quick_term {
+        return;
+    }
+    let th = app.theme;
+    let area = centered_rect_pct(f.area(), 72, 72);
+    if area.width < 4 || area.height < 4 {
+        return;
+    }
+    f.render_widget(Clear, area);
+    // Title: the branch the shell runs on, so the window says where you are.
+    let branch = app.term.as_ref().and_then(|t| match &t.sref {
+        SessionRef::Terminal(id) => app
+            .tree
+            .terminals
+            .iter()
+            .find(|term| &term.id == id)
+            .and_then(|term| app.tree.worktrees.iter().find(|w| w.id == term.worktree_id))
+            .map(|w| w.branch.clone()),
+        SessionRef::Agent(_) => None,
+    });
+    let title = match branch {
+        Some(b) => format!(" terminal · {} ", truncate(&b, 40)),
+        None => " terminal ".to_string(),
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(th.accent))
+        .title(Span::styled(
+            title,
+            Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(Line::from(Span::styled(
+            " ⌘T / ^q: close ",
+            Style::default().fg(th.dim),
+        )));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    match &app.term {
+        Some(term) => {
+            let screen = term.parser.screen();
+            f.render_widget(tui_term::widget::PseudoTerminal::new(screen), inner);
+            // Selection highlight, same stream-selection fill the pane draws.
+            if let Some(sel) = app.term_selection.filter(|s| s.active) {
+                let ((start_col, start_row), (end_col, end_row)) = sel.bounds();
+                let reversed = Style::default().add_modifier(Modifier::REVERSED);
+                let last_col = inner.width.saturating_sub(1);
+                for row in start_row..=end_row {
+                    let (from, to) = if start_row == end_row {
+                        (start_col, end_col)
+                    } else if row == start_row {
+                        (start_col, last_col)
+                    } else if row == end_row {
+                        (0, end_col)
+                    } else {
+                        (0, last_col)
+                    };
+                    let width = to.saturating_sub(from) + 1;
+                    let line =
+                        Rect::new(inner.x + from, inner.y + row, width, 1).intersection(inner);
+                    f.buffer_mut().set_style(line, reversed);
+                }
+            }
+            let links = crate::links::visible_links(screen);
+            let file_links = crate::links::visible_file_links(screen);
+            let underline = Style::default().add_modifier(Modifier::UNDERLINED);
+            let segments = links
+                .iter()
+                .flat_map(|l| l.segments.iter())
+                .chain(file_links.iter().flat_map(|l| l.segments.iter()));
+            for &(row, c0, c1) in segments {
+                let seg =
+                    Rect::new(inner.x + c0, inner.y + row, c1 - c0 + 1, 1).intersection(inner);
+                f.buffer_mut().set_style(seg, underline);
+            }
+            app.term_links = links;
+            app.term_file_links = file_links;
+        }
+        None => {
+            // CreateTerminal still in flight.
+            let msg = Paragraph::new(Line::from(Span::styled(
+                "starting shell…",
+                Style::default().fg(th.dim),
+            )))
+            .centered();
+            let mid = Rect {
+                y: inner.y + inner.height / 2,
+                height: 1,
+                ..inner
+            };
+            f.render_widget(msg, mid);
+        }
+    }
+    app.term_area = inner;
+    app.hits.insert(0, (inner, HitTarget::TerminalPane));
 }
 
 fn attached_session_name(app: &App) -> Option<String> {

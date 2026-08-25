@@ -110,17 +110,9 @@ pub enum MenuAction {
     /// Shell terminal in the worktree's directory; created immediately with
     /// a default name (no prompt), renameable later.
     NewTerminal(WorktreeId),
-    /// Open the branch picker (the orchestrator flow's extra step): pick
-    /// which local branch the new session's checkout starts from. The
-    /// terminal row of the orchestrator picker reaches it directly; agent
-    /// rows reach it through `NewAgentOfKind` once model/effort resolve.
-    PickBranch {
-        project: ProjectId,
-        spawn: BranchSpawn,
-    },
     /// A branch-picker row: run the spawn on a checkout of this branch —
-    /// the worktree that already has it checked out (the root included),
-    /// or a fresh worktree checking out the existing branch.
+    /// the worktree that already has it checked out (the primary checkout
+    /// included), or a fresh worktree checking out the existing branch.
     SpawnOnBranch {
         project: ProjectId,
         branch: String,
@@ -183,20 +175,16 @@ pub enum PaletteCommand {
     Workspaces,
 }
 
-/// What the branch picker spawns once a branch is picked. Model/effort are
+/// The agent spawn carried through the orchestrator flow's branch picker;
+/// chains into the name prompt once a branch is picked. Model/effort are
 /// already resolved against the configured defaults by the time the picker
 /// opens — a branch row is past the submenus.
 #[derive(Debug, Clone, PartialEq)]
-pub enum BranchSpawn {
-    /// Shell terminal, created right away (no name prompt).
-    Terminal,
-    /// Agent session; chains into the name prompt as usual.
-    Agent {
-        kind: AgentKind,
-        model: Option<String>,
-        effort: Option<String>,
-        orchestrator: bool,
-    },
+pub struct BranchSpawn {
+    pub kind: AgentKind,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub orchestrator: bool,
 }
 
 /// Which submenu → (right arrow) opens from a menu row.
@@ -372,6 +360,15 @@ pub struct ConfirmDialog {
     pub action: PendingAction,
 }
 
+/// Where a new agent session will run: an existing checkout, or a picked
+/// branch that has no checkout yet — submit then creates the worktree
+/// first (checking out the existing branch) and spawns on its Ack.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SpawnTarget {
+    Worktree(WorktreeId),
+    Branch { project: ProjectId, branch: String },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum PromptKind {
     AddProject,
@@ -389,24 +386,15 @@ pub enum PromptKind {
         suggestion: String,
     },
     NewAgent {
-        worktree: WorktreeId,
+        /// Where the session will run — an existing checkout, or a picked
+        /// branch whose checkout submit creates first.
+        target: SpawnTarget,
         kind: AgentKind,
         /// Resolved launch options (picker choice or configured default);
         /// None = the CLI's own default.
         model: Option<String>,
         effort: Option<String>,
         /// Name prompt for a new orchestrator, not a plain session.
-        orchestrator: bool,
-    },
-    /// Name prompt for an agent whose picked branch has no checkout yet:
-    /// submit creates the worktree first (checking out the existing
-    /// branch), then spawns the agent there once the Ack lands.
-    NewAgentOnBranch {
-        project: ProjectId,
-        branch: String,
-        kind: AgentKind,
-        model: Option<String>,
-        effort: Option<String>,
         orchestrator: bool,
     },
     RenameAgent {
@@ -1421,6 +1409,15 @@ pub enum Overlay {
     Hosts(HostsView),
 }
 
+/// What the ⌘T quick terminal displaced, restored when it closes.
+#[derive(Debug, Clone)]
+pub struct QuickTermRestore {
+    /// Session that was attached in the terminal pane, if any.
+    pub attach: Option<SessionRef>,
+    pub focus: Focus,
+    pub locked: bool,
+}
+
 /// Rows optimistically removed for an in-flight DeleteWorktree, kept so an
 /// Error reply can put them back exactly where they were.
 #[derive(Debug, Clone)]
@@ -1461,19 +1458,16 @@ pub enum PendingIntent {
     None,
 }
 
-/// Session to create once a branch-picked worktree's Ack lands.
+/// Agent session to create once a branch-picked worktree's Ack lands.
 #[derive(Debug, Clone)]
-pub enum DeferredSpawn {
-    Terminal,
-    Agent {
-        kind: AgentKind,
-        model: Option<String>,
-        effort: Option<String>,
-        /// Typed name; empty takes the generated default (and opts into
-        /// auto-titling), same as the direct create path.
-        name: String,
-        orchestrator: bool,
-    },
+pub struct DeferredSpawn {
+    pub kind: AgentKind,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    /// Typed name; empty takes the generated default (and opts into
+    /// auto-titling), same as the direct create path.
+    pub name: String,
+    pub orchestrator: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1928,6 +1922,14 @@ pub struct App {
     /// Input lock: keys forward to the attached PTY. Focusing the terminal
     /// pane alone (Tab / arrows) does NOT lock — Enter, a click, or `z` does.
     pub term_locked: bool,
+    /// ⌘T: the attached terminal renders in a centered floating window
+    /// instead of the terminal pane (`term_area` follows the window, so the
+    /// PTY resizes to it).
+    pub quick_term: bool,
+    /// What ⌘T displaced, so closing the quick terminal puts the user back
+    /// exactly where they were: the previously attached session (if any),
+    /// the focused panel, and whether input was locked.
+    pub quick_term_restore: Option<QuickTermRestore>,
     pub conn: ConnState,
     pub hits: Vec<(Rect, HitTarget)>,
     /// Inner rect of the terminal pane from the last draw.
@@ -2135,6 +2137,8 @@ impl App {
             sessions_anchor: None,
             term: None,
             term_locked: false,
+            quick_term: false,
+            quick_term_restore: None,
             conn: ConnState::Disconnected,
             hits: Vec::new(),
             term_area: Rect::default(),
@@ -2561,6 +2565,35 @@ impl App {
         loop {
             let candidate = format!("{prefix}-{n}");
             if !taken.contains(&candidate) {
+                return candidate;
+            }
+            n += 1;
+        }
+    }
+
+    /// First free `orchestrator-N` across the whole project — the
+    /// ORCHESTRATORS section spans every worktree, so numbering per
+    /// worktree would mint duplicates.
+    pub fn default_orchestrator_name(&self, project: &ProjectId) -> String {
+        let taken: Vec<&str> = self
+            .tree
+            .agents
+            .iter()
+            .filter(|a| {
+                a.orchestrator
+                    && !a.archived
+                    && self
+                        .tree
+                        .worktrees
+                        .iter()
+                        .any(|w| w.id == a.worktree_id && &w.project_id == project)
+            })
+            .map(|a| a.name.as_str())
+            .collect();
+        let mut n = 1;
+        loop {
+            let candidate = format!("orchestrator-{n}");
+            if !taken.contains(&candidate.as_str()) {
                 return candidate;
             }
             n += 1;

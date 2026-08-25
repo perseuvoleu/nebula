@@ -652,22 +652,27 @@ pub struct NewAgentOpts {
 /// Session name when the caller passed no `--name`: derived from the
 /// delegated task's prompt so the row is findable by search (`/`, ⌘K)
 /// from the moment it appears — auto-title stays pending, so the worker
-/// may still refine it. Numbered fallback when there is no prompt or the
-/// prompt has no meaningful words.
-fn default_agent_name(prompt: Option<&str>, orchestrator: bool, existing: usize) -> String {
+/// may still refine it. Fallback: the first free `agent-N` /
+/// `orchestrator-N` not in `taken` — for orchestrators the caller passes
+/// the project-wide names, since their section spans every worktree.
+fn default_agent_name(prompt: Option<&str>, orchestrator: bool, taken: &[String]) -> String {
     if let Some(title) = prompt.and_then(crate::branch_name::title_from_prompt) {
         return title;
     }
-    let n = existing + 1;
-    if orchestrator {
-        format!("orchestrator-{n}")
-    } else {
-        format!("agent-{n}")
+    let prefix = if orchestrator { "orchestrator" } else { "agent" };
+    let mut n = 1;
+    loop {
+        let candidate = format!("{prefix}-{n}");
+        if !taken.contains(&candidate) {
+            return candidate;
+        }
+        n += 1;
     }
 }
 
-/// `nebula agent new`: spawn a session — for orchestrators on the root
-/// worktree by default, for workers wherever `--worktree` points.
+/// `nebula agent new`: spawn a session. Orchestrators default to the
+/// primary checkout but may live on any of the project's worktrees
+/// (`--worktree` overrides); workers must say where.
 pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
     let kind = nebula_core::AgentKind::parse(&opts.kind)
         .with_context(|| format!("unknown agent kind {:?} (claude|codex|cursor|pi)", opts.kind))?;
@@ -683,12 +688,13 @@ pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
         .filter(|w| w.project_id == project.id)
         .collect();
     let target = match opts.worktree.as_deref() {
-        // Match by branch, by directory name, or "root" for the main checkout.
+        // Match by branch, by directory name, or "root"/"primary" for the
+        // primary checkout ("root" is the historical spelling, kept).
         Some(sel) => of_project
             .iter()
             .find(|w| {
                 w.branch == sel
-                    || (sel == "root" && w.is_main)
+                    || ((sel == "root" || sel == "primary") && w.is_main)
                     || w.path.file_name().is_some_and(|n| n == sel)
             })
             .with_context(|| {
@@ -702,20 +708,35 @@ pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
                         .join(", ")
                 )
             })?,
-        // Orchestrators default to the root checkout; workers must say where.
+        // Orchestrators default to the primary checkout (any worktree
+        // works via --worktree); workers must say where.
         None if opts.orchestrator => of_project
             .iter()
             .find(|w| w.is_main)
-            .context("project has no root worktree")?,
-        None => bail!("pass --worktree <branch> (or --orchestrator for the root checkout)"),
+            .context("project has no primary checkout")?,
+        None => bail!("pass --worktree <branch> (or --orchestrator for the primary checkout)"),
     };
     let auto_title = opts.name.is_none();
     let name = opts.name.unwrap_or_else(|| {
-        default_agent_name(
-            opts.prompt.as_deref(),
-            opts.orchestrator,
-            agents.iter().filter(|a| a.worktree_id == target.id).count(),
-        )
+        // Orchestrators are one project-wide group, so their default
+        // numbers must be unique across every worktree, not just the
+        // target one.
+        let taken: Vec<String> = if opts.orchestrator {
+            agents
+                .iter()
+                .filter(|a| {
+                    a.orchestrator && of_project.iter().any(|w| w.id == a.worktree_id)
+                })
+                .map(|a| a.name.clone())
+                .collect()
+        } else {
+            agents
+                .iter()
+                .filter(|a| a.worktree_id == target.id)
+                .map(|a| a.name.clone())
+                .collect()
+        };
+        default_agent_name(opts.prompt.as_deref(), opts.orchestrator, &taken)
     });
     let req_id = 1u64;
     write_frame(
@@ -1415,19 +1436,34 @@ mod tests {
     #[test]
     fn unnamed_prompted_agents_are_named_after_the_task() {
         assert_eq!(
-            default_agent_name(Some("please fix the login redirect flow"), false, 3),
+            default_agent_name(
+                Some("please fix the login redirect flow"),
+                false,
+                &["agent-1".into(), "agent-2".into(), "agent-3".into()]
+            ),
             "Fix Login Redirect Flow"
         );
         assert_eq!(
-            default_agent_name(Some("coordinate the payments epic"), true, 0),
+            default_agent_name(Some("coordinate the payments epic"), true, &[]),
             "Coordinate Payments Epic"
         );
     }
 
+    /// Numbered fallbacks take the first FREE slot among the taken names —
+    /// a deleted orchestrator-2 is reused, an existing orchestrator-3 is
+    /// never duplicated (the taken list is project-wide for orchestrators).
     #[test]
     fn no_prompt_or_empty_prompt_falls_back_to_numbered_names() {
-        assert_eq!(default_agent_name(None, false, 1), "agent-2");
-        assert_eq!(default_agent_name(None, true, 0), "orchestrator-1");
-        assert_eq!(default_agent_name(Some("the…"), false, 0), "agent-1");
+        assert_eq!(default_agent_name(None, false, &["agent-1".into()]), "agent-2");
+        assert_eq!(default_agent_name(None, true, &[]), "orchestrator-1");
+        assert_eq!(default_agent_name(Some("the…"), false, &[]), "agent-1");
+        assert_eq!(
+            default_agent_name(
+                None,
+                true,
+                &["orchestrator-1".into(), "orchestrator-3".into()]
+            ),
+            "orchestrator-2"
+        );
     }
 }

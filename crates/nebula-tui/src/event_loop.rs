@@ -101,6 +101,11 @@ const SPLASH_FRAME: Duration = crate::splash::FRAME;
 /// needs-feedback rows.
 const SWEEP_FRAME: Duration = crate::app::SWEEP_FRAME;
 
+/// How long a disconnected TUI waits between reconnect attempts. Each
+/// attempt itself may poll up to ~3s while a respawned daemon boots
+/// (`connect_or_spawn`), so the effective cadence is retry + boot-poll.
+const RECONNECT_RETRY: Duration = Duration::from_secs(2);
+
 /// `Some(entry)` = quit via the hosts picker: the caller should exec
 /// `nebula ssh` at it now that the terminal is restored.
 pub async fn run_app(
@@ -212,6 +217,10 @@ async fn main_loop(
     // spawns (VimEvent generations keep them apart).
     let (vim_tx, mut vim_rx) = tokio::sync::mpsc::unbounded_channel::<VimEvent>();
     app.vim_tx = Some(vim_tx);
+    // Armed whenever `app.conn` drops to Disconnected; the loop then
+    // re-dials (respawning the daemon if it's gone) instead of sitting on
+    // a dead footer until the user restarts the TUI.
+    let mut next_reconnect = tokio::time::Instant::now();
 
     loop {
         if app.dirty && tokio::time::Instant::now() >= next_draw {
@@ -327,6 +336,37 @@ async fn main_loop(
             {
                 fire_keepwarm(&mut app, &mut out);
             }
+            // The connection dropped (daemon killed, restarted, crashed):
+            // keep re-dialing until a daemon answers — connect_or_spawn
+            // also boots one when nothing is listening — then re-subscribe
+            // and re-attach what was on screen. The fresh Attach carries
+            // the CURRENT pane size (the daemon jiggles → full repaint),
+            // which also heals a resize done while disconnected.
+            _ = tokio::time::sleep_until(next_reconnect),
+                if app.conn == ConnState::Disconnected =>
+            {
+                next_reconnect = tokio::time::Instant::now() + RECONNECT_RETRY;
+                match ipc::connect_or_spawn().await {
+                    Ok(conn) => {
+                        *channels = ipc::split_connection(conn);
+                        if channels.tx.send(ClientRequest::Subscribe).await.is_ok() {
+                            app.conn = ConnState::Connected;
+                            app.flash = Some("reconnected to daemon".into());
+                            if let Some(sref) = app.term.take().map(|t| t.sref) {
+                                attach(&mut app, sref, &mut out);
+                            }
+                            app.dirty = true;
+                        }
+                    }
+                    // Surfaced because the message can require the user
+                    // (protocol skew says "run `nebula kill`"); a plain
+                    // boot failure just retries on the next tick.
+                    Err(e) => {
+                        app.flash = Some(format!("reconnect failed: {e}"));
+                        app.dirty = true;
+                    }
+                }
+            }
             ev = input.next() => match ev {
                 Some(Ok(event)) => {
                     tracing::debug!(?event, "terminal event");
@@ -334,14 +374,17 @@ async fn main_loop(
                 }
                 Some(Err(_)) | None => app.should_quit = true,
             },
-            ev = channels.rx.recv() => match ev {
+            // Guarded on Connected: a closed channel yields None instantly,
+            // and an unguarded arm would spin the loop hot while down.
+            ev = channels.rx.recv(), if app.conn == ConnState::Connected => match ev {
                 Some(server_event) => {
                     log_server_event(&server_event);
                     handle_server_event(&mut app, server_event, &mut out);
                 }
                 None => {
                     app.conn = ConnState::Disconnected;
-                    app.flash = Some("daemon connection lost".into());
+                    app.flash = Some("daemon connection lost — reconnecting…".into());
+                    next_reconnect = tokio::time::Instant::now() + Duration::from_millis(500);
                     app.dirty = true;
                 }
             },
@@ -387,7 +430,11 @@ async fn main_loop(
 
         for req in out.drain(..) {
             if channels.tx.send(req).await.is_err() {
-                app.conn = ConnState::Disconnected;
+                if app.conn == ConnState::Connected {
+                    app.conn = ConnState::Disconnected;
+                    next_reconnect =
+                        tokio::time::Instant::now() + Duration::from_millis(500);
+                }
                 app.dirty = true;
             }
         }
@@ -755,6 +802,12 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             || app.keymap.lookup(crate::keymap::Scope::Terminal, &chord)
                 == Some(crate::keymap::Action::UnlockTerminal);
         if is_hatch {
+            // Inside the ⌘T floating terminal the hatch closes the window
+            // (restoring what it displaced) instead of unlocking in place.
+            if app.quick_term {
+                close_quick_terminal(app, out);
+                return;
+            }
             // Escape hatch: also expands collapsed sidebars.
             app.collapsed = false;
             app.term_locked = false;
@@ -766,7 +819,28 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         // their Cmd-modified chords qualify; anything a child app could
         // plausibly want (plain N, plain E, ^n, …) keeps forwarding.
         if chord.mods.contains(crossterm::event::KeyModifiers::SUPER) {
+            // A quick terminal is a floating window, not a place to live:
+            // any of these global chords first closes it (restoring what it
+            // displaced) and then acts, except ⌘T itself which IS the close.
+            if app.quick_term
+                && matches!(
+                    app.keymap.lookup(crate::keymap::Scope::Global, &chord),
+                    Some(
+                        crate::keymap::Action::ToggleTerminalFullscreen
+                            | crate::keymap::Action::NewAgent
+                            | crate::keymap::Action::Notes
+                            | crate::keymap::Action::GitDiff
+                            | crate::keymap::Action::CommandPalette
+                    )
+                )
+            {
+                close_quick_terminal(app, out);
+            }
             match app.keymap.lookup(crate::keymap::Scope::Global, &chord) {
+                Some(crate::keymap::Action::QuickTerminal) => {
+                    toggle_quick_terminal(app, out);
+                    return;
+                }
                 Some(crate::keymap::Action::ToggleTerminalFullscreen) => {
                     toggle_terminal_fullscreen(app);
                     return;
@@ -1186,6 +1260,10 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         // New shell terminal, spawned in the worktree's directory.
         // (Cmd+T never reaches a TUI — the emulator opens its own tab.)
         Action::NewTerminal => create_terminal_for_context(app, out),
+        // Floating shell on the current branch, no picker. Like the command
+        // palette, no terminal-focus guard: an unlocked pane forwards
+        // nothing, and the locked path has its own SUPER intercept.
+        Action::QuickTerminal => toggle_quick_terminal(app, out),
         Action::NewLink => open_new_link_prompt(app),
         Action::ToggleTerminalFullscreen => toggle_terminal_fullscreen(app),
         // Terminal-scope only; never resolved here.
@@ -1269,48 +1347,62 @@ fn open_prompt(app: &mut App, kind: PromptKind) {
             format!("branch name (empty = {suggestion})"),
             String::new(),
         ),
-        PromptKind::NewAgent { model, effort, .. } => {
-            // Surface the resolved launch options so Enter-with-defaults is
-            // visibly what it is; plain "New agent" means CLI defaults.
-            let opts: Vec<&str> = model
-                .as_deref()
-                .into_iter()
-                .chain(effort.as_deref())
-                .collect();
-            let title = if opts.is_empty() {
-                "New agent".to_string()
-            } else {
-                format!("New agent ({})", opts.join(" · "))
-            };
-            (
-                title,
-                format!("name (empty = {})", app.default_session_name("agent")),
-                String::new(),
-            )
-        }
-        PromptKind::NewAgentOnBranch {
-            branch,
+        PromptKind::NewAgent {
+            target,
             model,
             effort,
+            orchestrator,
             ..
         } => {
-            // Same shape as NewAgent's title, with the picked branch in it
-            // so the pending worktree creation is visible.
+            // Surface the role, the resolved launch options, and — in the
+            // orchestrator flow — the picked branch, so Enter-with-defaults
+            // is visibly what it is; plain "New agent" means CLI defaults.
+            let mut title = if *orchestrator {
+                "New orchestrator".to_string()
+            } else {
+                "New agent".to_string()
+            };
+            if let crate::app::SpawnTarget::Branch { branch, .. } = target {
+                title.push_str(&format!(" on {branch}"));
+            }
             let opts: Vec<&str> = model
                 .as_deref()
                 .into_iter()
                 .chain(effort.as_deref())
                 .collect();
-            let title = if opts.is_empty() {
-                format!("New agent on {branch}")
+            if !opts.is_empty() {
+                title.push_str(&format!(" ({})", opts.join(" · ")));
+            }
+            let label = if *orchestrator {
+                // Orchestrator defaults number across the whole project —
+                // the section spans every worktree.
+                let project = match target {
+                    crate::app::SpawnTarget::Branch { project, .. } => Some(project.clone()),
+                    crate::app::SpawnTarget::Worktree(id) => app
+                        .tree
+                        .worktrees
+                        .iter()
+                        .find(|w| &w.id == id)
+                        .map(|w| w.project_id.clone()),
+                };
+                match project {
+                    Some(p) => format!(
+                        "orchestrator name (empty = {})",
+                        app.default_orchestrator_name(&p)
+                    ),
+                    None => "orchestrator name (empty = generated)".to_string(),
+                }
             } else {
-                format!("New agent on {branch} ({})", opts.join(" · "))
+                match target {
+                    crate::app::SpawnTarget::Worktree(_) => {
+                        format!("name (empty = {})", app.default_session_name("agent"))
+                    }
+                    crate::app::SpawnTarget::Branch { .. } => {
+                        "name (empty = generated)".to_string()
+                    }
+                }
             };
-            (
-                title,
-                "name (empty = generated)".to_string(),
-                String::new(),
-            )
+            (title, label, String::new())
         }
         PromptKind::RenameAgent { id } => {
             let current = app
@@ -1930,6 +2022,130 @@ fn create_terminal_for_context(app: &mut App, out: &mut Vec<ClientRequest>) {
     });
 }
 
+/// Name of the per-worktree shell the ⌘T floating window attaches: one
+/// dedicated tab per checkout, reused on every open so the shell keeps its
+/// history, created automatically on first use.
+const QUICK_TERMINAL_NAME: &str = "quick";
+
+/// ⌘T: toggle the floating quick terminal — a shell on the current branch's
+/// checkout, opened without any picker. "Current" is the attached session's
+/// worktree when input is locked there, otherwise the selection (Projects
+/// focus → the project's main checkout, the same rule `t` uses).
+fn toggle_quick_terminal(app: &mut App, out: &mut Vec<ClientRequest>) {
+    if app.quick_term {
+        close_quick_terminal(app, out);
+        return;
+    }
+    let Some(worktree) = quick_terminal_worktree(app) else {
+        app.flash = Some("select a project or worktree first".into());
+        return;
+    };
+    app.quick_term_restore = Some(crate::app::QuickTermRestore {
+        attach: app.term.as_ref().map(|t| t.sref.clone()),
+        focus: app.focus,
+        locked: app.term_locked,
+    });
+    app.quick_term = true;
+    let existing = app
+        .tree
+        .terminals
+        .iter()
+        .find(|t| t.worktree_id == worktree && t.name == QUICK_TERMINAL_NAME)
+        .map(|t| t.id.clone());
+    match existing {
+        // The daemon lazily respawns a dead shell on Attach, so reuse
+        // needs no aliveness check.
+        Some(id) => {
+            attach(app, SessionRef::Terminal(id), out);
+            app.focus = Focus::Terminal;
+            app.term_locked = true;
+        }
+        None => {
+            let req_id = app.alloc_req_id(PendingIntent::AttachCreated);
+            out.push(ClientRequest::CreateTerminal {
+                req_id,
+                worktree,
+                name: Some(QUICK_TERMINAL_NAME.into()),
+            });
+        }
+    }
+}
+
+/// The checkout the quick terminal should open on.
+fn quick_terminal_worktree(app: &App) -> Option<nebula_core::WorktreeId> {
+    if app.term_locked {
+        if let Some(t) = &app.term {
+            let wid = match &t.sref {
+                SessionRef::Agent(id) => app
+                    .tree
+                    .agents
+                    .iter()
+                    .find(|a| &a.id == id)
+                    .map(|a| a.worktree_id.clone()),
+                SessionRef::Terminal(id) => app
+                    .tree
+                    .terminals
+                    .iter()
+                    .find(|t| &t.id == id)
+                    .map(|t| t.worktree_id.clone()),
+            };
+            if wid.is_some() {
+                return wid;
+            }
+        }
+    }
+    match app.focus {
+        Focus::Projects => app.selected_project().and_then(|p| {
+            app.tree
+                .worktrees
+                .iter()
+                .find(|w| w.project_id == p.id && w.is_main)
+                .map(|w| w.id.clone())
+        }),
+        _ => app.selected_worktree().map(|w| w.id.clone()),
+    }
+}
+
+/// Close the ⌘T window and put back what it displaced. The quick shell
+/// keeps running in the daemon — the next ⌘T lands in the same session.
+fn close_quick_terminal(app: &mut App, out: &mut Vec<ClientRequest>) {
+    app.quick_term = false;
+    let restore = app.quick_term_restore.take();
+    let prev = restore
+        .as_ref()
+        .and_then(|r| r.attach.clone())
+        .filter(|sref| session_exists(app, sref));
+    match (prev, restore) {
+        (Some(sref), Some(r)) => {
+            attach(app, sref, out);
+            app.focus = r.focus;
+            app.term_locked = r.locked;
+        }
+        (_, restore) => {
+            if let Some(term) = &app.term {
+                out.push(ClientRequest::Detach {
+                    session: term.sref.clone(),
+                });
+            }
+            app.term = None;
+            app.term_locked = false;
+            app.focus = match restore {
+                Some(r) if r.focus != Focus::Terminal => r.focus,
+                _ => Focus::Sessions,
+            };
+        }
+    }
+}
+
+/// Whether a session row still exists (and, for agents, is unarchived) —
+/// guards re-attaching what ⌘T displaced after it may have been closed.
+fn session_exists(app: &App, sref: &SessionRef) -> bool {
+    match sref {
+        SessionRef::Agent(id) => app.tree.agents.iter().any(|a| &a.id == id && !a.archived),
+        SessionRef::Terminal(id) => app.tree.terminals.iter().any(|t| &t.id == id),
+    }
+}
+
 /// `L`: attach a URL to the worktree in context — the selected one, or the
 /// selected project's main checkout when the Projects panel has focus (the
 /// same rule `t` uses for terminals).
@@ -2483,7 +2699,7 @@ fn open_worktree_picker_for_agent(app: &mut App, project: nebula_core::ProjectId
         .filter(|w| w.project_id == project)
         .map(|w| MenuItem {
             label: if w.is_main {
-                format!("{} ⌂ root", w.branch)
+                format!("{} ⌂ primary", w.branch)
             } else {
                 w.branch.clone()
             },
@@ -2514,9 +2730,13 @@ fn open_new_agent_picker(app: &mut App, worktree: WorktreeId) {
 }
 
 /// The orchestrator flavor of the same picker: kind → model/effort →
-/// branch → name, identical to sessions plus the branch-picker step (the
-/// terminal row skips the name, same as sessions).
+/// branch → name. Deliberately different from the session flow — an
+/// orchestrator is an agent with a project-wide role, so the flow adds a
+/// branch step (any local branch, the primary checkout included) and has
+/// no shell-terminal row: a terminal is `t`/⇧T/⌘T's job, not a role.
 fn open_new_orchestrator_picker(app: &mut App, project: nebula_core::ProjectId) {
+    // The primary checkout only anchors the picker rows until the branch
+    // step decides the real checkout.
     let root = app
         .tree
         .worktrees
@@ -2525,7 +2745,7 @@ fn open_new_orchestrator_picker(app: &mut App, project: nebula_core::ProjectId) 
         .map(|w| w.id.clone());
     match root {
         Some(worktree) => open_agent_picker(app, worktree, true),
-        None => app.flash = Some("project has no root checkout".into()),
+        None => app.flash = Some("project has no primary checkout".into()),
     }
 }
 
@@ -2547,27 +2767,9 @@ fn open_agent_picker(app: &mut App, worktree: WorktreeId, orchestrator: bool) {
         kind_row("Cursor", AgentKind::Cursor),
         kind_row("Pi", AgentKind::Pi),
     ];
-    if orchestrator {
-        // The orchestrator flavor offers a shell too — but its checkout is
-        // the branch picker's to decide, so the row detours through it
-        // instead of creating on the carried (root) worktree.
-        if let Some(project) = app
-            .tree
-            .worktrees
-            .iter()
-            .find(|w| w.id == worktree)
-            .map(|w| w.project_id.clone())
-        {
-            items.push(MenuItem {
-                label: "Terminal (shell)".into(),
-                action: MenuAction::PickBranch {
-                    project,
-                    spawn: crate::app::BranchSpawn::Terminal,
-                },
-                destructive: false,
-            });
-        }
-    } else {
+    // A shell terminal is not an orchestrator — the role picker offers
+    // only agents. Shells stay in the session picker (and on t/⇧T/⌘T).
+    if !orchestrator {
         items.push(MenuItem {
             label: "Terminal (shell)".into(),
             action: MenuAction::NewTerminal(worktree),
@@ -2590,8 +2792,9 @@ fn open_agent_picker(app: &mut App, worktree: WorktreeId, orchestrator: bool) {
 }
 
 /// The orchestrator flow's branch picker: every local branch of the
-/// project's repo, newest commit first, the first row hovered. The root
-/// checkout's branch carries a dim `⌂ root` hint but keeps its
+/// project's repo (develop, main, feature branches — an orchestrator may
+/// run on any of them), newest commit first, the first row hovered. The
+/// primary checkout's branch carries a dim `⌂ primary` hint but keeps its
 /// newest-first slot. Falls back to the branches nebula already knows from
 /// the project's worktrees when git can't list (deleted repo, missing git).
 fn open_branch_picker(app: &mut App, project: nebula_core::ProjectId, spawn: crate::app::BranchSpawn) {
@@ -2628,7 +2831,7 @@ fn open_branch_picker(app: &mut App, project: nebula_core::ProjectId, spawn: cra
         .into_iter()
         .map(|branch| MenuItem {
             label: if Some(&branch) == root_branch.as_ref() {
-                format!("{branch} ⌂ root")
+                format!("{branch} ⌂ primary")
             } else {
                 branch.clone()
             },
@@ -2642,7 +2845,7 @@ fn open_branch_picker(app: &mut App, project: nebula_core::ProjectId, spawn: cra
         .collect();
     app.overlay = Some(Overlay::Menu(
         ContextMenu {
-            title: Some("From branch".into()),
+            title: Some("Orchestrator branch".into()),
             items,
             at: None,
             hover: 0,
@@ -2713,7 +2916,7 @@ fn open_base_branch_picker(
         .into_iter()
         .map(|b| MenuItem {
             label: if Some(&b) == root_branch.as_ref() {
-                format!("{b} ⌂ root")
+                format!("{b} ⌂ primary")
             } else {
                 b.clone()
             },
@@ -2851,7 +3054,7 @@ fn open_move_agent_picker(app: &mut App, agent: AgentId) {
         .filter(|w| Some(&w.id) != current.as_ref())
         .map(|w| MenuItem {
             label: if w.is_main {
-                format!("{} ⌂ root", w.branch)
+                format!("{} ⌂ primary", w.branch)
             } else {
                 w.branch.clone()
             },
@@ -3232,8 +3435,10 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 // on kind-pick); put the standing default spec back. Same
                 // spec = daemon-side no-op.
                 let restore = match &prompt.kind {
+                    // Only a worktree target had a prewarm fired — a
+                    // not-yet-created branch checkout has nothing to warm.
                     PromptKind::NewAgent {
-                        worktree,
+                        target: crate::app::SpawnTarget::Worktree(worktree),
                         kind: AgentKind::Claude,
                         ..
                     } => Some(worktree.clone()),
@@ -4222,9 +4427,7 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
     if value.is_empty()
         && !matches!(
             prompt.kind,
-            PromptKind::NewAgent { .. }
-                | PromptKind::NewAgentOnBranch { .. }
-                | PromptKind::NewWorktree { .. }
+            PromptKind::NewAgent { .. } | PromptKind::NewWorktree { .. }
         )
     {
         app.flash = Some("cancelled: empty input".into());
@@ -4288,48 +4491,45 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
             open_base_branch_picker(app, project, branch, base, out);
         }
         PromptKind::NewAgent {
-            worktree,
+            target,
             kind,
             model,
             effort,
             orchestrator,
-        } => create_agent(app, worktree, kind, model, effort, value, orchestrator, out),
-        PromptKind::NewAgentOnBranch {
-            project,
-            branch,
-            kind,
-            model,
-            effort,
-            orchestrator,
-        } => {
-            // The branch may have gained a checkout while the user typed
-            // (another client, an agent's `nebula worktree new`) — use it.
-            if let Some(worktree) = app
-                .tree
-                .worktrees
-                .iter()
-                .find(|w| w.project_id == project && w.branch == branch)
-                .map(|w| w.id.clone())
-            {
-                create_agent(app, worktree, kind, model, effort, value, orchestrator, out);
-                return;
+        } => match target {
+            crate::app::SpawnTarget::Worktree(worktree) => {
+                create_agent(app, worktree, kind, model, effort, value, orchestrator, out)
             }
-            let req_id = app.alloc_req_id(PendingIntent::SpawnOnCreatedWorktree(
-                crate::app::DeferredSpawn::Agent {
-                    kind,
-                    model,
-                    effort,
-                    name: value,
-                    orchestrator,
-                },
-            ));
-            out.push(ClientRequest::CreateWorktree {
-                req_id,
-                project,
-                branch,
-                base: None,
-            });
-        }
+            crate::app::SpawnTarget::Branch { project, branch } => {
+                // The branch may have gained a checkout while the user typed
+                // (another client, an agent's `nebula worktree new`) — use it.
+                if let Some(worktree) = app
+                    .tree
+                    .worktrees
+                    .iter()
+                    .find(|w| w.project_id == project && w.branch == branch)
+                    .map(|w| w.id.clone())
+                {
+                    create_agent(app, worktree, kind, model, effort, value, orchestrator, out);
+                    return;
+                }
+                let req_id = app.alloc_req_id(PendingIntent::SpawnOnCreatedWorktree(
+                    crate::app::DeferredSpawn {
+                        kind,
+                        model,
+                        effort,
+                        name: value,
+                        orchestrator,
+                    },
+                ));
+                out.push(ClientRequest::CreateWorktree {
+                    req_id,
+                    project,
+                    branch,
+                    base: None,
+                });
+            }
+        },
         PromptKind::RenameAgent { id } => {
             let req_id = app.alloc_req_id(PendingIntent::None);
             out.push(ClientRequest::RenameAgent {
@@ -4553,9 +4753,9 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             let model = resolve(model, cfg.default_model(kind));
             let effort = resolve(effort, cfg.default_effort(kind));
             // The orchestrator flow inserts its branch-picker step here —
-            // which checkout the session runs on is a pick, not the carried
-            // (root) worktree. Prewarm waits until the branch resolves to a
-            // worktree that actually exists.
+            // which checkout the session runs on is a pick (any local
+            // branch), not the carried (primary) worktree. Prewarm waits
+            // until the branch resolves to a worktree that actually exists.
             if orchestrator {
                 if let Some(project) = app
                     .tree
@@ -4567,7 +4767,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                     open_branch_picker(
                         app,
                         project,
-                        crate::app::BranchSpawn::Agent {
+                        crate::app::BranchSpawn {
                             kind,
                             model,
                             effort,
@@ -4597,7 +4797,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             open_prompt(
                 app,
                 PromptKind::NewAgent {
-                    worktree,
+                    target: crate::app::SpawnTarget::Worktree(worktree),
                     kind,
                     model,
                     effort,
@@ -4605,7 +4805,6 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                 },
             )
         }
-        MenuAction::PickBranch { project, spawn } => open_branch_picker(app, project, spawn),
         MenuAction::SpawnOnBranch {
             project,
             branch,
@@ -4742,6 +4941,12 @@ fn detach_if_attached(app: &mut App, sref: &SessionRef, out: &mut Vec<ClientRequ
             });
             app.term = None;
             app.term_locked = false;
+            // The ⌘T window loses its session (closed, worktree deleted):
+            // drop the window rather than float an empty box.
+            if app.quick_term {
+                app.quick_term = false;
+                app.quick_term_restore = None;
+            }
             if app.focus == Focus::Terminal {
                 app.focus = Focus::Sessions;
             }
@@ -5596,11 +5801,11 @@ fn fire_pending_preview(app: &mut App) {
     app.dirty = true;
 }
 
-/// A branch-picker row was chosen: run the spawn on a checkout of that
-/// branch. A worktree (the root included) that already has the branch
-/// checked out is used as-is; otherwise the daemon creates a worktree
-/// checking out the EXISTING branch — CreateWorktree's `-b` fails on an
-/// existing name and git.rs falls back to a plain checkout — and the
+/// A branch-picker row was chosen: spawn the agent on a checkout of that
+/// branch. A worktree (the primary checkout included) that already has the
+/// branch checked out is used as-is; otherwise the daemon creates a
+/// worktree checking out the EXISTING branch — CreateWorktree's `-b` fails
+/// on an existing name and git.rs falls back to a plain checkout — and the
 /// session spawn waits on its Ack (`PendingIntent::SpawnOnCreatedWorktree`).
 fn spawn_on_branch(
     app: &mut App,
@@ -5609,31 +5814,20 @@ fn spawn_on_branch(
     spawn: crate::app::BranchSpawn,
     out: &mut Vec<ClientRequest>,
 ) {
-    use crate::app::{BranchSpawn, DeferredSpawn};
+    let crate::app::BranchSpawn {
+        kind,
+        model,
+        effort,
+        orchestrator,
+    } = spawn;
     let existing = app
         .tree
         .worktrees
         .iter()
         .find(|w| w.project_id == project && w.branch == branch)
         .map(|w| w.id.clone());
-    match (spawn, existing) {
-        (BranchSpawn::Terminal, Some(worktree)) => {
-            let req_id = app.alloc_req_id(PendingIntent::AttachCreated);
-            out.push(ClientRequest::CreateTerminal {
-                req_id,
-                worktree,
-                name: None,
-            });
-        }
-        (
-            BranchSpawn::Agent {
-                kind,
-                model,
-                effort,
-                orchestrator,
-            },
-            Some(worktree),
-        ) => {
+    match existing {
+        Some(worktree) => {
             // From here the flow is the session picker's: warm the CLI
             // while the user types the name — or skip the prompt entirely.
             if crate::config::Config::load().skip_session_naming {
@@ -5649,7 +5843,7 @@ fn spawn_on_branch(
             open_prompt(
                 app,
                 PromptKind::NewAgent {
-                    worktree,
+                    target: crate::app::SpawnTarget::Worktree(worktree),
                     kind,
                     model,
                     effort,
@@ -5657,30 +5851,11 @@ fn spawn_on_branch(
                 },
             );
         }
-        (BranchSpawn::Terminal, None) => {
-            let req_id = app.alloc_req_id(PendingIntent::SpawnOnCreatedWorktree(
-                DeferredSpawn::Terminal,
-            ));
-            out.push(ClientRequest::CreateWorktree {
-                req_id,
-                project,
-                branch,
-                base: None,
-            });
-        }
-        (
-            BranchSpawn::Agent {
-                kind,
-                model,
-                effort,
-                orchestrator,
-            },
-            None,
-        ) => {
+        None => {
             // No checkout to warm a CLI in yet, so no prewarm here.
             if crate::config::Config::load().skip_session_naming {
                 let req_id = app.alloc_req_id(PendingIntent::SpawnOnCreatedWorktree(
-                    DeferredSpawn::Agent {
+                    crate::app::DeferredSpawn {
                         kind,
                         model,
                         effort,
@@ -5698,9 +5873,8 @@ fn spawn_on_branch(
             }
             open_prompt(
                 app,
-                PromptKind::NewAgentOnBranch {
-                    project,
-                    branch,
+                PromptKind::NewAgent {
+                    target: crate::app::SpawnTarget::Branch { project, branch },
                     kind,
                     model,
                     effort,
@@ -5733,29 +5907,19 @@ fn create_agent(
         name
     } else if orchestrator {
         // Orchestrators number within their own section (they are hidden
-        // from the sessions list `default_session_name` scans) — across the
-        // whole project, since the section now spans every worktree.
-        let project = app
+        // from the sessions list `default_session_name` scans) — first
+        // free `orchestrator-N` across the whole project, since the
+        // section spans every worktree.
+        match app
             .tree
             .worktrees
             .iter()
             .find(|w| w.id == worktree)
-            .map(|w| w.project_id.clone());
-        let n = app
-            .tree
-            .agents
-            .iter()
-            .filter(|a| {
-                a.orchestrator
-                    && !a.archived
-                    && (a.worktree_id == worktree
-                        || app.tree.worktrees.iter().any(|w| {
-                            w.id == a.worktree_id && Some(&w.project_id) == project.as_ref()
-                        }))
-            })
-            .count()
-            + 1;
-        format!("orchestrator-{n}")
+            .map(|w| w.project_id.clone())
+        {
+            Some(project) => app.default_orchestrator_name(&project),
+            None => "orchestrator-1".to_string(),
+        }
     } else {
         app.default_session_name("agent")
     };
@@ -6032,6 +6196,31 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
     // story is vim's, not ours.
     if app.vim.is_some() {
         return;
+    }
+    // The ⌘T floating terminal owns the mouse when no overlay sits above
+    // it: inside the window the normal terminal handling applies (its hit
+    // rect is registered first), a click outside closes the window, and
+    // wheel/hover outside is swallowed. Drag and Up pass through so a
+    // selection that leaves the window still finishes.
+    if app.quick_term && app.overlay.is_none() {
+        let a = app.term_area;
+        let inside = mouse.column >= a.x
+            && mouse.column < a.x + a.width
+            && mouse.row >= a.y
+            && mouse.row < a.y + a.height;
+        if !inside {
+            match mouse.kind {
+                MouseEventKind::Down(_) => {
+                    close_quick_terminal(app, out);
+                    app.dirty = true;
+                    return;
+                }
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown | MouseEventKind::Moved => {
+                    return;
+                }
+                _ => {}
+            }
+        }
     }
     // An open context menu owns the mouse: click inside activates, outside
     // closes (and swallows the click).
@@ -7326,23 +7515,14 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                     if !select_worktree_by_id(app, &id, out) {
                         app.select_worktree_when_seen = Some(id.clone());
                     }
-                    match spec {
-                        crate::app::DeferredSpawn::Terminal => {
-                            let req_id = app.alloc_req_id(PendingIntent::AttachCreated);
-                            out.push(ClientRequest::CreateTerminal {
-                                req_id,
-                                worktree: id,
-                                name: None,
-                            });
-                        }
-                        crate::app::DeferredSpawn::Agent {
-                            kind,
-                            model,
-                            effort,
-                            name,
-                            orchestrator,
-                        } => create_agent(app, id, kind, model, effort, name, orchestrator, out),
-                    }
+                    let crate::app::DeferredSpawn {
+                        kind,
+                        model,
+                        effort,
+                        name,
+                        orchestrator,
+                    } = spec;
+                    create_agent(app, id, kind, model, effort, name, orchestrator, out);
                 }
                 (Some(PendingIntent::SelectCreatedWorktree), Some(EntityId::Worktree(id))) => {
                     // Its upsert usually lands just before this Ack; if not,
@@ -8640,24 +8820,13 @@ mod tests {
             "click on the + row opens the orchestrator picker: {:?}",
             app.overlay
         );
-        // The orchestrator picker offers a shell too — its row detours
-        // through the branch picker instead of creating on the root.
+        // An orchestrator is an agent role — the picker offers no shell
+        // terminal row (shells stay in the session picker and on t/⇧T/⌘T).
         if let Some(Overlay::Menu(m)) = &app.overlay {
-            let terminal = m
-                .items
-                .iter()
-                .find(|i| i.label.contains("Terminal"))
-                .expect("terminal row present");
             assert!(
-                matches!(
-                    &terminal.action,
-                    crate::app::MenuAction::PickBranch {
-                        spawn: crate::app::BranchSpawn::Terminal,
-                        ..
-                    }
-                ),
-                "{:?}",
-                terminal.action
+                !m.items.iter().any(|i| i.label.contains("Terminal")),
+                "no terminal row in the orchestrator picker: {:?}",
+                m.items
             );
         }
     }
@@ -8703,6 +8872,7 @@ mod tests {
                 .unwrap();
             assert!(out.status.success());
             run_git(&repo, &["checkout", "main"]);
+            run_git(&repo, &["branch", "develop"]);
 
             let mut app = App::new();
             seed_repo_tree(&mut app, &repo);
@@ -8721,10 +8891,15 @@ mod tests {
             let Some(Overlay::Menu(menu)) = &app.overlay else {
                 panic!("expected the branch picker, got {:?}", app.overlay);
             };
-            assert_eq!(menu.title.as_deref(), Some("From branch"));
+            assert_eq!(menu.title.as_deref(), Some("Orchestrator branch"));
             assert_eq!(menu.hover, 0, "focus starts on the newest branch");
             assert_eq!(menu.items[0].label, "feature");
-            assert_eq!(menu.items[1].label, "main ⌂ root");
+            let labels: Vec<&str> = menu.items.iter().map(|i| i.label.as_str()).collect();
+            assert!(
+                labels.contains(&"develop"),
+                "every local branch is offered, develop included: {labels:?}"
+            );
+            assert!(labels.contains(&"main ⌂ primary"), "{labels:?}");
             assert!(
                 out.is_empty(),
                 "nothing fires until a branch is picked: {out:?}"
@@ -8746,7 +8921,7 @@ mod tests {
                 MenuAction::SpawnOnBranch {
                     project: nebula_core::ProjectId("p1".into()),
                     branch: "main".into(),
-                    spawn: crate::app::BranchSpawn::Agent {
+                    spawn: crate::app::BranchSpawn {
                         kind: AgentKind::Claude,
                         model: None,
                         effort: None,
@@ -8765,8 +8940,11 @@ mod tests {
                     &app.overlay,
                     Some(Overlay::Prompt(p)) if matches!(
                         &p.kind,
-                        PromptKind::NewAgent { worktree, orchestrator: true, .. }
-                            if worktree == &nebula_core::WorktreeId("w1".into())
+                        PromptKind::NewAgent {
+                            target: crate::app::SpawnTarget::Worktree(worktree),
+                            orchestrator: true,
+                            ..
+                        } if worktree == &nebula_core::WorktreeId("w1".into())
                     )
                 ),
                 "{:?}",
@@ -8804,7 +8982,7 @@ mod tests {
                 MenuAction::SpawnOnBranch {
                     project: nebula_core::ProjectId("p1".into()),
                     branch: "feature".into(),
-                    spawn: crate::app::BranchSpawn::Agent {
+                    spawn: crate::app::BranchSpawn {
                         kind: AgentKind::Claude,
                         model: None,
                         effort: None,
@@ -8819,8 +8997,11 @@ mod tests {
                     &app.overlay,
                     Some(Overlay::Prompt(p)) if matches!(
                         &p.kind,
-                        PromptKind::NewAgentOnBranch { branch, orchestrator: true, .. }
-                            if branch == "feature"
+                        PromptKind::NewAgent {
+                            target: crate::app::SpawnTarget::Branch { branch, .. },
+                            orchestrator: true,
+                            ..
+                        } if branch == "feature"
                     )
                 ),
                 "{:?}",
@@ -8867,73 +9048,191 @@ mod tests {
         })
     }
 
-    /// The orchestrator picker's terminal row goes through the branch
-    /// picker too: an existing checkout gets the terminal directly, a
-    /// missing one is created first and the terminal follows its Ack.
+    /// The orchestrator picker offers exactly the agent kinds — a shell
+    /// terminal is not an orchestrator, so the "Terminal (shell)" row the
+    /// session picker carries is absent here.
     #[test]
-    fn orchestrator_terminal_row_spawns_on_the_picked_branch() {
+    fn orchestrator_picker_offers_only_agent_kinds() {
         let mut app = App::new();
         seed_tree(&mut app);
-        let mut out = Vec::new();
-        run_menu_action(
-            &mut app,
-            MenuAction::PickBranch {
-                project: nebula_core::ProjectId("p1".into()),
-                spawn: crate::app::BranchSpawn::Terminal,
-            },
-            &mut out,
-        );
-        // /tmp/demo isn't a repo, so the picker falls back to the branches
-        // nebula knows from the project's worktrees.
-        assert!(
-            matches!(&app.overlay, Some(Overlay::Menu(m)) if m.title.as_deref() == Some("From branch")),
-            "{:?}",
-            app.overlay
-        );
-        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-        assert!(
-            matches!(
-                out.first(),
-                Some(ClientRequest::CreateTerminal { worktree, .. })
-                    if worktree == &nebula_core::WorktreeId("w1".into())
-            ),
-            "{out:?}"
-        );
-
-        // The deferred path: no checkout for the branch yet.
-        let mut out = Vec::new();
-        run_menu_action(
-            &mut app,
-            MenuAction::SpawnOnBranch {
-                project: nebula_core::ProjectId("p1".into()),
-                branch: "feature".into(),
-                spawn: crate::app::BranchSpawn::Terminal,
-            },
-            &mut out,
-        );
-        let Some(ClientRequest::CreateWorktree { req_id, .. }) = out.first() else {
-            panic!("expected CreateWorktree, got {out:?}");
+        open_new_orchestrator_picker(&mut app, nebula_core::ProjectId("p1".into()));
+        let Some(Overlay::Menu(menu)) = &app.overlay else {
+            panic!("expected the orchestrator picker, got {:?}", app.overlay);
         };
-        let req_id = *req_id;
-        let mut out = Vec::new();
-        handle_server_event(
-            &mut app,
-            ServerEvent::Ack {
-                req_id,
-                created: Some(nebula_core::EntityId::Worktree(nebula_core::WorktreeId(
-                    "w-feature".into(),
-                ))),
-            },
-            &mut out,
-        );
+        assert_eq!(menu.title.as_deref(), Some("New orchestrator"));
+        let labels: Vec<&str> = menu.items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, ["Claude", "Codex", "Cursor", "Pi"], "{labels:?}");
+    }
+
+    /// The normal session picker keeps its shell row — removing it from
+    /// the orchestrator flow must not touch session creation.
+    #[test]
+    fn session_picker_still_offers_the_terminal_row() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        open_new_agent_picker(&mut app, nebula_core::WorktreeId("w1".into()));
+        let Some(Overlay::Menu(menu)) = &app.overlay else {
+            panic!("expected the session picker, got {:?}", app.overlay);
+        };
+        assert_eq!(menu.title.as_deref(), Some("New session"));
+        let terminal = menu
+            .items
+            .iter()
+            .find(|i| i.label == "Terminal (shell)")
+            .expect("terminal row present");
         assert!(
-            matches!(
-                out.first(),
-                Some(ClientRequest::CreateTerminal { worktree, .. })
-                    if worktree == &nebula_core::WorktreeId("w-feature".into())
-            ),
-            "{out:?}"
+            matches!(&terminal.action, MenuAction::NewTerminal(w) if w == &nebula_core::WorktreeId("w1".into())),
+            "{:?}",
+            terminal.action
         );
+    }
+
+    /// The orchestrator name prompt is visibly the orchestrator flow —
+    /// role title, orchestrator-name label — and its default numbers
+    /// across the WHOLE project: with orchestrator-1 on the primary
+    /// checkout and orchestrator-3 on a branch worktree, the first free
+    /// project-wide slot is orchestrator-2.
+    #[test]
+    fn orchestrator_prompt_is_role_correct_with_a_project_wide_default() {
+        with_default_config(|| {
+            use nebula_core::{Entity, Worktree, WorktreeId};
+            let mut app = App::new();
+            seed_tree(&mut app);
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Worktree(Worktree {
+                        id: WorktreeId("w2".into()),
+                        project_id: nebula_core::ProjectId("p1".into()),
+                        path: "/tmp/demo-worktrees/feature".into(),
+                        branch: "feature".into(),
+                        is_main: false,
+                        created_from: None,
+                        pinned: false,
+                        sort_order: 1,
+                    }),
+                },
+            );
+            for (id, name, wt) in [
+                ("o1", "orchestrator-1", "w1"),
+                ("o3", "orchestrator-3", "w2"),
+            ] {
+                let mut orch = app.tree.agents[0].clone();
+                orch.id = AgentId(id.into());
+                orch.name = name.into();
+                orch.worktree_id = WorktreeId(wt.into());
+                orch.orchestrator = true;
+                hse(
+                    &mut app,
+                    ServerEvent::EntityUpserted {
+                        entity: Entity::Agent(orch),
+                    },
+                );
+            }
+            open_prompt(
+                &mut app,
+                PromptKind::NewAgent {
+                    target: crate::app::SpawnTarget::Worktree(WorktreeId("w1".into())),
+                    kind: AgentKind::Claude,
+                    model: None,
+                    effort: None,
+                    orchestrator: true,
+                },
+            );
+            let Some(Overlay::Prompt(p)) = &app.overlay else {
+                panic!("expected the name prompt, got {:?}", app.overlay);
+            };
+            assert_eq!(p.title, "New orchestrator");
+            assert_eq!(p.label, "orchestrator name (empty = orchestrator-2)");
+            // Accepting the empty prompt takes exactly the advertised name.
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(
+                matches!(
+                    out.first(),
+                    Some(ClientRequest::CreateAgent { name, orchestrator: true, .. })
+                        if name == "orchestrator-2"
+                ),
+                "{out:?}"
+            );
+        })
+    }
+
+    /// A picked branch with no checkout names the prompt after the branch
+    /// — "New orchestrator on develop", not the session flow's wording —
+    /// and submit creates the worktree, then the flagged agent on its Ack.
+    /// Any local branch works; develop is not special.
+    #[test]
+    fn orchestrator_branch_prompt_names_the_branch_and_spawns_on_develop() {
+        with_default_config(|| {
+            use nebula_core::{Entity, Worktree, WorktreeId};
+            let mut app = App::new();
+            seed_tree(&mut app);
+            open_prompt(
+                &mut app,
+                PromptKind::NewAgent {
+                    target: crate::app::SpawnTarget::Branch {
+                        project: nebula_core::ProjectId("p1".into()),
+                        branch: "develop".into(),
+                    },
+                    kind: AgentKind::Claude,
+                    model: None,
+                    effort: None,
+                    orchestrator: true,
+                },
+            );
+            let Some(Overlay::Prompt(p)) = &app.overlay else {
+                panic!("expected the name prompt, got {:?}", app.overlay);
+            };
+            assert_eq!(p.title, "New orchestrator on develop");
+            assert_eq!(p.label, "orchestrator name (empty = orchestrator-1)");
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            let Some(ClientRequest::CreateWorktree {
+                req_id,
+                branch,
+                base,
+                ..
+            }) = out.first()
+            else {
+                panic!("expected CreateWorktree, got {out:?}");
+            };
+            assert_eq!(branch, "develop");
+            assert_eq!(base, &None, "the existing branch is checked out, not re-based");
+            let req_id = *req_id;
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Worktree(Worktree {
+                        id: WorktreeId("w-dev".into()),
+                        project_id: nebula_core::ProjectId("p1".into()),
+                        path: "/tmp/demo-worktrees/develop".into(),
+                        branch: "develop".into(),
+                        is_main: false,
+                        created_from: None,
+                        pinned: false,
+                        sort_order: 1,
+                    }),
+                },
+            );
+            let mut out = Vec::new();
+            handle_server_event(
+                &mut app,
+                ServerEvent::Ack {
+                    req_id,
+                    created: Some(nebula_core::EntityId::Worktree(WorktreeId("w-dev".into()))),
+                },
+                &mut out,
+            );
+            assert!(
+                matches!(
+                    out.iter().find(|r| matches!(r, ClientRequest::CreateAgent { .. })),
+                    Some(ClientRequest::CreateAgent { worktree, name, orchestrator: true, .. })
+                        if worktree == &WorktreeId("w-dev".into()) && name == "orchestrator-1"
+                ),
+                "{out:?}"
+            );
+        })
     }
 
     /// An orchestrator on a non-root worktree still shows in the section
@@ -8985,16 +9284,16 @@ mod tests {
         let items: Vec<crate::app::MenuItem> = (0..60)
             .map(|i| crate::app::MenuItem {
                 label: format!("branch-{i:02}"),
-                action: MenuAction::SpawnOnBranch {
+                action: MenuAction::CreateWorktreeFrom {
                     project: nebula_core::ProjectId("p1".into()),
                     branch: format!("branch-{i:02}"),
-                    spawn: crate::app::BranchSpawn::Terminal,
+                    base: None,
                 },
                 destructive: false,
             })
             .collect();
         app.overlay = Some(Overlay::Menu(crate::app::ContextMenu {
-            title: Some("From branch".into()),
+            title: Some("Orchestrator branch".into()),
             items,
             at: None,
             hover: 59,
@@ -9033,6 +9332,7 @@ mod tests {
     /// Enter picks it.
     #[test]
     fn typing_filters_the_branch_picker_and_enter_picks_the_best_match() {
+        with_default_config(|| {
         use nebula_core::{Entity, Worktree, WorktreeId};
         let mut app = App::new();
         seed_tree(&mut app);
@@ -9052,13 +9352,15 @@ mod tests {
             },
         );
         let mut out = Vec::new();
-        run_menu_action(
+        open_branch_picker(
             &mut app,
-            MenuAction::PickBranch {
-                project: nebula_core::ProjectId("p1".into()),
-                spawn: crate::app::BranchSpawn::Terminal,
+            nebula_core::ProjectId("p1".into()),
+            crate::app::BranchSpawn {
+                kind: AgentKind::Claude,
+                model: None,
+                effort: None,
+                orchestrator: true,
             },
-            &mut out,
         );
         for c in "fea".chars() {
             press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
@@ -9080,11 +9382,27 @@ mod tests {
         assert!(
             matches!(
                 out.first(),
-                Some(ClientRequest::CreateTerminal { worktree, .. })
+                Some(ClientRequest::PrewarmAgent { worktree, .. })
                     if worktree == &WorktreeId("w2".into())
             ),
             "enter picks the filtered branch's checkout: {out:?}"
         );
+        assert!(
+            matches!(
+                &app.overlay,
+                Some(Overlay::Prompt(p)) if matches!(
+                    &p.kind,
+                    PromptKind::NewAgent {
+                        target: crate::app::SpawnTarget::Worktree(w),
+                        orchestrator: true,
+                        ..
+                    } if w == &WorktreeId("w2".into())
+                )
+            ),
+            "{:?}",
+            app.overlay
+        );
+        })
     }
 
     /// A query matching nothing leaves an editable empty picker: Enter is
@@ -9096,13 +9414,15 @@ mod tests {
         let mut app = App::new();
         seed_tree(&mut app);
         let mut out = Vec::new();
-        run_menu_action(
+        open_branch_picker(
             &mut app,
-            MenuAction::PickBranch {
-                project: nebula_core::ProjectId("p1".into()),
-                spawn: crate::app::BranchSpawn::Terminal,
+            nebula_core::ProjectId("p1".into()),
+            crate::app::BranchSpawn {
+                kind: AgentKind::Claude,
+                model: None,
+                effort: None,
+                orchestrator: true,
             },
-            &mut out,
         );
         press(&mut app, KeyCode::Char('z'), KeyModifiers::NONE, &mut out);
         let Some(Overlay::Menu(menu)) = &app.overlay else {
@@ -9169,7 +9489,7 @@ mod tests {
             "branches list newest-first"
         );
         assert_eq!(
-            menu.items[menu.hover].label, "main ⌂ root",
+            menu.items[menu.hover].label, "main ⌂ primary",
             "the selected worktree's branch starts hovered"
         );
         // Fuzzy-pick the other base instead of the default.
@@ -9213,7 +9533,7 @@ mod tests {
         // as orchestrator.
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
         assert!(
-            matches!(&app.overlay, Some(Overlay::Menu(m)) if m.title.as_deref() == Some("From branch")),
+            matches!(&app.overlay, Some(Overlay::Menu(m)) if m.title.as_deref() == Some("Orchestrator branch")),
             "the kind pick detours through the branch picker: {:?}",
             app.overlay
         );
@@ -10238,7 +10558,9 @@ mod tests {
                 "name",
                 "",
                 PromptKind::NewAgent {
-                    worktree: nebula_core::WorktreeId("w1".into()),
+                    target: crate::app::SpawnTarget::Worktree(nebula_core::WorktreeId(
+                        "w1".into(),
+                    )),
                     kind: AgentKind::Claude,
                     model: Some("opus".into()),
                     effort: Some("high".into()),
@@ -11359,6 +11681,186 @@ mod tests {
             matches!(out.last(), Some(ClientRequest::ArchiveAgent { id, .. }) if id.0 == "a1"),
             "⌘w closes the attached session"
         );
+    }
+
+    #[test]
+    fn cmd_t_opens_the_floating_quick_terminal_creating_the_shell() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        app.focus = Focus::Sessions;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::SUPER),
+            &mut out,
+        );
+        assert!(app.quick_term, "⌘t opens the floating quick terminal");
+        assert!(
+            matches!(
+                out.last(),
+                Some(ClientRequest::CreateTerminal { worktree, name: Some(n), .. })
+                    if worktree.0 == "w1" && n == "quick"
+            ),
+            "no quick shell yet: one is created on the selected worktree: {out:?}"
+        );
+        // The Ack attaches it into the floating window.
+        let req_id = *app.pending.keys().next().expect("pending intent");
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: nebula_core::Entity::Terminal(nebula_core::TerminalTab {
+                    id: nebula_core::TerminalId("t-quick".into()),
+                    worktree_id: nebula_core::WorktreeId("w1".into()),
+                    name: "quick".into(),
+                    sort_order: 0,
+                    alive: true,
+                }),
+            },
+        );
+        let mut out = Vec::new();
+        handle_server_event(
+            &mut app,
+            ServerEvent::Ack {
+                req_id,
+                created: Some(nebula_core::EntityId::Terminal(nebula_core::TerminalId(
+                    "t-quick".into(),
+                ))),
+            },
+            &mut out,
+        );
+        assert!(
+            matches!(&app.term, Some(t) if t.sref == SessionRef::Terminal(nebula_core::TerminalId("t-quick".into()))),
+            "the created shell is attached"
+        );
+        assert_eq!(app.focus, Focus::Terminal);
+        assert!(app.term_locked, "keys go straight to the shell");
+        assert!(app.quick_term, "still floating");
+    }
+
+    #[test]
+    fn cmd_t_reuses_the_existing_quick_shell() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: nebula_core::Entity::Terminal(nebula_core::TerminalTab {
+                    id: nebula_core::TerminalId("t-quick".into()),
+                    worktree_id: nebula_core::WorktreeId("w1".into()),
+                    name: "quick".into(),
+                    sort_order: 0,
+                    alive: false,
+                }),
+            },
+        );
+        let mut out = Vec::new();
+        app.focus = Focus::Sessions;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::SUPER),
+            &mut out,
+        );
+        assert!(
+            !out.iter()
+                .any(|r| matches!(r, ClientRequest::CreateTerminal { .. })),
+            "the existing quick shell is reused, not recreated"
+        );
+        assert!(
+            matches!(
+                out.last(),
+                Some(ClientRequest::Attach { session, .. })
+                    if *session == SessionRef::Terminal(nebula_core::TerminalId("t-quick".into()))
+            ),
+            "⌘t attaches the worktree's quick shell: {out:?}"
+        );
+        assert!(app.quick_term && app.term_locked);
+    }
+
+    #[test]
+    fn cmd_t_inside_a_locked_session_toggles_and_restores_it() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: nebula_core::Entity::Terminal(nebula_core::TerminalTab {
+                    id: nebula_core::TerminalId("t-quick".into()),
+                    worktree_id: nebula_core::WorktreeId("w1".into()),
+                    name: "quick".into(),
+                    sort_order: 0,
+                    alive: true,
+                }),
+            },
+        );
+        // Locked inside agent a1: ⌘t opens the quick terminal on a1's
+        // worktree without any picker.
+        app.term = Some(AttachedTerm::new(
+            SessionRef::Agent(AgentId("a1".into())),
+            80,
+            24,
+        ));
+        app.focus = Focus::Terminal;
+        app.term_locked = true;
+        let mut out = Vec::new();
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::SUPER),
+            &mut out,
+        );
+        assert!(app.quick_term, "⌘t fires through the locked SUPER intercept");
+        assert!(
+            matches!(&app.term, Some(t) if t.sref == SessionRef::Terminal(nebula_core::TerminalId("t-quick".into()))),
+            "the quick shell replaced the agent in the attachment"
+        );
+        // Second ⌘t closes the window and puts the agent back, still locked.
+        let mut out = Vec::new();
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::SUPER),
+            &mut out,
+        );
+        assert!(!app.quick_term, "second ⌘t closes the window");
+        assert!(
+            matches!(&app.term, Some(t) if t.sref == SessionRef::Agent(AgentId("a1".into()))),
+            "the displaced agent session is re-attached"
+        );
+        assert_eq!(app.focus, Focus::Terminal);
+        assert!(app.term_locked, "back exactly where the user was");
+    }
+
+    #[test]
+    fn ctrl_q_inside_the_quick_terminal_closes_it() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: nebula_core::Entity::Terminal(nebula_core::TerminalTab {
+                    id: nebula_core::TerminalId("t-quick".into()),
+                    worktree_id: nebula_core::WorktreeId("w1".into()),
+                    name: "quick".into(),
+                    sort_order: 0,
+                    alive: true,
+                }),
+            },
+        );
+        let mut out = Vec::new();
+        app.focus = Focus::Sessions;
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::SUPER),
+            &mut out,
+        );
+        assert!(app.quick_term);
+        let mut out = Vec::new();
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            &mut out,
+        );
+        assert!(!app.quick_term, "^q closes the floating window");
+        assert!(app.term.is_none(), "nothing was displaced, nothing restored");
+        assert_eq!(app.focus, Focus::Sessions);
     }
 
     #[test]
@@ -14227,7 +14729,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
-        assert!(text.contains("⌂ root"), "project shows worktrees:\n{text}");
+        assert!(text.contains("⌂ primary"), "project shows worktrees:\n{text}");
         assert!(text.contains("agent-1"), "project shows sessions:\n{text}");
 
         // On the divider row the panels stay but their content blanks, and
@@ -14240,7 +14742,7 @@ mod tests {
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
         assert!(
-            !text.contains("⌂ root"),
+            !text.contains("⌂ primary"),
             "divider hides worktree rows:\n{text}"
         );
         assert!(

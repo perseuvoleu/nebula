@@ -119,7 +119,8 @@ enum WorktreeCommand {
         /// Worktree/branch name; spaces become hyphens.
         #[arg(required = true, num_args = 1..)]
         name: Vec<String>,
-        /// Base branch or commit to branch from (default: the root HEAD).
+        /// Base branch or commit to branch from (default: the primary
+        /// checkout's HEAD).
         #[arg(long)]
         from: Option<String>,
         /// Project name (default: the calling session's project).
@@ -130,12 +131,15 @@ enum WorktreeCommand {
 
 #[derive(Subcommand)]
 enum AgentCommand {
-    /// Spawn an agent session. `--orchestrator` puts it on the project's
-    /// root checkout, pinned, in the orchestrators group; workers need
-    /// --worktree <branch>. `--prompt` hands it its first task.
+    /// Spawn an agent session. `--orchestrator` makes it a project
+    /// orchestrator — pinned, in the orchestrators group, on the primary
+    /// checkout unless --worktree says otherwise (any worktree works);
+    /// workers need --worktree <branch>. `--prompt` hands it its first
+    /// task.
     New {
         /// Worktree to spawn in: a branch name, a directory name, or
-        /// "root" (required unless --orchestrator).
+        /// "root"/"primary" for the primary checkout (required unless
+        /// --orchestrator, which defaults to the primary checkout).
         #[arg(long)]
         worktree: Option<String>,
         /// Project name (default: the calling session's project).
@@ -154,15 +158,16 @@ enum AgentCommand {
         /// from --prompt, else generated; the session then titles itself).
         #[arg(long, num_args = 1..)]
         name: Option<Vec<String>>,
-        /// Project-level orchestrator: root checkout, pinned, own group.
+        /// Project-level orchestrator: pinned, own group, primary
+        /// checkout by default (any worktree via --worktree).
         #[arg(long)]
         orchestrator: bool,
         /// Initial task, submitted as the CLI's first prompt.
         #[arg(long)]
         prompt: Option<String>,
     },
-    /// Promote a root-checkout session to project orchestrator (it moves
-    /// into the ORCHESTRATORS section, pinned).
+    /// Promote a session (on any of the project's worktrees) to project
+    /// orchestrator (it moves into the ORCHESTRATORS section, pinned).
     Promote {
         /// Session name (as shown in the panels).
         name: String,

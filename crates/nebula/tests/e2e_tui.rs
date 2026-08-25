@@ -383,7 +383,7 @@ fn tui_projects_worktrees_agents_navigation() {
     tui.send(b"\r");
     tui.wait_for_gone("Add project");
     tui.wait_for_text("alpha-proj");
-    tui.wait_for_text("main ⌂ root"); // main checkout appears as the root row
+    tui.wait_for_text("main ⌂ primary"); // main checkout appears as the root row
 
     // The live directory browser: typing "…/T/.tmpX/" lists both repos as
     // rows (no Tab needed), then Esc cancels.
@@ -436,7 +436,7 @@ fn tui_projects_worktrees_agents_navigation() {
     tui.send(b"k");
     tui.wait_for_selected("feat-a");
     tui.send(b"k");
-    tui.wait_for_selected("main ⌂ root");
+    tui.wait_for_selected("main ⌂ primary");
     tui.send(b"j");
     tui.wait_for_selected("feat-a");
 
@@ -491,12 +491,12 @@ fn tui_projects_worktrees_agents_navigation() {
     tui.send(b"j"); // select beta-proj
     tui.wait_for_selected("beta-proj");
     tui.wait_for_gone("feat-a"); // beta has only its main checkout
-    tui.wait_for_text("main ⌂ root");
+    tui.wait_for_text("main ⌂ primary");
     tui.wait_for_sessions_row_gone("agent-1");
 
     // ---- the root row tracks live branch switches, no restart needed ----
     repo_git(&beta, &["checkout", "-b", "hotfix"]);
-    tui.wait_for_text("hotfix ⌂ root");
+    tui.wait_for_text("hotfix ⌂ primary");
     tui.send(b"k"); // back to alpha-proj
     tui.wait_for_selected("alpha-proj");
     tui.wait_for_text("feat-a");
@@ -556,7 +556,7 @@ fn tui_note_modal_crud_and_badge() {
     tui.wait_for_text("no projects yet");
     add_project(&mut tui, &repo, "note-proj");
     // The root worktree row must exist before e has a list to open.
-    tui.wait_for_text("⌂ root");
+    tui.wait_for_text("⌂ primary");
 
     // ---- Projects focus: t opens the PROJECT's own list (no branch in
     // the title — the trailing space keeps it from matching ".../main") ----
@@ -648,7 +648,7 @@ fn tui_link_crud_in_sessions_panel() {
     tui.wait_for_text("no projects yet");
     add_project(&mut tui, &repo, "link-proj");
     // The root worktree row must exist before a link has an owner.
-    tui.wait_for_text("⌂ root");
+    tui.wait_for_text("⌂ primary");
 
     // ---- create: l prompts, the URL lands in a LINKS group ----
     tui.send(b"l");
@@ -709,7 +709,7 @@ fn tui_pull_request_row_leads_the_links_group() {
     let repo = tui.make_repo("pr-proj");
     tui.wait_for_text("no projects yet");
     add_project(&mut tui, &repo, "pr-proj");
-    tui.wait_for_text("⌂ root");
+    tui.wait_for_text("⌂ primary");
 
     // The lookup rides the git poll, so the row shows up on its own.
     tui.wait_for_text("LINKS");
@@ -742,7 +742,7 @@ fn tui_git_diff_modal() {
     tui.wait_for_text("no projects yet");
     add_project(&mut tui, &repo, "diff-proj");
     // The root worktree row must exist before g has anything to diff.
-    tui.wait_for_text("⌂ root");
+    tui.wait_for_text("⌂ primary");
 
     // Dirty the checkout: one tracked modification, one untracked file.
     std::fs::write(repo.join(".keep"), "tracked change\n").unwrap();
@@ -810,4 +810,32 @@ fn tui_git_diff_modal() {
     tui.wait_for_gone("+2 files");
     tui.send(b"g");
     tui.wait_for_text("no changes in main");
+}
+
+/// Killing the daemon out from under a running TUI (what `nebula kill`
+/// from another shell does) must not strand it on the "✗ disconnected"
+/// footer forever: the TUI re-dials, boots a fresh daemon, re-subscribes,
+/// and the panels come back live with the persisted tree.
+#[test]
+fn tui_reconnects_after_the_daemon_is_killed() {
+    let mut tui = TuiHarness::spawn();
+    let repo = tui.make_repo("proj");
+    add_project(&mut tui, &repo, "proj");
+
+    let ok = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        .arg("kill")
+        .env("NEBULA_RUNTIME_DIR", &tui.runtime_dir)
+        .env("NEBULA_DATA_DIR", &tui.data_dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "nebula kill failed");
+    tui.wait_for_text("✗ disconnected");
+
+    // Auto-reconnect: a fresh daemon comes up, the Snapshot restores the
+    // tree, and the footer stops flagging the connection.
+    tui.wait_for_gone("✗ disconnected");
+    tui.wait_for_text("proj");
 }

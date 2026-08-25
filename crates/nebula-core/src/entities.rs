@@ -177,9 +177,10 @@ pub struct Agent {
     pub sort_order: i64,
     /// True when the daemon currently holds a live PTY for this agent.
     pub alive: bool,
-    /// A project-level orchestrator: lives on the root worktree, drives
-    /// `nebula worktree new` / `nebula agent new` to manage the project.
-    /// Always spawned pinned so the idle reaper never touches it.
+    /// A project-level orchestrator: defaults to the primary checkout but
+    /// may live on any project worktree, and drives `nebula worktree new` /
+    /// `nebula agent new` to manage the project. Always spawned pinned so
+    /// the idle reaper never touches it.
     #[serde(default)]
     pub orchestrator: bool,
 }

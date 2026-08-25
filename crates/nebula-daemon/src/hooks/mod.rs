@@ -74,7 +74,8 @@ nebula agent new --worktree <branch> [--kind claude|codex|cursor|pi] \
 nebula agent list   # your workers, with status, as JSON\n  \
 nebula agent wait [<name>...] [--timeout <secs>]   # block until workers \
 settle\n\nRules: stay in \
-the root checkout — never cd into worktrees, spawn workers there instead; \
+your own checkout (wherever it is — orchestrators may run on any branch) — \
+never cd into workers' worktrees, spawn workers there instead; \
 split independent work across worktrees so workers don't collide. After \
 delegating, do NOT end your turn and do NOT hand-roll sleep loops: run \
 `nebula agent wait` (all your workers) or `nebula agent wait <name>...` \

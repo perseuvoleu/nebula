@@ -14,6 +14,105 @@ about what is worth recording.
 
 ## Entries
 
+### TUI Auto-Reconnects After The Daemon Dies (Frozen/Truncated Screen Diagnosis) — 2026-08-25
+
+**Asked:** "eu cand deschid ceva fereastra se face resize la nebula si dupa terminalul imi ramane cu
+textul trunk pe jumate, ce putem face" + "si mi se si inchide daemon ul cand face asta".
+
+**Did:** Diagnosis first: the daemon never crashed — `state/daemon.log` (in
+`~/Library/Application Support/dev.nebula.nebula/`) showed only clean "shutdown requested by client"
+exits, and the ONLY senders of `ClientRequest::Shutdown` are `nebula kill` and `nebula upgrade`'s
+`shutdown_if_idle` — so "daemon-ul se închide" was explicit kills, not the resize. The real bug: the
+TUI had **no reconnect at all** — after `ConnState::Disconnected` it dropped every outbound frame
+forever, the terminal pane froze on the last parsed screen, and a window resize then ran
+`sync_pty_size` → `parser.screen_mut().set_size()` on the dead stream, truncating the frozen lines
+mid-width ("text trunchiat pe jumate"). Fix in `main_loop` (event_loop.rs): a `next_reconnect`
+deadline armed on both disconnect sites, a select arm (gated on Disconnected) that awaits
+`ipc::connect_or_spawn()` (respawns the daemon when nothing listens), replaces `*channels =
+ipc::split_connection(conn)`, re-sends `Subscribe`, and re-attaches `app.term` via `attach()` — whose
+Attach carries the current pane size and the daemon's `resize_with_jiggle` forces a full repaint,
+healing the truncation too. e2e regression `tui_reconnects_after_the_daemon_is_killed`
+(e2e_tui.rs): external `nebula kill` → "✗ disconnected" appears → disappears on its own. 456
+nebula-tui + full workspace green; `make install` run.
+
+**Gotchas:**
+- The `channels.rx.recv()` select arm MUST be gated `if app.conn == ConnState::Connected`: a closed
+  mpsc yields `None` instantly, and ungated it spins the loop hot the entire time the daemon is down.
+- Snapshot handling already anticipated reconnects (`app.open_at.take()` — "Reconnect snapshots find
+  None here"), and Attach already jiggle-resizes — the ONLY missing piece was the re-dial.
+- `cargo test` runs can leak an isolated e2e daemon (`target/debug/nebula daemon --foreground` with a
+  socket under `/var/folders/…/.tmpXXXX/rt/`); it holds no user state — identify via
+  `lsof -p <pid> | grep daemon.sock` before assuming it's the real one.
+
+### Orchestrator UX Split From Shell Terminals, "root" → "primary" — 2026-08-25
+
+**Asked:** "Implement the orchestrator UX simplification… Make orchestrator agents and shell terminals
+clearly separate concepts, and make the orchestrator creation flow visibly different from normal session
+creation. Orchestrators may run on any local branch, including develop. 'root' means the original/primary
+checkout, not main branch; use 'primary checkout' in user-facing text… retaining compatibility for the
+CLI selector 'root'."
+
+**Did:** Orchestrator picker (`open_agent_picker`, event_loop.rs) lost its "Terminal (shell)" row — the
+session picker keeps it — which killed the whole terminal-on-branch detour: `MenuAction::PickBranch` is
+deleted, `BranchSpawn` and `DeferredSpawn` (app.rs) are now structs (agent-only, no `Terminal` variant),
+and `spawn_on_branch`/the `SpawnOnCreatedWorktree` Ack arm lost their terminal branches.
+`PromptKind::NewAgentOnBranch` merged into `PromptKind::NewAgent { target: SpawnTarget }`
+(`SpawnTarget::Worktree | Branch{project,branch}`, app.rs) — one open_prompt arm, one submit arm. The
+prompt is role-correct: title "New orchestrator [on <branch>]", label "orchestrator name (empty =
+orchestrator-N)"; branch picker title is now "Orchestrator branch". Default orchestrator numbering is
+first-free **project-wide**: `App::default_orchestrator_name` (app.rs, used by `create_agent` and the
+prompt label) and `ipc.rs::default_agent_name` now takes `taken: &[String]` (agent_new passes
+project-wide orchestrator names). User-facing "⌂ root" badge → "⌂ primary" everywhere (ui.rs
+`ROOT_BADGE`, both branch pickers, worktree pickers, e2e_tui.rs); CLI `--worktree` accepts
+"primary" alongside the kept "root"; root-only claims fixed in entities.rs, main.rs docs, ipc.rs, and
+`ORCHESTRATOR_INSTRUCTION` (hooks/mod.rs: "stay in your own checkout… may run on any branch"). No
+protocol change. 456 nebula-tui + full workspace green; built on top of the uncommitted ⌘T
+quick-terminal work without touching it (its 4 tests still pass). Deliberately did NOT introduce an
+`AgentRole` enum — the bool converts at CreateAgent anyway and the swap would churn ~30 test sites for
+three if/elses.
+
+**Gotchas:**
+- The Esc-restores-prewarm arm in the prompt handler must match only
+  `SpawnTarget::Worktree` — a branch target never fired a prewarm (nothing to warm in a
+  not-yet-created checkout), so restoring one would prewarm a worktree the user never picked.
+- `e2e_pty::move_agent_respawns_live_session_in_target_worktree` flaked once under the full
+  parallel workspace run and passed alone and on suite rerun — pre-existing PTY-load flake, not
+  related to picker/label changes.
+- Tests that need a multi-branch repo for the picker: two commits in the same second sort
+  unpredictably under `--sort=-committerdate`, so assert membership (`labels.contains`), not order,
+  for branches without a pinned `GIT_COMMITTER_DATE`.
+
+### ⌘T Floating Quick Terminal On The Current Branch — 2026-08-25
+
+**Asked:** "vreau cand dau cmmd t sa mi deschida o fereastrea ( cum e la cmmd +k ) doar ca sa fie
+putin mai mare si sa am terminam de la branch ul la care sunt automat fara sa aleg"
+
+**Did:** New `Action::QuickTerminal` (keymap.rs, id `quick_terminal`, defaults `cmd+t, ctrl+t`).
+`toggle_quick_terminal`/`close_quick_terminal`/`quick_terminal_worktree` (event_loop.rs, next to
+`create_terminal_for_context`): ⌘T reuses-or-creates one dedicated shell tab named `"quick"` per
+worktree (`CreateTerminal { name: Some("quick") }` + the existing `PendingIntent::AttachCreated`),
+attaches it, and sets `App.quick_term` — `ui.rs::draw_quick_terminal` then renders the attached
+screen in a `centered_rect_pct(72, 72)` floating window (above panels, below overlays/vim), writing
+`app.term_area` back to its inner rect so the post-draw `sync_pty_size` sizes the PTY to the window.
+`App.quick_term_restore` remembers what ⌘T displaced (attached sref + focus + lock) and the second
+⌘T/^q/outside-click restores it. In the locked-terminal SUPER intercept ⌘T toggles (locked in an
+agent → quick shell on that agent's worktree); the other SUPER arms close the window first, except
+⌘W which deliberately targets the quick shell itself. `~/.config/ghostty/nebula`: the old ⌘T
+chain-macro (worktrees + new-worktree dialog) was **replaced** by `super+t=csi:116;9u`. Four
+regression tests; 453 nebula-tui + full workspace green; `make install` run (TUI-only change, old
+daemon fine — `CreateTerminal.name` already existed).
+
+**Gotchas:**
+- The daemon lazily respawns dead shells in `ensure_session` on Attach, so reusing the per-worktree
+  `"quick"` tab needs no aliveness check and survives restarts with the same tab identity.
+- While the window is up, `draw_terminal` must NOT render the attached screen in the pane behind it
+  (the PTY is window-sized — pane render is garbage) nor write `term_area`/push its hit rect: the
+  window owns both. The pane shows a "quick terminal open" hint instead.
+- `hit_at` is first-match, and the panel/splitter rects are pushed during the panel draw — the
+  floating window's `HitTarget::TerminalPane` rect must go in with `app.hits.insert(0, …)`.
+- `detach_if_attached` clears `quick_term` too — a quick shell whose session/worktree is deleted
+  would otherwise leave an empty floating box with no owner.
+
 ### Global Command Palette On ⇧P / ⌘K — 2026-08-24
 
 **Asked:** "un shortcut care sa-mi deschida o fereastra de unde pot face orice comanda — ex: deschid
