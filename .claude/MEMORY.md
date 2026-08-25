@@ -42,8 +42,8 @@ overlay's diff bind — `super+g=csi:103;9u` — so the locked-session diff chor
 `toggle_split_terminal` (event_loop.rs, next to the quick-terminal fns) reuses
 `quick_terminal_worktree` for context and sends `CreateTerminal { name: None }` with new
 `PendingIntent::AttachCreatedSplit`, whose Ack runs `attach_split` (right pane + input lock); a
-second ⌘D runs `close_split_terminal` (Detach only — the shell stays a normal tab; lock returns to
-the left pane). `draw_terminal` (ui.rs) carves the pane into two halves with a rule that turns
+second ⌘D closes the split shell for real via `close_session` (see the `bb91be4` follow-up below —
+the original Detach-only close leaked the shell as a tab). `draw_terminal` (ui.rs) carves the pane into two halves with a rule that turns
 accent while the right pane holds the lock; `sync_pty_size` resizes both PTYs to their own rects
 (shared `resize_term` helper). Output/Scrollback/SessionExited/KittyFlags route to whichever pane's
 sref matches; locked-key input routes by `split_focused`; new `HitTarget::SplitTerminalPane` gives
@@ -62,7 +62,24 @@ WITHOUT dropping the lock: the close confirm → `PendingAction::CloseTerminal` 
 `detach_if_attached` → `close_split_terminal` chain hands the lock back to the left pane on its own.
 Test `cmd_w_closes_the_focused_split_pane` (477 green).
 
+Follow-up (screenshot: the split shell also appeared as a `term-2` top-level tab; "nu pot sa scriu
+in pannel-ul facut cu cmmd+d", commit `bb91be4`): the split now OWNS its shell. (1)
+`session_rows_for_worktree` (app.rs) filters out `App::split_sref()` — one funnel covers the tab
+strip, Sessions navigation, and the worktree sub-lists, so the split shell never renders as a row
+anywhere; the palette lists agents only, so it needed nothing. (2) `attach()` (event_loop.rs)
+refuses to mount the split's sref as the left pane — it sets `split_focused` and returns. (3) The
+second ⌘D routes through `close_session` (the ⌘W confirm → `CloseTerminal` → `detach_if_attached` →
+`close_split_terminal` chain) instead of Detach-only, so closing the split kills the shell rather
+than leaking a hidden terminal tab; `close_split_terminal` is now the local teardown only. Tests
+`split_shell_is_not_a_session_tab`, `selecting_tabs_cannot_duplicate_the_split_shell`, and the
+rewritten toggle test (479 green).
+
 **Gotchas:**
+- The "can't type in the split" report was NOT an input-routing bug: single-clicking the duplicate
+  `term-2` tab ran `preview_selected` → `attach()` with the split's own sref — daemon-side, Attach
+  REBINDS the session's forward task (`server.rs` aborts the old one), so the split's parser stopped
+  getting output, and the click set focus=Sessions unlocked, so typing did panel navigation. The
+  pane looked dead; the fix is exclusion + the attach guard, not the key path.
 - The reachable-chord keymap test rejects ⌘-only defaults — `SplitTerminal` needed the plain `|`
   alternate alongside `cmd+d`.
 - The locked-terminal guard was `app.term.is_some() && app.term_locked`; with a split the left pane
