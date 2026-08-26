@@ -897,7 +897,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             app.focus = Focus::Sessions;
             return;
         }
-        // These panel chords still fire inside a locked session: they are
+        // These chords still fire inside a locked session: they are
         // global operations that should not require unlocking first. Only
         // their Cmd-modified chords qualify; anything a child app could
         // plausibly want (plain N, plain E, ^n, …) keeps forwarding.
@@ -929,21 +929,8 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                     toggle_split_terminal(app, out);
                     return;
                 }
-                Some(
-                    action @ (crate::keymap::Action::FocusProjectsPanel
-                    | crate::keymap::Action::FocusOrchestratorsPanel
-                    | crate::keymap::Action::FocusWorktreesPanel
-                    | crate::keymap::Action::FocusSessionsPanel
-                    | crate::keymap::Action::FocusTerminalPanel),
-                ) => {
-                    let focus = match action {
-                        crate::keymap::Action::FocusProjectsPanel => Focus::Projects,
-                        crate::keymap::Action::FocusOrchestratorsPanel => Focus::Orchestrators,
-                        crate::keymap::Action::FocusWorktreesPanel => Focus::Worktrees,
-                        crate::keymap::Action::FocusSessionsPanel => Focus::Sessions,
-                        _ => Focus::Terminal,
-                    };
-                    focus_panel(app, focus, out);
+                Some(action) if action.tab_index().is_some() => {
+                    select_session_tab(app, action.tab_index().unwrap(), out);
                     return;
                 }
                 Some(crate::keymap::Action::ToggleTerminalFullscreen) => {
@@ -1084,11 +1071,18 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             app.splash_preview = true;
             app.collapsed = false;
         }
-        Action::FocusProjectsPanel => focus_panel(app, Focus::Projects, out),
-        Action::FocusOrchestratorsPanel => focus_panel(app, Focus::Orchestrators, out),
-        Action::FocusWorktreesPanel => focus_panel(app, Focus::Worktrees, out),
-        Action::FocusSessionsPanel => focus_panel(app, Focus::Sessions, out),
-        Action::FocusTerminalPanel => focus_panel(app, Focus::Terminal, out),
+        Action::SelectTab1
+        | Action::SelectTab2
+        | Action::SelectTab3
+        | Action::SelectTab4
+        | Action::SelectTab5
+        | Action::SelectTab6
+        | Action::SelectTab7
+        | Action::SelectTab8
+        | Action::SelectTab9 => {
+            let idx = action.tab_index().expect("SelectTabN carries an index");
+            select_session_tab(app, idx, out);
+        }
         Action::FocusNext => {
             app.focus = match app.focus {
                 Focus::Projects => Focus::Orchestrators,
@@ -2164,23 +2158,45 @@ fn create_terminal_for_context(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// history, created automatically on first use.
 const QUICK_TERMINAL_NAME: &str = "quick";
 
-/// ⌘T: toggle the floating quick terminal — a shell on the current branch's
-/// checkout, opened without any picker. "Current" is the attached session's
-/// worktree when input is locked there, otherwise the selection (Projects
-/// focus → the project's main checkout, the same rule `t` uses).
-/// ⌘1–⌘5: jump straight to a panel. Expands collapsed sidebars, closes
-/// the floating quick terminal, and drops the input lock — except ⌘5,
-/// which enters the terminal pane and locks input when a session is
-/// attached (that is what jumping there is for).
-fn focus_panel(app: &mut App, focus: Focus, out: &mut Vec<ClientRequest>) {
+/// ⌘1–⌘9: select the Nth tab of the current worktree's session bar —
+/// terminals and agents alike, the same order the tab bar draws. Closes
+/// the floating quick terminal first. From the panels it selects and
+/// previews (focus moves to the tab bar); from a locked terminal it
+/// switches the attached session and keeps the lock, so tab-hopping
+/// never dumps the user back into the sidebar. A digit past the last
+/// tab does nothing.
+fn select_session_tab(app: &mut App, idx: usize, out: &mut Vec<ClientRequest>) {
     if app.quick_term {
         close_quick_terminal(app, out);
     }
-    if focus != Focus::Terminal {
-        app.collapsed = false;
+    let rows = app.visible_session_rows();
+    let Some(row) = rows.get(idx).cloned() else {
+        return;
+    };
+    let stay_locked = app.term_locked && app.focus == Focus::Terminal;
+    app.sel_session = idx;
+    if row.is_archived_agent() {
+        app.term_locked = false;
+        app.focus = Focus::Sessions;
+        app.flash = Some("agent is archived — unarchive first (u)".into());
+        return;
     }
-    app.focus = focus;
-    app.term_locked = focus == Focus::Terminal && app.term.as_ref().is_some_and(|t| !t.exited);
+    let Some(sref) = row.sref() else {
+        // A link row has no session behind it: select it, leave the pane.
+        app.term_locked = false;
+        app.focus = Focus::Sessions;
+        app.dirty = true;
+        return;
+    };
+    attach(app, sref, out);
+    if stay_locked {
+        // The lock follows the main pane — a ⌘D split hands it over.
+        app.split_focused = false;
+        app.focus = Focus::Terminal;
+        app.term_locked = true;
+    } else {
+        app.focus = Focus::Sessions;
+    }
 }
 
 /// ⌘T: spawn a fresh unnamed shell terminal in the current worktree — a
@@ -8757,12 +8773,13 @@ mod tests {
             },
         );
         assert_eq!(app.orchestrator_row_count(), 1);
-        // Not double-listed in the sessions panel (it lives on w1 too).
+        // …and it also gets a tab under the worktree it runs on (w1), so
+        // the tab bar and ⌘digits reach it like any other session.
         assert!(
-            !app.visible_session_rows()
+            app.visible_session_rows()
                 .iter()
                 .any(|r| matches!(r, SessionRow::Agent(a) if a.orchestrator)),
-            "orchestrators keep out of the sessions list"
+            "an orchestrator shows as a tab under its worktree"
         );
         // Walking up from the first worktree row crosses into the section;
         // `sel_worktree` keeps meaning "worktree row" untouched.
@@ -9110,9 +9127,9 @@ mod tests {
         );
     }
 
-    /// Promoting a session flips it into the ORCHESTRATORS section (and
-    /// out of the sessions list) as soon as its upsert lands; demoting
-    /// flips it back.
+    /// Promoting a session flips it into the ORCHESTRATORS section as
+    /// soon as its upsert lands — while its tab stays under the worktree
+    /// it runs on; demoting flips it back out of the section.
     #[test]
     fn promoting_a_session_moves_it_between_panels() {
         use nebula_core::Entity;
@@ -9155,8 +9172,11 @@ mod tests {
                 entity: Entity::Agent(promoted.clone()),
             },
         );
-        assert!(!in_sessions(&app), "left the sessions list");
         assert_eq!(app.orchestrator_row_count(), 1, "entered the section");
+        assert!(
+            in_sessions(&app),
+            "promotion keeps its tab under the worktree"
+        );
 
         promoted.orchestrator = false;
         hse(
@@ -14243,36 +14263,49 @@ mod tests {
         })
     }
 
-    /// ⌘1–⌘5 jump straight to a panel — from anywhere, a locked terminal
-    /// included; ⌘5 enters the pane and locks input.
+    /// ⌘1–⌘9 walk the current worktree's session tabs — terminals and
+    /// agents alike — not the UI panels. From the panels a digit selects
+    /// and previews; from a locked terminal it switches the attached
+    /// session and keeps the lock; past-the-end digits are no-ops.
     #[test]
-    fn cmd_digits_jump_between_panels() {
+    fn cmd_digits_switch_session_tabs() {
         let mut app = App::new();
-        seed_tree(&mut app);
+        seed_tree(&mut app); // w1: agent-1
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: nebula_core::Entity::Terminal(nebula_core::TerminalTab {
+                    id: nebula_core::TerminalId("t1".into()),
+                    worktree_id: nebula_core::WorktreeId("w1".into()),
+                    name: "term-1".into(),
+                    sort_order: 0,
+                    alive: true,
+                }),
+            },
+        );
         let mut out = Vec::new();
-        for (digit, focus) in [
-            ('2', Focus::Orchestrators),
-            ('3', Focus::Worktrees),
-            ('4', Focus::Sessions),
-            ('1', Focus::Projects),
-        ] {
-            press(&mut app, KeyCode::Char(digit), KeyModifiers::SUPER, &mut out);
-            assert_eq!(app.focus, focus, "⌘{digit}");
-            assert!(!app.term_locked, "⌘{digit} leaves input unlocked");
-        }
+        assert_eq!(app.visible_session_rows().len(), 2);
 
-        // ⌘5 enters the pane and locks input onto the attached session.
-        press(&mut app, KeyCode::Char('\r'), KeyModifiers::NONE, &mut out); // noop guard
-        app.focus = Focus::Sessions;
-        attach(&mut app, SessionRef::Agent(AgentId("a1".into())), &mut out);
-        press(&mut app, KeyCode::Char('5'), KeyModifiers::SUPER, &mut out);
-        assert_eq!(app.focus, Focus::Terminal);
-        assert!(app.term_locked, "⌘5 locks input on the attached session");
-
-        // …and ⌘1 escapes the locked terminal without unlocking by hand.
-        press(&mut app, KeyCode::Char('1'), KeyModifiers::SUPER, &mut out);
-        assert_eq!(app.focus, Focus::Projects, "⌘1 works while locked");
+        // ⌘2 from the panels: selects tab 2 and previews it (no lock).
+        app.focus = Focus::Worktrees;
+        press(&mut app, KeyCode::Char('2'), KeyModifiers::SUPER, &mut out);
+        assert_eq!(app.focus, Focus::Sessions, "⌘2 lands on the tab bar");
         assert!(!app.term_locked);
+        assert_eq!(app.sel_session, 1);
+
+        // ⌘1 while locked in the pane: switch the attach, keep the lock.
+        attach(&mut app, SessionRef::Agent(AgentId("a1".into())), &mut out);
+        app.focus = Focus::Terminal;
+        app.term_locked = true;
+        press(&mut app, KeyCode::Char('1'), KeyModifiers::SUPER, &mut out);
+        assert_eq!(app.sel_session, 0);
+        assert_eq!(app.focus, Focus::Terminal, "⌘1 stays in the pane");
+        assert!(app.term_locked, "tab-hopping keeps the input lock");
+
+        // ⌘9 has no ninth tab to land on: selection stays put.
+        press(&mut app, KeyCode::Char('9'), KeyModifiers::SUPER, &mut out);
+        assert_eq!(app.sel_session, 0, "past-the-end digit is a no-op");
+        assert_eq!(app.focus, Focus::Terminal);
     }
 
     /// The Projects column's bottom half lists every project's live

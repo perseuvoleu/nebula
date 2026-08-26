@@ -2877,14 +2877,15 @@ impl App {
         let now = now_ms();
         // Stable throughout, so ties — never-run rows especially, which all
         // stamp 0 — keep tree order instead of shuffling between frames.
-        // Orchestrators are excluded: they have their own rows in the
-        // Worktrees panel, not a second one under the root checkout.
+        // Orchestrators are included: besides their rows in the Worktrees
+        // panel, they get a tab under the checkout they run on, so ⌘digits
+        // and the tab bar reach them like any other session.
         let collect = |keep: &dyn Fn(&Agent) -> bool| {
             let mut group: Vec<Agent> = self
                 .tree
                 .agents
                 .iter()
-                .filter(|a| &a.worktree_id == worktree && !a.orchestrator && keep(a))
+                .filter(|a| &a.worktree_id == worktree && keep(a))
                 .cloned()
                 .collect();
             group.sort_by_key(|a| recency_key(a, now));
@@ -2898,7 +2899,7 @@ impl App {
                 .tree
                 .agents
                 .iter()
-                .filter(|a| &a.worktree_id == worktree && !a.orchestrator && a.archived)
+                .filter(|a| &a.worktree_id == worktree && a.archived)
                 .cloned()
                 .collect();
             // Most recently archived first; pre-`archived_at` rows (stamp 0)
