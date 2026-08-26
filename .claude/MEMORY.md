@@ -14,6 +14,34 @@ about what is worth recording.
 
 ## Entries
 
+### Shell Tabs Get A Busy Status; Hand Cursor Over Everything Clickable — 2026-08-26
+
+**Asked:** "ok dar cand fac un panel cu terminat si bag claude in el nu vad statusri in stanga daca a
+pornit sau ceva" — plus mid-task: "si vreau hover cursor pointer peste tot pe unde se poate".
+
+**Did:** `TerminalTab` grew `#[serde(default)] busy: bool` (nebula-core entities.rs), derived from
+the live PTY's OSC 9;4 scanner — `session.progress_busy()` — exactly like `alive`, never persisted
+meaningfully (store constructors write `busy: false`). The daemon already ran `ProgressScanner` on
+terminal PTYs and dropped the edge: the `PtyEvent::Progress` arm in registry.rs now broadcasts an
+`EntityUpserted` for terminals (and the `Lagged` reconcile arm too); `terminal_entity` and
+`snapshot()` fill `busy` from the sessions map. TUI: the "❯" glyph in the worktree sublist and the
+tab bar (ui.rs) goes `th.warn` while busy, `th.ok` alive, dim dead — a hand-started `claude` in a
+shell tab lights up like a Running agent. Hover: new `PointerShape::Pointer` ("pointer" in OSC 22)
+plus `pointer_wants_hand` (event_loop.rs) — hand cursor over sidebar rows/tabs/global sessions and
+over every overlay's clickable list rows (Menu/Prompt/Palette/Files/Grep/Diff/Tree/Hosts/Metrics/
+Notes/Todos/Settings tabs+rows), each arm bounded by the same rect + row count its click handler
+uses. Tests: `pty_progress_marks_a_shell_terminal_busy` (e2e_pty, drives busy true→false through
+real PTY bytes), `pointer_shape_hands_over_clickable_rows`. 484 nebula-tui + workspace green;
+`make install`.
+
+**Gotchas:**
+- The busy bit needs the NEW daemon — `nebula kill` (stops all sessions) before it shows; the
+  glyph/pointer halves are TUI-only and just need a new `ng`.
+- Claude Code holds progress at *busy* through a permission prompt (`pty/progress.rs` docs) — a
+  warn-lit terminal tab can mean "waiting on you", same as agents.
+- The splitter grab zone is 2 cells wide and overlaps the first column of the worktree panel's
+  row rects — a hover test aimed at `row_rect.x` gets ColResize; aim at the rect's center.
+
 ### ⌘1–⌘9 Switch Session Tabs; Orchestrators Get A Worktree Tab — 2026-08-26
 
 **Asked:** "deci cand dau cmmd 1,2 ar treb sa mi mute intre taburile din trun worktreee ( temrinale
