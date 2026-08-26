@@ -14,6 +14,34 @@ about what is worth recording.
 
 ## Entries
 
+### ⌘1–⌘9 Switch Session Tabs; Orchestrators Get A Worktree Tab — 2026-08-26
+
+**Asked:** "deci cand dau cmmd 1,2 ar treb sa mi mute intre taburile din trun worktreee ( temrinale
+sau agenti) nu in tot ui ul" — plus mid-task: "cand adaug un orchestrator ar treb sa apara si tab ul
+sub acel wt/branch de care apartine, asta e important".
+
+**Did:** e554ce4. Replaced the five `Focus*Panel` actions with `SelectTab1`–`SelectTab9` (keymap.rs,
+ids `select_tab_N`, NAVIGATE group, `cmd+N` + plain `N`; `Action::tab_index()` maps them to 0-based
+indices). New `select_session_tab` in event_loop.rs: from the panels it selects tab N and previews
+(focus → Sessions); from a locked terminal it switches the attach and KEEPS the lock (a ⌘D split
+hands the lock to the main pane); archived rows flash, link rows only select, past-the-end digits
+no-op. `focus_panel` deleted — panel jumps are back to Tab/⇧Tab/arrows only. Orchestrators: dropped
+the `!a.orchestrator` filters in `sessions_for_worktree` (app.rs), so an orchestrator now shows both
+in the ORCHESTRATORS section and as a tab under its worktree; `session_group_counts_for_worktree`
+never filtered them, so counts already matched. Extended `~/.config/ghostty/nebula` with
+`super+digit_6`..`digit_9` (csi:54–57;9u). Tests: `cmd_digits_switch_session_tabs` replaces
+`cmd_digits_jump_between_panels`; the "orchestrators keep out of the sessions list" assertions in
+`orchestrators_group_tops_the_worktrees_panel_and_enter_attaches` and
+`promoting_a_session_moves_it_between_panels` were flipped. 483 nebula-tui + workspace green;
+`make install`.
+
+**Gotchas:**
+- ctrl+digit chords are `Reach::Risky` in `host_warning` ("most terminals have no encoding") — the
+  only Fine alternates for ⌘digits are the plain digits, which is why the panel-jump actions had to
+  go rather than coexist with tab selection.
+- The exclusion of orchestrators from session tabs was a deliberate earlier decision (comment in
+  `sessions_for_worktree`); the user explicitly reopened it here — don't restore it.
+
 ### Sidebar Rows Put Running Work First — 2026-08-25
 
 **Asked:** "la worktree uri ar treb ordonate dupa cele care ruleaza acum, la fel si la orchestratori sesiuni"
@@ -297,6 +325,10 @@ mods 9 = super). Full workspace green; `make install` run (instruction text is d
   change (same as the `agent wait` entry found).
 
 ### ⌘1–⌘5 Panel Jumps; ⌘T Always Makes A Terminal Tab — 2026-08-25
+
+> **Superseded (2026-08-26):** the ⌘digit half is gone — ⌘1–⌘9 now select the worktree's session
+> tabs (`SelectTabN`, see the 2026-08-26 entry); the `Focus*Panel` actions and `focus_panel` no
+> longer exist. The ⌘T half still stands.
 
 **Asked:** "si pune cand dau cmmd + 1, cmmd 2 etc sa mi dea switch pe pannels" — plus mid-task, after
 trying the previous ⌘T change: "ok dar cmmd t tot nu mi face temrinal nou acolo in tabs".
