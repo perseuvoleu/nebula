@@ -1977,6 +1977,8 @@ pub enum PointerShape {
     Default,
     /// Horizontal-resize arrows over a draggable panel boundary.
     ColResize,
+    /// The hand cursor over anything a click acts on — rows, tabs, buttons.
+    Pointer,
 }
 
 impl PointerShape {
@@ -1985,6 +1987,7 @@ impl PointerShape {
         match self {
             PointerShape::Default => "default",
             PointerShape::ColResize => "col-resize",
+            PointerShape::Pointer => "pointer",
         }
     }
 }
@@ -3189,6 +3192,7 @@ mod tests {
             name: "shell".into(),
             sort_order: 0,
             alive: true,
+            busy: false,
         });
         app.tree
             .links
@@ -3232,6 +3236,7 @@ mod tests {
             name: "shell".into(),
             sort_order: 0,
             alive: true,
+            busy: false,
         });
         app.tree
             .links

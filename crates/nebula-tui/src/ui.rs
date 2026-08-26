@@ -3199,9 +3199,18 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                     agent.name.as_str().to_string(),
                 ),
                 SessionRow::Terminal(terminal) => (
+                    // Busy = whatever runs inside advertises OSC 9;4
+                    // progress (a hand-started `claude`): same warn color
+                    // as a Running agent's dot.
                     Span::styled(
                         "❯ ",
-                        Style::default().fg(if terminal.alive { th.ok } else { th.dim }),
+                        Style::default().fg(if terminal.busy {
+                            th.warn
+                        } else if terminal.alive {
+                            th.ok
+                        } else {
+                            th.dim
+                        }),
                     ),
                     None,
                     terminal.name.clone(),
@@ -3356,9 +3365,17 @@ fn session_tab(
             (dot, Span::styled(truncate(&a.name, name_max), style))
         }
         SessionRow::Terminal(t) => (
+            // Warn while the tab's child advertises OSC 9;4 progress — a
+            // `claude` run by hand inside a shell tab reads as busy.
             Span::styled(
                 "❯ ",
-                Style::default().fg(if t.alive { th.ok } else { th.dim }),
+                Style::default().fg(if t.busy {
+                    th.warn
+                } else if t.alive {
+                    th.ok
+                } else {
+                    th.dim
+                }),
             ),
             Span::styled(truncate(&t.name, name_max), name_style),
         ),

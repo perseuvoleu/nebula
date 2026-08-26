@@ -6529,6 +6529,130 @@ fn pointer_wants_resize(app: &App, column: u16, row: u16) -> bool {
     }
 }
 
+/// True when the cell under the mouse is something a click acts on — a
+/// sidebar row, a session tab, an overlay list row, a settings row — so the
+/// outer terminal can show the hand cursor. Mirrors the click handlers'
+/// own hit-testing: each overlay arm bounds by the same list rect and row
+/// count its `MouseEventKind::Down` arm uses.
+fn pointer_wants_hand(app: &App, column: u16, row: u16) -> bool {
+    if app.vim.is_some() {
+        return false;
+    }
+    let inside = |a: ratatui::layout::Rect| {
+        a.width > 0 && column >= a.x && column < a.x + a.width && row >= a.y && row < a.y + a.height
+    };
+    // Nth row of a windowed list, when the mouse sits on a real row.
+    let list_row = |a: ratatui::layout::Rect, start: usize, len: usize| {
+        inside(a) && (start + (row - a.y) as usize) < len
+    };
+    match &app.overlay {
+        Some(Overlay::Menu(menu)) => {
+            let a = menu.area;
+            let in_rows = column > a.x
+                && column < a.x + a.width
+                && row > a.y
+                && row < a.y + a.height.saturating_sub(1);
+            let visible = a.height.saturating_sub(2) as usize;
+            in_rows
+                && (row - a.y - 1) as usize + menu.scroll_offset(visible) < menu.items.len()
+        }
+        Some(Overlay::Prompt(p)) => list_row(
+            p.list_area,
+            p.window_start(p.list_area.height as usize),
+            p.dirs.len(),
+        ),
+        Some(Overlay::Palette(p)) => list_row(
+            p.list_area,
+            p.window_start(p.list_area.height as usize),
+            p.matches.len(),
+        ),
+        Some(Overlay::Files(f)) => list_row(
+            f.list_area,
+            f.window_start(f.list_area.height as usize),
+            f.matches.len(),
+        ),
+        Some(Overlay::Grep(g)) => list_row(
+            g.list_area,
+            g.window_start(g.list_area.height as usize),
+            g.hits.len(),
+        ),
+        Some(Overlay::Diff(v)) => list_row(
+            v.list_area,
+            v.window_start(v.list_area.height as usize),
+            v.matches.len(),
+        ),
+        Some(Overlay::Tree(t)) => list_row(
+            t.list_area,
+            t.window_start(t.list_area.height as usize),
+            t.rows.len(),
+        ),
+        Some(Overlay::Hosts(h)) => list_row(
+            h.list_area,
+            h.window_start(h.list_area.height as usize),
+            h.hosts.len(),
+        ),
+        Some(Overlay::Metrics(m)) => list_row(m.list_area, m.scroll, m.rows.len()),
+        Some(Overlay::Notes(n)) => {
+            let count = app.tree.notes.iter().filter(|t| t.owner == n.owner).count();
+            list_row(n.list_area, n.window_start(n.list_area.height as usize), count)
+        }
+        Some(Overlay::Todos(t)) => {
+            let (count, row_offset) = match &t.detail {
+                Some(todo_id) => (
+                    app.tree
+                        .notes
+                        .iter()
+                        .filter(|n| n.owner == NoteOwner::Todo(todo_id.clone()))
+                        .count(),
+                    1u16,
+                ),
+                None => (
+                    app.tree.todos.iter().filter(|x| x.owner == t.owner).count(),
+                    0u16,
+                ),
+            };
+            let a = t.list_area;
+            let rows_y = a.y + row_offset;
+            let height = a.height.saturating_sub(row_offset) as usize;
+            inside(a)
+                && row >= rows_y
+                && (t.window_start(height) + (row - rows_y) as usize) < count
+        }
+        Some(Overlay::Settings(view)) => {
+            if view.capture.is_some() || !inside(view.area) {
+                return false;
+            }
+            let on_tab_label = row == view.area.y.saturating_add(1)
+                && view
+                    .tab_hits
+                    .iter()
+                    .any(|(x0, x1)| column >= *x0 && column < *x1);
+            let body = view.body_area;
+            let on_row = body.height > 0
+                && row >= body.y
+                && row < body.y + body.height
+                && crate::config::settings_rows(view.tab)
+                    .get(view.first_row + (row - body.y) as usize)
+                    .and_then(|r| r.index())
+                    .is_some();
+            on_tab_label || on_row
+        }
+        Some(_) => false,
+        None => matches!(
+            app.hit_at(column, row),
+            Some(
+                HitTarget::Project(_)
+                    | HitTarget::Worktree(_)
+                    | HitTarget::WorktreeSession(_, _)
+                    | HitTarget::Orchestrator(_)
+                    | HitTarget::Session(_)
+                    | HitTarget::GlobalSession(_)
+                    | HitTarget::ArchivedHeader
+            )
+        ),
+    }
+}
+
 /// Track the mouse for the resize affordances: the pointer shape the outer
 /// terminal should show (col-resize over any draggable boundary) and the
 /// main-screen grip highlight. Runs on every mouse event — including plain
@@ -6538,6 +6662,8 @@ fn pointer_wants_resize(app: &App, column: u16, row: u16) -> bool {
 fn update_pointer(app: &mut App, mouse: &MouseEvent) {
     app.pointer_shape = if pointer_wants_resize(app, mouse.column, mouse.row) {
         PointerShape::ColResize
+    } else if pointer_wants_hand(app, mouse.column, mouse.row) {
+        PointerShape::Pointer
     } else {
         PointerShape::Default
     };
@@ -12153,6 +12279,7 @@ mod tests {
                     name: "quick".into(),
                     sort_order: 0,
                     alive: true,
+                    busy: false,
                 }),
             },
         );
@@ -12189,6 +12316,7 @@ mod tests {
                     name: "quick".into(),
                     sort_order: 0,
                     alive: false,
+                    busy: false,
                 }),
             },
         );
@@ -12224,6 +12352,7 @@ mod tests {
                     name: "quick".into(),
                     sort_order: 0,
                     alive: true,
+                    busy: false,
                 }),
             },
         );
@@ -12273,6 +12402,7 @@ mod tests {
                     name: "quick".into(),
                     sort_order: 0,
                     alive: true,
+                    busy: false,
                 }),
             },
         );
@@ -12924,6 +13054,7 @@ mod tests {
                     name: name.into(),
                     sort_order: 0,
                     alive: true,
+                    busy: false,
                 }),
             },
         );
@@ -14155,6 +14286,42 @@ mod tests {
         assert!(!app.dirty);
     }
 
+    /// Anything a click acts on shows the hand cursor: a worktree row gets
+    /// `pointer`, plain panel background stays `default`.
+    #[test]
+    fn pointer_shape_hands_over_clickable_rows() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let row_rect = app
+            .hits
+            .iter()
+            .find_map(|(r, t)| matches!(t, HitTarget::Worktree(0)).then_some(*r))
+            .expect("worktree row registered");
+        let mut out = Vec::new();
+
+        handle_mouse(
+            &mut app,
+            mev(
+                MouseEventKind::Moved,
+                row_rect.x + row_rect.width / 2,
+                row_rect.y,
+            ),
+            &mut out,
+        );
+        assert_eq!(app.pointer_shape, PointerShape::Pointer);
+
+        // The terminal pane is not a click target — default there.
+        let a = app.term_area;
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Moved, a.x + a.width / 2, a.y + a.height / 2),
+            &mut out,
+        );
+        assert_eq!(app.pointer_shape, PointerShape::Default);
+    }
+
     #[test]
     fn pointer_shape_holds_while_dragging_past_the_boundary() {
         let mut app = App::new();
@@ -14280,6 +14447,7 @@ mod tests {
                     name: "term-1".into(),
                     sort_order: 0,
                     alive: true,
+                    busy: false,
                 }),
             },
         );
@@ -15580,6 +15748,7 @@ mod tests {
                     name: "shell-1".into(),
                     sort_order: 0,
                     alive: true,
+                    busy: false,
                 }),
             },
         );

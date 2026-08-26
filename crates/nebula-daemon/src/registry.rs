@@ -390,7 +390,12 @@ impl Daemon {
                 a.alive = sessions.contains_key(&SessionRef::Agent(a.id.clone()));
             }
             for t in &mut terminals {
-                t.alive = sessions.contains_key(&SessionRef::Terminal(t.id.clone()));
+                let sref = SessionRef::Terminal(t.id.clone());
+                t.alive = sessions.contains_key(&sref);
+                t.busy = sessions
+                    .get(&sref)
+                    .and_then(|s| s.progress_busy())
+                    .unwrap_or(false);
             }
         }
         Ok(ServerEvent::Snapshot {
@@ -416,7 +421,13 @@ impl Daemon {
 
     fn terminal_entity(&self, id: &TerminalId) -> Result<TerminalTab> {
         let mut term = self.store.get_terminal(id)?.context("terminal not found")?;
-        term.alive = self.is_alive(&SessionRef::Terminal(id.clone()));
+        let sref = SessionRef::Terminal(id.clone());
+        let sessions = self.sessions.lock().unwrap();
+        term.alive = sessions.contains_key(&sref);
+        term.busy = sessions
+            .get(&sref)
+            .and_then(|s| s.progress_busy())
+            .unwrap_or(false);
         Ok(term)
     }
 
@@ -1679,6 +1690,7 @@ impl Daemon {
             name,
             sort_order: 0,
             alive: false,
+            busy: false,
         };
         self.store.insert_terminal(&terminal)?;
         self.spawn_terminal_session(&terminal, &worktree, 80, 24)?;
@@ -2185,21 +2197,39 @@ impl Daemon {
                     // Code fires no Stop for an interrupted turn, and
                     // suppresses the idle notification because the user just
                     // pressed a key. See `pty::progress`.
-                    Ok(PtyEvent::Progress { busy }) => {
-                        if let SessionRef::Agent(id) = &sref {
+                    Ok(PtyEvent::Progress { busy }) => match &sref {
+                        SessionRef::Agent(id) => {
                             daemon.apply_hook_event(id, HookEvent::Progress { busy }, None);
                         }
-                    }
+                        // A shell tab running an agent CLI by hand: surface
+                        // its busy/idle bit as a terminal upsert so the tab
+                        // lights up like an agent's status dot.
+                        SessionRef::Terminal(id) => {
+                            if let Ok(term) = daemon.terminal_entity(id) {
+                                daemon.broadcast(ServerEvent::EntityUpserted {
+                                    entity: Entity::Terminal(term),
+                                });
+                            }
+                        }
+                    },
                     Ok(_) => {}
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         // A fire-hosing child can push progress edges off the
                         // broadcast queue. The scanner itself never lags, so
                         // reconcile from its current reading rather than
                         // leaving the status stuck on a dropped edge.
-                        if let (SessionRef::Agent(id), Some(busy)) =
-                            (&sref, session.progress_busy())
-                        {
-                            daemon.apply_hook_event(id, HookEvent::Progress { busy }, None);
+                        match (&sref, session.progress_busy()) {
+                            (SessionRef::Agent(id), Some(busy)) => {
+                                daemon.apply_hook_event(id, HookEvent::Progress { busy }, None);
+                            }
+                            (SessionRef::Terminal(id), Some(_)) => {
+                                if let Ok(term) = daemon.terminal_entity(id) {
+                                    daemon.broadcast(ServerEvent::EntityUpserted {
+                                        entity: Entity::Terminal(term),
+                                    });
+                                }
+                            }
+                            _ => {}
                         }
                         continue;
                     }

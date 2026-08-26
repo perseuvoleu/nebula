@@ -1145,6 +1145,7 @@ impl Store {
             name: r.get(2).unwrap(),
             sort_order: r.get(3).unwrap(),
             alive: false,
+            busy: false,
         }))
     }
 
@@ -1226,6 +1227,7 @@ impl Store {
                     name: r.get(2)?,
                     sort_order: r.get(3)?,
                     alive: false,
+                    busy: false,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2119,6 +2121,7 @@ mod tests {
                 name: "shell".into(),
                 sort_order: 0,
                 alive: false,
+                busy: false,
             })
             .unwrap();
 

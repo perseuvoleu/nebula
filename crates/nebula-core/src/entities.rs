@@ -193,6 +193,12 @@ pub struct TerminalTab {
     pub sort_order: i64,
     /// True when the daemon currently holds a live PTY for this terminal.
     pub alive: bool,
+    /// True while whatever runs inside advertises OSC 9;4 progress — a
+    /// `claude` started by hand in a shell tab lights up like an agent.
+    /// Derived from the live PTY (never persisted meaningfully), same as
+    /// `alive`.
+    #[serde(default)]
+    pub busy: bool,
 }
 
 /// Who a note list hangs off: a project (high-level notes spanning its

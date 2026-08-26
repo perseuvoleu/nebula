@@ -967,6 +967,87 @@ async fn pty_progress_sequence_drives_status_without_any_hook() {
     wait_for_exit(&mut daemon);
 }
 
+/// A shell terminal tab running an agent CLI by hand: the same OSC 9;4
+/// progress bytes flip the TerminalTab's `busy` bit through terminal
+/// upserts, so the TUI can light the tab like an agent's status dot.
+#[tokio::test]
+async fn pty_progress_marks_a_shell_terminal_busy() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let mut daemon = env.spawn_daemon();
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateTerminal {
+            req_id: 2,
+            worktree: worktree.id.clone(),
+            name: None,
+        },
+    )
+    .await
+    .unwrap();
+    let events =
+        read_events_until(&mut c, Duration::from_secs(5), |evs| find_ack(evs, 2).is_some()).await;
+    let ServerEvent::Ack {
+        created: Some(EntityId::Terminal(term_id)),
+        ..
+    } = find_ack(&events, 2).unwrap()
+    else {
+        panic!("CreateTerminal failed: {events:#?}");
+    };
+    let term_id = term_id.clone();
+
+    let sref = SessionRef::Terminal(term_id.clone());
+    write_frame(
+        &mut c,
+        &ClientRequest::Attach {
+            session: sref.clone(),
+            from_seq: None,
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await
+    .unwrap();
+
+    let emit = |state: &str| format!("printf '\\033]9;4;{state};\\007'\n").into_bytes();
+    let busy_upsert = |evs: &[ServerEvent], want: bool| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: nebula_core::Entity::Terminal(t) }
+                if t.id == term_id && t.busy == want)
+        })
+    };
+
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session: sref.clone(),
+            data: emit("3"),
+        },
+    )
+    .await
+    .unwrap();
+    read_events_until(&mut c, Duration::from_secs(10), |evs| busy_upsert(evs, true)).await;
+
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session: sref.clone(),
+            data: emit("0"),
+        },
+    )
+    .await
+    .unwrap();
+    read_events_until(&mut c, Duration::from_secs(10), |evs| busy_upsert(evs, false)).await;
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
 /// `nebula agent wait <name>` — the orchestrator's blocking verb: it must
 /// error out (nonzero) while the worker is still running past --timeout,
 /// and unblock with the settled row as JSON the moment the worker leaves
