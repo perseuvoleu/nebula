@@ -14,6 +14,29 @@ about what is worth recording.
 
 ## Entries
 
+### Notifications Rerouted Through Ghostty OSC 777 — 2026-08-27
+
+**Asked:** "as vrea sa am notificari in sus pe mac cand se termina un agent sau trebuie sa fac ceva"
+— the 2026-08-24 osascript notifications never showed for the user.
+
+**Did:** Root cause confirmed live: `osascript -e 'display notification …'` exits 0 but macOS shows
+nothing (the toast posts as "Script Editor" and gets dropped; user verified no banner). Fix:
+`post_notification` (event_loop.rs) now takes `&mut App`; under `TERM_PROGRAM=ghostty` (or test) it
+pushes `("nebula — <reason>", "<project>/<agent>")` onto new `App.notify_queue`, which the main loop
+drains next to the pointer-shape emitter as `\x1b]777;notify;title;body\x1b\\` — Ghostty posts a
+native macOS notification under its own identity. `escape_osc777` strips control bytes everywhere
+and `;` from the title. Non-Ghostty macOS keeps the osascript fallback. Gate/cooldown/toggle
+unchanged (`should_notify`: unfocused + →NeedsFeedback or Running→Finished; 30s per agent;
+`notifications` setting). The user's ghostty config already has `desktop-notifications = true`.
+Test extended: `status_flip_notifies_only_while_unfocused` asserts the queued pair. 484 green;
+`make install`.
+
+**Gotchas:**
+- `osascript` notifications silently no-op on this Mac despite exit 0 — never trust the exit code,
+  ask the user whether a banner appeared.
+- Ghostty (like our own gate) suppresses notifications for the focused window — both layers agree,
+  but it means you can't test by watching the focused nebula window.
+
 ### Shell Tabs Get A Busy Status; Hand Cursor Over Everything Clickable — 2026-08-26
 
 **Asked:** "ok dar cand fac un panel cu terminat si bag claude in el nu vad statusri in stanga daca a
