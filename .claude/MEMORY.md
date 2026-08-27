@@ -14,6 +14,37 @@ about what is worth recording.
 
 ## Entries
 
+### Unseen-Finished Sessions Render Blue; Visiting A Worktree Clears Them All — 2026-08-27
+
+**Asked:** "sesiunile care s au terminat si nu am intrat inca pe ele trebuie sa aiba un border
+albastru, dar daca intru pe o sesiune de pe un wt ar treb sa se valideze toate care au terminat ca sa
+nu treb sa intru prin toate".
+
+**Did:** Commit `27e0a65`. TUI-only (no daemon/protocol change). New `Theme.info` role (blue) in
+theme.rs. `App.unseen_finished: HashSet<AgentId>` (app.rs) with `worktree_of_sref` /
+`mark_worktree_seen`; `mark_unseen_finished` (event_loop.rs, next to `should_notify`) runs on any
+→Finished flip from BOTH the `StatusChanged` arm and `apply_upsert`'s Agent arm (Lagged reconcile),
+skipping when either pane (`term`/`split_term`) is attached on the same worktree — a finish on the
+worktree you're watching is seen live, whole-worktree, not just the exact session. Clearing sits at
+the top of `attach()` and `attach_split()` (every entry point funnels through them); archiving an
+agent or any removal cascade drops its mark. Rendering via shared `unseen_dot`/`unseen_or` helpers
+(ui.rs, above `status_dot`): blue dot + name on session tabs, worktree sub-list rows, global
+SESSIONS pills, and orchestrator rows. Persisted: `UiState.unseen_finished` (sorted ids,
+`#[serde(default)]`), restored only for still-Finished unarchived agents and only ONCE per process
+(`App.unseen_restored`). Tests: `finishing_while_unattached_marks_unseen_and_renders_blue` (asserts
+buffer fg on all three surfaces via hit rects), `attaching_a_sibling_session_marks_the_whole_worktree_seen`,
+`finishing_while_attached_never_marks_unseen`, `unseen_marks_roundtrip_through_ui_state`. 488
+nebula-tui + full workspace green. No `make install` (orchestrator installs after merge).
+
+**Gotchas:**
+- `restore_ui_state` runs on EVERY Snapshot, including daemon reconnects mid-session — restoring the
+  unseen set from the stale quit-time blob resurrected marks the user had already cleared by
+  visiting. Any new UiState field whose runtime value can diverge from the blob needs a
+  restore-once gate (`App.unseen_restored`).
+- The selected session tab renders `th.text` bold, so a blue-accent screen test must park
+  `sel_session` on a sibling tab first; selection previews→attaches, which clears the mark, so a
+  selected-and-unseen tab basically can't exist live.
+
 ### Notifications Rerouted Through Ghostty OSC 777 — 2026-08-27
 
 **Asked:** "as vrea sa am notificari in sus pe mac cand se termina un agent sau trebuie sa fac ceva"
