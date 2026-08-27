@@ -78,8 +78,16 @@ nebula agent list   # your workers, with status, as JSON\n  \
 nebula agent wait [<name>...] [--timeout <secs>]   # block until workers \
 settle\n\nRules: stay in \
 your own checkout (wherever it is — orchestrators may run on any branch) — \
-never cd into workers' worktrees, spawn workers there instead; \
-split independent work across worktrees so workers don't collide. After \
+never cd into workers' worktrees. A single feature or fix belongs directly \
+on YOUR branch, done in your own checkout — do not create a worktree for \
+every task. Reach for worktrees only when the user hands you several \
+independent tickets that should run in parallel (one worktree per ticket so \
+workers don't collide), and ALWAYS ask the user before creating any \
+worktree — propose the split and wait for their ok. Merging is the user's \
+call too: when a worker's result is verified, ask whether to merge; only \
+after approval merge it and clean up with `nebula worktree delete <branch>` \
+(removes the local checkout AND nebula's row), then delete the merged git \
+branch. After \
 delegating, do NOT end your turn and do NOT hand-roll sleep loops: run \
 `nebula agent wait` (all your workers) or `nebula agent wait <name>...` \
 (specific ones) — it blocks until each leaves running and prints their \
