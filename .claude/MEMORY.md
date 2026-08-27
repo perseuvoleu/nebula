@@ -14,6 +14,35 @@ about what is worth recording.
 
 ## Entries
 
+### WORKTREES Takes The Column Rows ORCHESTRATORS Does Not Need — 2026-08-27
+
+**Asked:** "as vrea sa am si sectiunea de wt sa fie 70% din asta, si mai redu spatiile intre
+elemente etc ca sa incapa mai multe" — the orchestrators half was mostly empty while worktrees
+were cramped.
+
+**Did:** Commit `8cc177b` (branch worktree-section-70-compact). The fixed 50/50 split of the
+shared column is gone: new `orchestrator_section_rows(list_h, entries)` (ui.rs, above
+`worktree_section_rects`) gives ORCHESTRATORS `entries · PILL_H` rows capped at 30% of the list
+(floored at one pill), and WORKTREES gets everything below — a long orchestrator list scrolls
+inside its band via the existing `scroll_skip(…, mid)`. `worktree_section_rects` grew an
+`orch_entries` param so the PanelBg hit rects and the focus tint use the same boundary; the count
+comes from new `orchestrator_entry_count(app)` (real rows, or 1 for the "+ new orchestrator"
+placeholder). Spacing: the blank row under the WORKTREES header (`screen_row += 2` → `+= 1`) and
+the quiet row after the primary checkout (both its `wt_heights` `+1` and the draw-loop
+guide-through-quiet-row block) are gone. Tests:
+`worktrees_take_the_column_rows_orchestrators_do_not_need`,
+`orchestrators_never_take_more_than_a_third_of_the_column` (event_loop.rs). 494 nebula-tui + full
+workspace green; `make install` (TUI-only).
+
+**Gotchas:**
+- The old screen tests all held: they assert positions relative to found cells, not absolute rows —
+  the height-accounting trap only fires if `wt_heights` and the draw loop disagree, and both edits
+  were made in the same diff.
+- `find_cell("agent-1")` grabs the terminal header's tab first; pin sub-row shapes with the
+  glyph-order prefix ("claude agent-1" — the header renders "agent-1 claude").
+- The list area for the 30% math is `screen − 3 header rows − 1 footer row`; a 20-row TestBackend
+  gives a 16-row list, band = 4.
+
 ### Nested Worktree Rows Draw Tree Guide Lines — 2026-08-27
 
 **Asked:** "as putea sa am si linie vizuala intre ele sau ceva?" — follow-up to the worktree
