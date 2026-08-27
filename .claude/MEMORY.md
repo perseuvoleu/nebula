@@ -14,6 +14,31 @@ about what is worth recording.
 
 ## Entries
 
+### Section Boundary Rules, d Deletes Branch Rows, 5-Pill Orchestrator Band — 2026-08-27
+
+**Asked:** "ar treb sa fie un separator o linie alba intre sectiuni ca nu mi dau seama acum unde
+incepe" — plus mid-turn: "si vreau sa mearrga si pe astea sa dau d ca sa pot sterge ca la restul"
+(branch rows) and "si vreau putin mai mare sectiunea de orchestratori sa incapa cam 5 elemente maxim".
+
+**Did:** Commit `2fc4123` (branch sidebar-section-separator, TUI-only). New `render_section_rule`
+(ui.rs, above `divider_spans`) draws a dim full-width `─` row; it owns the `mid` boundary row in
+both `draw_worktrees` (WORKTREES & BRANCHES header now at `mid+1`) and `draw_global_sessions`
+(SESSIONS header at `mid+1`) — everything below shifts through `screen_row`, so `avail`/scroll_skip/
+hit rects self-account and `worktree_section_rects` is untouched (the rule row lands in the bottom
+section's PanelBg/tint rect, which reads fine). `open_delete_confirm`'s `Focus::Worktrees` arm got
+an `else if selected_branch_row()` branch opening the same DeleteBranch confirm as the row menu.
+`orchestrator_section_rows` cap changed from 30% of the list to `entries.clamp(1,5) · PILL_H`,
+still capped at half the list on short windows. Tests: rule asserts folded into the two boundary
+tests (renamed `orchestrators_never_take_more_than_five_pills_or_half_the_column`), new
+`a_dim_rule_sits_above_the_global_sessions_header` and `d_on_a_branch_row_opens_the_delete_confirm`.
+506 nebula-tui + workspace green; `make install`.
+
+**Gotchas:**
+- A 20-row TestBackend gives a **15**-row list for the band math, not 16 (an earlier entry said 16 —
+  both divide to 4 under the old `*3/10`, so the error was invisible until the half-list cap).
+- The sessions section's "… N above" hint renders at `screen_row - 1` — the blank row under the
+  SESSIONS header must survive the shift (header +1, content +2), or the hint overwrites the header.
+
 ### Session Switching Reuses The Parser And Asks For A Scrollback Delta — 2026-08-27
 
 **Asked:** "Make switching between worktrees/sessions fast by reusing the terminal parser and
@@ -104,8 +129,8 @@ workspace green; `make install` (TUI-only).
   were made in the same diff.
 - `find_cell("agent-1")` grabs the terminal header's tab first; pin sub-row shapes with the
   glyph-order prefix ("claude agent-1" — the header renders "agent-1 claude").
-- The list area for the 30% math is `screen − 3 header rows − 1 footer row`; a 20-row TestBackend
-  gives a 16-row list, band = 4.
+- The band math's list area on a 20-row TestBackend is 15 rows, not 16 (measured on 2026-08-27 when
+  the cap moved to half-list); the 30% cap itself is gone — see the 5-pill entry above.
 ### Worktree Panel Lists Checkout-less Branches; New-Branch Flow — 2026-08-27
 
 **Asked:** "aici vreau sa am si pentru new branch cu aceeasi regula de la primary primul sau altele,
