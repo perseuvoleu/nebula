@@ -2217,6 +2217,11 @@ pub struct App {
     /// When each agent last posted a notification, so a flapping status
     /// can't spam the notification center (30s cooldown per agent).
     pub notified_at: HashMap<AgentId, std::time::Instant>,
+    /// Desktop notifications waiting to ride the output stream as OSC 777
+    /// (`(title, body)` pairs); the event loop drains and emits them. Used
+    /// when the host terminal posts its own notifications (Ghostty) —
+    /// macOS silently drops `osascript` toasts on most setups.
+    pub notify_queue: Vec<(String, String)>,
 }
 
 impl Default for App {
@@ -2304,6 +2309,7 @@ impl App {
             window_focused: true,
             notifications: true,
             notified_at: HashMap::new(),
+            notify_queue: Vec::new(),
         }
     }
 

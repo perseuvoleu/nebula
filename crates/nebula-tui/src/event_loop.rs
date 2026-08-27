@@ -456,6 +456,22 @@ async fn main_loop(
             let _ = backend.flush();
         }
 
+        // Queued desktop notifications ride the output stream as OSC 777;
+        // the host terminal (Ghostty) posts them natively.
+        if !app.notify_queue.is_empty() {
+            use std::io::Write;
+            let backend = terminal.backend_mut();
+            for (title, body) in app.notify_queue.drain(..) {
+                let _ = write!(
+                    backend,
+                    "\x1b]777;notify;{};{}\x1b\\",
+                    escape_osc777(&title, ';'),
+                    escape_osc777(&body, '\0'),
+                );
+            }
+            let _ = backend.flush();
+        }
+
         for req in out.drain(..) {
             if channels.tx.send(req).await.is_err() {
                 if app.conn == ConnState::Connected {
@@ -7943,14 +7959,24 @@ fn notify_status_change(app: &mut App, agent: &AgentId, reason: &'static str) {
         .unwrap_or("?");
     let body = format!("{project}/{}", a.name);
     app.notified_at.insert(agent.clone(), now);
-    post_notification(&body, reason);
+    post_notification(app, &body, reason);
 }
 
-/// Fire-and-forget `osascript` notification; the child is never waited on.
-/// macOS-only, and inert under test so the suite doesn't pepper the
-/// notification center.
-fn post_notification(body: &str, reason: &str) {
-    if cfg!(test) || !cfg!(target_os = "macos") {
+/// Post a desktop notification. Under Ghostty (and under test) it queues
+/// an OSC 777 for the event loop to write into the output stream — the
+/// terminal posts a native notification under its own identity, which is
+/// the only path macOS reliably shows: `osascript` toasts arrive as
+/// "Script Editor" and get silently dropped on most setups. Elsewhere on
+/// macOS the `osascript` fallback still fires (never waited on).
+fn post_notification(app: &mut App, body: &str, reason: &str) {
+    let host_posts = cfg!(test)
+        || std::env::var("TERM_PROGRAM").is_ok_and(|p| p.eq_ignore_ascii_case("ghostty"));
+    if host_posts {
+        app.notify_queue
+            .push((format!("nebula — {reason}"), body.to_string()));
+        return;
+    }
+    if !cfg!(target_os = "macos") {
         return;
     }
     let script = format!(
@@ -7965,6 +7991,20 @@ fn post_notification(body: &str, reason: &str) {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn();
+}
+
+/// OSC 777 payload fields ride inside the escape itself: control bytes
+/// would end it early, and a `;` in the title would shift the body over.
+fn escape_osc777(s: &str, field_break: char) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_control() || c == field_break {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 /// Backslashes and quotes would end the AppleScript string literal.
@@ -11813,6 +11853,16 @@ mod tests {
             .notified_at
             .get(&AgentId("a1".into()))
             .expect("the unfocused needs-feedback flip records a notification");
+        // …and queues the OSC 777 the event loop will write out (under
+        // test, post_notification always takes the queue path).
+        assert_eq!(
+            app.notify_queue.as_slice(),
+            &[(
+                "nebula — needs feedback".to_string(),
+                "demo/agent-1".to_string()
+            )],
+            "the flip queues a host-terminal notification"
+        );
 
         // Flapping back within the 30s cooldown stays silent: the recorded
         // instant doesn't move.
