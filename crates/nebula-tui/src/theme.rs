@@ -36,6 +36,9 @@ pub struct Theme {
     pub warn: Color,
     /// Needs feedback / deleted / destructive actions.
     pub err: Color,
+    /// Unseen-finished sessions: finished while the user was attached
+    /// elsewhere, not visited since.
+    pub info: Color,
     /// Terminated sessions and the session kind badge.
     pub special: Color,
     /// Selected-row fill in the focused panel (a subtle raised surface,
@@ -71,6 +74,7 @@ impl Default for Theme {
             ok: Color::Green,
             warn: Color::Yellow,
             err: Color::Red,
+            info: Color::Blue,
             special: Color::Magenta,
             sel_bg: Color::Indexed(237),
             sel_bg_dim: Color::Indexed(235),

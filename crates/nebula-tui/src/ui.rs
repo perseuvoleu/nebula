@@ -2350,6 +2350,26 @@ fn status_name_spans(
 /// the space it costs. Below this the label drops and the name gets it all.
 const MIN_SESSION_NAME_W: usize = 8;
 
+/// The status dot with the unseen-finished override: blue when the session
+/// finished while the user was attached elsewhere and hasn't been visited
+/// since (cleared per-worktree on attach).
+fn unseen_dot(unseen: bool, status: Option<AgentStatus>, th: Theme) -> Span<'static> {
+    if unseen {
+        Span::styled("● ", Style::default().fg(th.info))
+    } else {
+        status_dot(status, th)
+    }
+}
+
+/// A row name's style with the same unseen-finished override as the dot.
+fn unseen_or(unseen: bool, th: Theme, fallback: Style) -> Style {
+    if unseen {
+        Style::default().fg(th.info)
+    } else {
+        fallback
+    }
+}
+
 fn status_dot(status: Option<AgentStatus>, th: Theme) -> Span<'static> {
     match status {
         Some(AgentStatus::Fresh) => Span::styled("● ", Style::default().fg(th.dim)),
@@ -2776,10 +2796,11 @@ fn draw_global_sessions(f: &mut Frame, app: &mut App, inner: Rect, mid: usize) {
             break;
         }
         let roll = Some(a.status);
-        let mut spans = vec![status_dot(roll, th)];
+        let unseen = app.unseen_finished.contains(&a.id);
+        let mut spans = vec![unseen_dot(unseen, roll, th)];
         spans.extend(status_name_spans(
             truncate(&a.name, (inner.width as usize).saturating_sub(3)),
-            Style::default().fg(th.muted),
+            unseen_or(unseen, th, Style::default().fg(th.muted)),
             sweep_ramp(roll, th, app.animations),
             app.sweep_phase(),
         ));
@@ -2923,7 +2944,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     // Each orchestrator row also names the branch of the worktree it sits
     // on — they can live on any checkout now, so the branch is the row's
     // where.
-    let orchestrators: Vec<(String, AgentStatus, Option<String>, &'static str)> = app
+    let orchestrators: Vec<(String, AgentStatus, Option<String>, &'static str, bool)> = app
         .project_orchestrators()
         .iter()
         .map(|a| {
@@ -2936,6 +2957,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                     .find(|w| w.id == a.worktree_id)
                     .map(|w| w.branch.clone()),
                 a.kind.as_str(),
+                app.unseen_finished.contains(&a.id),
             )
         })
         .collect();
@@ -2995,7 +3017,9 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         app.sel_orchestrator.unwrap_or(0),
         mid,
     );
-    for (i, (name, status, branch, kind)) in orchestrators.iter().enumerate().skip(orch_skip) {
+    for (i, (name, status, branch, kind, unseen)) in
+        orchestrators.iter().enumerate().skip(orch_skip)
+    {
         if screen_row + PILL_H as usize > mid
             || row_rect(inner, screen_row + PILL_H as usize - 1).is_none()
         {
@@ -3003,7 +3027,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         }
         let roll = Some(*status);
         let ramp = sweep_ramp(roll, th, app.animations);
-        let mut spans = vec![status_dot(roll, th)];
+        let mut spans = vec![unseen_dot(*unseen, roll, th)];
         const ORCH_BADGE: &str = " ◆";
         let branch_label = branch
             .as_ref()
@@ -3030,7 +3054,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         }
         spans.extend(status_name_spans(
             truncate(name, max),
-            Style::default(),
+            unseen_or(*unseen, th, Style::default()),
             ramp,
             app.sweep_phase(),
         ));
@@ -3192,9 +3216,10 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             let Some(r) = row_rect(inner, screen_row + worktree_height + session_index) else {
                 break;
             };
+            let unseen = matches!(session, SessionRow::Agent(a) if app.unseen_finished.contains(&a.id));
             let (glyph, detail, name) = match session {
                 SessionRow::Agent(agent) => (
-                    status_dot(Some(agent.status), th),
+                    unseen_dot(unseen, Some(agent.status), th),
                     Some(agent.kind.as_str()),
                     agent.name.as_str().to_string(),
                 ),
@@ -3239,7 +3264,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             if let Some(detail) = detail {
                 spans.push(Span::styled(detail, dim));
             }
-            spans.push(Span::styled(name, dim));
+            spans.push(Span::styled(name, unseen_or(unseen, th, dim)));
             f.render_widget(Paragraph::new(Line::from(spans)), r);
             app.hits
                 .push((r, HitTarget::WorktreeSession(i, session_index)));
@@ -3344,15 +3369,18 @@ fn session_tab(
                     (None, None) => "default".to_string(),
                 };
             }
+            let unseen = app.unseen_finished.contains(&a.id);
             let dot = if a.archived {
                 Span::styled("⊘ ", Style::default().fg(th.dim))
             } else {
-                status_dot(Some(a.status), th)
+                unseen_dot(unseen, Some(a.status), th)
             };
             let style = if a.archived && !selected {
                 Style::default().fg(th.dim)
             } else {
-                name_style
+                // The selected tab keeps its bold text color — selection
+                // previews (attaches), which clears the mark anyway.
+                unseen_or(unseen && !selected, th, name_style)
             };
             // The selected tab carries the harness badge (the old column
             // badged every row; the bar only has room to badge one).

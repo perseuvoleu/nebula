@@ -639,6 +639,16 @@ fn ui_state_json(app: &App) -> String {
         collapsed: app.collapsed,
         panel_widths: Some(app.panel_widths.to_vec()),
         diff_files_width: Some(app.diff_files_width),
+        unseen_finished: {
+            // Sorted so the persisted blob is stable across saves.
+            let mut ids: Vec<String> = app
+                .unseen_finished
+                .iter()
+                .map(|id| id.to_string())
+                .collect();
+            ids.sort();
+            ids
+        },
     };
     serde_json::to_string(&state).unwrap_or_else(|_| "{}".into())
 }
@@ -686,6 +696,24 @@ fn restore_ui_state(app: &mut App, json: &str) {
             .position(|r| matches!(r, SessionRow::Agent(a) if a.id.as_str() == sid))
         {
             app.sel_session = i;
+        }
+    }
+    // Unseen marks come back only for agents the snapshot still knows as
+    // Finished and unarchived — anything restarted, archived, or gone in
+    // the meantime dropped its accent for good. First snapshot only: the
+    // blob is from the last quit, and a reconnect mid-session must not
+    // resurrect marks already cleared by visiting.
+    if app.unseen_restored {
+        return;
+    }
+    app.unseen_restored = true;
+    for id in state.unseen_finished {
+        let id = AgentId(id);
+        let still_finished = app.tree.agents.iter().any(|a| {
+            a.id == id && a.status == nebula_core::AgentStatus::Finished && !a.archived
+        });
+        if still_finished {
+            app.unseen_finished.insert(id);
         }
     }
 }
@@ -2314,6 +2342,10 @@ fn close_split_terminal(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// Attach the ⌘D-created shell in the split's right pane and lock input
 /// onto it. The left pane's attachment is untouched.
 fn attach_split(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
+    // Same visit rule as `attach`: the split pane is on the worktree too.
+    if let Some(worktree) = app.worktree_of_sref(&sref) {
+        app.mark_worktree_seen(&worktree);
+    }
     if let Some(existing) = app.split_term.take() {
         if existing.sref != sref {
             out.push(ClientRequest::Detach {
@@ -6116,6 +6148,12 @@ fn mark_pr_seen(app: &mut App, url: &str, out: &mut Vec<ClientRequest>) {
 }
 
 fn attach(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
+    // Entering ANY session of a worktree marks all of its unseen-finished
+    // sessions seen at once — before the dedupe early-returns below, so
+    // re-entering the already-attached session still counts as a visit.
+    if let Some(worktree) = app.worktree_of_sref(&sref) {
+        app.mark_worktree_seen(&worktree);
+    }
     // The ⌘D split's shell never mounts as the left/primary pane: that
     // would show the same PTY in both halves, and the second Attach
     // rebinds the daemon-side forward task out from under the split.
@@ -7933,6 +7971,29 @@ fn should_notify(
     }
 }
 
+/// A session just flipped to Finished: give it the blue "unseen" accent
+/// unless the user is currently attached inside its worktree (either
+/// pane) — a finish on the worktree they're watching counts as seen, so
+/// it never needs clicking away. The accent clears per-worktree on the
+/// next [`attach`].
+fn mark_unseen_finished(app: &mut App, agent: &AgentId) {
+    let Some(a) = app.tree.agents.iter().find(|a| &a.id == agent) else {
+        return;
+    };
+    if a.archived {
+        return;
+    }
+    let worktree = a.worktree_id.clone();
+    let viewing = [app.term.as_ref(), app.split_term.as_ref()]
+        .into_iter()
+        .flatten()
+        .any(|t| app.worktree_of_sref(&t.sref).as_ref() == Some(&worktree));
+    if !viewing {
+        app.unseen_finished.insert(agent.clone());
+        app.dirty = true;
+    }
+}
+
 /// Rate-limit and resolve "<project>/<agent>" for a flip [`should_notify`]
 /// approved, then hand off to [`post_notification`]. Tests assert against
 /// the `notified_at` map — everything but the spawn runs under test.
@@ -8099,14 +8160,20 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             // sessions; keep every cursor on the entity it already held.
             let before = selection_snapshot(app);
             let mut notify = None;
+            let mut finished = false;
             if let Some(a) = app.tree.agents.iter_mut().find(|a| a.id == agent) {
                 notify = should_notify(a.status, status, app.window_focused);
+                finished =
+                    status == AgentStatus::Finished && a.status != AgentStatus::Finished;
                 a.status = status;
                 a.status_changed_at = changed_at;
                 app.dirty = true;
             }
             if let Some(reason) = notify {
                 notify_status_change(app, &agent, reason);
+            }
+            if finished {
+                mark_unseen_finished(app, &agent);
             }
             reconcile_selection(app, before, out);
         }
@@ -8372,10 +8439,27 @@ fn apply_upsert(app: &mut App, entity: nebula_core::Entity) {
             Some(existing) => *existing = w,
             None => app.tree.worktrees.push(w),
         },
-        Entity::Agent(a) => match app.tree.agents.iter_mut().find(|x| x.id == a.id) {
-            Some(existing) => *existing = a,
-            None => app.tree.agents.push(a),
-        },
+        Entity::Agent(a) => {
+            let id = a.id.clone();
+            let prev = app.tree.agents.iter().find(|x| x.id == id).map(|x| x.status);
+            let archived = a.archived;
+            let status = a.status;
+            match app.tree.agents.iter_mut().find(|x| x.id == a.id) {
+                Some(existing) => *existing = a,
+                None => app.tree.agents.push(a),
+            }
+            // An upsert can carry a status flip too (the daemon's Lagged
+            // reconcile path re-sends whole entities): same unseen marking
+            // as StatusChanged. Archiving is acting on the session — the
+            // accent has done its job.
+            if archived {
+                app.unseen_finished.remove(&id);
+            } else if status == AgentStatus::Finished
+                && prev.is_some_and(|p| p != AgentStatus::Finished)
+            {
+                mark_unseen_finished(app, &id);
+            }
+        }
         Entity::Terminal(t) => match app.tree.terminals.iter_mut().find(|x| x.id == t.id) {
             Some(existing) => *existing = t,
             None => app.tree.terminals.push(t),
@@ -8547,6 +8631,11 @@ fn apply_removal(app: &mut App, id: &nebula_core::EntityId) {
         }
         EntityId::Link(id) => app.tree.links.retain(|l| &l.id != id),
     }
+    // Whatever the removal cascaded over, an unseen mark without its agent
+    // has nothing left to accent.
+    let tree = &app.tree;
+    app.unseen_finished
+        .retain(|id| tree.agents.iter().any(|a| &a.id == id));
     // A note modal aimed at a vanished owner has nothing left to show.
     if let Some(Overlay::Notes(view)) = &app.overlay {
         let gone = match &view.owner {
@@ -11898,6 +11987,219 @@ mod tests {
         assert!(
             app.notified_at.contains_key(&AgentId("a1".into())),
             "an unfocused finished run notifies"
+        );
+    }
+
+    /// Upsert a plain (non-orchestrator) agent for the unseen-finished
+    /// tests, mirroring seed_tree's a1 shape.
+    fn seed_agent(app: &mut App, id: &str, worktree: &str) {
+        use nebula_core::{Agent, AgentStatus, Entity};
+        hse(
+            app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(Agent {
+                    id: AgentId(id.into()),
+                    worktree_id: WorktreeId(worktree.into()),
+                    name: id.into(),
+                    status: AgentStatus::Fresh,
+                    archived: false,
+                    archived_at: 0,
+                    pinned: false,
+                    kind: nebula_core::AgentKind::Claude,
+                    model: None,
+                    effort: None,
+                    session_id: None,
+                    sort_order: 1,
+                    status_changed_at: 0,
+                    orchestrator: false,
+                    alive: true,
+                }),
+            },
+        );
+    }
+
+    fn finish(app: &mut App, id: &str) {
+        use nebula_core::AgentStatus;
+        hse(
+            app,
+            ServerEvent::StatusChanged {
+                agent: AgentId(id.into()),
+                status: AgentStatus::Finished,
+                changed_at: crate::app::now_ms(),
+            },
+        );
+    }
+
+    /// A session that finishes while nothing of its worktree is attached
+    /// gets the blue "unseen" accent everywhere it renders: the session
+    /// tab bar, the worktree sub-list, and the global SESSIONS section.
+    #[test]
+    fn finishing_while_unattached_marks_unseen_and_renders_blue() {
+        let mut app = App::new();
+        seed_tree(&mut app); // a1 on w1, nothing attached
+        seed_agent(&mut app, "a2", "w1");
+        finish(&mut app, "a1");
+        assert!(
+            app.unseen_finished.contains(&AgentId("a1".into())),
+            "an away finish marks the session unseen"
+        );
+        assert!(
+            !app.unseen_finished.contains(&AgentId("a2".into())),
+            "only the finished session is marked"
+        );
+
+        // Keep a1's tab unselected so its blue (not the selected-tab
+        // text color) is what renders.
+        let rows = app.visible_session_rows();
+        let index_of = |id: &str| {
+            rows.iter()
+                .position(
+                    |r| matches!(r, SessionRow::Agent(a) if a.id.as_str() == id),
+                )
+                .unwrap()
+        };
+        let a1_tab = index_of("a1");
+        app.sel_session = index_of("a2");
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let th = app.theme;
+        let rect_of = |hits: &[(ratatui::layout::Rect, HitTarget)], want: &HitTarget| {
+            hits.iter()
+                .find_map(|(rect, target)| (target == want).then_some(*rect))
+                .unwrap_or_else(|| panic!("{want:?} has a hit rect"))
+        };
+        // The tab bar: " " + dot + name.
+        let tab = rect_of(&app.hits, &HitTarget::Session(a1_tab));
+        assert_eq!(buffer[(tab.x + 1, tab.y)].fg, th.info, "tab dot is blue");
+        assert_eq!(buffer[(tab.x + 3, tab.y)].fg, th.info, "tab name is blue");
+        // The worktree sub-list row under w1 (indent + dot + kind + name).
+        let a1_row = app
+            .worktree_session_rows(&WorktreeId("w1".into()))
+            .iter()
+            .position(|r| matches!(r, SessionRow::Agent(a) if a.id.as_str() == "a1"))
+            .unwrap();
+        let sub = rect_of(&app.hits, &HitTarget::WorktreeSession(0, a1_row));
+        assert_eq!(buffer[(sub.x + 2, sub.y)].fg, th.info, "sub-list dot is blue");
+        // The global SESSIONS pill: rail + dot + name on the pill's text row.
+        let global = app
+            .global_sessions()
+            .iter()
+            .position(|a| a.id.as_str() == "a1")
+            .unwrap();
+        let pill = rect_of(&app.hits, &HitTarget::GlobalSession(global));
+        assert_eq!(
+            buffer[(pill.x + 1, pill.y + 1)].fg,
+            th.info,
+            "global dot is blue"
+        );
+        assert_eq!(
+            buffer[(pill.x + 3, pill.y + 1)].fg,
+            th.info,
+            "global name is blue"
+        );
+    }
+
+    /// Attaching to ANY session of a worktree validates every unseen
+    /// finish on it at once — the user shouldn't have to enter each one.
+    /// Other worktrees' marks stay put.
+    #[test]
+    fn attaching_a_sibling_session_marks_the_whole_worktree_seen() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_extra_worktrees(&mut app, 2, 2);
+        seed_agent(&mut app, "a2", "w1");
+        seed_agent(&mut app, "a3", "w2");
+        for id in ["a1", "a2", "a3"] {
+            finish(&mut app, id);
+        }
+        assert_eq!(app.unseen_finished.len(), 3);
+
+        let mut out = Vec::new();
+        attach(&mut app, SessionRef::Agent(AgentId("a2".into())), &mut out);
+        assert!(
+            !app.unseen_finished.contains(&AgentId("a1".into())),
+            "entering the sibling validated a1 too"
+        );
+        assert!(
+            !app.unseen_finished.contains(&AgentId("a2".into())),
+            "the entered session is seen"
+        );
+        assert!(
+            app.unseen_finished.contains(&AgentId("a3".into())),
+            "another worktree's unseen finish is untouched"
+        );
+
+        attach(&mut app, SessionRef::Agent(AgentId("a3".into())), &mut out);
+        assert!(app.unseen_finished.is_empty());
+    }
+
+    /// A finish the user is watching — attached to the session itself, or
+    /// to any session on the same worktree — never marks unseen.
+    #[test]
+    fn finishing_while_attached_never_marks_unseen() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_extra_worktrees(&mut app, 2, 2);
+        seed_agent(&mut app, "a2", "w1");
+        seed_agent(&mut app, "a3", "w2");
+        let mut out = Vec::new();
+        attach(&mut app, SessionRef::Agent(AgentId("a1".into())), &mut out);
+
+        finish(&mut app, "a1");
+        assert!(
+            app.unseen_finished.is_empty(),
+            "finishing the attached session is seen live"
+        );
+        finish(&mut app, "a2");
+        assert!(
+            app.unseen_finished.is_empty(),
+            "a sibling finishing on the watched worktree is seen live"
+        );
+        finish(&mut app, "a3");
+        assert!(
+            app.unseen_finished.contains(&AgentId("a3".into())),
+            "a finish on another worktree is unseen"
+        );
+    }
+
+    /// Unseen marks ride the persisted UiState blob, but only come back
+    /// for agents the snapshot still knows as Finished.
+    #[test]
+    fn unseen_marks_roundtrip_through_ui_state() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        finish(&mut app, "a1");
+        assert!(app.unseen_finished.contains(&AgentId("a1".into())));
+        let json = ui_state_json(&app);
+
+        // Same tree, same status: the mark comes back.
+        let mut restored = App::new();
+        seed_tree(&mut restored);
+        finish(&mut restored, "a1");
+        restored.unseen_finished.clear();
+        restore_ui_state(&mut restored, &json);
+        assert!(
+            restored.unseen_finished.contains(&AgentId("a1".into())),
+            "a still-finished agent keeps its unseen mark across restarts"
+        );
+
+        // A reconnect snapshot re-runs restore with the stale quit-time
+        // blob; a mark cleared by visiting must not come back blue.
+        restored.unseen_finished.clear();
+        restore_ui_state(&mut restored, &json);
+        assert!(
+            restored.unseen_finished.is_empty(),
+            "the blob restores once per process, not on every reconnect"
+        );
+
+        // An agent that is no longer Finished drops the stale mark.
+        let mut stale = App::new();
+        seed_tree(&mut stale); // a1 is Fresh here
+        restore_ui_state(&mut stale, &json);
+        assert!(
+            stale.unseen_finished.is_empty(),
+            "a restarted agent doesn't come back blue"
         );
     }
 

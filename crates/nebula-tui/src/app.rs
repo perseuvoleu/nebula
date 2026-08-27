@@ -9,7 +9,7 @@ use nebula_core::{
     WorkspaceId, Worktree, WorktreeId,
 };
 use ratatui::layout::Rect;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 /// Frame duration of the status-sweep text animation: the event loop's
@@ -1919,6 +1919,10 @@ pub struct UiState {
     /// Diff modal file-list width; absent in older blobs.
     #[serde(default)]
     pub diff_files_width: Option<u16>,
+    /// Agent ids that finished unseen (blue accent); absent in older blobs.
+    /// Restored only for agents that still exist and are still Finished.
+    #[serde(default)]
+    pub unseen_finished: Vec<String>,
 }
 
 /// A mouse selection over the terminal pane (drag or double-click word), in
@@ -2222,6 +2226,15 @@ pub struct App {
     /// when the host terminal posts its own notifications (Ghostty) —
     /// macOS silently drops `osascript` toasts on most setups.
     pub notify_queue: Vec<(String, String)>,
+    /// Sessions that finished while the user was attached elsewhere (or
+    /// nowhere): rendered with the blue "unseen" accent until the user
+    /// attaches to ANY session on the same worktree, which marks the whole
+    /// worktree seen at once. Persisted in `UiState` across restarts.
+    pub unseen_finished: HashSet<AgentId>,
+    /// Unseen marks restore from the persisted blob only once per process:
+    /// reconnect snapshots re-run `restore_ui_state`, and the stale quit-time
+    /// blob must not resurrect marks the user already cleared by visiting.
+    pub unseen_restored: bool,
 }
 
 impl Default for App {
@@ -2310,6 +2323,8 @@ impl App {
             notifications: true,
             notified_at: HashMap::new(),
             notify_queue: Vec::new(),
+            unseen_finished: HashSet::new(),
+            unseen_restored: false,
         }
     }
 
@@ -2329,6 +2344,41 @@ impl App {
         }
         if let Some(slot) = self.settings_selected.get_mut(tab) {
             *slot = row;
+        }
+    }
+
+    /// The worktree a session lives on, resolved through the tree.
+    pub fn worktree_of_sref(&self, sref: &SessionRef) -> Option<WorktreeId> {
+        match sref {
+            SessionRef::Agent(id) => self
+                .tree
+                .agents
+                .iter()
+                .find(|a| &a.id == id)
+                .map(|a| a.worktree_id.clone()),
+            SessionRef::Terminal(id) => self
+                .tree
+                .terminals
+                .iter()
+                .find(|t| &t.id == id)
+                .map(|t| t.worktree_id.clone()),
+        }
+    }
+
+    /// Attaching anywhere on a worktree validates every unseen-finished
+    /// session on it at once — the user shouldn't have to walk into each
+    /// one to drop its blue accent.
+    pub fn mark_worktree_seen(&mut self, worktree: &WorktreeId) {
+        let tree = &self.tree;
+        let before = self.unseen_finished.len();
+        self.unseen_finished.retain(|id| {
+            tree.agents
+                .iter()
+                .find(|a| &a.id == id)
+                .is_some_and(|a| &a.worktree_id != worktree)
+        });
+        if self.unseen_finished.len() != before {
+            self.dirty = true;
         }
     }
 
