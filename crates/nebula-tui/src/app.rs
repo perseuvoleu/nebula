@@ -43,6 +43,10 @@ pub enum HitTarget {
     /// A compact session row nested under a worktree: worktree index, then
     /// row index into `App::worktree_session_rows` for that worktree.
     WorktreeSession(usize, usize),
+    /// A checkout-less local branch row below the worktree rows — an index
+    /// into `App::branch_rows()`; `sel_worktree` addresses it as
+    /// `visible_worktrees().len() + index`.
+    WorktreeBranch(usize),
     /// Row in the Worktrees panel's ORCHESTRATORS section (the
     /// "+ new orchestrator" placeholder is row 0 of an empty section).
     Orchestrator(usize),
@@ -133,6 +137,22 @@ pub enum MenuAction {
     /// picker on this branch's checkout, creating the worktree first when
     /// the branch has none (kind is picked AFTER the branch here).
     AgentOnBranch {
+        project: ProjectId,
+        branch: String,
+    },
+    /// Open the new-branch name prompt (chains into the base-branch
+    /// picker; the branch is created with `git branch`, no checkout).
+    NewBranch(ProjectId),
+    /// A base-branch-picker row (new-branch flow): run
+    /// `git branch <name> <base>` in the project's primary checkout.
+    CreateBranchFrom {
+        project: ProjectId,
+        name: String,
+        base: String,
+    },
+    /// Delete a checkout-less local branch (`git branch -d` after a
+    /// confirm — git itself refuses an unmerged branch).
+    DeleteBranch {
         project: ProjectId,
         branch: String,
     },
@@ -407,6 +427,13 @@ pub enum PendingAction {
     },
     RemoveProject(ProjectId),
     DeleteLink(LinkId),
+    /// Confirmed branch-row delete: `git branch -d <branch>` in the
+    /// project's primary checkout (git refuses unmerged branches; the
+    /// error lands as a flash).
+    DeleteBranch {
+        project: ProjectId,
+        branch: String,
+    },
     Quit,
 }
 
@@ -434,6 +461,11 @@ pub enum PromptKind {
     DividerLabel {
         id: ProjectId,
         before: bool,
+    },
+    /// Name for a new local branch (no checkout); submit chains into the
+    /// base-branch picker, which leads with the primary checkout's branch.
+    NewBranch {
+        project: ProjectId,
     },
     NewWorktree {
         project: ProjectId,
@@ -2223,6 +2255,16 @@ pub struct App {
     /// A changed-file read is running off-loop; don't stack another. The
     /// answer lands on the event loop's git channel.
     pub git_inflight: bool,
+    /// The selected project's local branches, keyed by project so a
+    /// selection change can't show another repo's list. Read off-loop on
+    /// the git poll (and after branch ops) — the draw path only filters
+    /// this cache, it never runs git.
+    pub branch_list: Option<(ProjectId, Vec<String>)>,
+    /// A branch listing is running off-loop; don't stack another.
+    pub branch_inflight: bool,
+    /// Where off-loop branch listings and `git branch` ops send their
+    /// answers; the main loop installs it (None under test = run sync).
+    pub branch_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::event_loop::BranchEvent>>,
     /// What `gh pr view` last said about each worktree's branch: `Some(pr)`
     /// when one exists, `None` when the lookup came back empty (no PR, no
     /// `gh`, no remote). A missing key means "not looked up yet". An empty
@@ -2367,6 +2409,9 @@ impl App {
             vim_generation: 0,
             git_changes: None,
             git_inflight: false,
+            branch_list: None,
+            branch_inflight: false,
+            branch_tx: None,
             pull_requests: HashMap::new(),
             pr_seen: HashMap::new(),
             pr_inflight: std::collections::HashSet::new(),
@@ -2925,6 +2970,48 @@ impl App {
         rows
     }
 
+    /// Local branches of the selected project WITHOUT a checkout — the dim
+    /// ○ rows the panel lists below the worktree rows. Pure cache read
+    /// (`branch_list`, refreshed off-loop): the draw path never runs git.
+    /// Order is the cached listing's (newest commit first).
+    pub fn branch_rows(&self) -> Vec<String> {
+        let Some(project) = self.selected_project() else {
+            return vec![];
+        };
+        let Some((cached_for, branches)) = &self.branch_list else {
+            return vec![];
+        };
+        if cached_for != &project.id {
+            return vec![];
+        }
+        branches
+            .iter()
+            .filter(|branch| {
+                !self
+                    .tree
+                    .worktrees
+                    .iter()
+                    .any(|w| w.project_id == project.id && &&w.branch == branch)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Every row `sel_worktree` can land on: the worktree rows, then the
+    /// checkout-less branch rows below them.
+    pub fn worktree_panel_len(&self) -> usize {
+        self.visible_worktrees().len() + self.branch_rows().len()
+    }
+
+    /// The branch row under the cursor, when `sel_worktree` sits past the
+    /// worktree rows (where `selected_worktree()` is None).
+    pub fn selected_branch_row(&self) -> Option<String> {
+        let index = self
+            .sel_worktree
+            .checked_sub(self.visible_worktrees().len())?;
+        self.branch_rows().get(index).cloned()
+    }
+
     /// (pinned, unpinned) worktree counts for the selected project.
     pub fn worktree_group_counts(&self) -> (usize, usize) {
         let Some(project) = self.selected_project() else {
@@ -3476,6 +3563,50 @@ mod tests {
             branches,
             ["pinned-running", "pinned-idle", "main", "running", "idle"],
             "running-first stays inside pinned/primary placement constraints"
+        );
+    }
+
+    /// The panel's branch rows come straight from the cache, minus every
+    /// branch that already has a checkout, and only for the project the
+    /// cache was read for — a selection change can't show another repo's
+    /// branches.
+    #[test]
+    fn branch_rows_list_only_checkoutless_branches_of_the_selected_project() {
+        let (mut app, _main) = link_app();
+        let project = app.tree.projects[0].id.clone();
+        app.branch_list = Some((
+            project,
+            vec!["main".into(), "feature".into(), "fix".into()],
+        ));
+        assert_eq!(
+            app.branch_rows(),
+            ["feature", "fix"],
+            "main is checked out on w1, so only the checkout-less rest shows"
+        );
+        app.branch_list = Some((ProjectId("other".into()), vec!["ghost".into()]));
+        assert!(
+            app.branch_rows().is_empty(),
+            "a cache keyed to another project renders nothing"
+        );
+    }
+
+    /// `sel_worktree` walks worktree rows first, then the branch rows —
+    /// past the worktrees, `selected_worktree()` is None and
+    /// `selected_branch_row()` names the branch under the cursor.
+    #[test]
+    fn selected_branch_row_indexes_past_the_worktree_rows() {
+        let (mut app, _main) = link_app();
+        let project = app.tree.projects[0].id.clone();
+        app.branch_list = Some((project, vec!["feature".into()]));
+        assert_eq!(app.worktree_panel_len(), 2);
+        app.sel_worktree = 0;
+        assert!(app.selected_branch_row().is_none());
+        assert!(app.selected_worktree().is_some());
+        app.sel_worktree = 1;
+        assert_eq!(app.selected_branch_row().as_deref(), Some("feature"));
+        assert!(
+            app.selected_worktree().is_none(),
+            "a branch row is not a checkout"
         );
     }
 

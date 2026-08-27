@@ -14,6 +14,7 @@ about what is worth recording.
 
 ## Entries
 
+<<<<<<< HEAD
 ### Cmd-Click URLs Prefer Google Chrome — 2026-08-27
 
 **Asked:** "Use the implement skill for this task (read /Users/andrei/.agents/skills/implement/SKILL.md
@@ -57,6 +58,49 @@ workspace green; `make install` (TUI-only).
   glyph-order prefix ("claude agent-1" — the header renders "agent-1 claude").
 - The list area for the 30% math is `screen − 3 header rows − 1 footer row`; a 20-row TestBackend
   gives a 16-row list, band = 4.
+=======
+### Worktree Panel Lists Checkout-less Branches; New-Branch Flow — 2026-08-27
+
+**Asked:** "aici vreau sa am si pentru new branch cu aceeasi regula de la primary primul sau altele,
+sa fie Worktrees & branches" — screenshot showed the worktree panel's context menu with only
+'New worktree'.
+
+**Did:** Commit `2723e99` (branch branches-in-worktree-panel, TUI-only). Panel header is
+"WORKTREES & BRANCHES"; checkout-less local branches render as dim ○ pill rows below the worktree
+rows. Cache: `App.branch_list: Option<(ProjectId, Vec<String>)>` + `branch_inflight` + `branch_tx`
+(app.rs), refreshed via `spawn_branch_list` (event_loop.rs, next to `spawn_git_changes`) on the
+`GIT_POLL` tick and after ops — `App::branch_rows()` is a pure cache filter, draw never runs git.
+`sel_worktree` walks worktrees + branch rows as one list (`worktree_panel_len`,
+`selected_branch_row`); new `HitTarget::WorktreeBranch(usize)`; heights folded into `wt_heights` so
+scroll_skip/hit rects stay in sync. Enter/right-click on a branch row → `branch_row_menu`: New agent
+here (existing `MenuAction::AgentOnBranch`), New worktree from this branch (`CreateWorktreeFrom`
+base None = checkout of the existing branch), Delete branch (confirm →
+`PendingAction::DeleteBranch` → `git branch -d`). "New branch" added everywhere "New worktree"
+appears (worktree/project context menus, both panel right-clicks, palette alias `b · New branch…`):
+`PromptKind::NewBranch` name prompt (slugified) → `open_new_branch_base_picker` reusing
+`project_local_branches` (primary first, hovered) → `MenuAction::CreateBranchFrom` →
+`spawn_branch_op` runs `crate::branches::branch_op` (`git branch <name> <base>`) in the primary
+checkout on `spawn_blocking`; outcomes come back as `BranchEvent::Op` flashes. Tests:
+`branch_rows_list_only_checkoutless_branches_of_the_selected_project`,
+`selected_branch_row_indexes_past_the_worktree_rows` (app.rs);
+`worktrees_panel_lists_checkoutless_branches_under_the_renamed_header`,
+`enter_on_a_branch_row_opens_its_menu`,
+`command_palette_alias_b_creates_a_branch_from_the_primary_base`,
+`deleting_a_branch_row_confirms_then_respects_git_d` (event_loop.rs). 498 nebula-tui + full
+workspace green; `make install` (old daemon fine).
+
+**Gotchas:**
+- The panel's inner width at the default 22-col split is only 20 — "WORKTREES & BRANCHES" fits
+  ONLY with the gutter trimmed to zero; the header now shrinks its gutter char-by-char (and drops
+  the `· N` count) before it would ever clip the title.
+- `app.branch_tx: Option<UnboundedSender<BranchEvent>>` follows the `vim_tx` pattern; when it's
+  None (unit tests) `spawn_branch_list`/`spawn_branch_op` run inline, which is what lets the
+  palette-b and delete tests drive real git repos synchronously.
+- With `git branch -d` the unmerged refusal is git's own — `branch_op` returns stderr's first line
+  as the flash ("not fully merged"), no force path on purpose.
+- If the worktree loop runs out of rows mid-list it `break`s; the branch loop below must be gated
+  on that (`out_of_rows`) or branch rows would paint ahead of skipped worktree entries.
+>>>>>>> branches-in-worktree-panel
 
 ### Nested Worktree Rows Draw Tree Guide Lines — 2026-08-27
 

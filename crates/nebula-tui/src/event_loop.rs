@@ -220,6 +220,11 @@ async fn main_loop(
     // milliseconds on a big checkout, and a blocked draw is a visible hitch.
     let (git_tx, mut git_rx) =
         tokio::sync::mpsc::unbounded_channel::<(WorktreeId, Option<usize>)>();
+    // Local-branch listings and `git branch` op outcomes, read/run
+    // off-loop; the sender lives on App so menu/prompt handlers can kick
+    // ops without threading the channel through every call.
+    let (branch_tx, mut branch_rx) = tokio::sync::mpsc::unbounded_channel::<BranchEvent>();
+    app.branch_tx = Some(branch_tx);
     let mut next_metrics_poll = tokio::time::Instant::now();
     let mut next_splash_frame = tokio::time::Instant::now();
     let mut next_sweep_frame = tokio::time::Instant::now();
@@ -263,6 +268,9 @@ async fn main_loop(
             // traffic can't starve the badge refresh.
             _ = tokio::time::sleep_until(next_git_poll) => {
                 spawn_git_changes(&mut app, &git_tx);
+                // The panel's checkout-less branch rows refresh on the same
+                // slow tick — never on the draw path.
+                spawn_branch_list(&mut app);
                 // Rides the git tick rather than the repaint, so walking the
                 // worktree list with j/k can't spawn a `gh` per row passed —
                 // only whatever the selection is resting on when it fires.
@@ -422,6 +430,12 @@ async fn main_loop(
                     }
                 }
             }
+            ev = branch_rx.recv() => {
+                // Never None: App holds a sender for the loop's lifetime.
+                if let Some(ev) = ev {
+                    handle_branch_event(&mut app, ev);
+                }
+            }
             answer = pr_rx.recv() => {
                 // Never None: `pr_tx` lives as long as the loop.
                 if let Some((worktree, pr)) = answer {
@@ -545,6 +559,117 @@ fn refresh_git_changes(app: &mut App) {
     if app.git_changes != next {
         app.git_changes = next;
         app.dirty = true;
+    }
+}
+
+/// What the off-loop branch tasks send back on the main loop's branch
+/// channel: a fresh local-branch listing for the panel's cache, or the
+/// outcome of a `git branch` mutation (create/delete).
+#[derive(Debug)]
+pub enum BranchEvent {
+    /// `git for-each-ref` answer for this project's repo.
+    List(nebula_core::ProjectId, Vec<String>),
+    /// A `git branch` op finished; `message` is the flash to show.
+    Op { message: String, error: bool },
+}
+
+/// Kick a local-branch listing for the panel's checkout-less branch rows,
+/// off the loop (the same rule as `spawn_git_changes` — the draw path
+/// never runs git). Under test, with no channel installed, the read runs
+/// inline so flows stay synchronous.
+fn spawn_branch_list(app: &mut App) {
+    let Some((id, repo)) = app
+        .selected_project()
+        .map(|p| (p.id.clone(), p.repo_path.clone()))
+    else {
+        return;
+    };
+    match app.branch_tx.clone() {
+        Some(tx) => {
+            if app.branch_inflight {
+                return;
+            }
+            app.branch_inflight = true;
+            tokio::task::spawn_blocking(move || {
+                let _ = tx.send(BranchEvent::List(id, crate::branches::local_branches(&repo)));
+            });
+        }
+        None => {
+            let list = crate::branches::local_branches(&repo);
+            handle_branch_event(app, BranchEvent::List(id, list));
+        }
+    }
+}
+
+/// Land a branch-channel answer: refresh the cache, or flash an op's
+/// outcome and re-list so the new/removed branch row shows right away.
+fn handle_branch_event(app: &mut App, ev: BranchEvent) {
+    match ev {
+        BranchEvent::List(project, branches) => {
+            app.branch_inflight = false;
+            let next = Some((project, branches));
+            if app.branch_list != next {
+                app.branch_list = next;
+                app.dirty = true;
+            }
+        }
+        BranchEvent::Op { message, .. } => {
+            app.flash = Some(message);
+            app.dirty = true;
+            spawn_branch_list(app);
+        }
+    }
+}
+
+/// Run a `git branch` mutation in the project's primary checkout, off the
+/// loop; the outcome comes back as a `BranchEvent::Op` flash. Under test
+/// (no channel) it runs inline.
+fn spawn_branch_op(
+    app: &mut App,
+    project: &nebula_core::ProjectId,
+    args: Vec<String>,
+    done: String,
+) {
+    let repo = app
+        .tree
+        .worktrees
+        .iter()
+        .find(|w| &w.project_id == project && w.is_main)
+        .map(|w| w.path.clone())
+        .or_else(|| {
+            app.tree
+                .projects
+                .iter()
+                .find(|p| &p.id == project)
+                .map(|p| p.repo_path.clone())
+        });
+    let Some(repo) = repo else {
+        app.flash = Some("project has no primary checkout".into());
+        return;
+    };
+    let run = move || {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        match crate::branches::branch_op(&repo, &args) {
+            Ok(()) => BranchEvent::Op {
+                message: done,
+                error: false,
+            },
+            Err(e) => BranchEvent::Op {
+                message: e,
+                error: true,
+            },
+        }
+    };
+    match app.branch_tx.clone() {
+        Some(tx) => {
+            tokio::task::spawn_blocking(move || {
+                let _ = tx.send(run());
+            });
+        }
+        None => {
+            let ev = run();
+            handle_branch_event(app, ev);
+        }
     }
 }
 
@@ -1222,7 +1347,17 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 }
                 None => {}
             },
-            Focus::Worktrees => app.focus = Focus::Sessions,
+            Focus::Worktrees => {
+                // A checkout-less branch row has no sessions to enter —
+                // Enter opens its action menu instead.
+                if let Some(branch) = app.selected_branch_row() {
+                    if let Some(project) = app.selected_project().map(|p| p.id.clone()) {
+                        open_menu(app, branch_row_menu(project, branch), (30, 4));
+                    }
+                } else {
+                    app.focus = Focus::Sessions;
+                }
+            }
             Focus::Sessions => attach_selected(app, out),
             Focus::Terminal => {
                 // Lock input into an already-focused live pane.
@@ -1520,6 +1655,11 @@ fn open_prompt(app: &mut App, kind: PromptKind) {
         PromptKind::NewWorktree { suggestion, .. } => (
             "New worktree".to_string(),
             format!("branch name (empty = {suggestion})"),
+            String::new(),
+        ),
+        PromptKind::NewBranch { .. } => (
+            "New branch".to_string(),
+            "branch name (no checkout is created)".to_string(),
             String::new(),
         ),
         PromptKind::NewAgent {
@@ -2994,6 +3134,7 @@ fn open_command_palette(app: &mut App) {
             MenuAction::Command(PaletteCommand::NewAgentInWorktree(p.clone())),
         ));
         items.push(row("w · New worktree…", MenuAction::NewWorktree(p.clone())));
+        items.push(row("b · New branch…", MenuAction::NewBranch(p.clone())));
         items.push(row(
             "o · New orchestrator…",
             MenuAction::NewOrchestrator(p),
@@ -3271,6 +3412,76 @@ fn open_agent_branch_picker(app: &mut App, project: nebula_core::ProjectId) {
         }
         .filterable(),
     ));
+}
+
+/// The new-branch flow's second step: pick the branch the new one starts
+/// FROM. Same rule as the orchestrator/`ab` pickers — the primary
+/// checkout's branch leads the list and starts hovered, the rest stay
+/// newest commit first. The pick runs `git branch <name> <base>` in the
+/// primary checkout; nothing is checked out.
+fn open_new_branch_base_picker(app: &mut App, project: nebula_core::ProjectId, name: String) {
+    let Some((branches, root_branch)) = project_local_branches(app, &project) else {
+        app.flash = Some("no local branches found".into());
+        return;
+    };
+    let items: Vec<MenuItem> = branches
+        .into_iter()
+        .map(|base| MenuItem {
+            label: if Some(&base) == root_branch.as_ref() {
+                format!("{base} ⌂ primary")
+            } else {
+                base.clone()
+            },
+            action: MenuAction::CreateBranchFrom {
+                project: project.clone(),
+                name: name.clone(),
+                base,
+            },
+            destructive: false,
+        })
+        .collect();
+    app.overlay = Some(Overlay::Menu(
+        ContextMenu {
+            title: Some(format!("Base for {name}")),
+            items,
+            at: None,
+            hover: 0,
+            area: ratatui::layout::Rect::default(),
+            parent: None,
+            filter: None,
+        }
+        .filterable(),
+    ));
+}
+
+/// The menu on a checkout-less branch row (Enter, right-click, or the
+/// context-menu key): spawn work on the branch through the existing
+/// `AgentOnBranch` machinery, give it a checkout, or delete it.
+fn branch_row_menu(project: nebula_core::ProjectId, branch: String) -> Vec<MenuItem> {
+    vec![
+        MenuItem {
+            label: "New agent here".into(),
+            action: MenuAction::AgentOnBranch {
+                project: project.clone(),
+                branch: branch.clone(),
+            },
+            destructive: false,
+        },
+        MenuItem {
+            label: "New worktree from this branch".into(),
+            action: MenuAction::CreateWorktreeFrom {
+                project: project.clone(),
+                branch: branch.clone(),
+                base: None,
+            },
+            destructive: false,
+        },
+        MenuItem {
+            label: "Delete branch".into(),
+            action: MenuAction::DeleteBranch { project, branch },
+            destructive: true,
+        },
+    ]
 }
 
 /// The manual worktree flow's second step: pick the branch the new
@@ -3595,6 +3806,14 @@ fn open_context_menu_for_selection(app: &mut App) {
                 items.insert(
                     1,
                     MenuItem {
+                        label: "New branch".into(),
+                        action: MenuAction::NewBranch(p.id.clone()),
+                        destructive: false,
+                    },
+                );
+                items.insert(
+                    2,
+                    MenuItem {
                         label: "New orchestrator".into(),
                         action: MenuAction::NewOrchestrator(p.id.clone()),
                         destructive: false,
@@ -3635,7 +3854,16 @@ fn open_context_menu_for_selection(app: &mut App) {
             }
         }
         Focus::Worktrees => {
+            // The cursor can sit on a checkout-less branch row below the
+            // worktree rows — its menu acts on the branch, not a checkout.
+            if let Some(branch) = app.selected_branch_row() {
+                if let Some(p) = app.selected_project().map(|p| p.id.clone()) {
+                    open_menu(app, branch_row_menu(p, branch), at);
+                }
+                return;
+            }
             if let Some(w) = app.selected_worktree() {
+                let project = w.project_id.clone();
                 let mut items = vec![
                     MenuItem {
                         label: "New agent".into(),
@@ -3645,6 +3873,11 @@ fn open_context_menu_for_selection(app: &mut App) {
                     MenuItem {
                         label: "New terminal".into(),
                         action: MenuAction::NewTerminal(w.id.clone()),
+                        destructive: false,
+                    },
+                    MenuItem {
+                        label: "New branch".into(),
+                        action: MenuAction::NewBranch(project),
                         destructive: false,
                     },
                     MenuItem {
@@ -4906,6 +5139,16 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
             // typing fuzzy-picks any other local branch.
             open_base_branch_picker(app, project, branch, base, out);
         }
+        PromptKind::NewBranch { project } => {
+            // Same say-it-out-loud slugging as the worktree prompt; the
+            // empty-input guard above already cancelled a blank name.
+            let name = crate::branch_name::slugify(&value);
+            if name.is_empty() {
+                app.flash = Some("cancelled: empty input".into());
+                return;
+            }
+            open_new_branch_base_picker(app, project, name);
+        }
         PromptKind::NewAgent {
             target,
             kind,
@@ -5078,6 +5321,10 @@ fn run_pending_action(app: &mut App, action: PendingAction, out: &mut Vec<Client
         PendingAction::RemoveProject(id) => {
             let req_id = app.alloc_req_id(PendingIntent::None);
             out.push(ClientRequest::RemoveProject { req_id, id });
+        }
+        PendingAction::DeleteBranch { project, branch } => {
+            let done = format!("branch {branch} deleted");
+            spawn_branch_op(app, &project, vec!["-d".into(), branch], done);
         }
         PendingAction::Quit => app.should_quit = true,
     }
@@ -5262,6 +5509,24 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             });
         }
         MenuAction::NewWorktree(project) => open_new_worktree_prompt(app, project),
+        MenuAction::NewBranch(project) => {
+            open_prompt(app, PromptKind::NewBranch { project });
+        }
+        MenuAction::CreateBranchFrom {
+            project,
+            name,
+            base,
+        } => {
+            let done = format!("branch {name} created from {base}");
+            spawn_branch_op(app, &project, vec![name, base], done);
+        }
+        MenuAction::DeleteBranch { project, branch } => {
+            app.overlay = Some(Overlay::Confirm(ConfirmDialog {
+                title: "Delete branch".into(),
+                message: format!("Delete local branch '{branch}'? (git refuses unmerged branches)"),
+                action: PendingAction::DeleteBranch { project, branch },
+            }));
+        }
         MenuAction::OpenNotes(owner) => open_notes_for_owner(app, owner),
         MenuAction::OpenTodos(owner) => open_todos_for_owner(app, owner),
         MenuAction::NewLink(worktree) => open_prompt(app, PromptKind::NewLink { worktree }),
@@ -6003,7 +6268,9 @@ fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
         return;
     }
     if app.focus == Focus::Worktrees {
-        let worktrees = app.visible_worktrees().len();
+        // The cursor walks worktree rows and the checkout-less branch rows
+        // below them as one list.
+        let worktrees = app.worktree_panel_len();
         if worktrees == 0 {
             if delta < 0 && app.orchestrator_section_len() > 0 {
                 app.focus = Focus::Orchestrators;
@@ -6705,6 +6972,7 @@ fn pointer_wants_hand(app: &App, column: u16, row: u16) -> bool {
                 HitTarget::Project(_)
                     | HitTarget::Worktree(_)
                     | HitTarget::WorktreeSession(_, _)
+                    | HitTarget::WorktreeBranch(_)
                     | HitTarget::Orchestrator(_)
                     | HitTarget::Session(_)
                     | HitTarget::GlobalSession(_)
@@ -7484,6 +7752,19 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                         restore_session(app, out);
                     }
                 }
+                Some(HitTarget::WorktreeBranch(i)) => {
+                    // Selection only — a checkout-less branch has no
+                    // session to preview; Enter/right-click open its menu.
+                    let target = app.visible_worktrees().len() + i;
+                    let section_changed = app.focus != Focus::Worktrees;
+                    app.focus = Focus::Worktrees;
+                    if app.sel_worktree != target || section_changed {
+                        app.select_worktree_when_seen = None;
+                        remember_context(app);
+                        app.sel_worktree = target;
+                        restore_session(app, out);
+                    }
+                }
                 Some(HitTarget::WorktreeSession(worktree_index, session_index)) => {
                     let target = app
                         .visible_worktrees()
@@ -7793,7 +8074,9 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     Some(HitTarget::Worktree(_)) | Some(HitTarget::PanelBg(Focus::Worktrees)) => {
                         Some(Focus::Worktrees)
                     }
-                    Some(HitTarget::WorktreeSession(_, _)) => Some(Focus::Worktrees),
+                    Some(HitTarget::WorktreeSession(_, _)) | Some(HitTarget::WorktreeBranch(_)) => {
+                        Some(Focus::Worktrees)
+                    }
                     _ => None,
                 };
                 if let Some(section) = section {
@@ -7819,6 +8102,11 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                             MenuItem {
                                 label: "New worktree".into(),
                                 action: MenuAction::NewWorktree(p.id.clone()),
+                                destructive: false,
+                            },
+                            MenuItem {
+                                label: "New branch".into(),
+                                action: MenuAction::NewBranch(p.id.clone()),
                                 destructive: false,
                             },
                             MenuItem {
@@ -7861,6 +8149,11 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                                 destructive: false,
                             },
                             MenuItem {
+                                label: "New branch".into(),
+                                action: MenuAction::NewBranch(w.project_id.clone()),
+                                destructive: false,
+                            },
+                            MenuItem {
                                 label: "Add link".into(),
                                 action: MenuAction::NewLink(w.id.clone()),
                                 destructive: false,
@@ -7877,6 +8170,17 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     }
                 }
                 Some(HitTarget::WorktreeSession(_, _)) => {}
+                Some(HitTarget::WorktreeBranch(i)) => {
+                    app.focus = Focus::Worktrees;
+                    app.sel_worktree = app.visible_worktrees().len() + i;
+                    if let Some((project, branch)) = app
+                        .selected_project()
+                        .map(|p| p.id.clone())
+                        .zip(app.selected_branch_row())
+                    {
+                        open_menu_at(app, branch_row_menu(project, branch), at);
+                    }
+                }
                 Some(HitTarget::Session(i)) => {
                     app.sel_session = i;
                     app.focus = Focus::Sessions;
@@ -7912,11 +8216,18 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                         Focus::Worktrees => app
                             .selected_project()
                             .map(|p| {
-                                vec![MenuItem {
-                                    label: "New worktree".into(),
-                                    action: MenuAction::NewWorktree(p.id.clone()),
-                                    destructive: false,
-                                }]
+                                vec![
+                                    MenuItem {
+                                        label: "New worktree".into(),
+                                        action: MenuAction::NewWorktree(p.id.clone()),
+                                        destructive: false,
+                                    },
+                                    MenuItem {
+                                        label: "New branch".into(),
+                                        action: MenuAction::NewBranch(p.id.clone()),
+                                        destructive: false,
+                                    },
+                                ]
                             })
                             .unwrap_or_default(),
                         Focus::Sessions => app
@@ -17622,6 +17933,222 @@ mod tests {
             ),
             "{:?}",
             menu.items[0].action
+        );
+    }
+
+    /// The panel is WORKTREES & BRANCHES now: checkout-less local branches
+    /// render as dim ○ rows below the worktree rows, with their own hit
+    /// rects, and a click selects the row without attaching anything.
+    #[test]
+    fn worktrees_panel_lists_checkoutless_branches_under_the_renamed_header() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.branch_list = Some((
+            nebula_core::ProjectId("p1".into()),
+            vec!["main".into(), "feature-x".into()],
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("WORKTREES & BRANCHES"),
+            "the header reads at the default 22-col width: {text}"
+        );
+        assert!(text.contains("○ feature-x"), "{text}");
+        assert!(
+            !text.contains("○ main"),
+            "a branch with a checkout stays a worktree row only: {text}"
+        );
+        let rect = app
+            .hits
+            .iter()
+            .find_map(|(r, t)| matches!(t, HitTarget::WorktreeBranch(0)).then_some(*r))
+            .expect("the branch row registers a hit rect");
+        let mut out = Vec::new();
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Down(MouseButton::Left), rect.x + 2, rect.y),
+            &mut out,
+        );
+        assert_eq!(app.focus, Focus::Worktrees);
+        assert_eq!(
+            app.sel_worktree, 1,
+            "the branch row's index continues past the worktree rows"
+        );
+        assert_eq!(app.selected_branch_row().as_deref(), Some("feature-x"));
+    }
+
+    /// j walks off the last worktree onto the branch rows, and Enter there
+    /// opens the branch menu (agent / worktree / delete) instead of moving
+    /// focus into the empty sessions of a checkout that doesn't exist.
+    #[test]
+    fn enter_on_a_branch_row_opens_its_menu() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.branch_list = Some((
+            nebula_core::ProjectId("p1".into()),
+            vec!["feature-x".into()],
+        ));
+        app.focus = Focus::Worktrees;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+        assert_eq!(app.selected_branch_row().as_deref(), Some("feature-x"));
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        let Some(Overlay::Menu(menu)) = &app.overlay else {
+            panic!("expected the branch menu, got {:?}", app.overlay);
+        };
+        let labels: Vec<&str> = menu.items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "New agent here",
+                "New worktree from this branch",
+                "Delete branch"
+            ]
+        );
+        assert!(menu.items[2].destructive);
+        assert!(
+            matches!(
+                &menu.items[0].action,
+                MenuAction::AgentOnBranch { branch, .. } if branch == "feature-x"
+            ),
+            "{:?}",
+            menu.items[0].action
+        );
+        assert!(out.is_empty(), "opening the menu sends nothing");
+    }
+
+    /// `⌘K b Enter`: name prompt, then a base picker that leads with the
+    /// primary checkout's branch (the same rule as the other pickers);
+    /// Enter on the default runs `git branch <name> <base>` in the primary
+    /// checkout and the new row shows up in the panel's cache.
+    #[test]
+    fn command_palette_alias_b_creates_a_branch_from_the_primary_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo(&dir);
+        let mut app = App::new();
+        seed_repo_tree(&mut app, &repo);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('k'), KeyModifiers::SUPER, &mut out);
+        press(&mut app, KeyCode::Char('b'), KeyModifiers::NONE, &mut out);
+        {
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("expected the command palette, got {:?}", app.overlay);
+            };
+            assert_eq!(menu.items[menu.hover].label, "b · New branch…");
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(
+                &app.overlay,
+                Some(Overlay::Prompt(p)) if matches!(p.kind, crate::app::PromptKind::NewBranch { .. })
+            ),
+            "{:?}",
+            app.overlay
+        );
+        for c in "topic".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        {
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("expected the base picker, got {:?}", app.overlay);
+            };
+            assert_eq!(menu.title.as_deref(), Some("Base for topic"));
+            assert_eq!(
+                menu.items[0].label, "main ⌂ primary",
+                "the primary checkout's branch leads and starts hovered"
+            );
+            assert_eq!(menu.hover, 0);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        // No channel installed under test, so the op and the re-list ran
+        // inline: the branch exists in the repo and in the panel's rows.
+        assert!(
+            crate::branches::local_branches(&repo).contains(&"topic".to_string()),
+            "git branch ran in the primary checkout"
+        );
+        assert_eq!(
+            app.flash.as_deref(),
+            Some("branch topic created from main")
+        );
+        assert!(
+            app.branch_rows().contains(&"topic".to_string()),
+            "{:?}",
+            app.branch_list
+        );
+        assert!(out.is_empty(), "the branch op never talks to the daemon");
+    }
+
+    /// The branch row's destructive verb: a confirm first, then
+    /// `git branch -d` — which deletes a merged branch and refuses an
+    /// unmerged one, surfacing git's own reason as the flash.
+    #[test]
+    fn deleting_a_branch_row_confirms_then_respects_git_d() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo(&dir);
+        run_git(&repo, &["branch", "merged"]);
+        run_git(&repo, &["checkout", "-b", "unmerged"]);
+        std::fs::write(repo.join("b.txt"), "x\n").unwrap();
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-m", "diverge"]);
+        run_git(&repo, &["checkout", "main"]);
+        let mut app = App::new();
+        seed_repo_tree(&mut app, &repo);
+        spawn_branch_list(&mut app);
+        // Same-second commits sort unpredictably under -committerdate, so
+        // assert membership, not order (see the branch-picker tests).
+        let mut rows = app.branch_rows();
+        rows.sort();
+        assert_eq!(rows, ["merged", "unmerged"]);
+
+        // The context-menu key on the selected branch row offers the menu;
+        // its delete row confirms before touching the repo.
+        app.focus = Focus::Worktrees;
+        app.sel_worktree = app.visible_worktrees().len()
+            + app
+                .branch_rows()
+                .iter()
+                .position(|b| b == "merged")
+                .unwrap();
+        open_context_menu_for_selection(&mut app);
+        let Some(Overlay::Menu(menu)) = &app.overlay else {
+            panic!("expected the branch menu, got {:?}", app.overlay);
+        };
+        let delete = menu.items[2].action.clone();
+        app.overlay = None;
+        let mut out = Vec::new();
+        run_menu_action(&mut app, delete, &mut out);
+        assert!(
+            matches!(
+                &app.overlay,
+                Some(Overlay::Confirm(c)) if matches!(&c.action, PendingAction::DeleteBranch { branch, .. } if branch == "merged")
+            ),
+            "{:?}",
+            app.overlay
+        );
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert_eq!(app.flash.as_deref(), Some("branch merged deleted"));
+        assert_eq!(app.branch_rows(), ["unmerged"], "the row refreshed");
+
+        // The unmerged branch survives: git -d refuses, the flash says why.
+        run_menu_action(
+            &mut app,
+            MenuAction::DeleteBranch {
+                project: nebula_core::ProjectId("p1".into()),
+                branch: "unmerged".into(),
+            },
+            &mut out,
+        );
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(
+            app.flash.as_deref().is_some_and(|f| f.contains("not fully merged")),
+            "{:?}",
+            app.flash
+        );
+        assert!(
+            crate::branches::local_branches(&repo).contains(&"unmerged".to_string()),
+            "an unmerged branch is never force-deleted"
         );
     }
 
