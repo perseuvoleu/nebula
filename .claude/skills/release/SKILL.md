@@ -1,6 +1,6 @@
 ---
 name: release
-description: "Cut a nebula release — verify the tree is green, commit, bump the workspace version, tag, push, and replace the auto-generated GitHub release notes with a real changelog. Use when the user says \"do a release\", \"cut a release\", \"release this\", \"ship it\", \"commit and push and release\", or asks for a new version. Also use when they ask what the release process is."
+description: "Cut a nebula release: green gate, version bump, tag, push, real changelog on the GitHub release. Trigger: \"release\", \"ship it\", a new version, or questions about the release process."
 user-invocable: true
 ---
 

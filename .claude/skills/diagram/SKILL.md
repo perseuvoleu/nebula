@@ -1,6 +1,6 @@
 ---
 name: diagram
-description: "Show Mermaid diagrams in Mission Control's diagram viewer instead of dumping raw syntax in the terminal. Use when the user asks for a diagram, flowchart, sequence diagram, architecture sketch, state machine, ER diagram, or any visual that Mermaid can render — and whenever a diagram would clarify a complex flow. Requires a Mission Control agent session (MC_API_URL and MC_API_TOKEN are injected automatically). Not for ASCII art in chat, image generation, or projects running outside Mission Control."
+description: "Mission Control sessions only (MC_* env vars present). Trigger: any diagram request — flowchart, sequence, state, ER, architecture — rendered as Mermaid in MC's diagram viewer instead of raw syntax in the terminal."
 user-invocable: true
 ---
 
