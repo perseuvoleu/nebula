@@ -90,7 +90,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         let tinted = match app.focus {
             Focus::Projects => shrink_r(projects_a),
             Focus::Orchestrators | Focus::Worktrees => {
-                worktree_section_rects(worktrees_a, app.focus).unwrap()
+                worktree_section_rects(worktrees_a, app.focus, orchestrator_entry_count(app))
+                    .unwrap()
             }
             // The session tabs live in the terminal header, so their focus
             // tints the terminal pane too.
@@ -2179,15 +2180,41 @@ fn shrink_r(area: Rect) -> Rect {
     }
 }
 
+/// Rows of the shared column's list area the ORCHESTRATORS section keeps:
+/// what its pill rows actually need, capped at ~30% of the list so a long
+/// orchestrator list scrolls instead of crowding out the worktrees, and
+/// floored at one pill so the section stays enterable. `entries` counts
+/// the rendered rows — real orchestrators, or the one "+ new orchestrator"
+/// placeholder.
+fn orchestrator_section_rows(list_h: usize, entries: usize) -> usize {
+    (entries.max(1) * PILL_H as usize)
+        .min((list_h * 3 / 10).max(PILL_H as usize))
+        .min(list_h)
+}
+
+/// Orchestrator rows `draw_worktrees` will render for the selected
+/// project: the real ones, or the single placeholder while there are none.
+/// The section split is derived from this, so the boundary and the draw
+/// must count the same way.
+fn orchestrator_entry_count(app: &App) -> usize {
+    let n = app.project_orchestrators().len();
+    if n == 0 {
+        usize::from(app.tree.has_visible_projects())
+    } else {
+        n
+    }
+}
+
 /// The ORCHESTRATORS and WORKTREES halves share one sidebar column but
 /// have separate focus, hit, and tint rectangles. The split mirrors
 /// `draw_worktrees`: its list area begins three rows below the column top,
-/// then divides at that area's midpoint.
-fn worktree_section_rects(area: Rect, focus: Focus) -> Option<Rect> {
+/// then gives the top section only what its orchestrator rows need
+/// (`orchestrator_section_rows`) and the WORKTREES section all the rest.
+fn worktree_section_rects(area: Rect, focus: Focus, orch_entries: usize) -> Option<Rect> {
     let column = shrink_r(area);
     let list_y = column.y.saturating_add(3).min(column.bottom());
     let list_h = column.bottom().saturating_sub(list_y);
-    let mid = (list_h / 2).max(PILL_H + 1).min(list_h);
+    let mid = orchestrator_section_rows(list_h as usize, orch_entries) as u16;
     let split_y = list_y.saturating_add(mid).min(column.bottom());
     match focus {
         Focus::Orchestrators => Some(Rect {
@@ -2911,12 +2938,13 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         th,
     );
 
-    let push_section_backgrounds = |app: &mut App| {
-        if let Some(top) = worktree_section_rects(area, Focus::Orchestrators) {
+    let orch_entries = orchestrator_entry_count(app);
+    let push_section_backgrounds = move |app: &mut App| {
+        if let Some(top) = worktree_section_rects(area, Focus::Orchestrators, orch_entries) {
             app.hits
                 .push((top, HitTarget::PanelBg(Focus::Orchestrators)));
         }
-        if let Some(bottom) = worktree_section_rects(area, Focus::Worktrees) {
+        if let Some(bottom) = worktree_section_rects(area, Focus::Worktrees, orch_entries) {
             app.hits
                 .push((bottom, HitTarget::PanelBg(Focus::Worktrees)));
         }
@@ -2986,10 +3014,9 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     }
 
     // The primary checkout (the original clone, whatever branch it has
-    // checked out) renders as `branch ⌂ primary` (dim badge — the branch
-    // is live, the badge marks the primary checkout) with a rule separating
-    // it from the true worktrees below, so rows after it sit one screen
-    // line lower.
+    // checked out) renders as `branch ⌂ primary` — the dim badge alone
+    // marks it; the true worktrees stack directly below on the pill
+    // stride.
     const ROOT_BADGE: &str = " ⌂ primary";
     // Group headers only appear once something is pinned; otherwise the
     // list stays flat (same idiom as the sessions panel).
@@ -3007,9 +3034,11 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             *screen_row += 1;
         }
     };
-    // The column splits at its vertical middle: the top half belongs to
-    // the ORCHESTRATORS section, the bottom half to WORKTREES.
-    let mid = (inner.height as usize / 2).max(PILL_H as usize + 1);
+    // The split is adaptive: the ORCHESTRATORS section on top keeps only
+    // the rows its pills need (capped at ~30% of the list), and WORKTREES
+    // takes everything below — a short orchestrator list never wastes
+    // half the column.
+    let mid = orchestrator_section_rows(inner.height as usize, orch_entries);
     if orchestrators.is_empty() && app.tree.has_visible_projects() {
         // Selectable placeholder: walking onto it and pressing n/Enter
         // spawns the project's first orchestrator.
@@ -3101,8 +3130,8 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         }
         screen_row += PILL_H as usize;
     }
-    // Bottom half: the WORKTREES section starts at the panel's middle
-    // regardless of how few orchestrators sit above.
+    // Bottom section: WORKTREES starts right under the orchestrator rows,
+    // at the adaptive boundary.
     screen_row = mid;
     if let Some(r) = row_rect(inner, screen_row) {
         let header_style = if worktrees_focused {
@@ -3116,7 +3145,9 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         }
         f.render_widget(Paragraph::new(Line::from(spans)), r);
     }
-    screen_row += 2;
+    // One row for the header itself — the first pill's pad row is the
+    // breathing space, so no extra blank line.
+    screen_row += 1;
     if worktrees.is_empty() {
         if let Some(r) = row_rect(inner, screen_row) {
             f.render_widget(
@@ -3136,12 +3167,9 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     let wt_heights: Vec<usize> = worktrees
         .iter()
         .enumerate()
-        .map(|(i, (_, is_main, created_from, _, _, sessions, _))| {
+        .map(|(i, (_, _, created_from, _, _, sessions, _))| {
             let mut h = PILL_H as usize + usize::from(created_from.is_some()) + sessions.len();
             if grouped && (i == 0 || i == pinned_count) {
-                h += 1;
-            }
-            if !grouped && *is_main && worktrees.len() > 1 {
                 h += 1;
             }
             h
@@ -3360,20 +3388,6 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                 .push((r, HitTarget::WorktreeSession(i, session_index)));
         }
         screen_row += entry_height;
-        // An extra quiet row separates the main checkout from the true
-        // worktrees below; group headers take over once something is
-        // pinned. A child nested under main still gets its guide drawn
-        // through the quiet row so the line stays unbroken.
-        if !grouped && *is_main && worktrees.len() > 1 {
-            if let Some(&next_depth) = depths.get(i + 1) {
-                for l in 1..=next_depth {
-                    if nest_level_continues(&depths, i, l) {
-                        guide_cell(f, screen_row, l);
-                    }
-                }
-            }
-            screen_row += 1;
-        }
     }
     push_section_backgrounds(app);
 }

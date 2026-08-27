@@ -16472,6 +16472,88 @@ mod tests {
         assert!(!text.contains("boss-0 ◆"), "top rows scrolled out: {text}");
     }
 
+    /// The ORCHESTRATORS/WORKTREES split is adaptive: the top section
+    /// keeps only the rows its pills need, so with no orchestrators the
+    /// WORKTREES header sits right under the one placeholder pill — and
+    /// the rows below stack tight: no blank row under the header, no
+    /// quiet row after the primary checkout.
+    #[test]
+    fn worktrees_take_the_column_rows_orchestrators_do_not_need() {
+        let mut app = App::new();
+        seed_tree(&mut app); // p1/w1(main) + agent-1, no orchestrators
+        seed_extra_worktrees(&mut app, 2, 4);
+        app.focus = Focus::Worktrees;
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        let (_, orch_y) = find_cell(&terminal, "ORCHESTRATORS");
+        let (_, wt_y) = find_cell(&terminal, "WORKTREES");
+        // Title, blank spacer, the 2-row placeholder pill, then the
+        // WORKTREES header directly on the boundary.
+        assert_eq!(wt_y, orch_y + 4, "split hugs the placeholder pill: {text}");
+        let (_, main_y) = find_cell(&terminal, "main");
+        assert_eq!(main_y, wt_y + 2, "first pill text right under the header: {text}");
+        // "claude agent-1" pins the sub-row shape — the bare name also
+        // shows in the terminal header and the global SESSIONS list.
+        let (_, agent_y) = find_cell(&terminal, "claude agent-1");
+        assert_eq!(agent_y, main_y + 1, "session sub-row hugs its worktree: {text}");
+        let (_, wt2_y) = find_cell(&terminal, "wt-2");
+        assert_eq!(
+            wt2_y,
+            agent_y + 2,
+            "no quiet row after the primary checkout: {text}"
+        );
+    }
+
+    /// A long orchestrator list is capped at ~30% of the column's list
+    /// area — it scrolls inside that band instead of pushing WORKTREES
+    /// down the column.
+    #[test]
+    fn orchestrators_never_take_more_than_a_third_of_the_column() {
+        use nebula_core::{Agent, AgentStatus, Entity};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        for i in 0..6 {
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Agent(Agent {
+                        id: AgentId(format!("o{i}")),
+                        worktree_id: nebula_core::WorktreeId("w1".into()),
+                        name: format!("boss-{i}"),
+                        status: AgentStatus::Fresh,
+                        archived: false,
+                        archived_at: 0,
+                        pinned: false,
+                        kind: Default::default(),
+                        model: None,
+                        effort: None,
+                        session_id: None,
+                        sort_order: i,
+                        status_changed_at: 0,
+                        orchestrator: true,
+                        alive: false,
+                    }),
+                },
+            );
+        }
+        app.focus = Focus::Worktrees;
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        let (_, orch_y) = find_cell(&terminal, "ORCHESTRATORS");
+        let (_, wt_y) = find_cell(&terminal, "WORKTREES");
+        // 20-row screen → footer off → 16-row list → 30% = a 4-row band
+        // after the title and its spacer.
+        assert_eq!(wt_y, orch_y + 2 + 4, "band capped at 30%: {text}");
+        assert!(text.contains("boss-0 ◆"), "band still lists the top rows: {text}");
+        assert!(text.contains("boss-1 ◆"), "two pills fit the band: {text}");
+        assert!(
+            !text.contains("boss-2 ◆"),
+            "the rest scrolls instead of growing the band: {text}"
+        );
+    }
+
     /// And for the projects half of the PROJECTS column.
     #[test]
     fn projects_section_scrolls_to_keep_the_selection_visible() {
