@@ -2996,6 +2996,10 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     let (pinned_count, _) = app.worktree_group_counts();
     let grouped = pinned_count > 0;
     let dim = Style::default().fg(th.dim);
+    // Tree guide lines pick up the theme's warn orange so the lineage
+    // structure reads at a glance; only the glyph color differs from the
+    // plain dim indent.
+    let guide = Style::default().fg(th.warn);
     let mut screen_row = 0usize;
     let header = |f: &mut Frame, text: String, screen_row: &mut usize| {
         if let Some(r) = row_rect(inner, *screen_row) {
@@ -3155,7 +3159,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             let x = r.x + 1 + 2 * (level as u16 - 1);
             if x < r.x + r.width {
                 f.render_widget(
-                    Paragraph::new(Span::styled("│", dim)),
+                    Paragraph::new(Span::styled("│", guide)),
                     Rect { x, width: 1, ..r },
                 );
             }
@@ -3199,7 +3203,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 "└ "
             });
-            spans.push(Span::styled(guides, dim));
+            spans.push(Span::styled(guides, guide));
         }
         spans.push(status_dot(*roll, th));
         if *is_main {
@@ -3345,7 +3349,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                     4 + nest + detail.as_ref().map_or(0, |label| label.chars().count()),
                 ),
             );
-            let mut spans = vec![rail, Span::styled(guides, dim)];
+            let mut spans = vec![rail, Span::styled(guides, guide)];
             spans.push(glyph);
             if let Some(detail) = detail {
                 spans.push(Span::styled(detail, dim));

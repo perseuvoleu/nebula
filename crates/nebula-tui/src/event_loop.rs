@@ -16321,6 +16321,16 @@ mod tests {
         let guide_x = main_x - 2;
         assert_eq!(cell(guide_x, child_y), "├", "first child connects: {text}");
         assert_eq!(cell(guide_x, last_y), "└", "last child closes the line: {text}");
+        // Guide glyphs carry the theme's warn orange, not the dim indent.
+        let th = app.theme;
+        let fg = |x: u16, y: u16| terminal.backend().buffer()[(x, y)].fg;
+        assert_eq!(fg(guide_x, child_y), th.warn, "connector is orange: {text}");
+        assert_eq!(fg(guide_x, last_y), th.warn, "end connector is orange: {text}");
+        assert_eq!(
+            fg(guide_x, child_y + 1),
+            th.warn,
+            "continuation is orange: {text}"
+        );
         assert_eq!(
             cell(guide_x + 2, grand_y),
             "└",
