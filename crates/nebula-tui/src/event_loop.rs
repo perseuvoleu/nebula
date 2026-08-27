@@ -1616,11 +1616,8 @@ fn open_new_worktree_or_branch_picker(app: &mut App, project: nebula_core::Proje
     app.overlay = Some(Overlay::Menu(ContextMenu {
         title: Some("New worktree or branch".into()),
         items: vec![
-            row(
-                "Worktree (branch + checkout)",
-                MenuAction::NewWorktree(project.clone()),
-            ),
-            row("Branch only (no checkout)", MenuAction::NewBranch(project)),
+            row("Worktree", MenuAction::NewWorktree(project.clone())),
+            row("Branch", MenuAction::NewBranch(project)),
         ],
         at: None,
         hover: 0,
