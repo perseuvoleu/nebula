@@ -14,7 +14,6 @@ about what is worth recording.
 
 ## Entries
 
-<<<<<<< HEAD
 ### Cmd-Click URLs Prefer Google Chrome — 2026-08-27
 
 **Asked:** "Use the implement skill for this task (read /Users/andrei/.agents/skills/implement/SKILL.md
@@ -58,7 +57,6 @@ workspace green; `make install` (TUI-only).
   glyph-order prefix ("claude agent-1" — the header renders "agent-1 claude").
 - The list area for the 30% math is `screen − 3 header rows − 1 footer row`; a 20-row TestBackend
   gives a 16-row list, band = 4.
-=======
 ### Worktree Panel Lists Checkout-less Branches; New-Branch Flow — 2026-08-27
 
 **Asked:** "aici vreau sa am si pentru new branch cu aceeasi regula de la primary primul sau altele,
@@ -100,8 +98,6 @@ workspace green; `make install` (old daemon fine).
   as the flash ("not fully merged"), no force path on purpose.
 - If the worktree loop runs out of rows mid-list it `break`s; the branch loop below must be gated
   on that (`out_of_rows`) or branch rows would paint ahead of skipped worktree entries.
->>>>>>> branches-in-worktree-panel
-
 ### Nested Worktree Rows Draw Tree Guide Lines — 2026-08-27
 
 **Asked:** "as putea sa am si linie vizuala intre ele sau ceva?" — follow-up to the worktree
