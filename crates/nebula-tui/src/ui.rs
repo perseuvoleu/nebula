@@ -2881,6 +2881,18 @@ fn divider_spans(label: &str, width: u16, th: Theme) -> Vec<Span<'static>> {
     ]
 }
 
+/// Whether a nest-guide line at `level` keeps running below row `i`: it
+/// does while the next row at depth ≤ `level` is exactly at `level` (a
+/// sibling still to come); any shallower row ends the line first. Derived
+/// from the depth sequence `visible_worktrees_with_depth` already emits,
+/// so guides can never disagree with the ordering.
+fn nest_level_continues(depths: &[usize], i: usize, level: usize) -> bool {
+    depths[i + 1..]
+        .iter()
+        .find(|&&d| d <= level)
+        .is_some_and(|&d| d == level)
+}
+
 fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     let th = app.theme;
     let orchestrators_focused = app.focus == Focus::Orchestrators;
@@ -3133,6 +3145,22 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         .collect();
     let avail = (inner.height as usize).saturating_sub(screen_row);
     let wt_skip = scroll_skip(&wt_heights, app.sel_worktree, avail);
+    // Nest-guide geometry: level `l` owns the 2-cell column pair starting
+    // one cell right of the selection rail, so the `├`/`└` connector on a
+    // child's pill lines up with the `│` continuations drawn on the rows
+    // around it.
+    let depths: Vec<usize> = worktrees.iter().map(|w| w.6).collect();
+    let guide_cell = |f: &mut Frame, row: usize, level: usize| {
+        if let Some(r) = row_rect(inner, row) {
+            let x = r.x + 1 + 2 * (level as u16 - 1);
+            if x < r.x + r.width {
+                f.render_widget(
+                    Paragraph::new(Span::styled("│", dim)),
+                    Rect { x, width: 1, ..r },
+                );
+            }
+        }
+    };
     for (i, (branch, is_main, created_from, roll, notes, sessions, depth)) in
         worktrees.iter().enumerate().skip(wt_skip)
     {
@@ -3153,8 +3181,25 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         let badge_len = note_badge.as_ref().map_or(0, |(s, _)| s.chars().count());
         let ramp = sweep_ramp(*roll, th, app.animations);
         let mut spans = Vec::new();
-        if nest > 0 {
-            spans.push(Span::raw(" ".repeat(nest)));
+        if *depth > 0 {
+            // Tree guides in the indent cells: `│` continuations for
+            // ancestors that still have siblings coming, then this row's
+            // own `├`/`└` connector. Same 2-cell-per-level width as the
+            // plain indent, so truncation math is untouched.
+            let mut guides = String::new();
+            for l in 1..*depth {
+                guides.push_str(if nest_level_continues(&depths, i, l) {
+                    "│ "
+                } else {
+                    "  "
+                });
+            }
+            guides.push_str(if nest_level_continues(&depths, i, *depth) {
+                "├ "
+            } else {
+                "└ "
+            });
+            spans.push(Span::styled(guides, dim));
         }
         spans.push(status_dot(*roll, th));
         if *is_main {
@@ -3188,6 +3233,17 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             worktrees_focused,
             th,
         );
+        if *depth > 0 {
+            // The pill's top pad row: the line coming down from the parent
+            // into this row's connector, plus any ancestor continuations —
+            // drawn after the pill so a selected fill can't break the line.
+            for l in 1..*depth {
+                if nest_level_continues(&depths, i, l) {
+                    guide_cell(f, screen_row, l);
+                }
+            }
+            guide_cell(f, screen_row, *depth);
+        }
         if let Some(base) = created_from {
             if let Some(r) = row_rect(inner, screen_row + PILL_H as usize) {
                 let style = if selected {
@@ -3258,14 +3314,30 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                     link.label(),
                 ),
             };
-            let indent = if selected && session_index == 0 {
+            let rail = if selected && session_index == 0 {
                 Span::styled(
-                    format!("{} ", PILL_RAIL_CAPS.1),
+                    PILL_RAIL_CAPS.1.to_string(),
                     Style::default().fg(if worktrees_focused { th.accent } else { th.dim }),
                 )
             } else {
-                Span::raw("  ")
+                Span::raw(" ")
             };
+            // Ancestor `│` continuations run through the sub-rows so the
+            // guide stays unbroken down to the last child; the spacer cell
+            // before the glyph doubles as the level-(depth+1) column for a
+            // nested child still to come below these rows. Same prefix
+            // width as before: 1 rail + 2·depth + 1 spacer.
+            let mut guides = String::new();
+            for l in 1..=depth + 1 {
+                guides.push(if nest_level_continues(&depths, i, l) {
+                    '│'
+                } else {
+                    ' '
+                });
+                if l <= *depth {
+                    guides.push(' ');
+                }
+            }
             let detail = detail.map(|label| format!("{label} "));
             let name = truncate(
                 &name,
@@ -3273,10 +3345,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                     4 + nest + detail.as_ref().map_or(0, |label| label.chars().count()),
                 ),
             );
-            let mut spans = vec![indent];
-            if nest > 0 {
-                spans.push(Span::raw(" ".repeat(nest)));
-            }
+            let mut spans = vec![rail, Span::styled(guides, dim)];
             spans.push(glyph);
             if let Some(detail) = detail {
                 spans.push(Span::styled(detail, dim));
@@ -3289,8 +3358,16 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         screen_row += entry_height;
         // An extra quiet row separates the main checkout from the true
         // worktrees below; group headers take over once something is
-        // pinned.
+        // pinned. A child nested under main still gets its guide drawn
+        // through the quiet row so the line stays unbroken.
         if !grouped && *is_main && worktrees.len() > 1 {
+            if let Some(&next_depth) = depths.get(i + 1) {
+                for l in 1..=next_depth {
+                    if nest_level_continues(&depths, i, l) {
+                        guide_cell(f, screen_row, l);
+                    }
+                }
+            }
             screen_row += 1;
         }
     }

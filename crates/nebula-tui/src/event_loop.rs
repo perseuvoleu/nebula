@@ -16260,7 +16260,9 @@ mod tests {
     }
 
     /// A worktree created from a visible worktree's branch renders nested:
-    /// indented under its parent, its redundant "from <base>" sub-line
+    /// indented under its parent with tree guide glyphs (`├` for a child
+    /// with a sibling below, `└` for the last one, `│` continuations
+    /// through the rows in between), its redundant "from <base>" sub-line
     /// dropped. One whose base has no checkout keeps the flat row and the
     /// "from" line.
     #[test]
@@ -16271,6 +16273,8 @@ mod tests {
         for (id, branch, base) in [
             ("w2", "nest-child", Some("main")),
             ("w3", "nest-loner", Some("ghost")),
+            ("w4", "nest-grand", Some("nest-child")),
+            ("w5", "nest-last", Some("main")),
         ] {
             hse(
                 &mut app,
@@ -16289,13 +16293,20 @@ mod tests {
             );
         }
         app.focus = Focus::Worktrees;
-        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        // Tall enough that the whole lineage plus the flat orphan's
+        // from-line fits below the section's midpoint.
+        let mut terminal = Terminal::new(TestBackend::new(100, 44)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
-        let (main_x, _) = find_cell(&terminal, "main");
-        let (child_x, _) = find_cell(&terminal, "nest-child");
+        let cell = |x: u16, y: u16| terminal.backend().buffer()[(x, y)].symbol().to_string();
+        let (main_x, main_y) = find_cell(&terminal, "main");
+        let (child_x, child_y) = find_cell(&terminal, "nest-child");
+        let (grand_x, grand_y) = find_cell(&terminal, "nest-grand");
+        let (last_x, last_y) = find_cell(&terminal, "nest-last");
         let (loner_x, _) = find_cell(&terminal, "nest-loner");
         assert_eq!(child_x, main_x + 2, "child indents one level: {text}");
+        assert_eq!(last_x, main_x + 2, "sibling shares the level: {text}");
+        assert_eq!(grand_x, main_x + 4, "grandchild indents two levels: {text}");
         assert_eq!(loner_x, main_x, "orphan stays flat: {text}");
         assert!(
             !text.contains("from main"),
@@ -16304,6 +16315,46 @@ mod tests {
         assert!(
             text.contains("from ghost"),
             "orphan keeps its from-line: {text}"
+        );
+        // The guide column sits 2 cells left of the row's name (the
+        // connector plus its trailing space replace the plain indent).
+        let guide_x = main_x - 2;
+        assert_eq!(cell(guide_x, child_y), "├", "first child connects: {text}");
+        assert_eq!(cell(guide_x, last_y), "└", "last child closes the line: {text}");
+        assert_eq!(
+            cell(guide_x + 2, grand_y),
+            "└",
+            "only child gets the end connector: {text}"
+        );
+        // The parent line runs unbroken through every row between `├` and
+        // `└`: the grandchild's own row plus the pad rows above each child.
+        for y in child_y + 1..last_y {
+            assert_eq!(
+                cell(guide_x, y),
+                "│",
+                "level-1 guide continues on row {y}: {text}"
+            );
+        }
+        // …including main's session sub-row and the quiet row above the
+        // first child.
+        for y in main_y + 1..child_y {
+            assert_eq!(
+                cell(guide_x, y),
+                "│",
+                "guide descends from the parent on row {y}: {text}"
+            );
+        }
+        // The grandchild's approach line drops into its connector on the
+        // pad row above it, and nothing continues below its `└`.
+        assert_eq!(
+            cell(guide_x + 2, grand_y - 1),
+            "│",
+            "level-2 guide reaches the grandchild: {text}"
+        );
+        assert_eq!(
+            cell(guide_x + 2, grand_y + 1),
+            " ",
+            "nothing continues below the last nested row: {text}"
         );
     }
 
