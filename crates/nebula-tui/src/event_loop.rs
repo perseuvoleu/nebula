@@ -361,6 +361,10 @@ async fn main_loop(
                         if channels.tx.send(ClientRequest::Subscribe).await.is_ok() {
                             app.conn = ConnState::Connected;
                             app.flash = Some("reconnected to daemon".into());
+                            // Ring seqs live in the daemon process: after a
+                            // restart they mean nothing, so every parked
+                            // parser has to replay from scratch.
+                            app.term_cache.clear();
                             if let Some(sref) = app.term.take().map(|t| t.sref) {
                                 attach(&mut app, sref, &mut out);
                             }
@@ -2489,15 +2493,17 @@ fn attach_split(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
     if let Some(existing) = app.split_term.take() {
         if existing.sref != sref {
             out.push(ClientRequest::Detach {
-                session: existing.sref,
+                session: existing.sref.clone(),
             });
         }
+        app.park_term(existing);
     }
     let (cols, rows) = split_pane_size(app);
-    app.split_term = Some(AttachedTerm::new(sref.clone(), cols, rows));
+    let (term, from_seq) = resume_or_fresh(app, &sref, cols, rows);
+    app.split_term = Some(term);
     out.push(ClientRequest::Attach {
         session: sref,
-        from_seq: None,
+        from_seq,
         cols,
         rows,
     });
@@ -2570,12 +2576,12 @@ fn close_quick_terminal(app: &mut App, out: &mut Vec<ClientRequest>) {
             app.term_locked = r.locked;
         }
         (_, restore) => {
-            if let Some(term) = &app.term {
+            if let Some(term) = app.term.take() {
                 out.push(ClientRequest::Detach {
                     session: term.sref.clone(),
                 });
+                app.park_term(term);
             }
-            app.term = None;
             app.term_locked = false;
             app.focus = match restore {
                 Some(r) if r.focus != Focus::Terminal => r.focus,
@@ -5661,6 +5667,10 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
 }
 
 fn detach_if_attached(app: &mut App, sref: &SessionRef, out: &mut Vec<ClientRequest>) {
+    // Every caller is a session going away (closed, archived, deleted, or
+    // its worktree removed) — a parked parser for it would only be resumed
+    // against a session that no longer exists.
+    app.drop_cached_term(sref);
     // The ⌘D split's shell can be closed/deleted out from under it: drop
     // the right pane rather than render a dead screen.
     if app.split_term.as_ref().is_some_and(|t| &t.sref == sref) {
@@ -5890,10 +5900,11 @@ fn restore_session(app: &mut App, out: &mut Vec<ClientRequest>) {
             attach(app, sref, out);
         }
         None => {
-            if let Some(term) = &app.term {
-                let session = term.sref.clone();
-                out.push(ClientRequest::Detach { session });
-                app.term = None;
+            if let Some(term) = app.term.take() {
+                out.push(ClientRequest::Detach {
+                    session: term.sref.clone(),
+                });
+                app.park_term(term);
                 app.term_locked = false;
             }
         }
@@ -6438,16 +6449,42 @@ fn attach(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
             session: existing.sref.clone(),
         });
     }
+    // Park the parser we are leaving: walking back into it later resumes
+    // from its `end_seq` instead of re-parsing the session's whole ring.
+    if let Some(existing) = app.term.take() {
+        app.park_term(existing);
+    }
     let (cols, rows) = pane_size(app);
     // Fresh screen, so any persisted selection would point at stale cells.
     app.term_selection = None;
-    app.term = Some(AttachedTerm::new(sref.clone(), cols, rows));
+    let (term, from_seq) = resume_or_fresh(app, &sref, cols, rows);
+    app.term = Some(term);
     out.push(ClientRequest::Attach {
         session: sref,
-        from_seq: None,
+        from_seq,
         cols,
         rows,
     });
+}
+
+/// Mount a session's parser: the parked one when this pane already holds
+/// its state at this exact size (then the Attach asks for a delta from
+/// `end_seq`), else a fresh parser and a full replay.
+fn resume_or_fresh(
+    app: &mut App,
+    sref: &SessionRef,
+    cols: u16,
+    rows: u16,
+) -> (AttachedTerm, Option<u64>) {
+    match app.take_cached_term(sref, cols, rows) {
+        Some(mut term) => {
+            // Re-attaching always lands on the live tail, like a fresh one.
+            term.set_scroll(0);
+            let from_seq = Some(term.end_seq);
+            (term, from_seq)
+        }
+        None => (AttachedTerm::new(sref.clone(), cols, rows), None),
+    }
 }
 
 /// Terminal-pane grid for spawn/attach requests; the fallback keeps
@@ -8416,6 +8453,10 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             app.tree.todos = todos;
             app.tree.links = links;
             app.pr_seen = pr_seen.into_iter().map(|s| (s.url, s.marker)).collect();
+            // A snapshot means a fresh subscription; if the daemon restarted
+            // behind it, ring seqs restarted too — parked parsers can't be
+            // resumed against them.
+            app.term_cache.clear();
             if let Some(json) = ui_state {
                 restore_ui_state(app, &json);
             }
@@ -8431,29 +8472,48 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             }
             app.dirty = true;
         }
-        ServerEvent::Scrollback { session, data, .. } => {
+        ServerEvent::Scrollback {
+            session,
+            base_seq,
+            data,
+        } => {
             if let Some(term) = app.term.as_mut().filter(|t| t.sref == session) {
-                // Full replay: the screen is rebuilt from scratch.
-                app.term_selection = None;
-                term.reset();
+                // A replay whose base is exactly where the parser stopped is
+                // a delta on top of state we already hold — the whole point
+                // of a resumed attach, and usually empty. Any other base
+                // means the bytes in between fell off the ring (or this is a
+                // fresh parser): rebuild the screen from scratch.
+                if base_seq != term.end_seq {
+                    term.reset();
+                }
                 term.feed(&data);
+                term.end_seq = base_seq + data.len() as u64;
+                // Either way the cells under a stored selection moved.
+                app.term_selection = None;
                 app.dirty = true;
             } else if let Some(term) = app.split_term.as_mut().filter(|t| t.sref == session) {
-                term.reset();
+                if base_seq != term.end_seq {
+                    term.reset();
+                }
                 term.feed(&data);
+                term.end_seq = base_seq + data.len() as u64;
                 app.dirty = true;
             }
         }
-        ServerEvent::Output { session, data, .. } => {
+        ServerEvent::Output { session, seq, data } => {
             if let Some(term) = app.term.as_mut().filter(|t| t.sref == session) {
                 term.feed(&data);
+                term.end_seq = seq + data.len() as u64;
                 app.dirty = true;
             } else if let Some(term) = app.split_term.as_mut().filter(|t| t.sref == session) {
                 term.feed(&data);
+                term.end_seq = seq + data.len() as u64;
                 app.dirty = true;
             }
         }
         ServerEvent::SessionExited { session, .. } => {
+            // Its PTY is gone; a parked parser for it can never resume.
+            app.drop_cached_term(&session);
             if let Some(term) = app.term.as_mut().filter(|t| t.sref == session) {
                 term.exited = true;
                 app.dirty = true;
@@ -8954,6 +9014,8 @@ fn apply_removal(app: &mut App, id: &nebula_core::EntityId) {
     let tree = &app.tree;
     app.unseen_finished
         .retain(|id| tree.agents.iter().any(|a| &a.id == id));
+    // Same for a parked parser whose session the cascade took with it.
+    app.prune_term_cache();
     // A note modal aimed at a vanished owner has nothing left to show.
     if let Some(Overlay::Notes(view)) = &app.overlay {
         let gone = match &view.owner {
@@ -21765,5 +21827,196 @@ mod tests {
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
             assert!(!app.should_quit, "Enter on an empty list is a no-op");
         });
+    }
+
+    // ---- fast session re-attach: parked parsers + scrollback deltas ----
+
+    fn term_screen(term: &crate::app::AttachedTerm) -> String {
+        term.parser.screen().contents()
+    }
+
+    fn other_session() -> SessionRef {
+        SessionRef::Terminal(nebula_core::TerminalId("t-other".into()))
+    }
+
+    /// Walking back into a session it already parsed asks the daemon for
+    /// only the bytes since it left, and lays them on top of the screen it
+    /// kept — no reset, no 1 MiB re-parse.
+    #[test]
+    fn revisiting_a_session_resumes_its_parser_from_a_scrollback_delta() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.term_area = ratatui::layout::Rect::new(0, 0, 40, 10);
+        let a1 = SessionRef::Agent(AgentId("a1".into()));
+        let mut out = Vec::new();
+
+        attach(&mut app, a1.clone(), &mut out);
+        assert!(
+            matches!(
+                out.last(),
+                Some(ClientRequest::Attach { from_seq: None, .. })
+            ),
+            "first visit replays everything: {out:?}"
+        );
+        hse(
+            &mut app,
+            ServerEvent::Scrollback {
+                session: a1.clone(),
+                base_seq: 0,
+                data: b"hello\r\n".to_vec(),
+            },
+        );
+        hse(
+            &mut app,
+            ServerEvent::Output {
+                session: a1.clone(),
+                seq: 7,
+                data: b"there\r\n".to_vec(),
+            },
+        );
+
+        // Leave for another session, then come back.
+        out.clear();
+        attach(&mut app, other_session(), &mut out);
+        out.clear();
+        attach(&mut app, a1.clone(), &mut out);
+        assert!(
+            matches!(
+                out.last(),
+                Some(ClientRequest::Attach {
+                    from_seq: Some(14),
+                    ..
+                })
+            ),
+            "the return visit asks for the delta past 'hello there': {out:?}"
+        );
+        assert!(
+            term_screen(app.term.as_ref().unwrap()).contains("hello"),
+            "the parked screen is up before the daemon answers"
+        );
+
+        hse(
+            &mut app,
+            ServerEvent::Scrollback {
+                session: a1,
+                base_seq: 14,
+                data: b"world\r\n".to_vec(),
+            },
+        );
+        let screen = term_screen(app.term.as_ref().unwrap());
+        assert!(
+            screen.contains("hello") && screen.contains("there") && screen.contains("world"),
+            "the delta appended instead of wiping the screen:\n{screen}"
+        );
+    }
+
+    /// A replay whose base isn't where the parser stopped — the bytes in
+    /// between fell off the daemon's ring — still rebuilds from scratch.
+    #[test]
+    fn a_scrollback_off_the_parsers_seq_resets_and_replays() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.term_area = ratatui::layout::Rect::new(0, 0, 40, 10);
+        let a1 = SessionRef::Agent(AgentId("a1".into()));
+        let mut out = Vec::new();
+        attach(&mut app, a1.clone(), &mut out);
+        hse(
+            &mut app,
+            ServerEvent::Scrollback {
+                session: a1.clone(),
+                base_seq: 0,
+                data: b"stale\r\n".to_vec(),
+            },
+        );
+
+        hse(
+            &mut app,
+            ServerEvent::Scrollback {
+                session: a1,
+                base_seq: 9_000,
+                data: b"rebuilt\r\n".to_vec(),
+            },
+        );
+        let screen = term_screen(app.term.as_ref().unwrap());
+        assert!(screen.contains("rebuilt"), "{screen}");
+        assert!(
+            !screen.contains("stale"),
+            "the parser reset first:\n{screen}"
+        );
+        assert_eq!(app.term.as_ref().unwrap().end_seq, 9_009);
+    }
+
+    /// A pane that changed size between visits can't take a delta — bytes
+    /// laid out for the old grid would garble the new one — so it replays.
+    #[test]
+    fn a_resized_pane_falls_back_to_a_full_replay() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.term_area = ratatui::layout::Rect::new(0, 0, 40, 10);
+        let a1 = SessionRef::Agent(AgentId("a1".into()));
+        let mut out = Vec::new();
+        attach(&mut app, a1.clone(), &mut out);
+        hse(
+            &mut app,
+            ServerEvent::Scrollback {
+                session: a1.clone(),
+                base_seq: 0,
+                data: b"hello\r\n".to_vec(),
+            },
+        );
+        attach(&mut app, other_session(), &mut out);
+
+        app.term_area = ratatui::layout::Rect::new(0, 0, 100, 30);
+        out.clear();
+        attach(&mut app, a1, &mut out);
+        assert!(
+            matches!(
+                out.last(),
+                Some(ClientRequest::Attach { from_seq: None, .. })
+            ),
+            "a size change replays: {out:?}"
+        );
+        assert_eq!(term_screen(app.term.as_ref().unwrap()).trim(), "");
+    }
+
+    /// The cache is a small window on the sessions one walks between, and
+    /// it never holds a parser for a session that is gone.
+    #[test]
+    fn the_parked_parser_cache_evicts_and_forgets_dead_sessions() {
+        use crate::app::TERM_CACHE_CAP;
+        let mut app = App::new();
+        seed_tree(&mut app);
+        for i in 0..TERM_CACHE_CAP + 2 {
+            let sref = SessionRef::Terminal(nebula_core::TerminalId(format!("t{i}")));
+            app.park_term(AttachedTerm::new(sref, 40, 10));
+        }
+        assert_eq!(app.term_cache.len(), TERM_CACHE_CAP);
+        assert!(
+            app.take_cached_term(
+                &SessionRef::Terminal(nebula_core::TerminalId("t0".into())),
+                40,
+                10
+            )
+            .is_none(),
+            "the least recently parked one was evicted"
+        );
+
+        // Closing a session drops its parked parser.
+        let a1 = SessionRef::Agent(AgentId("a1".into()));
+        app.park_term(AttachedTerm::new(a1.clone(), 40, 10));
+        let mut out = Vec::new();
+        detach_if_attached(&mut app, &a1, &mut out);
+        assert!(app.take_cached_term(&a1, 40, 10).is_none());
+
+        // So does the session exiting on its own.
+        app.park_term(AttachedTerm::new(a1.clone(), 40, 10));
+        hse(
+            &mut app,
+            ServerEvent::SessionExited {
+                session: a1.clone(),
+                exit_code: Some(0),
+            },
+        );
+        assert!(app.take_cached_term(&a1, 40, 10).is_none());
     }
 }

@@ -78,6 +78,11 @@ pub const MIN_PANEL_W: u16 = 10;
 /// The terminal pane always keeps at least this much width.
 pub const MIN_TERM_W: u16 = 20;
 
+/// How many parked terminal parsers [`App::term_cache`] keeps. Each holds a
+/// vt100 grid plus 10k lines of scrollback, so the cap trades memory for
+/// instant re-attach across the handful of sessions one walks between.
+pub const TERM_CACHE_CAP: usize = 8;
+
 /// Default outer width of the diff modal's file-list panel.
 pub const DEFAULT_DIFF_FILES_W: u16 = 34;
 /// The diff modal's file list can't be dragged narrower than this.
@@ -1923,6 +1928,10 @@ pub struct AttachedTerm {
     /// The child's kitty keyboard flags (daemon-tracked); picks the key
     /// encoding dialect. 0 = legacy.
     pub kitty_flags: u8,
+    /// Seq the next PTY byte is expected to carry — i.e. everything below it
+    /// has already been fed to the parser. Re-attaching with this as
+    /// `from_seq` asks the daemon for a DELTA instead of the whole ring.
+    pub end_seq: u64,
     /// Bumped whenever the visible screen may have changed (output, replay,
     /// resize, scrollback), so screen-derived work can be memoized per
     /// change instead of per frame.
@@ -1945,6 +1954,7 @@ impl AttachedTerm {
             rows,
             scroll: 0,
             kitty_flags: 0,
+            end_seq: 0,
             screen_gen: 0,
             links_cache: None,
         }
@@ -2104,6 +2114,11 @@ pub struct App {
     /// ⌘D split: a fresh shell rendered in the right half of the terminal
     /// pane, alongside whatever `term` shows on the left. `None` = no split.
     pub split_term: Option<AttachedTerm>,
+    /// Parsers parked when a session is switched away from, so coming back
+    /// can ask the daemon for a scrollback DELTA (`from_seq`) instead of
+    /// replaying — and re-parsing — the session's whole 1 MiB ring on every
+    /// visit. Least-recently-parked first; capped at [`TERM_CACHE_CAP`].
+    pub term_cache: Vec<AttachedTerm>,
     /// Which split pane the input lock feeds: `true` = the ⌘D shell on the
     /// right, `false` = the main attachment on the left. Meaningless while
     /// `split_term` is `None`.
@@ -2354,6 +2369,7 @@ impl App {
             sel_session: 0,
             term: None,
             split_term: None,
+            term_cache: Vec::new(),
             split_focused: false,
             split_term_area: Rect::default(),
             term_locked: false,
@@ -2770,6 +2786,55 @@ impl App {
             rows.retain(|r| r.sref().as_ref() != Some(split));
         }
         rows
+    }
+
+    /// Park a parser for a session we are leaving, so the next visit can
+    /// resume it from `end_seq`. Exited sessions are never parked — their
+    /// screen is final and their PTY is gone.
+    pub fn park_term(&mut self, term: AttachedTerm) {
+        if term.exited {
+            self.drop_cached_term(&term.sref);
+            return;
+        }
+        self.term_cache.retain(|t| t.sref != term.sref);
+        self.term_cache.push(term);
+        while self.term_cache.len() > TERM_CACHE_CAP {
+            self.term_cache.remove(0);
+        }
+    }
+
+    /// Take back a parked parser, but only when it was parked at the size
+    /// the pane has now: feeding a delta produced at another grid size into
+    /// a resized parser garbles the screen, so a size change falls back to a
+    /// full replay.
+    pub fn take_cached_term(
+        &mut self,
+        sref: &SessionRef,
+        cols: u16,
+        rows: u16,
+    ) -> Option<AttachedTerm> {
+        let i = self
+            .term_cache
+            .iter()
+            .position(|t| &t.sref == sref && t.cols == cols && t.rows == rows)?;
+        Some(self.term_cache.remove(i))
+    }
+
+    /// Forget a session's parked parser — it exited, was closed, or its
+    /// worktree went away.
+    pub fn drop_cached_term(&mut self, sref: &SessionRef) {
+        self.term_cache.retain(|t| &t.sref != sref);
+    }
+
+    /// Drop parked parsers whose session no longer exists in the tree —
+    /// covers every removal cascade (agent, terminal, worktree, project) in
+    /// one place.
+    pub fn prune_term_cache(&mut self) {
+        let tree = &self.tree;
+        self.term_cache.retain(|t| match &t.sref {
+            SessionRef::Agent(id) => tree.agents.iter().any(|a| &a.id == id),
+            SessionRef::Terminal(id) => tree.terminals.iter().any(|x| &x.id == id),
+        });
     }
 
     /// The session mounted in the ⌘D split's right pane, when one is open.

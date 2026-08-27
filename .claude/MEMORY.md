@@ -14,6 +14,55 @@ about what is worth recording.
 
 ## Entries
 
+### Session Switching Reuses The Parser And Asks For A Scrollback Delta — 2026-08-27
+
+**Asked:** "Make switching between worktrees/sessions fast by reusing the terminal parser and
+requesting only a scrollback DELTA on re-attach, instead of the current full replay. … every session
+switch calls `attach()`, which DROPS the old `AttachedTerm` (parser state gone) and sends
+`ClientRequest::Attach { from_seq: None, .. }` … the TUI's `ServerEvent::Scrollback` arm does
+`term.reset(); term.feed(&data)` — re-parsing up to 1 MiB of ANSI synchronously in the event loop on
+EVERY switch."
+
+**Did:** TUI-only; no daemon or protocol change (the protocol already carried `from_seq` /
+`base_seq` / `seq` — the TUI just ignored them). `AttachedTerm` (`crates/nebula-tui/src/app.rs:1931`)
+gained `end_seq: u64`, set from `base_seq + data.len()` in the Scrollback arm and `seq + data.len()`
+in the Output arm (`event_loop.rs`, `handle_server_event`) — both panes. New `App::term_cache:
+Vec<AttachedTerm>` with `park_term` / `take_cached_term` / `drop_cached_term` / `prune_term_cache`
+(app.rs, next to `split_sref`), capped by `TERM_CACHE_CAP = 8` (app.rs:84), evicting the
+least-recently-parked. `attach()` and `attach_split()` (`event_loop.rs:6449` / `:2493`) park the term
+they replace and mount through the new `resume_or_fresh()` helper: a cached entry whose `cols`/`rows`
+match the pane is reused and the Attach carries `from_seq: Some(end_seq)`; anything else is a fresh
+`AttachedTerm::new` + `from_seq: None`. The `Scrollback` arm now resets ONLY when
+`base_seq != term.end_seq` (fell off the daemon's ring, or a fresh parser); a matching base is fed as
+a delta on top of the kept screen. Invalidation: `detach_if_attached` drops the entry (every caller is
+a session going away), `SessionExited` drops it, `apply_removal` calls `prune_term_cache`, and both
+the reconnect arm (`event_loop.rs:364`) and the `Snapshot` arm clear the whole cache — ring seqs are
+per-daemon-process. Tests (event_loop.rs, end of `mod tests`):
+`revisiting_a_session_resumes_its_parser_from_a_scrollback_delta`,
+`a_scrollback_off_the_parsers_seq_resets_and_replays`,
+`a_resized_pane_falls_back_to_a_full_replay`,
+`the_parked_parser_cache_evicts_and_forgets_dead_sessions`. 504 nebula-tui + full workspace green;
+`make install` (TUI-only, old daemon fine).
+
+**Gotchas:**
+- The park/resume path is race-safe for a reason worth knowing: after `Detach` the daemon aborts the
+  forward task, but `Output` frames already queued on the connection can still land after the term was
+  parked. They match neither pane, so they are dropped and `end_seq` does NOT advance — and that is
+  fine, because the ring is contiguous and `snapshot_from(end_seq)` re-delivers exactly those bytes on
+  the next visit. Never "helpfully" advance a parked term's `end_seq` from a dropped frame.
+- Reusing a parser at a different grid size garbles the screen, so `take_cached_term` matches on
+  `cols`/`rows` too and a resize silently falls back to a full replay. Do not relax this into a
+  `set_size` + delta — the delta's bytes were laid out for the old grid.
+- Memory is the real cost: a parked `vt100::Parser` keeps up to 10k scrollback rows × cols × 32 B
+  (`Cell` is `assert!`-ed at 32 bytes in `vendor/vt100/src/cell.rs:17`), so a wide, long-lived session
+  can be tens of MB and 8 of them is the worst case. `TERM_CACHE_CAP` is the one knob if nebula's RSS
+  readout in the footer starts looking wrong.
+- `park_term` refuses exited terms (and drops any stale entry for them) — otherwise ⌘D's shell or a
+  finished agent would be resumed against a PTY that no longer exists.
+- Two non-`attach` paths also drop `app.term` while the session stays alive — `close_quick_terminal`
+  and `restore_session`'s no-target branch — and both had to switch from `&app.term` + `app.term =
+  None` to `app.term.take()` + `park_term`, or ⌘T and context switches would keep replaying.
+
 ### Cmd-Click URLs Prefer Google Chrome — 2026-08-27
 
 **Asked:** "Use the implement skill for this task (read /Users/andrei/.agents/skills/implement/SKILL.md
