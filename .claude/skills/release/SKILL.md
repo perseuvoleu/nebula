@@ -40,7 +40,7 @@ cp <repo>/<file> "$W"/<file>
 
 For a file where your change is tangled with someone else's, extract only your hunks
 (`git diff -- <file> > all.patch`, keep your `@@` blocks, `git apply` them onto the pristine copy) and
-re-read the result. Read `.claude/MEMORY.md` for anything recorded about the subsystem you're releasing.
+re-read the result.
 
 ## 2. Green gate — the tag must point at code that compiles
 
@@ -75,13 +75,10 @@ One commit for the change, in the repo's voice: a subject line that says what a 
 what the diff did. Look at `git log --oneline -10` and match it — "Rebindable keys, a settings overlay,
 and a status signal that survives cancel", not "feat(tui): add keymap module".
 
-End the message with:
+End the message with a `Co-Authored-By:` line crediting the model cutting the release, e.g.
+`Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`.
 
-```
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
-```
-
-Keep project-memory scaffolding (`.claude/`, `CLAUDE.md`) in its own commit — it is not part of the
+Keep agent scaffolding (`.claude/`, `CLAUDE.md`) in its own commit — it is not part of the
 release story and clutters the changelog.
 
 ## 4. Bump the version
@@ -153,22 +150,13 @@ who has not read the diff: what the key does, where it shows up, what it does wh
 
 - …
 
-**Full install:** `curl -fsSL https://raw.githubusercontent.com/AgentSystemLabs/nebula/main/install.sh | sh`
+**Full install:** `curl -fsSL https://raw.githubusercontent.com/perseuvoleu/nebula/main/install.sh | sh`
 EOF
 )"
 ```
 
-Writing to the API needs an account with write access to `AgentSystemLabs/nebula`. Check first:
-
-```bash
-gh auth status
-```
-
-Two accounts are usually logged in. `webdevcody` is the admin; `codyseibert` has read only and fails
-with "must be a collaborator". If the wrong one is active:
-`gh auth switch --hostname github.com --user webdevcody`.
-
-The repo slug is **`AgentSystemLabs/nebula`** — never `webdevcody/nebula`.
+Writing to the API needs write access to the repo (`perseuvoleu/nebula`); `gh auth status` shows
+which account is active.
 
 ## 8. Confirm and record
 
@@ -178,5 +166,4 @@ Check the release actually carries its binaries:
 gh release view v0.3.0 --json assets -q '.assets[].name'
 ```
 
-Then report to the user: the version, the tag URL, and the asset list. Finish by invoking the
-`nebula-memory` skill to log the release and anything that bit you along the way.
+Then report to the user: the version, the tag URL, and the asset list.
