@@ -2666,6 +2666,18 @@ fn open_delete_confirm(app: &mut App) {
                     ),
                     action: PendingAction::DeleteWorktree(w.id.clone()),
                 }));
+            } else if let Some(branch) = app.selected_branch_row() {
+                // A checkout-less branch row: same confirm as the row
+                // menu's Delete branch.
+                if let Some(project) = app.selected_project().map(|p| p.id.clone()) {
+                    app.overlay = Some(Overlay::Confirm(ConfirmDialog {
+                        title: "Delete branch".into(),
+                        message: format!(
+                            "Delete local branch '{branch}'? (git refuses unmerged branches)"
+                        ),
+                        action: PendingAction::DeleteBranch { project, branch },
+                    }));
+                }
             }
         }
         Focus::Sessions => match app.selected_session_row() {
@@ -16860,10 +16872,12 @@ mod tests {
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
         let (_, orch_y) = find_cell(&terminal, "ORCHESTRATORS");
-        let (_, wt_y) = find_cell(&terminal, "WORKTREES");
-        // Title, blank spacer, the 2-row placeholder pill, then the
-        // WORKTREES header directly on the boundary.
-        assert_eq!(wt_y, orch_y + 4, "split hugs the placeholder pill: {text}");
+        let (wt_x, wt_y) = find_cell(&terminal, "WORKTREES");
+        // Title, blank spacer, the 2-row placeholder pill, the section
+        // rule on the boundary row, then the WORKTREES header.
+        assert_eq!(wt_y, orch_y + 5, "split hugs the placeholder pill: {text}");
+        let rule = terminal.backend().buffer()[(wt_x, wt_y - 1)].symbol();
+        assert_eq!(rule, "─", "section rule right above the header: {text}");
         let (_, main_y) = find_cell(&terminal, "main");
         assert_eq!(main_y, wt_y + 2, "first pill text right under the header: {text}");
         // "claude agent-1" pins the sub-row shape — the bare name also
@@ -16878,11 +16892,11 @@ mod tests {
         );
     }
 
-    /// A long orchestrator list is capped at ~30% of the column's list
-    /// area — it scrolls inside that band instead of pushing WORKTREES
-    /// down the column.
+    /// A long orchestrator list is capped at five pills — and at half the
+    /// column's list area on a short window — it scrolls inside that band
+    /// instead of pushing WORKTREES down the column.
     #[test]
-    fn orchestrators_never_take_more_than_a_third_of_the_column() {
+    fn orchestrators_never_take_more_than_five_pills_or_half_the_column() {
         use nebula_core::{Agent, AgentStatus, Entity};
         let mut app = App::new();
         seed_tree(&mut app);
@@ -16916,15 +16930,43 @@ mod tests {
         let text = buffer_text(&terminal);
         let (_, orch_y) = find_cell(&terminal, "ORCHESTRATORS");
         let (_, wt_y) = find_cell(&terminal, "WORKTREES");
-        // 20-row screen → footer off → 16-row list → 30% = a 4-row band
-        // after the title and its spacer.
-        assert_eq!(wt_y, orch_y + 2 + 4, "band capped at 30%: {text}");
-        assert!(text.contains("boss-0 ◆"), "band still lists the top rows: {text}");
-        assert!(text.contains("boss-1 ◆"), "two pills fit the band: {text}");
+        // 20-row screen → footer off → 15-row list → half = a 7-row band
+        // after the title and its spacer, then the section rule row.
+        assert_eq!(wt_y, orch_y + 2 + 7 + 1, "band capped at half: {text}");
+        assert!(text.contains("boss-2 ◆"), "three pills fit the band: {text}");
         assert!(
-            !text.contains("boss-2 ◆"),
+            !text.contains("boss-3 ◆"),
             "the rest scrolls instead of growing the band: {text}"
         );
+
+        // A tall window stops growing the band at five pills — the sixth
+        // orchestrator scrolls, and WORKTREES keeps the rest.
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        let (_, orch_y) = find_cell(&terminal, "ORCHESTRATORS");
+        let (_, wt_y) = find_cell(&terminal, "WORKTREES");
+        assert_eq!(wt_y, orch_y + 2 + 10 + 1, "band capped at five pills: {text}");
+        assert!(text.contains("boss-4 ◆"), "five pills fit the band: {text}");
+        assert!(
+            !text.contains("boss-5 ◆"),
+            "the sixth scrolls instead of growing the band: {text}"
+        );
+    }
+
+    /// The Projects column gets the same boundary treatment: a dim rule
+    /// row right above the global SESSIONS header, so the seam between
+    /// the tightened sections stays visible.
+    #[test]
+    fn a_dim_rule_sits_above_the_global_sessions_header() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        let (sx, sy) = find_cell(&terminal, "SESSIONS");
+        let rule = terminal.backend().buffer()[(sx, sy - 1)].symbol();
+        assert_eq!(rule, "─", "section rule right above the header: {text}");
     }
 
     /// And for the projects half of the PROJECTS column.
@@ -18212,6 +18254,34 @@ mod tests {
             crate::branches::local_branches(&repo).contains(&"unmerged".to_string()),
             "an unmerged branch is never force-deleted"
         );
+    }
+
+    /// `d` on a checkout-less branch row opens the same delete confirm as
+    /// the row menu — the delete verb works like on every other row kind.
+    #[test]
+    fn d_on_a_branch_row_opens_the_delete_confirm() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo(&dir);
+        run_git(&repo, &["branch", "merged"]);
+        let mut app = App::new();
+        seed_repo_tree(&mut app, &repo);
+        spawn_branch_list(&mut app);
+        assert_eq!(app.branch_rows(), ["merged"]);
+        app.focus = Focus::Worktrees;
+        app.sel_worktree = app.visible_worktrees().len();
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(
+                &app.overlay,
+                Some(Overlay::Confirm(c)) if matches!(&c.action, PendingAction::DeleteBranch { branch, .. } if branch == "merged")
+            ),
+            "{:?}",
+            app.overlay
+        );
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert_eq!(app.flash.as_deref(), Some("branch merged deleted"));
+        assert!(app.branch_rows().is_empty(), "the row refreshed");
     }
 
     #[test]

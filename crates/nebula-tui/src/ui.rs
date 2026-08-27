@@ -2181,14 +2181,14 @@ fn shrink_r(area: Rect) -> Rect {
 }
 
 /// Rows of the shared column's list area the ORCHESTRATORS section keeps:
-/// what its pill rows actually need, capped at ~30% of the list so a long
-/// orchestrator list scrolls instead of crowding out the worktrees, and
-/// floored at one pill so the section stays enterable. `entries` counts
-/// the rendered rows — real orchestrators, or the one "+ new orchestrator"
-/// placeholder.
+/// what its pill rows actually need, capped at five pills — and at half
+/// the list on a short window — so a long orchestrator list scrolls
+/// instead of crowding out the worktrees, and floored at one pill so the
+/// section stays enterable. `entries` counts the rendered rows — real
+/// orchestrators, or the one "+ new orchestrator" placeholder.
 fn orchestrator_section_rows(list_h: usize, entries: usize) -> usize {
-    (entries.max(1) * PILL_H as usize)
-        .min((list_h * 3 / 10).max(PILL_H as usize))
+    (entries.clamp(1, 5) * PILL_H as usize)
+        .min((list_h / 2).max(PILL_H as usize))
         .min(list_h)
 }
 
@@ -2765,6 +2765,11 @@ fn draw_global_sessions(f: &mut Frame, app: &mut App, inner: Rect, mid: usize) {
     let dim = Style::default().fg(th.dim);
     let sessions = app.global_sessions();
     let mut screen_row = mid;
+    // Same boundary treatment as the ORCHESTRATORS/WORKTREES column: the
+    // rule owns the `mid` row, the header sits one below, and the rows
+    // after inherit the shift through `screen_row`.
+    render_section_rule(f, inner, screen_row, th);
+    screen_row += 1;
     if let Some(r) = row_rect(inner, screen_row) {
         let mut spans = vec![Span::styled(
             format!("{ROW_GUTTER}SESSIONS"),
@@ -2885,6 +2890,23 @@ fn draw_global_sessions(f: &mut Frame, app: &mut App, inner: Rect, mid: usize) {
     };
     if bottom.height > 0 {
         app.hits.push((bottom, HitTarget::GlobalSessionsBg));
+    }
+}
+
+/// Dim full-width rule on the boundary between two stacked sections of a
+/// sidebar column, on its own row right above the lower section's header —
+/// after the compact spacing pass the sections sat flush and the seam was
+/// invisible. Callers advance their row cursor past it themselves so the
+/// height accounting below stays theirs.
+fn render_section_rule(f: &mut Frame, inner: Rect, screen_row: usize, th: Theme) {
+    if let Some(r) = row_rect(inner, screen_row) {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                "─".repeat(inner.width as usize),
+                Style::default().fg(th.dim),
+            )),
+            r,
+        );
     }
 }
 
@@ -3135,8 +3157,12 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         screen_row += PILL_H as usize;
     }
     // Bottom section: WORKTREES starts right under the orchestrator rows,
-    // at the adaptive boundary.
+    // at the adaptive boundary. The boundary row itself holds the section
+    // rule, so the header sits one row below `mid` and every row after it
+    // inherits the shift through `screen_row`.
     screen_row = mid;
+    render_section_rule(f, inner, screen_row, th);
+    screen_row += 1;
     if let Some(r) = row_rect(inner, screen_row) {
         let header_style = if worktrees_focused {
             Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
