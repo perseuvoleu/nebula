@@ -14,6 +14,37 @@ about what is worth recording.
 
 ## Entries
 
+### Nested Worktree Rows Draw Tree Guide Lines — 2026-08-27
+
+**Asked:** "as putea sa am si linie vizuala intre ele sau ceva?" — follow-up to the worktree
+lineage-nesting feature: a visual connector so parent/child worktrees read as a tree.
+
+**Did:** Commit `ec9106c` (branch worktree-nesting-tree-lines). `draw_worktrees` (ui.rs) replaces
+the plain 2-cell nest indent with dim tree guides: `├ `/`└ ` connector on the child's pill row plus
+`│ ` ancestor continuations, all derived by new `nest_level_continues(depths, i, level)` (free fn
+above `draw_worktrees`) from the depth sequence `visible_worktrees_with_depth` already emits — no
+app.rs change, no new sibling bookkeeping. The line stays unbroken by also drawing `│` on: session
+sub-rows (levels 1..=depth as 2-char cells, plus the spacer cell before the glyph doubling as the
+level-depth+1 column), the pill's top pad row (a `guide_cell` overlay drawn AFTER `render_pill` so
+a selected fill can't erase it), and the quiet row after the main checkout. Heights, hit rects,
+scroll_skip, and truncation math untouched — glyphs live inside the existing indent cells. Test
+`worktree_rows_nest_indented_under_their_parent` (event_loop.rs) extended: two children (`├` then
+`└`), a depth-2 chain, cell-exact `│` continuity assertions on every in-between row, and nothing
+below the last `└`. 492 nebula-tui + full workspace green; `make install` (TUI-only).
+
+**Gotchas:**
+- Pill rows and session sub-rows put their content one column apart (pill: rail + spans; sub-row:
+  2-char indent). To align the guide columns, the sub-row's 2-char indent had to split into a
+  1-char rail cap + the guide string — keeping the `▘` cap at column 0 and the same total prefix
+  width (`4 + nest`), so `pill_rail_spans_the_pads` and the truncation math never notice.
+- Pad-row guides must render after `render_pill` and as 1-cell overlays (never a full 2·depth
+  Paragraph): the pill's selected fill shares that row, and writing spacer cells would punch holes
+  in the fill.
+- The screen test grew two rows and stopped fitting a 30-row terminal below the WORKTREES midpoint
+  (rows silently `break` when `row_rect` runs out) — bumped to `TestBackend::new(100, 44)`.
+- A depth-0 parent whose own "from <base>" line is visible (base has no checkout) gets a 1-row gap
+  in the child's guide there — deliberate: the `│` would overwrite the "from" text at column 1.
+
 ### Unseen-Finished Sessions Render Blue; Visiting A Worktree Clears Them All — 2026-08-27
 
 **Asked:** "sesiunile care s au terminat si nu am intrat inca pe ele trebuie sa aiba un border
