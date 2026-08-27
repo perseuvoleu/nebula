@@ -14,6 +14,22 @@ about what is worth recording.
 
 ## Entries
 
+### Cmd-Click URLs Prefer Google Chrome — 2026-08-27
+
+**Asked:** "Use the implement skill for this task (read /Users/andrei/.agents/skills/implement/SKILL.md
+if needed). ... TASK: Cmd-clicking a URL in the terminal/agent panes should open it directly in Google
+Chrome instead of the macOS default browser."
+
+**Did:** Commit `f25cd63` (branch `open-links-in-chrome`). `crates/nebula-tui/src/event_loop.rs`
+updates `open_url` so macOS tries `open -a "Google Chrome" <url>` first and falls back to plain
+`open <url>` on a non-success status, while keeping the existing `http`/`https` allowlist and the
+`cfg!(test)` early return unchanged. Verified with `cargo test -p nebula-tui` (492 passed).
+
+**Gotchas:**
+- The existing saved-link, PR-link, and terminal-link tests already exercise the shared `open_url`
+  funnel; they stay green only because `cfg!(test)` returns before either `open` command runs, so
+  the fallback logic had to sit strictly after that guard.
+
 ### Nested Worktree Rows Draw Tree Guide Lines — 2026-08-27
 
 **Asked:** "as putea sa am si linie vizuala intre ele sau ceva?" — follow-up to the worktree
