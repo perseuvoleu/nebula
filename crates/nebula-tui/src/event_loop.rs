@@ -6522,7 +6522,7 @@ fn copy_to_clipboard(text: &str) -> bool {
     }
 }
 
-/// Open a URL in the default browser via open(1) (this tool targets macOS).
+/// Open a URL in Google Chrome, falling back to the default browser (macOS only).
 /// The scheme allowlist is defense in depth — the link scanner only ever
 /// produces http(s) URLs, but the text originates from untrusted PTY output.
 fn open_url(url: &str) -> bool {
@@ -6535,7 +6535,14 @@ fn open_url(url: &str) -> bool {
     #[cfg(target_os = "macos")]
     {
         use std::process::{Command, Stdio};
-        Command::new("open")
+        let chrome_opened = Command::new("open")
+            .args(["-a", "Google Chrome", url])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        chrome_opened
+            || Command::new("open")
             .arg(url)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
