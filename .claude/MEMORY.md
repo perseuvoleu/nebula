@@ -14,6 +14,27 @@ about what is worth recording.
 
 ## Entries
 
+### Orchestrators Ask Before Worktrees And Before Merges — 2026-08-27
+
+**Asked:** "o sa am orchestratori pe branch uri, o sa fac cate un feature sau mai multe pe un
+brnach, daca ii dau tichete la ai atunci o sa bage mai multi worktrees in paralel altfel poate
+direct pe acel branch sa scrie, trebuie sa ma intrebe inainte nu sa faca wt pentru orice, la fel si
+dupa implementare pana sa dau merge trebuie sa ma intrebe daca face merge si sa stearga wt din
+nebula si local"
+
+**Did:** Commit `b259489`. Rewrote the Rules paragraph of `ORCHESTRATOR_INSTRUCTION`
+(crates/nebula-daemon/src/hooks/mod.rs): a single feature/fix goes directly on the orchestrator's
+own branch in its own checkout; worktrees only for several independent tickets, and the
+orchestrator must ASK before creating any worktree AND before merging a verified worker branch —
+after approval it merges, runs `nebula worktree delete <branch>`, and deletes the merged git
+branch. This is the user's standing workflow decision — do not relitigate it by spawning worktrees
+for small tasks or auto-merging.
+
+**Gotchas:**
+- The instruction is daemon-side: `make install` alone doesn't change what running sessions see —
+  it takes a `nebula kill` (stops ALL sessions) and new sessions to take effect. Orchestrator
+  sessions started before the change still carry the old "split across worktrees" text.
+
 ### Section Boundary Rules, d Deletes Branch Rows, 5-Pill Orchestrator Band — 2026-08-27
 
 **Asked:** "ar treb sa fie un separator o linie alba intre sectiuni ca nu mi dau seama acum unde
