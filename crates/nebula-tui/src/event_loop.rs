@@ -494,8 +494,7 @@ async fn main_loop(
             if channels.tx.send(req).await.is_err() {
                 if app.conn == ConnState::Connected {
                     app.conn = ConnState::Disconnected;
-                    next_reconnect =
-                        tokio::time::Instant::now() + Duration::from_millis(500);
+                    next_reconnect = tokio::time::Instant::now() + Duration::from_millis(500);
                 }
                 app.dirty = true;
             }
@@ -595,7 +594,10 @@ fn spawn_branch_list(app: &mut App) {
             }
             app.branch_inflight = true;
             tokio::task::spawn_blocking(move || {
-                let _ = tx.send(BranchEvent::List(id, crate::branches::local_branches(&repo)));
+                let _ = tx.send(BranchEvent::List(
+                    id,
+                    crate::branches::local_branches(&repo),
+                ));
             });
         }
         None => {
@@ -838,9 +840,10 @@ fn restore_ui_state(app: &mut App, json: &str) {
     app.unseen_restored = true;
     for id in state.unseen_finished {
         let id = AgentId(id);
-        let still_finished = app.tree.agents.iter().any(|a| {
-            a.id == id && a.status == nebula_core::AgentStatus::Finished && !a.archived
-        });
+        let still_finished =
+            app.tree.agents.iter().any(|a| {
+                a.id == id && a.status == nebula_core::AgentStatus::Finished && !a.archived
+            });
         if still_finished {
             app.unseen_finished.insert(id);
         }
@@ -1383,7 +1386,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             }
             Focus::Worktrees => {
                 if let Some(project) = app.selected_project().map(|p| p.id.clone()) {
-                    open_new_worktree_prompt(app, project);
+                    open_new_worktree_or_branch_picker(app, project);
                 }
             }
             Focus::Sessions => {
@@ -1600,6 +1603,32 @@ fn toggle_terminal_fullscreen(app: &mut App) {
 }
 
 // ---- overlays ----
+
+/// Step 0 of `n` on the Worktrees panel: worktree or bare branch? The
+/// worktree row starts hovered so Enter keeps the old default; either
+/// row chains into its existing name prompt and base-branch picker.
+fn open_new_worktree_or_branch_picker(app: &mut App, project: nebula_core::ProjectId) {
+    let row = |label: &str, action: MenuAction| MenuItem {
+        label: label.into(),
+        action,
+        destructive: false,
+    };
+    app.overlay = Some(Overlay::Menu(ContextMenu {
+        title: Some("New worktree or branch".into()),
+        items: vec![
+            row(
+                "Worktree (branch + checkout)",
+                MenuAction::NewWorktree(project.clone()),
+            ),
+            row("Branch only (no checkout)", MenuAction::NewBranch(project)),
+        ],
+        at: None,
+        hover: 0,
+        area: ratatui::layout::Rect::default(),
+        parent: None,
+        filter: None,
+    }));
+}
 
 /// New-worktree prompt with a random branch name already picked out.
 /// The project's existing branches are excluded, so Enter on an empty
@@ -3061,7 +3090,7 @@ fn new_for_section_or_agent(app: &mut App) {
         }
         Focus::Worktrees => {
             if let Some(project) = app.selected_project().map(|p| p.id.clone()) {
-                open_new_worktree_prompt(app, project);
+                open_new_worktree_or_branch_picker(app, project);
             }
         }
         _ => new_agent_shortcut(app),
@@ -3153,10 +3182,7 @@ fn open_command_palette(app: &mut App) {
         ));
         items.push(row("w · New worktree…", MenuAction::NewWorktree(p.clone())));
         items.push(row("b · New branch…", MenuAction::NewBranch(p.clone())));
-        items.push(row(
-            "o · New orchestrator…",
-            MenuAction::NewOrchestrator(p),
-        ));
+        items.push(row("o · New orchestrator…", MenuAction::NewOrchestrator(p)));
         items.push(row(
             "t · Quick terminal (⌘T window)",
             MenuAction::Command(PaletteCommand::QuickTerminal),
@@ -3179,7 +3205,10 @@ fn open_command_palette(app: &mut App) {
         MenuAction::Command(PaletteCommand::GitDiff),
     ));
     items.push(row("n · Notes", MenuAction::Command(PaletteCommand::Notes)));
-    items.push(row("td · Todos", MenuAction::Command(PaletteCommand::Todos)));
+    items.push(row(
+        "td · Todos",
+        MenuAction::Command(PaletteCommand::Todos),
+    ));
     items.push(row(
         "st · Settings",
         MenuAction::Command(PaletteCommand::Settings),
@@ -3317,7 +3346,11 @@ fn open_agent_picker(app: &mut App, worktree: WorktreeId, orchestrator: bool) {
 /// which stay newest commit first. Falls back to the branches nebula
 /// already knows from the project's worktrees when git can't list
 /// (deleted repo, missing git).
-fn open_branch_picker(app: &mut App, project: nebula_core::ProjectId, spawn: crate::app::BranchSpawn) {
+fn open_branch_picker(
+    app: &mut App,
+    project: nebula_core::ProjectId,
+    spawn: crate::app::BranchSpawn,
+) {
     let Some((branches, root_branch)) = project_local_branches(app, &project) else {
         app.flash = Some("no local branches found".into());
         return;
@@ -4600,9 +4633,7 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                             TodoCmd::StartCreateNote
                         }
                         KeyCode::Enter | KeyCode::Char('r') => match rows.get(selected) {
-                            Some((id, text, _)) => {
-                                TodoCmd::StartEditNote(id.clone(), text.clone())
-                            }
+                            Some((id, text, _)) => TodoCmd::StartEditNote(id.clone(), text.clone()),
                             // Empty list: Enter starts the first note.
                             None => TodoCmd::StartCreateNote,
                         },
@@ -4664,9 +4695,7 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                             None => TodoCmd::StartCreateTodo,
                         },
                         KeyCode::Char('r') => match rows.get(selected) {
-                            Some((id, text, _)) => {
-                                TodoCmd::StartEditTodo(id.clone(), text.clone())
-                            }
+                            Some((id, text, _)) => TodoCmd::StartEditTodo(id.clone(), text.clone()),
                             None => TodoCmd::StartCreateTodo,
                         },
                         KeyCode::Char(' ') | KeyCode::Char('x') => match rows.get(selected) {
@@ -5148,8 +5177,7 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                         .strip_prefix("detached @ ")
                         .map(str::to_owned)
                         .or_else(|| {
-                            (worktree.branch != "(detached)")
-                                .then(|| worktree.branch.clone())
+                            (worktree.branch != "(detached)").then(|| worktree.branch.clone())
                         })
                 });
             // The name step chains into the base-branch picker: Enter on
@@ -5463,7 +5491,16 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             // warm slot gets adopted where it matches, and the refill
             // behind the create re-warms it either way.
             if cfg.skip_session_naming {
-                create_agent(app, worktree, kind, model, effort, String::new(), orchestrator, out);
+                create_agent(
+                    app,
+                    worktree,
+                    kind,
+                    model,
+                    effort,
+                    String::new(),
+                    orchestrator,
+                    out,
+                );
                 return;
             }
             // Warm the CLI while the user types the name: the daemon
@@ -5622,9 +5659,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
         MenuAction::Command(cmd) => {
             use crate::app::PaletteCommand;
             match cmd {
-                PaletteCommand::NewAgentOnBranch(project) => {
-                    open_agent_branch_picker(app, project)
-                }
+                PaletteCommand::NewAgentOnBranch(project) => open_agent_branch_picker(app, project),
                 PaletteCommand::NewAgentInWorktree(project) => {
                     open_worktree_picker_for_agent(app, project)
                 }
@@ -5640,7 +5675,16 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                     let cfg = crate::config::Config::load();
                     let model = cfg.default_model(kind);
                     let effort = cfg.default_effort(kind);
-                    create_agent(app, worktree, kind, model, effort, String::new(), false, out);
+                    create_agent(
+                        app,
+                        worktree,
+                        kind,
+                        model,
+                        effort,
+                        String::new(),
+                        false,
+                        out,
+                    );
                 }
                 PaletteCommand::ReloadUi => {
                     // Quit + re-exec the binary on disk (main.rs does the
@@ -6567,7 +6611,16 @@ fn spawn_on_branch(
             // From here the flow is the session picker's: warm the CLI
             // while the user types the name — or skip the prompt entirely.
             if crate::config::Config::load().skip_session_naming {
-                create_agent(app, worktree, kind, model, effort, String::new(), orchestrator, out);
+                create_agent(
+                    app,
+                    worktree,
+                    kind,
+                    model,
+                    effort,
+                    String::new(),
+                    orchestrator,
+                    out,
+                );
                 return;
             }
             out.push(ClientRequest::PrewarmAgent {
@@ -6859,11 +6912,11 @@ fn open_url(url: &str) -> bool {
             .is_ok_and(|status| status.success());
         chrome_opened
             || Command::new("open")
-            .arg(url)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
+                .arg(url)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -6930,8 +6983,7 @@ fn pointer_wants_hand(app: &App, column: u16, row: u16) -> bool {
                 && row > a.y
                 && row < a.y + a.height.saturating_sub(1);
             let visible = a.height.saturating_sub(2) as usize;
-            in_rows
-                && (row - a.y - 1) as usize + menu.scroll_offset(visible) < menu.items.len()
+            in_rows && (row - a.y - 1) as usize + menu.scroll_offset(visible) < menu.items.len()
         }
         Some(Overlay::Prompt(p)) => list_row(
             p.list_area,
@@ -6971,7 +7023,11 @@ fn pointer_wants_hand(app: &App, column: u16, row: u16) -> bool {
         Some(Overlay::Metrics(m)) => list_row(m.list_area, m.scroll, m.rows.len()),
         Some(Overlay::Notes(n)) => {
             let count = app.tree.notes.iter().filter(|t| t.owner == n.owner).count();
-            list_row(n.list_area, n.window_start(n.list_area.height as usize), count)
+            list_row(
+                n.list_area,
+                n.window_start(n.list_area.height as usize),
+                count,
+            )
         }
         Some(Overlay::Todos(t)) => {
             let (count, row_offset) = match &t.detail {
@@ -6991,9 +7047,7 @@ fn pointer_wants_hand(app: &App, column: u16, row: u16) -> bool {
             let a = t.list_area;
             let rows_y = a.y + row_offset;
             let height = a.height.saturating_sub(row_offset) as usize;
-            inside(a)
-                && row >= rows_y
-                && (t.window_start(height) + (row - rows_y) as usize) < count
+            inside(a) && row >= rows_y && (t.window_start(height) + (row - rows_y) as usize) < count
         }
         Some(Overlay::Settings(view)) => {
             if view.capture.is_some() || !inside(view.area) {
@@ -7110,8 +7164,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     // hovered row visible; the click's row maps back
                     // through the same derived offset the draw used.
                     let visible = area.height.saturating_sub(2) as usize;
-                    let index =
-                        (mouse.row - area.y - 1) as usize + menu.scroll_offset(visible);
+                    let index = (mouse.row - area.y - 1) as usize + menu.scroll_offset(visible);
                     if let Some(item) = menu.items.get(index) {
                         let action = item.action.clone();
                         app.overlay = None;
@@ -7834,12 +7887,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                         }
                         Some((worktree, SessionRow::Link(link))) => {
                             let key = SessionRow::Link(link).click_key();
-                            jump_to_target(
-                                app,
-                                PaletteTarget::Worktree(worktree),
-                                false,
-                                out,
-                            );
+                            jump_to_target(app, PaletteTarget::Worktree(worktree), false, out);
                             if let Some(index) = app
                                 .visible_session_rows()
                                 .iter()
@@ -8014,7 +8062,8 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 )
             );
             let in_split = matches!(over, Some(HitTarget::SplitTerminalPane));
-            let in_term = matches!(over, Some(HitTarget::TerminalPane)) || (app.collapsed && !in_split);
+            let in_term =
+                matches!(over, Some(HitTarget::TerminalPane)) || (app.collapsed && !in_split);
             if in_split {
                 // Wheel over the ⌘D split's right pane walks that shell's
                 // scrollback (no mouse-protocol forwarding — it's a shell).
@@ -8117,9 +8166,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                         Some(Focus::Projects)
                     }
                     Some(HitTarget::Orchestrator(_))
-                    | Some(HitTarget::PanelBg(Focus::Orchestrators)) => {
-                        Some(Focus::Orchestrators)
-                    }
+                    | Some(HitTarget::PanelBg(Focus::Orchestrators)) => Some(Focus::Orchestrators),
                     Some(HitTarget::Worktree(_)) | Some(HitTarget::PanelBg(Focus::Worktrees)) => {
                         Some(Focus::Worktrees)
                     }
@@ -8323,11 +8370,7 @@ const NOTIFY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
 /// Which status flips deserve a macOS notification: only ones that need the
 /// user, and only while the window isn't focused (a focused user is already
 /// watching). Pure so the table test can walk every transition.
-fn should_notify(
-    prev: AgentStatus,
-    next: AgentStatus,
-    focused: bool,
-) -> Option<&'static str> {
+fn should_notify(prev: AgentStatus, next: AgentStatus, focused: bool) -> Option<&'static str> {
     if focused || prev == next {
         return None;
     }
@@ -8553,8 +8596,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             let mut finished = false;
             if let Some(a) = app.tree.agents.iter_mut().find(|a| a.id == agent) {
                 notify = should_notify(a.status, status, app.window_focused);
-                finished =
-                    status == AgentStatus::Finished && a.status != AgentStatus::Finished;
+                finished = status == AgentStatus::Finished && a.status != AgentStatus::Finished;
                 a.status = status;
                 a.status_changed_at = changed_at;
                 app.dirty = true;
@@ -8591,11 +8633,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                 (Some(PendingIntent::AttachCreatedOrchestrator), Some(EntityId::Agent(id))) => {
                     // Its upsert usually precedes the Ack, so the section
                     // cursor can land on the new ORCHESTRATORS row now.
-                    if let Some(i) = app
-                        .project_orchestrators()
-                        .iter()
-                        .position(|a| a.id == id)
-                    {
+                    if let Some(i) = app.project_orchestrators().iter().position(|a| a.id == id) {
                         app.sel_orchestrator = Some(i);
                     }
                     attach(app, SessionRef::Agent(id), out);
@@ -8622,10 +8660,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                     } = spec;
                     create_agent(app, id, kind, model, effort, name, orchestrator, out);
                 }
-                (
-                    Some(PendingIntent::PickAgentOnCreatedWorktree),
-                    Some(EntityId::Worktree(id)),
-                ) => {
+                (Some(PendingIntent::PickAgentOnCreatedWorktree), Some(EntityId::Worktree(id))) => {
                     // The `a` flow's branch had no checkout: it exists now —
                     // land the cursor on it and open the session picker.
                     if !select_worktree_by_id(app, &id, out) {
@@ -8831,7 +8866,12 @@ fn apply_upsert(app: &mut App, entity: nebula_core::Entity) {
         },
         Entity::Agent(a) => {
             let id = a.id.clone();
-            let prev = app.tree.agents.iter().find(|x| x.id == id).map(|x| x.status);
+            let prev = app
+                .tree
+                .agents
+                .iter()
+                .find(|x| x.id == id)
+                .map(|x| x.status);
             let archived = a.archived;
             let status = a.status;
             match app.tree.agents.iter_mut().find(|x| x.id == a.id) {
@@ -9466,13 +9506,20 @@ mod tests {
             Some(nebula_core::WorktreeId("w1".into()))
         );
 
-        // `n` follows the section: worktree prompt below, a new
-        // orchestrator above.
+        // `n` follows the section: the worktree/branch picker below, a
+        // new orchestrator above. Enter on the picker's hovered default
+        // (worktree) chains into the name prompt.
         let mut out = Vec::new();
         press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
         assert!(
+            matches!(&app.overlay, Some(Overlay::Menu(m)) if m.title.as_deref() == Some("New worktree or branch")),
+            "n on a worktree row opens the worktree/branch picker: {:?}",
+            app.overlay
+        );
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(
             matches!(&app.overlay, Some(Overlay::Prompt(p)) if matches!(p.kind, crate::app::PromptKind::NewWorktree { .. })),
-            "n on a worktree row prompts for a worktree: {:?}",
+            "Enter on the default row prompts for a worktree: {:?}",
             app.overlay
         );
         app.overlay = None;
@@ -9586,7 +9633,7 @@ mod tests {
             app.focus = Focus::Worktrees;
             press(&mut app, KeyCode::Char('n'), modifiers, &mut out);
             assert!(
-                matches!(&app.overlay, Some(Overlay::Prompt(p)) if matches!(p.kind, crate::app::PromptKind::NewWorktree { .. })),
+                matches!(&app.overlay, Some(Overlay::Menu(m)) if m.title.as_deref() == Some("New worktree or branch")),
                 "{modifiers:?}+n follows the worktree half: {:?}",
                 app.overlay
             );
@@ -9799,7 +9846,10 @@ mod tests {
         assert!(
             matches!(
                 out.as_slice(),
-                [ClientRequest::SetAgentOrchestrator { orchestrator: true, .. }]
+                [ClientRequest::SetAgentOrchestrator {
+                    orchestrator: true,
+                    ..
+                }]
             ),
             "{out:?}"
         );
@@ -9888,7 +9938,12 @@ mod tests {
         let mut out = Vec::new();
         press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE, &mut out);
         assert!(app.in_orchestrator_section());
-        press(&mut app, KeyCode::Char('n'), KeyModifiers::CONTROL, &mut out);
+        press(
+            &mut app,
+            KeyCode::Char('n'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
         assert!(
             matches!(&app.overlay, Some(Overlay::Menu(m)) if m.title.as_deref() == Some("New orchestrator")),
             "^n in the section opens the orchestrator picker: {:?}",
@@ -9939,10 +9994,7 @@ mod tests {
             assert_eq!(menu.title.as_deref(), Some("Orchestrator branch"));
             assert_eq!(menu.hover, 0, "focus starts on the primary branch");
             assert_eq!(menu.items[0].label, "main ⌂ primary");
-            assert_eq!(
-                menu.items[1].label, "feature",
-                "the rest stay newest-first"
-            );
+            assert_eq!(menu.items[1].label, "feature", "the rest stay newest-first");
             let labels: Vec<&str> = menu.items.iter().map(|i| i.label.as_str()).collect();
             assert!(
                 labels.contains(&"develop"),
@@ -10070,7 +10122,10 @@ mod tests {
                 panic!("expected CreateWorktree, got {out:?}");
             };
             assert_eq!(branch, "feature");
-            assert_eq!(base, &None, "an existing branch is checked out, not re-based");
+            assert_eq!(
+                base, &None,
+                "an existing branch is checked out, not re-based"
+            );
             // The daemon answers with the created worktree; the deferred
             // create fires on it, still carrying the typed name and flag.
             let req_id = *req_id;
@@ -10246,7 +10301,10 @@ mod tests {
                 panic!("expected CreateWorktree, got {out:?}");
             };
             assert_eq!(branch, "develop");
-            assert_eq!(base, &None, "the existing branch is checked out, not re-based");
+            assert_eq!(
+                base, &None,
+                "the existing branch is checked out, not re-based"
+            );
             let req_id = *req_id;
             hse(
                 &mut app,
@@ -10390,75 +10448,80 @@ mod tests {
     #[test]
     fn typing_filters_the_branch_picker_and_enter_picks_the_best_match() {
         with_default_config(|| {
-        use nebula_core::{Entity, Worktree, WorktreeId};
-        let mut app = App::new();
-        seed_tree(&mut app);
-        hse(
-            &mut app,
-            ServerEvent::EntityUpserted {
-                entity: Entity::Worktree(Worktree {
-                    id: WorktreeId("w2".into()),
-                    project_id: nebula_core::ProjectId("p1".into()),
-                    path: "/tmp/demo-worktrees/feature".into(),
-                    branch: "feature".into(),
-                    is_main: false,
-                    created_from: None,
-                    pinned: false,
-                    sort_order: 1,
-                }),
-            },
-        );
-        let mut out = Vec::new();
-        open_branch_picker(
-            &mut app,
-            nebula_core::ProjectId("p1".into()),
-            crate::app::BranchSpawn {
-                kind: AgentKind::Claude,
-                model: None,
-                effort: None,
-                orchestrator: true,
-            },
-        );
-        for c in "fea".chars() {
-            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
-        }
-        let Some(Overlay::Menu(menu)) = &app.overlay else {
-            panic!("picker stays open while filtering: {:?}", app.overlay);
-        };
-        assert_eq!(menu.items.len(), 1, "only feature matches: {:?}", menu.items);
-        assert_eq!(menu.hover, 0, "the best match is hovered");
-        assert_eq!(menu.items[0].label, "feature");
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
-        assert!(
-            buffer_text(&terminal).contains("/fea"),
-            "the query shows in the border: {}",
-            buffer_text(&terminal)
-        );
-        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-        assert!(
-            matches!(
-                out.first(),
-                Some(ClientRequest::PrewarmAgent { worktree, .. })
-                    if worktree == &WorktreeId("w2".into())
-            ),
-            "enter picks the filtered branch's checkout: {out:?}"
-        );
-        assert!(
-            matches!(
-                &app.overlay,
-                Some(Overlay::Prompt(p)) if matches!(
-                    &p.kind,
-                    PromptKind::NewAgent {
-                        target: crate::app::SpawnTarget::Worktree(w),
-                        orchestrator: true,
-                        ..
-                    } if w == &WorktreeId("w2".into())
-                )
-            ),
-            "{:?}",
-            app.overlay
-        );
+            use nebula_core::{Entity, Worktree, WorktreeId};
+            let mut app = App::new();
+            seed_tree(&mut app);
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Worktree(Worktree {
+                        id: WorktreeId("w2".into()),
+                        project_id: nebula_core::ProjectId("p1".into()),
+                        path: "/tmp/demo-worktrees/feature".into(),
+                        branch: "feature".into(),
+                        is_main: false,
+                        created_from: None,
+                        pinned: false,
+                        sort_order: 1,
+                    }),
+                },
+            );
+            let mut out = Vec::new();
+            open_branch_picker(
+                &mut app,
+                nebula_core::ProjectId("p1".into()),
+                crate::app::BranchSpawn {
+                    kind: AgentKind::Claude,
+                    model: None,
+                    effort: None,
+                    orchestrator: true,
+                },
+            );
+            for c in "fea".chars() {
+                press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+            }
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("picker stays open while filtering: {:?}", app.overlay);
+            };
+            assert_eq!(
+                menu.items.len(),
+                1,
+                "only feature matches: {:?}",
+                menu.items
+            );
+            assert_eq!(menu.hover, 0, "the best match is hovered");
+            assert_eq!(menu.items[0].label, "feature");
+            let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            assert!(
+                buffer_text(&terminal).contains("/fea"),
+                "the query shows in the border: {}",
+                buffer_text(&terminal)
+            );
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(
+                matches!(
+                    out.first(),
+                    Some(ClientRequest::PrewarmAgent { worktree, .. })
+                        if worktree == &WorktreeId("w2".into())
+                ),
+                "enter picks the filtered branch's checkout: {out:?}"
+            );
+            assert!(
+                matches!(
+                    &app.overlay,
+                    Some(Overlay::Prompt(p)) if matches!(
+                        &p.kind,
+                        PromptKind::NewAgent {
+                            target: crate::app::SpawnTarget::Worktree(w),
+                            orchestrator: true,
+                            ..
+                        } if w == &WorktreeId("w2".into())
+                    )
+                ),
+                "{:?}",
+                app.overlay
+            );
         })
     }
 
@@ -10533,6 +10596,8 @@ mod tests {
         app.sel_worktree = 0;
         let mut out = Vec::new();
         press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+        // Enter takes the picker's hovered default: a worktree.
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
         for c in "my-feat".chars() {
             press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
         }
@@ -10541,10 +10606,7 @@ mod tests {
             panic!("name submit opens the base picker: {:?}", app.overlay);
         };
         assert_eq!(menu.title.as_deref(), Some("Base branch"));
-        assert_eq!(
-            menu.items[0].label, "feature",
-            "branches list newest-first"
-        );
+        assert_eq!(menu.items[0].label, "feature", "branches list newest-first");
         assert_eq!(
             menu.items[menu.hover].label, "main ⌂ primary",
             "the selected worktree's branch starts hovered"
@@ -11248,7 +11310,10 @@ mod tests {
             },
         );
         assert!(app.tree.todos.is_empty());
-        assert!(app.tree.notes.is_empty(), "child notes pruned with the todo");
+        assert!(
+            app.tree.notes.is_empty(),
+            "child notes pruned with the todo"
+        );
         match &app.overlay {
             Some(Overlay::Todos(view)) => {
                 assert_eq!(view.detail, None, "detail falls back to the list")
@@ -11615,9 +11680,7 @@ mod tests {
                 "name",
                 "",
                 PromptKind::NewAgent {
-                    target: crate::app::SpawnTarget::Worktree(nebula_core::WorktreeId(
-                        "w1".into(),
-                    )),
+                    target: crate::app::SpawnTarget::Worktree(nebula_core::WorktreeId("w1".into())),
                     kind: AgentKind::Claude,
                     model: Some("opus".into()),
                     effort: Some("high".into()),
@@ -11819,7 +11882,10 @@ mod tests {
             "set model · effort under its tab:\n{text}"
         );
         let (a2_x, _) = find_cell(&terminal, "agent-2");
-        let m_col = model_line.find("gpt-5.5").map(|b| model_line[..b].chars().count()).unwrap() as u16;
+        let m_col = model_line
+            .find("gpt-5.5")
+            .map(|b| model_line[..b].chars().count())
+            .unwrap() as u16;
         assert_eq!(m_col, a2_x, "the model aligns under its tab's name");
 
         // Selection moves: so does the badge.
@@ -11990,7 +12056,10 @@ mod tests {
             .find(|l| l.contains("pinned-fresh"))
             .expect("the tab bar row")
             .to_string();
-        let pos = |n: &str| line.find(n).unwrap_or_else(|| panic!("{n} missing:\n{line}"));
+        let pos = |n: &str| {
+            line.find(n)
+                .unwrap_or_else(|| panic!("{n} missing:\n{line}"))
+        };
         assert!(
             pos("pinned-fresh") < pos("recent-1") && pos("recent-1") < pos("stale-1"),
             "tabs keep the pinned → recent → rest order:\n{line}"
@@ -12298,9 +12367,18 @@ mod tests {
         use nebula_core::AgentStatus::*;
         // Unfocused: needs-feedback fires from anywhere, finished only
         // from a live run.
-        assert_eq!(should_notify(Fresh, NeedsFeedback, false), Some("needs feedback"));
-        assert_eq!(should_notify(Running, NeedsFeedback, false), Some("needs feedback"));
-        assert_eq!(should_notify(Finished, NeedsFeedback, false), Some("needs feedback"));
+        assert_eq!(
+            should_notify(Fresh, NeedsFeedback, false),
+            Some("needs feedback")
+        );
+        assert_eq!(
+            should_notify(Running, NeedsFeedback, false),
+            Some("needs feedback")
+        );
+        assert_eq!(
+            should_notify(Finished, NeedsFeedback, false),
+            Some("needs feedback")
+        );
         assert_eq!(should_notify(Running, Finished, false), Some("finished"));
         // Non-events: nothing the user has to act on, or no flip at all.
         assert_eq!(should_notify(Fresh, Running, false), None);
@@ -12350,7 +12428,8 @@ mod tests {
         hse(&mut app, flip(AgentStatus::Running));
         hse(&mut app, flip(AgentStatus::NeedsFeedback));
         assert_eq!(
-            app.notified_at[&AgentId("a1".into())], first,
+            app.notified_at[&AgentId("a1".into())],
+            first,
             "a repeat inside the cooldown is rate-limited"
         );
 
@@ -12445,9 +12524,7 @@ mod tests {
         let rows = app.visible_session_rows();
         let index_of = |id: &str| {
             rows.iter()
-                .position(
-                    |r| matches!(r, SessionRow::Agent(a) if a.id.as_str() == id),
-                )
+                .position(|r| matches!(r, SessionRow::Agent(a) if a.id.as_str() == id))
                 .unwrap()
         };
         let a1_tab = index_of("a1");
@@ -12472,7 +12549,11 @@ mod tests {
             .position(|r| matches!(r, SessionRow::Agent(a) if a.id.as_str() == "a1"))
             .unwrap();
         let sub = rect_of(&app.hits, &HitTarget::WorktreeSession(0, a1_row));
-        assert_eq!(buffer[(sub.x + 2, sub.y)].fg, th.info, "sub-list dot is blue");
+        assert_eq!(
+            buffer[(sub.x + 2, sub.y)].fg,
+            th.info,
+            "sub-list dot is blue"
+        );
         // The global SESSIONS pill: rail + dot + name on the pill's text row.
         let global = app
             .global_sessions()
@@ -13161,7 +13242,10 @@ mod tests {
             &mut out,
         );
         assert!(!app.quick_term, "^q closes the floating window");
-        assert!(app.term.is_none(), "nothing was displaced, nothing restored");
+        assert!(
+            app.term.is_none(),
+            "nothing was displaced, nothing restored"
+        );
         assert_eq!(app.focus, Focus::Sessions);
     }
 
@@ -13177,12 +13261,7 @@ mod tests {
         ));
         app.focus = Focus::Projects;
 
-        press(
-            &mut app,
-            KeyCode::Char('p'),
-            KeyModifiers::SUPER,
-            &mut out,
-        );
+        press(&mut app, KeyCode::Char('p'), KeyModifiers::SUPER, &mut out);
         assert!(app.collapsed, "Cmd+P hides the sidebars");
         assert_eq!(app.focus, Focus::Terminal);
         assert!(app.term_locked, "Cmd+P locks input into the terminal");
@@ -13195,12 +13274,7 @@ mod tests {
             "full-screen footer advertises both exits:\n{screen}"
         );
 
-        press(
-            &mut app,
-            KeyCode::Char('p'),
-            KeyModifiers::SUPER,
-            &mut out,
-        );
+        press(&mut app, KeyCode::Char('p'), KeyModifiers::SUPER, &mut out);
         assert!(!app.collapsed, "a second Cmd+P restores the sidebars");
         assert_eq!(app.focus, Focus::Sessions);
         assert!(!app.term_locked, "returning to panels unlocks input");
@@ -13220,12 +13294,7 @@ mod tests {
         app.focus = Focus::Terminal;
         app.term_locked = true;
 
-        press(
-            &mut app,
-            KeyCode::Char('p'),
-            KeyModifiers::SUPER,
-            &mut out,
-        );
+        press(&mut app, KeyCode::Char('p'), KeyModifiers::SUPER, &mut out);
 
         assert!(app.collapsed, "Cmd+P hides panels around a locked terminal");
         assert_eq!(app.focus, Focus::Terminal);
@@ -13240,12 +13309,7 @@ mod tests {
         let mut out = Vec::new();
         app.focus = Focus::Worktrees;
 
-        press(
-            &mut app,
-            KeyCode::Char('p'),
-            KeyModifiers::SUPER,
-            &mut out,
-        );
+        press(&mut app, KeyCode::Char('p'), KeyModifiers::SUPER, &mut out);
 
         assert!(!app.collapsed, "an empty terminal pane is never expanded");
         assert_eq!(app.focus, Focus::Worktrees, "panel focus stays put");
@@ -15116,11 +15180,7 @@ mod tests {
         let mut app = App::new();
         app.panel_widths = [50, 50];
         app.normalize_panel_widths(100);
-        assert_eq!(
-            app.panel_widths,
-            [50, 30],
-            "worktrees gives way first"
-        );
+        assert_eq!(app.panel_widths, [50, 30], "worktrees gives way first");
         let total: u16 = app.panel_widths.iter().sum();
         assert_eq!(100 - total, crate::app::MIN_TERM_W);
     }
@@ -15630,7 +15690,11 @@ mod tests {
         // on the left pane: no Attach request, focus lands on the split.
         app.split_focused = false;
         out.clear();
-        attach(&mut app, SessionRef::Terminal(TerminalId("t9".into())), &mut out);
+        attach(
+            &mut app,
+            SessionRef::Terminal(TerminalId("t9".into())),
+            &mut out,
+        );
         assert!(out.is_empty(), "no re-attach of the split sref: {out:?}");
         assert_eq!(
             app.term.as_ref().map(|t| t.sref.clone()),
@@ -15712,7 +15776,10 @@ mod tests {
 
         // Each pane holds its own non-overlapping rect.
         let (l, r) = (app.term_area, app.split_term_area);
-        assert!(l.width >= 2 && r.width >= 2, "both panes drawn: {l:?} {r:?}");
+        assert!(
+            l.width >= 2 && r.width >= 2,
+            "both panes drawn: {l:?} {r:?}"
+        );
         assert!(r.x > l.x + l.width, "right pane starts past the rule");
 
         // The sync resizes each PTY to its own half, not the full pane.
@@ -16043,10 +16110,16 @@ mod tests {
         let mut out = Vec::new();
         app.focus = Focus::Worktrees;
 
-        // n opens the branch prompt; submitting requests the worktree.
+        // n opens the worktree/branch picker; Enter on the hovered
+        // worktree default opens the name prompt.
         handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            &mut out,
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
             &mut out,
         );
         for c in "feat".chars() {
@@ -16138,6 +16211,12 @@ mod tests {
             KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
             &mut out,
         );
+        // Enter takes the picker's hovered default: a worktree.
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut out,
+        );
         for c in "child-feature".chars() {
             handle_key(
                 &mut app,
@@ -16191,6 +16270,12 @@ mod tests {
             KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
             &mut out,
         );
+        // Enter takes the picker's hovered default: a worktree.
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut out,
+        );
         for c in "  fix login  redirect ".chars() {
             handle_key(
                 &mut app,
@@ -16228,8 +16313,14 @@ mod tests {
             KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
             &mut out,
         );
+        // Enter takes the picker's hovered default: a worktree.
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &mut out,
+        );
         let Some(Overlay::Prompt(prompt)) = &app.overlay else {
-            panic!("n opens the new-worktree prompt");
+            panic!("n + Enter opens the new-worktree prompt");
         };
         let PromptKind::NewWorktree { suggestion, .. } = &prompt.kind else {
             panic!("wrong prompt: {:?}", prompt.kind);
@@ -16270,6 +16361,12 @@ mod tests {
         handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+            &mut out,
+        );
+        // Enter takes the picker's hovered default: a worktree.
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
             &mut out,
         );
         for _ in 0..3 {
@@ -16712,12 +16809,20 @@ mod tests {
         // connector plus its trailing space replace the plain indent).
         let guide_x = main_x - 2;
         assert_eq!(cell(guide_x, child_y), "├", "first child connects: {text}");
-        assert_eq!(cell(guide_x, last_y), "└", "last child closes the line: {text}");
+        assert_eq!(
+            cell(guide_x, last_y),
+            "└",
+            "last child closes the line: {text}"
+        );
         // Guide glyphs carry the theme's warn orange, not the dim indent.
         let th = app.theme;
         let fg = |x: u16, y: u16| terminal.backend().buffer()[(x, y)].fg;
         assert_eq!(fg(guide_x, child_y), th.warn, "connector is orange: {text}");
-        assert_eq!(fg(guide_x, last_y), th.warn, "end connector is orange: {text}");
+        assert_eq!(
+            fg(guide_x, last_y),
+            th.warn,
+            "end connector is orange: {text}"
+        );
         assert_eq!(
             fg(guide_x, child_y + 1),
             th.warn,
@@ -16853,7 +16958,10 @@ mod tests {
         let text = buffer_text(&terminal);
         // "boss-0 ◆" pins the ORCHESTRATORS row shape — the bare name also
         // shows up in the Projects column's global SESSIONS section.
-        assert!(text.contains("boss-5 ◆"), "selected last row visible: {text}");
+        assert!(
+            text.contains("boss-5 ◆"),
+            "selected last row visible: {text}"
+        );
         assert!(!text.contains("boss-0 ◆"), "top rows scrolled out: {text}");
     }
 
@@ -16879,11 +16987,19 @@ mod tests {
         let rule = terminal.backend().buffer()[(wt_x, wt_y - 1)].symbol();
         assert_eq!(rule, "─", "section rule right above the header: {text}");
         let (_, main_y) = find_cell(&terminal, "main");
-        assert_eq!(main_y, wt_y + 2, "first pill text right under the header: {text}");
+        assert_eq!(
+            main_y,
+            wt_y + 2,
+            "first pill text right under the header: {text}"
+        );
         // "claude agent-1" pins the sub-row shape — the bare name also
         // shows in the terminal header and the global SESSIONS list.
         let (_, agent_y) = find_cell(&terminal, "claude agent-1");
-        assert_eq!(agent_y, main_y + 1, "session sub-row hugs its worktree: {text}");
+        assert_eq!(
+            agent_y,
+            main_y + 1,
+            "session sub-row hugs its worktree: {text}"
+        );
         let (_, wt2_y) = find_cell(&terminal, "wt-2");
         assert_eq!(
             wt2_y,
@@ -16933,7 +17049,10 @@ mod tests {
         // 20-row screen → footer off → 15-row list → half = a 7-row band
         // after the title and its spacer, then the section rule row.
         assert_eq!(wt_y, orch_y + 2 + 7 + 1, "band capped at half: {text}");
-        assert!(text.contains("boss-2 ◆"), "three pills fit the band: {text}");
+        assert!(
+            text.contains("boss-2 ◆"),
+            "three pills fit the band: {text}"
+        );
         assert!(
             !text.contains("boss-3 ◆"),
             "the rest scrolls instead of growing the band: {text}"
@@ -16946,7 +17065,11 @@ mod tests {
         let text = buffer_text(&terminal);
         let (_, orch_y) = find_cell(&terminal, "ORCHESTRATORS");
         let (_, wt_y) = find_cell(&terminal, "WORKTREES");
-        assert_eq!(wt_y, orch_y + 2 + 10 + 1, "band capped at five pills: {text}");
+        assert_eq!(
+            wt_y,
+            orch_y + 2 + 10 + 1,
+            "band capped at five pills: {text}"
+        );
         assert!(text.contains("boss-4 ◆"), "five pills fit the band: {text}");
         assert!(
             !text.contains("boss-5 ◆"),
@@ -16978,7 +17101,13 @@ mod tests {
             hse(
                 &mut app,
                 ServerEvent::EntityUpserted {
-                    entity: project(&format!("p{i}"), &format!("proj-{i}"), i as i64, false, None),
+                    entity: project(
+                        &format!("p{i}"),
+                        &format!("proj-{i}"),
+                        i as i64,
+                        false,
+                        None,
+                    ),
                 },
             );
         }
@@ -17271,7 +17400,10 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
-        assert!(text.contains("⌂ primary"), "project shows worktrees:\n{text}");
+        assert!(
+            text.contains("⌂ primary"),
+            "project shows worktrees:\n{text}"
+        );
         assert!(text.contains("agent-1"), "project shows sessions:\n{text}");
 
         // On the divider row the panels stay but their content blanks, and
@@ -18008,11 +18140,20 @@ mod tests {
             },
             &mut out,
         );
-        let Some(ClientRequest::CreateWorktree { req_id, branch, base, .. }) = out.first() else {
+        let Some(ClientRequest::CreateWorktree {
+            req_id,
+            branch,
+            base,
+            ..
+        }) = out.first()
+        else {
             panic!("expected CreateWorktree, got {out:?}");
         };
         assert_eq!(branch, "feature");
-        assert_eq!(base, &None, "the existing branch is checked out, not re-based");
+        assert_eq!(
+            base, &None,
+            "the existing branch is checked out, not re-based"
+        );
         let req_id = *req_id;
         let mut out = Vec::new();
         handle_server_event(
@@ -18172,10 +18313,7 @@ mod tests {
             crate::branches::local_branches(&repo).contains(&"topic".to_string()),
             "git branch ran in the primary checkout"
         );
-        assert_eq!(
-            app.flash.as_deref(),
-            Some("branch topic created from main")
-        );
+        assert_eq!(app.flash.as_deref(), Some("branch topic created from main"));
         assert!(
             app.branch_rows().contains(&"topic".to_string()),
             "{:?}",
@@ -18246,7 +18384,9 @@ mod tests {
         );
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
         assert!(
-            app.flash.as_deref().is_some_and(|f| f.contains("not fully merged")),
+            app.flash
+                .as_deref()
+                .is_some_and(|f| f.contains("not fully merged")),
             "{:?}",
             app.flash
         );
