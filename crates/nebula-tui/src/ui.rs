@@ -89,10 +89,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.focus_tint {
         let tinted = match app.focus {
             Focus::Projects => shrink_r(projects_a),
-            Focus::Orchestrators | Focus::Worktrees => {
-                worktree_section_rects(worktrees_a, app.focus, orchestrator_entry_count(app))
-                    .unwrap()
-            }
+            Focus::Worktrees => shrink_r(worktrees_a),
             // The session tabs live in the terminal header, so their focus
             // tints the terminal pane too.
             Focus::Sessions | Focus::Terminal => term_a,
@@ -192,10 +189,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 .then_some(" n: new  r: rename  d: delete ");
             // A filterable picker shows its live query in the bottom
             // border; the bare "/" doubles as the type-to-filter hint.
-            let filter_line = menu
-                .filter
-                .as_ref()
-                .map(|fl| format!(" /{}▏ ", fl.query));
+            let filter_line = menu.filter.as_ref().map(|fl| format!(" /{}▏ ", fl.query));
             let width = (label_w + 4 + if any_submenu { 2 } else { 0 })
                 .max(title_width + 2)
                 .max(hint.map_or(0, |h| h.chars().count() + 2))
@@ -253,10 +247,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             if menu.items.is_empty() && menu.filter.is_some() {
                 if let Some(row) = row_rect(inner, 0) {
                     f.render_widget(
-                        Paragraph::new(Span::styled(
-                            " no match ",
-                            Style::default().fg(th.dim),
-                        )),
+                        Paragraph::new(Span::styled(" no match ", Style::default().fg(th.dim))),
                         row,
                     );
                 }
@@ -267,7 +258,9 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             // mouse hit-test recomputes the same value.
             let offset = menu.scroll_offset(inner.height as usize);
             for (i, item) in menu.items.iter().enumerate().skip(offset) {
-                let Some(row) = row_rect(inner, i - offset) else { break };
+                let Some(row) = row_rect(inner, i - offset) else {
+                    break;
+                };
                 let mut style = if item.destructive {
                     Style::default().fg(th.err)
                 } else {
@@ -2180,56 +2173,6 @@ fn shrink_r(area: Rect) -> Rect {
     }
 }
 
-/// Rows of the shared column's list area the ORCHESTRATORS section keeps:
-/// what its pill rows actually need, capped at five pills — and at half
-/// the list on a short window — so a long orchestrator list scrolls
-/// instead of crowding out the worktrees, and floored at one pill so the
-/// section stays enterable. `entries` counts the rendered rows — real
-/// orchestrators, or the one "+ new orchestrator" placeholder.
-fn orchestrator_section_rows(list_h: usize, entries: usize) -> usize {
-    (entries.clamp(1, 5) * PILL_H as usize)
-        .min((list_h / 2).max(PILL_H as usize))
-        .min(list_h)
-}
-
-/// Orchestrator rows `draw_worktrees` will render for the selected
-/// project: the real ones, or the single placeholder while there are none.
-/// The section split is derived from this, so the boundary and the draw
-/// must count the same way.
-fn orchestrator_entry_count(app: &App) -> usize {
-    let n = app.project_orchestrators().len();
-    if n == 0 {
-        usize::from(app.tree.has_visible_projects())
-    } else {
-        n
-    }
-}
-
-/// The ORCHESTRATORS and WORKTREES halves share one sidebar column but
-/// have separate focus, hit, and tint rectangles. The split mirrors
-/// `draw_worktrees`: its list area begins three rows below the column top,
-/// then gives the top section only what its orchestrator rows need
-/// (`orchestrator_section_rows`) and the WORKTREES section all the rest.
-fn worktree_section_rects(area: Rect, focus: Focus, orch_entries: usize) -> Option<Rect> {
-    let column = shrink_r(area);
-    let list_y = column.y.saturating_add(3).min(column.bottom());
-    let list_h = column.bottom().saturating_sub(list_y);
-    let mid = orchestrator_section_rows(list_h as usize, orch_entries) as u16;
-    let split_y = list_y.saturating_add(mid).min(column.bottom());
-    match focus {
-        Focus::Orchestrators => Some(Rect {
-            height: split_y.saturating_sub(column.y),
-            ..column
-        }),
-        Focus::Worktrees => Some(Rect {
-            y: split_y,
-            height: column.bottom().saturating_sub(split_y),
-            ..column
-        }),
-        _ => None,
-    }
-}
-
 /// Subtle focus cue: fill the whole focused panel with the theme's
 /// `focus_tint` — the accent at ~10% opacity, so the panel reads as a
 /// faintly lit surface. Painted after content, and only onto cells whose
@@ -2373,9 +2316,6 @@ fn status_name_spans(
     }
 }
 
-/// Columns a session name must keep before the "23m ago" label is worth
-/// the space it costs. Below this the label drops and the name gets it all.
-const MIN_SESSION_NAME_W: usize = 8;
 
 /// The status dot with the unseen-finished override: blue when the session
 /// finished while the user was attached elsewhere and hasn't been visited
@@ -2513,17 +2453,41 @@ fn draw_column(
     // plus a 2-column status glyph, so the title's text lines up with
     // row text below it.
     if let Some(r) = row_rect(inner, 1) {
-        let mut spans = vec![Span::styled(format!("{ROW_GUTTER}{title}"), header_style)];
+        // A long title keeps its text over its gutter: the indent shrinks
+        // until the title fits (WORKTREES & BRANCHES at the default
+        // 22-col width), and the count only shows when it fits too.
+        let mut gutter = ROW_GUTTER;
+        while !gutter.is_empty() && gutter.len() + title.len() > r.width as usize {
+            gutter = &gutter[..gutter.len() - 1];
+        }
+        let mut spans = vec![Span::styled(format!("{gutter}{title}"), header_style)];
         if let Some(n) = count {
-            spans.push(Span::styled(format!(" · {n}"), Style::default().fg(th.dim)));
+            let label = format!(" · {n}");
+            if gutter.len() + title.len() + label.chars().count() <= r.width as usize {
+                spans.push(Span::styled(label, Style::default().fg(th.dim)));
+            }
         }
         f.render_widget(Paragraph::new(Line::from(spans)), r);
+    }
+    // The thin rule under the header — the terminal pane's `terminal_rule`
+    // on the same screen row, so the three sections share one continuous
+    // frame line and the focused one lights up in accent.
+    if let Some(r) = row_rect(inner, 3) {
+        let rule_style = if focused {
+            Style::default().fg(th.accent)
+        } else {
+            Style::default().fg(th.edge)
+        };
+        f.render_widget(
+            Paragraph::new(Span::styled("─".repeat(r.width as usize), rule_style)),
+            r,
+        );
     }
     // One extra column of right padding so row text never touches the
     // column rule.
     Rect {
-        y: inner.y + 3,
-        height: inner.height.saturating_sub(3),
+        y: inner.y + 4,
+        height: inner.height.saturating_sub(4),
         width: inner.width.saturating_sub(1),
         ..inner
     }
@@ -2679,7 +2643,7 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
             }
         })
         .collect();
-    // The column splits at its vertical middle, like the ORCHESTRATORS /
+    // The column splits at its vertical middle, like the WORKTREES /
     // WORKTREES column: projects on top, the all-projects SESSIONS
     // section below.
     let mid = (inner.height as usize / 2).max(PILL_H as usize + 1);
@@ -2765,7 +2729,7 @@ fn draw_global_sessions(f: &mut Frame, app: &mut App, inner: Rect, mid: usize) {
     let dim = Style::default().fg(th.dim);
     let sessions = app.global_sessions();
     let mut screen_row = mid;
-    // Same boundary treatment as the ORCHESTRATORS/WORKTREES column: the
+    // Same boundary treatment as the sidebar columns: the
     // rule owns the `mid` row, the header sits one below, and the rows
     // after inherit the shift through `screen_row`.
     render_section_rule(f, inner, screen_row, th);
@@ -2864,7 +2828,10 @@ fn draw_global_sessions(f: &mut Frame, app: &mut App, inner: Rect, mid: usize) {
             f.render_widget(
                 Paragraph::new(format!(
                     "{ROW_GUTTER}{}",
-                    truncate(&sub, (inner.width as usize).saturating_sub(ROW_GUTTER.len()))
+                    truncate(
+                        &sub,
+                        (inner.width as usize).saturating_sub(ROW_GUTTER.len())
+                    )
                 ))
                 .style(style),
                 r,
@@ -2944,36 +2911,26 @@ fn nest_level_continues(depths: &[usize], i: usize, level: usize) -> bool {
 
 fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     let th = app.theme;
-    let orchestrators_focused = app.focus == Focus::Orchestrators;
     let worktrees_focused = app.focus == Focus::Worktrees;
     let wt_count = app.visible_worktrees().len();
     // Checkout-less local branches render as dim ○ rows below the
     // worktree rows; `sel_worktree` walks both as one list. Pure cache
     // read — git never runs on the draw path.
-    let branch_rows = app.branch_rows();
-    // The column is permanently split in two stacked sections: the
-    // project's ORCHESTRATORS on top (the column title doubles as that
-    // section's header), its WORKTREES below.
-    let orch_count_title = Some(app.orchestrator_row_count()).filter(|n| *n > 0);
+    let branch_rows = app.branch_rows_with_depth();
+    let total = wt_count + branch_rows.len();
+    let count_title = Some(total).filter(|n| *n > 0);
     let inner = draw_column(
         f,
         area,
-        "ORCHESTRATORS",
-        orch_count_title.filter(|_| !app.divider_focused()),
-        orchestrators_focused,
+        "WORKTREES & BRANCHES",
+        count_title.filter(|_| !app.divider_focused()),
+        worktrees_focused,
         th,
     );
 
-    let orch_entries = orchestrator_entry_count(app);
     let push_section_backgrounds = move |app: &mut App| {
-        if let Some(top) = worktree_section_rects(area, Focus::Orchestrators, orch_entries) {
-            app.hits
-                .push((top, HitTarget::PanelBg(Focus::Orchestrators)));
-        }
-        if let Some(bottom) = worktree_section_rects(area, Focus::Worktrees, orch_entries) {
-            app.hits
-                .push((bottom, HitTarget::PanelBg(Focus::Worktrees)));
-        }
+        app.hits
+            .push((shrink_r(area), HitTarget::PanelBg(Focus::Worktrees)));
     };
 
     // A selected separator has nothing underneath it: keep the panel, hide
@@ -3010,31 +2967,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             )
         })
         .collect();
-    // Top section: the project's orchestrators — the managers sit above
-    // the checkouts they manage. Always drawn, so the split (and the way
-    // to create one) stays discoverable.
-    // Each orchestrator row also names the branch of the worktree it sits
-    // on — they can live on any checkout now, so the branch is the row's
-    // where.
-    let orchestrators: Vec<(String, AgentStatus, Option<String>, &'static str, bool)> = app
-        .project_orchestrators()
-        .iter()
-        .map(|a| {
-            (
-                a.name.clone(),
-                a.status,
-                app.tree
-                    .worktrees
-                    .iter()
-                    .find(|w| w.id == a.worktree_id)
-                    .map(|w| w.branch.clone()),
-                a.kind.as_str(),
-                app.unseen_finished.contains(&a.id),
-            )
-        })
-        .collect();
-
-    if worktrees.is_empty() && orchestrators.is_empty() && !app.tree.has_visible_projects() {
+    if worktrees.is_empty() && !app.tree.has_visible_projects() {
         push_section_backgrounds(app);
         return;
     }
@@ -3060,135 +2993,6 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             *screen_row += 1;
         }
     };
-    // The split is adaptive: the ORCHESTRATORS section on top keeps only
-    // the rows its pills need (capped at ~30% of the list), and WORKTREES
-    // takes everything below — a short orchestrator list never wastes
-    // half the column.
-    let mid = orchestrator_section_rows(inner.height as usize, orch_entries);
-    if orchestrators.is_empty() && app.tree.has_visible_projects() {
-        // Selectable placeholder: walking onto it and pressing n/Enter
-        // spawns the project's first orchestrator.
-        let spans = vec![
-            Span::styled("+ ", Style::default().fg(th.accent)),
-            Span::styled("new orchestrator", dim),
-        ];
-        let selected = app.on_orchestrator_placeholder();
-        render_pill(
-            f,
-            inner,
-            screen_row as isize,
-            spans,
-            selected,
-            orchestrators_focused,
-            th,
-        );
-        if let Some(hit) = rows_rect(inner, screen_row, PILL_H) {
-            app.hits.push((hit, HitTarget::Orchestrator(0)));
-        }
-        screen_row += PILL_H as usize;
-    }
-    // More orchestrators than the half fits: scroll so the selected row
-    // stays visible instead of clipping the tail.
-    let orch_skip = scroll_skip(
-        &vec![PILL_H as usize; orchestrators.len()],
-        app.sel_orchestrator.unwrap_or(0),
-        mid,
-    );
-    for (i, (name, status, branch, kind, unseen)) in
-        orchestrators.iter().enumerate().skip(orch_skip)
-    {
-        if screen_row + PILL_H as usize > mid
-            || row_rect(inner, screen_row + PILL_H as usize - 1).is_none()
-        {
-            break;
-        }
-        let roll = Some(*status);
-        let ramp = sweep_ramp(roll, th, app.animations);
-        let mut spans = vec![unseen_dot(*unseen, roll, th)];
-        const ORCH_BADGE: &str = " ◆";
-        let branch_label = branch
-            .as_ref()
-            .map(|b| format!(" {}", truncate(b, 24)))
-            .unwrap_or_default();
-        // The CLI behind the orchestrator, trailing like the sessions
-        // panel's harness badge — same "name · where · harness" read. The
-        // badge always shows (the sessions-panel rule); on a narrow panel
-        // the BRANCH label is what drops, whole, so the name keeps its
-        // columns.
-        let kind_label = format!(" {kind}");
-        let mut branch_label = branch_label;
-        // 3 = the selection rail + the status dot's two cells; without the
-        // rail in the math the branch label loses its last character.
-        let mut max = (inner.width as usize).saturating_sub(
-            3 + ORCH_BADGE.chars().count()
-                + branch_label.chars().count()
-                + kind_label.chars().count(),
-        );
-        if max < MIN_SESSION_NAME_W {
-            branch_label.clear();
-            max = (inner.width as usize)
-                .saturating_sub(3 + ORCH_BADGE.chars().count() + kind_label.chars().count());
-        }
-        spans.extend(status_name_spans(
-            truncate(name, max),
-            unseen_or(*unseen, th, Style::default()),
-            ramp,
-            app.sweep_phase(),
-        ));
-        spans.push(Span::styled(ORCH_BADGE, Style::default().fg(th.accent)));
-        if !branch_label.is_empty() {
-            spans.push(Span::styled(branch_label, dim));
-        }
-        spans.push(Span::styled(kind_label, dim));
-        let selected = app.sel_orchestrator == Some(i)
-            || (orchestrators_focused && app.sel_orchestrator.is_none() && i == 0);
-        render_pill(
-            f,
-            inner,
-            screen_row as isize,
-            spans,
-            selected,
-            orchestrators_focused,
-            th,
-        );
-        if let Some(hit) = rows_rect(inner, screen_row, PILL_H) {
-            app.hits.push((hit, HitTarget::Orchestrator(i)));
-        }
-        screen_row += PILL_H as usize;
-    }
-    // Bottom section: WORKTREES starts right under the orchestrator rows,
-    // at the adaptive boundary. The boundary row itself holds the section
-    // rule, so the header sits one row below `mid` and every row after it
-    // inherits the shift through `screen_row`.
-    screen_row = mid;
-    render_section_rule(f, inner, screen_row, th);
-    screen_row += 1;
-    if let Some(r) = row_rect(inner, screen_row) {
-        let header_style = if worktrees_focused {
-            Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(th.muted).add_modifier(Modifier::BOLD)
-        };
-        // The section header covers both row kinds. At the default 22-col
-        // panel width the full title only fits with a trimmed gutter, and
-        // the `· N` count (all rows, branch rows included) only shows once
-        // the panel is dragged wide enough — never a clipped title.
-        let title = "WORKTREES & BRANCHES";
-        let total = wt_count + branch_rows.len();
-        let mut gutter = ROW_GUTTER;
-        while !gutter.is_empty() && gutter.len() + title.len() > inner.width as usize {
-            gutter = &gutter[..gutter.len() - 1];
-        }
-        let mut spans = vec![Span::styled(format!("{gutter}{title}"), header_style)];
-        let count = format!(" · {total}");
-        if total > 0 && gutter.len() + title.len() + count.chars().count() <= inner.width as usize {
-            spans.push(Span::styled(count, dim));
-        }
-        f.render_widget(Paragraph::new(Line::from(spans)), r);
-    }
-    // One row for the header itself — the first pill's pad row is the
-    // breathing space, so no extra blank line.
-    screen_row += 1;
     if worktrees.is_empty() && branch_rows.is_empty() {
         if let Some(r) = row_rect(inner, screen_row) {
             f.render_widget(
@@ -3295,7 +3099,10 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             spans.push(Span::styled(ROOT_BADGE, Style::default().fg(th.dim)));
         } else {
             spans.extend(status_name_spans(
-                truncate(branch, (inner.width as usize).saturating_sub(2 + badge_len + nest)),
+                truncate(
+                    branch,
+                    (inner.width as usize).saturating_sub(2 + badge_len + nest),
+                ),
                 Style::default(),
                 ramp,
                 app.sweep_phase(),
@@ -3365,7 +3172,8 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             let Some(r) = row_rect(inner, screen_row + worktree_height + session_index) else {
                 break;
             };
-            let unseen = matches!(session, SessionRow::Agent(a) if app.unseen_finished.contains(&a.id));
+            let unseen =
+                matches!(session, SessionRow::Agent(a) if app.unseen_finished.contains(&a.id));
             let (glyph, detail, name) = match session {
                 SessionRow::Agent(agent) => (
                     unseen_dot(unseen, Some(agent.status), th),
@@ -3395,7 +3203,16 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                     link.label(),
                 ),
             };
-            let rail = if selected && session_index == 0 {
+            // The session mounted in the terminal pane: a white frame
+            // (side bars + bright name) marks where the attached session
+            // lives in the tree, whatever panel has focus.
+            let attached = app
+                .term
+                .as_ref()
+                .is_some_and(|t| session.sref().as_ref() == Some(&t.sref));
+            let rail = if attached {
+                Span::styled("▌", Style::default().fg(th.text))
+            } else if selected && session_index == 0 {
                 Span::styled(
                     PILL_RAIL_CAPS.1.to_string(),
                     Style::default().fg(if worktrees_focused { th.accent } else { th.dim }),
@@ -3423,7 +3240,9 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             let name = truncate(
                 &name,
                 (inner.width as usize).saturating_sub(
-                    4 + nest + detail.as_ref().map_or(0, |label| label.chars().count()),
+                    4 + nest
+                        + detail.as_ref().map_or(0, |label| label.chars().count())
+                        + usize::from(attached),
                 ),
             );
             let mut spans = vec![rail, Span::styled(guides, guide)];
@@ -3431,8 +3250,26 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             if let Some(detail) = detail {
                 spans.push(Span::styled(detail, dim));
             }
-            spans.push(Span::styled(name, unseen_or(unseen, th, dim)));
+            spans.push(Span::styled(
+                name,
+                if attached {
+                    Style::default().fg(th.text)
+                } else {
+                    unseen_or(unseen, th, dim)
+                },
+            ));
             f.render_widget(Paragraph::new(Line::from(spans)), r);
+            if attached && r.width > 1 {
+                // Right side of the frame, flush with the panel edge.
+                f.render_widget(
+                    Paragraph::new(Span::styled("▐", Style::default().fg(th.text))),
+                    Rect {
+                        x: r.x + r.width - 1,
+                        width: 1,
+                        ..r
+                    },
+                );
+            }
             app.hits
                 .push((r, HitTarget::WorktreeSession(i, session_index)));
         }
@@ -3440,9 +3277,12 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     }
     // Local branches without a checkout: dim ○ pills after the worktree
     // rows — no sessions, no from-line. Their indices continue the same
-    // scroll_skip accounting (heights already appended above).
+    // scroll_skip accounting (heights already appended above). A branch
+    // created from another checkout-less branch nests under it with the
+    // same tree guides as the worktree rows.
+    let branch_depths: Vec<usize> = branch_rows.iter().map(|(_, d)| *d).collect();
     if !out_of_rows {
-        for (j, branch) in branch_rows
+        for (j, (branch, depth)) in branch_rows
             .iter()
             .enumerate()
             .skip(wt_skip.saturating_sub(worktrees.len()))
@@ -3450,13 +3290,31 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             if row_rect(inner, screen_row + PILL_H as usize - 1).is_none() {
                 break;
             }
-            let spans = vec![
-                Span::styled("○ ", dim),
-                Span::styled(
-                    truncate(branch, (inner.width as usize).saturating_sub(3)),
-                    dim,
-                ),
-            ];
+            let nest = 2 * depth;
+            let mut spans = Vec::new();
+            if *depth > 0 {
+                // Same guide layout as the worktree rows: ancestor `│`
+                // continuations, then this row's own `├`/`└` connector.
+                let mut guides = String::new();
+                for l in 1..*depth {
+                    guides.push_str(if nest_level_continues(&branch_depths, j, l) {
+                        "│ "
+                    } else {
+                        "  "
+                    });
+                }
+                guides.push_str(if nest_level_continues(&branch_depths, j, *depth) {
+                    "├ "
+                } else {
+                    "└ "
+                });
+                spans.push(Span::styled(guides, guide));
+            }
+            spans.push(Span::styled("○ ", dim));
+            spans.push(Span::styled(
+                truncate(branch, (inner.width as usize).saturating_sub(3 + nest)),
+                dim,
+            ));
             let selected = app.sel_worktree == worktrees.len() + j;
             render_pill(
                 f,
@@ -3467,6 +3325,17 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                 worktrees_focused,
                 th,
             );
+            if *depth > 0 {
+                // The pill's top pad row: the line coming down from the
+                // parent, plus ancestor continuations — drawn after the
+                // pill so a selected fill can't break the line.
+                for l in 1..*depth {
+                    if nest_level_continues(&branch_depths, j, l) {
+                        guide_cell(f, screen_row, l);
+                    }
+                }
+                guide_cell(f, screen_row, *depth);
+            }
             if let Some(hit) = rows_rect(inner, screen_row, PILL_H) {
                 app.hits.push((hit, HitTarget::WorktreeBranch(j)));
             }
@@ -3538,6 +3407,19 @@ const TAB_NAME_SEL_W: usize = 24;
 /// One session tab, two rows tall: glyph + truncated name on top, the
 /// model (dim) underneath, both padded one column each side. Returns the
 /// two span rows and the tab's total width in columns.
+/// One fixed color per harness so the tab sub-row identifies the agent
+/// at a glance: claude orange-ish (warn), codex green (ok), cursor blue
+/// (info), pi magenta (special); terminals use muted.
+fn kind_color(kind: nebula_core::AgentKind, th: Theme) -> ratatui::style::Color {
+    use nebula_core::AgentKind;
+    match kind {
+        AgentKind::Claude => th.warn,
+        AgentKind::Codex => th.ok,
+        AgentKind::Cursor => th.info,
+        AgentKind::Pi => th.special,
+    }
+}
+
 fn session_tab(
     app: &App,
     row: &SessionRow,
@@ -3552,9 +3434,11 @@ fn session_tab(
     };
     let mut badge: Option<Span<'static>> = None;
     // The sub-row: the model (and effort) the agent runs with. "default"
-    // when the CLI picks; blank for kinds with no model flag, terminals,
-    // and links.
+    // when the CLI picks; blank for kinds with no model flag and links.
     let mut sub = String::new();
+    // The harness kind, trailing the sub-row in its own color so every
+    // tab says what runs it even when the title truncates.
+    let mut kind_span: Option<Span<'static>> = None;
     let (glyph, name) = match row {
         SessionRow::Agent(a) => {
             if !crate::config::model_choices(a.kind).is_empty() {
@@ -3578,14 +3462,10 @@ fn session_tab(
                 // previews (attaches), which clears the mark anyway.
                 unseen_or(unseen && !selected, th, name_style)
             };
-            // The selected tab carries the harness badge (the old column
-            // badged every row; the bar only has room to badge one).
-            if selected {
-                badge = Some(Span::styled(
-                    format!(" {}", a.kind.as_str()),
-                    Style::default().fg(th.dim),
-                ));
-            }
+            kind_span = Some(Span::styled(
+                a.kind.as_str(),
+                Style::default().fg(kind_color(a.kind, th)),
+            ));
             (dot, Span::styled(truncate(&a.name, name_max), style))
         }
         SessionRow::Terminal(t) => (
@@ -3601,7 +3481,10 @@ fn session_tab(
                     th.dim
                 }),
             ),
-            Span::styled(truncate(&t.name, name_max), name_style),
+            {
+                kind_span = Some(Span::styled("terminal", Style::default().fg(th.muted)));
+                Span::styled(truncate(&t.name, name_max), name_style)
+            },
         ),
         SessionRow::Link(l) => {
             let pr = l.pull_request();
@@ -3628,7 +3511,11 @@ fn session_tab(
     };
     let badge_w = badge.as_ref().map_or(0, |b| b.content.chars().count());
     let top_w = 2 + name.content.chars().count() + badge_w;
-    let sub_len = sub.chars().count();
+    // The kind trails the model with one space between (or stands alone
+    // when the kind has no model flag).
+    let kind_w = kind_span.as_ref().map_or(0, |k| k.content.chars().count());
+    let gap = if !sub.is_empty() && kind_w > 0 { 1 } else { 0 };
+    let sub_len = sub.chars().count() + gap + kind_w;
     // The wider row sets the tab width, so the model is never squeezed by
     // a short name. The sub-row indents 2 to sit under the name.
     let w = 1 + top_w.max(2 + sub_len) + 1;
@@ -3638,11 +3525,14 @@ fn session_tab(
     // Dim sinks into the selection fill, so the selected tab's model gets
     // lifted to muted (same rule as `render_pill`).
     let sub_style = Style::default().fg(if selected { th.muted } else { th.dim });
-    let mut bottom = vec![
-        Span::raw("   "),
-        Span::styled(sub, sub_style),
-        Span::raw(" ".repeat(w - 3 - sub_len)),
-    ];
+    let mut bottom = vec![Span::raw("   "), Span::styled(sub, sub_style)];
+    if let Some(k) = kind_span {
+        if gap == 1 {
+            bottom.push(Span::raw(" "));
+        }
+        bottom.push(k);
+    }
+    bottom.push(Span::raw(" ".repeat(w - 3 - sub_len)));
     if selected {
         let bg = match app.focus {
             Focus::Sessions | Focus::Terminal => th.sel_bg,
@@ -3675,7 +3565,10 @@ fn draw_session_tabs(f: &mut Frame, app: &mut App, area: Rect, right: Option<Spa
     let mut chip_hit_w = 0usize;
     if archived_count > 0 {
         let (text, style) = if app.show_archived {
-            (format!("⊘ {archived_count} "), Style::default().fg(th.accent))
+            (
+                format!("⊘ {archived_count} "),
+                Style::default().fg(th.accent),
+            )
         } else {
             (format!("⊘ {archived_count} "), dim)
         };
@@ -3719,10 +3612,8 @@ fn draw_session_tabs(f: &mut Frame, app: &mut App, area: Rect, right: Option<Spa
                 r,
             );
         }
-        app.hits.push((
-            Rect { height: 2, ..r },
-            HitTarget::PanelBg(Focus::Sessions),
-        ));
+        app.hits
+            .push((Rect { height: 2, ..r }, HitTarget::PanelBg(Focus::Sessions)));
         return;
     }
 
@@ -3796,10 +3687,8 @@ fn draw_session_tabs(f: &mut Frame, app: &mut App, area: Rect, right: Option<Spa
     }
     f.render_widget(Paragraph::new(Line::from(line1)), bar);
     // Bare header background focuses the tab strip, like the old panel bg.
-    app.hits.push((
-        Rect { height: 2, ..r },
-        HitTarget::PanelBg(Focus::Sessions),
-    ));
+    app.hits
+        .push((Rect { height: 2, ..r }, HitTarget::PanelBg(Focus::Sessions)));
 }
 
 fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
@@ -4156,13 +4045,6 @@ fn breadcrumb(app: &App) -> Vec<Span<'static>> {
         return spans;
     };
     spans.push(seg(&project.name, app.focus == Focus::Projects));
-    if app.focus == Focus::Orchestrators {
-        if let Some(orchestrator) = app.selected_orchestrator() {
-            spans.push(sep());
-            spans.push(seg(&orchestrator.name, true));
-        }
-        return spans;
-    }
     if let Some(worktree) = app.selected_worktree() {
         spans.push(sep());
         spans.push(seg(&worktree.branch, app.focus == Focus::Worktrees));
@@ -4374,15 +4256,6 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                     k(Action::Help)
                 ),
             },
-            Focus::Orchestrators => format!(
-                "{}: new orchestrator  {}: attach  {}: rename  {}: delete  {}: menu  {}: help",
-                k(Action::New),
-                k(Action::Activate),
-                k(Action::Rename),
-                k(Action::Delete),
-                k(Action::ContextMenu),
-                k(Action::Help)
-            ),
             Focus::Worktrees => format!(
                 "{}: new worktree  {}/{}: notes/todos  {}: terminal  {}: pin  {}: delete  {}: search  {}: menu  {}: help",
                 k(Action::New),

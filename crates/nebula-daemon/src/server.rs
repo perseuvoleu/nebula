@@ -222,6 +222,46 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         }
                     });
                 }
+                ClientRequest::ReadSession {
+                    req_id,
+                    session,
+                    lines,
+                } => {
+                    // A pure look: no ensure_session (a dead session stays
+                    // dead), no resize. Rendering ~1MB of ring through vt100
+                    // takes a few ms — keep it off the request loop.
+                    match daemon.session(&session) {
+                        Some(s) => {
+                            let (_, data) = s.snapshot(None);
+                            let (cols, rows) = s.size();
+                            let out_tx = out_tx.clone();
+                            tokio::spawn(async move {
+                                let text = tokio::task::spawn_blocking(move || {
+                                    crate::pty::render::ring_to_text(&data, cols, rows, lines)
+                                })
+                                .await;
+                                if let Ok(text) = text {
+                                    let _ = out_tx
+                                        .send(ServerEvent::SessionText {
+                                            req_id,
+                                            cols,
+                                            rows,
+                                            text,
+                                        })
+                                        .await;
+                                }
+                            });
+                        }
+                        None => {
+                            let _ = out_tx
+                                .send(ServerEvent::Error {
+                                    req_id: Some(req_id),
+                                    message: "session is not running — nothing to read".into(),
+                                })
+                                .await;
+                        }
+                    }
+                }
                 // ---- entity CRUD: run the op, reply Ack/Error ----
                 ClientRequest::AddWorkspace { req_id, name } => {
                     reply(&out_tx, req_id, daemon.add_workspace(&name).map(Some)).await;
@@ -344,7 +384,6 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     model,
                     effort,
                     auto_title,
-                    orchestrator,
                     prompt,
                 } => {
                     reply(
@@ -358,7 +397,6 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                                 model,
                                 effort,
                                 auto_title,
-                                orchestrator,
                                 prompt,
                             )
                             .await
@@ -433,18 +471,6 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         &out_tx,
                         req_id,
                         daemon.set_agent_pinned(&id, pinned).map(|_| None),
-                    )
-                    .await;
-                }
-                ClientRequest::SetAgentOrchestrator {
-                    req_id,
-                    id,
-                    orchestrator,
-                } => {
-                    reply(
-                        &out_tx,
-                        req_id,
-                        daemon.set_agent_orchestrator(&id, orchestrator).map(|_| None),
                     )
                     .await;
                 }

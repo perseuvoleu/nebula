@@ -521,8 +521,8 @@ impl Store {
     /// clients never see it, they only observe the eventual rename.
     pub fn insert_agent_with_auto_title(&self, a: &Agent, auto_title: bool) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO agents (id, worktree_id, name, status, archived, archived_at, pinned, kind, claude_session_id, sort_order, created_at, status_changed_at, model, effort, auto_title_pending, orchestrator)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            "INSERT INTO agents (id, worktree_id, name, status, archived, archived_at, pinned, kind, claude_session_id, sort_order, created_at, status_changed_at, model, effort, auto_title_pending)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 a.id.as_str(),
                 a.worktree_id.as_str(),
@@ -538,8 +538,7 @@ impl Store {
                 a.status_changed_at,
                 a.model,
                 a.effort,
-                auto_title as i64,
-                a.orchestrator as i64
+                auto_title as i64
             ],
         )?;
         Ok(())
@@ -586,27 +585,6 @@ impl Store {
         Ok(pending == Some(1))
     }
 
-    /// Whether this agent is a project orchestrator — drives the
-    /// orchestration cheat-sheet injection on every prompt. Unknown ids
-    /// answer false (prewarm sessions, stale env).
-    pub fn agent_is_orchestrator(&self, id: &AgentId) -> Result<bool> {
-        let flag: Option<i64> = self
-            .conn
-            .lock()
-            .unwrap()
-            .query_row(
-                "SELECT orchestrator FROM agents WHERE id = ?1",
-                params![id.as_str()],
-                |r| r.get(0),
-            )
-            .map(Some)
-            .or_else(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                e => Err(e),
-            })?;
-        Ok(flag == Some(1))
-    }
-
     pub fn set_agent_worktree(&self, id: &AgentId, worktree_id: &WorktreeId) -> Result<()> {
         self.conn.lock().unwrap().execute(
             "UPDATE agents SET worktree_id = ?2 WHERE id = ?1",
@@ -622,14 +600,6 @@ impl Store {
         self.conn.lock().unwrap().execute(
             "UPDATE agents SET archived = ?2, archived_at = ?3 WHERE id = ?1",
             params![id.as_str(), archived as i64, archived_at],
-        )?;
-        Ok(())
-    }
-
-    pub fn set_agent_orchestrator(&self, id: &AgentId, orchestrator: bool) -> Result<()> {
-        self.conn.lock().unwrap().execute(
-            "UPDATE agents SET orchestrator = ?2 WHERE id = ?1",
-            params![id.as_str(), orchestrator as i64],
         )?;
         Ok(())
     }
@@ -749,6 +719,23 @@ impl Store {
             "SELECT COUNT(*) FROM notes n, agents a, worktrees w
              WHERE a.id = ?1 AND w.id = a.worktree_id AND n.done = 0
                AND (n.worktree_id = w.id OR n.project_id = w.project_id)",
+            params![id.as_str()],
+            |r| r.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
+    /// Unarchived sibling sessions on the agent's worktree that have run
+    /// (any status but `fresh` — a fresh session has produced no changes
+    /// yet). Drives the hook-side shared-checkout pointer: foreign
+    /// modifications in the diff are likely a sibling's, and the agent
+    /// should check `nebula agent list` before acting on them. Unknown
+    /// agents count as zero.
+    pub fn active_sibling_count_for_agent(&self, id: &AgentId) -> Result<usize> {
+        let count: i64 = self.conn.lock().unwrap().query_row(
+            "SELECT COUNT(*) FROM agents b, agents a
+             WHERE a.id = ?1 AND b.worktree_id = a.worktree_id
+               AND b.id != a.id AND b.archived = 0 AND b.status != 'fresh'",
             params![id.as_str()],
             |r| r.get(0),
         )?;
@@ -1111,7 +1098,7 @@ impl Store {
     pub fn get_agent(&self, id: &AgentId) -> Result<Option<Agent>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, worktree_id, name, status, archived, pinned, kind, claude_session_id, sort_order, status_changed_at, model, effort, archived_at, orchestrator FROM agents WHERE id = ?1",
+            "SELECT id, worktree_id, name, status, archived, pinned, kind, claude_session_id, sort_order, status_changed_at, model, effort, archived_at FROM agents WHERE id = ?1",
         )?;
         let mut rows = stmt.query(params![id.as_str()])?;
         Ok(rows.next()?.map(|r| Agent {
@@ -1126,7 +1113,6 @@ impl Store {
             session_id: r.get(7).unwrap(),
             sort_order: r.get(8).unwrap(),
             status_changed_at: r.get(9).unwrap(),
-            orchestrator: r.get::<_, i64>(13).unwrap() != 0,
             model: r.get(10).unwrap(),
             effort: r.get(11).unwrap(),
             archived_at: r.get(12).unwrap(),
@@ -1196,7 +1182,7 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let agents = conn
-            .prepare("SELECT id, worktree_id, name, status, archived, pinned, kind, claude_session_id, sort_order, status_changed_at, model, effort, archived_at, orchestrator FROM agents ORDER BY sort_order, created_at")?
+            .prepare("SELECT id, worktree_id, name, status, archived, pinned, kind, claude_session_id, sort_order, status_changed_at, model, effort, archived_at FROM agents ORDER BY sort_order, created_at")?
             .query_map([], |r| {
                 Ok(Agent {
                     id: AgentId(r.get(0)?),
@@ -1209,7 +1195,6 @@ impl Store {
                     session_id: r.get(7)?,
                     sort_order: r.get(8)?,
                     status_changed_at: r.get(9)?,
-                    orchestrator: r.get::<_, i64>(13)? != 0,
                     model: r.get(10)?,
                     effort: r.get(11)?,
                     archived_at: r.get(12)?,
@@ -1298,7 +1283,6 @@ mod tests {
             session_id: Some("sess-123".into()),
             sort_order: 0,
             status_changed_at: 0,
-            orchestrator: false,
             alive: false,
         };
         store.insert_agent(&agent).unwrap();
@@ -1316,7 +1300,6 @@ mod tests {
             session_id: None,
             sort_order: 1,
             status_changed_at: 0,
-            orchestrator: false,
             alive: false,
         };
         store.insert_agent(&codex_agent).unwrap();
@@ -1334,7 +1317,6 @@ mod tests {
             session_id: None,
             sort_order: 2,
             status_changed_at: 0,
-            orchestrator: false,
             alive: false,
         };
         store.insert_agent(&cursor_agent).unwrap();
@@ -1568,7 +1550,6 @@ mod tests {
                 session_id: None,
                 sort_order: 0,
                 status_changed_at: 0,
-                orchestrator: false,
                 alive: false,
             })
             .unwrap();
@@ -2015,7 +1996,6 @@ mod tests {
             session_id: None,
             sort_order: 0,
             status_changed_at: 0,
-            orchestrator: false,
             alive: false,
         };
 
@@ -2178,7 +2158,6 @@ mod tests {
                     session_id: None,
                     sort_order: 0,
                     status_changed_at: 0,
-                    orchestrator: false,
                     alive: false,
                 })
                 .unwrap();

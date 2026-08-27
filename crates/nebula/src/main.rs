@@ -66,8 +66,8 @@ enum Command {
         #[command(subcommand)]
         command: WorktreeCommand,
     },
-    /// Spawn and inspect agent sessions from the command line — how an
-    /// orchestrator manages its workers.
+    /// Spawn and inspect agent sessions from the command line — how a
+    /// session delegates work to and manages its workers.
     Agent {
         #[command(subcommand)]
         command: AgentCommand,
@@ -112,6 +112,15 @@ enum Command {
 
 #[derive(Subcommand)]
 enum WorktreeCommand {
+    /// List worktrees as JSON (branch, path, sessions living on each).
+    List {
+        /// Project name (default: the calling session's project).
+        #[arg(long)]
+        project: Option<String>,
+        /// Every project, not just one.
+        #[arg(long)]
+        all: bool,
+    },
     /// Create a worktree in a project ("fix login flow" → fix-login-flow).
     /// Inside a nebula session the project is the caller's own; outside,
     /// pass --project.
@@ -144,15 +153,11 @@ enum WorktreeCommand {
 
 #[derive(Subcommand)]
 enum AgentCommand {
-    /// Spawn an agent session. `--orchestrator` makes it a project
-    /// orchestrator — pinned, in the orchestrators group, on the primary
-    /// checkout unless --worktree says otherwise (any worktree works);
-    /// workers need --worktree <branch>. `--prompt` hands it its first
-    /// task.
+    /// Spawn an agent session on a worktree (--worktree <branch>).
+    /// `--prompt` hands it its first task.
     New {
         /// Worktree to spawn in: a branch name, a directory name, or
-        /// "root"/"primary" for the primary checkout (required unless
-        /// --orchestrator, which defaults to the primary checkout).
+        /// "root"/"primary" for the primary checkout.
         #[arg(long)]
         worktree: Option<String>,
         /// Project name (default: the calling session's project).
@@ -171,30 +176,9 @@ enum AgentCommand {
         /// from --prompt, else generated; the session then titles itself).
         #[arg(long, num_args = 1..)]
         name: Option<Vec<String>>,
-        /// Project-level orchestrator: pinned, own group, primary
-        /// checkout by default (any worktree via --worktree).
-        #[arg(long)]
-        orchestrator: bool,
         /// Initial task, submitted as the CLI's first prompt.
         #[arg(long)]
         prompt: Option<String>,
-    },
-    /// Promote a session (on any of the project's worktrees) to project
-    /// orchestrator (it moves into the ORCHESTRATORS section, pinned).
-    Promote {
-        /// Session name (as shown in the panels).
-        name: String,
-        /// Project name (default: the calling session's project).
-        #[arg(long)]
-        project: Option<String>,
-    },
-    /// Demote an orchestrator back to a plain session.
-    Demote {
-        /// Session name (as shown in the panels).
-        name: String,
-        /// Project name (default: the calling session's project).
-        #[arg(long)]
-        project: Option<String>,
     },
     /// Block until workers settle out of running (finished, needs_feedback,
     /// terminated…), then print them as JSON — `agent list`'s row shape.
@@ -217,6 +201,74 @@ enum AgentCommand {
         /// Every project, not just one.
         #[arg(long)]
         all: bool,
+        /// Only sessions on this worktree (branch, directory name, or
+        /// "root"/"primary" for the primary checkout).
+        #[arg(long)]
+        worktree: Option<String>,
+    },
+    /// One session's full JSON row (status, model, path, timestamps).
+    Show {
+        /// Session name (as shown in the panels).
+        name: String,
+        /// Project name (default: the calling session's project).
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Print a worker's screen — scrollback tail included — as plain text.
+    /// Rendered by the daemon; nothing is attached, resized, or respawned.
+    Read {
+        /// Session name (as shown in the panels).
+        name: String,
+        /// Keep only the last N lines (default: everything retained).
+        #[arg(long)]
+        lines: Option<usize>,
+        /// Project name (default: the calling session's project).
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Type a follow-up prompt into a running worker and submit it — the
+    /// steering half of delegation (`new --prompt` only covers the first task).
+    Send {
+        /// Session name (as shown in the panels).
+        name: String,
+        /// The prompt; multiple words need no quotes.
+        #[arg(required = true, num_args = 1..)]
+        text: Vec<String>,
+        /// Project name (default: the calling session's project).
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Kill a worker's PTY but keep its row (the TUI's ARCHIVED group).
+    Archive {
+        /// Session name (as shown in the panels).
+        name: String,
+        /// Project name (default: the calling session's project).
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Bring an archived session back (its PTY respawns on next attach).
+    Unarchive {
+        /// Session name (as shown in the panels).
+        name: String,
+        /// Project name (default: the calling session's project).
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Kill a worker's PTY and remove its row entirely.
+    Delete {
+        /// Session name (as shown in the panels).
+        name: String,
+        /// Project name (default: the calling session's project).
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Respawn a worker's CLI, resuming its stored session when one exists.
+    Restart {
+        /// Session name (as shown in the panels).
+        name: String,
+        /// Project name (default: the calling session's project).
+        #[arg(long)]
+        project: Option<String>,
     },
 }
 
@@ -319,6 +371,7 @@ fn main() -> Result<()> {
             nebula_tui::run_workspace(op)
         }
         Some(Command::Worktree { command }) => match command {
+            WorktreeCommand::List { project, all } => nebula_tui::run_worktree_list(project, all),
             WorktreeCommand::New {
                 name,
                 from,
@@ -338,7 +391,6 @@ fn main() -> Result<()> {
                 model,
                 effort,
                 name,
-                orchestrator,
                 prompt,
             } => nebula_tui::run_agent_new(nebula_tui::NewAgentOpts {
                 worktree,
@@ -347,21 +399,41 @@ fn main() -> Result<()> {
                 model,
                 effort,
                 name: name.map(|words| words.join(" ")),
-                orchestrator,
                 prompt,
             }),
-            AgentCommand::Promote { name, project } => {
-                nebula_tui::run_agent_set_orchestrator(name, project, true)
-            }
-            AgentCommand::Demote { name, project } => {
-                nebula_tui::run_agent_set_orchestrator(name, project, false)
-            }
             AgentCommand::Wait {
                 names,
                 timeout,
                 project,
             } => nebula_tui::run_agent_wait(names, timeout, project),
-            AgentCommand::List { project, all } => nebula_tui::run_agent_list(project, all),
+            AgentCommand::List {
+                project,
+                all,
+                worktree,
+            } => nebula_tui::run_agent_list(project, all, worktree),
+            AgentCommand::Show { name, project } => nebula_tui::run_agent_show(name, project),
+            AgentCommand::Read {
+                name,
+                lines,
+                project,
+            } => nebula_tui::run_agent_read(name, lines, project),
+            AgentCommand::Send {
+                name,
+                text,
+                project,
+            } => nebula_tui::run_agent_send(name, text.join(" "), project),
+            AgentCommand::Archive { name, project } => {
+                nebula_tui::run_agent_ctl(nebula_tui::AgentCtl::Archive, name, project)
+            }
+            AgentCommand::Unarchive { name, project } => {
+                nebula_tui::run_agent_ctl(nebula_tui::AgentCtl::Unarchive, name, project)
+            }
+            AgentCommand::Delete { name, project } => {
+                nebula_tui::run_agent_ctl(nebula_tui::AgentCtl::Delete, name, project)
+            }
+            AgentCommand::Restart { name, project } => {
+                nebula_tui::run_agent_ctl(nebula_tui::AgentCtl::Restart, name, project)
+            }
         },
         Some(Command::Notes { command }) => {
             use nebula_tui::NotesOp;

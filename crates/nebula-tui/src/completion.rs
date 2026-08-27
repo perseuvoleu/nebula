@@ -450,8 +450,14 @@ mod tests {
         let names: Vec<&str> = scanned.iter().map(|d| d.name.as_str()).collect();
         assert!(names.contains(&"projects/beta/nested"), "{names:?}");
         assert!(names.contains(&"projects/alpha"), "{names:?}");
-        assert!(!names.contains(&"projects/alpha/src"), "repo is a leaf: {names:?}");
-        assert!(!names.iter().any(|n| n.contains("node_modules")), "{names:?}");
+        assert!(
+            !names.contains(&"projects/alpha/src"),
+            "repo is a leaf: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("node_modules")),
+            "{names:?}"
+        );
 
         // A typed partial matches nested basenames; repos outrank plain
         // dirs at equal match quality.
@@ -472,7 +478,11 @@ mod tests {
     fn match_positions_cover_substring_and_subsequence() {
         assert_eq!(match_positions("nebula", "neb"), vec![0, 1, 2]);
         assert_eq!(match_positions("my-work", "wrk"), vec![3, 5, 6]);
-        assert_eq!(match_positions("Nebula", "neb"), vec![0, 1, 2], "case-insensitive");
+        assert_eq!(
+            match_positions("Nebula", "neb"),
+            vec![0, 1, 2],
+            "case-insensitive"
+        );
         assert!(match_positions("nebula", "").is_empty());
         assert!(match_positions("nebula", "xyz").is_empty());
         // Multi-token queries highlight the union of their matches.

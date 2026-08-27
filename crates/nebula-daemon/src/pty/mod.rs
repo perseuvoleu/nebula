@@ -1,5 +1,6 @@
 pub mod kitty;
 pub mod progress;
+pub mod render;
 pub mod ring;
 
 use anyhow::{Context, Result};
@@ -226,6 +227,11 @@ impl PtySession {
     /// Ring snapshot for attach replay: (base_seq, bytes).
     pub fn snapshot(&self, from_seq: Option<u64>) -> (u64, Vec<u8>) {
         self.ring.lock().unwrap().snapshot_from(from_seq)
+    }
+
+    /// Last applied PTY size (cols, rows) — the grid ReadSession renders at.
+    pub fn size(&self) -> (u16, u16) {
+        *self.last_size.lock().unwrap()
     }
 
     /// The child's current kitty keyboard flags (0 = legacy).

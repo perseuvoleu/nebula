@@ -339,7 +339,6 @@ async fn full_crud_attach_and_restart_persistence() {
             model: None,
             effort: None,
             auto_title: false,
-            orchestrator: false,
             prompt: None,
         },
     )
@@ -725,7 +724,6 @@ async fn hook_post_from_agent_pty_drives_status() {
             model: None,
             effort: None,
             auto_title: false,
-            orchestrator: false,
             prompt: None,
         },
     )
@@ -1048,7 +1046,7 @@ async fn pty_progress_marks_a_shell_terminal_busy() {
     wait_for_exit(&mut daemon);
 }
 
-/// `nebula agent wait <name>` — the orchestrator's blocking verb: it must
+/// `nebula agent wait <name>` — the delegating session's blocking verb: it must
 /// error out (nonzero) while the worker is still running past --timeout,
 /// and unblock with the settled row as JSON the moment the worker leaves
 /// running. Driven end-to-end through the real CLI binary against an
@@ -1250,7 +1248,6 @@ async fn hook_cwd_rehomes_agent_to_other_worktree() {
             model: None,
             effort: None,
             auto_title: false,
-            orchestrator: false,
             prompt: None,
         },
     )
@@ -1412,7 +1409,6 @@ async fn move_agent_respawns_live_session_in_target_worktree() {
             model: None,
             effort: None,
             auto_title: false,
-            orchestrator: false,
             prompt: None,
         },
     )
@@ -1594,7 +1590,6 @@ async fn codex_hooks_install_and_drive_status() {
             model: None,
             effort: None,
             auto_title: false,
-            orchestrator: false,
             prompt: None,
         },
     )
@@ -2192,7 +2187,6 @@ async fn prewarmed_session_is_adopted_by_create_agent() {
             model: None,
             effort: None,
             auto_title: false,
-            orchestrator: false,
             prompt: None,
         },
     )
@@ -2322,7 +2316,6 @@ async fn dead_prewarm_falls_back_to_cold_spawn() {
             model: None,
             effort: None,
             auto_title: false,
-            orchestrator: false,
             prompt: None,
         },
     )
@@ -2381,8 +2374,7 @@ async fn create_agent_refuses_when_the_cli_is_not_installed() {
                 model: None,
                 effort: None,
                 auto_title: false,
-                orchestrator: false,
-                prompt: None,
+                    prompt: None,
             },
         )
         .await
@@ -2474,7 +2466,6 @@ async fn create_agent_succeeds_when_the_cli_is_on_the_login_shell_path() {
             model: None,
             effort: None,
             auto_title: false,
-            orchestrator: false,
             prompt: None,
         },
     )
@@ -2544,7 +2535,6 @@ async fn create_agent_get_id(
             model: None,
             effort: None,
             auto_title: false,
-            orchestrator: false,
             prompt: None,
         },
     )
@@ -2722,7 +2712,6 @@ async fn archive_sigkills_an_agent_that_ignores_sighup() {
             model: None,
             effort: None,
             auto_title: false,
-            orchestrator: false,
             prompt: None,
         },
     )
@@ -2789,7 +2778,6 @@ async fn prewarm_worktree_sessions_boots_dead_sessions() {
             model: None,
             effort: None,
             auto_title: false,
-            orchestrator: false,
             prompt: None,
         },
     )
@@ -2841,7 +2829,6 @@ async fn prewarm_worktree_sessions_boots_dead_sessions() {
             model: None,
             effort: None,
             auto_title: false,
-            orchestrator: false,
             prompt: None,
         },
     )
@@ -2961,7 +2948,6 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
             model: None,
             effort: None,
             auto_title: false,
-            orchestrator: false,
             prompt: None,
         },
     )
@@ -3016,7 +3002,6 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
             model: None,
             effort: None,
             auto_title: false,
-            orchestrator: false,
             prompt: None,
         },
     )
@@ -3160,6 +3145,183 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
     wait_for_exit(&mut daemon);
 }
 
+/// ReadSession renders a live session's ring to plain text daemon-side
+/// (`nebula agent read`): the marker echoed into the PTY comes back in
+/// SessionText, `lines` tails it, and a session with no live PTY errors.
+#[tokio::test]
+async fn read_session_returns_screen_text() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let mut daemon = env.spawn_daemon();
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    write_frame(
+        &mut c,
+        &ClientRequest::AddProject {
+            req_id: 1,
+            path: repo.clone(),
+            name: None,
+            create_missing: false,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        find_ack(evs, 1).is_some()
+    })
+    .await;
+    assert!(
+        matches!(find_ack(&events, 1), Some(ServerEvent::Ack { .. })),
+        "AddProject failed: {events:#?}"
+    );
+
+    // The main worktree upsert goes to subscribers only; fetch it from the
+    // snapshot instead (same as the kitty test).
+    write_frame(&mut c, &ClientRequest::Subscribe)
+        .await
+        .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        evs.iter()
+            .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
+    })
+    .await;
+    let worktree_id = events
+        .iter()
+        .find_map(|e| match e {
+            ServerEvent::Snapshot { worktrees, .. } => {
+                worktrees.iter().find(|w| w.is_main).map(|w| w.id.clone())
+            }
+            _ => None,
+        })
+        .expect("snapshot has the main worktree");
+
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateTerminal {
+            req_id: 2,
+            worktree: worktree_id,
+            name: None,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        find_ack(evs, 2).is_some()
+    })
+    .await;
+    let ServerEvent::Ack {
+        created: Some(EntityId::Terminal(term_id)),
+        ..
+    } = find_ack(&events, 2).unwrap()
+    else {
+        panic!("CreateTerminal failed: {events:#?}");
+    };
+    let sref = SessionRef::Terminal(term_id.clone());
+
+    // Attach spawns the PTY; echo a marker through it.
+    write_frame(
+        &mut c,
+        &ClientRequest::Attach {
+            session: sref.clone(),
+            from_seq: None,
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await
+    .unwrap();
+    let marker = "nebula_read_session_marker";
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session: sref.clone(),
+            data: format!("echo {marker}\n").into_bytes(),
+        },
+    )
+    .await
+    .unwrap();
+    read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        String::from_utf8_lossy(&collected_output(evs))
+            .matches(marker)
+            .count()
+            >= 2
+    })
+    .await;
+
+    // The rendered text carries the marker; a 1-line tail is 1 line.
+    write_frame(
+        &mut c,
+        &ClientRequest::ReadSession {
+            req_id: 3,
+            session: sref.clone(),
+            lines: None,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        evs.iter()
+            .any(|e| matches!(e, ServerEvent::SessionText { req_id: 3, .. }))
+    })
+    .await;
+    let text = events
+        .iter()
+        .find_map(|e| match e {
+            ServerEvent::SessionText { req_id: 3, text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(text.contains(marker), "screen text has the echo: {text:?}");
+
+    write_frame(
+        &mut c,
+        &ClientRequest::ReadSession {
+            req_id: 4,
+            session: sref.clone(),
+            lines: Some(1),
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        evs.iter()
+            .any(|e| matches!(e, ServerEvent::SessionText { req_id: 4, .. }))
+    })
+    .await;
+    let tail = events
+        .iter()
+        .find_map(|e| match e {
+            ServerEvent::SessionText { req_id: 4, text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(tail.lines().count(), 1, "lines:1 tails to one line: {tail:?}");
+
+    // A session with no live PTY answers with an Error, not a spawn.
+    write_frame(
+        &mut c,
+        &ClientRequest::ReadSession {
+            req_id: 5,
+            session: SessionRef::Agent(nebula_core::AgentId("no-such-agent".into())),
+            lines: None,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        find_ack(evs, 5).is_some()
+    })
+    .await;
+    assert!(
+        matches!(find_ack(&events, 5), Some(ServerEvent::Error { .. })),
+        "dead session should error: {events:#?}"
+    );
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
 fn wait_for_exit(daemon: &mut std::process::Child) {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
@@ -3271,7 +3433,6 @@ async fn auto_title_instruction_and_rename_flow() {
             model: None,
             effort: None,
             auto_title: true,
-            orchestrator: false,
             prompt: None,
         },
     )

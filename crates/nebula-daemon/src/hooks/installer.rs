@@ -441,7 +441,7 @@ On the first user message of a new conversation:
 /// instead. The managed extension below reports status over the same
 /// loopback endpoint (`/api/hooks/pi`) and re-injects the daemon's
 /// UserPromptSubmit response body as a context message, so pi gets the
-/// auto-title/notes/orchestrator channel the injectable CLIs have. It is
+/// auto-title/notes channel the injectable CLIs have. It is
 /// env-guarded (inert without NEBULA_* vars) and lives in pi's global
 /// extensions dir, so one install covers every worktree.
 const PI_EXTENSION: &str = include_str!("nebula_pi.ts");

@@ -570,8 +570,9 @@ fn refresh_git_changes(app: &mut App) {
 /// outcome of a `git branch` mutation (create/delete).
 #[derive(Debug)]
 pub enum BranchEvent {
-    /// `git for-each-ref` answer for this project's repo.
-    List(nebula_core::ProjectId, Vec<String>),
+    /// `git for-each-ref` answer for this project's repo, each branch
+    /// carrying the creation base its reflog names.
+    List(nebula_core::ProjectId, Vec<crate::branches::LocalBranch>),
     /// A `git branch` op finished; `message` is the flash to show.
     Op { message: String, error: bool },
 }
@@ -596,12 +597,12 @@ fn spawn_branch_list(app: &mut App) {
             tokio::task::spawn_blocking(move || {
                 let _ = tx.send(BranchEvent::List(
                     id,
-                    crate::branches::local_branches(&repo),
+                    crate::branches::local_branches_with_bases(&repo),
                 ));
             });
         }
         None => {
-            let list = crate::branches::local_branches(&repo);
+            let list = crate::branches::local_branches_with_bases(&repo);
             handle_branch_event(app, BranchEvent::List(id, list));
         }
     }
@@ -768,7 +769,7 @@ fn ui_state_json(app: &App) -> String {
         session_agent: app.selected_session().map(|a| a.id.to_string()),
         show_archived: app.show_archived,
         collapsed: app.collapsed,
-        panel_widths: Some(app.panel_widths.to_vec()),
+        panel_widths: Some(app.desired_panel_widths.to_vec()),
         diff_files_width: Some(app.diff_files_width),
         unseen_finished: {
             // Sorted so the persisted blob is stable across saves.
@@ -794,9 +795,10 @@ fn restore_ui_state(app: &mut App, json: &str) {
         // Coarse sanity clamp; normalize_panel_widths re-fits to the actual
         // screen on the next draw. Older blobs carry a third (sessions)
         // width — ignored now that sessions render as tabs.
-        for (slot, v) in app.panel_widths.iter_mut().zip(w) {
+        for (slot, v) in app.desired_panel_widths.iter_mut().zip(w) {
             *slot = v.clamp(crate::app::MIN_PANEL_W, 300);
         }
+        app.panel_widths = app.desired_panel_widths;
     }
     if let Some(w) = state.diff_files_width {
         // Coarse sanity clamp; the draw re-caps it to the actual modal width.
@@ -816,7 +818,6 @@ fn restore_ui_state(app: &mut App, json: &str) {
             .iter()
             .position(|w| w.id.as_str() == wid)
         {
-            app.sel_orchestrator = None;
             app.sel_worktree = i;
         }
     }
@@ -1261,8 +1262,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         }
         Action::FocusNext => {
             app.focus = match app.focus {
-                Focus::Projects => Focus::Orchestrators,
-                Focus::Orchestrators => Focus::Worktrees,
+                Focus::Projects => Focus::Worktrees,
                 Focus::Worktrees => Focus::Sessions,
                 Focus::Sessions => Focus::Terminal,
                 Focus::Terminal => Focus::Projects,
@@ -1271,8 +1271,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         Action::FocusPrev => {
             app.focus = match app.focus {
                 Focus::Projects => Focus::Terminal,
-                Focus::Orchestrators => Focus::Projects,
-                Focus::Worktrees => Focus::Orchestrators,
+                Focus::Worktrees => Focus::Projects,
                 Focus::Sessions => Focus::Worktrees,
                 Focus::Terminal => Focus::Sessions,
             }
@@ -1280,7 +1279,6 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         Action::FocusLeft => {
             app.focus = match app.focus {
                 Focus::Projects => Focus::Projects,
-                Focus::Orchestrators => Focus::Projects,
                 Focus::Worktrees => Focus::Projects,
                 Focus::Sessions => Focus::Worktrees,
                 Focus::Terminal => Focus::Sessions,
@@ -1291,8 +1289,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         // Ctrl+← escape hatch).
         Action::FocusTerminal => {
             app.focus = match app.focus {
-                Focus::Projects => Focus::Orchestrators,
-                Focus::Orchestrators => Focus::Worktrees,
+                Focus::Projects => Focus::Worktrees,
                 Focus::Worktrees => Focus::Sessions,
                 Focus::Sessions => Focus::Terminal,
                 Focus::Terminal => Focus::Terminal,
@@ -1303,8 +1300,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             // chose a session, which is Enter's job — plain focus movement
             // never crosses into the pane (Tab/Ctrl+→ do).
             app.focus = match app.focus {
-                Focus::Projects => Focus::Orchestrators,
-                Focus::Orchestrators => Focus::Sessions,
+                Focus::Projects => Focus::Worktrees,
                 Focus::Worktrees => Focus::Sessions,
                 Focus::Sessions => Focus::Sessions,
                 Focus::Terminal => Focus::Terminal,
@@ -1335,24 +1331,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                     let id = app.tree.projects[project].id.clone();
                     open_prompt(app, PromptKind::DividerLabel { id, before });
                 }
-                _ => app.focus = Focus::Orchestrators,
-            },
-            // Enter on an orchestrator row walks into its terminal (it is
-            // a session, not a container); on the empty section's
-            // "+ new orchestrator" row it creates the first one.
-            Focus::Orchestrators => match app.selected_orchestrator() {
-                Some(orch) => {
-                    let sref = SessionRef::Agent(orch.id.clone());
-                    attach(app, sref, out);
-                    app.focus = Focus::Terminal;
-                    app.term_locked = true;
-                }
-                None if app.on_orchestrator_placeholder() => {
-                    if let Some(p) = app.selected_project().map(|p| p.id.clone()) {
-                        open_new_orchestrator_picker(app, p);
-                    }
-                }
-                None => {}
+                _ => app.focus = Focus::Worktrees,
             },
             Focus::Worktrees => {
                 // A checkout-less branch row has no sessions to enter —
@@ -1379,11 +1358,6 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         Action::New if !app.tree.has_visible_projects() => open_prompt(app, PromptKind::AddProject),
         Action::New => match app.focus {
             Focus::Projects => open_prompt(app, PromptKind::AddProject),
-            Focus::Orchestrators => {
-                if let Some(project) = app.selected_project().map(|p| p.id.clone()) {
-                    open_new_orchestrator_picker(app, project);
-                }
-            }
             Focus::Worktrees => {
                 if let Some(project) = app.selected_project().map(|p| p.id.clone()) {
                     open_new_worktree_or_branch_picker(app, project);
@@ -1399,11 +1373,6 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         },
         Action::NewAgent => new_for_section_or_agent(app),
         Action::Rename => match app.focus {
-            Focus::Orchestrators => {
-                if let Some(id) = app.selected_orchestrator().map(|a| a.id.clone()) {
-                    open_prompt(app, PromptKind::RenameAgent { id });
-                }
-            }
             Focus::Sessions => match app.selected_session_row() {
                 Some(SessionRow::Agent(a)) => {
                     open_prompt(app, PromptKind::RenameAgent { id: a.id })
@@ -1574,6 +1543,10 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         Action::Notes => open_note_view(app),
         Action::Todos => open_todo_view(app),
         Action::TreeBrowser => open_tree_browser(app),
+        // t: the new-session picker (agents + shell) on the selection's
+        // checkout — complements n, which creates worktrees/branches when
+        // that panel has focus.
+        Action::NewSessionPicker => open_session_picker_for_context(app),
         // New shell terminal, spawned in the worktree's directory.
         // (Cmd+T never reaches a TUI — the emulator opens its own tab.)
         Action::NewTerminal => create_terminal_for_context(app, out),
@@ -1696,20 +1669,12 @@ fn open_prompt(app: &mut App, kind: PromptKind) {
             target,
             model,
             effort,
-            orchestrator,
             ..
         } => {
-            // Surface the role, the resolved launch options, and — in the
-            // orchestrator flow — the picked branch, so Enter-with-defaults
+            // Surface the resolved launch options, so Enter-with-defaults
             // is visibly what it is; plain "New agent" means CLI defaults.
-            let mut title = if *orchestrator {
-                "New orchestrator".to_string()
-            } else {
-                "New agent".to_string()
-            };
-            if let crate::app::SpawnTarget::Branch { branch, .. } = target {
-                title.push_str(&format!(" on {branch}"));
-            }
+            let _ = target;
+            let mut title = "New agent".to_string();
             let opts: Vec<&str> = model
                 .as_deref()
                 .into_iter()
@@ -1718,35 +1683,7 @@ fn open_prompt(app: &mut App, kind: PromptKind) {
             if !opts.is_empty() {
                 title.push_str(&format!(" ({})", opts.join(" · ")));
             }
-            let label = if *orchestrator {
-                // Orchestrator defaults number across the whole project —
-                // the section spans every worktree.
-                let project = match target {
-                    crate::app::SpawnTarget::Branch { project, .. } => Some(project.clone()),
-                    crate::app::SpawnTarget::Worktree(id) => app
-                        .tree
-                        .worktrees
-                        .iter()
-                        .find(|w| &w.id == id)
-                        .map(|w| w.project_id.clone()),
-                };
-                match project {
-                    Some(p) => format!(
-                        "orchestrator name (empty = {})",
-                        app.default_orchestrator_name(&p)
-                    ),
-                    None => "orchestrator name (empty = generated)".to_string(),
-                }
-            } else {
-                match target {
-                    crate::app::SpawnTarget::Worktree(_) => {
-                        format!("name (empty = {})", app.default_session_name("agent"))
-                    }
-                    crate::app::SpawnTarget::Branch { .. } => {
-                        "name (empty = generated)".to_string()
-                    }
-                }
-            };
+            let label = format!("name (empty = {})", app.default_session_name("agent"));
             (title, label, String::new())
         }
         PromptKind::RenameAgent { id } => {
@@ -2340,6 +2277,28 @@ fn toggle_archived(app: &mut App, out: &mut Vec<ClientRequest>) {
     reconcile_selection(app, before, out);
 }
 
+/// t: open the new-session picker (Claude/Codex/Cursor/Pi/Terminal) for the
+/// selection's checkout — the selected worktree, or the project's main
+/// checkout when the Projects panel has focus. The plain shell lives on the
+/// picker's Terminal row; ⇧T/⌘T still spawn one directly.
+fn open_session_picker_for_context(app: &mut App) {
+    let worktree = match app.focus {
+        Focus::Projects => app.selected_project().and_then(|p| {
+            app.tree
+                .worktrees
+                .iter()
+                .find(|w| w.project_id == p.id && w.is_main)
+                .map(|w| w.id.clone())
+        }),
+        _ => app.selected_worktree().map(|w| w.id.clone()),
+    };
+    let Some(worktree) = worktree else {
+        app.flash = Some("select a project or worktree first".into());
+        return;
+    };
+    open_new_agent_picker(app, worktree);
+}
+
 /// Shift+T: create a shell terminal whose pwd is the selection's checkout —
 /// the selected worktree, or the project's main checkout (root) when the
 /// Projects panel has focus. The daemon names it (`term-N`) and the Ack
@@ -2660,18 +2619,6 @@ fn open_delete_confirm(app: &mut App) {
                 }));
             }
         }
-        Focus::Orchestrators => {
-            if let Some(a) = app.selected_orchestrator() {
-                app.overlay = Some(Overlay::Confirm(ConfirmDialog {
-                    title: "Delete orchestrator".into(),
-                    message: format!(
-                        "Delete orchestrator '{}'? Its session and history go away.",
-                        a.name
-                    ),
-                    action: PendingAction::DeleteAgent(a.id.clone()),
-                }));
-            }
-        }
         Focus::Worktrees => {
             if let Some(w) = app.selected_worktree() {
                 if w.is_main {
@@ -2786,27 +2733,6 @@ fn bulk_confirm_listing(names: &[String]) -> String {
 /// itemizes the casualties so the blast radius is unmistakable.
 fn open_delete_all_confirm(app: &mut App) {
     match app.focus {
-        Focus::Orchestrators => {
-            let orchestrators = app.project_orchestrators();
-            if orchestrators.is_empty() {
-                app.flash = Some("no orchestrators to delete".into());
-                return;
-            }
-            let names: Vec<String> = orchestrators.iter().map(|a| a.name.clone()).collect();
-            let agents: Vec<AgentId> = orchestrators.iter().map(|a| a.id.clone()).collect();
-            app.overlay = Some(Overlay::Confirm(ConfirmDialog {
-                title: format!("Delete ALL {} orchestrator(s)", agents.len()),
-                message: format!(
-                    "Delete these {} orchestrator(s)? Their history goes away.\n{}",
-                    agents.len(),
-                    bulk_confirm_listing(&names),
-                ),
-                action: PendingAction::DeleteAllSessions {
-                    agents,
-                    terminals: vec![],
-                },
-            }));
-        }
         Focus::Worktrees => {
             let doomed: Vec<&nebula_core::Worktree> = app
                 .visible_worktrees()
@@ -2936,13 +2862,6 @@ fn menu_items_for_session(a: &nebula_core::Agent) -> Vec<MenuItem> {
                 action: MenuAction::SetAgentPinned(a.id.clone(), !a.pinned),
                 destructive: false,
             },
-            // Any session can be promoted in place — an orchestrator may
-            // live on whichever worktree its session runs on.
-            MenuItem {
-                label: "Make orchestrator".into(),
-                action: MenuAction::SetAgentOrchestrator(a.id.clone(), true),
-                destructive: false,
-            },
             MenuItem {
                 label: "Rename".into(),
                 action: MenuAction::RenameAgent(a.id.clone()),
@@ -2965,31 +2884,6 @@ fn menu_items_for_session(a: &nebula_core::Agent) -> Vec<MenuItem> {
             },
         ]
     }
-}
-
-fn menu_items_for_orchestrator(a: &nebula_core::Agent) -> Vec<MenuItem> {
-    vec![
-        MenuItem {
-            label: "Attach".into(),
-            action: MenuAction::Attach(SessionRef::Agent(a.id.clone())),
-            destructive: false,
-        },
-        MenuItem {
-            label: "Rename".into(),
-            action: MenuAction::RenameAgent(a.id.clone()),
-            destructive: false,
-        },
-        MenuItem {
-            label: "Demote to session".into(),
-            action: MenuAction::SetAgentOrchestrator(a.id.clone(), false),
-            destructive: false,
-        },
-        MenuItem {
-            label: "Delete".into(),
-            action: MenuAction::DeleteAgent(a.id.clone()),
-            destructive: true,
-        },
-    ]
 }
 
 fn menu_items_for_terminal(t: &nebula_core::TerminalTab) -> Vec<MenuItem> {
@@ -3080,11 +2974,6 @@ fn new_for_section_or_agent(app: &mut App) {
         return;
     }
     match app.focus {
-        Focus::Orchestrators => {
-            if let Some(project) = app.selected_project().map(|p| p.id.clone()) {
-                open_new_orchestrator_picker(app, project);
-            }
-        }
         Focus::Worktrees => {
             if let Some(project) = app.selected_project().map(|p| p.id.clone()) {
                 open_new_worktree_or_branch_picker(app, project);
@@ -3097,14 +2986,6 @@ fn new_for_section_or_agent(app: &mut App) {
 fn new_agent_shortcut(app: &mut App) {
     if !app.tree.has_visible_projects() {
         open_prompt(app, PromptKind::AddProject);
-        return;
-    }
-    // Context-aware: with the Worktrees-panel cursor in the ORCHESTRATORS
-    // section, the chord means "new orchestrator" — same as `n` there.
-    if app.in_orchestrator_section() {
-        if let Some(p) = app.selected_project().map(|p| p.id.clone()) {
-            open_new_orchestrator_picker(app, p);
-        }
         return;
     }
     match app.selected_worktree() {
@@ -3179,7 +3060,6 @@ fn open_command_palette(app: &mut App) {
         ));
         items.push(row("w · New worktree…", MenuAction::NewWorktree(p.clone())));
         items.push(row("b · New branch…", MenuAction::NewBranch(p.clone())));
-        items.push(row("o · New orchestrator…", MenuAction::NewOrchestrator(p)));
         items.push(row(
             "t · Quick terminal (⌘T window)",
             MenuAction::Command(PaletteCommand::QuickTerminal),
@@ -3271,30 +3151,10 @@ fn open_worktree_picker_for_agent(app: &mut App, project: nebula_core::ProjectId
 }
 
 fn open_new_agent_picker(app: &mut App, worktree: WorktreeId) {
-    open_agent_picker(app, worktree, false)
+    open_agent_picker(app, worktree)
 }
 
-/// The orchestrator flavor of the same picker: kind → model/effort →
-/// branch → name. Deliberately different from the session flow — an
-/// orchestrator is an agent with a project-wide role, so the flow adds a
-/// branch step (any local branch, the primary checkout included) and has
-/// no shell-terminal row: a terminal is `t`/⇧T/⌘T's job, not a role.
-fn open_new_orchestrator_picker(app: &mut App, project: nebula_core::ProjectId) {
-    // The primary checkout only anchors the picker rows until the branch
-    // step decides the real checkout.
-    let root = app
-        .tree
-        .worktrees
-        .iter()
-        .find(|w| w.project_id == project && w.is_main)
-        .map(|w| w.id.clone());
-    match root {
-        Some(worktree) => open_agent_picker(app, worktree, true),
-        None => app.flash = Some("project has no primary checkout".into()),
-    }
-}
-
-fn open_agent_picker(app: &mut App, worktree: WorktreeId, orchestrator: bool) {
+fn open_agent_picker(app: &mut App, worktree: WorktreeId) {
     let kind_row = |label: &str, kind: AgentKind| MenuItem {
         label: label.into(),
         action: MenuAction::NewAgentOfKind {
@@ -3302,7 +3162,6 @@ fn open_agent_picker(app: &mut App, worktree: WorktreeId, orchestrator: bool) {
             kind,
             model: None,
             effort: None,
-            orchestrator,
         },
         destructive: false,
     };
@@ -3312,21 +3171,13 @@ fn open_agent_picker(app: &mut App, worktree: WorktreeId, orchestrator: bool) {
         kind_row("Cursor", AgentKind::Cursor),
         kind_row("Pi", AgentKind::Pi),
     ];
-    // A shell terminal is not an orchestrator — the role picker offers
-    // only agents. Shells stay in the session picker (and on t/⇧T/⌘T).
-    if !orchestrator {
-        items.push(MenuItem {
-            label: "Terminal (shell)".into(),
-            action: MenuAction::NewTerminal(worktree),
-            destructive: false,
-        });
-    }
+    items.push(MenuItem {
+        label: "Terminal (shell)".into(),
+        action: MenuAction::NewTerminal(worktree),
+        destructive: false,
+    });
     app.overlay = Some(Overlay::Menu(ContextMenu {
-        title: Some(if orchestrator {
-            "New orchestrator".into()
-        } else {
-            "New session".into()
-        }),
+        title: Some("New session".into()),
         items,
         at: None,
         hover: 0,
@@ -3334,52 +3185,6 @@ fn open_agent_picker(app: &mut App, worktree: WorktreeId, orchestrator: bool) {
         parent: None,
         filter: None,
     }));
-}
-
-/// The orchestrator flow's branch picker: every local branch of the
-/// project's repo (develop, main, feature branches — an orchestrator may
-/// run on any of them). The primary checkout's branch leads the list and
-/// starts hovered — Enter takes the default, j walks down into the rest,
-/// which stay newest commit first. Falls back to the branches nebula
-/// already knows from the project's worktrees when git can't list
-/// (deleted repo, missing git).
-fn open_branch_picker(
-    app: &mut App,
-    project: nebula_core::ProjectId,
-    spawn: crate::app::BranchSpawn,
-) {
-    let Some((branches, root_branch)) = project_local_branches(app, &project) else {
-        app.flash = Some("no local branches found".into());
-        return;
-    };
-    let items: Vec<MenuItem> = branches
-        .into_iter()
-        .map(|branch| MenuItem {
-            label: if Some(&branch) == root_branch.as_ref() {
-                format!("{branch} ⌂ primary")
-            } else {
-                branch.clone()
-            },
-            action: MenuAction::SpawnOnBranch {
-                project: project.clone(),
-                branch,
-                spawn: spawn.clone(),
-            },
-            destructive: false,
-        })
-        .collect();
-    app.overlay = Some(Overlay::Menu(
-        ContextMenu {
-            title: Some("Orchestrator branch".into()),
-            items,
-            at: None,
-            hover: 0,
-            area: ratatui::layout::Rect::default(),
-            parent: None,
-            filter: None,
-        }
-        .filterable(),
-    ));
 }
 
 /// The project's local branches and the primary checkout's branch. The
@@ -3427,7 +3232,7 @@ fn project_local_branches(
 
 /// The `a` palette command: pick a local branch FIRST, then run the
 /// normal new-session picker on its checkout — the mirror of the
-/// orchestrator flow's kind-first order, for plain sessions.
+/// branch flow's kind-first order, for plain sessions.
 fn open_agent_branch_picker(app: &mut App, project: nebula_core::ProjectId) {
     let Some((branches, root_branch)) = project_local_branches(app, &project) else {
         app.flash = Some("no local branches found".into());
@@ -3463,7 +3268,7 @@ fn open_agent_branch_picker(app: &mut App, project: nebula_core::ProjectId) {
 }
 
 /// The new-branch flow's second step: pick the branch the new one starts
-/// FROM. Same rule as the orchestrator/`ab` pickers — the primary
+/// FROM. Same rule as the `ab` picker — the primary
 /// checkout's branch leads the list and starts hovered, the rest stay
 /// newest commit first. The pick runs `git branch <name> <base>` in the
 /// primary checkout; nothing is checked out.
@@ -3649,7 +3454,6 @@ fn build_submenu(item: &MenuItem) -> Option<ContextMenu> {
         worktree,
         kind,
         model,
-        orchestrator,
         ..
     } = &item.action
     else {
@@ -3688,7 +3492,6 @@ fn build_submenu(item: &MenuItem) -> Option<ContextMenu> {
                     SubmenuKind::Models => None,
                     SubmenuKind::Efforts => Some((*choice).to_string()),
                 },
-                orchestrator: *orchestrator,
             },
             destructive: false,
         })
@@ -3859,14 +3662,6 @@ fn open_context_menu_for_selection(app: &mut App) {
                         destructive: false,
                     },
                 );
-                items.insert(
-                    2,
-                    MenuItem {
-                        label: "New orchestrator".into(),
-                        action: MenuAction::NewOrchestrator(p.id.clone()),
-                        destructive: false,
-                    },
-                );
                 items.push(MenuItem {
                     label: "Notes".into(),
                     action: MenuAction::OpenNotes(NoteOwner::Project(p.id.clone())),
@@ -3885,21 +3680,6 @@ fn open_context_menu_for_selection(app: &mut App) {
                 });
             }
             open_menu(app, items, at);
-        }
-        Focus::Orchestrators => {
-            if let Some(a) = app.selected_orchestrator() {
-                open_menu(app, menu_items_for_orchestrator(a), at);
-            } else if let Some(p) = app.selected_project() {
-                open_menu(
-                    app,
-                    vec![MenuItem {
-                        label: "New orchestrator".into(),
-                        action: MenuAction::NewOrchestrator(p.id.clone()),
-                        destructive: false,
-                    }],
-                    at,
-                );
-            }
         }
         Focus::Worktrees => {
             // The cursor can sit on a checkout-less branch row below the
@@ -5197,39 +4977,9 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
             kind,
             model,
             effort,
-            orchestrator,
         } => match target {
             crate::app::SpawnTarget::Worktree(worktree) => {
-                create_agent(app, worktree, kind, model, effort, value, orchestrator, out)
-            }
-            crate::app::SpawnTarget::Branch { project, branch } => {
-                // The branch may have gained a checkout while the user typed
-                // (another client, an agent's `nebula worktree new`) — use it.
-                if let Some(worktree) = app
-                    .tree
-                    .worktrees
-                    .iter()
-                    .find(|w| w.project_id == project && w.branch == branch)
-                    .map(|w| w.id.clone())
-                {
-                    create_agent(app, worktree, kind, model, effort, value, orchestrator, out);
-                    return;
-                }
-                let req_id = app.alloc_req_id(PendingIntent::SpawnOnCreatedWorktree(
-                    crate::app::DeferredSpawn {
-                        kind,
-                        model,
-                        effort,
-                        name: value,
-                        orchestrator,
-                    },
-                ));
-                out.push(ClientRequest::CreateWorktree {
-                    req_id,
-                    project,
-                    branch,
-                    base: None,
-                });
+                create_agent(app, worktree, kind, model, effort, value, out)
             }
         },
         PromptKind::RenameAgent { id } => {
@@ -5444,7 +5194,6 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             kind,
             model,
             effort,
-            orchestrator,
         } => {
             // Resolve the picker's choice against the configured defaults:
             // an unexpanded submenu (None) and the explicit "default" row
@@ -5458,31 +5207,6 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             };
             let model = resolve(model, cfg.default_model(kind));
             let effort = resolve(effort, cfg.default_effort(kind));
-            // The orchestrator flow inserts its branch-picker step here —
-            // which checkout the session runs on is a pick (any local
-            // branch), not the carried (primary) worktree. Prewarm waits
-            // until the branch resolves to a worktree that actually exists.
-            if orchestrator {
-                if let Some(project) = app
-                    .tree
-                    .worktrees
-                    .iter()
-                    .find(|w| w.id == worktree)
-                    .map(|w| w.project_id.clone())
-                {
-                    open_branch_picker(
-                        app,
-                        project,
-                        crate::app::BranchSpawn {
-                            kind,
-                            model,
-                            effort,
-                            orchestrator: true,
-                        },
-                    );
-                }
-                return;
-            }
             // No name prompt means no typing window to warm through, so
             // create straight from the picker: the standing default-spec
             // warm slot gets adopted where it matches, and the refill
@@ -5495,7 +5219,6 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                     model,
                     effort,
                     String::new(),
-                    orchestrator,
                     out,
                 );
                 return;
@@ -5516,15 +5239,9 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                     kind,
                     model,
                     effort,
-                    orchestrator,
                 },
             )
         }
-        MenuAction::SpawnOnBranch {
-            project,
-            branch,
-            spawn,
-        } => spawn_on_branch(app, project, branch, spawn, out),
         MenuAction::AgentOnBranch { project, branch } => {
             // Existing checkout (the primary included): straight into the
             // session picker. No checkout: create the worktree checking
@@ -5606,15 +5323,6 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                 }));
             }
         }
-        MenuAction::NewOrchestrator(project) => open_new_orchestrator_picker(app, project),
-        MenuAction::SetAgentOrchestrator(id, orchestrator) => {
-            let req_id = app.alloc_req_id(PendingIntent::None);
-            out.push(ClientRequest::SetAgentOrchestrator {
-                req_id,
-                id,
-                orchestrator,
-            });
-        }
         MenuAction::AddProject => open_prompt(app, PromptKind::AddProject),
         MenuAction::OpenWorkspace(id) => {
             // The switch itself lands when ActiveWorkspaceChanged arrives.
@@ -5672,16 +5380,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                     let cfg = crate::config::Config::load();
                     let model = cfg.default_model(kind);
                     let effort = cfg.default_effort(kind);
-                    create_agent(
-                        app,
-                        worktree,
-                        kind,
-                        model,
-                        effort,
-                        String::new(),
-                        false,
-                        out,
-                    );
+                    create_agent(app, worktree, kind, model, effort, String::new(), out);
                 }
                 PaletteCommand::ReloadUi => {
                     // Quit + re-exec the binary on disk (main.rs does the
@@ -5896,9 +5595,6 @@ fn remember_context(app: &mut App) {
 /// After a project switch: land on the project's remembered worktree (its
 /// main checkout otherwise), then re-show that worktree's session.
 fn restore_context(app: &mut App, out: &mut Vec<ClientRequest>) {
-    // A project switch lands on a worktree row (the remembered one, else
-    // the root checkout), never inside the orchestrator section.
-    app.sel_orchestrator = None;
     app.sel_worktree = 0;
     if let Some(pid) = app.selected_project().map(|p| p.id.clone()) {
         if let Some(wid) = app.last_worktree_for_project.get(&pid).cloned() {
@@ -5918,16 +5614,6 @@ fn restore_session(app: &mut App, out: &mut Vec<ClientRequest>) {
     app.sel_session = 0;
     schedule_prewarm(app);
     schedule_pr_lookup(app);
-    // An orchestrator row previews the orchestrator's own terminal — it
-    // has no worktree context to restore.
-    if app.focus == Focus::Orchestrators {
-        let Some(orch) = app.selected_orchestrator() else {
-            return;
-        };
-        let sref = SessionRef::Agent(orch.id.clone());
-        attach(app, sref, out);
-        return;
-    }
     let remembered = app
         .selected_worktree()
         .and_then(|w| app.last_session_for_worktree.get(&w.id).cloned());
@@ -6118,7 +5804,7 @@ fn select_project_row_by_id(app: &mut App, id: &nebula_core::ProjectId) -> bool 
 }
 
 /// Space: jump to the session that has been waiting on the user the
-/// longest — the oldest unarchived needs-feedback agent (orchestrators
+/// longest — the oldest unarchived needs-feedback agent (sessions
 /// included) in the open workspace — and attach it, exactly like a palette
 /// session pick. Hitting the key repeatedly answers sessions oldest-first.
 fn next_attention(app: &mut App, out: &mut Vec<ClientRequest>) {
@@ -6197,7 +5883,6 @@ fn jump_to_target(
         }
         PaletteTarget::Session(id) => {
             let agent = app.tree.agents.iter().find(|a| a.id == id);
-            let orchestrator = agent.is_some_and(|a| a.orchestrator);
             let worktree = agent.map(|a| a.worktree_id.clone());
             let found = worktree.as_ref().is_some_and(|wid| {
                 app.tree
@@ -6207,27 +5892,6 @@ fn jump_to_target(
                     .map(|w| w.project_id.clone())
                     .is_some_and(|pid| select_project_row_by_id(app, &pid))
             });
-            // An orchestrator's row lives in the Worktrees panel's
-            // ORCHESTRATORS section, not the sessions list — land the
-            // section cursor on it instead of a session row.
-            if orchestrator {
-                let index = found
-                    .then(|| app.project_orchestrators().iter().position(|a| a.id == id))
-                    .flatten();
-                let Some(index) = index else {
-                    app.flash = Some("session no longer exists".into());
-                    return;
-                };
-                app.sel_orchestrator = Some(index);
-                self::attach(app, SessionRef::Agent(id), out);
-                if attach {
-                    app.focus = Focus::Terminal;
-                    app.term_locked = true;
-                } else {
-                    app.focus = Focus::Orchestrators;
-                }
-                return;
-            }
             let wt_index = found
                 .then(|| worktree.as_ref().and_then(|id| app.worktree_row_index(id)))
                 .flatten();
@@ -6235,7 +5899,6 @@ fn jump_to_target(
                 app.flash = Some("session no longer exists".into());
                 return;
             };
-            app.sel_orchestrator = None;
             app.sel_worktree = wt_index;
             let Some(index) = app
                 .visible_session_rows()
@@ -6293,7 +5956,6 @@ fn open_session(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
         app.flash = Some("session no longer exists".into());
         return;
     };
-    app.sel_orchestrator = None;
     app.sel_worktree = wt_index;
     let Some(index) = app
         .visible_session_rows()
@@ -6310,46 +5972,14 @@ fn open_session(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
 }
 
 fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
-    // The two vertical halves keep independent cursors, but ↑/↓ still
-    // walks across their shared boundary as one coherent column.
-    if app.focus == Focus::Orchestrators {
-        let section = app.orchestrator_section_len();
-        if section == 0 {
-            return;
-        }
-        let current = app.sel_orchestrator.unwrap_or(0).min(section - 1);
-        if delta > 0 && current == section - 1 && !app.visible_worktrees().is_empty() {
-            app.focus = Focus::Worktrees;
-            restore_session(app, out);
-            return;
-        }
-        let new = (current as i64 + delta).clamp(0, section as i64 - 1) as usize;
-        if new != current || app.sel_orchestrator.is_none() {
-            remember_context(app);
-            app.sel_orchestrator = Some(new);
-            restore_session(app, out);
-        }
-        return;
-    }
     if app.focus == Focus::Worktrees {
         // The cursor walks worktree rows and the checkout-less branch rows
         // below them as one list.
         let worktrees = app.worktree_panel_len();
         if worktrees == 0 {
-            if delta < 0 && app.orchestrator_section_len() > 0 {
-                app.focus = Focus::Orchestrators;
-                app.sel_orchestrator = Some(app.orchestrator_section_len() - 1);
-                restore_session(app, out);
-            }
             return;
         }
         let current = app.sel_worktree.min(worktrees - 1);
-        if delta < 0 && current == 0 && app.orchestrator_section_len() > 0 {
-            app.focus = Focus::Orchestrators;
-            app.sel_orchestrator = Some(app.orchestrator_section_len() - 1);
-            restore_session(app, out);
-            return;
-        }
         let new = (current as i64 + delta).clamp(0, worktrees as i64 - 1) as usize;
         if new != current {
             app.select_worktree_when_seen = None;
@@ -6362,7 +5992,7 @@ fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
     let len = match app.focus {
         Focus::Projects => app.project_rows().len(),
         Focus::Sessions => app.visible_session_rows().len(),
-        Focus::Orchestrators | Focus::Worktrees | Focus::Terminal => return,
+        Focus::Worktrees | Focus::Terminal => return,
     };
     if len == 0 {
         return;
@@ -6370,7 +6000,7 @@ fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
     let sel = match app.focus {
         Focus::Projects => app.sel_project,
         Focus::Sessions => app.sel_session,
-        Focus::Orchestrators | Focus::Worktrees | Focus::Terminal => return,
+        Focus::Worktrees | Focus::Terminal => return,
     };
     let new = (sel as i64 + delta).clamp(0, len as i64 - 1) as usize;
     if new == sel {
@@ -6391,8 +6021,6 @@ fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
                 restore_context(app, out);
             }
         }
-        // Handled by the two-section walk above.
-        Focus::Orchestrators => unreachable!("orchestrator navigation returns early"),
         Focus::Worktrees => unreachable!("worktrees navigation returns early"),
         Focus::Sessions => {
             app.sel_session = new;
@@ -6578,99 +6206,6 @@ fn fire_pending_prewarm(app: &mut App, out: &mut Vec<ClientRequest>) {
     app.next_keepwarm = Some(std::time::Instant::now() + KEEPWARM_REFRESH);
 }
 
-/// A branch-picker row was chosen: spawn the agent on a checkout of that
-/// branch. A worktree (the primary checkout included) that already has the
-/// branch checked out is used as-is; otherwise the daemon creates a
-/// worktree checking out the EXISTING branch — CreateWorktree's `-b` fails
-/// on an existing name and git.rs falls back to a plain checkout — and the
-/// session spawn waits on its Ack (`PendingIntent::SpawnOnCreatedWorktree`).
-fn spawn_on_branch(
-    app: &mut App,
-    project: nebula_core::ProjectId,
-    branch: String,
-    spawn: crate::app::BranchSpawn,
-    out: &mut Vec<ClientRequest>,
-) {
-    let crate::app::BranchSpawn {
-        kind,
-        model,
-        effort,
-        orchestrator,
-    } = spawn;
-    let existing = app
-        .tree
-        .worktrees
-        .iter()
-        .find(|w| w.project_id == project && w.branch == branch)
-        .map(|w| w.id.clone());
-    match existing {
-        Some(worktree) => {
-            // From here the flow is the session picker's: warm the CLI
-            // while the user types the name — or skip the prompt entirely.
-            if crate::config::Config::load().skip_session_naming {
-                create_agent(
-                    app,
-                    worktree,
-                    kind,
-                    model,
-                    effort,
-                    String::new(),
-                    orchestrator,
-                    out,
-                );
-                return;
-            }
-            out.push(ClientRequest::PrewarmAgent {
-                worktree: worktree.clone(),
-                kind,
-                model: model.clone(),
-                effort: effort.clone(),
-            });
-            open_prompt(
-                app,
-                PromptKind::NewAgent {
-                    target: crate::app::SpawnTarget::Worktree(worktree),
-                    kind,
-                    model,
-                    effort,
-                    orchestrator,
-                },
-            );
-        }
-        None => {
-            // No checkout to warm a CLI in yet, so no prewarm here.
-            if crate::config::Config::load().skip_session_naming {
-                let req_id = app.alloc_req_id(PendingIntent::SpawnOnCreatedWorktree(
-                    crate::app::DeferredSpawn {
-                        kind,
-                        model,
-                        effort,
-                        name: String::new(),
-                        orchestrator,
-                    },
-                ));
-                out.push(ClientRequest::CreateWorktree {
-                    req_id,
-                    project,
-                    branch,
-                    base: None,
-                });
-                return;
-            }
-            open_prompt(
-                app,
-                PromptKind::NewAgent {
-                    target: crate::app::SpawnTarget::Branch { project, branch },
-                    kind,
-                    model,
-                    effort,
-                    orchestrator,
-                },
-            );
-        }
-    }
-}
-
 /// Ask the daemon for a new agent session and attach it once the Ack lands.
 /// An empty `name` takes the generated default (agent-1, …) and opts the
 /// session into agent-driven auto-titling (`nebula rename` on the first
@@ -6685,38 +6220,15 @@ fn create_agent(
     model: Option<String>,
     effort: Option<String>,
     name: String,
-    orchestrator: bool,
     out: &mut Vec<ClientRequest>,
 ) {
     let auto_title = name.is_empty();
     let name = if !auto_title {
         name
-    } else if orchestrator {
-        // Orchestrators number within their own section (they are hidden
-        // from the sessions list `default_session_name` scans) — first
-        // free `orchestrator-N` across the whole project, since the
-        // section spans every worktree.
-        match app
-            .tree
-            .worktrees
-            .iter()
-            .find(|w| w.id == worktree)
-            .map(|w| w.project_id.clone())
-        {
-            Some(project) => app.default_orchestrator_name(&project),
-            None => "orchestrator-1".to_string(),
-        }
     } else {
         app.default_session_name("agent")
     };
-    // An orchestrator's row lives in the Worktrees panel — its Ack lands
-    // the section cursor there instead of the sessions list.
-    let intent = if orchestrator {
-        PendingIntent::AttachCreatedOrchestrator
-    } else {
-        PendingIntent::AttachCreated
-    };
-    let req_id = app.alloc_req_id(intent);
+    let req_id = app.alloc_req_id(PendingIntent::AttachCreated);
     out.push(ClientRequest::CreateAgent {
         req_id,
         worktree: worktree.clone(),
@@ -6725,7 +6237,6 @@ fn create_agent(
         model,
         effort,
         auto_title,
-        orchestrator,
         prompt: None,
     });
     // The create consumes (or, off-spec, discards) the worktree's warm
@@ -7073,7 +6584,6 @@ fn pointer_wants_hand(app: &App, column: u16, row: u16) -> bool {
                     | HitTarget::Worktree(_)
                     | HitTarget::WorktreeSession(_, _)
                     | HitTarget::WorktreeBranch(_)
-                    | HitTarget::Orchestrator(_)
                     | HitTarget::Session(_)
                     | HitTarget::GlobalSession(_)
                     | HitTarget::ArchivedHeader
@@ -7897,24 +7407,6 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                         None => {}
                     }
                 }
-                Some(HitTarget::Orchestrator(i)) => {
-                    let section_changed = app.focus != Focus::Orchestrators;
-                    app.focus = Focus::Orchestrators;
-                    if app.sel_orchestrator != Some(i) || section_changed {
-                        remember_context(app);
-                        app.sel_orchestrator = Some(i);
-                        restore_session(app, out);
-                    }
-                    // "+ new orchestrator" is a button, not a row — a
-                    // click opens the kind → model → name picker (same
-                    // flow as new sessions); a real orchestrator row is
-                    // selected + previewed, and Enter attaches.
-                    if app.on_orchestrator_placeholder() {
-                        if let Some(p) = app.selected_project().map(|p| p.id.clone()) {
-                            open_new_orchestrator_picker(app, p);
-                        }
-                    }
-                }
                 Some(HitTarget::Session(i)) => {
                     app.sel_session = i;
                     match app.selected_session_row() {
@@ -8162,8 +7654,6 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     Some(HitTarget::Project(_)) | Some(HitTarget::PanelBg(Focus::Projects)) => {
                         Some(Focus::Projects)
                     }
-                    Some(HitTarget::Orchestrator(_))
-                    | Some(HitTarget::PanelBg(Focus::Orchestrators)) => Some(Focus::Orchestrators),
                     Some(HitTarget::Worktree(_)) | Some(HitTarget::PanelBg(Focus::Worktrees)) => {
                         Some(Focus::Worktrees)
                     }
@@ -8214,14 +7704,6 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                                 destructive: true,
                             },
                         ];
-                        open_menu_at(app, items, at);
-                    }
-                }
-                Some(HitTarget::Orchestrator(i)) => {
-                    app.sel_orchestrator = Some(i);
-                    app.focus = Focus::Orchestrators;
-                    if let Some(a) = app.selected_orchestrator() {
-                        let items = menu_items_for_orchestrator(a);
                         open_menu_at(app, items, at);
                     }
                 }
@@ -8296,16 +7778,6 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                             action: MenuAction::AddProject,
                             destructive: false,
                         }],
-                        Focus::Orchestrators => app
-                            .selected_project()
-                            .map(|p| {
-                                vec![MenuItem {
-                                    label: "New orchestrator".into(),
-                                    action: MenuAction::NewOrchestrator(p.id.clone()),
-                                    destructive: false,
-                                }]
-                            })
-                            .unwrap_or_default(),
                         Focus::Worktrees => app
                             .selected_project()
                             .map(|p| {
@@ -8586,7 +8058,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             status,
             changed_at,
         } => {
-            // A status flip can reorder worktrees, orchestrators, and
+            // A status flip can reorder worktrees and
             // sessions; keep every cursor on the entity it already held.
             let before = selection_snapshot(app);
             let mut notify = None;
@@ -8626,36 +8098,6 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                 }
                 (Some(PendingIntent::AttachCreatedSplit), Some(EntityId::Terminal(id))) => {
                     attach_split(app, SessionRef::Terminal(id), out);
-                }
-                (Some(PendingIntent::AttachCreatedOrchestrator), Some(EntityId::Agent(id))) => {
-                    // Its upsert usually precedes the Ack, so the section
-                    // cursor can land on the new ORCHESTRATORS row now.
-                    if let Some(i) = app.project_orchestrators().iter().position(|a| a.id == id) {
-                        app.sel_orchestrator = Some(i);
-                    }
-                    attach(app, SessionRef::Agent(id), out);
-                    app.focus = Focus::Terminal;
-                    app.term_locked = true;
-                }
-                (
-                    Some(PendingIntent::SpawnOnCreatedWorktree(spec)),
-                    Some(EntityId::Worktree(id)),
-                ) => {
-                    // The branch-picked checkout exists now: land the panel
-                    // cursor on it (when-seen idiom) and fire the session
-                    // create it was made for — a second Ack cycle whose
-                    // intent attaches as usual.
-                    if !select_worktree_by_id(app, &id, out) {
-                        app.select_worktree_when_seen = Some(id.clone());
-                    }
-                    let crate::app::DeferredSpawn {
-                        kind,
-                        model,
-                        effort,
-                        name,
-                        orchestrator,
-                    } = spec;
-                    create_agent(app, id, kind, model, effort, name, orchestrator, out);
                 }
                 (Some(PendingIntent::PickAgentOnCreatedWorktree), Some(EntityId::Worktree(id))) => {
                     // The `a` flow's branch had no checkout: it exists now —
@@ -9159,7 +8601,6 @@ struct SelectionSnapshot {
     /// A divider move was in flight — its landing is apply_upsert's to
     /// chase, so the project cursor is left alone.
     divider_chase: bool,
-    orchestrator: Option<AgentId>,
     worktree: Option<WorktreeId>,
     session: Option<SessionRef>,
     /// Whether the selected session row was already in the archived group —
@@ -9183,7 +8624,6 @@ fn selection_snapshot(app: &App) -> SelectionSnapshot {
             .as_ref()
             .and_then(project_row_kind),
         divider_chase: app.select_divider_when_seen.is_some(),
-        orchestrator: app.selected_orchestrator().map(|agent| agent.id.clone()),
         worktree: app.selected_worktree().map(|w| w.id.clone()),
         session_archived: row.as_ref().is_some_and(|r| r.is_archived_agent()),
         session: row.and_then(|r| r.sref()),
@@ -9225,22 +8665,10 @@ fn reconcile_selection(app: &mut App, before: SelectionSnapshot, out: &mut Vec<C
             }
         }
     }
-    if let Some(oid) = &before.orchestrator {
-        if app.selected_orchestrator().map(|agent| &agent.id) != Some(oid) {
-            if let Some(index) = app
-                .project_orchestrators()
-                .iter()
-                .position(|agent| &agent.id == oid)
-            {
-                app.sel_orchestrator = Some(index);
-            }
-        }
-    }
     if let Some(wid) = &before.worktree {
         if app.selected_worktree().map(|w| w.id.clone()).as_ref() != Some(wid) {
             match app.worktree_row_index(wid) {
                 Some(i) => {
-                    app.sel_orchestrator = None;
                     app.sel_worktree = i;
                 }
                 None => {
@@ -9289,16 +8717,6 @@ fn clamp_selections(app: &mut App) {
     let wt_len = app.visible_worktrees().len();
     if app.sel_worktree >= wt_len {
         app.sel_worktree = wt_len.saturating_sub(1);
-    }
-    // The section cursor survives shrinks too — and empties out entirely
-    // when no project is selected (no placeholder to sit on).
-    if let Some(i) = app.sel_orchestrator {
-        let section = app.orchestrator_section_len();
-        if section == 0 {
-            app.sel_orchestrator = None;
-        } else if i >= section {
-            app.sel_orchestrator = Some(section - 1);
-        }
     }
     let sess_len = app.visible_session_rows().len();
     if app.sel_session >= sess_len {
@@ -9396,8 +8814,7 @@ mod tests {
                     session_id: None,
                     sort_order: 0,
                     status_changed_at: 0,
-                    orchestrator: false,
-                    alive: true,
+                                        alive: true,
                 }),
             },
         );
@@ -9423,281 +8840,6 @@ mod tests {
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
         assert!(text.contains("PROJECTS"), "columns stay: {text}");
-    }
-
-    /// The Worktrees panel's two stacked cursors: the ORCHESTRATORS
-    /// section (`sel_orchestrator`) above, worktree rows (`sel_worktree`,
-    /// unchanged meaning) below. Enter on an orchestrator attaches; `n`
-    /// creates whatever the cursor's section holds.
-    #[test]
-    fn orchestrators_group_tops_the_worktrees_panel_and_enter_attaches() {
-        use nebula_core::{Agent, AgentStatus, Entity};
-        let mut app = App::new();
-        seed_tree(&mut app);
-        hse(
-            &mut app,
-            ServerEvent::EntityUpserted {
-                entity: Entity::Agent(Agent {
-                    id: AgentId("orch".into()),
-                    worktree_id: nebula_core::WorktreeId("w1".into()),
-                    name: "orchestrator-1".into(),
-                    status: AgentStatus::Fresh,
-                    archived: false,
-                    archived_at: 0,
-                    pinned: true,
-                    kind: Default::default(),
-                    model: None,
-                    effort: None,
-                    session_id: None,
-                    sort_order: 0,
-                    status_changed_at: 0,
-                    orchestrator: true,
-                    alive: false,
-                }),
-            },
-        );
-        assert_eq!(app.orchestrator_row_count(), 1);
-        // …and it also gets a tab under the worktree it runs on (w1), so
-        // the tab bar and ⌘digits reach it like any other session.
-        assert!(
-            app.visible_session_rows()
-                .iter()
-                .any(|r| matches!(r, SessionRow::Agent(a) if a.orchestrator)),
-            "an orchestrator shows as a tab under its worktree"
-        );
-        // Walking up from the first worktree row crosses into the section;
-        // `sel_worktree` keeps meaning "worktree row" untouched.
-        app.focus = Focus::Worktrees;
-        app.sel_worktree = 0;
-        let mut out = Vec::new();
-        press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE, &mut out);
-        assert_eq!(app.focus, Focus::Orchestrators);
-        assert_eq!(app.sel_orchestrator, Some(0));
-        assert!(app.selected_orchestrator().is_some());
-        assert!(
-            app.selected_worktree().is_some(),
-            "the inactive half keeps its own selection"
-        );
-        assert_eq!(app.sel_worktree, 0, "worktree cursor unchanged");
-        // Enter walks straight into the orchestrator's terminal.
-        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-        assert_eq!(app.focus, Focus::Terminal);
-        assert!(app.term_locked);
-        assert!(
-            app.term
-                .as_ref()
-                .is_some_and(|t| t.sref == SessionRef::Agent(AgentId("orch".into()))),
-            "enter attached the orchestrator"
-        );
-        // Walking back down returns to the worktree rows.
-        app.focus = Focus::Orchestrators;
-        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
-        assert_eq!(app.focus, Focus::Worktrees);
-        assert_eq!(
-            app.sel_orchestrator,
-            Some(0),
-            "orchestrator cursor is retained"
-        );
-        assert_eq!(
-            app.selected_worktree().map(|w| w.id.clone()),
-            Some(nebula_core::WorktreeId("w1".into()))
-        );
-
-        // `n` follows the section: the worktree/branch picker below, a
-        // new orchestrator above. Enter on the picker's hovered default
-        // (worktree) chains into the name prompt.
-        let mut out = Vec::new();
-        press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
-        assert!(
-            matches!(&app.overlay, Some(Overlay::Menu(m)) if m.title.as_deref() == Some("New worktree or branch")),
-            "n on a worktree row opens the worktree/branch picker: {:?}",
-            app.overlay
-        );
-        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-        assert!(
-            matches!(&app.overlay, Some(Overlay::Prompt(p)) if matches!(p.kind, crate::app::PromptKind::NewWorktree { .. })),
-            "Enter on the default row prompts for a worktree: {:?}",
-            app.overlay
-        );
-        app.overlay = None;
-        press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE, &mut out);
-        let mut out = Vec::new();
-        press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
-        assert!(
-            matches!(&app.overlay, Some(Overlay::Menu(m)) if m.title.as_deref() == Some("New orchestrator")),
-            "n in the section opens the orchestrator picker: {:?}",
-            app.overlay
-        );
-        app.overlay = None;
-
-        // The panel draws both section headers, the ◆ badge, and the
-        // branch of the worktree the orchestrator sits on.
-        let mut terminal = Terminal::new(TestBackend::new(160, 30)).unwrap();
-        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
-        let text = buffer_text(&terminal);
-        assert!(text.contains("ORCHESTRATORS"), "{text}");
-        assert!(text.contains("WORKTREES"), "{text}");
-        // The name may truncate at the panel's default width; the ◆ and
-        // harness badges always survive, and the branch label drops whole
-        // when the panel is too narrow to hold all three.
-        assert!(text.contains("orchest"), "{text}");
-        assert!(text.contains("◆ claude"), "{text}");
-    }
-
-    #[test]
-    fn clicking_each_middle_half_activates_only_that_section() {
-        use nebula_core::{Agent, AgentStatus, Entity};
-        let mut app = App::new();
-        seed_tree(&mut app);
-        hse(
-            &mut app,
-            ServerEvent::EntityUpserted {
-                entity: Entity::Agent(Agent {
-                    id: AgentId("orch".into()),
-                    worktree_id: nebula_core::WorktreeId("w1".into()),
-                    name: "orchestrator-1".into(),
-                    status: AgentStatus::Fresh,
-                    archived: false,
-                    archived_at: 0,
-                    pinned: true,
-                    kind: Default::default(),
-                    model: None,
-                    effort: None,
-                    session_id: None,
-                    sort_order: 0,
-                    status_changed_at: 0,
-                    orchestrator: true,
-                    alive: false,
-                }),
-            },
-        );
-        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
-        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
-        let orch = app
-            .hits
-            .iter()
-            .find_map(|(r, t)| matches!(t, HitTarget::Orchestrator(0)).then_some(*r))
-            .unwrap();
-        let worktree = app
-            .hits
-            .iter()
-            .find_map(|(r, t)| matches!(t, HitTarget::Worktree(0)).then_some(*r))
-            .unwrap();
-        let mut out = Vec::new();
-
-        handle_mouse(
-            &mut app,
-            mev(
-                MouseEventKind::Down(MouseButton::Left),
-                orch.x + orch.width / 2,
-                orch.y + 1,
-            ),
-            &mut out,
-        );
-        assert_eq!(app.focus, Focus::Orchestrators);
-
-        handle_mouse(
-            &mut app,
-            mev(
-                MouseEventKind::Down(MouseButton::Left),
-                worktree.x + worktree.width / 2,
-                worktree.y + 1,
-            ),
-            &mut out,
-        );
-        assert_eq!(app.focus, Focus::Worktrees);
-    }
-
-    #[test]
-    fn plain_and_modified_n_follow_the_active_middle_section() {
-        let mut app = App::new();
-        seed_tree(&mut app);
-        let mut out = Vec::new();
-        for modifiers in [
-            KeyModifiers::NONE,
-            KeyModifiers::CONTROL,
-            KeyModifiers::SUPER,
-        ] {
-            app.focus = Focus::Orchestrators;
-            press(&mut app, KeyCode::Char('n'), modifiers, &mut out);
-            assert!(
-                matches!(&app.overlay, Some(Overlay::Menu(m)) if m.title.as_deref() == Some("New orchestrator")),
-                "{modifiers:?}+n follows the orchestrator half: {:?}",
-                app.overlay
-            );
-            app.overlay = None;
-
-            app.focus = Focus::Worktrees;
-            press(&mut app, KeyCode::Char('n'), modifiers, &mut out);
-            assert!(
-                matches!(&app.overlay, Some(Overlay::Menu(m)) if m.title.as_deref() == Some("New worktree or branch")),
-                "{modifiers:?}+n follows the worktree half: {:?}",
-                app.overlay
-            );
-            app.overlay = None;
-        }
-    }
-
-    #[test]
-    fn only_the_active_middle_header_uses_focused_styling() {
-        let mut app = App::new();
-        seed_tree(&mut app);
-        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
-
-        app.focus = Focus::Orchestrators;
-        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
-        let (orch_x, orch_y) = find_cell(&terminal, "ORCHESTRATORS");
-        let (wt_x, wt_y) = find_cell(&terminal, "WORKTREES");
-        assert_eq!(
-            terminal.backend().buffer()[(orch_x, orch_y)].fg,
-            app.theme.accent
-        );
-        assert_eq!(
-            terminal.backend().buffer()[(wt_x, wt_y)].fg,
-            app.theme.muted
-        );
-
-        app.focus = Focus::Worktrees;
-        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
-        let (orch_x, orch_y) = find_cell(&terminal, "ORCHESTRATORS");
-        let (wt_x, wt_y) = find_cell(&terminal, "WORKTREES");
-        assert_eq!(
-            terminal.backend().buffer()[(orch_x, orch_y)].fg,
-            app.theme.muted
-        );
-        assert_eq!(
-            terminal.backend().buffer()[(wt_x, wt_y)].fg,
-            app.theme.accent
-        );
-    }
-
-    /// Both palettes label orchestrator rows in their searchable text, so
-    /// "orch" in ⌘K narrows straight to the project managers.
-    #[test]
-    fn palettes_label_orchestrators_in_the_search_text() {
-        use nebula_core::Entity;
-        let mut app = App::new();
-        seed_tree(&mut app);
-        let mut orch = app.tree.agents[0].clone();
-        orch.id = AgentId("orch".into());
-        orch.name = "boss".into();
-        orch.orchestrator = true;
-        hse(
-            &mut app,
-            ServerEvent::EntityUpserted {
-                entity: Entity::Agent(orch),
-            },
-        );
-        let palette = crate::app::Palette::sessions(&app.tree, false);
-        let texts: Vec<&str> = palette.items.iter().map(|i| i.text.as_str()).collect();
-        assert!(
-            texts.iter().any(|t| t.contains("boss ◆ orchestrator")),
-            "{texts:?}"
-        );
-        assert!(
-            texts.iter().any(|t| t.contains("demo/main/agent-1")),
-            "plain sessions keep the branch path: {texts:?}"
-        );
     }
 
     /// Space answers the queue oldest-first: with two needs-feedback
@@ -9783,389 +8925,76 @@ mod tests {
         assert!(out.is_empty(), "no requests sent");
     }
 
-    /// Orchestrators are sessions too: when the longest-waiting agent is
-    /// an orchestrator, space lands the Worktrees-panel section cursor on
-    /// its row and attaches it.
+    /// With the window unfocused, a needs-feedback flip records its
+    /// notification (the rate-limit map is the observable seam), a repeat
+    /// within the cooldown doesn't, and a focused window never records.
     #[test]
-    fn space_reaches_a_blocked_orchestrator() {
-        use nebula_core::{AgentStatus, Entity};
-        let mut app = App::new();
-        seed_tree(&mut app);
-        let mut orch = app.tree.agents[0].clone();
-        orch.id = AgentId("orch".into());
-        orch.name = "boss".into();
-        orch.orchestrator = true;
-        orch.status = AgentStatus::NeedsFeedback;
-        orch.status_changed_at = 1;
-        hse(
-            &mut app,
-            ServerEvent::EntityUpserted {
-                entity: Entity::Agent(orch),
-            },
-        );
-
-        let mut out = Vec::new();
-        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE, &mut out);
-        assert_eq!(app.sel_orchestrator, Some(0), "cursor on the section row");
-        assert_eq!(app.focus, Focus::Terminal);
-        assert!(app.term_locked);
-        assert!(
-            app.term
-                .as_ref()
-                .is_some_and(|t| t.sref == SessionRef::Agent(AgentId("orch".into()))),
-            "space attached the orchestrator: {:?}",
-            app.term.as_ref().map(|t| &t.sref)
-        );
-    }
-
-    /// Promoting a session flips it into the ORCHESTRATORS section as
-    /// soon as its upsert lands — while its tab stays under the worktree
-    /// it runs on; demoting flips it back out of the section.
-    #[test]
-    fn promoting_a_session_moves_it_between_panels() {
-        use nebula_core::Entity;
-        let mut app = App::new();
-        seed_tree(&mut app);
-        let in_sessions = |app: &App| {
-            app.visible_session_rows()
-                .iter()
-                .any(|r| matches!(r, SessionRow::Agent(a) if a.id == AgentId("a1".into())))
+    fn status_flip_notifies_only_while_unfocused() {
+        use nebula_core::AgentStatus;
+        let flip = |to: AgentStatus| ServerEvent::StatusChanged {
+            agent: AgentId("a1".into()),
+            status: to,
+            changed_at: crate::app::now_ms(),
         };
-        assert!(in_sessions(&app) && app.project_orchestrators().is_empty());
 
-        // The context-menu action asks the daemon…
-        let mut out = Vec::new();
-        run_menu_action(
-            &mut app,
-            crate::app::MenuAction::SetAgentOrchestrator(AgentId("a1".into()), true),
-            &mut out,
-        );
-        assert!(
-            matches!(
-                out.as_slice(),
-                [ClientRequest::SetAgentOrchestrator {
-                    orchestrator: true,
-                    ..
-                }]
-            ),
-            "{out:?}"
-        );
-        // …and the answering upsert moves the row.
-        let mut promoted = app
-            .tree
-            .agents
-            .iter()
-            .find(|a| a.id == AgentId("a1".into()))
-            .cloned()
-            .unwrap();
-        promoted.orchestrator = true;
-        promoted.pinned = true;
-        hse(
-            &mut app,
-            ServerEvent::EntityUpserted {
-                entity: Entity::Agent(promoted.clone()),
-            },
-        );
-        assert_eq!(app.orchestrator_row_count(), 1, "entered the section");
-        assert!(
-            in_sessions(&app),
-            "promotion keeps its tab under the worktree"
+        let mut app = App::new();
+        seed_tree(&mut app); // agent-1: Fresh
+        app.window_focused = false;
+        hse(&mut app, flip(AgentStatus::NeedsFeedback));
+        let first = *app
+            .notified_at
+            .get(&AgentId("a1".into()))
+            .expect("the unfocused needs-feedback flip records a notification");
+        // …and queues the OSC 777 the event loop will write out (under
+        // test, post_notification always takes the queue path).
+        assert_eq!(
+            app.notify_queue.as_slice(),
+            &[(
+                "nebula — needs feedback".to_string(),
+                "demo/agent-1".to_string()
+            )],
+            "the flip queues a host-terminal notification"
         );
 
-        promoted.orchestrator = false;
-        hse(
-            &mut app,
-            ServerEvent::EntityUpserted {
-                entity: Entity::Agent(promoted),
-            },
+        // Flapping back within the 30s cooldown stays silent: the recorded
+        // instant doesn't move.
+        hse(&mut app, flip(AgentStatus::Running));
+        hse(&mut app, flip(AgentStatus::NeedsFeedback));
+        assert_eq!(
+            app.notified_at[&AgentId("a1".into())],
+            first,
+            "a repeat inside the cooldown is rate-limited"
         );
-        assert!(in_sessions(&app), "demoted back to the sessions list");
-        assert!(app.project_orchestrators().is_empty());
-    }
 
-    /// The whole mouse path of the "+ new orchestrator" button: a draw
-    /// registers its hit rect, and a left click on it creates right away
-    /// (it reads as a button, so click must act — no Enter needed).
-    #[test]
-    fn clicking_the_orchestrator_placeholder_creates_one() {
+        // Focused, the same flip records nothing.
         let mut app = App::new();
         seed_tree(&mut app);
-        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
-        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
-        let rect = app
-            .hits
-            .iter()
-            .find_map(|(r, t)| matches!(t, HitTarget::Orchestrator(0)).then_some(*r))
-            .expect("placeholder registered a click target");
-        let mut out = Vec::new();
-        handle_mouse(
-            &mut app,
-            mev(
-                MouseEventKind::Down(MouseButton::Left),
-                rect.x + rect.width / 2,
-                rect.y,
-            ),
-            &mut out,
-        );
-        assert!(
-            matches!(&app.overlay, Some(Overlay::Menu(m)) if m.title.as_deref() == Some("New orchestrator")),
-            "click on the + row opens the orchestrator picker: {:?}",
-            app.overlay
-        );
-        // An orchestrator is an agent role — the picker offers no shell
-        // terminal row (shells stay in the session picker and on t/⇧T/⌘T).
-        if let Some(Overlay::Menu(m)) = &app.overlay {
-            assert!(
-                !m.items.iter().any(|i| i.label.contains("Terminal")),
-                "no terminal row in the orchestrator picker: {:?}",
-                m.items
-            );
-        }
-    }
+        app.window_focused = true;
+        hse(&mut app, flip(AgentStatus::NeedsFeedback));
+        assert!(app.notified_at.is_empty(), "focused windows never notify");
 
-    /// The new-agent chord (⌘N/^N) follows the Worktrees-panel split the
-    /// way `n` does: in the ORCHESTRATORS section it opens the
-    /// orchestrator picker instead of flashing "select a worktree first".
-    #[test]
-    fn cmd_n_in_the_orchestrator_section_opens_the_orchestrator_picker() {
+        // The setting turned off wins over an unfocused window.
         let mut app = App::new();
         seed_tree(&mut app);
-        app.focus = Focus::Worktrees;
-        app.sel_worktree = 0;
-        let mut out = Vec::new();
-        press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE, &mut out);
-        assert!(app.in_orchestrator_section());
-        press(
-            &mut app,
-            KeyCode::Char('n'),
-            KeyModifiers::CONTROL,
-            &mut out,
-        );
-        assert!(
-            matches!(&app.overlay, Some(Overlay::Menu(m)) if m.title.as_deref() == Some("New orchestrator")),
-            "^n in the section opens the orchestrator picker: {:?}",
-            app.overlay
-        );
-    }
+        app.window_focused = false;
+        app.notifications = false;
+        hse(&mut app, flip(AgentStatus::NeedsFeedback));
+        assert!(app.notified_at.is_empty(), "the toggle disables notifying");
 
-    /// The orchestrator flow's branch picker leads with the primary
-    /// checkout's branch (hovered, Enter takes the default) and lists the
-    /// repo's remaining LOCAL branches newest-committed first below it.
-    #[test]
-    fn orchestrator_branch_picker_leads_with_primary_then_newest_first() {
-        with_default_config(|| {
-            let dir = tempfile::tempdir().unwrap();
-            let repo = test_repo(&dir);
-            // `feature` gets a commit far in the future, so it outranks
-            // `main` under --sort=-committerdate no matter how fast the
-            // fixture ran.
-            run_git(&repo, &["checkout", "-b", "feature"]);
-            let out = std::process::Command::new("git")
-                .arg("-C")
-                .arg(&repo)
-                .env("GIT_COMMITTER_DATE", "2030-01-01T00:00:00")
-                .args(["commit", "--allow-empty", "-m", "newest"])
-                .output()
-                .unwrap();
-            assert!(out.status.success());
-            run_git(&repo, &["checkout", "main"]);
-            run_git(&repo, &["branch", "develop"]);
-
-            let mut app = App::new();
-            seed_repo_tree(&mut app, &repo);
-            let mut out = Vec::new();
-            run_menu_action(
-                &mut app,
-                MenuAction::NewAgentOfKind {
-                    worktree: nebula_core::WorktreeId("w1".into()),
-                    kind: AgentKind::Claude,
-                    model: None,
-                    effort: None,
-                    orchestrator: true,
-                },
-                &mut out,
-            );
-            let Some(Overlay::Menu(menu)) = &app.overlay else {
-                panic!("expected the branch picker, got {:?}", app.overlay);
-            };
-            assert_eq!(menu.title.as_deref(), Some("Orchestrator branch"));
-            assert_eq!(menu.hover, 0, "focus starts on the primary branch");
-            assert_eq!(menu.items[0].label, "main ⌂ primary");
-            assert_eq!(menu.items[1].label, "feature", "the rest stay newest-first");
-            let labels: Vec<&str> = menu.items.iter().map(|i| i.label.as_str()).collect();
-            assert!(
-                labels.contains(&"develop"),
-                "every local branch is offered, develop included: {labels:?}"
-            );
-            assert!(
-                out.is_empty(),
-                "nothing fires until a branch is picked: {out:?}"
-            );
-        })
-    }
-
-    /// Picking a branch some worktree (here the root) already has checked
-    /// out reuses that worktree: prewarm + name prompt aim at it, and the
-    /// create lands there — no CreateWorktree involved.
-    #[test]
-    fn picking_a_branch_with_a_checkout_reuses_that_worktree() {
-        with_default_config(|| {
-            let mut app = App::new();
-            seed_tree(&mut app);
-            let mut out = Vec::new();
-            run_menu_action(
-                &mut app,
-                MenuAction::SpawnOnBranch {
-                    project: nebula_core::ProjectId("p1".into()),
-                    branch: "main".into(),
-                    spawn: crate::app::BranchSpawn {
-                        kind: AgentKind::Claude,
-                        model: None,
-                        effort: None,
-                        orchestrator: true,
-                    },
-                },
-                &mut out,
-            );
-            assert!(matches!(
-                out.as_slice(),
-                [ClientRequest::PrewarmAgent { worktree, .. }]
-                    if worktree == &nebula_core::WorktreeId("w1".into())
-            ));
-            assert!(
-                matches!(
-                    &app.overlay,
-                    Some(Overlay::Prompt(p)) if matches!(
-                        &p.kind,
-                        PromptKind::NewAgent {
-                            target: crate::app::SpawnTarget::Worktree(worktree),
-                            orchestrator: true,
-                            ..
-                        } if worktree == &nebula_core::WorktreeId("w1".into())
-                    )
-                ),
-                "{:?}",
-                app.overlay
-            );
-            let mut out = Vec::new();
-            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-            assert!(
-                matches!(
-                    out.first(),
-                    Some(ClientRequest::CreateAgent { worktree, orchestrator: true, .. })
-                        if worktree == &nebula_core::WorktreeId("w1".into())
-                ),
-                "{out:?}"
-            );
-            assert!(
-                !out.iter()
-                    .any(|r| matches!(r, ClientRequest::CreateWorktree { .. })),
-                "no worktree creation for an existing checkout: {out:?}"
-            );
-        })
-    }
-
-    /// Picking a branch with no checkout creates a worktree that checks
-    /// out the EXISTING branch (no base — git.rs falls back past `-b`),
-    /// then the worktree's Ack fires the deferred agent create on it.
-    #[test]
-    fn picking_a_branch_without_a_checkout_creates_the_worktree_then_spawns() {
-        with_default_config(|| {
-            let mut app = App::new();
-            seed_tree(&mut app);
-            let mut out = Vec::new();
-            run_menu_action(
-                &mut app,
-                MenuAction::SpawnOnBranch {
-                    project: nebula_core::ProjectId("p1".into()),
-                    branch: "feature".into(),
-                    spawn: crate::app::BranchSpawn {
-                        kind: AgentKind::Claude,
-                        model: None,
-                        effort: None,
-                        orchestrator: true,
-                    },
-                },
-                &mut out,
-            );
-            assert!(out.is_empty(), "the name comes first: {out:?}");
-            assert!(
-                matches!(
-                    &app.overlay,
-                    Some(Overlay::Prompt(p)) if matches!(
-                        &p.kind,
-                        PromptKind::NewAgent {
-                            target: crate::app::SpawnTarget::Branch { branch, .. },
-                            orchestrator: true,
-                            ..
-                        } if branch == "feature"
-                    )
-                ),
-                "{:?}",
-                app.overlay
-            );
-            for c in "boss".chars() {
-                press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
-            }
-            let mut out = Vec::new();
-            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-            let Some(ClientRequest::CreateWorktree {
-                req_id,
-                branch,
-                base,
-                ..
-            }) = out.first()
-            else {
-                panic!("expected CreateWorktree, got {out:?}");
-            };
-            assert_eq!(branch, "feature");
-            assert_eq!(
-                base, &None,
-                "an existing branch is checked out, not re-based"
-            );
-            // The daemon answers with the created worktree; the deferred
-            // create fires on it, still carrying the typed name and flag.
-            let req_id = *req_id;
-            let mut out = Vec::new();
-            handle_server_event(
-                &mut app,
-                ServerEvent::Ack {
-                    req_id,
-                    created: Some(nebula_core::EntityId::Worktree(nebula_core::WorktreeId(
-                        "w-feature".into(),
-                    ))),
-                },
-                &mut out,
-            );
-            assert!(
-                matches!(
-                    out.first(),
-                    Some(ClientRequest::CreateAgent { worktree, name, orchestrator: true, .. })
-                        if worktree == &nebula_core::WorktreeId("w-feature".into()) && name == "boss"
-                ),
-                "{out:?}"
-            );
-        })
-    }
-
-    /// The orchestrator picker offers exactly the agent kinds — a shell
-    /// terminal is not an orchestrator, so the "Terminal (shell)" row the
-    /// session picker carries is absent here.
-    #[test]
-    fn orchestrator_picker_offers_only_agent_kinds() {
+        // Running → Finished is the other notifying flip.
         let mut app = App::new();
         seed_tree(&mut app);
-        open_new_orchestrator_picker(&mut app, nebula_core::ProjectId("p1".into()));
-        let Some(Overlay::Menu(menu)) = &app.overlay else {
-            panic!("expected the orchestrator picker, got {:?}", app.overlay);
-        };
-        assert_eq!(menu.title.as_deref(), Some("New orchestrator"));
-        let labels: Vec<&str> = menu.items.iter().map(|i| i.label.as_str()).collect();
-        assert_eq!(labels, ["Claude", "Codex", "Cursor", "Pi"], "{labels:?}");
+        app.window_focused = false;
+        hse(&mut app, flip(AgentStatus::Running));
+        assert!(app.notified_at.is_empty(), "starting a run is not news");
+        hse(&mut app, flip(AgentStatus::Finished));
+        assert!(
+            app.notified_at.contains_key(&AgentId("a1".into())),
+            "an unfocused finished run notifies"
+        );
     }
 
-    /// The normal session picker keeps its shell row — removing it from
-    /// the orchestrator flow must not touch session creation.
+    /// The session picker offers a shell row alongside the agent kinds.
     #[test]
     fn session_picker_still_offers_the_terminal_row() {
         let mut app = App::new();
@@ -10187,206 +9016,6 @@ mod tests {
         );
     }
 
-    /// The orchestrator name prompt is visibly the orchestrator flow —
-    /// role title, orchestrator-name label — and its default numbers
-    /// across the WHOLE project: with orchestrator-1 on the primary
-    /// checkout and orchestrator-3 on a branch worktree, the first free
-    /// project-wide slot is orchestrator-2.
-    #[test]
-    fn orchestrator_prompt_is_role_correct_with_a_project_wide_default() {
-        with_default_config(|| {
-            use nebula_core::{Entity, Worktree, WorktreeId};
-            let mut app = App::new();
-            seed_tree(&mut app);
-            hse(
-                &mut app,
-                ServerEvent::EntityUpserted {
-                    entity: Entity::Worktree(Worktree {
-                        id: WorktreeId("w2".into()),
-                        project_id: nebula_core::ProjectId("p1".into()),
-                        path: "/tmp/demo-worktrees/feature".into(),
-                        branch: "feature".into(),
-                        is_main: false,
-                        created_from: None,
-                        pinned: false,
-                        sort_order: 1,
-                    }),
-                },
-            );
-            for (id, name, wt) in [
-                ("o1", "orchestrator-1", "w1"),
-                ("o3", "orchestrator-3", "w2"),
-            ] {
-                let mut orch = app.tree.agents[0].clone();
-                orch.id = AgentId(id.into());
-                orch.name = name.into();
-                orch.worktree_id = WorktreeId(wt.into());
-                orch.orchestrator = true;
-                hse(
-                    &mut app,
-                    ServerEvent::EntityUpserted {
-                        entity: Entity::Agent(orch),
-                    },
-                );
-            }
-            open_prompt(
-                &mut app,
-                PromptKind::NewAgent {
-                    target: crate::app::SpawnTarget::Worktree(WorktreeId("w1".into())),
-                    kind: AgentKind::Claude,
-                    model: None,
-                    effort: None,
-                    orchestrator: true,
-                },
-            );
-            let Some(Overlay::Prompt(p)) = &app.overlay else {
-                panic!("expected the name prompt, got {:?}", app.overlay);
-            };
-            assert_eq!(p.title, "New orchestrator");
-            assert_eq!(p.label, "orchestrator name (empty = orchestrator-2)");
-            // Accepting the empty prompt takes exactly the advertised name.
-            let mut out = Vec::new();
-            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-            assert!(
-                matches!(
-                    out.first(),
-                    Some(ClientRequest::CreateAgent { name, orchestrator: true, .. })
-                        if name == "orchestrator-2"
-                ),
-                "{out:?}"
-            );
-        })
-    }
-
-    /// A picked branch with no checkout names the prompt after the branch
-    /// — "New orchestrator on develop", not the session flow's wording —
-    /// and submit creates the worktree, then the flagged agent on its Ack.
-    /// Any local branch works; develop is not special.
-    #[test]
-    fn orchestrator_branch_prompt_names_the_branch_and_spawns_on_develop() {
-        with_default_config(|| {
-            use nebula_core::{Entity, Worktree, WorktreeId};
-            let mut app = App::new();
-            seed_tree(&mut app);
-            open_prompt(
-                &mut app,
-                PromptKind::NewAgent {
-                    target: crate::app::SpawnTarget::Branch {
-                        project: nebula_core::ProjectId("p1".into()),
-                        branch: "develop".into(),
-                    },
-                    kind: AgentKind::Claude,
-                    model: None,
-                    effort: None,
-                    orchestrator: true,
-                },
-            );
-            let Some(Overlay::Prompt(p)) = &app.overlay else {
-                panic!("expected the name prompt, got {:?}", app.overlay);
-            };
-            assert_eq!(p.title, "New orchestrator on develop");
-            assert_eq!(p.label, "orchestrator name (empty = orchestrator-1)");
-            let mut out = Vec::new();
-            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-            let Some(ClientRequest::CreateWorktree {
-                req_id,
-                branch,
-                base,
-                ..
-            }) = out.first()
-            else {
-                panic!("expected CreateWorktree, got {out:?}");
-            };
-            assert_eq!(branch, "develop");
-            assert_eq!(
-                base, &None,
-                "the existing branch is checked out, not re-based"
-            );
-            let req_id = *req_id;
-            hse(
-                &mut app,
-                ServerEvent::EntityUpserted {
-                    entity: Entity::Worktree(Worktree {
-                        id: WorktreeId("w-dev".into()),
-                        project_id: nebula_core::ProjectId("p1".into()),
-                        path: "/tmp/demo-worktrees/develop".into(),
-                        branch: "develop".into(),
-                        is_main: false,
-                        created_from: None,
-                        pinned: false,
-                        sort_order: 1,
-                    }),
-                },
-            );
-            let mut out = Vec::new();
-            handle_server_event(
-                &mut app,
-                ServerEvent::Ack {
-                    req_id,
-                    created: Some(nebula_core::EntityId::Worktree(WorktreeId("w-dev".into()))),
-                },
-                &mut out,
-            );
-            assert!(
-                matches!(
-                    out.iter().find(|r| matches!(r, ClientRequest::CreateAgent { .. })),
-                    Some(ClientRequest::CreateAgent { worktree, name, orchestrator: true, .. })
-                        if worktree == &WorktreeId("w-dev".into()) && name == "orchestrator-1"
-                ),
-                "{out:?}"
-            );
-        })
-    }
-
-    /// An orchestrator on a non-root worktree still shows in the section
-    /// (the daemon no longer refuses off-root), with its branch on the row.
-    #[test]
-    fn orchestrators_on_branch_worktrees_list_with_their_branch() {
-        use nebula_core::{Entity, Worktree, WorktreeId};
-        let mut app = App::new();
-        seed_tree(&mut app);
-        hse(
-            &mut app,
-            ServerEvent::EntityUpserted {
-                entity: Entity::Worktree(Worktree {
-                    id: WorktreeId("w2".into()),
-                    project_id: nebula_core::ProjectId("p1".into()),
-                    path: "/tmp/demo-worktrees/feature".into(),
-                    branch: "feature".into(),
-                    is_main: false,
-                    created_from: None,
-                    pinned: false,
-                    sort_order: 1,
-                }),
-            },
-        );
-        let mut orch = app.tree.agents[0].clone();
-        orch.id = AgentId("orch".into());
-        orch.name = "boss".into();
-        orch.worktree_id = WorktreeId("w2".into());
-        orch.orchestrator = true;
-        hse(
-            &mut app,
-            ServerEvent::EntityUpserted {
-                entity: Entity::Agent(orch),
-            },
-        );
-        assert_eq!(app.orchestrator_row_count(), 1, "off-root still listed");
-        // At the default (narrow) width the branch label drops whole so
-        // the name and the harness badge keep their columns.
-        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
-        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
-        let text = buffer_text(&terminal);
-        assert!(text.contains("boss ◆ claude"), "{text}");
-        // Wide enough, the row reads "name ◆ branch kind" — where it
-        // lives AND what CLI drives it.
-        app.panel_widths[1] = 40;
-        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
-        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
-        let text = buffer_text(&terminal);
-        assert!(text.contains("boss ◆ feature claude"), "{text}");
-    }
-
     /// A menu taller than the frame slides its window to keep the hovered
     /// row visible (the branch picker in a branch-heavy repo).
     #[test]
@@ -10405,7 +9034,7 @@ mod tests {
             })
             .collect();
         app.overlay = Some(Overlay::Menu(crate::app::ContextMenu {
-            title: Some("Orchestrator branch".into()),
+            title: Some("Branch".into()),
             items,
             at: None,
             hover: 59,
@@ -10464,16 +9093,7 @@ mod tests {
                 },
             );
             let mut out = Vec::new();
-            open_branch_picker(
-                &mut app,
-                nebula_core::ProjectId("p1".into()),
-                crate::app::BranchSpawn {
-                    kind: AgentKind::Claude,
-                    model: None,
-                    effort: None,
-                    orchestrator: true,
-                },
-            );
+            open_agent_branch_picker(&mut app, nebula_core::ProjectId("p1".into()));
             for c in "fea".chars() {
                 press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
             }
@@ -10498,25 +9118,10 @@ mod tests {
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
             assert!(
                 matches!(
-                    out.first(),
-                    Some(ClientRequest::PrewarmAgent { worktree, .. })
-                        if worktree == &WorktreeId("w2".into())
-                ),
-                "enter picks the filtered branch's checkout: {out:?}"
-            );
-            assert!(
-                matches!(
                     &app.overlay,
-                    Some(Overlay::Prompt(p)) if matches!(
-                        &p.kind,
-                        PromptKind::NewAgent {
-                            target: crate::app::SpawnTarget::Worktree(w),
-                            orchestrator: true,
-                            ..
-                        } if w == &WorktreeId("w2".into())
-                    )
+                    Some(Overlay::Menu(m)) if m.title.as_deref() == Some("New session")
                 ),
-                "{:?}",
+                "enter opens the session picker on the filtered branch's checkout: {:?}",
                 app.overlay
             );
         })
@@ -10531,16 +9136,7 @@ mod tests {
         let mut app = App::new();
         seed_tree(&mut app);
         let mut out = Vec::new();
-        open_branch_picker(
-            &mut app,
-            nebula_core::ProjectId("p1".into()),
-            crate::app::BranchSpawn {
-                kind: AgentKind::Claude,
-                model: None,
-                effort: None,
-                orchestrator: true,
-            },
-        );
+        open_agent_branch_picker(&mut app, nebula_core::ProjectId("p1".into()));
         press(&mut app, KeyCode::Char('z'), KeyModifiers::NONE, &mut out);
         let Some(Overlay::Menu(menu)) = &app.overlay else {
             panic!("{:?}", app.overlay);
@@ -10620,57 +9216,6 @@ mod tests {
                     if branch == "my-feat" && base.as_deref() == Some("feature")
             ),
             "{out:?}"
-        );
-    }
-
-    /// An empty ORCHESTRATORS section keeps one selectable
-    /// "+ new orchestrator" row, so the first one is a k + Enter away.
-    #[test]
-    fn empty_orchestrator_section_offers_a_placeholder_row() {
-        let mut app = App::new();
-        seed_tree(&mut app);
-        app.focus = Focus::Worktrees;
-        app.sel_worktree = 0;
-        let mut out = Vec::new();
-        press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE, &mut out);
-        assert!(app.on_orchestrator_placeholder());
-        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
-        assert!(buffer_text(&terminal).contains("new orchestrator"));
-        let mut out = Vec::new();
-        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-        assert!(
-            matches!(&app.overlay, Some(Overlay::Menu(m)) if m.title.as_deref() == Some("New orchestrator")),
-            "enter opens the kind picker: {:?}",
-            app.overlay
-        );
-        // Same chain as sessions plus the branch step: Enter on Claude →
-        // branch picker → name prompt → typed name → CreateAgent flagged
-        // as orchestrator.
-        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-        assert!(
-            matches!(&app.overlay, Some(Overlay::Menu(m)) if m.title.as_deref() == Some("Orchestrator branch")),
-            "the kind pick detours through the branch picker: {:?}",
-            app.overlay
-        );
-        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-        assert!(
-            matches!(&app.overlay, Some(Overlay::Prompt(p)) if matches!(p.kind, crate::app::PromptKind::NewAgent { orchestrator: true, .. })),
-            "name prompt carries the orchestrator flag: {:?}",
-            app.overlay
-        );
-        for c in "boss".chars() {
-            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
-        }
-        let mut out = Vec::new();
-        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-        assert!(
-            matches!(
-                out.as_slice(),
-                [ClientRequest::CreateAgent { orchestrator: true, name, auto_title: false, .. }, ..]
-                    if name == "boss"
-            ),
-            "named orchestrator created: {out:?}"
         );
     }
 
@@ -11681,8 +10226,7 @@ mod tests {
                     kind: AgentKind::Claude,
                     model: Some("opus".into()),
                     effort: Some("high".into()),
-                    orchestrator: false,
-                },
+                                    },
             )));
             let mut out = Vec::new();
             press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
@@ -11814,10 +10358,9 @@ mod tests {
         );
     }
 
-    /// The selected tab names its harness in a dim badge after the title;
-    /// unselected tabs stay bare (the bar only has room to badge one), and
-    /// the badge follows the selection. Every tab carries its model (and
-    /// effort) on the bar's second row — "default" when the CLI picks.
+    /// Every tab names its harness on the bar's second row, trailing the
+    /// model (and effort — "default" when the CLI picks) in the kind's
+    /// own color, so each tab says what runs it even when unselected.
     #[test]
     fn the_selected_tab_badges_its_harness() {
         use nebula_core::{Agent, AgentKind, AgentStatus, Entity};
@@ -11840,8 +10383,7 @@ mod tests {
                     session_id: None,
                     sort_order: 2,
                     status_changed_at: 0,
-                    orchestrator: false,
-                    alive: true,
+                                        alive: true,
                 }),
             },
         );
@@ -11850,25 +10392,27 @@ mod tests {
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
         assert!(
-            text.contains("agent-1 claude"),
-            "selected tab badged claude:\n{text}"
+            text.contains("default claude"),
+            "selected tab's sub-row names claude after the model:\n{text}"
         );
         assert!(
-            !text.contains("agent-2 codex"),
-            "unselected tab stays bare:\n{text}"
+            text.contains("gpt-5.5 · high codex"),
+            "unselected tab's sub-row names codex too:\n{text}"
         );
 
-        // The badge is dim, the name isn't — it reads as secondary.
+        // The kind renders in its harness color, not the model's dim.
         let th = app.theme;
         let buffer = terminal.backend().buffer();
-        let (x, y) = find_cell(&terminal, "agent-1 claude");
-        let badge_x = x + "agent-1 ".chars().count() as u16;
-        assert_eq!(buffer[(badge_x, y)].fg, th.dim, "badge is dim");
+        let (x, y) = find_cell(&terminal, "default claude");
+        let kind_x = x + "default ".chars().count() as u16;
+        assert_eq!(buffer[(kind_x, y)].fg, th.warn, "claude kind is warn");
+        let (cx, cy) = find_cell(&terminal, "gpt-5.5 · high codex");
+        let codex_x = cx + "gpt-5.5 · high ".chars().count() as u16;
+        assert_eq!(buffer[(codex_x, cy)].fg, th.ok, "codex kind is ok-green");
 
-        // The model row sits directly under the names: an unset model says
+        // The sub-row sits directly under the names: an unset model says
         // "default", a set one names model · effort under its own tab.
-        let text = buffer_text(&terminal);
-        let (_, names_y) = find_cell(&terminal, "agent-1 claude");
+        let (_, names_y) = find_cell(&terminal, "agent-1");
         let model_line = text.lines().nth(names_y as usize + 1).unwrap();
         assert!(
             model_line.contains("default"),
@@ -11885,15 +10429,18 @@ mod tests {
             .unwrap() as u16;
         assert_eq!(m_col, a2_x, "the model aligns under its tab's name");
 
-        // Selection moves: so does the badge.
+        // Selection moves: every tab keeps its kind either way.
         app.sel_session = 1;
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
         assert!(
-            text.contains("agent-2 codex"),
-            "newly selected tab badged codex:\n{text}"
+            text.contains("gpt-5.5 · high codex"),
+            "newly selected tab still names codex:\n{text}"
         );
-        assert!(!text.contains("agent-1 claude"), "old badge gone:\n{text}");
+        assert!(
+            text.contains("default claude"),
+            "unselected tab keeps its kind:\n{text}"
+        );
     }
 
     /// Pinning an agent splits the sessions panel into PINNED and UNPINNED
@@ -11920,8 +10467,7 @@ mod tests {
                     session_id: None,
                     sort_order: 1,
                     status_changed_at: 0,
-                    orchestrator: false,
-                    alive: true,
+                                        alive: true,
                 }),
             },
         );
@@ -12024,8 +10570,7 @@ mod tests {
                 session_id: None,
                 sort_order: sort,
                 status_changed_at: changed_at,
-                orchestrator: false,
-                alive: true,
+                                alive: true,
             }),
         };
         // Pinned with a fresh change: must stay in PINNED, not RECENT.
@@ -12089,8 +10634,7 @@ mod tests {
                     session_id: None,
                     sort_order: sort,
                     status_changed_at: changed_at,
-                    orchestrator: false,
-                    alive: true,
+                                        alive: true,
                 }),
             }
         };
@@ -12158,8 +10702,7 @@ mod tests {
                     session_id: None,
                     sort_order: sort,
                     status_changed_at: at,
-                    orchestrator: false,
-                    alive: true,
+                                        alive: true,
                 }),
             }
         };
@@ -12256,8 +10799,7 @@ mod tests {
                     session_id: None,
                     sort_order: 1,
                     status_changed_at: 0,
-                    orchestrator: false,
-                    alive: true,
+                                        alive: true,
                 }),
             },
         );
@@ -12291,12 +10833,7 @@ mod tests {
         let mut app = App::new();
         seed_tree(&mut app); // main/w1 + a1
         seed_extra_worktrees(&mut app, 2, 3);
-        for (id, worktree, orchestrator) in [
-            ("a2", "w2", false),
-            ("a3", "w3", false),
-            ("o1", "w1", true),
-            ("o2", "w1", true),
-        ] {
+        for (id, worktree) in [("a2", "w2"), ("a3", "w3")] {
             hse(
                 &mut app,
                 ServerEvent::EntityUpserted {
@@ -12314,7 +10851,6 @@ mod tests {
                         session_id: None,
                         sort_order: 0,
                         status_changed_at: 0,
-                        orchestrator,
                         alive: true,
                     }),
                 },
@@ -12335,25 +10871,6 @@ mod tests {
             app.selected_worktree().map(|worktree| worktree.id.as_str()),
             Some("w3"),
             "the worktree cursor follows the row that became active"
-        );
-
-        app.focus = Focus::Orchestrators;
-        app.sel_orchestrator = app
-            .project_orchestrators()
-            .iter()
-            .position(|agent| agent.id.as_str() == "o1");
-        hse(
-            &mut app,
-            ServerEvent::StatusChanged {
-                agent: AgentId("o2".into()),
-                status: AgentStatus::Running,
-                changed_at: crate::app::now_ms(),
-            },
-        );
-        assert_eq!(
-            app.selected_orchestrator().map(|agent| agent.id.as_str()),
-            Some("o1"),
-            "the orchestrator cursor stays on the same entity"
         );
     }
 
@@ -12389,77 +10906,8 @@ mod tests {
         assert_eq!(should_notify(Running, Finished, true), None);
     }
 
-    /// With the window unfocused, a needs-feedback flip records its
-    /// notification (the rate-limit map is the observable seam), a repeat
-    /// within the cooldown doesn't, and a focused window never records.
-    #[test]
-    fn status_flip_notifies_only_while_unfocused() {
-        use nebula_core::AgentStatus;
-        let flip = |to: AgentStatus| ServerEvent::StatusChanged {
-            agent: AgentId("a1".into()),
-            status: to,
-            changed_at: crate::app::now_ms(),
-        };
-
-        let mut app = App::new();
-        seed_tree(&mut app); // agent-1: Fresh
-        app.window_focused = false;
-        hse(&mut app, flip(AgentStatus::NeedsFeedback));
-        let first = *app
-            .notified_at
-            .get(&AgentId("a1".into()))
-            .expect("the unfocused needs-feedback flip records a notification");
-        // …and queues the OSC 777 the event loop will write out (under
-        // test, post_notification always takes the queue path).
-        assert_eq!(
-            app.notify_queue.as_slice(),
-            &[(
-                "nebula — needs feedback".to_string(),
-                "demo/agent-1".to_string()
-            )],
-            "the flip queues a host-terminal notification"
-        );
-
-        // Flapping back within the 30s cooldown stays silent: the recorded
-        // instant doesn't move.
-        hse(&mut app, flip(AgentStatus::Running));
-        hse(&mut app, flip(AgentStatus::NeedsFeedback));
-        assert_eq!(
-            app.notified_at[&AgentId("a1".into())],
-            first,
-            "a repeat inside the cooldown is rate-limited"
-        );
-
-        // Focused, the same flip records nothing.
-        let mut app = App::new();
-        seed_tree(&mut app);
-        app.window_focused = true;
-        hse(&mut app, flip(AgentStatus::NeedsFeedback));
-        assert!(app.notified_at.is_empty(), "focused windows never notify");
-
-        // The setting turned off wins over an unfocused window.
-        let mut app = App::new();
-        seed_tree(&mut app);
-        app.window_focused = false;
-        app.notifications = false;
-        hse(&mut app, flip(AgentStatus::NeedsFeedback));
-        assert!(app.notified_at.is_empty(), "the toggle disables notifying");
-
-        // Running → Finished is the other notifying flip.
-        let mut app = App::new();
-        seed_tree(&mut app);
-        app.window_focused = false;
-        hse(&mut app, flip(AgentStatus::Running));
-        assert!(app.notified_at.is_empty(), "starting a run is not news");
-        hse(&mut app, flip(AgentStatus::Finished));
-        assert!(
-            app.notified_at.contains_key(&AgentId("a1".into())),
-            "an unfocused finished run notifies"
-        );
-    }
-
-    /// Upsert a plain (non-orchestrator) agent for the unseen-finished
-    /// tests, mirroring seed_tree's a1 shape.
+    /// Upsert a plain agent for the unseen-finished tests, mirroring
+    /// seed_tree's a1 shape.
     fn seed_agent(app: &mut App, id: &str, worktree: &str) {
         use nebula_core::{Agent, AgentStatus, Entity};
         hse(
@@ -12479,7 +10927,6 @@ mod tests {
                     session_id: None,
                     sort_order: 1,
                     status_changed_at: 0,
-                    orchestrator: false,
                     alive: true,
                 }),
             },
@@ -12722,8 +11169,7 @@ mod tests {
                     session_id: None,
                     sort_order: 0,
                     status_changed_at: 0,
-                    orchestrator: false,
-                    alive: true,
+                                        alive: true,
                 }),
             },
         );
@@ -13865,6 +12311,40 @@ mod tests {
         );
     }
 
+    /// Plain t on a selected worktree opens the new-session picker — the
+    /// same kind menu as ⌘N (agents + Terminal row) — targeting that
+    /// worktree; the direct shell moved to ⇧T.
+    #[test]
+    fn t_opens_the_session_picker_for_the_selected_worktree() {
+        use nebula_core::WorktreeId;
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.focus = Focus::Worktrees;
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::NONE, &mut out);
+        assert!(out.is_empty(), "no request until a kind is picked: {out:?}");
+        let Some(Overlay::Menu(menu)) = &app.overlay else {
+            panic!("expected the session picker, got {:?}", app.overlay);
+        };
+        assert_eq!(menu.title.as_deref(), Some("New session"));
+        assert!(
+            matches!(
+                &menu.items[0].action,
+                MenuAction::NewAgentOfKind { worktree, .. }
+                    if worktree == &WorktreeId("w1".into())
+            ),
+            "first row spawns an agent in the selected worktree: {:?}",
+            menu.items[0].action
+        );
+        assert!(
+            menu.items
+                .iter()
+                .any(|i| matches!(&i.action, MenuAction::NewTerminal(w) if w == &WorktreeId("w1".into()))),
+            "the picker keeps a Terminal row"
+        );
+    }
+
     #[test]
     fn shift_t_creates_terminal_in_selected_worktree() {
         use nebula_core::WorktreeId;
@@ -14265,8 +12745,7 @@ mod tests {
                 session_id: None,
                 sort_order: sort,
                 status_changed_at: 0,
-                orchestrator: false,
-                alive: true,
+                                alive: true,
             })
         };
         hse(
@@ -14336,8 +12815,7 @@ mod tests {
             session_id: None,
             sort_order: sort,
             status_changed_at: 0,
-            orchestrator: false,
-            alive: false,
+                        alive: false,
         })
     }
 
@@ -15175,17 +13653,29 @@ mod tests {
     #[test]
     fn normalize_panel_widths_shrinks_rightmost_first() {
         let mut app = App::new();
-        app.panel_widths = [50, 50];
+        app.desired_panel_widths = [50, 50];
         app.normalize_panel_widths(100);
         assert_eq!(app.panel_widths, [50, 30], "worktrees gives way first");
         let total: u16 = app.panel_widths.iter().sum();
         assert_eq!(100 - total, crate::app::MIN_TERM_W);
     }
 
+    /// A temporarily narrow window (split screen) must not lose the user's
+    /// layout: widths spring back once the window regains its width.
+    #[test]
+    fn normalize_panel_widths_restores_after_shrink() {
+        let mut app = App::new();
+        app.desired_panel_widths = [50, 50];
+        app.normalize_panel_widths(80); // window squeezed
+        assert!(app.panel_widths.iter().sum::<u16>() < 100);
+        app.normalize_panel_widths(200); // window back to full size
+        assert_eq!(app.panel_widths, [50, 50], "manual layout restored");
+    }
+
     #[test]
     fn ui_state_roundtrip_includes_panel_widths() {
         let mut app = App::new();
-        app.panel_widths = [33, 44];
+        app.desired_panel_widths = [33, 44];
         let json = ui_state_json(&app);
 
         let mut restored = App::new();
@@ -15324,8 +13814,7 @@ mod tests {
                     session_id: None,
                     sort_order: 0,
                     status_changed_at: crate::app::now_ms() - 2 * 60_000,
-                    orchestrator: false,
-                    alive: true,
+                                        alive: true,
                 }),
             },
         );
@@ -15875,8 +14364,7 @@ mod tests {
                     session_id: None,
                     sort_order: 0,
                     status_changed_at: 0,
-                    orchestrator: false,
-                    alive: true,
+                                        alive: true,
                 }),
             },
         );
@@ -16528,8 +15016,7 @@ mod tests {
                     session_id: None,
                     sort_order: 0,
                     status_changed_at: 0,
-                    orchestrator: false,
-                    alive: true,
+                                        alive: true,
                 }),
             },
         );
@@ -16618,8 +15105,7 @@ mod tests {
                     session_id: None,
                     sort_order: 1,
                     status_changed_at: 0,
-                    orchestrator: false,
-                    alive: false,
+                                        alive: false,
                 }),
             },
         );
@@ -16698,8 +15184,7 @@ mod tests {
                     session_id: None,
                     sort_order: 0,
                     status_changed_at: 0,
-                    orchestrator: false,
-                    alive: true,
+                                        alive: true,
                 }),
             },
         );
@@ -16735,14 +15220,14 @@ mod tests {
     fn worktrees_section_scrolls_to_keep_the_selection_visible() {
         let mut app = App::new();
         seed_tree(&mut app); // p1/w1(main)
-        seed_extra_worktrees(&mut app, 2, 8);
+        seed_extra_worktrees(&mut app, 2, 12);
         app.focus = Focus::Worktrees;
-        app.sel_worktree = 7; // wt-8, the last row
+        app.sel_worktree = 11; // wt-12, the last row
         let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
-        assert!(text.contains("wt-8"), "selected last row visible: {text}");
-        assert!(!text.contains("wt-2"), "top rows scrolled out: {text}");
+        assert!(text.contains("wt-12"), "selected last row visible: {text}");
+        assert!(!text.contains("wt-2 "), "top rows scrolled out: {text}");
     }
 
     /// A worktree created from a visible worktree's branch renders nested:
@@ -16888,8 +15373,7 @@ mod tests {
                         session_id: None,
                         sort_order: i,
                         status_changed_at: 0,
-                        orchestrator: false,
-                        alive: true,
+                                                alive: true,
                     }),
                 },
             );
@@ -16915,162 +15399,6 @@ mod tests {
         assert!(
             !worktree_column.contains("wt-2"),
             "earlier groups scroll out: {text}"
-        );
-    }
-
-    /// Same for the ORCHESTRATORS half above the worktrees.
-    #[test]
-    fn orchestrators_section_scrolls_to_keep_the_selection_visible() {
-        use nebula_core::{Agent, AgentStatus, Entity};
-        let mut app = App::new();
-        seed_tree(&mut app);
-        for i in 0..6 {
-            hse(
-                &mut app,
-                ServerEvent::EntityUpserted {
-                    entity: Entity::Agent(Agent {
-                        id: AgentId(format!("o{i}")),
-                        worktree_id: nebula_core::WorktreeId("w1".into()),
-                        name: format!("boss-{i}"),
-                        status: AgentStatus::Fresh,
-                        archived: false,
-                        archived_at: 0,
-                        pinned: false,
-                        kind: Default::default(),
-                        model: None,
-                        effort: None,
-                        session_id: None,
-                        sort_order: i,
-                        status_changed_at: 0,
-                        orchestrator: true,
-                        alive: false,
-                    }),
-                },
-            );
-        }
-        app.focus = Focus::Orchestrators;
-        app.sel_orchestrator = Some(5);
-        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
-        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
-        let text = buffer_text(&terminal);
-        // "boss-0 ◆" pins the ORCHESTRATORS row shape — the bare name also
-        // shows up in the Projects column's global SESSIONS section.
-        assert!(
-            text.contains("boss-5 ◆"),
-            "selected last row visible: {text}"
-        );
-        assert!(!text.contains("boss-0 ◆"), "top rows scrolled out: {text}");
-    }
-
-    /// The ORCHESTRATORS/WORKTREES split is adaptive: the top section
-    /// keeps only the rows its pills need, so with no orchestrators the
-    /// WORKTREES header sits right under the one placeholder pill — and
-    /// the rows below stack tight: no blank row under the header, no
-    /// quiet row after the primary checkout.
-    #[test]
-    fn worktrees_take_the_column_rows_orchestrators_do_not_need() {
-        let mut app = App::new();
-        seed_tree(&mut app); // p1/w1(main) + agent-1, no orchestrators
-        seed_extra_worktrees(&mut app, 2, 4);
-        app.focus = Focus::Worktrees;
-        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
-        let text = buffer_text(&terminal);
-        let (_, orch_y) = find_cell(&terminal, "ORCHESTRATORS");
-        let (wt_x, wt_y) = find_cell(&terminal, "WORKTREES");
-        // Title, blank spacer, the 2-row placeholder pill, the section
-        // rule on the boundary row, then the WORKTREES header.
-        assert_eq!(wt_y, orch_y + 5, "split hugs the placeholder pill: {text}");
-        let rule = terminal.backend().buffer()[(wt_x, wt_y - 1)].symbol();
-        assert_eq!(rule, "─", "section rule right above the header: {text}");
-        let (_, main_y) = find_cell(&terminal, "main");
-        assert_eq!(
-            main_y,
-            wt_y + 2,
-            "first pill text right under the header: {text}"
-        );
-        // "claude agent-1" pins the sub-row shape — the bare name also
-        // shows in the terminal header and the global SESSIONS list.
-        let (_, agent_y) = find_cell(&terminal, "claude agent-1");
-        assert_eq!(
-            agent_y,
-            main_y + 1,
-            "session sub-row hugs its worktree: {text}"
-        );
-        let (_, wt2_y) = find_cell(&terminal, "wt-2");
-        assert_eq!(
-            wt2_y,
-            agent_y + 2,
-            "no quiet row after the primary checkout: {text}"
-        );
-    }
-
-    /// A long orchestrator list is capped at five pills — and at half the
-    /// column's list area on a short window — it scrolls inside that band
-    /// instead of pushing WORKTREES down the column.
-    #[test]
-    fn orchestrators_never_take_more_than_five_pills_or_half_the_column() {
-        use nebula_core::{Agent, AgentStatus, Entity};
-        let mut app = App::new();
-        seed_tree(&mut app);
-        for i in 0..6 {
-            hse(
-                &mut app,
-                ServerEvent::EntityUpserted {
-                    entity: Entity::Agent(Agent {
-                        id: AgentId(format!("o{i}")),
-                        worktree_id: nebula_core::WorktreeId("w1".into()),
-                        name: format!("boss-{i}"),
-                        status: AgentStatus::Fresh,
-                        archived: false,
-                        archived_at: 0,
-                        pinned: false,
-                        kind: Default::default(),
-                        model: None,
-                        effort: None,
-                        session_id: None,
-                        sort_order: i,
-                        status_changed_at: 0,
-                        orchestrator: true,
-                        alive: false,
-                    }),
-                },
-            );
-        }
-        app.focus = Focus::Worktrees;
-        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
-        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
-        let text = buffer_text(&terminal);
-        let (_, orch_y) = find_cell(&terminal, "ORCHESTRATORS");
-        let (_, wt_y) = find_cell(&terminal, "WORKTREES");
-        // 20-row screen → footer off → 15-row list → half = a 7-row band
-        // after the title and its spacer, then the section rule row.
-        assert_eq!(wt_y, orch_y + 2 + 7 + 1, "band capped at half: {text}");
-        assert!(
-            text.contains("boss-2 ◆"),
-            "three pills fit the band: {text}"
-        );
-        assert!(
-            !text.contains("boss-3 ◆"),
-            "the rest scrolls instead of growing the band: {text}"
-        );
-
-        // A tall window stops growing the band at five pills — the sixth
-        // orchestrator scrolls, and WORKTREES keeps the rest.
-        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
-        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
-        let text = buffer_text(&terminal);
-        let (_, orch_y) = find_cell(&terminal, "ORCHESTRATORS");
-        let (_, wt_y) = find_cell(&terminal, "WORKTREES");
-        assert_eq!(
-            wt_y,
-            orch_y + 2 + 10 + 1,
-            "band capped at five pills: {text}"
-        );
-        assert!(text.contains("boss-4 ◆"), "five pills fit the band: {text}");
-        assert!(
-            !text.contains("boss-5 ◆"),
-            "the sixth scrolls instead of growing the band: {text}"
         );
     }
 
@@ -17166,8 +15494,7 @@ mod tests {
                         session_id: None,
                         sort_order: i as i64,
                         status_changed_at: 0,
-                        orchestrator: false,
-                        alive: true,
+                                                alive: true,
                     }),
                 },
             );
@@ -17212,25 +15539,26 @@ mod tests {
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
         // Borderless column: row 0 a top-padding spacer, row 1 the header,
-        // row 2 a spacer, rows 3-4 the project pill (selected in the
-        // focused panel → accent rail cap on the pad, ▌ on the text row),
-        // row 5 the divider behind a 1-cell gutter (it overwrites the
-        // pill's bottom pad, same as a following pill would).
+        // row 2 a spacer, row 3 the full-width rule under the header row,
+        // rows 4-5 the project pill (selected in the focused panel →
+        // accent rail cap on the pad, ▌ on the text row), row 6 the
+        // divider behind a 1-cell gutter (it overwrites the pill's bottom
+        // pad, same as a following pill would).
         let lines: Vec<&str> = text.lines().collect();
         assert!(
             lines[1].starts_with("   PROJECTS"),
             "column header first:\n{text}"
         );
         assert!(
-            lines[3].starts_with("▖"),
+            lines[4].starts_with("▖"),
             "selection rail caps the pill's pad:\n{text}"
         );
         assert!(
-            lines[4].starts_with("▌● demo"),
+            lines[5].starts_with("▌● demo"),
             "project name on the pill's text row:\n{text}"
         );
         assert!(
-            lines[5].starts_with(&format!(" {}", "─".repeat(10))),
+            lines[6].starts_with(&format!(" {}", "─".repeat(10))),
             "divider row under the project:\n{text}"
         );
 
@@ -17244,7 +15572,7 @@ mod tests {
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
         assert!(
-            text.lines().nth(5).unwrap().starts_with(" ─ work ──"),
+            text.lines().nth(6).unwrap().starts_with(" ─ work ──"),
             "labeled divider row:\n{text}"
         );
     }
@@ -17786,7 +16114,6 @@ mod tests {
         let labels: Vec<&str> = menu.items.iter().map(|i| i.label.as_str()).collect();
         for expected in [
             "w · New worktree…",
-            "o · New orchestrator…",
             "a · New agent (primary)",
             "acc · New Claude agent (primary)",
             "ac · New Codex agent (primary)",
@@ -17968,7 +16295,7 @@ mod tests {
         assert!(
             matches!(
                 &menu.items[0].action,
-                MenuAction::NewAgentOfKind { worktree, orchestrator: false, .. }
+                MenuAction::NewAgentOfKind { worktree, .. }
                     if worktree == &nebula_core::WorktreeId("w1".into())
             ),
             "{:?}",
@@ -18013,8 +16340,7 @@ mod tests {
                         kind: AgentKind::Codex,
                         name,
                         auto_title: true,
-                        orchestrator: false,
-                        ..
+                                                ..
                     }) if worktree == &nebula_core::WorktreeId("w1".into()) && name == "agent-2"
                 ),
                 "created immediately with the generated default: {out:?}"
@@ -18091,7 +16417,7 @@ mod tests {
         assert!(
             matches!(
                 &menu.items[0].action,
-                MenuAction::NewAgentOfKind { worktree, orchestrator: false, .. }
+                MenuAction::NewAgentOfKind { worktree, .. }
                     if worktree == &nebula_core::WorktreeId("w1".into())
             ),
             "{:?}",
@@ -18218,6 +16544,33 @@ mod tests {
             "the branch row's index continues past the worktree rows"
         );
         assert_eq!(app.selected_branch_row().as_deref(), Some("feature-x"));
+    }
+
+    /// A checkout-less branch created from another checkout-less branch
+    /// renders nested under it with the same `└` tree guide the worktree
+    /// rows use.
+    #[test]
+    fn branch_rows_render_nested_under_their_base() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.branch_list = Some((
+            nebula_core::ProjectId("p1".into()),
+            vec![
+                "feature-x".into(),
+                crate::branches::LocalBranch {
+                    name: "feature-x-sub".into(),
+                    created_from: Some("feature-x".into()),
+                },
+            ],
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("○ feature-x"), "{text}");
+        assert!(
+            text.contains("└ ○ feature-x-sub"),
+            "the child row carries a tree connector: {text}"
+        );
     }
 
     /// j walks off the last worktree onto the branch rows, and Enter there
@@ -19143,8 +17496,7 @@ mod tests {
                     session_id: None,
                     sort_order: 0,
                     status_changed_at: 0,
-                    orchestrator: false,
-                    alive: true,
+                                        alive: true,
                 }),
             },
         );
@@ -19165,8 +17517,7 @@ mod tests {
                     session_id: None,
                     sort_order: 1,
                     status_changed_at: 0,
-                    orchestrator: false,
-                    alive: false,
+                                        alive: false,
                 }),
             },
         );
@@ -19485,11 +17836,8 @@ mod tests {
             text.contains("type to search"),
             "query placeholder rendered:\n{text}"
         );
-        // Sidebar headers are plain uppercase text (no emoji). The middle
-        // column titles ORCHESTRATORS (its WORKTREES half-header sits
-        // mid-panel, behind this palette overlay).
+        // Sidebar headers are plain uppercase text (no emoji).
         assert!(text.contains("PROJECTS"), "{text}");
-        assert!(text.contains("ORCHESTRATORS"), "{text}");
         // Palette rows carry per-kind glyphs: ▪ project, ▸ worktree,
         // ● session.
         assert!(text.contains("▪ demo"), "project glyph row:\n{text}");
@@ -19530,8 +17878,7 @@ mod tests {
                     session_id: None,
                     sort_order: 0,
                     status_changed_at: 0,
-                    orchestrator: false,
-                    alive: true,
+                                        alive: true,
                 }),
             },
         );
@@ -21083,8 +19430,7 @@ mod tests {
                         session_id: None,
                         sort_order: 1,
                         status_changed_at: 0,
-                        orchestrator: false,
-                        alive: true,
+                                                alive: true,
                     }),
                 },
             );
@@ -21155,8 +19501,7 @@ mod tests {
             session_id: None,
             sort_order: 1,
             status_changed_at: 0,
-            orchestrator: false,
-            alive: true,
+                        alive: true,
         })
     }
 

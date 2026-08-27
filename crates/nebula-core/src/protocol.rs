@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 25;
+pub const PROTOCOL_VERSION: u32 = 26;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -141,10 +141,6 @@ pub enum ClientRequest {
         /// the session eligible for one agent-driven auto-title (the CLI
         /// runs `nebula rename` on its first prompt).
         auto_title: bool,
-        /// Project-level orchestrator: spawned pinned, listed in its own
-        /// group, and taught the `nebula worktree new` / `nebula agent new`
-        /// commands via hook-injected context.
-        orchestrator: bool,
         /// Initial task handed to the CLI as its positional prompt argument
         /// (`nebula agent new --prompt`). Skips warm-slot adoption — an
         /// already-booted CLI can't take a launch argument.
@@ -213,14 +209,6 @@ pub enum ClientRequest {
         req_id: u64,
         id: AgentId,
         pinned: bool,
-    },
-    /// Promote a session to project orchestrator (or demote one back).
-    /// An orchestrator may live on any of the project's worktrees.
-    /// Promotion also pins.
-    SetAgentOrchestrator {
-        req_id: u64,
-        id: AgentId,
-        orchestrator: bool,
     },
     DeleteAgent {
         req_id: u64,
@@ -323,6 +311,18 @@ pub enum ClientRequest {
     /// the same req_id (not an Ack).
     GetMetrics {
         req_id: u64,
+    },
+
+    /// One plain-text reading of a live session's screen — scrollback tail
+    /// included — rendered daemon-side at the session's current size, so
+    /// nothing is attached, resized, or respawned by looking. Answered by
+    /// `ServerEvent::SessionText` (or Error when the PTY is not live).
+    /// `nebula agent read` is the caller.
+    ReadSession {
+        req_id: u64,
+        session: SessionRef,
+        /// Keep only the last N lines; None = everything retained.
+        lines: Option<usize>,
     },
 
     Shutdown,
@@ -449,5 +449,14 @@ pub enum ServerEvent {
     Metrics {
         req_id: u64,
         snapshot: MetricsSnapshot,
+    },
+
+    /// Reply to `ClientRequest::ReadSession`: the session's screen (and
+    /// scrollback tail) as plain text, plus the grid it was rendered at.
+    SessionText {
+        req_id: u64,
+        cols: u16,
+        rows: u16,
+        text: String,
     },
 }

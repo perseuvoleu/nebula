@@ -1077,7 +1077,6 @@ impl Daemon {
         model: Option<String>,
         effort: Option<String>,
         auto_title: bool,
-        orchestrator: bool,
         prompt: Option<String>,
     ) -> Result<EntityId> {
         let worktree = self
@@ -1114,17 +1113,13 @@ impl Daemon {
             status: AgentStatus::Fresh,
             archived: false,
             archived_at: 0,
-            // Orchestrators are always pinned: the idle reaper never
-            // touches pinned sessions, and a project's manager must not
-            // be reaped out from under its workers.
-            pinned: orchestrator,
+            pinned: false,
             kind,
             model,
             effort,
             session_id: None,
             sort_order: 0,
             status_changed_at: epoch_ms(),
-            orchestrator,
             alive: false,
         };
         self.store
@@ -1205,7 +1200,6 @@ impl Daemon {
             session_id: None,
             sort_order: 0,
             status_changed_at: 0,
-            orchestrator: false,
             alive: false,
         };
         self.spawn_agent_session(&agent, &worktree, 80, 24)?;
@@ -1615,24 +1609,6 @@ impl Daemon {
 
     pub fn set_agent_pinned(self: &Arc<Self>, id: &AgentId, pinned: bool) -> Result<()> {
         self.store.set_agent_pinned(id, pinned)?;
-        let agent = self.agent_entity(id)?;
-        self.broadcast(ServerEvent::EntityUpserted {
-            entity: Entity::Agent(agent),
-        });
-        Ok(())
-    }
-
-    /// Promote a session to project orchestrator, or demote one back to a
-    /// plain session. An orchestrator may live on any of the project's
-    /// worktrees (the TUI's branch picker decides which); promotion pins
-    /// the row, demotion unpins it.
-    pub fn set_agent_orchestrator(
-        self: &Arc<Self>,
-        id: &AgentId,
-        orchestrator: bool,
-    ) -> Result<()> {
-        self.store.set_agent_orchestrator(id, orchestrator)?;
-        self.store.set_agent_pinned(id, orchestrator)?;
         let agent = self.agent_entity(id)?;
         self.broadcast(ServerEvent::EntityUpserted {
             entity: Entity::Agent(agent),
@@ -3020,7 +2996,6 @@ mod tests {
                 session_id: session_id.map(str::to_string),
                 sort_order: 0,
                 status_changed_at: 0,
-                orchestrator: false,
                 alive: false,
             })
             .unwrap();
@@ -3034,38 +3009,6 @@ mod tests {
             .unwrap()
             .worktree_id
             .to_string()
-    }
-
-    /// Orchestrators may live on any worktree now (the TUI's branch picker
-    /// decides which): promotion off the root checkout succeeds, pins, and
-    /// demotion unpins — the old root-only refusal is gone.
-    #[test]
-    fn promotion_works_off_the_root_checkout() {
-        let daemon = test_daemon();
-        seed_projects(&daemon, &["p"]);
-        seed_worktree(&daemon, "p", "root", "/nebula-test/p", true);
-        seed_worktree(&daemon, "p", "feat", "/nebula-test/p-feat", false);
-        seed_agent(&daemon, "a1", "feat", None);
-
-        daemon
-            .set_agent_orchestrator(&AgentId("a1".into()), true)
-            .unwrap();
-        let a = daemon
-            .store
-            .get_agent(&AgentId("a1".into()))
-            .unwrap()
-            .unwrap();
-        assert!(a.orchestrator && a.pinned, "promoted and pinned off-root");
-
-        daemon
-            .set_agent_orchestrator(&AgentId("a1".into()), false)
-            .unwrap();
-        let a = daemon
-            .store
-            .get_agent(&AgentId("a1".into()))
-            .unwrap()
-            .unwrap();
-        assert!(!a.orchestrator && !a.pinned, "demotion unpins");
     }
 
     #[test]
@@ -3113,7 +3056,6 @@ mod tests {
                     session_id: None,
                     sort_order: 0,
                     status_changed_at: 0,
-                    orchestrator: false,
                     alive: false,
                 },
                 true,

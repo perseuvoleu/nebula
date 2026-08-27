@@ -80,15 +80,14 @@ mod tests {
     use std::io::Write;
 
     fn assistant_line(texts: &[&str]) -> String {
-        let blocks: Vec<serde_json::Value> = std::iter::once(
-            serde_json::json!({"type": "thinking", "thinking": "hm"}),
-        )
-        .chain(
-            texts
-                .iter()
-                .map(|t| serde_json::json!({"type": "text", "text": t})),
-        )
-        .collect();
+        let blocks: Vec<serde_json::Value> =
+            std::iter::once(serde_json::json!({"type": "thinking", "thinking": "hm"}))
+                .chain(
+                    texts
+                        .iter()
+                        .map(|t| serde_json::json!({"type": "text", "text": t})),
+                )
+                .collect();
         serde_json::json!({
             "type": "assistant",
             "message": {"role": "assistant", "content": blocks},

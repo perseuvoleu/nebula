@@ -28,7 +28,6 @@ pub fn now_ms() -> i64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Projects,
-    Orchestrators,
     Worktrees,
     Sessions,
     Terminal,
@@ -47,9 +46,6 @@ pub enum HitTarget {
     /// into `App::branch_rows()`; `sel_worktree` addresses it as
     /// `visible_worktrees().len() + index`.
     WorktreeBranch(usize),
-    /// Row in the Worktrees panel's ORCHESTRATORS section (the
-    /// "+ new orchestrator" placeholder is row 0 of an empty section).
-    Orchestrator(usize),
     Session(usize),
     /// Row in the Projects panel's all-projects SESSIONS section — an
     /// index into `App::global_sessions()`; a click jumps to the session.
@@ -104,15 +100,8 @@ pub enum MenuAction {
     ArchiveAgent(AgentId),
     UnarchiveAgent(AgentId),
     SetAgentPinned(AgentId, bool),
-    /// Promote a session (on any worktree) into the ORCHESTRATORS section,
-    /// or demote an orchestrator back to a plain session.
-    SetAgentOrchestrator(AgentId, bool),
     DeleteAgent(AgentId),
     NewAgent(WorktreeId),
-    /// Spawn a project orchestrator: a pinned agent session on a checkout
-    /// of a picked branch, listed in the Worktrees panel's ORCHESTRATORS
-    /// group.
-    NewOrchestrator(ProjectId),
     /// Picker result: create an agent of this kind (chains into the name
     /// prompt). `model`/`effort` are submenu choices: None means the row
     /// hasn't drilled into that submenu (its configured default applies);
@@ -122,22 +111,10 @@ pub enum MenuAction {
         kind: AgentKind,
         model: Option<String>,
         effort: Option<String>,
-        /// The picked session becomes a project orchestrator (its row in
-        /// the ORCHESTRATORS section) instead of a plain session — and its
-        /// activation detours through the branch picker.
-        orchestrator: bool,
     },
     /// Shell terminal in the worktree's directory; created immediately with
     /// a default name (no prompt), renameable later.
     NewTerminal(WorktreeId),
-    /// A branch-picker row: run the spawn on a checkout of this branch —
-    /// the worktree that already has it checked out (the primary checkout
-    /// included), or a fresh worktree checking out the existing branch.
-    SpawnOnBranch {
-        project: ProjectId,
-        branch: String,
-        spawn: BranchSpawn,
-    },
     /// The `a` palette command's branch row: open the normal new-session
     /// picker on this branch's checkout, creating the worktree first when
     /// the branch has none (kind is picked AFTER the branch here).
@@ -236,18 +213,6 @@ pub enum PaletteCommand {
     Todos,
     Settings,
     Workspaces,
-}
-
-/// The agent spawn carried through the orchestrator flow's branch picker;
-/// chains into the name prompt once a branch is picked. Model/effort are
-/// already resolved against the configured defaults by the time the picker
-/// opens — a branch row is past the submenus.
-#[derive(Debug, Clone, PartialEq)]
-pub struct BranchSpawn {
-    pub kind: AgentKind,
-    pub model: Option<String>,
-    pub effort: Option<String>,
-    pub orchestrator: bool,
 }
 
 /// Which submenu → (right arrow) opens from a menu row.
@@ -449,13 +414,10 @@ pub struct ConfirmDialog {
     pub action: PendingAction,
 }
 
-/// Where a new agent session will run: an existing checkout, or a picked
-/// branch that has no checkout yet — submit then creates the worktree
-/// first (checking out the existing branch) and spawns on its Ack.
+/// Where a new agent session will run: an existing checkout.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SpawnTarget {
     Worktree(WorktreeId),
-    Branch { project: ProjectId, branch: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -488,8 +450,6 @@ pub enum PromptKind {
         /// None = the CLI's own default.
         model: Option<String>,
         effort: Option<String>,
-        /// Name prompt for a new orchestrator, not a plain session.
-        orchestrator: bool,
     },
     RenameAgent {
         id: AgentId,
@@ -911,12 +871,7 @@ impl Palette {
         Self::build(tree, show_archived, true, true)
     }
 
-    fn build(
-        tree: &Tree,
-        show_archived: bool,
-        enter_attaches: bool,
-        sessions_only: bool,
-    ) -> Self {
+    fn build(tree: &Tree, show_archived: bool, enter_attaches: bool, sessions_only: bool) -> Self {
         let mut palette = Self {
             items: build_palette_items(tree, show_archived, sessions_only),
             query: TextInput::new(),
@@ -988,11 +943,7 @@ impl Palette {
 /// worktrees, then each worktree's sessions. Archived sessions appear only
 /// when the archived toggle is on (the Sessions panel rule). Scoped to the
 /// open workspace — `/` never searches across other workspaces.
-fn build_palette_items(
-    tree: &Tree,
-    show_archived: bool,
-    sessions_only: bool,
-) -> Vec<PaletteItem> {
+fn build_palette_items(tree: &Tree, show_archived: bool, sessions_only: bool) -> Vec<PaletteItem> {
     let projects: Vec<&Project> = tree
         .projects
         .iter()
@@ -1025,13 +976,7 @@ fn build_palette_items(
                 if a.archived && !show_archived {
                     continue;
                 }
-                // Orchestrators carry their label in the searchable text
-                // itself, so typing "orch" narrows straight to them.
-                let text = if a.orchestrator {
-                    format!("{}/{} ◆ orchestrator", p.name, a.name)
-                } else {
-                    format!("{}/{}/{}", p.name, w.branch, a.name)
-                };
+                let text = format!("{}/{}/{}", p.name, w.branch, a.name);
                 items.push(PaletteItem {
                     target: PaletteTarget::Session(a.id.clone()),
                     text,
@@ -1531,9 +1476,6 @@ pub enum PendingIntent {
     /// ⌘D: attach the created shell in the split's right pane and move the
     /// input lock onto it (the left pane keeps the current attachment).
     AttachCreatedSplit,
-    /// Same, for an orchestrator — its row lives in the Worktrees panel,
-    /// so the cursor lands there instead of the Sessions list.
-    AttachCreatedOrchestrator,
     /// Select the created worktree in the Worktrees panel.
     SelectCreatedWorktree,
     /// Project added by `nebula open <dir>`: land the selection on it.
@@ -1549,25 +1491,10 @@ pub enum PendingIntent {
     OpenCreatedWorkspace,
     /// Worktree removed optimistically; restore these rows on Error.
     DeleteWorktree(WorktreeRollback),
-    /// Branch picker picked a branch with no checkout: once the worktree's
-    /// Ack lands, create this session on it (a second request cycle).
-    SpawnOnCreatedWorktree(DeferredSpawn),
     /// The `a` palette flow picked a branch with no checkout: once the
     /// worktree's Ack lands, open the new-session picker on it.
     PickAgentOnCreatedWorktree,
     None,
-}
-
-/// Agent session to create once a branch-picked worktree's Ack lands.
-#[derive(Debug, Clone)]
-pub struct DeferredSpawn {
-    pub kind: AgentKind,
-    pub model: Option<String>,
-    pub effort: Option<String>,
-    /// Typed name; empty takes the generated default (and opts into
-    /// auto-titling), same as the direct create path.
-    pub name: String,
-    pub orchestrator: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1781,7 +1708,7 @@ pub const WORKTREE_NEST_MAX_DEPTH: usize = 3;
 /// `created_from` loop in the data cannot recurse forever: any row whose
 /// parent chain fails to reach a root is placed flat instead.
 fn nest_by_lineage(rows: Vec<&Worktree>) -> Vec<(&Worktree, usize)> {
-    let mut parent: Vec<Option<usize>> = rows
+    let parent: Vec<Option<usize>> = rows
         .iter()
         .enumerate()
         .map(|(i, w)| {
@@ -1795,6 +1722,15 @@ fn nest_by_lineage(rows: Vec<&Worktree>) -> Vec<(&Worktree, usize)> {
             })
         })
         .collect();
+    nest_by_parent(rows, parent)
+}
+
+/// The lineage nester shared by worktree rows and the checkout-less branch
+/// rows: emit each row directly after its parent's subtree, tagged with a
+/// depth capped at `WORKTREE_NEST_MAX_DEPTH`. Roots and siblings keep the
+/// incoming order; a parent loop degrades to flat placement instead of
+/// recursing forever.
+fn nest_by_parent<T>(rows: Vec<T>, mut parent: Vec<Option<usize>>) -> Vec<(T, usize)> {
     for i in 0..rows.len() {
         let mut cursor = i;
         let mut steps = 0;
@@ -1815,10 +1751,13 @@ fn nest_by_lineage(rows: Vec<&Worktree>) -> Vec<(&Worktree, usize)> {
             None => roots.push(i),
         }
     }
-    let mut out = Vec::with_capacity(rows.len());
+    let mut slots: Vec<Option<T>> = rows.into_iter().map(Some).collect();
+    let mut out = Vec::with_capacity(slots.len());
     let mut stack: Vec<(usize, usize)> = roots.into_iter().rev().map(|i| (i, 0)).collect();
     while let Some((i, depth)) = stack.pop() {
-        out.push((rows[i], depth.min(WORKTREE_NEST_MAX_DEPTH)));
+        if let Some(row) = slots[i].take() {
+            out.push((row, depth.min(WORKTREE_NEST_MAX_DEPTH)));
+        }
         for &child in children[i].iter().rev() {
             stack.push((child, depth + 1));
         }
@@ -2103,12 +2042,6 @@ pub struct App {
     /// interleaves projects and their dividers.
     pub sel_project: usize,
     pub sel_worktree: usize,
-    /// Separate cursor for the Worktrees panel's ORCHESTRATORS section:
-    /// Some(i) = the cursor sits on orchestrator row i (or the
-    /// "+ new orchestrator" placeholder when the section is empty);
-    /// None = it sits on worktree row `sel_worktree`. `sel_worktree`
-    /// keeps indexing worktrees only.
-    pub sel_orchestrator: Option<usize>,
     pub sel_session: usize,
     pub term: Option<AttachedTerm>,
     /// ⌘D split: a fresh shell rendered in the right half of the terminal
@@ -2217,6 +2150,11 @@ pub struct App {
     /// Widths of the Projects / Worktrees / Sessions panels; the terminal
     /// pane takes the remainder.
     pub panel_widths: [u16; 2],
+    /// Widths as the user last dragged them. `normalize_panel_widths` re-fits
+    /// `panel_widths` from these on every draw, so a temporarily narrow
+    /// window (split screen, tiling) doesn't permanently lose the layout —
+    /// growing back restores it.
+    pub desired_panel_widths: [u16; 2],
     /// File-list width of the diff modal, remembered across opens.
     pub diff_files_width: u16,
     /// Selected tab of the settings modal, remembered across opens.
@@ -2274,7 +2212,7 @@ pub struct App {
     /// selection change can't show another repo's list. Read off-loop on
     /// the git poll (and after branch ops) — the draw path only filters
     /// this cache, it never runs git.
-    pub branch_list: Option<(ProjectId, Vec<String>)>,
+    pub branch_list: Option<(ProjectId, Vec<crate::branches::LocalBranch>)>,
     /// A branch listing is running off-loop; don't stack another.
     pub branch_inflight: bool,
     /// Where off-loop branch listings and `git branch` ops send their
@@ -2365,7 +2303,6 @@ impl App {
             focus: Focus::Projects,
             sel_project: 0,
             sel_worktree: 0,
-            sel_orchestrator: None,
             sel_session: 0,
             term: None,
             split_term: None,
@@ -2407,6 +2344,7 @@ impl App {
             term_links: Vec::new(),
             term_file_links: Vec::new(),
             panel_widths: DEFAULT_PANEL_WIDTHS,
+            desired_panel_widths: DEFAULT_PANEL_WIDTHS,
             diff_files_width: DEFAULT_DIFF_FILES_W,
             settings_tab: 0,
             settings_selected: vec![0; crate::config::tab_count()],
@@ -2557,12 +2495,17 @@ impl App {
         }
         let want = boundary_x.max(0) as u16;
         self.panel_widths[idx] = want.saturating_sub(left).clamp(MIN_PANEL_W, max);
+        self.desired_panel_widths[idx] = self.panel_widths[idx];
     }
 
-    /// Re-fit panel widths to the current body width, shrinking the rightmost
-    /// panel first, each floored at `MIN_PANEL_W`. Keeps the terminal pane at
-    /// `MIN_TERM_W` whenever the screen allows it at all.
+    /// Re-fit panel widths from the user's desired widths to the current
+    /// body width, shrinking the rightmost panel first, each floored at
+    /// `MIN_PANEL_W`. Keeps the terminal pane at `MIN_TERM_W` whenever the
+    /// screen allows it at all. Starting from `desired_panel_widths` each
+    /// time means a shrink is never permanent: the layout springs back when
+    /// the window regains its width.
     pub fn normalize_panel_widths(&mut self, body_w: u16) {
+        self.panel_widths = self.desired_panel_widths;
         let budget = body_w.saturating_sub(MIN_TERM_W);
         for i in (0..2).rev() {
             let others: u16 = self
@@ -2635,75 +2578,9 @@ impl App {
         self.tree.projects.get(row.project_index())
     }
 
-    /// The selected project's orchestrator agents — flagged sessions on any
-    /// of the project's worktrees (root or branch checkout), rendered as
-    /// their own group at the top of the Worktrees panel. Unarchived only;
-    /// active rows lead while each status rank keeps tree order.
-    pub fn project_orchestrators(&self) -> Vec<&Agent> {
-        let Some(project) = self.selected_project() else {
-            return vec![];
-        };
-        let mut rows: Vec<&Agent> = self
-            .tree
-            .agents
-            .iter()
-            .filter(|a| {
-                a.orchestrator
-                    && !a.archived
-                    && self
-                        .tree
-                        .worktrees
-                        .iter()
-                        .any(|w| w.id == a.worktree_id && w.project_id == project.id)
-            })
-            .collect();
-        rows.sort_by_key(|agent| !is_active_status(agent.status));
-        rows
-    }
-
-    /// Orchestrator rows sit above the worktree rows in the Worktrees
-    /// panel; `sel_worktree` indexes the combined list.
-    pub fn orchestrator_row_count(&self) -> usize {
-        self.project_orchestrators().len()
-    }
-
-    /// Rows the ORCHESTRATORS section occupies: its agents — or the one
-    /// selectable "+ new orchestrator" placeholder while there are none,
-    /// so the section can be entered (and `n`/Enter create the first one)
-    /// before it has any. Zero only when no project is selected.
-    pub fn orchestrator_section_len(&self) -> usize {
-        if self.selected_project().is_none() {
-            return 0;
-        }
-        self.orchestrator_row_count().max(1)
-    }
-
-    /// Is the cursor on the empty section's "+ new orchestrator" row?
-    pub fn on_orchestrator_placeholder(&self) -> bool {
-        self.focus == Focus::Orchestrators
-            && self.sel_orchestrator.unwrap_or(0) == 0
-            && self.selected_project().is_some()
-            && self.project_orchestrators().is_empty()
-    }
-
-    /// Is the cursor anywhere in the ORCHESTRATORS section (a real row or
-    /// the placeholder)? Drives what `n` creates.
-    pub fn in_orchestrator_section(&self) -> bool {
-        self.focus == Focus::Orchestrators
-    }
-
-    /// Index into `visible_worktrees()`. The worktree cursor remains valid
-    /// while the independently focused ORCHESTRATORS section is active.
+    /// Index into `visible_worktrees()`.
     pub fn selected_worktree_index(&self) -> Option<usize> {
         Some(self.sel_worktree)
-    }
-
-    /// The orchestrator under that section's independent cursor.
-    pub fn selected_orchestrator(&self) -> Option<&Agent> {
-        let index = self
-            .sel_orchestrator
-            .or_else(|| (self.focus == Focus::Orchestrators).then_some(0))?;
-        self.project_orchestrators().get(index).copied()
     }
 
     /// Row index of worktree `id` in `visible_worktrees()`.
@@ -2941,35 +2818,6 @@ impl App {
         }
     }
 
-    /// First free `orchestrator-N` across the whole project — the
-    /// ORCHESTRATORS section spans every worktree, so numbering per
-    /// worktree would mint duplicates.
-    pub fn default_orchestrator_name(&self, project: &ProjectId) -> String {
-        let taken: Vec<&str> = self
-            .tree
-            .agents
-            .iter()
-            .filter(|a| {
-                a.orchestrator
-                    && !a.archived
-                    && self
-                        .tree
-                        .worktrees
-                        .iter()
-                        .any(|w| w.id == a.worktree_id && &w.project_id == project)
-            })
-            .map(|a| a.name.as_str())
-            .collect();
-        let mut n = 1;
-        loop {
-            let candidate = format!("orchestrator-{n}");
-            if !taken.contains(&candidate.as_str()) {
-                return candidate;
-            }
-            n += 1;
-        }
-    }
-
     /// Worktrees of the selected project: pinned first, then the rest.
     /// Within each group, worktrees with active sessions lead while stable
     /// tree order and the primary checkout's existing placement are kept.
@@ -3038,8 +2886,23 @@ impl App {
     /// Local branches of the selected project WITHOUT a checkout — the dim
     /// ○ rows the panel lists below the worktree rows. Pure cache read
     /// (`branch_list`, refreshed off-loop): the draw path never runs git.
-    /// Order is the cached listing's (newest commit first).
+    /// `branch_rows_with_depth` with the depths dropped, so keyboard
+    /// indices, hit targets, and the draw all share one ordering.
     pub fn branch_rows(&self) -> Vec<String> {
+        self.branch_rows_with_depth()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
+    }
+
+    /// `branch_rows` plus each row's nesting depth: a branch whose recorded
+    /// creation base is another checkout-less row nests under it, the same
+    /// indented tree as the worktree rows (chains ramify, depth capped at
+    /// `WORKTREE_NEST_MAX_DEPTH`). A base with a checkout of its own — a
+    /// worktree row up in the other section — leaves the row flat, like a
+    /// worktree whose parent sits in the other pin group. Roots keep the
+    /// cached listing's order (newest commit first).
+    pub fn branch_rows_with_depth(&self) -> Vec<(String, usize)> {
         let Some(project) = self.selected_project() else {
             return vec![];
         };
@@ -3049,16 +2912,30 @@ impl App {
         if cached_for != &project.id {
             return vec![];
         }
-        branches
+        let rows: Vec<&crate::branches::LocalBranch> = branches
             .iter()
             .filter(|branch| {
                 !self
                     .tree
                     .worktrees
                     .iter()
-                    .any(|w| w.project_id == project.id && &&w.branch == branch)
+                    .any(|w| w.project_id == project.id && w.branch == branch.name)
             })
-            .cloned()
+            .collect();
+        let parent: Vec<Option<usize>> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, b)| {
+                b.created_from.as_ref().and_then(|base| {
+                    rows.iter()
+                        .position(|p| &p.name == base)
+                        .filter(|&p| p != i)
+                })
+            })
+            .collect();
+        nest_by_parent(rows, parent)
+            .into_iter()
+            .map(|(b, depth)| (b.name.clone(), depth))
             .collect()
     }
 
@@ -3122,8 +2999,7 @@ impl App {
     /// long the turn has taken.
     /// Every live (non-archived) session across every project of the open
     /// workspace, most recent activity first — working sessions lead.
-    /// Feeds the Projects panel's all-projects SESSIONS section;
-    /// orchestrators are included, they are sessions too.
+    /// Feeds the Projects panel's all-projects SESSIONS section.
     pub fn global_sessions(&self) -> Vec<Agent> {
         let now = now_ms();
         let mut working: Vec<Agent> = Vec::new();
@@ -3134,10 +3010,7 @@ impl App {
                     .project_of_agent(a)
                     .is_some_and(|p| self.tree.in_active_workspace(p))
         }) {
-            if matches!(
-                a.status,
-                AgentStatus::Running | AgentStatus::NeedsFeedback
-            ) {
+            if matches!(a.status, AgentStatus::Running | AgentStatus::NeedsFeedback) {
                 working.push(a.clone());
             } else {
                 rest.push(a.clone());
@@ -3167,9 +3040,6 @@ impl App {
         let now = now_ms();
         // Stable throughout, so ties — never-run rows especially, which all
         // stamp 0 — keep tree order instead of shuffling between frames.
-        // Orchestrators are included: besides their rows in the Worktrees
-        // panel, they get a tab under the checkout they run on, so ⌘digits
-        // and the tab bar reach them like any other session.
         let collect = |keep: &dyn Fn(&Agent) -> bool| {
             let mut group: Vec<Agent> = self
                 .tree
@@ -3459,7 +3329,6 @@ mod tests {
             archived_at: 0,
             pinned: false,
             status_changed_at: 0,
-            orchestrator: false,
             kind: AgentKind::Claude,
             model: None,
             effort: None,
@@ -3508,7 +3377,6 @@ mod tests {
                 archived_at: 0,
                 pinned,
                 status_changed_at: 0,
-                orchestrator: false,
                 kind: AgentKind::Claude,
                 model: None,
                 effort: None,
@@ -3605,7 +3473,6 @@ mod tests {
                 archived_at: 0,
                 pinned: false,
                 status_changed_at: 0,
-                orchestrator: false,
                 kind: AgentKind::Claude,
                 model: None,
                 effort: None,
@@ -3639,10 +3506,7 @@ mod tests {
     fn branch_rows_list_only_checkoutless_branches_of_the_selected_project() {
         let (mut app, _main) = link_app();
         let project = app.tree.projects[0].id.clone();
-        app.branch_list = Some((
-            project,
-            vec!["main".into(), "feature".into(), "fix".into()],
-        ));
+        app.branch_list = Some((project, vec!["main".into(), "feature".into(), "fix".into()]));
         assert_eq!(
             app.branch_rows(),
             ["feature", "fix"],
@@ -3672,6 +3536,49 @@ mod tests {
         assert!(
             app.selected_worktree().is_none(),
             "a branch row is not a checkout"
+        );
+    }
+
+    /// Branch rows nest by their recorded creation base like worktrees do:
+    /// children trail their parent (chains ramify), a base that has a
+    /// checkout — or that loops — leaves the row flat, and
+    /// `selected_branch_row` walks the same nested order.
+    #[test]
+    fn branch_rows_nest_under_the_branch_they_were_created_from() {
+        let (mut app, _main) = link_app();
+        let project = app.tree.projects[0].id.clone();
+        let branch = |name: &str, base: Option<&str>| crate::branches::LocalBranch {
+            name: name.into(),
+            created_from: base.map(str::to_owned),
+        };
+        app.branch_list = Some((
+            project,
+            vec![
+                branch("feat-a", Some("main")),
+                branch("feat-b", None),
+                branch("feat-b-sub", Some("feat-b")),
+                branch("feat-b-sub-sub", Some("feat-b-sub")),
+                branch("loop-x", Some("loop-y")),
+                branch("loop-y", Some("loop-x")),
+            ],
+        ));
+        assert_eq!(
+            app.branch_rows_with_depth(),
+            [
+                ("feat-a".into(), 0), // base has a checkout: stays flat
+                ("feat-b".into(), 0),
+                ("feat-b-sub".into(), 1),
+                ("feat-b-sub-sub".into(), 2),
+                ("loop-x".into(), 0),
+                ("loop-y".into(), 1),
+            ],
+            "chains ramify below their base, a checked-out base keeps the row flat"
+        );
+        app.sel_worktree = app.visible_worktrees().len() + 3;
+        assert_eq!(
+            app.selected_branch_row().as_deref(),
+            Some("feat-b-sub-sub"),
+            "selection walks the nested order"
         );
     }
 
@@ -3721,7 +3628,6 @@ mod tests {
             archived_at: 0,
             pinned: false,
             status_changed_at: 0,
-            orchestrator: false,
             kind: AgentKind::Claude,
             model: None,
             effort: None,
@@ -3771,42 +3677,6 @@ mod tests {
             [("main".into(), 0), ("x".into(), 0), ("y".into(), 1)],
             "the cycle breaks at one member, everything stays visible"
         );
-    }
-
-    #[test]
-    fn project_orchestrators_put_running_rows_first_stably() {
-        let (mut app, worktree) = link_app();
-        for (id, status) in [
-            ("idle-1", AgentStatus::Fresh),
-            ("running", AgentStatus::Running),
-            ("blocked", AgentStatus::NeedsFeedback),
-            ("idle-2", AgentStatus::Finished),
-        ] {
-            app.tree.agents.push(Agent {
-                id: AgentId(id.into()),
-                worktree_id: worktree.clone(),
-                name: id.into(),
-                status,
-                archived: false,
-                archived_at: 0,
-                pinned: false,
-                status_changed_at: 0,
-                orchestrator: true,
-                kind: AgentKind::Claude,
-                model: None,
-                effort: None,
-                session_id: None,
-                sort_order: 0,
-                alive: true,
-            });
-        }
-
-        let names: Vec<&str> = app
-            .project_orchestrators()
-            .iter()
-            .map(|agent| agent.name.as_str())
-            .collect();
-        assert_eq!(names, ["running", "blocked", "idle-1", "idle-2"]);
     }
 
     /// Codex (ratatui inline viewport) inserts chat history by scrolling a

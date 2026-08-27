@@ -89,28 +89,46 @@ pub fn run_worktree_delete(name: String, force: bool, project: Option<String>) -
     runtime()?.block_on(ipc::worktree_delete(name, force, project))
 }
 
-/// `nebula agent new` — spawn a session (orchestrators included).
+/// `nebula agent new` — spawn a session.
 pub fn run_agent_new(opts: NewAgentOpts) -> Result<()> {
     runtime()?.block_on(ipc::agent_new(opts))
 }
 
-/// `nebula agent list` — the orchestrator's JSON view of its workers.
-pub fn run_agent_list(project: Option<String>, all: bool) -> Result<()> {
-    runtime()?.block_on(ipc::agent_list(project, all))
+/// `nebula worktree list` — JSON map of the checkouts and who lives on them.
+pub fn run_worktree_list(project: Option<String>, all: bool) -> Result<()> {
+    runtime()?.block_on(ipc::worktree_list(project, all))
+}
+
+/// `nebula agent list` — the delegating session's JSON view of its workers.
+pub fn run_agent_list(project: Option<String>, all: bool, worktree: Option<String>) -> Result<()> {
+    runtime()?.block_on(ipc::agent_list(project, all, worktree))
+}
+
+/// `nebula agent show` — one session's full JSON row.
+pub fn run_agent_show(name: String, project: Option<String>) -> Result<()> {
+    runtime()?.block_on(ipc::agent_show(name, project))
+}
+
+/// `nebula agent read` — a worker's screen (and scrollback tail) as text.
+pub fn run_agent_read(name: String, lines: Option<usize>, project: Option<String>) -> Result<()> {
+    runtime()?.block_on(ipc::agent_read(name, lines, project))
+}
+
+/// `nebula agent send` — submit a follow-up prompt to a running worker.
+pub fn run_agent_send(name: String, text: String, project: Option<String>) -> Result<()> {
+    runtime()?.block_on(ipc::agent_send(name, text, project))
+}
+
+pub use ipc::AgentCtl;
+
+/// `nebula agent archive|unarchive|delete|restart` — lifecycle verbs.
+pub fn run_agent_ctl(op: AgentCtl, name: String, project: Option<String>) -> Result<()> {
+    runtime()?.block_on(ipc::agent_ctl(op, name, project))
 }
 
 /// `nebula agent wait` — block until workers settle out of running.
 pub fn run_agent_wait(names: Vec<String>, timeout: u64, project: Option<String>) -> Result<()> {
     runtime()?.block_on(ipc::agent_wait(names, timeout, project))
-}
-
-/// `nebula agent promote|demote <name>` — flip a session's orchestrator role.
-pub fn run_agent_set_orchestrator(
-    name: String,
-    project: Option<String>,
-    orchestrator: bool,
-) -> Result<()> {
-    runtime()?.block_on(ipc::agent_set_orchestrator(name, project, orchestrator))
 }
 
 /// `nebula workspace <add|open|list|delete|rename>` (see `ipc::run_workspace_op`).

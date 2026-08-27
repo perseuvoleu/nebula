@@ -1,8 +1,30 @@
-//! Local-branch listing for the orchestrator flow's branch picker — shelled
+//! Local-branch listing for branch pickers — shelled
 //! out to the `git` CLI like the daemon's worktree ops, newest commit first
 //! so the branch just worked on is the one under the cursor.
 
 use std::path::Path;
+
+/// One local branch plus the base it was created from, for the panel's
+/// lineage-nested branch rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalBranch {
+    pub name: String,
+    /// Branch this one was created from, read from the oldest reflog entry
+    /// (`branch: Created from <base>`). None when the reflog is gone
+    /// (expired, a fresh clone) or names no branch (a detached `HEAD`).
+    pub created_from: Option<String>,
+}
+
+/// A branch with no known base — how most test fixtures and fallbacks
+/// start out.
+impl From<&str> for LocalBranch {
+    fn from(name: &str) -> Self {
+        Self {
+            name: name.to_owned(),
+            created_from: None,
+        }
+    }
+}
 
 /// Local branches of `repo`, ordered newest-committed first. Empty when the
 /// path isn't a git repo (or git is missing) — callers fall back to the
@@ -31,6 +53,41 @@ pub fn local_branches(repo: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// `local_branches` plus each branch's creation base — one extra `git
+/// reflog` read per branch, so this runs off-loop like the listing itself.
+pub fn local_branches_with_bases(repo: &Path) -> Vec<LocalBranch> {
+    local_branches(repo)
+        .into_iter()
+        .map(|name| {
+            let created_from = branch_creation_base(repo, &name);
+            LocalBranch { name, created_from }
+        })
+        .collect()
+}
+
+/// The base a branch's oldest reflog entry names. Git writes
+/// `branch: Created from <base>` at creation; an explicit base (`git
+/// branch x y`, `git checkout -b x y`, nebula's own base picker) records
+/// the branch name, while creation from an implicit HEAD records the
+/// literal `HEAD` — useless for lineage, so it maps to None.
+fn branch_creation_base(repo: &Path, branch: &str) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["reflog", "show", "--format=%gs"])
+        .arg(branch)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let base = stdout
+        .lines()
+        .last()?
+        .strip_prefix("branch: Created from ")?
+        .trim();
+    (!base.is_empty() && base != "HEAD").then(|| base.to_owned())
+}
+
 /// Run a `git branch …` mutation (create/delete) in `repo`. Err carries
 /// git's own stderr — "not fully merged", "already exists" — so the toast
 /// says exactly why the branch didn't change.
@@ -46,7 +103,11 @@ pub fn branch_op(repo: &Path, args: &[&str]) -> Result<(), String> {
         Ok(())
     } else {
         let err = String::from_utf8_lossy(&out.stderr);
-        Err(err.lines().next().unwrap_or("git branch failed").to_string())
+        Err(err
+            .lines()
+            .next()
+            .unwrap_or("git branch failed")
+            .to_string())
     }
 }
 
@@ -94,6 +155,38 @@ mod tests {
         assert_eq!(branches.first().map(String::as_str), Some("newer"));
         assert!(branches.contains(&"main".to_string()));
         assert!(branches.contains(&"older".to_string()));
+    }
+
+    /// The reflog remembers what a branch was created from — explicit
+    /// bases come back as lineage, an implicit HEAD creation stays flat.
+    #[test]
+    fn creation_bases_come_from_the_reflog() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        run_git(&repo, &["init", "-b", "main"]);
+        run_git(&repo, &["config", "user.email", "t@t"]);
+        run_git(&repo, &["config", "user.name", "t"]);
+        run_git(&repo, &["commit", "--allow-empty", "-m", "init"]);
+        run_git(&repo, &["branch", "feat", "main"]);
+        run_git(&repo, &["branch", "sub", "feat"]);
+        run_git(&repo, &["checkout", "-b", "implicit"]);
+        run_git(&repo, &["checkout", "main"]);
+
+        let base = |name: &str| {
+            local_branches_with_bases(&repo)
+                .into_iter()
+                .find(|b| b.name == name)
+                .unwrap()
+                .created_from
+        };
+        assert_eq!(base("feat").as_deref(), Some("main"));
+        assert_eq!(base("sub").as_deref(), Some("feat"));
+        assert_eq!(
+            base("implicit"),
+            None,
+            "a literal 'Created from HEAD' names no branch"
+        );
     }
 
     #[test]

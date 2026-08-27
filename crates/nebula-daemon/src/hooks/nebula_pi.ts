@@ -1,7 +1,7 @@
 // managed by nebula — rewritten on every pi agent spawn; edits are lost.
 // Add your own extensions beside this file instead of editing it.
 // Reports the session's busy/idle state to the nebula daemon and carries
-// nebula's context injections (auto-title, notes, orchestrator) into the
+// nebula's context injections (auto-title, notes) into the
 // conversation. Inert outside nebula: without the NEBULA_* env vars it
 // registers nothing.
 // @ts-nocheck

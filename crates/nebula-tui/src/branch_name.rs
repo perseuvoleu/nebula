@@ -32,7 +32,7 @@ const FILLER: &[&str] = &[
 /// the first few meaningful words of its first non-empty line ("please fix
 /// the login redirect on mobile" → "Fix Login Redirect Mobile"). `None`
 /// when nothing survives the filtering — the caller falls back to a
-/// numbered name. This is what makes an orchestrator-spawned session
+/// numbered name. This is what makes a delegated session
 /// findable in search from the moment its row appears.
 pub fn title_from_prompt(prompt: &str) -> Option<String> {
     let line = prompt.lines().find(|l| !l.trim().is_empty())?;
@@ -192,7 +192,7 @@ mod tests {
         );
     }
 
-    /// Only the first non-empty line names the task — orchestrator prompts
+    /// Only the first non-empty line names the task — delegation prompts
     /// often carry paragraphs of context below it.
     #[test]
     fn prompt_titles_come_from_the_first_line_only() {

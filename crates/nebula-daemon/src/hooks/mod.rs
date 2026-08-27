@@ -62,46 +62,22 @@ pub fn todos_instruction(open: usize) -> String {
     )
 }
 
-/// Standing instructions for a project orchestrator, injected on every
-/// prompt (so they survive context compaction). Kept compact — this rides
-/// along with the user's message each turn.
-pub const ORCHESTRATOR_INSTRUCTION: &str = "[nebula] This session is the \
-project's ORCHESTRATOR. You manage the project by creating worktrees and \
-delegating work to agent sessions via shell commands (pre-authorized):\n\n  \
-nebula worktree new <name> [--from <ref>]\n  \
-nebula worktree delete <branch> [--force]   # removes the checkout AND \
-nebula's row (kills its sessions); never raw `git worktree remove` — \
-that leaves a ghost row in nebula\n  \
-nebula agent new --worktree <branch> [--kind claude|codex|cursor|pi] \
-[--model M] [--effort E] [--name <title>] --prompt \"<task>\"\n  \
-nebula agent list   # your workers, with status, as JSON\n  \
-nebula agent wait [<name>...] [--timeout <secs>]   # block until workers \
-settle\n\nRules: stay in \
-your own checkout (wherever it is — orchestrators may run on any branch) — \
-never cd into workers' worktrees. A single feature or fix belongs directly \
-on YOUR branch, done in your own checkout — do not create a worktree for \
-every task. Reach for worktrees only when the user hands you several \
-independent tickets that should run in parallel (one worktree per ticket so \
-workers don't collide), and ALWAYS ask the user before creating any \
-worktree — propose the split and wait for their ok. Merging is the user's \
-call too: when a worker's result is verified, ask whether to merge; only \
-after approval merge it and clean up with `nebula worktree delete <branch>` \
-(removes the local checkout AND nebula's row), then delete the merged git \
-branch. After \
-delegating, do NOT end your turn and do NOT hand-roll sleep loops: run \
-`nebula agent wait` (all your workers) or `nebula agent wait <name>...` \
-(specific ones) — it blocks until each leaves running and prints their \
-final rows as JSON (default --timeout 600, nonzero exit on timeout, then \
-wait again if work is still legitimately going). When a worker comes back \
-needs_feedback, it is blocked on a human — find out what it needs and \
-surface that to the user; when finished, verify its result before \
-reporting progress. Name everything after the \
-task you delegate — these names are how the user finds things in search: \
-the worktree name becomes its branch (\"fix login flow\" → fix-login-flow), \
-and --name gives the session a 3-4 word title (no quotes needed; omitted, \
-it is derived from --prompt). Statuses: running = busy, needs_feedback = \
-waiting on a human, finished = turn done. The user watches everything in \
-nebula's panels — keep each worker's task small and well-scoped.";
+/// Shared-checkout pointer, injected on every prompt while other unarchived
+/// sessions that have run share the agent's worktree. Foreign modifications
+/// in the diff are likely theirs — the agent should look before assuming
+/// the changes are stray or its own to manage.
+pub fn siblings_instruction(others: usize) -> String {
+    format!(
+        "[nebula] {others} other agent session{} shar{} this checkout — \
+         changes in `git status` or `git diff` that you didn't make are \
+         likely theirs, not stray. Before acting on modifications that \
+         aren't yours, run `nebula agent list` to see who else is working \
+         here and what state they're in; never revert or commit another \
+         session's changes.",
+        if others == 1 { "" } else { "s" },
+        if others == 1 { "es" } else { "e" },
+    )
+}
 
 /// Instructions as a UserPromptSubmit hook's stdout. Codex only reads
 /// injected context out of this JSON envelope (its hook output schema is
@@ -274,38 +250,6 @@ mod tests {
     use super::*;
     use nebula_core::{Agent, AgentKind, AgentStatus, Project, ProjectId, Worktree, WorktreeId};
 
-    /// The standing orchestrator brief must keep teaching task-derived
-    /// names — they are what makes delegated worktrees and sessions
-    /// findable in the search palettes.
-    #[test]
-    fn orchestrator_instruction_teaches_task_derived_naming() {
-        assert!(ORCHESTRATOR_INSTRUCTION.contains("--name"));
-        assert!(ORCHESTRATOR_INSTRUCTION.contains("search"));
-        assert!(ORCHESTRATOR_INSTRUCTION.contains("derived from --prompt"));
-    }
-
-    /// The brief must keep teaching the daemon-side worktree delete —
-    /// raw `git worktree remove` leaves a ghost row in the panel.
-    #[test]
-    fn orchestrator_instruction_teaches_worktree_delete() {
-        assert!(ORCHESTRATOR_INSTRUCTION.contains("nebula worktree delete"));
-        assert!(ORCHESTRATOR_INSTRUCTION.contains("git worktree remove"));
-        assert!(ORCHESTRATOR_INSTRUCTION.contains("ghost row"));
-    }
-
-    /// The brief must keep teaching the blocking wait: delegate, then
-    /// `nebula agent wait` — never end the turn or hand-roll sleep loops —
-    /// and surface what a needs_feedback worker is blocked on.
-    #[test]
-    fn orchestrator_instruction_teaches_blocking_wait() {
-        assert!(ORCHESTRATOR_INSTRUCTION.contains("nebula agent wait"));
-        assert!(ORCHESTRATOR_INSTRUCTION.contains("--timeout"));
-        assert!(ORCHESTRATOR_INSTRUCTION.contains("do NOT end your turn"));
-        assert!(ORCHESTRATOR_INSTRUCTION.contains("sleep loops"));
-        assert!(ORCHESTRATOR_INSTRUCTION.contains("needs_feedback"));
-        assert!(ORCHESTRATOR_INSTRUCTION.contains("surface that to the user"));
-    }
-
     /// Minimal raw HTTP/1.1 POST (Connection: close), so the real response
     /// body — what the hook one-liner pipes to the CLI's stdout — is under
     /// test, not a re-implementation of the handler's logic.
@@ -372,7 +316,6 @@ mod tests {
             session_id: None,
             sort_order: 0,
             status_changed_at: 0,
-            orchestrator: false,
             alive: false,
         };
         store
@@ -548,6 +491,45 @@ mod tests {
         );
     }
 
+    /// The shared-checkout pointer rides UserPromptSubmit while another
+    /// unarchived session on the same worktree has run; fresh and archived
+    /// siblings stay silent.
+    #[tokio::test]
+    async fn user_prompt_submit_injects_siblings_pointer_when_shared() {
+        let store = seeded_store();
+        let (env, _rx) = start_hook_server(store.clone()).await.unwrap();
+        let payload = r#"{"session_id":"s1"}"#;
+        let post = |port, token: String| async move {
+            http_post(
+                port,
+                "/api/hooks/claude?agentId=titled&hookEvent=UserPromptSubmit",
+                &token,
+                payload,
+            )
+            .await
+        };
+
+        // Sibling still fresh: silence — it has produced no changes yet.
+        let (_, body) = post(env.port, env.token.clone()).await;
+        assert_eq!(body, "");
+
+        // Sibling has run: the pointer appears.
+        store
+            .set_agent_status(&AgentId("pending".into()), AgentStatus::Running)
+            .unwrap();
+        let (status, body) = post(env.port, env.token.clone()).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, context_injection(&[siblings_instruction(1)]));
+        assert!(body.contains("nebula agent list"), "cli pointer: {body}");
+
+        // Archived sibling: silence again.
+        store
+            .set_agent_archived(&AgentId("pending".into()), true)
+            .unwrap();
+        let (_, body) = post(env.port, env.token.clone()).await;
+        assert_eq!(body, "");
+    }
+
     #[tokio::test]
     async fn bash_tool_use_carries_cwd_but_subagent_traffic_does_not() {
         let store = seeded_store();
@@ -704,10 +686,11 @@ async fn receive_hook(
         .await;
 
     if injectable {
-        // Titling instruction while the session is untitled, plus the
-        // open-notes pointer while the project/worktree has undone notes.
-        // Unknown ids (prewarm, stale env) and store errors degrade to no
-        // injection.
+        // Titling instruction while the session is untitled, the notes and
+        // todos pointers while the project/worktree has undone entries, and
+        // the shared-checkout pointer while sibling sessions have run on the
+        // same worktree. Unknown ids (prewarm, stale env) and store errors
+        // degrade to no injection.
         let mut parts = Vec::new();
         if state
             .store
@@ -715,11 +698,6 @@ async fn receive_hook(
             .unwrap_or(false)
         {
             parts.push(AUTO_TITLE_INSTRUCTION.to_string());
-        }
-        // Orchestrators get their cheat-sheet every prompt: it must
-        // survive context compaction mid-project.
-        if state.store.agent_is_orchestrator(&agent_id).unwrap_or(false) {
-            parts.push(ORCHESTRATOR_INSTRUCTION.to_string());
         }
         let open = state
             .store
@@ -734,6 +712,13 @@ async fn receive_hook(
             .unwrap_or(0);
         if open_todos > 0 {
             parts.push(todos_instruction(open_todos));
+        }
+        let siblings = state
+            .store
+            .active_sibling_count_for_agent(&agent_id)
+            .unwrap_or(0);
+        if siblings > 0 {
+            parts.push(siblings_instruction(siblings));
         }
         let body = if parts.is_empty() {
             String::new()
