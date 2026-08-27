@@ -1731,6 +1731,64 @@ pub fn is_active_status(s: AgentStatus) -> bool {
     matches!(s, AgentStatus::Running | AgentStatus::NeedsFeedback)
 }
 
+/// Deepest indent level a nested worktree row reports — chains longer than
+/// this still nest in order, but the indent stops growing so the narrow
+/// worktrees panel keeps room for the branch name.
+pub const WORKTREE_NEST_MAX_DEPTH: usize = 3;
+
+/// Reorder one pinned/unpinned worktree group into lineage order: each
+/// worktree whose `created_from` names another group member's branch is
+/// emitted directly after that parent's subtree, tagged with its depth.
+/// Roots (no parent in the group) and siblings keep the incoming order.
+/// The primary checkout never nests — it anchors the group. A
+/// `created_from` loop in the data cannot recurse forever: any row whose
+/// parent chain fails to reach a root is placed flat instead.
+fn nest_by_lineage(rows: Vec<&Worktree>) -> Vec<(&Worktree, usize)> {
+    let mut parent: Vec<Option<usize>> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, w)| {
+            if w.is_main {
+                return None;
+            }
+            w.created_from.as_ref().and_then(|base| {
+                rows.iter()
+                    .position(|p| &p.branch == base)
+                    .filter(|&p| p != i)
+            })
+        })
+        .collect();
+    for i in 0..rows.len() {
+        let mut cursor = i;
+        let mut steps = 0;
+        while let Some(p) = parent[cursor] {
+            cursor = p;
+            steps += 1;
+            if steps > rows.len() {
+                parent[i] = None;
+                break;
+            }
+        }
+    }
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); rows.len()];
+    let mut roots = Vec::new();
+    for (i, p) in parent.iter().enumerate() {
+        match p {
+            Some(p) => children[*p].push(i),
+            None => roots.push(i),
+        }
+    }
+    let mut out = Vec::with_capacity(rows.len());
+    let mut stack: Vec<(usize, usize)> = roots.into_iter().rev().map(|i| (i, 0)).collect();
+    while let Some((i, depth)) = stack.pop() {
+        out.push((rows[i], depth.min(WORKTREE_NEST_MAX_DEPTH)));
+        for &child in children[i].iter().rev() {
+            stack.push((child, depth + 1));
+        }
+    }
+    out
+}
+
 /// Epoch ms of the last interaction with a session — the stamp the sessions
 /// list sorts on and renders as "23m ago". A working session counts as
 /// interacting *now*: it is producing output as you look at it, so it holds
@@ -2805,7 +2863,27 @@ impl App {
     /// Worktrees of the selected project: pinned first, then the rest.
     /// Within each group, worktrees with active sessions lead while stable
     /// tree order and the primary checkout's existing placement are kept.
+    /// Rows are then nested by lineage — `visible_worktrees_with_depth`
+    /// with the depths dropped, so keyboard indices, hit targets, and the
+    /// draw all share one ordering.
     pub fn visible_worktrees(&self) -> Vec<&Worktree> {
+        self.visible_worktrees_with_depth()
+            .into_iter()
+            .map(|(worktree, _)| worktree)
+            .collect()
+    }
+
+    /// `visible_worktrees` plus each row's nesting depth. Within a pinned/
+    /// unpinned group, a worktree whose `created_from` names another group
+    /// member's branch moves directly after that parent (after the parent's
+    /// earlier children — chains and multiple children both nest), so
+    /// lineage reads as an indented tree. A parent in the OTHER group is
+    /// never torn out of it: the child stays a top-level row of its own
+    /// group, like a worktree whose base branch has no visible checkout.
+    /// Siblings keep the running-first stable order; the primary checkout
+    /// never nests. Depth is capped at `WORKTREE_NEST_MAX_DEPTH` so the
+    /// indent stays sane on narrow panels.
+    pub fn visible_worktrees_with_depth(&self) -> Vec<(&Worktree, usize)> {
         let Some(project) = self.selected_project() else {
             return vec![];
         };
@@ -2842,8 +2920,9 @@ impl App {
         };
         running_first(&mut pinned);
         running_first(&mut unpinned);
-        pinned.extend(unpinned);
-        pinned
+        let mut rows = nest_by_lineage(pinned);
+        rows.extend(nest_by_lineage(unpinned));
+        rows
     }
 
     /// (pinned, unpinned) worktree counts for the selected project.
@@ -3397,6 +3476,104 @@ mod tests {
             branches,
             ["pinned-running", "pinned-idle", "main", "running", "idle"],
             "running-first stays inside pinned/primary placement constraints"
+        );
+    }
+
+    fn lineage_worktree(
+        app: &mut App,
+        id: &str,
+        branch: &str,
+        created_from: Option<&str>,
+        pinned: bool,
+    ) {
+        let project = app.tree.projects[0].id.clone();
+        app.tree.worktrees.push(Worktree {
+            id: WorktreeId(id.into()),
+            project_id: project,
+            path: format!("/tmp/demo-worktrees/{branch}").into(),
+            branch: branch.into(),
+            is_main: false,
+            created_from: created_from.map(str::to_owned),
+            pinned,
+            sort_order: app.tree.worktrees.len() as i64,
+        });
+    }
+
+    fn branches_with_depth(app: &App) -> Vec<(String, usize)> {
+        app.visible_worktrees_with_depth()
+            .iter()
+            .map(|(w, d)| (w.branch.clone(), *d))
+            .collect()
+    }
+
+    /// Lineage nesting: children follow their parent (chains included),
+    /// siblings keep the running-first order, and a worktree whose base
+    /// branch has no visible checkout stays a flat row.
+    #[test]
+    fn worktrees_nest_under_the_branch_they_were_created_from() {
+        let (mut app, _main) = link_app();
+        lineage_worktree(&mut app, "a", "feat-a", Some("main"), false);
+        lineage_worktree(&mut app, "b", "feat-b", Some("feat-a"), false);
+        lineage_worktree(&mut app, "c", "feat-c", Some("main"), false);
+        lineage_worktree(&mut app, "o", "orphan", Some("ghost"), false);
+        app.tree.agents.push(Agent {
+            id: AgentId("busy".into()),
+            worktree_id: WorktreeId("c".into()),
+            name: "busy".into(),
+            status: AgentStatus::Running,
+            archived: false,
+            archived_at: 0,
+            pinned: false,
+            status_changed_at: 0,
+            orchestrator: false,
+            kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            session_id: None,
+            sort_order: 0,
+            alive: true,
+        });
+
+        assert_eq!(
+            branches_with_depth(&app),
+            [
+                ("main".into(), 0),
+                ("feat-c".into(), 1),
+                ("feat-a".into(), 1),
+                ("feat-b".into(), 2),
+                ("orphan".into(), 0),
+            ],
+            "children trail their parent, running sibling first, orphan flat"
+        );
+    }
+
+    /// A parent pinned into the other group is never torn apart from it:
+    /// the child stays a flat row of its own group.
+    #[test]
+    fn worktree_nesting_never_crosses_pin_groups() {
+        let (mut app, _main) = link_app();
+        lineage_worktree(&mut app, "base", "base", None, true);
+        lineage_worktree(&mut app, "leaf", "leaf", Some("base"), false);
+
+        assert_eq!(
+            branches_with_depth(&app),
+            [("base".into(), 0), ("main".into(), 0), ("leaf".into(), 0)],
+            "pinned parent keeps its group, unpinned child stays flat"
+        );
+    }
+
+    /// A created_from loop in the data degrades to flat placement instead
+    /// of looping forever.
+    #[test]
+    fn worktree_nesting_survives_a_created_from_cycle() {
+        let (mut app, _main) = link_app();
+        lineage_worktree(&mut app, "x", "x", Some("y"), false);
+        lineage_worktree(&mut app, "y", "y", Some("x"), false);
+
+        assert_eq!(
+            branches_with_depth(&app),
+            [("main".into(), 0), ("x".into(), 0), ("y".into(), 1)],
+            "the cycle breaks at one member, everything stays visible"
         );
     }
 

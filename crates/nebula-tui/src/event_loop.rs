@@ -16259,6 +16259,54 @@ mod tests {
         assert!(!text.contains("wt-2"), "top rows scrolled out: {text}");
     }
 
+    /// A worktree created from a visible worktree's branch renders nested:
+    /// indented under its parent, its redundant "from <base>" sub-line
+    /// dropped. One whose base has no checkout keeps the flat row and the
+    /// "from" line.
+    #[test]
+    fn worktree_rows_nest_indented_under_their_parent() {
+        use nebula_core::{Entity, Worktree, WorktreeId};
+        let mut app = App::new();
+        seed_tree(&mut app); // p1/w1(main) + agent-1
+        for (id, branch, base) in [
+            ("w2", "nest-child", Some("main")),
+            ("w3", "nest-loner", Some("ghost")),
+        ] {
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Worktree(Worktree {
+                        id: WorktreeId(id.into()),
+                        project_id: nebula_core::ProjectId("p1".into()),
+                        path: format!("/tmp/demo-worktrees/{branch}").into(),
+                        branch: branch.into(),
+                        is_main: false,
+                        created_from: base.map(str::to_owned),
+                        pinned: false,
+                        sort_order: 0,
+                    }),
+                },
+            );
+        }
+        app.focus = Focus::Worktrees;
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        let (main_x, _) = find_cell(&terminal, "main");
+        let (child_x, _) = find_cell(&terminal, "nest-child");
+        let (loner_x, _) = find_cell(&terminal, "nest-loner");
+        assert_eq!(child_x, main_x + 2, "child indents one level: {text}");
+        assert_eq!(loner_x, main_x, "orphan stays flat: {text}");
+        assert!(
+            !text.contains("from main"),
+            "nested row drops the redundant from-line: {text}"
+        );
+        assert!(
+            text.contains("from ghost"),
+            "orphan keeps its from-line: {text}"
+        );
+    }
+
     /// Session sub-rows count toward a worktree entry's scroll height, but
     /// an entry taller than the viewport still keeps its worktree row visible.
     #[test]

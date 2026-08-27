@@ -44,6 +44,34 @@ nebula-tui + full workspace green. No `make install` (orchestrator installs afte
 - The selected session tab renders `th.text` bold, so a blue-accent screen test must park
   `sel_session` on a sibling tab first; selection previews→attaches, which clears the mark, so a
   selected-and-unseen tab basically can't exist live.
+### Worktree Rows Nest Under Their Parent Branch — 2026-08-27
+
+**Asked:** "daca am un branch de la altul sau un wt de la un branch, sa apara acel wt/branch sub
+branch-ul de la care porneste, ca sa-mi dau mai usor seama care de cine apartine"
+
+**Did:** Commit `f9ce18a` (branch worktree-parent-nesting). `App::visible_worktrees` (app.rs) now
+routes through new `visible_worktrees_with_depth`: after the existing pinned/unpinned +
+running-first ordering, each group is reordered by `nest_by_lineage` (free fn next to
+`is_active_status`) — a worktree whose `created_from` matches another group member's branch is
+emitted right after that parent's subtree (chains + multiple children; siblings keep running-first
+order; `is_main` never nests; depth capped at `WORKTREE_NEST_MAX_DEPTH = 3`; a created_from cycle
+flattens the node whose parent chain never reaches a root instead of looping). `draw_worktrees`
+(ui.rs) consumes the depths: 2-cell indent per level on the pill, its session sub-rows, with
+matching truncation-width subtraction; the "from <base>" sub-line is filtered out at depth > 0
+(tuple field is `created_from.filter(|_| depth == 0)`, so `wt_heights` and the draw agree for
+free). Nesting never crosses pin groups — a child whose parent is pinned elsewhere stays flat with
+its from-line, same for a base branch with no checkout. Tests:
+`worktrees_nest_under_the_branch_they_were_created_from`, `worktree_nesting_never_crosses_pin_groups`,
+`worktree_nesting_survives_a_created_from_cycle` (app.rs),
+`worktree_rows_nest_indented_under_their_parent` (event_loop.rs screen test). 488 nebula-tui +
+full workspace green; `make install` (TUI-only, old daemon fine).
+
+**Gotchas:**
+- Dropping the "from" line must happen in the draw tuple itself (filter created_from by depth), not
+  in the render arm — `wt_heights` sums `created_from.is_some()`, and a height/render mismatch
+  desyncs scroll_skip and every hit rect below it.
+- `render_pill` inserts the selection-rail marker at span index 0, so the nest indent goes first in
+  the caller's spans and lands after the rail — rail and `PILL_RAIL_CAPS` stay at column 0.
 
 ### Notifications Rerouted Through Ghostty OSC 777 — 2026-08-27
 

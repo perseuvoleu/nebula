@@ -2924,17 +2924,23 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         Option<AgentStatus>,
         (usize, usize),
         Vec<SessionRow>,
+        usize,
     )> = app
-        .visible_worktrees()
+        .visible_worktrees_with_depth()
         .iter()
-        .map(|w| {
+        .map(|(w, depth)| {
             (
                 w.branch.clone(),
                 w.is_main,
-                w.created_from.clone(),
+                // Nested rows sit right under their parent's row — the
+                // "from <base>" sub-line would restate it; only flat rows
+                // (base branch without a visible checkout, or a parent in
+                // the other pin group) keep it.
+                w.created_from.clone().filter(|_| *depth == 0),
                 app.worktree_rollup(&w.id),
                 app.note_stats(&nebula_core::NoteOwner::Worktree(w.id.clone())),
                 app.worktree_session_rows(&w.id),
+                *depth,
             )
         })
         .collect();
@@ -3114,7 +3120,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     let wt_heights: Vec<usize> = worktrees
         .iter()
         .enumerate()
-        .map(|(i, (_, is_main, created_from, _, _, sessions))| {
+        .map(|(i, (_, is_main, created_from, _, _, sessions, _))| {
             let mut h = PILL_H as usize + usize::from(created_from.is_some()) + sessions.len();
             if grouped && (i == 0 || i == pinned_count) {
                 h += 1;
@@ -3127,9 +3133,11 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         .collect();
     let avail = (inner.height as usize).saturating_sub(screen_row);
     let wt_skip = scroll_skip(&wt_heights, app.sel_worktree, avail);
-    for (i, (branch, is_main, created_from, roll, notes, sessions)) in
+    for (i, (branch, is_main, created_from, roll, notes, sessions, depth)) in
         worktrees.iter().enumerate().skip(wt_skip)
     {
+        // 2 cells per lineage level, already depth-capped by the app side.
+        let nest = 2 * depth;
         if grouped && i == 0 {
             header(f, "PINNED".into(), &mut screen_row);
         }
@@ -3144,7 +3152,11 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         let note_badge = note_badge(*notes, th);
         let badge_len = note_badge.as_ref().map_or(0, |(s, _)| s.chars().count());
         let ramp = sweep_ramp(*roll, th, app.animations);
-        let mut spans = vec![status_dot(*roll, th)];
+        let mut spans = Vec::new();
+        if nest > 0 {
+            spans.push(Span::raw(" ".repeat(nest)));
+        }
+        spans.push(status_dot(*roll, th));
         if *is_main {
             let max =
                 (inner.width as usize).saturating_sub(2 + ROOT_BADGE.chars().count() + badge_len);
@@ -3157,7 +3169,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             spans.push(Span::styled(ROOT_BADGE, Style::default().fg(th.dim)));
         } else {
             spans.extend(status_name_spans(
-                truncate(branch, (inner.width as usize).saturating_sub(2 + badge_len)),
+                truncate(branch, (inner.width as usize).saturating_sub(2 + badge_len + nest)),
                 Style::default(),
                 ramp,
                 app.sweep_phase(),
@@ -3257,10 +3269,15 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             let detail = detail.map(|label| format!("{label} "));
             let name = truncate(
                 &name,
-                (inner.width as usize)
-                    .saturating_sub(4 + detail.as_ref().map_or(0, |label| label.chars().count())),
+                (inner.width as usize).saturating_sub(
+                    4 + nest + detail.as_ref().map_or(0, |label| label.chars().count()),
+                ),
             );
-            let mut spans = vec![indent, glyph];
+            let mut spans = vec![indent];
+            if nest > 0 {
+                spans.push(Span::raw(" ".repeat(nest)));
+            }
+            spans.push(glyph);
             if let Some(detail) = detail {
                 spans.push(Span::styled(detail, dim));
             }
