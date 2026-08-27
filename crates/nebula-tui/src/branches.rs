@@ -31,6 +31,25 @@ pub fn local_branches(repo: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Run a `git branch …` mutation (create/delete) in `repo`. Err carries
+/// git's own stderr — "not fully merged", "already exists" — so the toast
+/// says exactly why the branch didn't change.
+pub fn branch_op(repo: &Path, args: &[&str]) -> Result<(), String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .arg("branch")
+        .args(args)
+        .output()
+        .map_err(|e| format!("git: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        let err = String::from_utf8_lossy(&out.stderr);
+        Err(err.lines().next().unwrap_or("git branch failed").to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

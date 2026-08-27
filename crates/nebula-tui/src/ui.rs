@@ -479,9 +479,9 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     ],
                 ),
                 (
-                    "WORKTREES",
+                    "WORKTREES & BRANCHES",
                     &[
-                        (Act(&[New]), "new worktree"),
+                        (Act(&[New]), "new worktree (⌘K b: new branch)"),
                         (Act(&[Notes]), "notes for the worktree"),
                         (Act(&[Todos]), "todos for the worktree"),
                         (Act(&[GitDiff]), "git diff (^r: mark reviewed ✓)"),
@@ -2898,6 +2898,10 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     let orchestrators_focused = app.focus == Focus::Orchestrators;
     let worktrees_focused = app.focus == Focus::Worktrees;
     let wt_count = app.visible_worktrees().len();
+    // Checkout-less local branches render as dim ○ rows below the
+    // worktree rows; `sel_worktree` walks both as one list. Pure cache
+    // read — git never runs on the draw path.
+    let branch_rows = app.branch_rows();
     // The column is permanently split in two stacked sections: the
     // project's ORCHESTRATORS on top (the column title doubles as that
     // section's header), its WORKTREES below.
@@ -3110,14 +3114,25 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         } else {
             Style::default().fg(th.muted).add_modifier(Modifier::BOLD)
         };
-        let mut spans = vec![Span::styled(format!("{ROW_GUTTER}WORKTREES"), header_style)];
-        if wt_count > 0 {
-            spans.push(Span::styled(format!(" · {wt_count}"), dim));
+        // The section header covers both row kinds. At the default 22-col
+        // panel width the full title only fits with a trimmed gutter, and
+        // the `· N` count (all rows, branch rows included) only shows once
+        // the panel is dragged wide enough — never a clipped title.
+        let title = "WORKTREES & BRANCHES";
+        let total = wt_count + branch_rows.len();
+        let mut gutter = ROW_GUTTER;
+        while !gutter.is_empty() && gutter.len() + title.len() > inner.width as usize {
+            gutter = &gutter[..gutter.len() - 1];
+        }
+        let mut spans = vec![Span::styled(format!("{gutter}{title}"), header_style)];
+        let count = format!(" · {total}");
+        if total > 0 && gutter.len() + title.len() + count.chars().count() <= inner.width as usize {
+            spans.push(Span::styled(count, dim));
         }
         f.render_widget(Paragraph::new(Line::from(spans)), r);
     }
     screen_row += 2;
-    if worktrees.is_empty() {
+    if worktrees.is_empty() && branch_rows.is_empty() {
         if let Some(r) = row_rect(inner, screen_row) {
             f.render_widget(
                 Paragraph::new(Line::from(vec![
@@ -3133,7 +3148,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     // More worktrees than the half fits: scroll so the selected row stays
     // visible. Group headers and the primary-checkout gap are folded into
     // their entry's height, so skipping an entry skips them with it.
-    let wt_heights: Vec<usize> = worktrees
+    let mut wt_heights: Vec<usize> = worktrees
         .iter()
         .enumerate()
         .map(|(i, (_, is_main, created_from, _, _, sessions, _))| {
@@ -3147,6 +3162,10 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             h
         })
         .collect();
+    // Branch rows are plain pills below the worktree entries; folding them
+    // into the same height list keeps scroll_skip, the draw, and the hit
+    // rects on one accounting.
+    wt_heights.extend(std::iter::repeat(PILL_H as usize).take(branch_rows.len()));
     let avail = (inner.height as usize).saturating_sub(screen_row);
     let wt_skip = scroll_skip(&wt_heights, app.sel_worktree, avail);
     // Nest-guide geometry: level `l` owns the 2-cell column pair starting
@@ -3165,6 +3184,9 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             }
         }
     };
+    // The half ran out of rows mid-list: the branch rows below must not
+    // render either, or they'd paint ahead of worktrees that were skipped.
+    let mut out_of_rows = false;
     for (i, (branch, is_main, created_from, roll, notes, sessions, depth)) in
         worktrees.iter().enumerate().skip(wt_skip)
     {
@@ -3179,6 +3201,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         let worktree_height = PILL_H as usize + usize::from(created_from.is_some());
         let entry_height = worktree_height + sessions.len();
         if row_rect(inner, screen_row + worktree_height - 1).is_none() {
+            out_of_rows = true;
             break;
         }
         let note_badge = note_badge(*notes, th);
@@ -3373,6 +3396,41 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                 }
             }
             screen_row += 1;
+        }
+    }
+    // Local branches without a checkout: dim ○ pills after the worktree
+    // rows — no sessions, no from-line. Their indices continue the same
+    // scroll_skip accounting (heights already appended above).
+    if !out_of_rows {
+        for (j, branch) in branch_rows
+            .iter()
+            .enumerate()
+            .skip(wt_skip.saturating_sub(worktrees.len()))
+        {
+            if row_rect(inner, screen_row + PILL_H as usize - 1).is_none() {
+                break;
+            }
+            let spans = vec![
+                Span::styled("○ ", dim),
+                Span::styled(
+                    truncate(branch, (inner.width as usize).saturating_sub(3)),
+                    dim,
+                ),
+            ];
+            let selected = app.sel_worktree == worktrees.len() + j;
+            render_pill(
+                f,
+                inner,
+                screen_row as isize,
+                spans,
+                selected,
+                worktrees_focused,
+                th,
+            );
+            if let Some(hit) = rows_rect(inner, screen_row, PILL_H) {
+                app.hits.push((hit, HitTarget::WorktreeBranch(j)));
+            }
+            screen_row += PILL_H as usize;
         }
     }
     push_section_backgrounds(app);
