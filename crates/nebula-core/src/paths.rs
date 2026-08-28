@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Runtime dir holding the socket + pidfile. Mode 0700 — this is the auth
 /// boundary, same model as tmux. `NEBULA_RUNTIME_DIR` overrides (tests,
@@ -86,4 +86,22 @@ pub fn daemon_log_path() -> PathBuf {
 
 pub fn tui_log_path() -> PathBuf {
     log_dir().join("tui.log")
+}
+
+/// Directory a nebula-made worktree for `branch` lives in:
+/// `<repo>/../<repo-name>-worktrees/<branch>` (slashes in branch → dashes).
+/// Shared by the daemon (which creates checkouts here) and the TUI (which
+/// tells a checkout made FOR a branch apart from one the branch was merely
+/// switched to inside).
+pub fn worktree_dir(repo: &Path, branch: &str) -> PathBuf {
+    let repo_name = repo
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "repo".into());
+    let safe_branch = branch.replace('/', "-");
+    repo.parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(format!("{repo_name}-worktrees"))
+        .join(safe_branch)
 }

@@ -48,6 +48,10 @@ async fn serve() -> Result<()> {
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, "boot sweep failed"),
     }
+    // Hand-run-CLI statuses on shell tabs died with their PTYs too.
+    if let Err(e) = store.sweep_terminal_statuses() {
+        tracing::warn!(error = %e, "terminal status sweep failed");
+    }
 
     // Hook receiver: loopback HTTP endpoint the claude hook one-liners hit.
     // It shares the store to answer UserPromptSubmit hooks with the

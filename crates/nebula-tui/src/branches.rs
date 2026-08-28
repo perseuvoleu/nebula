@@ -88,6 +88,16 @@ fn branch_creation_base(repo: &Path, branch: &str) -> Option<String> {
     (!base.is_empty() && base != "HEAD").then(|| base.to_owned())
 }
 
+/// Delete a local branch: `-d` first, and when git refuses because the tip
+/// isn't fully merged, retry with `-D`. The force isn't silent — every
+/// caller sits behind a confirm dialog that warns commits may be lost.
+pub fn delete_branch(repo: &Path, branch: &str) -> Result<(), String> {
+    match branch_op(repo, &["-d", branch]) {
+        Err(e) if e.contains("not fully merged") => branch_op(repo, &["-D", branch]),
+        r => r,
+    }
+}
+
 /// Run a `git branch …` mutation (create/delete) in `repo`. Err carries
 /// git's own stderr — "not fully merged", "already exists" — so the toast
 /// says exactly why the branch didn't change.

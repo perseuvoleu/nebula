@@ -138,6 +138,15 @@ pub fn split_connection(conn: Connection) -> IpcChannels {
     }
 }
 
+/// NEBULA_AGENT_ID when it names a real agent session. Shell tabs export a
+/// `term:`-prefixed id (hook routing for hand-run CLIs) that no agent row
+/// matches — commands that resolve their own agent treat it as absent.
+fn env_agent_id() -> Option<String> {
+    std::env::var("NEBULA_AGENT_ID")
+        .ok()
+        .filter(|v| !v.is_empty() && !v.starts_with("term:"))
+}
+
 /// One-shot client for `nebula rename`, run from inside an agent session's
 /// CLI: resolve the agent from NEBULA_AGENT_ID and ask the daemon to title
 /// it. Never spawns a daemon — no daemon means no session worth titling.
@@ -146,13 +155,10 @@ pub fn split_connection(conn: Connection) -> IpcChannels {
 /// path) both print and exit 0: for the model running this, a declined
 /// auto-title is a settled answer, not a failure to retry.
 pub async fn rename_current_agent(title: String, force: bool) -> Result<()> {
-    let agent_id = std::env::var("NEBULA_AGENT_ID")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .context(
-            "NEBULA_AGENT_ID is not set — `nebula rename` only works from inside a \
+    let agent_id = env_agent_id().context(
+        "NEBULA_AGENT_ID is not set — `nebula rename` only works from inside a \
              nebula agent session",
-        )?;
+    )?;
     let sock = paths::socket_path();
     let Ok(stream) = try_connect(&sock).await else {
         bail!("no nebula daemon is running — title unchanged");
@@ -519,9 +525,7 @@ fn resolve_project(
         })?;
         return Ok(hit.clone());
     }
-    let agent_id = std::env::var("NEBULA_AGENT_ID")
-        .ok()
-        .filter(|v| !v.is_empty())
+    let agent_id = env_agent_id()
         .context("not inside a nebula agent session — pass --project <name> to pick the target")?;
     let agent = agents
         .iter()

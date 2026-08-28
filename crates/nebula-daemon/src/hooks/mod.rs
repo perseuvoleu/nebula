@@ -299,6 +299,7 @@ mod tests {
                 is_main: true,
                 created_from: None,
                 pinned: false,
+                for_branch: false,
                 sort_order: 0,
             })
             .unwrap();

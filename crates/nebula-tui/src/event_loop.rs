@@ -628,13 +628,21 @@ fn handle_branch_event(app: &mut App, ev: BranchEvent) {
     }
 }
 
+/// The git branch mutations the panel runs: a raw `git branch …` arg list
+/// (create), or the lossless delete that knows when `-D` can't lose
+/// commits.
+enum BranchCmd {
+    Op(Vec<String>),
+    Delete(String),
+}
+
 /// Run a `git branch` mutation in the project's primary checkout, off the
 /// loop; the outcome comes back as a `BranchEvent::Op` flash. Under test
 /// (no channel) it runs inline.
 fn spawn_branch_op(
     app: &mut App,
     project: &nebula_core::ProjectId,
-    args: Vec<String>,
+    cmd: BranchCmd,
     done: String,
 ) {
     let repo = app
@@ -655,8 +663,14 @@ fn spawn_branch_op(
         return;
     };
     let run = move || {
-        let args: Vec<&str> = args.iter().map(String::as_str).collect();
-        match crate::branches::branch_op(&repo, &args) {
+        let result = match &cmd {
+            BranchCmd::Op(args) => {
+                let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                crate::branches::branch_op(&repo, &args)
+            }
+            BranchCmd::Delete(branch) => crate::branches::delete_branch(&repo, branch),
+        };
+        match result {
             Ok(()) => BranchEvent::Op {
                 message: done,
                 error: false,
@@ -952,7 +966,14 @@ fn handle_terminal_event(app: &mut App, event: Event, out: &mut Vec<ClientReques
         Event::Paste(text) if paste_into_overlay(app, &text) => {}
         Event::Paste(text) => {
             if app.focus == Focus::Terminal && app.term_locked {
-                if let Some(term) = &app.term {
+                // Same pane routing as typed keys: the ⌘D split's right
+                // pane takes the paste while it holds the input lock.
+                let term = if app.split_focused && app.split_term.is_some() {
+                    app.split_term.as_ref()
+                } else {
+                    app.term.as_ref()
+                };
+                if let Some(term) = term {
                     // Bracketed paste so the child (claude, vim…) knows.
                     let mut data = b"\x1b[200~".to_vec();
                     data.extend_from_slice(text.as_bytes());
@@ -1104,6 +1125,10 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 }
                 Some(crate::keymap::Action::SplitTerminal) => {
                     toggle_split_terminal(app, out);
+                    return;
+                }
+                Some(crate::keymap::Action::FocusOtherPane) => {
+                    focus_other_pane(app);
                     return;
                 }
                 Some(action) if action.tab_index().is_some() => {
@@ -1534,6 +1559,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         Action::ContextMenu => open_context_menu_for_selection(app),
         Action::GitDiff => open_diff_view(app),
         Action::SplitTerminal => toggle_split_terminal(app, out),
+        Action::FocusOtherPane => focus_other_pane(app),
         Action::OpenRepo => open_repo_in_browser(app),
         // AddProject adds a project from ANY panel — unlike New it never
         // changes meaning with focus, matching the "open a repo" instinct.
@@ -1546,7 +1572,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         // t: the new-session picker (agents + shell) on the selection's
         // checkout — complements n, which creates worktrees/branches when
         // that panel has focus.
-        Action::NewSessionPicker => open_session_picker_for_context(app),
+        Action::NewSessionPicker => open_session_picker_for_context(app, out),
         // New shell terminal, spawned in the worktree's directory.
         // (Cmd+T never reaches a TUI — the emulator opens its own tab.)
         Action::NewTerminal => create_terminal_for_context(app, out),
@@ -2281,7 +2307,7 @@ fn toggle_archived(app: &mut App, out: &mut Vec<ClientRequest>) {
 /// selection's checkout — the selected worktree, or the project's main
 /// checkout when the Projects panel has focus. The plain shell lives on the
 /// picker's Terminal row; ⇧T/⌘T still spawn one directly.
-fn open_session_picker_for_context(app: &mut App) {
+fn open_session_picker_for_context(app: &mut App, out: &mut Vec<ClientRequest>) {
     let worktree = match app.focus {
         Focus::Projects => app.selected_project().and_then(|p| {
             app.tree
@@ -2293,10 +2319,49 @@ fn open_session_picker_for_context(app: &mut App) {
         _ => app.selected_worktree().map(|w| w.id.clone()),
     };
     let Some(worktree) = worktree else {
+        // The cursor can sit on a checkout-less branch row: same flow as
+        // the row menu's "New agent here" — a checkout is created for the
+        // branch when it needs one, the picker follows.
+        if let Some((project, branch)) = app
+            .selected_project()
+            .map(|p| p.id.clone())
+            .zip(app.selected_branch_row())
+        {
+            pick_agent_on_branch(app, project, branch, out);
+            return;
+        }
         app.flash = Some("select a project or worktree first".into());
         return;
     };
     open_new_agent_picker(app, worktree);
+}
+
+/// The session picker on a branch: an existing checkout (the primary
+/// included) goes straight to the picker; a checkout-less branch gets a
+/// worktree created checking it out, and the picker follows its Ack.
+fn pick_agent_on_branch(
+    app: &mut App,
+    project: nebula_core::ProjectId,
+    branch: String,
+    out: &mut Vec<ClientRequest>,
+) {
+    if let Some(worktree) = app
+        .tree
+        .worktrees
+        .iter()
+        .find(|w| w.project_id == project && w.branch == branch)
+        .map(|w| w.id.clone())
+    {
+        open_new_agent_picker(app, worktree);
+    } else {
+        let req_id = app.alloc_req_id(PendingIntent::PickAgentOnCreatedWorktree);
+        out.push(ClientRequest::CreateWorktree {
+            req_id,
+            project,
+            branch,
+            base: None,
+        });
+    }
 }
 
 /// Shift+T: create a shell terminal whose pwd is the selection's checkout —
@@ -2361,10 +2426,12 @@ fn select_session_tab(app: &mut App, idx: usize, out: &mut Vec<ClientRequest>) {
         app.dirty = true;
         return;
     };
-    attach(app, sref, out);
+    attach(app, sref.clone(), out);
     if stay_locked {
-        // The lock follows the main pane — a ⌘D split hands it over.
-        app.split_focused = false;
+        // The lock follows the pane that holds the session: picking the
+        // ⌘D split's own tab keeps the split focused (attach rerouted it
+        // there); any other tab hands the lock to the main pane.
+        app.split_focused = app.split_term.as_ref().is_some_and(|t| t.sref == sref);
         app.focus = Focus::Terminal;
         app.term_locked = true;
     } else {
@@ -2425,39 +2492,94 @@ fn toggle_quick_terminal(app: &mut App, out: &mut Vec<ClientRequest>) {
     }
 }
 
-/// ⌘D: toggle the split terminal. Opening keeps the current attachment in
-/// the left pane and creates a fresh unnamed shell — in the same worktree
-/// context as what's attached (or selected) — for the right pane; its Ack
-/// attaches there and moves the input lock onto it, so the user can type
-/// straight away. The split owns that shell (it never shows as a session
-/// tab), so a second ⌘D closes it for real: the usual close confirm, then
-/// CloseTerminal → detach_if_attached → close_split_terminal — same as ⌘W
-/// on the focused split — leaving no orphan terminal tab behind.
+/// ⌘D: toggle the split pane. Opening keeps the current attachment in the
+/// left pane and asks what the right pane should run — the same kinds the
+/// new-session picker offers (Claude/Codex/Cursor/Pi or a shell), created
+/// in the same worktree context as what's attached (or selected). The row
+/// matching the current attachment starts hovered, so Enter-Enter still
+/// means "another one of these". The pick creates the session immediately
+/// (configured defaults, generated name — no name prompt) and its Ack
+/// attaches it on the right with the input lock. The sibling is a normal,
+/// independent session (it shows as a tab; ⌘O and clicks switch panes),
+/// so a second ⌘D only closes the *pane*: the right session detaches and
+/// keeps running as a tab — ⌘W is the one that kills it.
 fn toggle_split_terminal(app: &mut App, out: &mut Vec<ClientRequest>) {
-    if let Some(sref) = app.split_term.as_ref().map(|t| t.sref.clone()) {
-        close_session(app, sref, out);
+    if app.split_term.is_some() {
+        close_split_terminal(app, out);
         return;
     }
     let Some(worktree) = quick_terminal_worktree(app) else {
         app.flash = Some("select a project or worktree first".into());
         return;
     };
-    let req_id = app.alloc_req_id(PendingIntent::AttachCreatedSplit);
-    out.push(ClientRequest::CreateTerminal {
-        req_id,
-        worktree,
-        name: None,
-    });
+    let kind_row = |label: &str, kind: AgentKind| MenuItem {
+        label: label.into(),
+        action: MenuAction::SplitAgentOfKind {
+            worktree: worktree.clone(),
+            kind,
+        },
+        destructive: false,
+    };
+    let items = vec![
+        kind_row("Claude", AgentKind::Claude),
+        kind_row("Codex", AgentKind::Codex),
+        kind_row("Cursor", AgentKind::Cursor),
+        kind_row("Pi", AgentKind::Pi),
+        MenuItem {
+            label: "Terminal (shell)".into(),
+            action: MenuAction::SplitShell(worktree),
+            destructive: false,
+        },
+    ];
+    // Start on "another one of these": the attached agent's kind row, or
+    // the shell row when a terminal (or nothing) is attached.
+    let hover = match app.term.as_ref().map(|t| &t.sref) {
+        Some(SessionRef::Agent(id)) => app
+            .tree
+            .agents
+            .iter()
+            .find(|a| &a.id == id)
+            .map(|a| match a.kind {
+                AgentKind::Claude => 0,
+                AgentKind::Codex => 1,
+                AgentKind::Cursor => 2,
+                AgentKind::Pi => 3,
+            })
+            .unwrap_or(0),
+        Some(SessionRef::Terminal(_)) => items.len() - 1,
+        None => 0,
+    };
+    app.overlay = Some(Overlay::Menu(ContextMenu {
+        title: Some("Split pane".into()),
+        items,
+        at: None,
+        hover,
+        area: ratatui::layout::Rect::default(),
+        parent: None,
+        filter: None,
+    }));
 }
 
-/// Tear down the ⌘D split pane state: detach the right pane's shell and
-/// hand the input lock back to the left pane — or drop out of the terminal
-/// when nothing is attached there. This is the local teardown only; the
-/// shell's session is closed by the confirm flow that gets here (via
-/// `detach_if_attached`), or is already gone (worktree deleted, exited).
+/// ⌘D-close (and death) path: unmount the split pane AND forget its
+/// pairing, so the owner tab comes back split-less next time.
 fn close_split_terminal(app: &mut App, out: &mut Vec<ClientRequest>) {
+    if let Some(sref) = app.split_term.as_ref().map(|t| t.sref.clone()) {
+        app.split_pairs.retain(|_, v| v != &sref);
+    }
+    hide_split_pane(app, out);
+}
+
+/// Unmount the ⌘D split pane: detach the right pane's session and hand the
+/// input lock back to the left pane — or drop out of the terminal when
+/// nothing is attached there. The session itself keeps running as a normal
+/// tab (its parser is parked for a cheap re-attach); the pairing survives,
+/// so `attach` restores the pane when its owner session returns.
+fn hide_split_pane(app: &mut App, out: &mut Vec<ClientRequest>) {
     if let Some(t) = app.split_term.take() {
-        out.push(ClientRequest::Detach { session: t.sref });
+        out.push(ClientRequest::Detach {
+            session: t.sref.clone(),
+        });
+        app.park_term(t);
     }
     app.split_focused = false;
     app.split_term_area = ratatui::layout::Rect::default();
@@ -2468,9 +2590,16 @@ fn close_split_terminal(app: &mut App, out: &mut Vec<ClientRequest>) {
     app.dirty = true;
 }
 
-/// Attach the ⌘D-created shell in the split's right pane and lock input
+/// Attach the ⌘D-created session in the split's right pane and lock input
 /// onto it. The left pane's attachment is untouched.
 fn attach_split(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
+    mount_split(app, sref, out, true);
+}
+
+/// Mount a session in the split's right pane and record its pairing with
+/// the left-pane session. `take_focus` moves the input lock onto it (the
+/// ⌘D-create path); the restore-on-return path leaves focus where it is.
+fn mount_split(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>, take_focus: bool) {
     // Same visit rule as `attach`: the split pane is on the worktree too.
     if let Some(worktree) = app.worktree_of_sref(&sref) {
         app.mark_worktree_seen(&worktree);
@@ -2483,6 +2612,11 @@ fn attach_split(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
         }
         app.park_term(existing);
     }
+    // The split belongs to the session it was opened from: switching the
+    // left pane away hides it, switching back restores it (see `attach`).
+    if let Some(owner) = app.term.as_ref().map(|t| t.sref.clone()) {
+        app.split_pairs.insert(owner, sref.clone());
+    }
     let (cols, rows) = split_pane_size(app);
     let (term, from_seq) = resume_or_fresh(app, &sref, cols, rows);
     app.split_term = Some(term);
@@ -2492,7 +2626,32 @@ fn attach_split(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
         cols,
         rows,
     });
-    app.split_focused = true;
+    if take_focus {
+        app.split_focused = true;
+        app.focus = Focus::Terminal;
+        app.term_locked = true;
+    } else {
+        app.split_focused = false;
+    }
+    app.dirty = true;
+}
+
+/// ⌘O: move the input lock to the split's other pane, so switching between
+/// the two side-by-side sessions never needs the mouse. A no-op without a
+/// split; switching to an empty left pane is refused (nothing to type into).
+fn focus_other_pane(app: &mut App) {
+    if app.split_term.is_none() {
+        app.flash = Some("no split open — ⌘d opens one".into());
+        return;
+    }
+    if app.split_focused {
+        if app.term.is_none() {
+            return;
+        }
+        app.split_focused = false;
+    } else {
+        app.split_focused = true;
+    }
     app.focus = Focus::Terminal;
     app.term_locked = true;
     app.dirty = true;
@@ -2625,20 +2784,8 @@ fn open_delete_confirm(app: &mut App) {
                     app.flash = Some("cannot delete the main checkout".into());
                     return;
                 }
-                let live_here = app
-                    .visible_sessions()
-                    .iter()
-                    .filter(|a| !a.archived)
-                    .count()
-                    + app.visible_terminals().len();
-                app.overlay = Some(Overlay::Confirm(ConfirmDialog {
-                    title: "Delete worktree".into(),
-                    message: format!(
-                        "Delete worktree '{}' from disk? {live_here} session(s) will be killed.",
-                        w.branch
-                    ),
-                    action: PendingAction::DeleteWorktree(w.id.clone()),
-                }));
+                let dialog = delete_worktree_confirm(app, w);
+                app.overlay = Some(Overlay::Confirm(dialog));
             } else if let Some(branch) = app.selected_branch_row() {
                 // A checkout-less branch row: same confirm as the row
                 // menu's Delete branch.
@@ -2646,7 +2793,7 @@ fn open_delete_confirm(app: &mut App) {
                     app.overlay = Some(Overlay::Confirm(ConfirmDialog {
                         title: "Delete branch".into(),
                         message: format!(
-                            "Delete local branch '{branch}'? (git refuses unmerged branches)"
+                            "Delete local branch '{branch}'?\nWARNING: commits only on this branch are LOST."
                         ),
                         action: PendingAction::DeleteBranch { project, branch },
                     }));
@@ -2760,7 +2907,7 @@ fn open_delete_all_confirm(app: &mut App) {
             app.overlay = Some(Overlay::Confirm(ConfirmDialog {
                 title: format!("Delete ALL {} worktree(s)", ids.len()),
                 message: format!(
-                    "Delete these {} worktree(s) from disk? {killed} session(s) will be killed.\n{}\nThe main checkout stays.",
+                    "Delete these {} worktree(s) from disk? {killed} session(s) will be killed.\n{}\nThe main checkout stays. Uncommitted changes in them are LOST.",
                     ids.len(),
                     bulk_confirm_listing(&names),
                 ),
@@ -3230,6 +3377,31 @@ fn project_local_branches(
     Some((branches, root_branch))
 }
 
+/// Picker-row label for a branch: the primary checkout keeps its `⌂`
+/// badge, any other checkout reads `(wt)`, a checkout-less branch
+/// `(branch)` — the same kinds the panel's rows tag.
+fn branch_pick_label(
+    app: &App,
+    project: &nebula_core::ProjectId,
+    branch: &str,
+    root_branch: Option<&String>,
+) -> String {
+    if Some(branch) == root_branch.map(String::as_str) {
+        format!("{branch} ⌂ primary")
+    } else if app
+        .tree
+        .worktrees
+        .iter()
+        // A for_branch checkout hosts sessions on a branch the user made
+        // as a branch — the picker keeps calling it one.
+        .any(|w| &w.project_id == project && w.branch == branch && !w.for_branch)
+    {
+        format!("{branch} (wt)")
+    } else {
+        format!("{branch} (branch)")
+    }
+}
+
 /// The `a` palette command: pick a local branch FIRST, then run the
 /// normal new-session picker on its checkout — the mirror of the
 /// branch flow's kind-first order, for plain sessions.
@@ -3241,11 +3413,7 @@ fn open_agent_branch_picker(app: &mut App, project: nebula_core::ProjectId) {
     let items: Vec<MenuItem> = branches
         .into_iter()
         .map(|branch| MenuItem {
-            label: if Some(&branch) == root_branch.as_ref() {
-                format!("{branch} ⌂ primary")
-            } else {
-                branch.clone()
-            },
+            label: branch_pick_label(app, &project, &branch, root_branch.as_ref()),
             action: MenuAction::AgentOnBranch {
                 project: project.clone(),
                 branch,
@@ -3280,11 +3448,7 @@ fn open_new_branch_base_picker(app: &mut App, project: nebula_core::ProjectId, n
     let items: Vec<MenuItem> = branches
         .into_iter()
         .map(|base| MenuItem {
-            label: if Some(&base) == root_branch.as_ref() {
-                format!("{base} ⌂ primary")
-            } else {
-                base.clone()
-            },
+            label: branch_pick_label(app, &project, &base, root_branch.as_ref()),
             action: MenuAction::CreateBranchFrom {
                 project: project.clone(),
                 name: name.clone(),
@@ -3395,11 +3559,7 @@ fn open_base_branch_picker(
     let mut items: Vec<MenuItem> = branches
         .into_iter()
         .map(|b| MenuItem {
-            label: if Some(&b) == root_branch.as_ref() {
-                format!("{b} ⌂ primary")
-            } else {
-                b.clone()
-            },
+            label: branch_pick_label(app, &project, &b, root_branch.as_ref()),
             action: MenuAction::CreateWorktreeFrom {
                 project: project.clone(),
                 branch: branch.clone(),
@@ -3731,7 +3891,13 @@ fn open_context_menu_for_selection(app: &mut App) {
                 ];
                 if !w.is_main {
                     items.push(MenuItem {
-                        label: "Delete worktree".into(),
+                        // A row presenting as a branch deletes as one.
+                        label: if w.for_branch {
+                            "Delete branch"
+                        } else {
+                            "Delete worktree"
+                        }
+                        .into(),
                         action: MenuAction::DeleteWorktree(w.id.clone()),
                         destructive: true,
                     });
@@ -4956,7 +5122,10 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                         .or_else(|| {
                             (worktree.branch != "(detached)").then(|| worktree.branch.clone())
                         })
-                });
+                })
+                // A checkout-less branch row under the cursor is just as
+                // deliberate a base choice as a selected worktree.
+                .or_else(|| app.selected_branch_row());
             // The name step chains into the base-branch picker: Enter on
             // the hovered default row recreates the old implicit choice,
             // typing fuzzy-picks any other local branch.
@@ -5061,6 +5230,25 @@ fn run_pending_action(app: &mut App, action: PendingAction, out: &mut Vec<Client
             out.push(ClientRequest::DeleteLink { req_id, id });
         }
         PendingAction::DeleteWorktree(id) => {
+            // A branch created in place inside a pre-existing checkout: the
+            // daemon reverts the checkout to its base and the row SURVIVES
+            // (an EntityUpserted renames it) — no optimistic removal, or
+            // the row would flicker out and its sessions with it.
+            let survives = app
+                .tree
+                .worktrees
+                .iter()
+                .find(|w| w.id == id)
+                .is_some_and(|w| w.for_branch && !checkout_purpose_made(app, w));
+            if survives {
+                let req_id = app.alloc_req_id(PendingIntent::None);
+                out.push(ClientRequest::DeleteWorktree {
+                    req_id,
+                    id,
+                    force: true,
+                });
+                return;
+            }
             // Optimistic: drop the rows now (the daemon deletes in the
             // background — `git worktree remove` can take seconds). The
             // eventual EntityRemoved is a no-op; an Error for this req_id
@@ -5117,9 +5305,96 @@ fn run_pending_action(app: &mut App, action: PendingAction, out: &mut Vec<Client
         }
         PendingAction::DeleteBranch { project, branch } => {
             let done = format!("branch {branch} deleted");
-            spawn_branch_op(app, &project, vec!["-d".into(), branch], done);
+            spawn_branch_op(app, &project, BranchCmd::Delete(branch), done);
         }
         PendingAction::Quit => app.should_quit = true,
+    }
+}
+
+/// Whether a for_branch checkout is the one nebula made FOR its branch
+/// (it lives in nebula's worktree dir for that name). The alternative is a
+/// pre-existing checkout the branch was created inside (an in-place
+/// `checkout -b`): deleting that row reverts the checkout to its base
+/// instead of removing it.
+fn checkout_purpose_made(app: &App, w: &nebula_core::Worktree) -> bool {
+    app.tree
+        .projects
+        .iter()
+        .find(|p| p.id == w.project_id)
+        .is_some_and(|p| nebula_core::paths::worktree_dir(&p.repo_path, &w.branch) == w.path)
+}
+
+/// The delete confirm for a worktree row. A row presenting as a branch
+/// (`for_branch`) deletes as one — the wording says what actually happens
+/// to its checkout — while a plain worktree row keeps the classic text.
+fn delete_worktree_confirm(app: &App, w: &nebula_core::Worktree) -> ConfirmDialog {
+    let live_here = app
+        .tree
+        .agents
+        .iter()
+        .filter(|a| a.worktree_id == w.id && !a.archived)
+        .count()
+        + app
+            .tree
+            .terminals
+            .iter()
+            .filter(|t| t.worktree_id == w.id)
+            .count();
+    let dirty = dirty_count(app, w);
+    let (title, mut message) = if w.for_branch && !checkout_purpose_made(app, w) {
+        (
+            "Delete branch",
+            format!(
+                "Delete branch '{}'? The checkout goes back to {}; sessions keep running.\nCommits only on this branch are LOST.",
+                w.branch,
+                w.created_from.as_deref().unwrap_or("its previous branch"),
+            ),
+        )
+    } else if w.for_branch {
+        (
+            "Delete branch",
+            format!(
+                "Delete branch '{}' and its checkout? {live_here} session(s) will be killed.\nCommits only on this branch are LOST.",
+                w.branch
+            ),
+        )
+    } else {
+        (
+            "Delete worktree",
+            format!(
+                "Delete worktree '{}' from disk? {live_here} session(s) will be killed.",
+                w.branch
+            ),
+        )
+    };
+    if dirty > 0 {
+        // The revert-to-base case carries changes over when they don't
+        // conflict; the removal cases always lose them.
+        let fate = if w.for_branch && !checkout_purpose_made(app, w) {
+            "may be discarded"
+        } else {
+            "will be LOST"
+        };
+        message.push_str(&format!(
+            "\nWARNING: {dirty} uncommitted change(s) {fate}."
+        ));
+    }
+    ConfirmDialog {
+        title: title.into(),
+        message,
+        action: PendingAction::DeleteWorktree(w.id.clone()),
+    }
+}
+
+/// Uncommitted-change count for a worktree about to be deleted: the badge
+/// cache when it already describes this checkout, a one-off status read
+/// otherwise (opening a confirm is rare enough to afford one).
+fn dirty_count(app: &App, w: &nebula_core::Worktree) -> usize {
+    match &app.git_changes {
+        Some((id, Some(n))) if *id == w.id => *n,
+        _ => crate::git_diff::changed_files(&w.path)
+            .map(|f| f.len())
+            .unwrap_or(0),
     }
 }
 
@@ -5173,6 +5448,35 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
         MenuAction::NewAgent(worktree) => open_new_agent_picker(app, worktree),
         MenuAction::NewTerminal(worktree) => {
             let req_id = app.alloc_req_id(PendingIntent::AttachCreated);
+            out.push(ClientRequest::CreateTerminal {
+                req_id,
+                worktree,
+                name: None,
+            });
+        }
+        MenuAction::SplitAgentOfKind { worktree, kind } => {
+            // Straight to the create — the split skips the name prompt and
+            // model submenus on purpose: configured defaults, generated
+            // name, auto-title, mounted in the right pane by its Ack.
+            let cfg = crate::config::Config::load();
+            let req_id = app.alloc_req_id(PendingIntent::AttachCreatedSplit);
+            out.push(ClientRequest::CreateAgent {
+                req_id,
+                worktree: worktree.clone(),
+                name: app.default_session_name("agent"),
+                kind,
+                model: cfg.default_model(kind),
+                effort: cfg.default_effort(kind),
+                auto_title: true,
+                prompt: None,
+            });
+            // Same warm-slot refill as `create_agent`.
+            if kind == AgentKind::Claude {
+                out.push(default_claude_prewarm(worktree));
+            }
+        }
+        MenuAction::SplitShell(worktree) => {
+            let req_id = app.alloc_req_id(PendingIntent::AttachCreatedSplit);
             out.push(ClientRequest::CreateTerminal {
                 req_id,
                 worktree,
@@ -5243,26 +5547,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             )
         }
         MenuAction::AgentOnBranch { project, branch } => {
-            // Existing checkout (the primary included): straight into the
-            // session picker. No checkout: create the worktree checking
-            // out the existing branch, picker follows its Ack.
-            if let Some(worktree) = app
-                .tree
-                .worktrees
-                .iter()
-                .find(|w| w.project_id == project && w.branch == branch)
-                .map(|w| w.id.clone())
-            {
-                open_new_agent_picker(app, worktree);
-            } else {
-                let req_id = app.alloc_req_id(PendingIntent::PickAgentOnCreatedWorktree);
-                out.push(ClientRequest::CreateWorktree {
-                    req_id,
-                    project,
-                    branch,
-                    base: None,
-                });
-            }
+            pick_agent_on_branch(app, project, branch, out);
         }
         MenuAction::CreateWorktreeFrom {
             project,
@@ -5287,12 +5572,14 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             base,
         } => {
             let done = format!("branch {name} created from {base}");
-            spawn_branch_op(app, &project, vec![name, base], done);
+            spawn_branch_op(app, &project, BranchCmd::Op(vec![name, base]), done);
         }
         MenuAction::DeleteBranch { project, branch } => {
             app.overlay = Some(Overlay::Confirm(ConfirmDialog {
                 title: "Delete branch".into(),
-                message: format!("Delete local branch '{branch}'? (git refuses unmerged branches)"),
+                message: format!(
+                    "Delete local branch '{branch}'?\nWARNING: commits only on this branch are LOST."
+                ),
                 action: PendingAction::DeleteBranch { project, branch },
             }));
         }
@@ -5316,11 +5603,8 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
         }
         MenuAction::DeleteWorktree(id) => {
             if let Some(w) = app.tree.worktrees.iter().find(|w| w.id == id).cloned() {
-                app.overlay = Some(Overlay::Confirm(ConfirmDialog {
-                    title: "Delete worktree".into(),
-                    message: format!("Delete worktree '{}' from disk?", w.branch),
-                    action: PendingAction::DeleteWorktree(id),
-                }));
+                let dialog = delete_worktree_confirm(app, &w);
+                app.overlay = Some(Overlay::Confirm(dialog));
             }
         }
         MenuAction::AddProject => open_prompt(app, PromptKind::AddProject),
@@ -5419,15 +5703,19 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
 }
 
 fn detach_if_attached(app: &mut App, sref: &SessionRef, out: &mut Vec<ClientRequest>) {
+    // The ⌘D split's session can be closed/deleted out from under it: drop
+    // the right pane rather than render a dead screen. Before the cache
+    // purge below — closing the pane parks its parser.
+    if app.split_term.as_ref().is_some_and(|t| &t.sref == sref) {
+        close_split_terminal(app, out);
+    }
+    // A dying session ends any ⌘D pairing it took part in, hidden or not —
+    // as owner (nothing to restore onto) or as the split half.
+    app.split_pairs.retain(|k, v| k != sref && v != sref);
     // Every caller is a session going away (closed, archived, deleted, or
     // its worktree removed) — a parked parser for it would only be resumed
     // against a session that no longer exists.
     app.drop_cached_term(sref);
-    // The ⌘D split's shell can be closed/deleted out from under it: drop
-    // the right pane rather than render a dead screen.
-    if app.split_term.as_ref().is_some_and(|t| &t.sref == sref) {
-        close_split_terminal(app, out);
-    }
     if let Some(term) = &app.term {
         if &term.sref == sref {
             out.push(ClientRequest::Detach {
@@ -6141,11 +6429,30 @@ fn attach(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
     let (term, from_seq) = resume_or_fresh(app, &sref, cols, rows);
     app.term = Some(term);
     out.push(ClientRequest::Attach {
-        session: sref,
+        session: sref.clone(),
         from_seq,
         cols,
         rows,
     });
+    // Deliberately mounting a split session as a main tab pulls it out of
+    // its pair (the visible-split case was rerouted above instead).
+    app.split_pairs.retain(|_, v| v != &sref);
+    // The ⌘D split is paired to the session it was opened from: hide the
+    // pane when the left pane moves elsewhere, restore it — without
+    // stealing the focus — when its owner comes back.
+    let paired = app.split_pairs.get(&sref).cloned();
+    if app
+        .split_term
+        .as_ref()
+        .is_some_and(|t| Some(&t.sref) != paired.as_ref())
+    {
+        hide_split_pane(app, out);
+    }
+    if app.split_term.is_none() {
+        if let Some(paired) = paired {
+            mount_split(app, paired, out, false);
+        }
+    }
 }
 
 /// Mount a session's parser: the parked one when this pane already holds
@@ -6282,6 +6589,65 @@ fn pane_cell(area: ratatui::layout::Rect, col: u16, row: u16) -> (u16, u16) {
         col.clamp(area.x, max_x) - area.x,
         row.clamp(area.y, max_y) - area.y,
     )
+}
+
+/// Route a wheel event into one terminal pane — either half of the ⌘D
+/// split. The child may have asked for the mouse (claude's alt-screen UI,
+/// vim `mouse=a`, htop): forward the wheel event itself — synthesized
+/// arrows would land in claude's input box, cycling prompt history and
+/// tripping its "Scroll wheel is sending arrow keys" warning. Full-screen
+/// apps that ignore the mouse expect arrows; a plain shell scrolls our own
+/// scrollback view.
+fn wheel_into_pane(
+    term: &mut AttachedTerm,
+    area: ratatui::layout::Rect,
+    mouse: &MouseEvent,
+    up: bool,
+    out: &mut Vec<ClientRequest>,
+) {
+    let screen = term.parser.screen();
+    let mouse_mode = screen.mouse_protocol_mode();
+    let sgr = screen.mouse_protocol_encoding() == vt100::MouseProtocolEncoding::Sgr;
+    let alternate = screen.alternate_screen();
+    if mouse_mode != vt100::MouseProtocolMode::None {
+        let (col, row) = pane_cell(area, mouse.column, mouse.row);
+        let button: u16 = if up { 64 } else { 65 };
+        let data = if sgr {
+            format!("\x1b[<{button};{};{}M", col + 1, row + 1).into_bytes()
+        } else {
+            // Legacy X10 bytes: 32 + button/coord, 1-based coords capped
+            // at the encoding's 223 limit.
+            vec![
+                0x1b,
+                b'[',
+                b'M',
+                32 + button as u8,
+                32 + (col + 1).min(223) as u8,
+                32 + (row + 1).min(223) as u8,
+            ]
+        };
+        out.push(ClientRequest::Input {
+            session: term.sref.clone(),
+            data,
+        });
+    } else if alternate {
+        let arrow: &[u8] = if up {
+            b"\x1b[A\x1b[A\x1b[A"
+        } else {
+            b"\x1b[B\x1b[B\x1b[B"
+        };
+        out.push(ClientRequest::Input {
+            session: term.sref.clone(),
+            data: arrow.to_vec(),
+        });
+    } else {
+        let new_scroll = if up {
+            term.scroll.saturating_add(3)
+        } else {
+            term.scroll.saturating_sub(3)
+        };
+        term.set_scroll(new_scroll);
+    }
 }
 
 /// Text under the current selection, from the screen's visible view
@@ -7554,15 +7920,12 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
             let in_term =
                 matches!(over, Some(HitTarget::TerminalPane)) || (app.collapsed && !in_split);
             if in_split {
-                // Wheel over the ⌘D split's right pane walks that shell's
-                // scrollback (no mouse-protocol forwarding — it's a shell).
+                // Wheel over the ⌘D split's right pane: same routing as the
+                // left pane — the child may be an agent whose alt-screen UI
+                // wants the mouse events themselves.
+                let area = app.split_term_area;
                 if let Some(term) = &mut app.split_term {
-                    let new_scroll = if up {
-                        term.scroll.saturating_add(3)
-                    } else {
-                        term.scroll.saturating_sub(3)
-                    };
-                    term.set_scroll(new_scroll);
+                    wheel_into_pane(term, area, &mouse, up, out);
                     app.dirty = true;
                 }
             } else if over_sessions {
@@ -7578,60 +7941,12 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 }
                 app.dirty = true;
             } else if in_term {
+                let area = app.term_area;
                 if let Some(term) = &mut app.term {
                     // Scrolling shifts the content under a (screen-anchored)
                     // selection highlight — drop it.
                     app.term_selection = None;
-                    let screen = term.parser.screen();
-                    let mouse_mode = screen.mouse_protocol_mode();
-                    let sgr = screen.mouse_protocol_encoding() == vt100::MouseProtocolEncoding::Sgr;
-                    let alternate = screen.alternate_screen();
-                    if mouse_mode != vt100::MouseProtocolMode::None {
-                        // The child asked for the mouse (claude's alt-screen
-                        // UI, vim `mouse=a`, htop): forward the wheel event
-                        // itself. Synthesized arrows would land in claude's
-                        // input box — cycling prompt history and tripping its
-                        // "Scroll wheel is sending arrow keys" warning.
-                        let (col, row) = pane_cell(app.term_area, mouse.column, mouse.row);
-                        let button: u16 = if up { 64 } else { 65 };
-                        let data = if sgr {
-                            format!("\x1b[<{button};{};{}M", col + 1, row + 1).into_bytes()
-                        } else {
-                            // Legacy X10 bytes: 32 + button/coord, 1-based
-                            // coords capped at the encoding's 223 limit.
-                            vec![
-                                0x1b,
-                                b'[',
-                                b'M',
-                                32 + button as u8,
-                                32 + (col + 1).min(223) as u8,
-                                32 + (row + 1).min(223) as u8,
-                            ]
-                        };
-                        out.push(ClientRequest::Input {
-                            session: term.sref.clone(),
-                            data,
-                        });
-                    } else if alternate {
-                        // Full-screen apps that ignore the mouse (plain vim,
-                        // less, htop with mouse off) expect arrows.
-                        let arrow: &[u8] = if up {
-                            b"\x1b[A\x1b[A\x1b[A"
-                        } else {
-                            b"\x1b[B\x1b[B\x1b[B"
-                        };
-                        out.push(ClientRequest::Input {
-                            session: term.sref.clone(),
-                            data: arrow.to_vec(),
-                        });
-                    } else {
-                        let new_scroll = if up {
-                            term.scroll.saturating_add(3)
-                        } else {
-                            term.scroll.saturating_sub(3)
-                        };
-                        term.set_scroll(new_scroll);
-                    }
+                    wheel_into_pane(term, area, &mouse, up, out);
                     app.dirty = true;
                 }
             } else if matches!(
@@ -7736,7 +8051,13 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                         ];
                         if !w.is_main {
                             items.push(MenuItem {
-                                label: "Delete worktree".into(),
+                                // A row presenting as a branch deletes as one.
+                                label: if w.for_branch {
+                                    "Delete branch"
+                                } else {
+                                    "Delete worktree"
+                                }
+                                .into(),
                                 action: MenuAction::DeleteWorktree(w.id.clone()),
                                 destructive: true,
                             });
@@ -8096,8 +8417,17 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                         app.term_locked = true;
                     }
                 }
-                (Some(PendingIntent::AttachCreatedSplit), Some(EntityId::Terminal(id))) => {
-                    attach_split(app, SessionRef::Terminal(id), out);
+                (Some(PendingIntent::AttachCreatedSplit), Some(id)) => {
+                    // ⌘D's sibling: an agent when one was attached, a shell
+                    // otherwise — either way it mounts in the right pane.
+                    let sref = match id {
+                        EntityId::Agent(id) => Some(SessionRef::Agent(id)),
+                        EntityId::Terminal(id) => Some(SessionRef::Terminal(id)),
+                        _ => None,
+                    };
+                    if let Some(sref) = sref {
+                        attach_split(app, sref, out);
+                    }
                 }
                 (Some(PendingIntent::PickAgentOnCreatedWorktree), Some(EntityId::Worktree(id))) => {
                     // The `a` flow's branch had no checkout: it exists now —
@@ -8793,6 +9123,7 @@ mod tests {
                     is_main: true,
                     created_from: None,
                     pinned: false,
+                    for_branch: false,
                     sort_order: 0,
                 }),
             },
@@ -9088,6 +9419,7 @@ mod tests {
                         is_main: false,
                         created_from: None,
                         pinned: false,
+                        for_branch: false,
                         sort_order: 1,
                     }),
                 },
@@ -9107,7 +9439,7 @@ mod tests {
                 menu.items
             );
             assert_eq!(menu.hover, 0, "the best match is hovered");
-            assert_eq!(menu.items[0].label, "feature");
+            assert_eq!(menu.items[0].label, "feature (wt)");
             let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
             terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
             assert!(
@@ -9199,7 +9531,10 @@ mod tests {
             panic!("name submit opens the base picker: {:?}", app.overlay);
         };
         assert_eq!(menu.title.as_deref(), Some("Base branch"));
-        assert_eq!(menu.items[0].label, "feature", "branches list newest-first");
+        assert_eq!(
+            menu.items[0].label, "feature (branch)",
+            "branches list newest-first"
+        );
         assert_eq!(
             menu.items[menu.hover].label, "main ⌂ primary",
             "the selected worktree's branch starts hovered"
@@ -9926,6 +10261,7 @@ mod tests {
                     is_main: false,
                     created_from: None,
                     pinned: false,
+                    for_branch: false,
                     sort_order: 1,
                 }),
             },
@@ -10156,6 +10492,7 @@ mod tests {
                     is_main: false,
                     created_from: None,
                     pinned: false,
+                    for_branch: false,
                     sort_order: 1,
                 }),
             },
@@ -10504,6 +10841,7 @@ mod tests {
                 is_main: false,
                 created_from: None,
                 pinned,
+                for_branch: false,
                 sort_order: 0,
             }),
         };
@@ -11148,6 +11486,7 @@ mod tests {
                     is_main: false,
                     created_from: None,
                     pinned: false,
+                    for_branch: false,
                     sort_order: 0,
                 }),
             },
@@ -11206,6 +11545,58 @@ mod tests {
         assert!(
             app.pending.is_empty(),
             "failed request leaves no pending intent"
+        );
+    }
+
+    /// The delete confirm warns about uncommitted changes — the delete is
+    /// forced, so this line is the only thing standing between the user
+    /// and lost work — and stays quiet on a clean checkout.
+    #[test]
+    fn worktree_delete_confirm_warns_on_dirty_checkout() {
+        use nebula_core::{Entity, Worktree, WorktreeId};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let wt_id = WorktreeId("w2".into());
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(Worktree {
+                    id: wt_id.clone(),
+                    project_id: nebula_core::ProjectId("p1".into()),
+                    path: "/tmp/demo-feature".into(),
+                    branch: "feature".into(),
+                    is_main: false,
+                    created_from: None,
+                    pinned: false,
+                    for_branch: false,
+                    sort_order: 0,
+                }),
+            },
+        );
+        let w = app
+            .tree
+            .worktrees
+            .iter()
+            .find(|w| w.id == wt_id)
+            .unwrap()
+            .clone();
+
+        app.git_changes = Some((wt_id.clone(), Some(3)));
+        let dialog = delete_worktree_confirm(&app, &w);
+        assert!(
+            dialog
+                .message
+                .contains("WARNING: 3 uncommitted change(s) will be LOST"),
+            "dirty checkout warns:\n{}",
+            dialog.message
+        );
+
+        app.git_changes = Some((wt_id, Some(0)));
+        let dialog = delete_worktree_confirm(&app, &w);
+        assert!(
+            !dialog.message.contains("WARNING"),
+            "clean checkout keeps the classic text:\n{}",
+            dialog.message
         );
     }
 
@@ -11548,6 +11939,8 @@ mod tests {
                     sort_order: 0,
                     alive: true,
                     busy: false,
+                    status: None,
+                    status_changed_at: 0,
                 }),
             },
         );
@@ -11585,6 +11978,8 @@ mod tests {
                     sort_order: 0,
                     alive: false,
                     busy: false,
+                    status: None,
+                    status_changed_at: 0,
                 }),
             },
         );
@@ -11621,6 +12016,8 @@ mod tests {
                     sort_order: 0,
                     alive: true,
                     busy: false,
+                    status: None,
+                    status_changed_at: 0,
                 }),
             },
         );
@@ -11671,6 +12068,8 @@ mod tests {
                     sort_order: 0,
                     alive: true,
                     busy: false,
+                    status: None,
+                    status_changed_at: 0,
                 }),
             },
         );
@@ -12306,6 +12705,8 @@ mod tests {
                     sort_order: 0,
                     alive: true,
                     busy: false,
+                    status: None,
+                    status_changed_at: 0,
                 }),
             },
         );
@@ -12383,6 +12784,7 @@ mod tests {
                     is_main: false,
                     created_from: None,
                     pinned: false,
+                    for_branch: false,
                     sort_order: 1,
                 }),
             },
@@ -13739,6 +14141,8 @@ mod tests {
                     sort_order: 0,
                     alive: true,
                     busy: false,
+                    status: None,
+                    status_changed_at: 0,
                 }),
             },
         );
@@ -13793,6 +14197,7 @@ mod tests {
                     is_main: true,
                     created_from: None,
                     pinned: false,
+                    for_branch: false,
                     sort_order: 0,
                 }),
             },
@@ -13891,14 +14296,15 @@ mod tests {
         assert!(!app.quick_term, "⌘T closes the floating quick terminal");
     }
 
-    /// ⌘D splits the terminal pane: the current attachment stays in the
-    /// left pane, a fresh unnamed shell is created in the same worktree,
-    /// and its Ack attaches it in the right pane with the input lock —
-    /// ready to type. Keys follow the pane focus, the split survives a
-    /// left-pane session switch, and a second ⌘D closes it.
+    /// ⌘D with an agent attached splits the pane with a *sibling agent*:
+    /// same kind/model/effort, same worktree, created as a normal session
+    /// and attached in the right pane with the input lock — ready to
+    /// prompt. Keys follow the pane focus (⌘O switches it), the split
+    /// survives a left-pane session switch, and a second ⌘D closes only
+    /// the pane — the sibling keeps running as a tab.
     #[test]
-    fn cmd_d_splits_with_a_fresh_shell_then_toggles_closed() {
-        use nebula_core::{EntityId, TerminalId, WorktreeId};
+    fn cmd_d_splits_with_a_sibling_agent_then_toggles_closed() {
+        use nebula_core::{AgentKind, EntityId, WorktreeId};
         let mut app = App::new();
         seed_tree(&mut app);
         let mut out = Vec::new();
@@ -13907,34 +14313,64 @@ mod tests {
         app.term_locked = true;
 
         // ⌘D fires through the locked-terminal SUPER intercept: not
-        // forwarded to the PTY, and no diff viewer (that moved to ⌘G/g).
+        // forwarded to the PTY, no diff viewer (that moved to ⌘G/g) —
+        // instead the split picker comes up, hovering the attached
+        // session's kind so Enter means "another one of these".
         out.clear();
         press(&mut app, KeyCode::Char('d'), KeyModifiers::SUPER, &mut out);
-        assert!(app.overlay.is_none(), "⌘d no longer opens the git diff");
+        let hovered = match &app.overlay {
+            Some(Overlay::Menu(m)) => {
+                assert_eq!(m.title.as_deref(), Some("Split pane"));
+                m.items[m.hover].action.clone()
+            }
+            other => panic!("⌘d opens the split picker: {other:?}"),
+        };
+        assert!(
+            matches!(
+                &hovered,
+                MenuAction::SplitAgentOfKind { worktree, kind: AgentKind::Claude }
+                    if worktree == &WorktreeId("w1".into())
+            ),
+            "the attached Claude's kind row starts hovered: {hovered:?}"
+        );
+
+        // Enter picks it: a sibling Claude agent is created right away
+        // (plus the usual warm-slot refill) — no name prompt.
+        out.clear();
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none(), "the pick closes the menu");
         let req_id = match out.as_slice() {
-            [ClientRequest::CreateTerminal {
+            [ClientRequest::CreateAgent {
                 req_id,
                 worktree,
-                name: None,
-            }] if worktree == &WorktreeId("w1".into()) => *req_id,
-            other => panic!("expected a fresh unnamed shell in w1: {other:?}"),
+                kind: AgentKind::Claude,
+                model: None,
+                effort: None,
+                auto_title: true,
+                ..
+            }, ClientRequest::PrewarmAgent { .. }]
+                if worktree == &WorktreeId("w1".into()) =>
+            {
+                *req_id
+            }
+            other => panic!("expected a sibling Claude agent in w1: {other:?}"),
         };
 
-        // The daemon upserts the terminal entity just before the Ack; the
-        // Ack attaches the shell on the right and locks input onto it.
-        seed_terminal(&mut app, "t9", "term-2");
+        // The daemon upserts the agent entity just before the Ack; the
+        // Ack attaches the sibling on the right and locks input onto it.
+        seed_agent(&mut app, "a9", "w1");
         hse(
             &mut app,
             ServerEvent::Ack {
                 req_id,
-                created: Some(EntityId::Terminal(TerminalId("t9".into()))),
+                created: Some(EntityId::Agent(AgentId("a9".into()))),
             },
         );
         assert_eq!(
             app.split_term.as_ref().map(|t| t.sref.clone()),
-            Some(SessionRef::Terminal(TerminalId("t9".into())))
+            Some(SessionRef::Agent(AgentId("a9".into())))
         );
-        assert!(app.split_focused, "the new shell holds the input lock");
+        assert!(app.split_focused, "the sibling holds the input lock");
         assert!(app.term_locked);
         assert_eq!(app.focus, Focus::Terminal);
         assert_eq!(
@@ -13943,20 +14379,23 @@ mod tests {
             "the left pane keeps the current attachment"
         );
 
-        // Keys route to the right-hand shell…
+        // Keys route to the right-hand sibling…
         out.clear();
         press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE, &mut out);
         assert!(
             matches!(
                 out.as_slice(),
                 [ClientRequest::Input { session, .. }]
-                    if session == &SessionRef::Terminal(TerminalId("t9".into()))
+                    if session == &SessionRef::Agent(AgentId("a9".into()))
             ),
-            "typing lands in the split shell: {out:?}"
+            "typing lands in the split sibling: {out:?}"
         );
 
-        // …and back to the left pane once it takes the lock again.
-        app.split_focused = false;
+        // …⌘O hands the lock to the left pane…
+        out.clear();
+        press(&mut app, KeyCode::Char('o'), KeyModifiers::SUPER, &mut out);
+        assert!(!app.split_focused, "⌘O switches to the left pane");
+        assert!(app.term_locked);
         out.clear();
         press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE, &mut out);
         assert!(
@@ -13968,47 +14407,49 @@ mod tests {
             "typing lands in the left pane: {out:?}"
         );
 
-        // Switching the left attachment leaves the split alone.
-        attach(&mut app, SessionRef::Agent(AgentId("a2".into())), &mut out);
-        assert!(app.split_term.is_some(), "split survives a session switch");
+        // …and ⌘O again goes back to the right pane.
+        out.clear();
+        press(&mut app, KeyCode::Char('o'), KeyModifiers::SUPER, &mut out);
+        assert!(app.split_focused, "⌘O switches back to the split");
 
-        // A second ⌘D closes the split for real: the split owns its shell,
-        // so the usual terminal-close confirm comes up (same as ⌘W on the
-        // focused split) instead of quietly leaking the shell as a tab.
+        // The split is paired with the tab it was opened from: switching
+        // the left pane to another session hides it…
+        attach(&mut app, SessionRef::Agent(AgentId("a2".into())), &mut out);
+        assert!(
+            app.split_term.is_none(),
+            "another tab shows no split — the pair belongs to a1"
+        );
+        // …and walking back to the owner restores it, without stealing
+        // the focus onto the right pane.
+        attach(&mut app, SessionRef::Agent(AgentId("a1".into())), &mut out);
+        assert_eq!(
+            app.split_term.as_ref().map(|t| t.sref.clone()),
+            Some(SessionRef::Agent(AgentId("a9".into()))),
+            "the owner tab brings its split back"
+        );
+        assert!(!app.split_focused, "restoring does not steal the lock");
+
+        // A second ⌘D closes the *pane* only: the sibling detaches, keeps
+        // running, and stays a normal session tab — no confirm, no kill.
         out.clear();
         press(&mut app, KeyCode::Char('d'), KeyModifiers::SUPER, &mut out);
+        assert!(app.overlay.is_none(), "closing the pane needs no confirm");
+        assert!(app.split_term.is_none(), "the pane is gone");
         assert!(
             matches!(
-                &app.overlay,
-                Some(Overlay::Confirm(c))
-                    if matches!(&c.action, PendingAction::CloseTerminal(id)
-                        if id == &TerminalId("t9".into()))
+                out.as_slice(),
+                [ClientRequest::Detach { session }]
+                    if session == &SessionRef::Agent(AgentId("a9".into()))
             ),
-            "⌘d again confirms closing the split shell: {:?}",
-            app.overlay
-        );
-        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE, &mut out);
-        assert!(app.split_term.is_none(), "confirming closes the split");
-        assert!(
-            out.iter().any(|r| matches!(r,
-                ClientRequest::CloseTerminal { id, .. } if id == &TerminalId("t9".into()))),
-            "the shell session is closed daemon-side, not left behind: {out:?}"
+            "the sibling only detaches — ⌘W is what kills it: {out:?}"
         );
         assert_eq!(app.focus, Focus::Terminal);
         assert!(app.term_locked, "the left pane keeps the input lock");
-
-        // Once the daemon confirms the removal, no `term-N` tab survives.
-        hse(
-            &mut app,
-            ServerEvent::EntityRemoved {
-                id: EntityId::Terminal(TerminalId("t9".into())),
-            },
-        );
         assert!(
             app.visible_session_rows()
                 .iter()
-                .all(|r| r.sref() != Some(SessionRef::Terminal(TerminalId("t9".into())))),
-            "the split shell leaves no session tab behind"
+                .any(|r| r.sref() == Some(SessionRef::Agent(AgentId("a9".into())))),
+            "the sibling lives on as a session tab"
         );
     }
 
@@ -14082,32 +14523,46 @@ mod tests {
         );
     }
 
-    /// ⌘D from the panels (nothing locked) opens the split on the
-    /// selected worktree too.
+    /// ⌘D from the panels (nothing locked) opens the split picker on the
+    /// selected worktree too; picking the shell row creates the terminal.
     #[test]
-    fn cmd_d_from_the_panels_creates_the_split_shell() {
+    fn cmd_d_from_the_panels_opens_the_picker() {
         use nebula_core::WorktreeId;
         let mut app = App::new();
         seed_tree(&mut app);
         app.focus = Focus::Worktrees;
         let mut out = Vec::new();
         press(&mut app, KeyCode::Char('d'), KeyModifiers::SUPER, &mut out);
+        let shell_row = match &app.overlay {
+            Some(Overlay::Menu(m)) => {
+                assert_eq!(m.title.as_deref(), Some("Split pane"));
+                m.items
+                    .iter()
+                    .position(|i| matches!(&i.action, MenuAction::SplitShell(_)))
+                    .expect("the picker offers a shell row")
+            }
+            other => panic!("⌘d opens the split picker: {other:?}"),
+        };
+        if let Some(Overlay::Menu(m)) = &mut app.overlay {
+            m.hover = shell_row;
+        }
+        out.clear();
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
         assert!(
             matches!(
                 out.as_slice(),
                 [ClientRequest::CreateTerminal { worktree, name: None, .. }]
                     if worktree == &WorktreeId("w1".into())
             ),
-            "⌘d from the panels creates the split shell: {out:?}"
+            "the shell row creates the split shell: {out:?}"
         );
     }
 
-    /// The ⌘D shell belongs to the split, not the tab strip: while the
-    /// split is up its terminal renders in the right pane only — no
-    /// `term-N` tab appears next to the normal sessions (the screenshot
-    /// bug), and no session row can re-attach it as the left pane.
+    /// The ⌘D split's session is a normal, independent session: it shows
+    /// in the tab strip and the worktree sub-lists like any other — only
+    /// mounting it twice is guarded (attach() reroutes to the split).
     #[test]
-    fn split_shell_is_not_a_session_tab() {
+    fn split_session_is_a_normal_tab() {
         use nebula_core::TerminalId;
         let mut app = App::new();
         seed_tree(&mut app);
@@ -14122,23 +14577,21 @@ mod tests {
             &mut out,
         );
 
-        // Row lists — the tab strip, Sessions navigation, and the
-        // worktree sub-lists all read these — exclude the split's shell.
         let split = SessionRef::Terminal(TerminalId("t9".into()));
         assert!(
             app.visible_session_rows()
                 .iter()
-                .all(|r| r.sref().as_ref() != Some(&split)),
-            "the split shell is not a session row"
+                .any(|r| r.sref().as_ref() == Some(&split)),
+            "the split session is a normal session row"
         );
         assert!(
             app.worktree_session_rows(&nebula_core::WorktreeId("w1".into()))
                 .iter()
-                .all(|r| r.sref().as_ref() != Some(&split)),
-            "the split shell is not in the worktree sub-list"
+                .any(|r| r.sref().as_ref() == Some(&split)),
+            "the split session shows in the worktree sub-list"
         );
 
-        // Screenshot-level: the tab bar shows the normal tabs, no term-2.
+        // Screenshot-level: both tabs render side by side in the bar.
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
@@ -14147,8 +14600,8 @@ mod tests {
             "the normal session tab still renders:\n{text}"
         );
         assert!(
-            !text.contains("term-2"),
-            "the split shell renders no top-level tab:\n{text}"
+            text.contains("term-2"),
+            "the split session renders as a tab too:\n{text}"
         );
     }
 
@@ -14189,7 +14642,8 @@ mod tests {
         );
         assert!(app.split_focused, "the split takes the focus instead");
 
-        // A normal tab still attaches as the left pane; the split stays.
+        // A normal tab still attaches as the left pane; the split hides
+        // (it belongs to a1's tab) and comes back when a1 returns.
         let rows = app.visible_session_rows();
         let other = rows
             .iter()
@@ -14204,10 +14658,38 @@ mod tests {
             Some(SessionRef::Terminal(TerminalId("t2".into()))),
             "a normal tab mounts as the left pane"
         );
+        assert!(
+            app.split_term.is_none(),
+            "the split hides on a foreign tab — it belongs to a1"
+        );
+        attach(&mut app, SessionRef::Agent(AgentId("a1".into())), &mut out);
         assert_eq!(
             app.split_term.as_ref().map(|t| t.sref.clone()),
             Some(SessionRef::Terminal(TerminalId("t9".into()))),
-            "the split survives selecting a normal tab"
+            "a1's tab restores its split"
+        );
+
+        // Mounting the split session itself as a main tab dissolves the
+        // pair: a1 comes back split-less afterwards.
+        attach(
+            &mut app,
+            SessionRef::Terminal(TerminalId("t2".into())),
+            &mut out,
+        );
+        attach(
+            &mut app,
+            SessionRef::Terminal(TerminalId("t9".into())),
+            &mut out,
+        );
+        assert_eq!(
+            app.term.as_ref().map(|t| t.sref.clone()),
+            Some(SessionRef::Terminal(TerminalId("t9".into()))),
+            "with its pair hidden, the split session mounts as a normal tab"
+        );
+        attach(&mut app, SessionRef::Agent(AgentId("a1".into())), &mut out);
+        assert!(
+            app.split_term.is_none(),
+            "the dissolved pair does not come back"
         );
     }
 
@@ -14216,7 +14698,7 @@ mod tests {
     /// resizes each PTY to its own half.
     #[test]
     fn split_panes_render_and_resize_independently() {
-        use nebula_core::{EntityId, TerminalId};
+        use nebula_core::EntityId;
         let mut app = App::new();
         seed_tree(&mut app);
         let mut out = Vec::new();
@@ -14225,15 +14707,23 @@ mod tests {
         app.term_locked = true;
         out.clear();
         press(&mut app, KeyCode::Char('d'), KeyModifiers::SUPER, &mut out);
+        assert!(
+            matches!(&app.overlay, Some(Overlay::Menu(_))),
+            "⌘d opens the split picker"
+        );
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
         let req_id = match out.as_slice() {
-            [ClientRequest::CreateTerminal { req_id, .. }] => *req_id,
-            other => panic!("expected CreateTerminal: {other:?}"),
+            [ClientRequest::CreateAgent { req_id, .. }, ClientRequest::PrewarmAgent { .. }] => {
+                *req_id
+            }
+            other => panic!("expected CreateAgent: {other:?}"),
         };
+        seed_agent(&mut app, "a9", "w1");
         hse(
             &mut app,
             ServerEvent::Ack {
                 req_id,
-                created: Some(EntityId::Terminal(TerminalId("t9".into()))),
+                created: Some(EntityId::Agent(AgentId("a9".into()))),
             },
         );
         hse(
@@ -14247,7 +14737,7 @@ mod tests {
         hse(
             &mut app,
             ServerEvent::Output {
-                session: SessionRef::Terminal(TerminalId("t9".into())),
+                session: SessionRef::Agent(AgentId("a9".into())),
                 seq: 1,
                 data: b"RIGHTSIDE".to_vec(),
             },
@@ -14278,7 +14768,7 @@ mod tests {
                     ClientRequest::Resize { session: s1, cols: c1, rows: r1 },
                     ClientRequest::Resize { session: s2, cols: c2, rows: r2 },
                 ] if s1 == &SessionRef::Agent(AgentId("a1".into()))
-                    && s2 == &SessionRef::Terminal(TerminalId("t9".into()))
+                    && s2 == &SessionRef::Agent(AgentId("a9".into()))
                     && (*c1, *r1) == (l.width, l.height)
                     && (*c2, *r2) == (r.width, r.height)
             ),
@@ -14320,6 +14810,7 @@ mod tests {
                     is_main: false,
                     created_from: None,
                     pinned: false,
+                    for_branch: false,
                     sort_order: 0,
                 }),
             },
@@ -14647,6 +15138,7 @@ mod tests {
             is_main: false,
             created_from: None,
             pinned: false,
+            for_branch: false,
             sort_order: 0,
         };
         hse(
@@ -14683,6 +15175,7 @@ mod tests {
                     is_main: false,
                     created_from: Some("develop".into()),
                     pinned: false,
+                    for_branch: false,
                     sort_order: 0,
                 }),
             },
@@ -14721,7 +15214,7 @@ mod tests {
             panic!("name submit opens the base picker: {:?}", app.overlay);
         };
         assert_eq!(menu.title.as_deref(), Some("Base branch"));
-        assert_eq!(menu.items[menu.hover].label, "selected-feature");
+        assert_eq!(menu.items[menu.hover].label, "selected-feature (wt)");
         handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
@@ -14908,6 +15401,7 @@ mod tests {
                     is_main: false,
                     created_from: None,
                     pinned: false,
+                    for_branch: false,
                     sort_order: 1,
                 }),
             },
@@ -14995,6 +15489,7 @@ mod tests {
                     is_main: false,
                     created_from: None,
                     pinned: false,
+                    for_branch: false,
                     sort_order: 1,
                 }),
             },
@@ -15050,6 +15545,7 @@ mod tests {
                         is_main: false,
                         created_from: None,
                         pinned: false,
+                        for_branch: false,
                         sort_order: i as i64,
                     }),
                 },
@@ -15074,6 +15570,8 @@ mod tests {
                     sort_order: 0,
                     alive: true,
                     busy: false,
+                    status: None,
+                    status_changed_at: 0,
                 }),
             },
         );
@@ -15242,10 +15740,10 @@ mod tests {
         let mut app = App::new();
         seed_tree(&mut app); // p1/w1(main) + agent-1
         for (id, branch, base) in [
-            ("w2", "nest-child", Some("main")),
-            ("w3", "nest-loner", Some("ghost")),
-            ("w4", "nest-grand", Some("nest-child")),
-            ("w5", "nest-last", Some("main")),
+            ("w2", "n-child", Some("main")),
+            ("w3", "n-loner", Some("ghost")),
+            ("w4", "n-grand", Some("n-child")),
+            ("w5", "n-last", Some("main")),
         ] {
             hse(
                 &mut app,
@@ -15258,6 +15756,7 @@ mod tests {
                         is_main: false,
                         created_from: base.map(str::to_owned),
                         pinned: false,
+                        for_branch: false,
                         sort_order: 0,
                     }),
                 },
@@ -15271,10 +15770,10 @@ mod tests {
         let text = buffer_text(&terminal);
         let cell = |x: u16, y: u16| terminal.backend().buffer()[(x, y)].symbol().to_string();
         let (main_x, main_y) = find_cell(&terminal, "main");
-        let (child_x, child_y) = find_cell(&terminal, "nest-child");
-        let (grand_x, grand_y) = find_cell(&terminal, "nest-grand");
-        let (last_x, last_y) = find_cell(&terminal, "nest-last");
-        let (loner_x, _) = find_cell(&terminal, "nest-loner");
+        let (child_x, child_y) = find_cell(&terminal, "n-child");
+        let (grand_x, grand_y) = find_cell(&terminal, "n-grand");
+        let (last_x, last_y) = find_cell(&terminal, "n-last");
+        let (loner_x, _) = find_cell(&terminal, "n-loner");
         assert_eq!(child_x, main_x + 2, "child indents one level: {text}");
         assert_eq!(last_x, main_x + 2, "sibling shares the level: {text}");
         assert_eq!(grand_x, main_x + 4, "grandchild indents two levels: {text}");
@@ -15990,6 +16489,7 @@ mod tests {
                     is_main: true,
                     created_from: None,
                     pinned: false,
+                    for_branch: false,
                     sort_order: 0,
                 }),
             },
@@ -16223,6 +16723,7 @@ mod tests {
                     is_main: false,
                     created_from: None,
                     pinned: false,
+                    for_branch: false,
                     sort_order: 0,
                 }),
             },
@@ -16513,7 +17014,7 @@ mod tests {
         seed_tree(&mut app);
         app.branch_list = Some((
             nebula_core::ProjectId("p1".into()),
-            vec!["main".into(), "feature-x".into()],
+            vec!["main".into(), "feat-x".into()],
         ));
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
@@ -16522,7 +17023,7 @@ mod tests {
             text.contains("WORKTREES & BRANCHES"),
             "the header reads at the default 22-col width: {text}"
         );
-        assert!(text.contains("○ feature-x"), "{text}");
+        assert!(text.contains("○ feat-x (branch)"), "{text}");
         assert!(
             !text.contains("○ main"),
             "a branch with a checkout stays a worktree row only: {text}"
@@ -16543,7 +17044,7 @@ mod tests {
             app.sel_worktree, 1,
             "the branch row's index continues past the worktree rows"
         );
-        assert_eq!(app.selected_branch_row().as_deref(), Some("feature-x"));
+        assert_eq!(app.selected_branch_row().as_deref(), Some("feat-x"));
     }
 
     /// A checkout-less branch created from another checkout-less branch
@@ -16556,19 +17057,19 @@ mod tests {
         app.branch_list = Some((
             nebula_core::ProjectId("p1".into()),
             vec![
-                "feature-x".into(),
+                "fx".into(),
                 crate::branches::LocalBranch {
-                    name: "feature-x-sub".into(),
-                    created_from: Some("feature-x".into()),
+                    name: "fx-sub".into(),
+                    created_from: Some("fx".into()),
                 },
             ],
         ));
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
-        assert!(text.contains("○ feature-x"), "{text}");
+        assert!(text.contains("○ fx (branch)"), "{text}");
         assert!(
-            text.contains("└ ○ feature-x-sub"),
+            text.contains("└ ○ fx-sub (branch)"),
             "the child row carries a tree connector: {text}"
         );
     }
@@ -16611,6 +17112,65 @@ mod tests {
             menu.items[0].action
         );
         assert!(out.is_empty(), "opening the menu sends nothing");
+    }
+
+    /// A worktree whose checkout was created for a pre-existing branch
+    /// (`for_branch`) keeps the (branch) tag — spawning a session on a
+    /// branch must not re-label it as a worktree.
+    #[test]
+    fn for_branch_worktree_rows_keep_the_branch_tag() {
+        use nebula_core::{Entity, Worktree, WorktreeId};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(Worktree {
+                    id: WorktreeId("w2".into()),
+                    project_id: nebula_core::ProjectId("p1".into()),
+                    path: "/tmp/demo-worktrees/feat".into(),
+                    branch: "feat".into(),
+                    is_main: false,
+                    created_from: None,
+                    pinned: false,
+                    for_branch: true,
+                    sort_order: 0,
+                }),
+            },
+        );
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("feat (branch)"), "{text}");
+        assert!(!text.contains("feat (wt)"), "{text}");
+    }
+
+    /// `t` on a checkout-less branch row skips the "select a worktree"
+    /// flash: with no checkout for the branch, it asks the daemon for one
+    /// (the session picker follows the Ack, same as the row menu's
+    /// "New agent here").
+    #[test]
+    fn t_on_a_branch_row_creates_its_checkout_for_the_picker() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.branch_list = Some((
+            nebula_core::ProjectId("p1".into()),
+            vec!["feature-x".into()],
+        ));
+        app.focus = Focus::Worktrees;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+        assert_eq!(app.selected_branch_row().as_deref(), Some("feature-x"));
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::NONE, &mut out);
+        assert!(app.flash.is_none(), "no flash: {:?}", app.flash);
+        assert!(
+            matches!(
+                out.last(),
+                Some(ClientRequest::CreateWorktree { branch, base: None, .. })
+                    if branch == "feature-x"
+            ),
+            "{out:?}"
+        );
     }
 
     /// `⌘K b Enter`: name prompt, then a base picker that leads with the
@@ -16672,11 +17232,11 @@ mod tests {
         assert!(out.is_empty(), "the branch op never talks to the daemon");
     }
 
-    /// The branch row's destructive verb: a confirm first, then
-    /// `git branch -d` — which deletes a merged branch and refuses an
-    /// unmerged one, surfacing git's own reason as the flash.
+    /// The branch row's destructive verb: a confirm first (its text warns
+    /// commits may be lost), then the delete — merged branches via `-d`,
+    /// unmerged ones through the `-D` retry.
     #[test]
-    fn deleting_a_branch_row_confirms_then_respects_git_d() {
+    fn deleting_a_branch_row_confirms_then_deletes_even_unmerged() {
         let dir = tempfile::tempdir().unwrap();
         let repo = test_repo(&dir);
         run_git(&repo, &["branch", "merged"]);
@@ -16723,7 +17283,7 @@ mod tests {
         assert_eq!(app.flash.as_deref(), Some("branch merged deleted"));
         assert_eq!(app.branch_rows(), ["unmerged"], "the row refreshed");
 
-        // The unmerged branch survives: git -d refuses, the flash says why.
+        // The unmerged branch goes too — the confirm warned, `-D` retried.
         run_menu_action(
             &mut app,
             MenuAction::DeleteBranch {
@@ -16732,17 +17292,19 @@ mod tests {
             },
             &mut out,
         );
-        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
         assert!(
-            app.flash
-                .as_deref()
-                .is_some_and(|f| f.contains("not fully merged")),
-            "{:?}",
-            app.flash
+            matches!(
+                &app.overlay,
+                Some(Overlay::Confirm(c)) if c.message.contains("WARNING")
+            ),
+            "the confirm text carries the lost-commits warning: {:?}",
+            app.overlay
         );
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert_eq!(app.flash.as_deref(), Some("branch unmerged deleted"));
         assert!(
-            crate::branches::local_branches(&repo).contains(&"unmerged".to_string()),
-            "an unmerged branch is never force-deleted"
+            !crate::branches::local_branches(&repo).contains(&"unmerged".to_string()),
+            "the warned delete goes through"
         );
     }
 
@@ -17475,6 +18037,7 @@ mod tests {
                     is_main: true,
                     created_from: None,
                     pinned: false,
+                    for_branch: false,
                     sort_order: 0,
                 }),
             },
@@ -19342,6 +19905,7 @@ mod tests {
                         is_main: false,
                         created_from: None,
                         pinned: false,
+                        for_branch: false,
                         sort_order: 0,
                     }),
                 },
@@ -19481,6 +20045,7 @@ mod tests {
             is_main,
             created_from: None,
             pinned: false,
+            for_branch: false,
             sort_order: 0,
         })
     }
@@ -19831,6 +20396,7 @@ mod tests {
                     is_main: true,
                     created_from: None,
                     pinned: false,
+                    for_branch: false,
                     sort_order: 0,
                 }),
             },

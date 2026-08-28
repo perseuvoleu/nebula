@@ -115,6 +115,15 @@ pub enum MenuAction {
     /// Shell terminal in the worktree's directory; created immediately with
     /// a default name (no prompt), renameable later.
     NewTerminal(WorktreeId),
+    /// ⌘D picker row: create an agent of this kind — configured default
+    /// model/effort, generated name, auto-title — and mount it in the
+    /// split's right pane. No name prompt: the split is a "work now" pane.
+    SplitAgentOfKind {
+        worktree: WorktreeId,
+        kind: AgentKind,
+    },
+    /// ⌘D picker row: fresh shell mounted in the split's right pane.
+    SplitShell(WorktreeId),
     /// The `a` palette command's branch row: open the normal new-session
     /// picker on this branch's checkout, creating the worktree first when
     /// the branch has none (kind is picked AFTER the branch here).
@@ -2047,6 +2056,12 @@ pub struct App {
     /// ⌘D split: a fresh shell rendered in the right half of the terminal
     /// pane, alongside whatever `term` shows on the left. `None` = no split.
     pub split_term: Option<AttachedTerm>,
+    /// ⌘D pairings that survive tab switches: left-pane session → the
+    /// split session opened from it. The pane itself mounts only while its
+    /// owner is attached — walking to another tab/worktree/project hides
+    /// it, walking back restores it. Forgotten on ⌘D-close, on either
+    /// session dying, or when the split session is mounted as a main tab.
+    pub split_pairs: std::collections::HashMap<SessionRef, SessionRef>,
     /// Parsers parked when a session is switched away from, so coming back
     /// can ask the daemon for a scrollback DELTA (`from_seq`) instead of
     /// replaying — and re-parsing — the session's whole 1 MiB ring on every
@@ -2306,6 +2321,7 @@ impl App {
             sel_session: 0,
             term: None,
             split_term: None,
+            split_pairs: std::collections::HashMap::new(),
             term_cache: Vec::new(),
             split_focused: false,
             split_term_area: Rect::default(),
@@ -2656,12 +2672,10 @@ impl App {
         rows.sort_by_key(
             |row| !matches!(row, SessionRow::Agent(agent) if is_active_status(agent.status)),
         );
-        // The ⌘D split owns its shell: it lives in the right pane, never as
-        // a tab/row — selecting it as a row would mount the same PTY in
-        // both halves and rebind its daemon-side attach.
-        if let Some(split) = self.split_sref() {
-            rows.retain(|r| r.sref().as_ref() != Some(split));
-        }
+        // The ⌘D split's session is a normal row/tab like any other — it's
+        // an independent session that happens to render in the right pane.
+        // `attach` guards the one hazard: selecting its row focuses the
+        // split instead of mounting the same PTY in both halves.
         rows
     }
 
@@ -2712,11 +2726,6 @@ impl App {
             SessionRef::Agent(id) => tree.agents.iter().any(|a| &a.id == id),
             SessionRef::Terminal(id) => tree.terminals.iter().any(|x| &x.id == id),
         });
-    }
-
-    /// The session mounted in the ⌘D split's right pane, when one is open.
-    pub fn split_sref(&self) -> Option<&SessionRef> {
-        self.split_term.as_ref().map(|t| &t.sref)
     }
 
     /// The selected worktree's LINKS group: the pull request on its branch
@@ -2891,18 +2900,19 @@ impl App {
     pub fn branch_rows(&self) -> Vec<String> {
         self.branch_rows_with_depth()
             .into_iter()
-            .map(|(name, _)| name)
+            .map(|(name, _, _)| name)
             .collect()
     }
 
-    /// `branch_rows` plus each row's nesting depth: a branch whose recorded
-    /// creation base is another checkout-less row nests under it, the same
-    /// indented tree as the worktree rows (chains ramify, depth capped at
-    /// `WORKTREE_NEST_MAX_DEPTH`). A base with a checkout of its own — a
-    /// worktree row up in the other section — leaves the row flat, like a
-    /// worktree whose parent sits in the other pin group. Roots keep the
-    /// cached listing's order (newest commit first).
-    pub fn branch_rows_with_depth(&self) -> Vec<(String, usize)> {
+    /// `branch_rows` plus each row's nesting depth and recorded base: a
+    /// branch whose creation base is another checkout-less row nests under
+    /// it, the same indented tree as the worktree rows (chains ramify,
+    /// depth capped at `WORKTREE_NEST_MAX_DEPTH`). A base with a checkout
+    /// of its own — a worktree row up in the other section — leaves the
+    /// row flat; the base rides along so the draw can print a `from <base>`
+    /// sub-line there, the same cross-section link the flat worktree rows
+    /// get. Roots keep the cached listing's order (newest commit first).
+    pub fn branch_rows_with_depth(&self) -> Vec<(String, usize, Option<String>)> {
         let Some(project) = self.selected_project() else {
             return vec![];
         };
@@ -2935,7 +2945,7 @@ impl App {
             .collect();
         nest_by_parent(rows, parent)
             .into_iter()
-            .map(|(b, depth)| (b.name.clone(), depth))
+            .map(|(b, depth)| (b.name.clone(), depth, b.created_from.clone()))
             .collect()
     }
 
@@ -3236,6 +3246,7 @@ mod tests {
             is_main: true,
             created_from: None,
             pinned: false,
+            for_branch: false,
             sort_order: 0,
         });
         (app, worktree_id)
@@ -3349,6 +3360,8 @@ mod tests {
             sort_order: 0,
             alive: true,
             busy: false,
+            status: None,
+            status_changed_at: 0,
         });
         app.tree
             .links
@@ -3392,6 +3405,8 @@ mod tests {
             sort_order: 0,
             alive: true,
             busy: false,
+            status: None,
+            status_changed_at: 0,
         });
         app.tree
             .links
@@ -3455,6 +3470,7 @@ mod tests {
                 is_main: false,
                 created_from: None,
                 pinned,
+                for_branch: false,
                 sort_order: app.tree.worktrees.len() as i64,
             });
         };
@@ -3565,12 +3581,14 @@ mod tests {
         assert_eq!(
             app.branch_rows_with_depth(),
             [
-                ("feat-a".into(), 0), // base has a checkout: stays flat
-                ("feat-b".into(), 0),
-                ("feat-b-sub".into(), 1),
-                ("feat-b-sub-sub".into(), 2),
-                ("loop-x".into(), 0),
-                ("loop-y".into(), 1),
+                // base has a checkout: stays flat, base rides along for
+                // the `from <base>` sub-line
+                ("feat-a".into(), 0, Some("main".into())),
+                ("feat-b".into(), 0, None),
+                ("feat-b-sub".into(), 1, Some("feat-b".into())),
+                ("feat-b-sub-sub".into(), 2, Some("feat-b-sub".into())),
+                ("loop-x".into(), 0, Some("loop-y".into())),
+                ("loop-y".into(), 1, Some("loop-x".into())),
             ],
             "chains ramify below their base, a checked-out base keeps the row flat"
         );
@@ -3598,6 +3616,7 @@ mod tests {
             is_main: false,
             created_from: created_from.map(str::to_owned),
             pinned,
+            for_branch: false,
             sort_order: app.tree.worktrees.len() as i64,
         });
     }

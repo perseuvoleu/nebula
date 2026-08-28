@@ -48,6 +48,12 @@ struct PrewarmEntry {
     buffered_hooks: Vec<(HookEvent, Option<String>)>,
 }
 
+/// Terminal tabs export `NEBULA_AGENT_ID` with this prefix on their
+/// TerminalId, so an agent CLI run by hand inside the shell reports
+/// through the globally-installed hooks and the daemon can route those
+/// events onto the terminal's own status instead of an agent row.
+pub const TERMINAL_HOOK_PREFIX: &str = "term:";
+
 /// Wall-clock epoch ms, matching the store's `status_changed_at` stamps.
 fn epoch_ms() -> i64 {
     std::time::SystemTime::now()
@@ -59,6 +65,10 @@ fn epoch_ms() -> i64 {
 pub struct Daemon {
     sessions: Mutex<HashMap<SessionRef, Arc<PtySession>>>,
     status_machines: Mutex<HashMap<AgentId, AgentStatusMachine>>,
+    /// Status machines for agent CLIs run by hand inside shell tabs (hook
+    /// events arriving under a `term:<id>` agent id). Dropped, and the
+    /// persisted status cleared, when the tab's PTY dies.
+    terminal_status_machines: Mutex<HashMap<TerminalId, AgentStatusMachine>>,
     pub hook_env: HookEnv,
     /// Shared with the hook HTTP server, which reads agent rows to decide
     /// auto-title injection.
@@ -95,6 +105,7 @@ impl Daemon {
         Arc::new(Self {
             sessions: Mutex::new(HashMap::new()),
             status_machines: Mutex::new(HashMap::new()),
+            terminal_status_machines: Mutex::new(HashMap::new()),
             hook_env,
             store,
             events,
@@ -118,6 +129,12 @@ impl Daemon {
         event: HookEvent,
         session_id: Option<String>,
     ) {
+        // A `term:`-prefixed id is a shell tab's hook env: the event drives
+        // the terminal's own status, not an agent row.
+        if let Some(tid) = agent_id.as_str().strip_prefix(TERMINAL_HOOK_PREFIX) {
+            self.apply_terminal_hook_event(&TerminalId(tid.to_string()), event, session_id);
+            return;
+        }
         enum Outcome {
             Effects(Vec<Effect>),
             UnknownAgent(HookEvent, Option<String>),
@@ -178,6 +195,79 @@ impl Daemon {
         };
         for (id, effects) in ticked {
             self.apply_status_effects(&id, effects);
+        }
+        let ticked: Vec<(TerminalId, Vec<Effect>)> = {
+            let mut machines = self.terminal_status_machines.lock().unwrap();
+            machines
+                .iter_mut()
+                .map(|(id, m)| (id.clone(), m.tick(now)))
+                .collect()
+        };
+        for (id, effects) in ticked {
+            self.apply_terminal_status_effects(&id, effects);
+        }
+    }
+
+    /// Feed a shell tab's hook event (its env reports as `term:<id>`)
+    /// through the terminal's status machine. Ids with no terminal row
+    /// (deleted tab, stale env copied elsewhere) are dropped.
+    fn apply_terminal_hook_event(
+        &self,
+        id: &TerminalId,
+        event: HookEvent,
+        session_id: Option<String>,
+    ) {
+        let effects = {
+            let mut machines = self.terminal_status_machines.lock().unwrap();
+            match machines.entry(id.clone()) {
+                std::collections::hash_map::Entry::Occupied(e) => {
+                    e.into_mut()
+                        .handle(event, session_id.as_deref(), Instant::now())
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    match self.store.get_terminal(id) {
+                        Ok(Some(term)) => slot
+                            .insert(AgentStatusMachine::new(
+                                term.status.unwrap_or(AgentStatus::Fresh),
+                                None,
+                            ))
+                            .handle(event, session_id.as_deref(), Instant::now()),
+                        _ => return,
+                    }
+                }
+            }
+        };
+        self.apply_terminal_status_effects(id, effects);
+    }
+
+    fn apply_terminal_status_effects(&self, id: &TerminalId, effects: Vec<Effect>) {
+        for effect in effects {
+            match effect {
+                Effect::SetStatus(status) => {
+                    if let Err(e) = self.store.set_terminal_status(id, Some(status)) {
+                        tracing::warn!(error = %e, "persist terminal status failed");
+                    }
+                    // Terminals have no StatusChanged lane — the upsert
+                    // carries the new status like any other terminal edit.
+                    if let Ok(term) = self.terminal_entity(id) {
+                        self.broadcast(ServerEvent::EntityUpserted {
+                            entity: Entity::Terminal(term),
+                        });
+                    }
+                }
+                // A hand-run CLI's resume id belongs to nobody: there is no
+                // agent row to resume it from.
+                Effect::SaveSessionId(_) => {}
+            }
+        }
+    }
+
+    /// The tab's shell died — whatever CLI reported status inside it is
+    /// gone too: drop its machine and clear the persisted status.
+    fn clear_terminal_status(&self, id: &TerminalId) {
+        self.terminal_status_machines.lock().unwrap().remove(id);
+        if let Err(e) = self.store.set_terminal_status(id, None) {
+            tracing::warn!(error = %e, "clear terminal status failed");
         }
     }
 
@@ -589,14 +679,22 @@ impl Daemon {
         let entries = git::list_worktrees(&toplevel).await.unwrap_or_default();
         let mut first = true;
         for entry in entries {
+            let created_from = if first {
+                None
+            } else {
+                git::branch_creation_base(&toplevel, &entry.branch)
+                    .await
+                    .filter(|b| b != &entry.branch)
+            };
             let worktree = Worktree {
                 id: WorktreeId::generate(),
                 project_id: project.id.clone(),
                 path: entry.path.clone(),
                 branch: entry.branch,
                 is_main: first,
-                created_from: None,
+                created_from,
                 pinned: false,
+                for_branch: false,
                 sort_order: 0,
             };
             first = false;
@@ -928,18 +1026,35 @@ impl Daemon {
         } else {
             None
         };
+        // Lineage for the panel's tree lines: an explicit base wins;
+        // otherwise a pre-existing branch remembers its creation base in
+        // the reflog, and a branch minted right here branches from the
+        // root checkout's HEAD (which `git worktree add` reads too).
+        let pre_existing = git::branch_exists(&project.repo_path, branch).await;
         let path = git::add_worktree(&project.repo_path, branch, base).await?;
         if let Some(primary) = seed_primary {
             git::seed_node_modules_in_background(&primary, &path);
         }
+        let created_from = match base {
+            Some(b) => Some(b.to_owned()),
+            None if pre_existing => git::branch_creation_base(&project.repo_path, branch).await,
+            None => git::current_branch(&project.repo_path)
+                .await
+                .ok()
+                .filter(|b| !b.starts_with("detached@")),
+        }
+        .filter(|b| b != branch);
         let worktree = Worktree {
             id: WorktreeId::generate(),
             project_id: project_id.clone(),
             path,
             branch: branch.to_string(),
             is_main: false,
-            created_from: base.map(str::to_owned),
+            created_from,
             pinned: false,
+            // A pre-existing branch keeps its branch identity: the checkout
+            // exists to host sessions, the panel still tags it (branch).
+            for_branch: pre_existing,
             sort_order: 0,
         };
         self.store.insert_worktree(&worktree)?;
@@ -960,6 +1075,44 @@ impl Daemon {
             .get_project(&worktree.project_id)?
             .context("project not found")?;
 
+        // A row presenting as a branch deletes as one. When the branch was
+        // created in place inside a pre-existing checkout (the path isn't
+        // nebula's dir for this branch), the checkout reverts to the
+        // recorded base and the row survives — sessions keep running; only
+        // the branch goes away.
+        if worktree.for_branch
+            && worktree.path != git::worktree_dir(&project.repo_path, &worktree.branch)
+        {
+            let base = worktree.created_from.clone();
+            let target = base.as_deref().unwrap_or("-");
+            // A dirty checkout can make the plain revert refuse (changes
+            // that conflict with the base). The confirm dialog warned; a
+            // forced delete retries discarding them.
+            match git::checkout(&worktree.path, target).await {
+                Err(_) if force => git::checkout_forced(&worktree.path, target).await?,
+                r => r?,
+            }
+            if let Err(e) = git::delete_branch(&project.repo_path, &worktree.branch).await {
+                tracing::warn!(
+                    branch = %worktree.branch, error = %e,
+                    "checkout reverted but the branch survived"
+                );
+            }
+            let now = git::current_branch(&worktree.path)
+                .await
+                .unwrap_or_else(|_| worktree.branch.clone());
+            self.store.update_worktree_branch(id, &now)?;
+            // The stored base described the deleted branch, not the one the
+            // checkout reverted to.
+            self.store.set_worktree_created_from(id, None)?;
+            self.store.set_worktree_for_branch(id, false)?;
+            let updated = self.store.get_worktree(id)?.context("worktree not found")?;
+            self.broadcast(ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(updated),
+            });
+            return Ok(());
+        }
+
         // Kill sessions living in this worktree.
         let (_, _, agents, terminals) = self.store.load_tree()?;
         for a in agents.iter().filter(|a| &a.worktree_id == id) {
@@ -975,6 +1128,17 @@ impl Daemon {
         self.broadcast(ServerEvent::EntityRemoved {
             id: EntityId::Worktree(id.clone()),
         });
+        // The checkout existed to host sessions on a branch the user made
+        // as a branch: deleting the row means deleting the branch too,
+        // unmerged commits included — the confirm dialog warned.
+        if worktree.for_branch {
+            if let Err(e) = git::delete_branch(&project.repo_path, &worktree.branch).await {
+                tracing::warn!(
+                    branch = %worktree.branch, error = %e,
+                    "checkout removed but the branch survived"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -1022,11 +1186,56 @@ impl Daemon {
                 // Branch switched in place (checkout on the root or inside a
                 // linked worktree): refresh the stored name so the row tracks
                 // reality instead of the branch at adoption time.
+                let mut updated = (*known).clone();
+                let mut changed = false;
                 if known.branch != entry.branch {
                     self.store
                         .update_worktree_branch(&known.id, &entry.branch)?;
-                    let mut updated = (*known).clone();
                     updated.branch = entry.branch.clone();
+                    changed = true;
+                    // The checkout now hosts a branch the user switched to
+                    // (or created) in its terminal — not the worktree they
+                    // asked for by name. The row presents as a branch from
+                    // here on, like a checkout created for one.
+                    if !known.is_main && !known.for_branch {
+                        self.store.set_worktree_for_branch(&known.id, true)?;
+                        updated.for_branch = true;
+                    }
+                }
+                // Rows from before lineage was recorded (or adopted without
+                // it) backfill from the reflog, so the panel's tree lines
+                // appear without recreating the worktree. An in-place branch
+                // switch re-derives too — the stored base described the old
+                // branch.
+                if !known.is_main && (known.created_from.is_none() || changed) {
+                    let mut base =
+                        git::branch_creation_base(&project.repo_path, &entry.branch).await;
+                    if base.is_none() && known.branch != entry.branch {
+                        // `checkout -b` from an implicit HEAD logs only
+                        // `Created from HEAD`. The sync watched the switch,
+                        // so the branch this checkout sat on IS that HEAD —
+                        // claimed only when the creation sha still matches
+                        // its tip, so switching to some old branch never
+                        // invents lineage.
+                        let created_at =
+                            git::branch_creation_sha_from_head(&project.repo_path, &entry.branch)
+                                .await;
+                        let old_tip = git::branch_tip(&project.repo_path, &known.branch).await;
+                        if created_at.is_some() && created_at == old_tip {
+                            base = Some(known.branch.clone());
+                        }
+                    }
+                    if let Some(base) = base
+                        .filter(|b| b != &entry.branch)
+                        .filter(|b| known.created_from.as_ref() != Some(b))
+                    {
+                        self.store
+                            .set_worktree_created_from(&known.id, Some(&base))?;
+                        updated.created_from = Some(base);
+                        changed = true;
+                    }
+                }
+                if changed {
                     self.broadcast(ServerEvent::EntityUpserted {
                         entity: Entity::Worktree(updated),
                     });
@@ -1039,8 +1248,11 @@ impl Daemon {
                 path: entry.path.clone(),
                 branch: entry.branch.clone(),
                 is_main: false,
-                created_from: None,
+                created_from: git::branch_creation_base(&project.repo_path, &entry.branch)
+                    .await
+                    .filter(|b| b != &entry.branch),
                 pinned: false,
+                for_branch: false,
                 sort_order: 0,
             };
             self.store.insert_worktree(&worktree)?;
@@ -1667,6 +1879,8 @@ impl Daemon {
             sort_order: 0,
             alive: false,
             busy: false,
+            status: None,
+            status_changed_at: 0,
         };
         self.store.insert_terminal(&terminal)?;
         self.spawn_terminal_session(&terminal, &worktree, 80, 24)?;
@@ -2095,11 +2309,24 @@ impl Daemon {
     ) -> Result<Arc<PtySession>> {
         // `-l` makes it a login shell, matching Terminal.app: zsh then sources
         // /etc/zprofile (path_helper), ~/.zprofile, and ~/.zshrc.
+        // The hook env carries a `term:`-prefixed id: an agent CLI run by
+        // hand inside this shell reports through the same globally-installed
+        // hooks, and the daemon routes those onto the terminal's status.
         let spec = SpawnSpec {
             program: user_shell(),
             args: vec!["-l".into()],
             cwd: worktree.path.clone(),
-            env: vec![],
+            env: vec![
+                (
+                    "NEBULA_AGENT_ID".into(),
+                    format!("{TERMINAL_HOOK_PREFIX}{}", terminal.id.as_str()),
+                ),
+                (
+                    "NEBULA_API_URL".into(),
+                    format!("http://127.0.0.1:{}", self.hook_env.port),
+                ),
+                ("NEBULA_API_TOKEN".into(), self.hook_env.token.clone()),
+            ],
             scrub_env: scrubbed_env_names(),
             cols,
             rows,
@@ -2156,6 +2383,9 @@ impl Daemon {
                                 HookEvent::SessionEnded { exit_code },
                                 None,
                             );
+                        }
+                        if let SessionRef::Terminal(id) = &sref {
+                            daemon.clear_terminal_status(id);
                         }
                         let upsert = match &sref {
                             SessionRef::Agent(id) => daemon.agent_entity(id).map(Entity::Agent),
@@ -2974,6 +3204,7 @@ mod tests {
                 is_main,
                 created_from: None,
                 pinned: false,
+                for_branch: false,
                 sort_order: 0,
             })
             .unwrap();
@@ -3242,6 +3473,284 @@ mod tests {
         );
         daemon.sync_project_worktrees(&project).await.unwrap();
         assert_eq!(agent_worktree(&daemon, "a1"), "root");
+    }
+
+    /// A worktree row that never recorded its lineage (created before
+    /// nebula stored bases, or via a base-less create for an existing
+    /// branch) backfills `created_from` from the branch's reflog on the
+    /// next sync — the panel's tree line appears without recreating the
+    /// checkout. Adoption of an unknown checkout derives it the same way.
+    #[tokio::test]
+    async fn worktree_sync_backfills_lineage_from_the_reflog() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo = root.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-b", "main"]);
+        git_in(&repo, &["commit", "--allow-empty", "-m", "init"]);
+        git_in(&repo, &["branch", "dad", "main"]);
+        let dad = root.join("repo-worktrees").join("dad");
+        git_in(&repo, &["worktree", "add", &dad.to_string_lossy(), "dad"]);
+
+        let daemon = test_daemon();
+        let project = Project {
+            workspace_id: Default::default(),
+            id: ProjectId("p".into()),
+            name: "p".into(),
+            repo_path: repo.clone(),
+            sort_order: 0,
+            divider_after: false,
+            divider_label: None,
+            divider_before: false,
+            divider_before_label: None,
+        };
+        daemon.store.insert_project(&project).unwrap();
+        seed_worktree(&daemon, "p", "root", &repo.to_string_lossy(), true);
+        daemon
+            .store
+            .insert_worktree(&Worktree {
+                id: WorktreeId("wt-dad".into()),
+                project_id: ProjectId("p".into()),
+                path: dad.clone(),
+                branch: "dad".into(),
+                is_main: false,
+                created_from: None,
+                pinned: false,
+                for_branch: false,
+                sort_order: 0,
+            })
+            .unwrap();
+
+        daemon.sync_project_worktrees(&project).await.unwrap();
+        let (_, worktrees, _, _) = daemon.store.load_tree().unwrap();
+        let row = worktrees.iter().find(|w| w.branch == "dad").unwrap();
+        assert_eq!(row.created_from.as_deref(), Some("main"));
+
+        // An unknown checkout adopted by the sync gets its lineage at
+        // adoption time, not just on the backfill pass.
+        git_in(&repo, &["branch", "kid", "dad"]);
+        let kid = root.join("repo-worktrees").join("kid");
+        git_in(&repo, &["worktree", "add", &kid.to_string_lossy(), "kid"]);
+        daemon.sync_project_worktrees(&project).await.unwrap();
+        let (_, worktrees, _, _) = daemon.store.load_tree().unwrap();
+        let row = worktrees.iter().find(|w| w.branch == "kid").unwrap();
+        assert_eq!(row.created_from.as_deref(), Some("dad"));
+    }
+
+    /// `create_worktree` records lineage even without an explicit base: an
+    /// existing branch keeps its reflog base, a fresh branch records the
+    /// root checkout's HEAD it was cut from.
+    #[tokio::test]
+    async fn create_worktree_derives_a_base_when_none_is_given() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo = root.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-b", "main"]);
+        git_in(&repo, &["commit", "--allow-empty", "-m", "init"]);
+        git_in(&repo, &["branch", "dad", "main"]);
+
+        let daemon = test_daemon();
+        let project = Project {
+            workspace_id: Default::default(),
+            id: ProjectId("p".into()),
+            name: "p".into(),
+            repo_path: repo.clone(),
+            sort_order: 0,
+            divider_after: false,
+            divider_label: None,
+            divider_before: false,
+            divider_before_label: None,
+        };
+        daemon.store.insert_project(&project).unwrap();
+
+        // Existing branch, no base passed (the agent-on-branch path).
+        daemon
+            .create_worktree(&ProjectId("p".into()), "dad", None)
+            .await
+            .unwrap();
+        // Fresh branch, no base passed: cut from the root HEAD (main).
+        daemon
+            .create_worktree(&ProjectId("p".into()), "fresh", None)
+            .await
+            .unwrap();
+
+        let (_, worktrees, _, _) = daemon.store.load_tree().unwrap();
+        let base = |branch: &str| {
+            worktrees
+                .iter()
+                .find(|w| w.branch == branch)
+                .unwrap()
+                .created_from
+                .clone()
+        };
+        assert_eq!(base("dad").as_deref(), Some("main"));
+        assert_eq!(base("fresh").as_deref(), Some("main"));
+        // Identity: checking out a pre-existing branch keeps it a branch;
+        // a branch minted by the worktree flow is a worktree.
+        let for_branch = |branch: &str| {
+            worktrees
+                .iter()
+                .find(|w| w.branch == branch)
+                .unwrap()
+                .for_branch
+        };
+        assert!(for_branch("dad"), "existing branch keeps branch identity");
+        assert!(!for_branch("fresh"), "minted branch is a worktree");
+    }
+
+    /// An in-place `checkout -b` inside a known checkout: the sync flips
+    /// the row to the new branch, marks it a branch row (`for_branch`),
+    /// and — though git logged only `Created from HEAD` — records the
+    /// branch the checkout sat on as the base. Deleting that row then
+    /// deletes the BRANCH: the checkout reverts to the base and the row
+    /// survives as the worktree it was.
+    #[tokio::test]
+    async fn in_place_checkout_b_presents_and_deletes_as_a_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo = root.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-b", "main"]);
+        git_in(&repo, &["commit", "--allow-empty", "-m", "init"]);
+        git_in(&repo, &["branch", "dad", "main"]);
+        let dad = root.join("repo-worktrees").join("dad");
+        git_in(&repo, &["worktree", "add", &dad.to_string_lossy(), "dad"]);
+
+        let daemon = test_daemon();
+        let project = Project {
+            workspace_id: Default::default(),
+            id: ProjectId("p".into()),
+            name: "p".into(),
+            repo_path: repo.clone(),
+            sort_order: 0,
+            divider_after: false,
+            divider_label: None,
+            divider_before: false,
+            divider_before_label: None,
+        };
+        daemon.store.insert_project(&project).unwrap();
+        daemon
+            .store
+            .insert_worktree(&Worktree {
+                id: WorktreeId("wt-dad".into()),
+                project_id: ProjectId("p".into()),
+                path: dad.clone(),
+                branch: "dad".into(),
+                is_main: false,
+                created_from: None,
+                pinned: false,
+                for_branch: false,
+                sort_order: 0,
+            })
+            .unwrap();
+
+        git_in(&dad, &["checkout", "-b", "feat"]);
+        daemon.sync_project_worktrees(&project).await.unwrap();
+        let (_, worktrees, _, _) = daemon.store.load_tree().unwrap();
+        let row = worktrees
+            .iter()
+            .find(|w| w.id == WorktreeId("wt-dad".into()))
+            .unwrap();
+        assert_eq!(row.branch, "feat", "row tracks the in-place switch");
+        assert!(row.for_branch, "a branch made in the terminal stays a branch");
+        assert_eq!(
+            row.created_from.as_deref(),
+            Some("dad"),
+            "implicit-HEAD creation links back to the branch the checkout sat on"
+        );
+
+        daemon
+            .delete_worktree(&WorktreeId("wt-dad".into()), true)
+            .await
+            .unwrap();
+        let (_, worktrees, _, _) = daemon.store.load_tree().unwrap();
+        let row = worktrees
+            .iter()
+            .find(|w| w.id == WorktreeId("wt-dad".into()))
+            .expect("the pre-existing checkout's row survives a branch delete");
+        assert_eq!(row.branch, "dad", "checkout reverted to the base");
+        assert!(!row.for_branch, "back to the worktree it was");
+        assert_eq!(row.created_from, None, "the base described the dead branch");
+        assert!(dad.exists(), "the checkout stays on disk");
+        let feat = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["branch", "--list", "feat"])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&feat.stdout).trim().is_empty(),
+            "the branch itself is gone"
+        );
+    }
+
+    /// The in-place branch delete on a DIRTY checkout: uncommitted changes
+    /// that conflict with the base make the plain revert refuse; a forced
+    /// delete (the confirm dialog warned) retries with `checkout -f`.
+    #[tokio::test]
+    async fn forced_in_place_branch_delete_discards_conflicting_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo = root.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-b", "main"]);
+        git_in(&repo, &["commit", "--allow-empty", "-m", "init"]);
+        git_in(&repo, &["branch", "dad", "main"]);
+        let dad = root.join("repo-worktrees").join("dad");
+        git_in(&repo, &["worktree", "add", &dad.to_string_lossy(), "dad"]);
+
+        let daemon = test_daemon();
+        let project = Project {
+            workspace_id: Default::default(),
+            id: ProjectId("p".into()),
+            name: "p".into(),
+            repo_path: repo.clone(),
+            sort_order: 0,
+            divider_after: false,
+            divider_label: None,
+            divider_before: false,
+            divider_before_label: None,
+        };
+        daemon.store.insert_project(&project).unwrap();
+        daemon
+            .store
+            .insert_worktree(&Worktree {
+                id: WorktreeId("wt-dad".into()),
+                project_id: ProjectId("p".into()),
+                path: dad.clone(),
+                branch: "dad".into(),
+                is_main: false,
+                created_from: None,
+                pinned: false,
+                for_branch: false,
+                sort_order: 0,
+            })
+            .unwrap();
+
+        git_in(&dad, &["checkout", "-b", "feat"]);
+        daemon.sync_project_worktrees(&project).await.unwrap();
+        // A file committed on feat, then edited again: reverting to dad
+        // (which lacks it) conflicts, so a plain `git checkout` refuses.
+        std::fs::write(dad.join("f.txt"), "committed").unwrap();
+        git_in(&dad, &["add", "f.txt"]);
+        git_in(&dad, &["commit", "-m", "feat work"]);
+        std::fs::write(dad.join("f.txt"), "uncommitted").unwrap();
+
+        daemon
+            .delete_worktree(&WorktreeId("wt-dad".into()), true)
+            .await
+            .unwrap();
+        let (_, worktrees, _, _) = daemon.store.load_tree().unwrap();
+        let row = worktrees
+            .iter()
+            .find(|w| w.id == WorktreeId("wt-dad".into()))
+            .expect("the pre-existing checkout's row survives");
+        assert_eq!(row.branch, "dad", "forced revert landed on the base");
+        assert!(
+            !dad.join("f.txt").exists(),
+            "the conflicting uncommitted file went with the branch"
+        );
     }
 
     /// The replay is scoped to the synced project and skips archived rows.

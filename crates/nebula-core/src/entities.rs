@@ -141,6 +141,11 @@ pub struct Worktree {
     /// Pinned worktrees sort into their own PINNED group in the worktrees list.
     #[serde(default)]
     pub pinned: bool,
+    /// The checkout was created for a branch that already existed (a
+    /// session spawned on a branch row) — the panel keeps presenting the
+    /// row as a branch, not a worktree the user asked for by name.
+    #[serde(default)]
+    pub for_branch: bool,
     pub sort_order: i64,
 }
 
@@ -193,6 +198,16 @@ pub struct TerminalTab {
     /// `alive`.
     #[serde(default)]
     pub busy: bool,
+    /// Status of an agent CLI run by hand inside this shell tab, fed by
+    /// the same hook events as real agent sessions (terminals export
+    /// `NEBULA_AGENT_ID=term:<id>`, so the globally-installed hooks
+    /// report here too). None = no CLI has reported since the tab
+    /// spawned; cleared when the tab's PTY dies.
+    #[serde(default)]
+    pub status: Option<AgentStatus>,
+    /// Epoch ms of the last `status` change; 0 = never.
+    #[serde(default)]
+    pub status_changed_at: i64,
 }
 
 /// Who a note list hangs off: a project (high-level notes spanning its

@@ -74,6 +74,83 @@ pub async fn current_branch(repo: &Path) -> Result<String> {
     Ok(branch.to_string())
 }
 
+/// Whether `branch` already exists as a local branch head.
+pub async fn branch_exists(repo: &Path, branch: &str) -> bool {
+    let head = format!("refs/heads/{branch}");
+    git(repo, &["show-ref", "--verify", "--quiet", &head])
+        .await
+        .is_ok()
+}
+
+/// The base a branch's oldest reflog entry names. Git writes
+/// `branch: Created from <base>` at creation; an explicit base records the
+/// branch name, while creation from an implicit HEAD records the literal
+/// `HEAD` — useless for lineage, so it maps to None, like an expired
+/// reflog does.
+pub async fn branch_creation_base(repo: &Path, branch: &str) -> Option<String> {
+    let out = git(repo, &["reflog", "show", "--format=%gs", branch])
+        .await
+        .ok()?;
+    let base = out
+        .lines()
+        .last()?
+        .strip_prefix("branch: Created from ")?
+        .trim();
+    (!base.is_empty() && base != "HEAD").then(|| base.to_owned())
+}
+
+/// The commit a branch was created at, only when its oldest reflog entry is
+/// the implicit-HEAD form (`branch: Created from HEAD`) that names no base.
+/// The worktree sync uses it to tie an in-place `checkout -b` back to the
+/// branch the checkout sat on: the creation sha matching that branch's tip
+/// proves the lineage the reflog didn't record.
+pub async fn branch_creation_sha_from_head(repo: &Path, branch: &str) -> Option<String> {
+    let out = git(repo, &["reflog", "show", "--format=%H %gs", branch])
+        .await
+        .ok()?;
+    let (sha, subject) = out.lines().last()?.split_once(' ')?;
+    (subject.trim() == "branch: Created from HEAD").then(|| sha.to_owned())
+}
+
+/// Tip commit of a local branch.
+pub async fn branch_tip(repo: &Path, branch: &str) -> Option<String> {
+    let head = format!("refs/heads/{branch}");
+    git(repo, &["rev-parse", &head])
+        .await
+        .ok()
+        .map(|s| s.trim().to_owned())
+}
+
+/// `git checkout <branch>` inside a checkout. `-` (git's "previous
+/// branch") works too — the deleting-a-branch-row flow uses it when no
+/// recorded base survives.
+pub async fn checkout(worktree: &Path, branch: &str) -> Result<()> {
+    git(worktree, &["checkout", branch]).await?;
+    Ok(())
+}
+
+/// `git checkout -f <branch>`: the user force-confirmed the revert, so
+/// uncommitted changes that would block the plain checkout are discarded.
+pub async fn checkout_forced(worktree: &Path, branch: &str) -> Result<()> {
+    git(worktree, &["checkout", "-f", branch]).await?;
+    Ok(())
+}
+
+/// Delete a local branch: `-d` first, and when git refuses because the tip
+/// isn't fully merged, retry with `-D`. The force isn't silent — this only
+/// runs for deletes the user confirmed behind a dialog that warns commits
+/// may be lost.
+pub async fn delete_branch(repo: &Path, branch: &str) -> Result<()> {
+    match git(repo, &["branch", "-d", branch]).await {
+        Err(e) if e.to_string().contains("not fully merged") => {
+            git(repo, &["branch", "-D", branch]).await?;
+            Ok(())
+        }
+        Err(e) => Err(e),
+        Ok(_) => Ok(()),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WorktreeEntry {
     pub path: PathBuf,
@@ -123,19 +200,10 @@ fn detached_label(head: Option<&str>) -> String {
     }
 }
 
-/// Directory a new worktree for `branch` should live in:
-/// `<repo>/../<repo-name>-worktrees/<branch>` (slashes in branch → dashes).
+/// Directory a new worktree for `branch` should live in — the shared
+/// naming rule lives in `nebula_core::paths` so the TUI can apply it too.
 pub fn worktree_dir(repo: &Path, branch: &str) -> PathBuf {
-    let repo_name = repo
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "repo".into());
-    let safe_branch = branch.replace('/', "-");
-    repo.parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(format!("{repo_name}-worktrees"))
-        .join(safe_branch)
+    nebula_core::paths::worktree_dir(repo, branch)
 }
 
 /// `git worktree add <path> -b <branch> [base]`. Falls back to checking out an

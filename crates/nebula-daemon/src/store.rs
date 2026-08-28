@@ -240,6 +240,18 @@ const MIGRATIONS: &[&str] = &[
     DROP TABLE notes;
     ALTER TABLE notes_new RENAME TO notes;
     ",
+    // 21: checkouts created for a pre-existing branch (a session spawned
+    // on a branch row) keep presenting as branches in the panel.
+    "
+    ALTER TABLE worktrees ADD COLUMN for_branch INTEGER NOT NULL DEFAULT 0;
+    ",
+    // 22: status for agent CLIs run by hand inside a shell tab (hook
+    // events keyed by the terminal's `term:<id>` env). NULL = nothing has
+    // reported; cleared whenever the tab's PTY dies or the daemon boots.
+    "
+    ALTER TABLE terminals ADD COLUMN status TEXT;
+    ALTER TABLE terminals ADD COLUMN status_changed_at INTEGER NOT NULL DEFAULT 0;
+    ",
 ];
 
 pub struct Store {
@@ -469,8 +481,8 @@ impl Store {
 
     pub fn insert_worktree(&self, w: &Worktree) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO worktrees (id, project_id, path, branch, is_main, pinned, sort_order, created_from, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO worktrees (id, project_id, path, branch, is_main, pinned, sort_order, created_from, for_branch, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 w.id.as_str(),
                 w.project_id.as_str(),
@@ -480,6 +492,7 @@ impl Store {
                 w.pinned as i64,
                 w.sort_order,
                 w.created_from,
+                w.for_branch as i64,
                 now_ms()
             ],
         )?;
@@ -498,6 +511,22 @@ impl Store {
         self.conn.lock().unwrap().execute(
             "UPDATE worktrees SET branch = ?2 WHERE id = ?1",
             params![id.as_str(), branch],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_worktree_created_from(&self, id: &WorktreeId, base: Option<&str>) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE worktrees SET created_from = ?2 WHERE id = ?1",
+            params![id.as_str(), base],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_worktree_for_branch(&self, id: &WorktreeId, for_branch: bool) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE worktrees SET for_branch = ?2 WHERE id = ?1",
+            params![id.as_str(), for_branch as i64],
         )?;
         Ok(())
     }
@@ -1068,7 +1097,7 @@ impl Store {
     pub fn get_worktree(&self, id: &WorktreeId) -> Result<Option<Worktree>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, project_id, path, branch, is_main, pinned, sort_order, created_from FROM worktrees WHERE id = ?1",
+            "SELECT id, project_id, path, branch, is_main, pinned, sort_order, created_from, for_branch FROM worktrees WHERE id = ?1",
         )?;
         let mut rows = stmt.query(params![id.as_str()])?;
         Ok(rows.next()?.map(|r| Worktree {
@@ -1079,6 +1108,7 @@ impl Store {
             is_main: r.get::<_, i64>(4).unwrap() != 0,
             created_from: r.get(7).unwrap(),
             pinned: r.get::<_, i64>(5).unwrap() != 0,
+            for_branch: r.get::<_, i64>(8).unwrap() != 0,
             sort_order: r.get(6).unwrap(),
         }))
     }
@@ -1122,8 +1152,9 @@ impl Store {
 
     pub fn get_terminal(&self, id: &TerminalId) -> Result<Option<TerminalTab>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT id, worktree_id, name, sort_order FROM terminals WHERE id = ?1")?;
+        let mut stmt = conn.prepare(
+            "SELECT id, worktree_id, name, sort_order, status, status_changed_at FROM terminals WHERE id = ?1",
+        )?;
         let mut rows = stmt.query(params![id.as_str()])?;
         Ok(rows.next()?.map(|r| TerminalTab {
             id: TerminalId(r.get::<_, String>(0).unwrap()),
@@ -1132,7 +1163,34 @@ impl Store {
             sort_order: r.get(3).unwrap(),
             alive: false,
             busy: false,
+            status: r
+                .get::<_, Option<String>>(4)
+                .unwrap()
+                .and_then(|s| AgentStatus::parse(&s)),
+            status_changed_at: r.get(5).unwrap(),
         }))
+    }
+
+    /// Set (or clear, with None) the hook-driven status of a shell tab.
+    /// Returns the epoch-ms stamp written, so the caller can broadcast the
+    /// exact same timestamp it persisted.
+    pub fn set_terminal_status(&self, id: &TerminalId, status: Option<AgentStatus>) -> Result<i64> {
+        let stamp = now_ms();
+        self.conn.lock().unwrap().execute(
+            "UPDATE terminals SET status = ?2, status_changed_at = ?3 WHERE id = ?1",
+            params![id.as_str(), status.map(|s| s.as_str()), stamp],
+        )?;
+        Ok(stamp)
+    }
+
+    /// Boot sweep: every persisted terminal status describes a CLI whose
+    /// PTY died with the previous daemon — clear them all.
+    pub fn sweep_terminal_statuses(&self) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE terminals SET status = NULL WHERE status IS NOT NULL",
+            [],
+        )?;
+        Ok(())
     }
 
     pub fn count_terminals(&self, worktree_id: &WorktreeId) -> Result<i64> {
@@ -1166,7 +1224,7 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let worktrees = conn
-            .prepare("SELECT id, project_id, path, branch, is_main, pinned, sort_order, created_from FROM worktrees ORDER BY is_main DESC, sort_order, created_at")?
+            .prepare("SELECT id, project_id, path, branch, is_main, pinned, sort_order, created_from, for_branch FROM worktrees ORDER BY is_main DESC, sort_order, created_at")?
             .query_map([], |r| {
                 Ok(Worktree {
                     id: WorktreeId(r.get(0)?),
@@ -1176,6 +1234,7 @@ impl Store {
                     is_main: r.get::<_, i64>(4)? != 0,
                     created_from: r.get(7)?,
                     pinned: r.get::<_, i64>(5)? != 0,
+                    for_branch: r.get::<_, i64>(8)? != 0,
                     sort_order: r.get(6)?,
                 })
             })?
@@ -1204,7 +1263,7 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let terminals = conn
-            .prepare("SELECT id, worktree_id, name, sort_order FROM terminals ORDER BY sort_order, created_at")?
+            .prepare("SELECT id, worktree_id, name, sort_order, status, status_changed_at FROM terminals ORDER BY sort_order, created_at")?
             .query_map([], |r| {
                 Ok(TerminalTab {
                     id: TerminalId(r.get(0)?),
@@ -1213,6 +1272,8 @@ impl Store {
                     sort_order: r.get(3)?,
                     alive: false,
                     busy: false,
+                    status: r.get::<_, Option<String>>(4)?.and_then(|s| AgentStatus::parse(&s)),
+                    status_changed_at: r.get(5)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1266,6 +1327,7 @@ mod tests {
             is_main: false,
             created_from: Some("main".into()),
             pinned: false,
+            for_branch: false,
             sort_order: 0,
         };
         store.insert_worktree(&worktree).unwrap();
@@ -1359,6 +1421,7 @@ mod tests {
             is_main: true,
             created_from: None,
             pinned: false,
+            for_branch: false,
             sort_order: 0,
         };
         store.insert_worktree(&worktree).unwrap();
@@ -1429,6 +1492,7 @@ mod tests {
             is_main: true,
             created_from: None,
             pinned: false,
+            for_branch: false,
             sort_order: 0,
         };
         store.insert_worktree(&worktree).unwrap();
@@ -1531,6 +1595,7 @@ mod tests {
             is_main: false,
             created_from: None,
             pinned: false,
+            for_branch: false,
             sort_order: 0,
         };
         store.insert_worktree(&wt("w1", "/tmp/demo")).unwrap();
@@ -1695,6 +1760,7 @@ mod tests {
             is_main: true,
             created_from: None,
             pinned: false,
+            for_branch: false,
             sort_order: 0,
         };
         store.insert_worktree(&worktree).unwrap();
@@ -1979,6 +2045,7 @@ mod tests {
             is_main: true,
             created_from: None,
             pinned: false,
+            for_branch: false,
             sort_order: 0,
         };
         store.insert_worktree(&wt).unwrap();
@@ -2091,6 +2158,7 @@ mod tests {
             is_main: true,
             created_from: None,
             pinned: false,
+            for_branch: false,
             sort_order: 0,
         };
         store.insert_worktree(&worktree).unwrap();
@@ -2102,6 +2170,8 @@ mod tests {
                 sort_order: 0,
                 alive: false,
                 busy: false,
+                status: None,
+                status_changed_at: 0,
             })
             .unwrap();
 
@@ -2110,6 +2180,77 @@ mod tests {
         assert!(projects.is_empty());
         assert!(worktrees.is_empty());
         assert!(terminals.is_empty());
+    }
+
+    /// A shell tab's hook-driven status (a `claude` run by hand inside it)
+    /// persists, clears, and is wiped wholesale by the boot sweep.
+    #[test]
+    fn terminal_status_persists_clears_and_boot_sweeps() {
+        let store = Store::open_in_memory().unwrap();
+        let project = Project {
+            workspace_id: Default::default(),
+            id: ProjectId::generate(),
+            name: "p".into(),
+            repo_path: "/tmp/p".into(),
+            sort_order: 0,
+            divider_after: false,
+            divider_label: None,
+            divider_before: false,
+            divider_before_label: None,
+        };
+        store.insert_project(&project).unwrap();
+        let worktree = Worktree {
+            id: WorktreeId::generate(),
+            project_id: project.id.clone(),
+            path: "/tmp/p".into(),
+            branch: "main".into(),
+            is_main: true,
+            created_from: None,
+            pinned: false,
+            for_branch: false,
+            sort_order: 0,
+        };
+        store.insert_worktree(&worktree).unwrap();
+        let tid = TerminalId::generate();
+        store
+            .insert_terminal(&TerminalTab {
+                id: tid.clone(),
+                worktree_id: worktree.id.clone(),
+                name: "shell".into(),
+                sort_order: 0,
+                alive: false,
+                busy: false,
+                status: None,
+                status_changed_at: 0,
+            })
+            .unwrap();
+        assert_eq!(store.get_terminal(&tid).unwrap().unwrap().status, None);
+
+        let stamp = store
+            .set_terminal_status(&tid, Some(AgentStatus::NeedsFeedback))
+            .unwrap();
+        let term = store.get_terminal(&tid).unwrap().unwrap();
+        assert_eq!(term.status, Some(AgentStatus::NeedsFeedback));
+        assert_eq!(term.status_changed_at, stamp);
+        let (_, _, _, terminals) = store.load_tree().unwrap();
+        assert_eq!(
+            terminals[0].status,
+            Some(AgentStatus::NeedsFeedback),
+            "load_tree carries the status too"
+        );
+
+        store.set_terminal_status(&tid, None).unwrap();
+        assert_eq!(store.get_terminal(&tid).unwrap().unwrap().status, None);
+
+        store
+            .set_terminal_status(&tid, Some(AgentStatus::Running))
+            .unwrap();
+        store.sweep_terminal_statuses().unwrap();
+        assert_eq!(
+            store.get_terminal(&tid).unwrap().unwrap().status,
+            None,
+            "boot sweep clears every terminal status"
+        );
     }
 
     #[test]
@@ -2135,6 +2276,7 @@ mod tests {
             is_main: true,
             created_from: None,
             pinned: false,
+            for_branch: false,
             sort_order: 0,
         };
         store.insert_worktree(&wt).unwrap();

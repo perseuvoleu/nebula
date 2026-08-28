@@ -2349,6 +2349,29 @@ fn status_dot(status: Option<AgentStatus>, th: Theme) -> Span<'static> {
     }
 }
 
+/// The `❯` glyph for a terminal row/tab, colored by what runs inside:
+/// the hook-driven status of a hand-run agent CLI first (same palette as
+/// the agent dots — the tab lights up like an agent), then the OSC 9;4
+/// busy bit, then plain alive/dead.
+fn terminal_glyph(t: &nebula_core::TerminalTab, th: Theme) -> Span<'static> {
+    let color = match t.status {
+        Some(AgentStatus::Running) => th.warn,
+        Some(AgentStatus::Finished) => th.ok,
+        Some(AgentStatus::NeedsFeedback) => th.err,
+        Some(AgentStatus::Terminated) => th.special,
+        Some(AgentStatus::Fresh | AgentStatus::Disconnected) | None => {
+            if t.busy {
+                th.warn
+            } else if t.alive {
+                th.ok
+            } else {
+                th.dim
+            }
+        }
+    };
+    Span::styled("❯ ", Style::default().fg(color))
+}
+
 /// Base style for a whole list row. Selection reads as a subtly raised
 /// full-width surface (never a reverse-video slab), brighter in the
 /// focused panel than in unfocused ones.
@@ -2948,6 +2971,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         (usize, usize),
         Vec<SessionRow>,
         usize,
+        bool,
     )> = app
         .visible_worktrees_with_depth()
         .iter()
@@ -2964,6 +2988,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                 app.note_stats(&nebula_core::NoteOwner::Worktree(w.id.clone())),
                 app.worktree_session_rows(&w.id),
                 *depth,
+                w.for_branch,
             )
         })
         .collect();
@@ -2977,6 +3002,11 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     // marks it; the true worktrees stack directly below on the pill
     // stride.
     const ROOT_BADGE: &str = " ⌂ primary";
+    // Row-kind tags: worktree checkouts vs plain local branches, each in
+    // its own color so the two kinds read apart at a glance. The primary
+    // checkout keeps its `⌂ primary` badge instead.
+    const WT_TAG: &str = " (wt)";
+    const BRANCH_TAG: &str = " (branch)";
     // Group headers only appear once something is pinned; otherwise the
     // list stays flat (same idiom as the sessions panel).
     let (pinned_count, _) = app.worktree_group_counts();
@@ -3012,7 +3042,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     let mut wt_heights: Vec<usize> = worktrees
         .iter()
         .enumerate()
-        .map(|(i, (_, _, created_from, _, _, sessions, _))| {
+        .map(|(i, (_, _, created_from, _, _, sessions, _, _))| {
             let mut h = PILL_H as usize + usize::from(created_from.is_some()) + sessions.len();
             if grouped && (i == 0 || i == pinned_count) {
                 h += 1;
@@ -3022,8 +3052,14 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         .collect();
     // Branch rows are plain pills below the worktree entries; folding them
     // into the same height list keeps scroll_skip, the draw, and the hit
-    // rects on one accounting.
-    wt_heights.extend(std::iter::repeat(PILL_H as usize).take(branch_rows.len()));
+    // rects on one accounting. A flat row with a recorded base carries a
+    // `from <base>` sub-line (its parent lives in the worktree section, so
+    // no tree guide can reach it), same as the flat worktree rows.
+    wt_heights.extend(
+        branch_rows
+            .iter()
+            .map(|(_, depth, from)| PILL_H as usize + usize::from(*depth == 0 && from.is_some())),
+    );
     let avail = (inner.height as usize).saturating_sub(screen_row);
     let wt_skip = scroll_skip(&wt_heights, app.sel_worktree, avail);
     // Nest-guide geometry: level `l` owns the 2-cell column pair starting
@@ -3045,7 +3081,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     // The half ran out of rows mid-list: the branch rows below must not
     // render either, or they'd paint ahead of worktrees that were skipped.
     let mut out_of_rows = false;
-    for (i, (branch, is_main, created_from, roll, notes, sessions, depth)) in
+    for (i, (branch, is_main, created_from, roll, notes, sessions, depth, for_branch)) in
         worktrees.iter().enumerate().skip(wt_skip)
     {
         // 2 cells per lineage level, already depth-capped by the app side.
@@ -3098,15 +3134,24 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             ));
             spans.push(Span::styled(ROOT_BADGE, Style::default().fg(th.dim)));
         } else {
+            // A checkout that exists only to host sessions on a branch the
+            // user created as a branch keeps its (branch) identity.
+            let (tag, tag_color) = if *for_branch {
+                (BRANCH_TAG, th.special)
+            } else {
+                (WT_TAG, th.info)
+            };
             spans.extend(status_name_spans(
                 truncate(
                     branch,
-                    (inner.width as usize).saturating_sub(2 + badge_len + nest),
+                    (inner.width as usize)
+                        .saturating_sub(2 + badge_len + nest + tag.chars().count()),
                 ),
                 Style::default(),
                 ramp,
                 app.sweep_phase(),
             ));
+            spans.push(Span::styled(tag, Style::default().fg(tag_color)));
         }
         if let Some((text, style)) = note_badge {
             spans.push(Span::styled(text, style));
@@ -3181,19 +3226,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                     agent.name.as_str().to_string(),
                 ),
                 SessionRow::Terminal(terminal) => (
-                    // Busy = whatever runs inside advertises OSC 9;4
-                    // progress (a hand-started `claude`): same warn color
-                    // as a Running agent's dot.
-                    Span::styled(
-                        "❯ ",
-                        Style::default().fg(if terminal.busy {
-                            th.warn
-                        } else if terminal.alive {
-                            th.ok
-                        } else {
-                            th.dim
-                        }),
-                    ),
+                    terminal_glyph(terminal, th),
                     None,
                     terminal.name.clone(),
                 ),
@@ -3276,18 +3309,21 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         screen_row += entry_height;
     }
     // Local branches without a checkout: dim ○ pills after the worktree
-    // rows — no sessions, no from-line. Their indices continue the same
-    // scroll_skip accounting (heights already appended above). A branch
-    // created from another checkout-less branch nests under it with the
-    // same tree guides as the worktree rows.
-    let branch_depths: Vec<usize> = branch_rows.iter().map(|(_, d)| *d).collect();
+    // rows — no sessions. Their indices continue the same scroll_skip
+    // accounting (heights already appended above). A branch created from
+    // another checkout-less branch nests under it with the same tree
+    // guides as the worktree rows; a flat one with a recorded base prints
+    // the `from <base>` sub-line instead.
+    let branch_depths: Vec<usize> = branch_rows.iter().map(|(_, d, _)| *d).collect();
     if !out_of_rows {
-        for (j, (branch, depth)) in branch_rows
+        for (j, (branch, depth, from)) in branch_rows
             .iter()
             .enumerate()
             .skip(wt_skip.saturating_sub(worktrees.len()))
         {
-            if row_rect(inner, screen_row + PILL_H as usize - 1).is_none() {
+            let from = from.as_ref().filter(|_| *depth == 0);
+            let row_height = PILL_H as usize + usize::from(from.is_some());
+            if row_rect(inner, screen_row + row_height - 1).is_none() {
                 break;
             }
             let nest = 2 * depth;
@@ -3312,9 +3348,14 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             }
             spans.push(Span::styled("○ ", dim));
             spans.push(Span::styled(
-                truncate(branch, (inner.width as usize).saturating_sub(3 + nest)),
+                truncate(
+                    branch,
+                    (inner.width as usize)
+                        .saturating_sub(3 + nest + BRANCH_TAG.chars().count()),
+                ),
                 dim,
             ));
+            spans.push(Span::styled(BRANCH_TAG, Style::default().fg(th.special)));
             let selected = app.sel_worktree == worktrees.len() + j;
             render_pill(
                 f,
@@ -3336,10 +3377,47 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                 }
                 guide_cell(f, screen_row, *depth);
             }
-            if let Some(hit) = rows_rect(inner, screen_row, PILL_H) {
+            if let Some(base) = from {
+                if let Some(r) = row_rect(inner, screen_row + PILL_H as usize) {
+                    let style = if selected {
+                        Style::default().fg(th.muted).bg(if worktrees_focused {
+                            th.sel_bg
+                        } else {
+                            th.sel_bg_dim
+                        })
+                    } else {
+                        Style::default().fg(th.dim)
+                    };
+                    f.render_widget(
+                        Paragraph::new(format!(
+                            "{ROW_GUTTER}{}",
+                            truncate(
+                                &format!("from {base}"),
+                                (inner.width as usize).saturating_sub(ROW_GUTTER.len()),
+                            )
+                        ))
+                        .style(style),
+                        r,
+                    );
+                    if selected {
+                        f.render_widget(
+                            Paragraph::new(Span::styled(
+                                "▌",
+                                Style::default().fg(if worktrees_focused {
+                                    th.accent
+                                } else {
+                                    th.dim
+                                }),
+                            )),
+                            Rect { width: 1, ..r },
+                        );
+                    }
+                }
+            }
+            if let Some(hit) = rows_rect(inner, screen_row, row_height as u16) {
                 app.hits.push((hit, HitTarget::WorktreeBranch(j)));
             }
-            screen_row += PILL_H as usize;
+            screen_row += row_height;
         }
     }
     push_section_backgrounds(app);
@@ -3469,18 +3547,7 @@ fn session_tab(
             (dot, Span::styled(truncate(&a.name, name_max), style))
         }
         SessionRow::Terminal(t) => (
-            // Warn while the tab's child advertises OSC 9;4 progress — a
-            // `claude` run by hand inside a shell tab reads as busy.
-            Span::styled(
-                "❯ ",
-                Style::default().fg(if t.busy {
-                    th.warn
-                } else if t.alive {
-                    th.ok
-                } else {
-                    th.dim
-                }),
-            ),
+            terminal_glyph(t, th),
             {
                 kind_span = Some(Span::styled("terminal", Style::default().fg(th.muted)));
                 Span::styled(truncate(&t.name, name_max), name_style)
