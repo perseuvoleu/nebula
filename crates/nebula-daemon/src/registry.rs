@@ -2948,6 +2948,12 @@ fn remote_spawn_command(
             .iter()
             .map(|s| s.to_string()),
     );
+    // The hook tunnel is a reverse `-R` forward, which a shared
+    // ControlMaster connection can't carry (the master a short git hop
+    // opened has no such forward, and a reused master silently drops the
+    // request). Force a dedicated connection so every spawn brings its own
+    // working tunnel, whatever the user's ssh config multiplexes.
+    argv.extend(["-o".to_string(), "ControlPath=none".to_string()]);
     argv.extend([
         "-R".to_string(),
         format!("{port}:127.0.0.1:{port}"),
@@ -3015,10 +3021,12 @@ mod tests {
             &["--dangerously-skip-permissions".to_string(), "it's".to_string()],
         );
         assert_eq!(program, "ssh");
-        // A tty for the interactive CLI, no password prompts, and the
-        // hook receiver reverse-forwarded at the same port.
+        // A tty for the interactive CLI, no password prompts, its own
+        // connection (not a shared ControlMaster), and the hook receiver
+        // reverse-forwarded at the same port.
         assert_eq!(args[0], "-t");
         assert!(args.contains(&"BatchMode=yes".to_string()));
+        assert!(args.windows(2).any(|w| w == ["-o", "ControlPath=none"]));
         let r = args.iter().position(|a| a == "-R").unwrap();
         assert_eq!(args[r + 1], "4242:127.0.0.1:4242");
         assert_eq!(args[args.len() - 2], "findl");
