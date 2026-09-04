@@ -24,11 +24,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
-/// Env var set on the remote side of an agent/terminal spawn, so `nebula
-/// rename` (and friends) running there know to report over the tunnelled
-/// HTTP endpoint rather than the remote box's own daemon socket.
-pub const REMOTE_ENV: &str = "NEBULA_REMOTE";
-
 fn registry() -> &'static RwLock<HashMap<PathBuf, String>> {
     static REG: OnceLock<RwLock<HashMap<PathBuf, String>>> = OnceLock::new();
     REG.get_or_init(|| RwLock::new(HashMap::new()))

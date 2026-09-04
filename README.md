@@ -276,52 +276,42 @@ nebula ssh <host> [dir]   # open nebula on a remote machine over ssh (installs i
                           # missing); destinations are remembered for the TUI's `h` picker
 nebula hooks install <kind> [dir]  # install an agent CLI's status hooks (what a spawn does;
                           # remote spawns run it on the far host)
-nebula remote <host> status    # nebula + daemon on the host, your sessions there, leftover CLIs
-nebula remote <host> sessions  # every session on the host, the host daemon's own included
+nebula remote <host> status    # nebula + daemon on the host, the sessions there
+nebula remote <host> sessions  # every session on the host, archived included
 nebula remote <host> watch     # the same, live
 nebula remote <host> sync      # mirror skills (nebula-sync-skills) + ff-pull every remote checkout
-nebula remote <host> upgrade   # nebula upgrade on the host
-nebula remote <host> clean     # kill agent processes whose tunnel from here is gone
+nebula remote <host> upgrade   # nebula upgrade on the host (its daemon keeps the old build until restart)
+nebula remote <host> restart   # nebula kill on the host — ends every session there
 nebula upgrade            # install the latest release (--force on a dev build)
 ```
 
 ### Remote projects
 
-`nebula add findl:/srv/app` (any `ssh` destination — an alias from
-`~/.ssh/config` works) adds a checkout that lives on another machine. It shows
-in the Projects panel as `app` with a pink `@findl` badge — the same badge
-marks its worktree rows, its sessions (in the tree, the global list and the
-tabs) and the breadcrumb — and everything under it happens over
-ssh from this daemon: `git` for the diff, branch and grep views; `t` shells
-that land in the remote checkout; and agent sessions, which run the CLI on
-the far host with the same status hooks (the spawn reverse-forwards the hook
-receiver through the ssh connection, so dots, auto-titles and `nebula rename`
-work unchanged). The remote host needs `nebula` and the agent CLIs installed
-and logged in (`nebula ssh host` installs nebula). Local-only tools — the
-editor, file finder, tree browser, `gh` — say so instead of opening a remote
-path.
+`nebula add findl:~/app` (any `ssh` destination — an alias from `~/.ssh/config`
+works) adds a checkout that lives on another machine. **The sessions live
+there too**: the host's own nebula daemon owns the PTYs, and your daemon
+mirrors them over one ssh connection per host (`ssh host nebula proxy`, which
+also boots the host daemon when it isn't running). Close the laptop and the
+agent keeps working; open it and the pane repaints from the live screen.
+Status dots, auto-titles and `nebula rename` are the host daemon's own hooks,
+so nothing is tunnelled.
 
-A local project and its remote twin (same name, added from both places) show
-as **one row**: the remote project is absorbed into the local one, whose
-worktree list gains the checkouts that exist only on the host (pink badge)
-and whose session lists and tabs include the remote sessions. Remove the
-local project and the remote row resurfaces on its own. They also get
-cross rows in every session picker: `Run on findl ▸` / `Run locally ▸` in the
-`n` picker, and flat `Claude on findl` … `Terminal on findl` rows in ⌘T and
-⌘D — local ⇄ remote is one keypress inside the same flow. On the command
-line, `--project name@host` picks the remote twin (`nebula agent new
---project nebula@findl --kind pi`), and `nebula remote <host> …` is the
-host-side view: what runs there, sync, upgrade, clean-up.
+What you see: one project row — the remote checkout is absorbed into the
+local project of the same name (or stands on its own when there is none) —
+with the host's worktrees, sessions and tabs under it wearing a pink `@findl`
+badge. Every session picker offers the other side (`Run on findl ▸` in `n`,
+flat `Claude on findl` … rows in ⌘T/⌘D), `--project name@host` picks the
+remote twin on the command line, and `nebula remote <host> …` is the
+host-side view: status, sessions, a live watch, skills + fast-forward sync of
+every remote checkout, upgrade, restart.
 
-Closing a remote session here (archive, ⌘W) ends its process on the host;
-stopping this daemon ends them all. A dropped ssh (sleep, network) ends the
-process too, and the next attach respawns it with the CLI's own resume, so
-the conversation continues. The host's own daemon never sees these
-sessions, and sessions started there never show here. Give the host `ControlMaster auto` in `~/.ssh/config` so the
-many short git hops share one connection. The per-run hook token rides the
-ssh command line, so other accounts on the remote host could read it from
-`ps` — it only lets them post status for your sessions, but treat shared
-boxes accordingly.
+The diff, branch and grep views run git on the host over ssh; `t` shells
+land in the remote checkout. Local-only tools — the editor, file finder,
+tree browser, `gh` — say so instead of opening a remote path. A dropped link
+reconnects on its own; the host needs `nebula` and the agent CLIs (logged in)
+installed, and `ControlMaster` in `~/.ssh/config` is welcome for the git
+hops. Stopping *your* daemon never ends a remote session;
+`nebula remote <host> restart` is what does.
 
 Settings: `~/.local/share/nebula/config.json` (or the platform equivalent),
 beside the database — hand-editable, and what the `s` overlay writes.

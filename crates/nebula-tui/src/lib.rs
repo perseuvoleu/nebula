@@ -126,6 +126,11 @@ pub fn run_remote(host: String, op: remote_cli::RemoteOp) -> Result<()> {
 
 pub use remote_cli::RemoteOp;
 
+/// `nebula proxy` — stdin/stdout ↔ the local daemon socket (see `ipc::proxy`).
+pub fn run_proxy() -> Result<()> {
+    runtime()?.block_on(ipc::proxy())
+}
+
 pub fn run_agent_list(project: Option<String>, all: bool, worktree: Option<String>) -> Result<()> {
     runtime()?.block_on(ipc::agent_list(project, all, worktree))
 }

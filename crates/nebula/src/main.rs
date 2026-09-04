@@ -143,6 +143,10 @@ enum Command {
     /// a different build than this binary (see `make install` / install.sh).
     #[command(hide = true, name = "_stale-daemon-note")]
     StaleDaemonNote,
+    /// Pipe stdin/stdout to this machine's daemon socket — what a remote
+    /// nebula runs over ssh to reach the daemon here.
+    #[command(hide = true)]
+    Proxy,
 }
 
 #[derive(Subcommand)]
@@ -396,10 +400,12 @@ enum RemoteCommand {
     Watch,
     /// Mirror skills (nebula-sync-skills) and fast-forward every remote checkout.
     Sync,
-    /// `nebula upgrade` on the host (restarts its daemon).
+    /// `nebula upgrade` on the host (its daemon keeps running the old
+    /// build until `restart`).
     Upgrade,
-    /// Kill agent processes on the host whose tunnel from here is gone.
-    Clean,
+    /// `nebula kill` on the host: restart its daemon. Ends every session
+    /// there — they are the host daemon's.
+    Restart,
 }
 
 #[derive(Subcommand)]
@@ -582,11 +588,12 @@ fn main() -> Result<()> {
                 RemoteCommand::Watch => nebula_tui::RemoteOp::Watch,
                 RemoteCommand::Sync => nebula_tui::RemoteOp::Sync,
                 RemoteCommand::Upgrade => nebula_tui::RemoteOp::Upgrade,
-                RemoteCommand::Clean => nebula_tui::RemoteOp::Clean,
+                RemoteCommand::Restart => nebula_tui::RemoteOp::Restart,
             },
         ),
         Some(Command::Ssh { host, path }) => ssh::run_ssh(&host, path.as_deref()),
         Some(Command::Upgrade { force }) => upgrade::run_upgrade(force),
+        Some(Command::Proxy) => nebula_tui::run_proxy(),
         Some(Command::StaleDaemonNote) => {
             if nebula_daemon::lifecycle::daemon_is_stale() {
                 println!("note: the running daemon was built from older code.");

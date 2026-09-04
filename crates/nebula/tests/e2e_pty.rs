@@ -3728,12 +3728,190 @@ async fn worktree_new_skips_node_modules_when_seeding_is_disabled() {
 }
 
 /// `nebula add <dir>` and the bare `nebula <dir>` shorthand: the one-shot CLI
-/// A remote project on a host ssh can't reach: the daemon answers with
-/// ssh's own complaint (BatchMode + ConnectTimeout keep it from hanging on
-/// a prompt), never touches the local filesystem for the remote path, and
-/// records nothing. `.invalid` is reserved by RFC 6761 to never resolve.
+/// The relay: a second daemon plays the remote host (reached through
+/// `nebula proxy` instead of ssh). Adding `host:/path` here mirrors the
+/// host's project, a terminal created and attached through this daemon
+/// runs *there*, and it outlives this daemon — the promise the whole
+/// design exists for.
 #[tokio::test]
-async fn remote_add_project_unreachable_host_errors_cleanly() {
+async fn relay_mirrors_a_host_and_its_sessions_outlive_the_viewer() {
+    let host_env = TestEnv::new();
+    let repo = host_env.make_repo();
+    let mut host_daemon = host_env.spawn_daemon();
+    let proxy = format!(
+        "NEBULA_RUNTIME_DIR='{}' NEBULA_DATA_DIR='{}' '{}' proxy",
+        host_env.runtime_dir.display(),
+        host_env.tmp.path().join("data").display(),
+        env!("CARGO_BIN_EXE_nebula")
+    );
+
+    let env = TestEnv::new();
+    let relay_env = [("NEBULA_RELAY_CMD", proxy.as_str())];
+    let mut daemon = env.spawn_daemon_with("/bin/sh", &relay_env);
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    write_frame(&mut c, &ClientRequest::Subscribe).await.unwrap();
+    read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        evs.iter().any(|e| matches!(e, ServerEvent::Snapshot { .. }))
+    })
+    .await;
+
+    // Anchor the host's repo here. The host daemon adopts it on the
+    // relay's request and its rows arrive as upserts, stamped with the host.
+    write_frame(
+        &mut c,
+        &ClientRequest::AddProject {
+            req_id: 1,
+            path: repo.clone(),
+            name: None,
+            create_missing: false,
+            host: Some("testhost".into()),
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(15), |evs| {
+        find_ack(evs, 1).is_some()
+            && evs.iter().any(|e| {
+                matches!(e, ServerEvent::EntityUpserted { entity: Entity::Worktree(w) } if w.is_main)
+            })
+    })
+    .await;
+    assert!(matches!(find_ack(&events, 1), Some(ServerEvent::Ack { .. })), "{events:#?}");
+    let project = events
+        .iter()
+        .find_map(|e| match e {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Project(p),
+            } => Some(p.clone()),
+            _ => None,
+        })
+        .expect("mirrored project upsert");
+    assert_eq!(project.host.as_deref(), Some("testhost"));
+    // The host reports its own spelling of the root (macOS: /private/var
+    // for /var); the same directory either way.
+    assert_eq!(project.repo_path.file_name(), repo.file_name());
+    let main_worktree = events
+        .iter()
+        .find_map(|e| match e {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(w),
+            } if w.is_main => Some(w.clone()),
+            _ => None,
+        })
+        .unwrap();
+
+    // A terminal on the mirrored worktree: created by the host daemon,
+    // attached through ours, echoing through two daemons and a pipe.
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateTerminal {
+            req_id: 2,
+            worktree: main_worktree.id.clone(),
+            name: Some("relayed".into()),
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(10), |evs| {
+        find_ack(evs, 2).is_some()
+    })
+    .await;
+    let ServerEvent::Ack {
+        created: Some(EntityId::Terminal(term_id)),
+        ..
+    } = find_ack(&events, 2).unwrap()
+    else {
+        panic!("CreateTerminal over the relay failed: {events:#?}");
+    };
+    let term_id = term_id.clone();
+    let sref = SessionRef::Terminal(term_id.clone());
+    write_frame(
+        &mut c,
+        &ClientRequest::Attach {
+            session: sref.clone(),
+            from_seq: None,
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await
+    .unwrap();
+    let marker = "relay_marker_7731";
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session: sref.clone(),
+            data: format!("echo {marker}\n").into_bytes(),
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(10), |evs| {
+        let text = String::from_utf8_lossy(&collected_output(evs)).into_owned();
+        text.matches(marker).count() >= 2
+    })
+    .await;
+    assert!(!events.is_empty());
+
+    // The viewer goes away (laptop closed). The session is the host's and
+    // stays alive.
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+    let mut h = connect(&host_env.sock()).await;
+    handshake(&mut h).await;
+    write_frame(&mut h, &ClientRequest::Subscribe).await.unwrap();
+    let events = read_events_until(&mut h, Duration::from_secs(5), |evs| {
+        evs.iter().any(|e| matches!(e, ServerEvent::Snapshot { .. }))
+    })
+    .await;
+    let alive = events.iter().any(|e| {
+        matches!(e, ServerEvent::Snapshot { terminals, .. }
+            if terminals.iter().any(|t| t.id == term_id && t.alive))
+    });
+    assert!(alive, "the host keeps the session after the viewer's daemon exits: {events:#?}");
+
+    // Back (laptop open): a fresh daemon mirrors the same rows and an
+    // attach replays the ring — the marker is still on screen.
+    let mut daemon = env.spawn_daemon_with("/bin/sh", &relay_env);
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    write_frame(&mut c, &ClientRequest::Subscribe).await.unwrap();
+    read_events_until(&mut c, Duration::from_secs(15), |evs| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Terminal(t) } if t.id == term_id)
+                || matches!(e, ServerEvent::Snapshot { terminals, .. } if terminals.iter().any(|t| t.id == term_id))
+        })
+    })
+    .await;
+    write_frame(
+        &mut c,
+        &ClientRequest::Attach {
+            session: sref.clone(),
+            from_seq: None,
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(10), |evs| {
+        String::from_utf8_lossy(&collected_output(evs)).contains(marker)
+    })
+    .await;
+    assert!(!events.is_empty());
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+    write_frame(&mut h, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut host_daemon);
+}
+
+/// A remote project whose host ssh can't reach: the anchor row is stored
+/// (the relay keeps retrying in the background), nothing is created on
+/// this machine, and the panels show no phantom rows for it.
+#[tokio::test]
+async fn remote_add_project_unreachable_host_is_an_anchor_only() {
     let env = TestEnv::new();
     let mut daemon = env.spawn_daemon();
     let mut c = connect(&env.sock()).await;
@@ -3764,22 +3942,13 @@ async fn remote_add_project_unreachable_host_errors_cleanly() {
         find_ack(evs, 1).is_some()
     })
     .await;
-    let Some(ServerEvent::Error { message, .. }) = find_ack(&events, 1) else {
-        panic!("expected an error for the unreachable host: {events:#?}");
-    };
-    assert!(
-        message.contains("not a git repository") || message.contains("ssh"),
-        "ssh's complaint should reach the client: {message}"
-    );
-    assert!(
-        !remote_path.exists(),
-        "create_missing must not apply to a remote path"
-    );
+    assert!(matches!(find_ack(&events, 1), Some(ServerEvent::Ack { .. })), "{events:#?}");
+    assert!(!remote_path.exists(), "create_missing never applies to a remote path");
     assert!(
         !events
             .iter()
             .any(|e| matches!(e, ServerEvent::EntityUpserted { entity: Entity::Project(_) })),
-        "no project row for a failed remote add"
+        "no local project row is announced for a remote anchor"
     );
 
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();

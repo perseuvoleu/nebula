@@ -1,18 +1,11 @@
 //! `nebula remote <host> …`: the host-side view of remote projects.
 //!
-//! Sessions on a remote host are owned by *this* daemon (their PTY is an
-//! ssh client here; the far side only has the CLI process), so the local
-//! snapshot is the source of truth for "what runs on findl". What the
-//! snapshot can't see — nebula's version there, the daemon a `nebula ssh`
-//! visit left running, agent processes that outlived their tunnel — this
-//! module asks the host over ssh. Every ssh hop is BatchMode: a host that
-//! needs a password fails fast instead of hanging a CLI.
-//!
-//! Ownership is decided by env, not by process tree: a remote spawn exports
-//! `NEBULA_AGENT_ID` and `NEBULA_REMOTE=1` to its CLI, so `/proc/<pid>/environ`
-//! says which local session a process belongs to. Processes without that
-//! marker were started by the host's own daemon or by hand — `clean` never
-//! touches them.
+//! Sessions on a remote host are owned by the host's own daemon and
+//! mirrored here by the relay (see the daemon's `relay.rs`), so the local
+//! snapshot already says what runs on findl. What it can't say — nebula's
+//! version there, whether the host daemon is up — this module asks over
+//! ssh. Every ssh hop is BatchMode: a host that needs a password fails fast
+//! instead of hanging a CLI.
 
 use crate::ipc::{handshake, subscribe_snapshot, try_connect};
 use anyhow::{bail, Context, Result};
@@ -26,7 +19,9 @@ pub enum RemoteOp {
     Watch,
     Sync,
     Upgrade,
-    Clean,
+    /// `nebula kill` on the host: restarts its daemon, ending every
+    /// session there.
+    Restart,
 }
 
 pub async fn run(host: String, op: RemoteOp) -> Result<()> {
@@ -39,7 +34,7 @@ pub async fn run(host: String, op: RemoteOp) -> Result<()> {
         RemoteOp::Watch => watch(&host).await,
         RemoteOp::Sync => sync(&host).await,
         RemoteOp::Upgrade => upgrade(&host),
-        RemoteOp::Clean => clean(&host).await,
+        RemoteOp::Restart => restart(&host),
     }
 }
 
@@ -106,43 +101,6 @@ fn ssh(host: &str, script: &str, tty: bool) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Agent ids with a live ssh client from this machine right now — every
-/// remote spawn's argv carries `nebula-remote '<id>'`. Prewarmed slots
-/// have such a client but no row in the snapshot, so this, not the
-/// snapshot, is what says a remote process is still ours.
-fn tunnelled_ids() -> Vec<String> {
-    let out = Command::new("ps").args(["-eo", "args"]).output();
-    let Ok(out) = out else { return Vec::new() };
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter(|l| l.contains("ssh") && l.contains("nebula-remote '"))
-        .filter_map(|l| {
-            let rest = l.split("nebula-remote '").nth(1)?;
-            Some(rest.split('\'').next()?.to_string())
-        })
-        .collect()
-}
-
-/// Agent CLI processes on the host: (pid, cli, NEBULA_AGENT_ID or "").
-/// Linux `/proc` only — which is what a nebula server is.
-fn remote_agent_procs(host: &str) -> Result<Vec<(u32, String, String)>> {
-    // One regex — pgrep takes a single pattern; -x anchors it whole.
-    let script = r#"for p in $(pgrep -x -d ' ' 'claude|codex|cursor-agent|pi' 2>/dev/null); do
-  c=$(ps -o comm= -p $p 2>/dev/null); id=$(tr '\0' '\n' < /proc/$p/environ 2>/dev/null | sed -n 's/^NEBULA_AGENT_ID=//p');
-  echo "$p $c $id"; done"#;
-    let out = ssh(host, script, false)?;
-    Ok(out
-        .lines()
-        .filter_map(|l| {
-            let mut it = l.split_whitespace();
-            let pid = it.next()?.parse().ok()?;
-            let cli = it.next()?.to_string();
-            let id = it.next().unwrap_or("").to_string();
-            Some((pid, cli, id))
-        })
-        .collect())
-}
-
 async fn status(host: &str) -> Result<()> {
     let snap = snapshot().await?;
     let projects = projects_on(&snap, host);
@@ -163,41 +121,22 @@ async fn status(host: &str) -> Result<()> {
         Err(e) => println!("{host}: unreachable — {e}"),
     }
     print_sessions(host, &snap, false).await?;
-    // Processes the tunnel left behind.
-    let live = tunnelled_ids();
-    if let Ok(procs) = remote_agent_procs(host) {
-        let orphans: Vec<_> = procs
-            .iter()
-            .filter(|(_, _, id)| !id.is_empty() && !live.contains(id))
-            .collect();
-        let foreign = procs.iter().filter(|(_, _, id)| id.is_empty()).count();
-        println!(
-            "processes on {host}: {} agent CLI{} ({} orphaned from here, {} not ours)",
-            procs.len(),
-            if procs.len() == 1 { "" } else { "s" },
-            orphans.len(),
-            foreign
-        );
-        if !orphans.is_empty() {
-            println!("  `nebula remote {host} clean` kills the orphans");
-        }
-    }
     Ok(())
 }
 
-async fn print_sessions(host: &str, snap: &Snapshot, include_server_owned: bool) -> Result<()> {
+async fn print_sessions(host: &str, snap: &Snapshot, everything: bool) -> Result<()> {
     let all = sessions_on(snap, host);
     // `status` is the glance: live rows only, archived as a count.
     // `sessions` is the ledger and shows everything.
     let archived = all.iter().filter(|(a, ..)| a.archived).count();
     let ours: Vec<_> = all
         .iter()
-        .filter(|(a, ..)| include_server_owned || !a.archived)
+        .filter(|(a, ..)| everything || !a.archived)
         .collect();
     println!(
-        "sessions on {host} (owned by this daemon): {}{}",
+        "sessions on {host}: {}{}",
         ours.len(),
-        if !include_server_owned && archived > 0 {
+        if !everything && archived > 0 {
             format!("  (+{archived} archived)")
         } else {
             String::new()
@@ -211,34 +150,8 @@ async fn print_sessions(host: &str, snap: &Snapshot, include_server_owned: bool)
             truncate(&a.name, 28),
             p.name,
             w.branch,
-            if a.archived { "  (archived)" } else if !a.alive { "  (no pty)" } else { "" }
+            if a.archived { "  (archived)" } else if !a.alive { "  (idle)" } else { "" }
         );
-    }
-    if include_server_owned {
-        // What the host's own daemon runs — sessions started there with
-        // `nebula ssh` or by hand. Invisible to our tree, listed for the
-        // full picture.
-        match ssh(host, "nebula agent list --all 2>/dev/null", false) {
-            Ok(out) if !out.trim().is_empty() => {
-                let rows: Vec<serde_json::Value> = serde_json::from_str(&out).unwrap_or_default();
-                let live: Vec<&serde_json::Value> = rows
-                    .iter()
-                    .filter(|r| r["archived"].as_bool() != Some(true))
-                    .collect();
-                println!("sessions owned by {host}'s own daemon: {}", live.len());
-                for r in live {
-                    println!(
-                        "  {:<12} {:<7} {:<28} {}/{}",
-                        r["status"].as_str().unwrap_or("?"),
-                        r["kind"].as_str().unwrap_or("?"),
-                        truncate(r["name"].as_str().unwrap_or("?"), 28),
-                        r["project"].as_str().unwrap_or("?"),
-                        r["worktree"].as_str().unwrap_or("?")
-                    );
-                }
-            }
-            _ => println!("sessions owned by {host}'s own daemon: none (or its daemon is down)"),
-        }
     }
     Ok(())
 }
@@ -301,30 +214,17 @@ async fn sync(host: &str) -> Result<()> {
 }
 
 fn upgrade(host: &str) -> Result<()> {
-    // Interactive on purpose: nebula upgrade prints progress and kills the
-    // host's daemon (its own sessions, not ours — ours ride ssh from here).
-    ssh(host, "nebula kill 2>/dev/null; nebula upgrade && nebula --version", true)?;
+    // Interactive on purpose: nebula upgrade prints progress. The host's
+    // daemon keeps running the old build (and its sessions) until
+    // `nebula remote <host> restart`.
+    ssh(host, "nebula upgrade && nebula --version", true)?;
     Ok(())
 }
 
-/// Kill agent CLI processes on the host that carry a NEBULA_AGENT_ID with
-/// no ssh client left on this machine — a tunnel that dropped without
-/// taking its CLI down. Processes without the marker are left alone.
-async fn clean(host: &str) -> Result<()> {
-    let live = tunnelled_ids();
-    let orphans: Vec<(u32, String, String)> = remote_agent_procs(host)?
-        .into_iter()
-        .filter(|(_, _, id)| !id.is_empty() && !live.contains(id))
-        .collect();
-    if orphans.is_empty() {
-        println!("nothing to clean on {host}");
-        return Ok(());
-    }
-    let pids: Vec<String> = orphans.iter().map(|(p, ..)| p.to_string()).collect();
-    ssh(host, &format!("kill {} 2>/dev/null; sleep 1; kill -9 {} 2>/dev/null; true", pids.join(" "), pids.join(" ")), false)?;
-    for (pid, cli, id) in &orphans {
-        println!("killed {cli} pid {pid} (session {id})");
-    }
+/// `nebula kill` on the host. Its daemon owns every session there, so
+/// this ends them all — the one remote action with that blast radius.
+fn restart(host: &str) -> Result<()> {
+    ssh(host, "nebula kill; sleep 1; nebula agent list --all >/dev/null 2>&1 && echo 'daemon: running' || echo 'daemon: stopped (starts on the next relay connect)'", true)?;
     Ok(())
 }
 

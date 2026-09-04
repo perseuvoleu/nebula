@@ -106,33 +106,9 @@ pub struct HookEnv {
 pub struct HookServerState {
     token: String,
     tx: mpsc::Sender<HookDelivery>,
-    /// Commands from a remote session's `nebula` CLI (see `RemoteCommand`).
-    cmd_tx: mpsc::Sender<RemoteCommand>,
     /// Read-only peek at agent rows: drives the auto-title injection
     /// decision without a round-trip through the daemon's drain loop.
     store: Arc<Store>,
-}
-
-/// A verb a remote session's `nebula` CLI sent through the ssh tunnel.
-/// Locally `nebula rename` talks to the daemon socket; on a remote host that
-/// socket belongs to the wrong daemon, so the CLI POSTs here instead (the
-/// same loopback port the hooks use, reverse-forwarded by the spawn's ssh).
-/// `reply` carries the daemon's verdict back to the HTTP response.
-pub enum RemoteCommand {
-    Rename {
-        agent_id: AgentId,
-        title: String,
-        force: bool,
-        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
-    },
-}
-
-/// JSON body of `POST /api/agent/rename`.
-#[derive(Deserialize)]
-struct RenameBody {
-    title: String,
-    #[serde(default)]
-    force: bool,
 }
 
 /// One accepted hook POST, decoded for the daemon's drain loop.
@@ -227,21 +203,15 @@ pub fn parse_event(hook_event: &str, payload: &HookPayload) -> Option<HookEvent>
 /// bearer token) and the receiving end of the event pipe.
 pub async fn start_hook_server(
     store: Arc<Store>,
-) -> anyhow::Result<(
-    HookEnv,
-    mpsc::Receiver<HookDelivery>,
-    mpsc::Receiver<RemoteCommand>,
-)> {
+) -> anyhow::Result<(HookEnv, mpsc::Receiver<HookDelivery>)> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
     let token = generate_token();
     let (tx, rx) = mpsc::channel(256);
-    let (cmd_tx, cmd_rx) = mpsc::channel(32);
 
     let state = Arc::new(HookServerState {
         token: token.clone(),
         tx,
-        cmd_tx,
         store,
     });
     // Claude and Codex UserPromptSubmit hooks pipe this server's response
@@ -257,8 +227,6 @@ pub async fn start_hook_server(
         // UserPromptSubmit POST and re-injects it as a custom context
         // message, so it takes the injectable route like claude/codex.
         .route("/api/hooks/pi", post(receive_injectable_hook))
-        // `nebula rename` from a remote session (see `RemoteCommand`).
-        .route("/api/agent/rename", post(receive_rename))
         .with_state(state);
 
     tokio::spawn(async move {
@@ -267,7 +235,7 @@ pub async fn start_hook_server(
         }
     });
 
-    Ok((HookEnv { port, token }, rx, cmd_rx))
+    Ok((HookEnv { port, token }, rx))
 }
 
 fn generate_token() -> String {
@@ -360,52 +328,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rename_route_is_token_gated_and_reaches_the_daemon() {
-        let store = seeded_store();
-        let (env, _rx, mut cmd_rx) = start_hook_server(store).await.unwrap();
-
-        let (status, _) = http_post(
-            env.port,
-            "/api/agent/rename?agent=pending",
-            "wrong",
-            r#"{"title":"Fix It"}"#,
-        )
-        .await;
-        assert_eq!(status, 401);
-
-        // A good token: the command lands on the daemon channel carrying
-        // the agent, title and force flag; the HTTP reply waits on the
-        // daemon's verdict.
-        let port = env.port;
-        let token = env.token.clone();
-        let client = tokio::spawn(async move {
-            http_post(
-                port,
-                "/api/agent/rename?agent=term%3At1",
-                &token,
-                r#"{"title":"Fix It","force":true}"#,
-            )
-            .await
-        });
-        let RemoteCommand::Rename {
-            agent_id,
-            title,
-            force,
-            reply,
-        } = cmd_rx.recv().await.unwrap();
-        assert_eq!(agent_id.as_str(), "term:t1", "query is percent-decoded");
-        assert_eq!(title, "Fix It");
-        assert!(force);
-        reply.send(Err("already titled".into())).unwrap();
-        let (status, body) = client.await.unwrap();
-        assert_eq!(status, 409);
-        assert_eq!(body, "already titled");
-    }
-
-    #[tokio::test]
     async fn user_prompt_submit_injects_title_instruction_only_while_pending() {
         let store = seeded_store();
-        let (env, mut rx, _cmd) = start_hook_server(store.clone()).await.unwrap();
+        let (env, mut rx) = start_hook_server(store.clone()).await.unwrap();
         let payload = r#"{"session_id":"s1"}"#;
 
         // Untitled session: the instruction rides the response body (and the
@@ -498,7 +423,7 @@ mod tests {
     async fn user_prompt_submit_injects_todos_instruction_while_open() {
         use nebula_core::{Note, NoteId, NoteOwner, Todo, TodoId, TodoOwner};
         let store = seeded_store();
-        let (env, _rx, _cmd) = start_hook_server(store.clone()).await.unwrap();
+        let (env, _rx) = start_hook_server(store.clone()).await.unwrap();
         let payload = r#"{"session_id":"s1"}"#;
 
         // Two open todos (project + worktree) and one done one.
@@ -574,7 +499,7 @@ mod tests {
     #[tokio::test]
     async fn user_prompt_submit_injects_siblings_pointer_when_shared() {
         let store = seeded_store();
-        let (env, _rx, _cmd) = start_hook_server(store.clone()).await.unwrap();
+        let (env, _rx) = start_hook_server(store.clone()).await.unwrap();
         let payload = r#"{"session_id":"s1"}"#;
         let post = |port, token: String| async move {
             http_post(
@@ -610,7 +535,7 @@ mod tests {
     #[tokio::test]
     async fn bash_tool_use_carries_cwd_but_subagent_traffic_does_not() {
         let store = seeded_store();
-        let (env, mut rx, _cmd) = start_hook_server(store).await.unwrap();
+        let (env, mut rx) = start_hook_server(store).await.unwrap();
 
         // The mid-turn position signal: a Bash call that just `cd`ed into a
         // fresh worktree, long before the turn's Stop.
@@ -702,51 +627,6 @@ async fn receive_injectable_hook(
 
 /// Cursor route: every hook command answers cursor with its own gating JSON
 /// and discards this body, so the `{"ok": ...}` diagnostics stay.
-/// `POST /api/agent/rename` with `{"title", "force"}`: the remote-session
-/// form of `nebula rename`. Bearer-token gated like the hooks; the agent is
-/// named by the `agent` query param (the CLI's `NEBULA_AGENT_ID`). Answers
-/// with the daemon's own message so the model reads the same text a local
-/// rename prints.
-async fn receive_rename(
-    State(state): State<Arc<HookServerState>>,
-    Query(query): Query<RenameQuery>,
-    headers: HeaderMap,
-    body: String,
-) -> (StatusCode, String) {
-    let authorized = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(|presented| presented.as_bytes().ct_eq(state.token.as_bytes()).into())
-        .unwrap_or(false);
-    if !authorized {
-        return (StatusCode::UNAUTHORIZED, "bad token".into());
-    }
-    let Ok(parsed) = serde_json::from_str::<RenameBody>(&body) else {
-        return (StatusCode::BAD_REQUEST, "malformed body".into());
-    };
-    let (reply, wait) = tokio::sync::oneshot::channel();
-    let cmd = RemoteCommand::Rename {
-        agent_id: AgentId(query.agent),
-        title: parsed.title,
-        force: parsed.force,
-        reply,
-    };
-    if state.cmd_tx.send(cmd).await.is_err() {
-        return (StatusCode::SERVICE_UNAVAILABLE, "daemon is shutting down".into());
-    }
-    match wait.await {
-        Ok(Ok(())) => (StatusCode::OK, String::new()),
-        Ok(Err(msg)) => (StatusCode::CONFLICT, msg),
-        Err(_) => (StatusCode::SERVICE_UNAVAILABLE, "daemon dropped the request".into()),
-    }
-}
-
-#[derive(Deserialize)]
-struct RenameQuery {
-    agent: String,
-}
-
 async fn receive_plain_hook(
     State(state): State<Arc<HookServerState>>,
     Query(query): Query<HookQuery>,

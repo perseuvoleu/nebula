@@ -43,6 +43,34 @@ pub async fn connect_or_spawn() -> Result<Connection> {
     }
 }
 
+/// `nebula proxy`: pump stdin/stdout to this machine's daemon socket, no
+/// framing, no handshake — the peer speaks the protocol itself. It is what
+/// another nebula's relay runs over `ssh host nebula proxy` to reach this
+/// daemon; spawning the daemon when none is listening keeps a fresh host
+/// zero-setup. Exits when either side closes.
+pub async fn proxy() -> Result<()> {
+    let sock = paths::socket_path();
+    let mut stream = match try_connect(&sock).await {
+        Ok(s) => s,
+        Err(_) => {
+            spawn_daemon()?;
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                match try_connect(&sock).await {
+                    Ok(s) => break s,
+                    Err(_) if tokio::time::Instant::now() < deadline => {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    Err(e) => return Err(e).context("daemon did not come up"),
+                }
+            }
+        }
+    };
+    let mut stdio = tokio::io::join(tokio::io::stdin(), tokio::io::stdout());
+    let _ = tokio::io::copy_bidirectional(&mut stdio, &mut stream).await;
+    Ok(())
+}
+
 pub(crate) async fn try_connect(sock: &std::path::Path) -> Result<UnixStream> {
     Ok(UnixStream::connect(sock).await?)
 }
@@ -159,12 +187,6 @@ pub async fn rename_current_agent(title: String, force: bool) -> Result<()> {
         "NEBULA_AGENT_ID is not set — `nebula rename` only works from inside a \
              nebula agent session",
     )?;
-    // Inside a remote spawn the local socket belongs to this host's own
-    // daemon; the session's daemon is the one behind the tunnelled hook
-    // endpoint.
-    if std::env::var_os(nebula_core::remote::REMOTE_ENV).is_some() {
-        return rename_over_tunnel(&agent_id, &title, force).await;
-    }
     let sock = paths::socket_path();
     let Ok(stream) = try_connect(&sock).await else {
         bail!("no nebula daemon is running — title unchanged");
@@ -801,62 +823,6 @@ pub async fn switch(
         eprintln!("cd '{path}'");
     }
     Ok(())
-}
-
-/// `POST /api/agent/rename` on the daemon's hook receiver, reached through
-/// the reverse tunnel a remote spawn opens (`NEBULA_API_URL` names it).
-/// Minimal HTTP/1.1 by hand — the hooks' own one-liners do the same, and a
-/// client crate for one request isn't worth the dependency.
-async fn rename_over_tunnel(agent_id: &str, title: &str, force: bool) -> Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let url = std::env::var("NEBULA_API_URL").context("NEBULA_API_URL is not set")?;
-    let token = std::env::var("NEBULA_API_TOKEN").context("NEBULA_API_TOKEN is not set")?;
-    let authority = url
-        .strip_prefix("http://")
-        .with_context(|| format!("unsupported NEBULA_API_URL: {url}"))?
-        .trim_end_matches('/');
-    let body = serde_json::json!({ "title": title, "force": force }).to_string();
-    let request = format!(
-        "POST /api/agent/rename?agent={} HTTP/1.1\r\nHost: {authority}\r\n\
-         Authorization: Bearer {token}\r\nContent-Type: application/json\r\n\
-         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        percent_encode(agent_id),
-        body.len()
-    );
-    let mut stream = tokio::net::TcpStream::connect(authority)
-        .await
-        .context("no nebula daemon reachable through the ssh tunnel — title unchanged")?;
-    stream.write_all(request.as_bytes()).await?;
-    let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).await?;
-    let text = String::from_utf8_lossy(&raw);
-    let (head, reply) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
-    let status: u16 = head
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    if status == 200 {
-        println!("session renamed to \"{title}\"");
-        Ok(())
-    } else {
-        bail!("{}", reply.trim())
-    }
-}
-
-/// Query-string escape for the agent id (ULIDs are plain, but a `term:`
-/// prefix carries a colon).
-fn percent_encode(s: &str) -> String {
-    let mut out = String::new();
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
 }
 
 fn git_branch_exists(repo: &std::path::Path, branch: &str) -> bool {

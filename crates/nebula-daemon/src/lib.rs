@@ -5,6 +5,7 @@ pub mod lifecycle;
 pub mod metrics;
 pub mod pty;
 pub mod registry;
+pub mod relay;
 pub mod server;
 pub mod status;
 pub mod store;
@@ -56,11 +57,12 @@ async fn serve() -> Result<()> {
     // Hook receiver: loopback HTTP endpoint the claude hook one-liners hit.
     // It shares the store to answer UserPromptSubmit hooks with the
     // auto-title instruction while a session is still untitled.
-    let (hook_env, mut hook_rx, mut cmd_rx) = hooks::start_hook_server(store.clone()).await?;
+    let (hook_env, mut hook_rx) = hooks::start_hook_server(store.clone()).await?;
     tracing::info!(port = hook_env.port, "hook receiver listening");
 
     let daemon = registry::Daemon::new(store, hook_env);
     daemon.refresh_remote_hosts();
+    daemon.ensure_relays();
 
     // Drain hook events into the status machines; a payload that reports a
     // cwd inside another worktree of the same project re-homes the agent row.
@@ -83,31 +85,6 @@ async fn serve() -> Result<()> {
                         session_id.as_deref(),
                         captures_session,
                     );
-                }
-            }
-        });
-    }
-
-    // Verbs tunnelled in from remote sessions (`nebula rename` on the far
-    // side of an ssh spawn).
-    {
-        let daemon = daemon.clone();
-        tokio::spawn(async move {
-            while let Some(cmd) = cmd_rx.recv().await {
-                match cmd {
-                    hooks::RemoteCommand::Rename {
-                        agent_id,
-                        title,
-                        force,
-                        reply,
-                    } => {
-                        let result = if force {
-                            daemon.rename_agent(&agent_id, &title)
-                        } else {
-                            daemon.auto_rename_agent(&agent_id, &title)
-                        };
-                        let _ = reply.send(result.map_err(|e| e.to_string()));
-                    }
                 }
             }
         });
@@ -192,6 +169,11 @@ async fn serve() -> Result<()> {
                 };
                 seen.retain(|id, _| projects.iter().any(|p| &p.id == id));
                 for project in projects {
+                    // A remote anchor's checkouts are the host daemon's to
+                    // sync; the relay mirrors them.
+                    if project.host.is_some() {
+                        continue;
+                    }
                     let stamp = worktree_probe_stamp(&project.repo_path);
                     if seen.get(&project.id) == Some(&stamp) {
                         continue;

@@ -85,6 +85,14 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         .await;
                     break;
                 }
+                // A request naming something mirrored from a remote host
+                // belongs to that host's daemon; the relay carries it there
+                // and brings the reply (or the PTY stream) back on out_tx.
+                req if daemon.relay_for_request(&req).is_some() => {
+                    if let Some(relay) = daemon.relay_for_request(&req) {
+                        relay.forward(req, &out_tx).await;
+                    }
+                }
                 ClientRequest::Subscribe => {
                     let snapshot = daemon.snapshot().unwrap_or(ServerEvent::Snapshot {
                         workspaces: vec![],

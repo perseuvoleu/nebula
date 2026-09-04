@@ -257,6 +257,13 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE projects ADD COLUMN host TEXT;
     ",
+    // 24: a remote project's checkouts and sessions live in the host's own
+    // daemon and are mirrored live, never stored here; rows the earlier
+    // ssh-spawn model wrote under host projects are dropped (agents and
+    // terminals cascade with their worktrees).
+    "
+    DELETE FROM worktrees WHERE project_id IN (SELECT id FROM projects WHERE host IS NOT NULL);
+    ",
 ];
 
 pub struct Store {
@@ -434,6 +441,16 @@ impl Store {
             [],
             |r| r.get(0),
         )?)
+    }
+
+    /// Rewrite a remote anchor's path to the toplevel its host resolved
+    /// (`host:~/repo/sub` → the repo root), so later mirrors match by path.
+    pub fn set_project_repo_path(&self, id: &ProjectId, path: &Path) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE projects SET repo_path = ?2 WHERE id = ?1",
+            params![id.as_str(), path.to_string_lossy()],
+        )?;
+        Ok(())
     }
 
     /// Persist a project's list position: sort order plus both dividers.

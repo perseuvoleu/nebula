@@ -1,42 +1,41 @@
 ---
 name: remote-projects
-description: "Working on a remote host (findl or any ssh destination) through nebula: adding a remote checkout, starting sessions there from the local TUI or CLI, what the pink @host badge means, `nebula remote <host>` for status/sync/upgrade/clean, and the session lifecycle over the ssh tunnel. Trigger: \"remote\", \"pe server\", \"findl\", \"@findl\", `nebula remote`, a session or checkout that lives on another machine, or hooks/status not arriving from a remote session."
+description: "Working on a remote host (findl or any ssh destination) through nebula: adding a remote checkout, starting sessions there from the local TUI or CLI, what the pink @host badge means, how the relay keeps sessions alive on the host with the laptop closed, `nebula remote <host>` for status/sync/upgrade/restart. Trigger: \"remote\", \"pe server\", \"findl\", \"@findl\", `nebula remote`, a session or checkout that lives on another machine, or remote rows missing/stale."
 user-invocable: true
 ---
 
-A *remote project* is a git checkout on another machine that the **local** daemon drives over ssh.
-`nebula add findl:~/repo` (or `host:/path` in the `n` add-project prompt) registers it; the row shows as
-`repo` with a pink `@findl` badge. Nothing about it is a second nebula: the local daemon spawns the
-agent CLI on the host through `ssh -t`, reverse-forwards its hook receiver through that same
-connection, and runs every git command for the panels over ssh. The host needs `nebula`, the agent
-CLIs and their logins installed (`nebula remote <host> upgrade` keeps nebula current there).
+A *remote project* is a git checkout on another machine. `nebula add findl:~/repo` (or `host:/path` in
+the `n` add-project prompt) registers it as an **anchor**; everything else about it — worktrees,
+sessions, PTYs, status hooks — belongs to the **host's own nebula daemon**, which the local daemon
+mirrors through a relay. The row shows as `repo` with a pink `@findl` badge (absorbed into the local
+project of the same name when one exists). The host needs `nebula`, the agent CLIs and their logins
+installed; `nebula remote <host> upgrade` keeps nebula current there.
 
-## Where things live
+## The model (why it behaves the way it does)
 
-| Thing | Where | Reached how |
+| Thing | Where it lives | Reached how |
 |---|---|---|
-| Session row, status, title, PTY | local daemon | the TUI, `nebula agent … --project repo@host` |
-| The CLI process, its conversation, the checkout | the host | ssh from the local daemon |
-| Status hooks, `nebula rename`, session id | posted on the host → tunnel → local daemon | `-R port:127.0.0.1:port` on the spawn's ssh |
+| Session row, status, title, PTY, conversation, checkout | the host daemon | mirrored here by the relay |
+| Status hooks, `nebula rename`, session id | the host daemon's own loopback | native on the host, nothing tunnelled |
+| The relay link | one `ssh host nebula proxy` per host, from the local daemon | reconnects on its own with backoff |
 | Skills / global agent config | the host's home | `nebula-sync-skills` / `nebula remote <host> sync` |
 
-The host's own daemon (what `nebula ssh host` uses) never sees these sessions, and sessions started
-there never show locally. Treat the two as separate worlds that happen to share a checkout.
+So: **closing the laptop, sleeping, losing the network, or `nebula kill` locally never ends a remote
+session** — the agent keeps working on the host. Coming back, the relay re-subscribes and re-attaches
+every session a pane was on, which repaints from the live screen. The one thing that ends host sessions
+is `nebula remote <host> restart` (a `nebula kill` there), and the host's own idle reaper.
+
+Ids are the host daemon's, used verbatim; a request naming a mirrored id is forwarded to the host. The
+local anchor row is hidden; the host's project row (stamped with the host) stands in for it, and the
+anchor's path is rewritten to the host's spelling of the repo root the first time it connects.
 
 ## Twins: local ⇄ remote in one list
 
-A local project and a remote one **with the same name** in the same workspace are twins, and the
-Projects panel shows them as **one row** (the local one): the remote project is absorbed — its
-remote-only checkouts join the worktree list with the badge, its sessions join the session lists —
-and only resurfaces as its own row if the local project is removed. Every session picker offers
-the other side (`Run on findl ▸` in `n`; flat `Claude on findl` … `Terminal
-on findl` rows in ⌘T/⌘D), and a worktree's session list and tab bar include the twin's sessions
-(primary pairs with primary, other worktrees pair by branch), each wearing the badge. So a session
-started "on findl" from the local `nebula` row appears right there — do not go looking for it under
-`nebula @findl`, though it is listed there too.
-
-On the command line two projects share the name, so say which: `--project nebula@findl` is the
-remote twin, `--project nebula` the local one.
+A local project and a remote one **with the same name** in the same workspace are twins: one row
+in Projects, the remote-only checkouts join the worktree list with the badge, remote sessions join
+the session lists and tabs. Every session picker offers the other side (`Run on findl ▸` in `n`;
+flat `Claude on findl` … rows in ⌘T/⌘D). On the command line two projects share the name, so say
+which: `--project nebula@findl` is the remote twin, `--project nebula` the local one.
 
 ```bash
 nebula agent new --project nebula@findl --kind pi --worktree root --name fix login
@@ -44,50 +43,38 @@ nebula agent read "fix login" --project nebula@findl
 nebula agent send "fix login" "run the tests" --project nebula@findl
 ```
 
-## Lifecycle (verified)
-
-- **Archive / ⌘W / delete here** ends the CLI process on the host at once.
-- **Stopping the local daemon** (`nebula kill`) ends every remote session's process.
-- **A dropped ssh** (laptop sleep, network) ends the process; the next attach respawns it with the
-  CLI's own resume (`claude --resume <id>`, `codex resume`, `pi --session`), so the conversation
-  continues. The id comes from the SessionStart hook through the tunnel.
-- Processes that outlive their tunnel are orphans: `nebula remote <host> status` counts them,
-  `nebula remote <host> clean` kills them. Only processes carrying a `NEBULA_AGENT_ID` this daemon no
-  longer owns are touched; anything started by hand or by the host's daemon is left alone.
-
 ## `nebula remote <host>`
 
 ```
-status    nebula + daemon on the host, this daemon's live sessions there, orphan count
-sessions  every session there, archived and the host daemon's own included
+status    nebula + daemon on the host, the sessions there (live; archived as a count)
+sessions  every session there, archived included
 watch     `sessions`, live, every 2s
 sync      skills (nebula-sync-skills) + `git pull --ff-only` on every remote checkout
-upgrade   `nebula upgrade` on the host (restarts only its daemon)
-clean     kill orphaned agent processes (see above)
+upgrade   `nebula upgrade` on the host; its daemon keeps the old build until `restart`
+restart   `nebula kill` on the host — ends every session there
 ```
 
 ## What does not work remotely, on purpose
 
 The editor, file finder, tree browser and `gh` are local tools; on a remote checkout they flash
 "lives on <host>" instead of opening a path that isn't here. Use a `t` shell tab on the remote row
-and edit there. Diff, branches, grep, worktree creation and PR links all work — they are git.
+and edit there. Diff, branches, grep, worktree creation and PR links all work — they are git, run
+on the host over ssh.
 
-## When status is stuck on `fresh`
+## When remote rows are missing or stale
 
-The hook tunnel is the usual suspect. Check, in order:
+The relay link is the usual suspect. In order:
 
-1. `nebula remote <host> status` — is nebula there ≥ 0.4.1 (has `nebula hooks install`)? Older
-   hosts print `could not install … status hooks` at the top of the pane and never report.
-2. The local daemon is on a build ≥ 0.4.1 too (`nebula --version` vs the running daemon; a
-   stale daemon needs `nebula kill` — it stops ALL sessions, so ask first).
-3. From the host: `curl -m 3 http://127.0.0.1:<port>/` where `<port>` is the local daemon's hook
-   port (`hook receiver listening port=…` in the daemon log). A timeout means the reverse forward
-   is dead: ssh multiplexing (`ControlMaster`) hijacking it was the v0.4.0 bug; spawns now force
-   `ControlPath=none`.
+1. `nebula remote <host> status` — nebula there ≥ 0.5.0 (has `nebula proxy`)? `daemon: running`?
+2. The local daemon log (`daemon.log` in the state dir): `relay link up host=…` after boot or
+   after `nebula add host:…`; a `relay link down` line carries ssh's own complaint (host key,
+   BatchMode refusing a password, protocol mismatch → upgrade one side).
+3. `ssh host 'nebula proxy' </dev/null` by hand: it should sit silently (Ctrl-C) rather than error.
+4. A protocol mismatch (`Incompatible`) means the two nebulas disagree on the wire format:
+   `nebula remote <host> upgrade` then `restart`, or upgrade locally.
 
 ## Security notes
 
-The per-run hook token rides the ssh command line and is readable via `ps` by other accounts on
-the host; it only allows status posts and `nebula rename` for your sessions. Never copy personal ssh
-keys to the host — a per-repo deploy key (`gh repo deploy-key add --allow-write`) is the pattern
-used for findl.
+Never copy personal ssh keys to the host — a per-repo deploy key (`gh repo deploy-key add
+--allow-write`) is the pattern used for findl. The relay runs under your ssh identity and BatchMode:
+it never answers prompts, so a host that needs a password simply stays unreachable.

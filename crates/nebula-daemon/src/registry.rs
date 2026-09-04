@@ -7,6 +7,7 @@ use crate::pty::{PtyEvent, PtySession, SpawnSpec};
 use crate::status::{AgentStatusMachine, Effect, HookEvent};
 use crate::store::Store;
 use anyhow::{bail, Context, Result};
+use nebula_core::ClientRequest;
 use nebula_core::{
     Agent, AgentId, AgentKind, AgentStatus, Entity, EntityId, Link, LinkId, Note, NoteId,
     NoteOwner, Project, ProjectId, ServerEvent, SessionRef, TerminalId, TerminalTab, Todo, TodoId,
@@ -97,6 +98,10 @@ pub struct Daemon {
     /// nebula hasn't adopted yet leaves its cwd here, so the worktree sync
     /// can finish the re-home once the row exists.
     last_cwd: Mutex<HashMap<AgentId, PathBuf>>,
+    /// One relay per remote host with projects here: mirrors that host
+    /// daemon's tree for those projects and forwards our clients' requests
+    /// to it (see `relay.rs`).
+    relays: Mutex<HashMap<String, Arc<crate::relay::Relay>>>,
 }
 
 impl Daemon {
@@ -116,7 +121,53 @@ impl Daemon {
             attach_counts: Mutex::new(HashMap::new()),
             session_interest: Mutex::new(HashMap::new()),
             last_cwd: Mutex::new(HashMap::new()),
+            relays: Mutex::new(HashMap::new()),
         })
+    }
+
+    // ---- relays ----
+
+    /// Start a relay for every host that has a project here and none yet.
+    /// Called at boot and after a remote project is added.
+    pub fn ensure_relays(self: &Arc<Self>) {
+        let Ok((projects, ..)) = self.store.load_tree() else {
+            return;
+        };
+        let mut relays = self.relays.lock().unwrap();
+        for host in projects.iter().filter_map(|p| p.host.clone()) {
+            if !relays.contains_key(&host) {
+                tracing::info!(host = %host, "starting relay");
+                let relay = crate::relay::Relay::spawn(self.clone(), host.clone());
+                relays.insert(host, relay);
+            }
+        }
+    }
+
+    /// The relay whose mirror a request addresses, if any.
+    pub fn relay_for_request(&self, req: &ClientRequest) -> Option<Arc<crate::relay::Relay>> {
+        let relays = self.relays.lock().unwrap();
+        relays.values().find(|r| r.owns_request(req)).cloned()
+    }
+
+    /// Whether a session is mirrored from some host (its PTY isn't here).
+    pub fn is_mirrored_session(&self, sref: &SessionRef) -> bool {
+        self.relays
+            .lock()
+            .unwrap()
+            .values()
+            .any(|r| r.owns_session(sref))
+    }
+
+    /// Mirrored entities, for the snapshot. The local `host:/path` rows
+    /// stay hidden: the host's own project row (stamped with the host)
+    /// stands in for them.
+    fn mirrored(&self) -> Vec<crate::relay::Mirror> {
+        self.relays
+            .lock()
+            .unwrap()
+            .values()
+            .map(|r| r.mirror.lock().unwrap().clone())
+            .collect()
     }
 
     /// Rebuild the process-wide checkout→host map from the store: every
@@ -500,14 +551,35 @@ impl Daemon {
     // ---- snapshot ----
 
     pub fn snapshot(&self) -> Result<ServerEvent> {
-        let (projects, worktrees, mut agents, mut terminals) = self.store.load_tree()?;
+        let (mut projects, mut worktrees, mut agents, mut terminals) = self.store.load_tree()?;
+        let mut notes = self.store.load_notes()?;
+        let mut todos = self.store.load_todos()?;
+        let mut links = self.store.load_links()?;
+        // Remote projects are shown through their host daemon's rows.
+        projects.retain(|p| p.host.is_none());
+        for m in self.mirrored() {
+            projects.extend(m.projects);
+            worktrees.extend(m.worktrees);
+            agents.extend(m.agents);
+            terminals.extend(m.terminals);
+            notes.extend(m.notes);
+            todos.extend(m.todos);
+            links.extend(m.links);
+        }
         {
             let sessions = self.sessions.lock().unwrap();
+            // Mirrored rows keep the liveness their host reported.
             for a in &mut agents {
+                if self.is_mirrored_session(&SessionRef::Agent(a.id.clone())) {
+                    continue;
+                }
                 a.alive = sessions.contains_key(&SessionRef::Agent(a.id.clone()));
             }
             for t in &mut terminals {
                 let sref = SessionRef::Terminal(t.id.clone());
+                if self.is_mirrored_session(&sref) {
+                    continue;
+                }
                 t.alive = sessions.contains_key(&sref);
                 t.busy = sessions
                     .get(&sref)
@@ -522,9 +594,9 @@ impl Daemon {
             worktrees,
             agents,
             terminals,
-            notes: self.store.load_notes()?,
-            todos: self.store.load_todos()?,
-            links: self.store.load_links()?,
+            notes,
+            todos,
+            links,
             pr_seen: self.store.load_pr_seen()?,
             ui_state: self.store.load_ui_state()?,
         })
@@ -649,27 +721,52 @@ impl Daemon {
         create_missing: bool,
         host: Option<String>,
     ) -> Result<EntityId> {
-        // A remote checkout: every git call below hops over ssh once the
-        // path is on the host map. Registered before the toplevel probe so
-        // the probe itself goes to the right machine; `refresh_remote_hosts`
-        // rebuilds the map from the store afterwards either way.
-        let expanded;
-        let path = match &host {
-            // `host:~/repo`: only the remote shell knows its $HOME.
-            Some(host) if path.starts_with("~") => {
+        // A remote checkout is an *anchor*: the host's own daemon adopts
+        // the repo (normalizing to its toplevel, rejecting non-repos) once
+        // the relay hands it the path, and mirrors everything back. Nothing
+        // to probe from here beyond a `~`, which only the remote shell can
+        // expand.
+        if let Some(host) = host {
+            let path = if path.starts_with("~") {
                 let rest = path.strip_prefix("~").unwrap_or(path);
-                expanded = git::remote_home(host)
+                git::remote_home(&host)
                     .await
                     .with_context(|| format!("resolve ~ on {host}"))?
-                    .join(rest);
-                expanded.as_path()
+                    .join(rest)
+            } else {
+                path.to_path_buf()
+            };
+            let workspace_id = self.store.active_workspace_id()?;
+            if self
+                .store
+                .project_in_workspace_on(&path, &workspace_id, Some(&host))?
+                .is_some()
+            {
+                bail!("project already added to this workspace: {host}:{}", path.display());
             }
-            _ => path,
-        };
-        if let Some(host) = &host {
-            nebula_core::remote::register(path, host);
+            let name = name.unwrap_or_else(|| {
+                path.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "project".into())
+            });
+            let project = Project {
+                id: ProjectId::generate(),
+                name,
+                workspace_id,
+                repo_path: path,
+                sort_order: self.store.next_project_sort_order()?,
+                divider_after: false,
+                divider_label: None,
+                divider_before: false,
+                divider_before_label: None,
+                host: Some(host),
+            };
+            self.store.insert_project(&project)?;
+            self.refresh_remote_hosts();
+            self.ensure_relays();
+            return Ok(EntityId::Project(project.id));
         }
-        if host.is_none() && create_missing && !path.exists() {
+        if create_missing && !path.exists() {
             tokio::fs::create_dir_all(path)
                 .await
                 .with_context(|| format!("create {}", path.display()))?;
@@ -687,15 +784,12 @@ impl Daemon {
                 e.context(format!("{} is not a git repository", path.display()))
             }
         })?;
-        if let Some(host) = &host {
-            nebula_core::remote::register(&toplevel, host);
-        }
         // New projects land in whichever workspace is open; the same repo
         // may be added to any number of workspaces, just not twice to one.
         let workspace_id = self.store.active_workspace_id()?;
         if self
             .store
-            .project_in_workspace_on(&toplevel, &workspace_id, host.as_deref())?
+            .project_in_workspace(&toplevel, &workspace_id)?
             .is_some()
         {
             bail!(
@@ -719,7 +813,7 @@ impl Daemon {
             divider_label: None,
             divider_before: false,
             divider_before_label: None,
-            host,
+            host: None,
         };
         self.store.insert_project(&project)?;
         self.broadcast(ServerEvent::EntityUpserted {
@@ -1427,14 +1521,7 @@ impl Daemon {
         // the CLI runs. Without this, a missing CLI still "succeeds" — the
         // login shell prints `command not found` into a PTY that dies at
         // once, leaving a dead row that looks identical to a fresh one.
-        // (A remote project's CLI lives on the far host, where the login
-        // shell there is the only honest probe — a missing CLI shows up as
-        // ssh's `command not found` in the pane instead.)
-        let remote = self
-            .store
-            .get_project(&worktree.project_id)?
-            .is_some_and(|p| p.host.is_some());
-        if adopted.is_none() && !remote && !self.cli_available_for_create(kind).await {
+        if adopted.is_none() && !self.cli_available_for_create(kind).await {
             bail!("{}", cli_missing_message(kind));
         }
         let agent = Agent {
@@ -2369,19 +2456,10 @@ impl Daemon {
         rows: u16,
         initial_prompt: Option<&str>,
     ) -> Result<Arc<PtySession>> {
-        // A remote project's checkout is on another machine: the CLI runs
-        // there under ssh, and its hooks are installed there too (by the
-        // remote `nebula hooks install` the spawn script runs first).
-        let host = self
-            .store
-            .get_project(&worktree.project_id)?
-            .and_then(|p| p.host);
         // Managed status hooks; a failure here degrades to "no status
         // updates", never blocks the spawn.
-        if host.is_none() {
-            if let Err(e) = hooks::installer::install_for_kind(agent.kind, &worktree.path) {
-                tracing::warn!(error = %e, cwd = %worktree.path.display(), "hook install failed");
-            }
+        if let Err(e) = hooks::installer::install_for_kind(agent.kind, &worktree.path) {
+            tracing::warn!(error = %e, cwd = %worktree.path.display(), "hook install failed");
         }
 
         // NEBULA_AGENT_CMD overrides for tests; default is the kind's CLI.
@@ -2395,21 +2473,6 @@ impl Daemon {
             initial_prompt,
         );
         let hook_env = self.hook_env_pairs(&agent.id.to_string());
-        // Remote: the whole command line moves to the far side under ssh,
-        // hook env and all (the tunnel brings the hooks back here). Local:
-        // the CLI's own argv.
-        let (program, args) = match &host {
-            Some(host) => remote_spawn_command(
-                host,
-                self.hook_env.port,
-                &hook_env,
-                &worktree.path,
-                Some(agent.kind),
-                &program,
-                &args,
-            ),
-            None => (program, args),
-        };
         // Run the agent through the user's login+interactive shell so it sees
         // the same env as a Terminal.app tab (~/.zprofile, ~/.zshrc,
         // path_helper) instead of the daemon's inherited-at-boot env.
@@ -2423,7 +2486,7 @@ impl Daemon {
         let spec = SpawnSpec {
             program,
             args,
-            cwd: spawn_cwd(host.as_deref(), &worktree.path),
+            cwd: worktree.path.clone(),
             env: hook_env,
             scrub_env: scrubbed_env_names(),
             cols,
@@ -2500,30 +2563,12 @@ impl Daemon {
         // The hook env carries a `term:`-prefixed id: an agent CLI run by
         // hand inside this shell reports through the same globally-installed
         // hooks, and the daemon routes those onto the terminal's status.
-        let host = self
-            .store
-            .get_project(&worktree.project_id)?
-            .and_then(|p| p.host);
         let hook_env =
             self.hook_env_pairs(&format!("{TERMINAL_HOOK_PREFIX}{}", terminal.id.as_str()));
-        // Remote: an ssh session that lands in the checkout and execs the
-        // remote user's login shell (the spawn script's no-argv case).
-        let (program, args) = match &host {
-            Some(host) => remote_spawn_command(
-                host,
-                self.hook_env.port,
-                &hook_env,
-                &worktree.path,
-                None,
-                "",
-                &[],
-            ),
-            None => (user_shell(), vec!["-l".into()]),
-        };
         let spec = SpawnSpec {
-            program,
-            args,
-            cwd: spawn_cwd(host.as_deref(), &worktree.path),
+            program: user_shell(),
+            args: vec!["-l".into()],
+            cwd: worktree.path.clone(),
             env: hook_env,
             scrub_env: scrubbed_env_names(),
             cols,
@@ -2865,105 +2910,6 @@ fn cli_missing_message(kind: AgentKind) -> String {
     )
 }
 
-/// Working directory for the local side of a spawn. A remote checkout's
-/// path doesn't exist here, and portable-pty refuses a missing cwd, so
-/// the ssh client starts in $HOME (or `/`) — the far side `cd`s.
-fn spawn_cwd(host: Option<&str>, checkout: &Path) -> PathBuf {
-    match host {
-        None => checkout.to_path_buf(),
-        Some(_) => std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .filter(|h| h.is_dir())
-            .unwrap_or_else(|| PathBuf::from("/")),
-    }
-}
-
-/// Runs under `sh -c` on the remote host. Positional parameters:
-/// `$1` agent id, `$2` api url, `$3` api token, `$4` checkout dir, `$5`
-/// agent kind ("" for a shell tab), then the CLI's own argv. It exports the
-/// hook env (plus `NEBULA_REMOTE`, so the remote `nebula rename` reports
-/// through the tunnel instead of the remote daemon), has the remote nebula
-/// install that kind's status hooks, enters the checkout and execs the CLI
-/// — or the user's login shell when no argv follows.
-///
-/// Same quoting contract as `nebula ssh`: no single quotes, backslashes or
-/// newlines, wrapped once in '...'; user data rides only as quoted
-/// positionals. Hook-install failure is a warning, not a stop — a session
-/// without status beats no session.
-const REMOTE_SPAWN_SCRIPT: &str = concat!(
-    "export PATH=\"$HOME/.local/bin:$PATH\"; ",
-    "export NEBULA_REMOTE=1 NEBULA_AGENT_ID=\"$1\" NEBULA_API_URL=\"$2\" NEBULA_API_TOKEN=\"$3\"; ",
-    "if [ -n \"$5\" ]; then ",
-    "nebula hooks install \"$5\" \"$4\" >/dev/null 2>&1 || ",
-    "echo \"nebula: could not install $5 status hooks on this host (is nebula installed here?)\" >&2; ",
-    "fi; ",
-    "cd -- \"$4\" || exit 1; ",
-    "shift 5; ",
-    "if [ $# -eq 0 ]; then exec \"${SHELL:-sh}\" -l; fi; ",
-    "exec \"$@\""
-);
-
-/// `ssh -t -R port:127.0.0.1:port host 'sh -c SCRIPT nebula-remote …'`:
-/// the local argv that runs `program args…` inside `checkout` on `host`.
-/// The reverse forward puts this daemon's hook receiver on the remote's
-/// loopback at the same port, so the hook env crosses unchanged. `-t`
-/// forces a remote tty (the CLI is interactive); `BatchMode` keeps a
-/// daemon with no terminal from hanging on a password prompt.
-fn remote_spawn_command(
-    host: &str,
-    port: u16,
-    hook_env: &[(String, String)],
-    checkout: &Path,
-    kind: Option<AgentKind>,
-    program: &str,
-    args: &[String],
-) -> (String, Vec<String>) {
-    let env = |name: &str| {
-        hook_env
-            .iter()
-            .find(|(k, _)| k == name)
-            .map(|(_, v)| v.as_str())
-            .unwrap_or("")
-    };
-    let mut words: Vec<&str> = vec![
-        env("NEBULA_AGENT_ID"),
-        env("NEBULA_API_URL"),
-        env("NEBULA_API_TOKEN"),
-    ];
-    let checkout = checkout.to_string_lossy();
-    words.push(&checkout);
-    words.push(kind.map(|k| k.as_str()).unwrap_or(""));
-    if !program.is_empty() {
-        words.push(program);
-        words.extend(args.iter().map(String::as_str));
-    }
-    let remote = format!(
-        "sh -c {} nebula-remote {}",
-        nebula_core::remote::ssh_quote(REMOTE_SPAWN_SCRIPT),
-        nebula_core::remote::join_quoted(words)
-    );
-    let mut argv: Vec<String> = vec!["-t".into()];
-    argv.extend(
-        nebula_core::remote::SSH_BATCH_OPTS
-            .iter()
-            .map(|s| s.to_string()),
-    );
-    // The hook tunnel is a reverse `-R` forward, which a shared
-    // ControlMaster connection can't carry (the master a short git hop
-    // opened has no such forward, and a reused master silently drops the
-    // request). Force a dedicated connection so every spawn brings its own
-    // working tunnel, whatever the user's ssh config multiplexes.
-    argv.extend(["-o".to_string(), "ControlPath=none".to_string()]);
-    argv.extend([
-        "-R".to_string(),
-        format!("{port}:127.0.0.1:{port}"),
-        "--".to_string(),
-        host.to_string(),
-        remote,
-    ]);
-    ("ssh".into(), argv)
-}
-
 /// Wrap `program args…` in a login + interactive shell (`$SHELL -l -i -c
 /// 'exec …'`) so the child gets the user's real environment — ~/.zprofile
 /// and ~/.zshrc on zsh — rather than the daemon's. `exec` keeps the child
@@ -2994,67 +2940,6 @@ pub fn scrubbed_env_names() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn remote_spawn_script_survives_single_quoting() {
-        // Same contract as `nebula ssh`: the script rides inside one '...'
-        // under any login shell, so it can't contain what would end it.
-        assert!(!REMOTE_SPAWN_SCRIPT.contains('\''));
-        assert!(!REMOTE_SPAWN_SCRIPT.contains('\\'));
-        assert!(!REMOTE_SPAWN_SCRIPT.contains('\n'));
-    }
-
-    #[test]
-    fn remote_spawn_command_tunnels_hooks_and_quotes_argv() {
-        let env = vec![
-            ("NEBULA_AGENT_ID".to_string(), "a1".to_string()),
-            ("NEBULA_API_URL".to_string(), "http://127.0.0.1:4242".to_string()),
-            ("NEBULA_API_TOKEN".to_string(), "tok".to_string()),
-        ];
-        let (program, args) = remote_spawn_command(
-            "findl",
-            4242,
-            &env,
-            Path::new("/srv/my app"),
-            Some(AgentKind::Claude),
-            "claude",
-            &["--dangerously-skip-permissions".to_string(), "it's".to_string()],
-        );
-        assert_eq!(program, "ssh");
-        // A tty for the interactive CLI, no password prompts, its own
-        // connection (not a shared ControlMaster), and the hook receiver
-        // reverse-forwarded at the same port.
-        assert_eq!(args[0], "-t");
-        assert!(args.contains(&"BatchMode=yes".to_string()));
-        assert!(args.windows(2).any(|w| w == ["-o", "ControlPath=none"]));
-        let r = args.iter().position(|a| a == "-R").unwrap();
-        assert_eq!(args[r + 1], "4242:127.0.0.1:4242");
-        assert_eq!(args[args.len() - 2], "findl");
-        let remote = args.last().unwrap();
-        assert!(remote.starts_with("sh -c '"), "{remote}");
-        // Positionals: id, url, token, dir, kind, then the CLI argv — each
-        // single-quoted, embedded quotes escaped.
-        assert!(remote.ends_with(
-            "nebula-remote 'a1' 'http://127.0.0.1:4242' 'tok' '/srv/my app' 'claude' \
-             'claude' '--dangerously-skip-permissions' 'it'\\''s'"
-        ), "{remote}");
-    }
-
-    #[test]
-    fn remote_terminal_spawn_has_no_kind_and_no_argv() {
-        let (_, args) = remote_spawn_command("box", 1, &[], Path::new("/w"), None, "", &[]);
-        let remote = args.last().unwrap();
-        // Empty kind → no hook install; empty argv → the script execs the
-        // remote login shell.
-        assert!(remote.ends_with("nebula-remote '' '' '' '/w' ''"), "{remote}");
-    }
-
-    #[test]
-    fn spawn_cwd_falls_back_to_home_for_remote_checkouts() {
-        assert_eq!(spawn_cwd(None, Path::new("/x")), PathBuf::from("/x"));
-        let cwd = spawn_cwd(Some("findl"), Path::new("/remote/only"));
-        assert!(cwd.is_dir(), "local side starts somewhere that exists: {cwd:?}");
-    }
 
     #[test]
     fn spawn_command_per_kind_resume_shapes() {
