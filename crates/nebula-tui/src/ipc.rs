@@ -43,7 +43,7 @@ pub async fn connect_or_spawn() -> Result<Connection> {
     }
 }
 
-async fn try_connect(sock: &std::path::Path) -> Result<UnixStream> {
+pub(crate) async fn try_connect(sock: &std::path::Path) -> Result<UnixStream> {
     Ok(UnixStream::connect(sock).await?)
 }
 
@@ -81,7 +81,7 @@ fn libc_setsid() -> i32 {
     unsafe { setsid() }
 }
 
-async fn handshake(mut stream: UnixStream) -> Result<Connection> {
+pub(crate) async fn handshake(mut stream: UnixStream) -> Result<Connection> {
     write_frame(
         &mut stream,
         &ClientRequest::Hello {
@@ -499,7 +499,7 @@ fn send_sigterm(pid: i32) -> i32 {
 /// One tree snapshot over an already-handshaken connection: send Subscribe,
 /// return the first Snapshot's rows. The connection keeps streaming deltas
 /// afterwards, which the control verbs use to catch their own upserts.
-async fn subscribe_snapshot(
+pub(crate) async fn subscribe_snapshot(
     conn: &mut Connection,
 ) -> Result<(
     Vec<nebula_core::Project>,

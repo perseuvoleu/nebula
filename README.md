@@ -276,6 +276,12 @@ nebula ssh <host> [dir]   # open nebula on a remote machine over ssh (installs i
                           # missing); destinations are remembered for the TUI's `h` picker
 nebula hooks install <kind> [dir]  # install an agent CLI's status hooks (what a spawn does;
                           # remote spawns run it on the far host)
+nebula remote <host> status    # nebula + daemon on the host, your sessions there, leftover CLIs
+nebula remote <host> sessions  # every session on the host, the host daemon's own included
+nebula remote <host> watch     # the same, live
+nebula remote <host> sync      # mirror skills (nebula-sync-skills) + ff-pull every remote checkout
+nebula remote <host> upgrade   # nebula upgrade on the host
+nebula remote <host> clean     # kill agent processes whose tunnel from here is gone
 nebula upgrade            # install the latest release (--force on a dev build)
 ```
 
@@ -300,7 +306,14 @@ cross rows in every session picker: `Run on findl ▸` / `Run locally ▸` in th
 `n` picker, and flat `Claude on findl` … `Terminal on findl` rows in ⌘T and
 ⌘D — local ⇄ remote is one keypress inside the same flow. On the command
 line, `--project name@host` picks the remote twin (`nebula agent new
---project nebula@findl --kind pi`). Give the host `ControlMaster auto` in `~/.ssh/config` so the
+--project nebula@findl --kind pi`), and `nebula remote <host> …` is the
+host-side view: what runs there, sync, upgrade, clean-up.
+
+Closing a remote session here (archive, ⌘W) ends its process on the host;
+stopping this daemon ends them all. A dropped ssh (sleep, network) ends the
+process too, and the next attach respawns it with the CLI's own resume, so
+the conversation continues. The host's own daemon never sees these
+sessions, and sessions started there never show here. Give the host `ControlMaster auto` in `~/.ssh/config` so the
 many short git hops share one connection. The per-run hook token rides the
 ssh command line, so other accounts on the remote host could read it from
 `ps` — it only lets them post status for your sessions, but treat shared

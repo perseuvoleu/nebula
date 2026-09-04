@@ -112,6 +112,14 @@ enum Command {
         #[command(subcommand)]
         command: HooksCommand,
     },
+    /// The host-side view of remote projects: what runs on a server, its
+    /// nebula, orphaned agent processes; sync skills and checkouts; upgrade.
+    Remote {
+        /// ssh destination (an alias from ~/.ssh/config works).
+        host: String,
+        #[command(subcommand)]
+        command: RemoteCommand,
+    },
     /// Open nebula on a remote host over ssh (installs it there if missing).
     Ssh {
         /// ssh destination, passed verbatim (e.g. user@server).
@@ -378,6 +386,23 @@ enum TodoCommand {
 }
 
 #[derive(Subcommand)]
+enum RemoteCommand {
+    /// nebula version and daemon on the host, this daemon's sessions there,
+    /// leftover agent processes.
+    Status,
+    /// Sessions on the host: this daemon's, plus the host daemon's own.
+    Sessions,
+    /// Live session list, refreshed every 2s.
+    Watch,
+    /// Mirror skills (nebula-sync-skills) and fast-forward every remote checkout.
+    Sync,
+    /// `nebula upgrade` on the host (restarts its daemon).
+    Upgrade,
+    /// Kill agent processes on the host whose tunnel from here is gone.
+    Clean,
+}
+
+#[derive(Subcommand)]
 enum HooksCommand {
     /// Install `kind`'s hooks (claude, codex, cursor, pi) for `dir`.
     Install {
@@ -549,6 +574,17 @@ fn main() -> Result<()> {
         }
         Some(Command::Kill) => nebula_tui::run_kill(),
         Some(Command::Rename { title, force }) => nebula_tui::run_rename(title.join(" "), force),
+        Some(Command::Remote { host, command }) => nebula_tui::run_remote(
+            host,
+            match command {
+                RemoteCommand::Status => nebula_tui::RemoteOp::Status,
+                RemoteCommand::Sessions => nebula_tui::RemoteOp::Sessions,
+                RemoteCommand::Watch => nebula_tui::RemoteOp::Watch,
+                RemoteCommand::Sync => nebula_tui::RemoteOp::Sync,
+                RemoteCommand::Upgrade => nebula_tui::RemoteOp::Upgrade,
+                RemoteCommand::Clean => nebula_tui::RemoteOp::Clean,
+            },
+        ),
         Some(Command::Ssh { host, path }) => ssh::run_ssh(&host, path.as_deref()),
         Some(Command::Upgrade { force }) => upgrade::run_upgrade(force),
         Some(Command::StaleDaemonNote) => {

@@ -17,6 +17,7 @@ pub mod links;
 pub mod pull_request;
 pub mod raw_attach;
 pub mod remote;
+pub mod remote_cli;
 pub mod review;
 pub mod splash;
 pub mod syntax;
@@ -118,6 +119,13 @@ pub fn run_worktree_list(project: Option<String>, all: bool) -> Result<()> {
 }
 
 /// `nebula agent list` — the delegating session's JSON view of its workers.
+/// `nebula remote <host> …` — the host-side view of remote projects.
+pub fn run_remote(host: String, op: remote_cli::RemoteOp) -> Result<()> {
+    runtime()?.block_on(remote_cli::run(host, op))
+}
+
+pub use remote_cli::RemoteOp;
+
 pub fn run_agent_list(project: Option<String>, all: bool, worktree: Option<String>) -> Result<()> {
     runtime()?.block_on(ipc::agent_list(project, all, worktree))
 }
