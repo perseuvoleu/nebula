@@ -9620,13 +9620,11 @@ mod tests {
         let mut app = App::new();
         seed_tree(&mut app);
         seed_remote_twin(&mut app);
-        // The tree sync taught the host map where /srv/demo lives.
-        assert_eq!(
-            nebula_core::remote::host_for(std::path::Path::new("/srv/demo/src")).as_deref(),
-            Some("findl")
-        );
 
-        // Local picker: the kinds, the shell, then "Run on findl".
+        // Local picker: the kinds, the shell, then "Run on findl". (The
+        // rows come from `project_twins`, which reads `app.tree` directly;
+        // the process-global host map is asserted elsewhere and would be
+        // racy here since sibling tests share it.)
         open_agent_picker(&mut app, WorktreeId("w1".into()));
         let Some(Overlay::Menu(menu)) = &app.overlay else {
             panic!("expected the picker");
