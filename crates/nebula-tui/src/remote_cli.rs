@@ -109,7 +109,12 @@ async fn status(host: &str) -> Result<()> {
     }
     for p in &projects {
         let n = snap.1.iter().filter(|w| w.project_id == p.id).count();
-        println!("project {} @{host}  {}  ({n} checkout{})", p.name, p.repo_path.display(), if n == 1 { "" } else { "s" });
+        println!(
+            "project {} @{host}  {}  ({n} checkout{})",
+            p.name,
+            p.repo_path.display(),
+            if n == 1 { "" } else { "s" }
+        );
     }
     // The host itself.
     match ssh(host, "nebula --version 2>/dev/null || echo 'nebula: not installed'; nebula agent list --all >/dev/null 2>&1 && echo 'daemon: running' || echo 'daemon: not running'", false) {
@@ -150,7 +155,13 @@ async fn print_sessions(host: &str, snap: &Snapshot, everything: bool) -> Result
             truncate(&a.name, 28),
             p.name,
             w.branch,
-            if a.archived { "  (archived)" } else if !a.alive { "  (idle)" } else { "" }
+            if a.archived {
+                "  (archived)"
+            } else if !a.alive {
+                "  (idle)"
+            } else {
+                ""
+            }
         );
     }
     Ok(())
@@ -160,7 +171,10 @@ async fn watch(host: &str) -> Result<()> {
     loop {
         let snap = snapshot().await?;
         print!("\x1b[2J\x1b[H");
-        println!("nebula remote {host} watch — {}   (Ctrl-C to stop)", chrono_now());
+        println!(
+            "nebula remote {host} watch — {}   (Ctrl-C to stop)",
+            chrono_now()
+        );
         print_sessions(host, &snap, false).await?;
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
@@ -171,7 +185,12 @@ fn chrono_now() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    format!("{:02}:{:02}:{:02} UTC", (secs / 3600) % 24, (secs / 60) % 60, secs % 60)
+    format!(
+        "{:02}:{:02}:{:02} UTC",
+        (secs / 3600) % 24,
+        (secs / 60) % 60,
+        secs % 60
+    )
 }
 
 /// Skills (the same mirror `nss` runs) and a fast-forward pull on every
@@ -181,12 +200,17 @@ async fn sync(host: &str) -> Result<()> {
     match which("nebula-sync-skills") {
         Some(script) => {
             println!("skills → {host}");
-            let status = Command::new(script).arg(host).status().context("run nebula-sync-skills")?;
+            let status = Command::new(script)
+                .arg(host)
+                .status()
+                .context("run nebula-sync-skills")?;
             if !status.success() {
                 println!("  skills sync failed ({status})");
             }
         }
-        None => println!("skills: `nebula-sync-skills` not on PATH — see the sync-skills skill; skipped"),
+        None => println!(
+            "skills: `nebula-sync-skills` not on PATH — see the sync-skills skill; skipped"
+        ),
     }
     let snap = snapshot().await?;
     let checkouts: Vec<&Worktree> = {
@@ -243,4 +267,3 @@ fn truncate(s: &str, max: usize) -> String {
         s.chars().take(max - 1).collect::<String>() + "…"
     }
 }
-

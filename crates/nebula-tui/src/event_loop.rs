@@ -2244,7 +2244,9 @@ fn open_file_link(app: &mut App, path: &str, line: Option<u64>) {
         return;
     };
     if let Some(host) = nebula_core::remote::host_for(&root) {
-        app.flash = Some(format!("{path} is on {host} — open it from a shell tab there"));
+        app.flash = Some(format!(
+            "{path} is on {host} — open it from a shell tab there"
+        ));
         return;
     }
     let Some(file) = resolve_file_link(&root, path) else {
@@ -2670,8 +2672,8 @@ fn quick_terminal_shortcut(app: &mut App, out: &mut Vec<ClientRequest>) {
         },
     ];
     let hover = items.len() - 1; // the shell row: ⌘T's historical behaviour
-    // The project's twins on other machines get the same rows, flat —
-    // ⌘T's promise is one keypress to a ready tab, so no submenu.
+                                 // The project's twins on other machines get the same rows, flat —
+                                 // ⌘T's promise is one keypress to a ready tab, so no submenu.
     for (place, twin) in project_twins(app, &worktree) {
         for (label, kind) in [
             ("Claude", AgentKind::Claude),
@@ -2680,16 +2682,13 @@ fn quick_terminal_shortcut(app: &mut App, out: &mut Vec<ClientRequest>) {
         ] {
             items.push(MenuItem {
                 label: format!("{label} {}", on(&place)),
-                action: MenuAction::QuickAgentOfKind {
-                    worktree: twin.clone(),
-                    kind,
-                },
+                action: twin.clone().then(AfterCheckout::QuickAgent(kind)),
                 destructive: false,
             });
         }
         items.push(MenuItem {
             label: format!("Terminal {}", on(&place)),
-            action: MenuAction::NewTerminal(twin),
+            action: twin.then(AfterCheckout::Terminal),
             destructive: false,
         });
     }
@@ -2795,16 +2794,13 @@ fn toggle_split_terminal(app: &mut App, out: &mut Vec<ClientRequest>) {
         ] {
             items.push(MenuItem {
                 label: format!("{label} {}", on(&place)),
-                action: MenuAction::SplitAgentOfKind {
-                    worktree: twin.clone(),
-                    kind,
-                },
+                action: twin.clone().then(AfterCheckout::SplitAgent(kind)),
                 destructive: false,
             });
         }
         items.push(MenuItem {
             label: format!("Terminal {}", on(&place)),
-            action: MenuAction::SplitShell(twin),
+            action: twin.then(AfterCheckout::SplitShell),
             destructive: false,
         });
     }
@@ -3605,10 +3601,10 @@ fn open_agent_picker(app: &mut App, worktree: WorktreeId) {
     // their primary checkout — local ⇄ remote is one keypress inside the
     // same flow, no separate TUI to hop into.
     let host = app.worktree_host(&worktree).map(str::to_owned);
-    for (place, twin_main) in project_twins(app, &worktree) {
+    for (place, twin) in project_twins(app, &worktree) {
         items.push(MenuItem {
             label: format!("Run {} ▸", on(&place)),
-            action: MenuAction::NewAgent(twin_main),
+            action: twin.then(AfterCheckout::PickAgent),
             destructive: false,
         });
     }
@@ -3627,12 +3623,53 @@ fn open_agent_picker(app: &mut App, worktree: WorktreeId) {
     }));
 }
 
+/// Where a twin row sends a new session: the twin's checkout of the same
+/// branch when it has one, otherwise a checkout of that branch on the
+/// twin's primary first (`nebula switch` there, then the session).
+#[derive(Debug, Clone, PartialEq)]
+enum TwinTarget {
+    Worktree(WorktreeId),
+    Checkout {
+        project: nebula_core::ProjectId,
+        branch: String,
+    },
+}
+
+impl TwinTarget {
+    /// The menu action that runs `next` on this target.
+    fn then(self, next: AfterCheckout) -> MenuAction {
+        match self {
+            TwinTarget::Worktree(w) => match next {
+                AfterCheckout::Land => MenuAction::NewAgent(w),
+                AfterCheckout::PickAgent => MenuAction::NewAgent(w),
+                AfterCheckout::Terminal => MenuAction::NewTerminal(w),
+                AfterCheckout::QuickAgent(kind) => {
+                    MenuAction::QuickAgentOfKind { worktree: w, kind }
+                }
+                AfterCheckout::SplitAgent(kind) => {
+                    MenuAction::SplitAgentOfKind { worktree: w, kind }
+                }
+                AfterCheckout::SplitShell => MenuAction::SplitShell(w),
+            },
+            TwinTarget::Checkout { project, branch } => MenuAction::CheckoutThen {
+                project,
+                branch,
+                next,
+            },
+        }
+    }
+}
+
 /// Twins of the worktree's project — projects of the same name in this
 /// workspace on a different host (a local checkout and its `nebula add
-/// findl:/path` counterpart, say) — as (where, primary worktree id) pairs
-/// for the session pickers; `where` is the host name, or "locally" for
-/// the checkout on this machine.
-fn project_twins(app: &App, worktree: &WorktreeId) -> Vec<(String, WorktreeId)> {
+/// findl:/path` counterpart, say) — as (where, target) pairs for the
+/// session pickers; `where` is the host name, or "locally" for the
+/// checkout on this machine. The target follows the worktree's *branch*,
+/// exactly like a local pick would: the twin's checkout of that branch,
+/// or a checkout of it on the twin's primary when there is none — a
+/// session started "on findl" from a feature worktree never lands on
+/// whatever findl's primary happens to be on.
+fn project_twins(app: &App, worktree: &WorktreeId) -> Vec<(String, TwinTarget)> {
     let Some(w) = app.tree.worktrees.iter().find(|w| &w.id == worktree) else {
         return Vec::new();
     };
@@ -3649,16 +3686,31 @@ fn project_twins(app: &App, worktree: &WorktreeId) -> Vec<(String, WorktreeId)> 
                 && p.host != project.host
         })
         .filter_map(|p| {
-            let main = app
-                .tree
+            // A twin without a primary has nothing to check out on.
+            app.tree
                 .worktrees
                 .iter()
                 .find(|x| x.project_id == p.id && x.is_main)?;
+            let same_branch = app
+                .tree
+                .worktrees
+                .iter()
+                .filter(|x| x.project_id == p.id && x.branch == w.branch)
+                // The primary wins over a parked worktree on the same branch.
+                .max_by_key(|x| x.is_main)
+                .map(|x| x.id.clone());
+            let target = match same_branch {
+                Some(id) => TwinTarget::Worktree(id),
+                None => TwinTarget::Checkout {
+                    project: p.id.clone(),
+                    branch: w.branch.clone(),
+                },
+            };
             let place = match &p.host {
                 Some(h) => h.clone(),
                 None => "locally".to_string(),
             };
-            Some((place, main.id.clone()))
+            Some((place, target))
         })
         .collect()
 }
@@ -5859,42 +5911,13 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
         MenuAction::QuickAgentOfKind { worktree, kind } => {
             // Like the ⌘D rows: configured defaults, generated name,
             // auto-title, attached by its Ack — ⌘T never prompts.
-            let cfg = crate::config::Config::load();
-            let req_id = app.alloc_req_id(PendingIntent::AttachCreated);
-            out.push(ClientRequest::CreateAgent {
-                req_id,
-                worktree: worktree.clone(),
-                name: app.default_session_name("agent"),
-                kind,
-                model: cfg.default_model(kind),
-                effort: cfg.default_effort(kind),
-                auto_title: true,
-                prompt: None,
-            });
-            if kind == AgentKind::Claude {
-                out.push(default_claude_prewarm(worktree));
-            }
+            create_default_agent(app, worktree, kind, PendingIntent::AttachCreated, out);
         }
         MenuAction::SplitAgentOfKind { worktree, kind } => {
             // Straight to the create — the split skips the name prompt and
             // model submenus on purpose: configured defaults, generated
             // name, auto-title, mounted in the right pane by its Ack.
-            let cfg = crate::config::Config::load();
-            let req_id = app.alloc_req_id(PendingIntent::AttachCreatedSplit);
-            out.push(ClientRequest::CreateAgent {
-                req_id,
-                worktree: worktree.clone(),
-                name: app.default_session_name("agent"),
-                kind,
-                model: cfg.default_model(kind),
-                effort: cfg.default_effort(kind),
-                auto_title: true,
-                prompt: None,
-            });
-            // Same warm-slot refill as `create_agent`.
-            if kind == AgentKind::Claude {
-                out.push(default_claude_prewarm(worktree));
-            }
+            create_default_agent(app, worktree, kind, PendingIntent::AttachCreatedSplit, out);
         }
         MenuAction::SplitShell(worktree) => {
             let req_id = app.alloc_req_id(PendingIntent::AttachCreatedSplit);
@@ -5904,6 +5927,11 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                 name: None,
             });
         }
+        MenuAction::CheckoutThen {
+            project,
+            branch,
+            next,
+        } => checkout_primary_then(app, project, branch, next, out),
         MenuAction::RenameTerminal(id) => open_prompt(app, PromptKind::RenameTerminal { id }),
         MenuAction::CloseTerminal(id) => {
             if let Some(t) = app.tree.terminals.iter().find(|t| t.id == id).cloned() {
@@ -6588,7 +6616,11 @@ fn jump_to_target(
         }
         PaletteTarget::Session(id) => {
             let agent = app.tree.agents.iter().find(|a| a.id == id);
-            let worktree = agent.map(|a| a.worktree_id.clone());
+            // A remote session's own checkout may be hidden behind its
+            // local twin; land on the row that actually lists it.
+            let worktree = agent
+                .map(|a| a.worktree_id.clone())
+                .and_then(|wid| app.listed_worktree_for(&wid));
             let found = worktree.as_ref().is_some_and(|wid| {
                 app.tree
                     .worktrees
@@ -6645,7 +6677,8 @@ fn open_session(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
             .iter()
             .find(|t| &t.id == id)
             .map(|t| t.worktree_id.clone()),
-    };
+    }
+    .and_then(|wid| app.listed_worktree_for(&wid));
     let found = worktree.as_ref().is_some_and(|wid| {
         app.tree
             .worktrees
@@ -6674,6 +6707,34 @@ fn open_session(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
     };
     app.sel_session = index;
     attach_selected(app, out);
+}
+
+/// A no-prompt agent create — configured defaults, generated name,
+/// auto-title — attached (or mounted in the split) by its Ack per
+/// `intent`. The ⌘T / ⌘D rows and their post-checkout continuations.
+fn create_default_agent(
+    app: &mut App,
+    worktree: WorktreeId,
+    kind: AgentKind,
+    intent: PendingIntent,
+    out: &mut Vec<ClientRequest>,
+) {
+    let cfg = crate::config::Config::load();
+    let req_id = app.alloc_req_id(intent);
+    out.push(ClientRequest::CreateAgent {
+        req_id,
+        worktree: worktree.clone(),
+        name: app.default_session_name("agent"),
+        kind,
+        model: cfg.default_model(kind),
+        effort: cfg.default_effort(kind),
+        auto_title: true,
+        prompt: None,
+    });
+    // Same warm-slot refill as `create_agent`.
+    if kind == AgentKind::Claude {
+        out.push(default_claude_prewarm(worktree));
+    }
 }
 
 fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
@@ -8942,6 +9003,28 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                                 name: None,
                             });
                         }
+                        AfterCheckout::QuickAgent(kind) => create_default_agent(
+                            app,
+                            primary,
+                            kind,
+                            PendingIntent::AttachCreated,
+                            out,
+                        ),
+                        AfterCheckout::SplitAgent(kind) => create_default_agent(
+                            app,
+                            primary,
+                            kind,
+                            PendingIntent::AttachCreatedSplit,
+                            out,
+                        ),
+                        AfterCheckout::SplitShell => {
+                            let req_id = app.alloc_req_id(PendingIntent::AttachCreatedSplit);
+                            out.push(ClientRequest::CreateTerminal {
+                                req_id,
+                                worktree: primary,
+                                name: None,
+                            });
+                        }
                     }
                 }
                 (Some(PendingIntent::SelectCreatedWorktree), Some(EntityId::Worktree(id))) => {
@@ -9646,11 +9729,8 @@ mod tests {
             panic!("expected the remote picker");
         };
         assert_eq!(menu.title.as_deref(), Some("New session on findl"));
-        assert!(menu
-            .items
-            .iter()
-            .any(|i| i.label == "Run locally ▸"
-                && matches!(&i.action, MenuAction::NewAgent(w) if w.as_str() == "w1")));
+        assert!(menu.items.iter().any(|i| i.label == "Run locally ▸"
+            && matches!(&i.action, MenuAction::NewAgent(w) if w.as_str() == "w1")));
         assert!(menu.items.iter().any(|i| matches!(
             &i.action,
             MenuAction::NewAgentOfKind { worktree, kind: AgentKind::Pi, .. } if worktree.as_str() == "w-remote"
@@ -9670,6 +9750,161 @@ mod tests {
             && matches!(&i.action, MenuAction::QuickAgentOfKind { worktree, kind: AgentKind::Pi } if worktree.as_str() == "w-remote")));
         assert!(menu.items.iter().any(|i| i.label == "Terminal on findl"
             && matches!(&i.action, MenuAction::NewTerminal(w) if w.as_str() == "w-remote")));
+    }
+
+    #[test]
+    fn clicking_a_twin_session_row_lands_on_it() {
+        use nebula_core::{Agent, AgentStatus, Entity, WorktreeId};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_remote_twin(&mut app);
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(Agent {
+                    id: AgentId("a-remote".into()),
+                    worktree_id: WorktreeId("w-remote".into()),
+                    name: "remote-one".into(),
+                    status: AgentStatus::Fresh,
+                    archived: false,
+                    archived_at: 0,
+                    pinned: false,
+                    kind: AgentKind::Pi,
+                    model: None,
+                    effort: None,
+                    session_id: None,
+                    sort_order: 0,
+                    status_changed_at: 0,
+                    alive: false,
+                }),
+            },
+        );
+        // The twin's checkout is absorbed — no project row of its own —
+        // yet its session row under the local worktree must still be a
+        // click away, like any local row (the sidebar's sublist click,
+        // the palette pick and Space all funnel through this jump).
+        app.sel_project = 0;
+        app.sel_worktree = 0;
+        app.flash = None;
+        let mut out = Vec::new();
+        jump_to_target(
+            &mut app,
+            PaletteTarget::Session(AgentId("a-remote".into())),
+            false,
+            &mut out,
+        );
+        assert_eq!(app.flash, None, "no 'session no longer exists'");
+        assert_eq!(app.focus, Focus::Sessions);
+        assert_eq!(
+            app.selected_session_row().map(|r| r.name().to_string()),
+            Some("remote-one".into())
+        );
+        assert_eq!(
+            app.listed_worktree_for(&WorktreeId("w-remote".into())),
+            Some(WorktreeId("w1".into()))
+        );
+    }
+
+    #[test]
+    fn twin_rows_follow_the_branch_not_the_primary() {
+        use nebula_core::{Entity, ProjectId, Worktree, WorktreeId};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_remote_twin(&mut app);
+        let feature = |id: &str, project: &str, sort: i64| Worktree {
+            id: WorktreeId(id.into()),
+            project_id: ProjectId(project.into()),
+            path: format!("/tmp/{id}").into(),
+            branch: "feature-x".into(),
+            is_main: false,
+            created_from: None,
+            pinned: false,
+            for_branch: false,
+            sort_order: sort,
+        };
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(feature("w-feat", "p1", 1)),
+            },
+        );
+        // findl has no checkout of feature-x: "Run on findl" checks the
+        // branch out on findl's primary first, then picks the agent there
+        // — never a session on whatever findl's primary was on.
+        open_agent_picker(&mut app, WorktreeId("w-feat".into()));
+        let Some(Overlay::Menu(menu)) = &app.overlay else {
+            panic!("expected the picker");
+        };
+        let twin = menu
+            .items
+            .iter()
+            .find(|i| i.label == "Run on findl ▸")
+            .unwrap();
+        assert_eq!(
+            twin.action,
+            MenuAction::CheckoutThen {
+                project: ProjectId("p-remote".into()),
+                branch: "feature-x".into(),
+                next: AfterCheckout::PickAgent,
+            }
+        );
+        let action = twin.action.clone();
+        app.overlay = None;
+        let mut out = Vec::new();
+        run_menu_action(&mut app, action, &mut out);
+        assert!(
+            matches!(
+                out.last(),
+                Some(ClientRequest::CheckoutPrimary { project, branch, .. })
+                    if project.as_str() == "p-remote" && branch == "feature-x"
+            ),
+            "{out:?}"
+        );
+        // ⌘T's flat rows take the same road.
+        app.overlay = None;
+        app.sel_project = 0;
+        app.focus = Focus::Worktrees;
+        app.sel_worktree = app
+            .worktree_row_index(&WorktreeId("w-feat".into()))
+            .unwrap();
+        let mut out = Vec::new();
+        quick_terminal_shortcut(&mut app, &mut out);
+        let Some(Overlay::Menu(menu)) = &app.overlay else {
+            panic!("expected the ⌘T picker");
+        };
+        assert!(menu.items.iter().any(|i| i.label == "Pi on findl"
+            && i.action
+                == MenuAction::CheckoutThen {
+                    project: ProjectId("p-remote".into()),
+                    branch: "feature-x".into(),
+                    next: AfterCheckout::QuickAgent(AgentKind::Pi),
+                }));
+        assert!(menu.items.iter().any(|i| i.label == "Terminal on findl"
+            && i.action
+                == MenuAction::CheckoutThen {
+                    project: ProjectId("p-remote".into()),
+                    branch: "feature-x".into(),
+                    next: AfterCheckout::Terminal,
+                }));
+        // Once findl has the branch checked out, the rows aim straight at
+        // that checkout.
+        app.overlay = None;
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(feature("w-remote-feat", "p-remote", 1)),
+            },
+        );
+        open_agent_picker(&mut app, WorktreeId("w-feat".into()));
+        let Some(Overlay::Menu(menu)) = &app.overlay else {
+            panic!("expected the picker");
+        };
+        let twin = menu
+            .items
+            .iter()
+            .find(|i| i.label == "Run on findl ▸")
+            .unwrap();
+        assert!(matches!(&twin.action, MenuAction::NewAgent(w) if w.as_str() == "w-remote-feat"));
     }
 
     #[test]
@@ -9701,7 +9936,12 @@ mod tests {
             },
         );
         // …but lists under the local primary too, wearing its host.
-        app.sel_project = app.tree.projects.iter().position(|p| p.host.is_none()).unwrap();
+        app.sel_project = app
+            .tree
+            .projects
+            .iter()
+            .position(|p| p.host.is_none())
+            .unwrap();
         app.sel_worktree = 0;
         let rows = app.visible_session_rows();
         let remote = rows
@@ -9709,9 +9949,15 @@ mod tests {
             .find(|r| r.name() == "remote-one")
             .expect("twin session listed under the local worktree");
         assert_eq!(app.session_host(remote), Some("findl"));
-        assert!(rows.iter().any(|r| r.name() == "agent-one" || matches!(r, SessionRow::Agent(a) if a.worktree_id.as_str() == "w1")), "local rows stay");
+        assert!(
+            rows.iter().any(|r| r.name() == "agent-one"
+                || matches!(r, SessionRow::Agent(a) if a.worktree_id.as_str() == "w1")),
+            "local rows stay"
+        );
         // The twin's own list shows the same family.
-        assert!(app.worktree_family(&WorktreeId("w-remote".into())).contains(&WorktreeId("w1".into())));
+        assert!(app
+            .worktree_family(&WorktreeId("w-remote".into()))
+            .contains(&WorktreeId("w1".into())));
     }
 
     #[test]
@@ -9748,7 +9994,10 @@ mod tests {
         let worktrees = app.visible_worktrees();
         let branches: Vec<&str> = worktrees.iter().map(|w| w.branch.as_str()).collect();
         assert_eq!(branches, vec!["main", "feature-x"]);
-        assert_eq!(app.worktree_host(&WorktreeId("w-remote-feat".into())), Some("findl"));
+        assert_eq!(
+            app.worktree_host(&WorktreeId("w-remote-feat".into())),
+            Some("findl")
+        );
         // The twin's primary is not a second "main" row: it merges with ours.
         assert!(app
             .worktree_family(&WorktreeId("w1".into()))
@@ -9761,7 +10010,10 @@ mod tests {
         let text = buffer_text(&terminal);
         assert!(text.contains("feature-x"), "{text}");
         assert!(text.matches("@findl").count() >= 2, "{text}");
-        assert!(!text.contains("demo @findl"), "project row stays plain: {text}");
+        assert!(
+            !text.contains("demo @findl"),
+            "project row stays plain: {text}"
+        );
         // Remove the local project: the twin resurfaces as its own row.
         app.tree.projects.retain(|p| p.host.is_some());
         assert_eq!(app.project_rows().len(), 1);

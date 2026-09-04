@@ -4896,8 +4896,6 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;

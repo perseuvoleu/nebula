@@ -139,6 +139,16 @@ pub enum MenuAction {
         project: ProjectId,
         branch: String,
     },
+    /// A twin row (`… on findl`) whose host has no checkout of this
+    /// branch yet: check it out on the twin's primary (the `nebula
+    /// switch` shape, same as a local checkout-less branch row) and
+    /// carry on with `next` there — never on whatever branch the
+    /// primary happened to be on.
+    CheckoutThen {
+        project: ProjectId,
+        branch: String,
+        next: AfterCheckout,
+    },
     /// Open the new-branch name prompt (chains into the base-branch
     /// picker; the branch is created with `git branch` and checked out on
     /// the primary, like `nebula switch`).
@@ -1093,11 +1103,7 @@ impl Palette {
 /// when the archived toggle is on (the Sessions panel rule). Scoped to the
 /// open workspace — `/` never searches across other workspaces.
 fn build_palette_items(tree: &Tree, show_archived: bool, sessions_only: bool) -> Vec<PaletteItem> {
-    let projects: Vec<&Project> = tree
-        .projects
-        .iter()
-        .filter(|p| tree.is_listed(p))
-        .collect();
+    let projects: Vec<&Project> = tree.projects.iter().filter(|p| tree.is_listed(p)).collect();
     let mut items = Vec::new();
     if !sessions_only {
         for p in &projects {
@@ -1663,6 +1669,12 @@ pub enum AfterCheckout {
     PickAgent,
     /// Create and attach a shell terminal on the primary.
     Terminal,
+    /// ⌘T row: create and attach an agent of this kind, no prompts.
+    QuickAgent(AgentKind),
+    /// ⌘D row: create an agent of this kind in the split's right pane.
+    SplitAgent(AgentKind),
+    /// ⌘D row: create a shell in the split's right pane.
+    SplitShell,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2007,9 +2019,10 @@ impl Tree {
     /// resurfaces on its own the moment the local project is removed.
     pub fn absorbed_by_twin(&self, p: &Project) -> bool {
         p.host.is_some()
-            && self.projects.iter().any(|q| {
-                q.host.is_none() && q.name == p.name && q.workspace_id == p.workspace_id
-            })
+            && self
+                .projects
+                .iter()
+                .any(|q| q.host.is_none() && q.name == p.name && q.workspace_id == p.workspace_id)
     }
 
     /// What the panels list: in the open workspace and not absorbed.
@@ -2035,10 +2048,7 @@ impl Tree {
 
     /// Visible-project count for the PROJECTS panel header.
     pub fn visible_project_count(&self) -> usize {
-        self.projects
-            .iter()
-            .filter(|p| self.is_listed(p))
-            .count()
+        self.projects.iter().filter(|p| self.is_listed(p)).count()
     }
 }
 
@@ -2848,6 +2858,42 @@ impl App {
         family
     }
 
+    /// The worktree row that lists `id`'s sessions. A checkout on an
+    /// absorbed twin (the `@host` project hidden behind its local
+    /// namesake) has no row of its own — its sessions show up under the
+    /// local counterpart via [`Self::worktree_family`] — so a jump to one
+    /// of them must land on that counterpart, not on the hidden twin. The
+    /// selected project's member wins when the family straddles several
+    /// listed projects, so a click never hops projects needlessly.
+    pub fn listed_worktree_for(&self, id: &WorktreeId) -> Option<WorktreeId> {
+        let project_of = |wid: &WorktreeId| {
+            self.tree
+                .worktrees
+                .iter()
+                .find(|w| &w.id == wid)
+                .and_then(|w| self.tree.projects.iter().find(|p| p.id == w.project_id))
+        };
+        if project_of(id).is_some_and(|p| self.tree.is_listed(p)) {
+            return Some(id.clone());
+        }
+        let selected = self.selected_project().map(|p| p.id.clone());
+        let mut candidates = self
+            .tree
+            .worktrees
+            .iter()
+            .filter(|w| project_of(&w.id).is_some_and(|p| self.tree.is_listed(p)))
+            .filter(|w| self.worktree_family(&w.id).contains(id))
+            .map(|w| (w.project_id.clone(), w.id.clone()));
+        let first = candidates.next()?;
+        Some(
+            std::iter::once(first.clone())
+                .chain(candidates)
+                .find(|(pid, _)| Some(pid) == selected.as_ref())
+                .unwrap_or(first)
+                .1,
+        )
+    }
+
     /// Push every remote checkout path into the process-wide host map so
     /// the git-backed panels reach the right machine. Called whenever the
     /// tree's projects or worktrees change.
@@ -3168,12 +3214,9 @@ impl App {
         // checkout with a local counterpart is already represented by it
         // (their sessions merge via `worktree_family`).
         let local_branches: Vec<&str> = rows.iter().map(|(w, _)| w.branch.as_str()).collect();
-        for twin in self
-            .tree
-            .projects
-            .iter()
-            .filter(|q| q.id != project.id && self.tree.absorbed_by_twin(q) && q.name == project.name)
-        {
+        for twin in self.tree.projects.iter().filter(|q| {
+            q.id != project.id && self.tree.absorbed_by_twin(q) && q.name == project.name
+        }) {
             rows.extend(
                 self.tree
                     .worktrees

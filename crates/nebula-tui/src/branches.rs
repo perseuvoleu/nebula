@@ -49,17 +49,17 @@ pub fn local_branches(repo: &Path) -> Vec<String> {
         ],
     )
     .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
+    .ok()
+    .filter(|o| o.status.success())
+    .map(|o| {
+        String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_owned)
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// `local_branches` plus each branch's creation base — one extra `git
@@ -109,9 +109,7 @@ pub fn delete_branch(repo: &Path, branch: &str) -> Result<(), String> {
 pub fn branch_op(repo: &Path, args: &[&str]) -> Result<(), String> {
     let mut argv = vec!["branch"];
     argv.extend(args);
-    let out = git(repo, &argv)
-        .output()
-        .map_err(|e| format!("git: {e}"))?;
+    let out = git(repo, &argv).output().map_err(|e| format!("git: {e}"))?;
     if out.status.success() {
         Ok(())
     } else {
