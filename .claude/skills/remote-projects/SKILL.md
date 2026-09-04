@@ -25,8 +25,11 @@ there never show locally. Treat the two as separate worlds that happen to share 
 
 ## Twins: local ⇄ remote in one list
 
-A local project and a remote one **with the same name** in the same workspace are twins. Every
-session picker offers the other side (`Run on findl ▸` in `n`; flat `Claude on findl` … `Terminal
+A local project and a remote one **with the same name** in the same workspace are twins, and the
+Projects panel shows them as **one row** (the local one): the remote project is absorbed — its
+remote-only checkouts join the worktree list with the badge, its sessions join the session lists —
+and only resurfaces as its own row if the local project is removed. Every session picker offers
+the other side (`Run on findl ▸` in `n`; flat `Claude on findl` … `Terminal
 on findl` rows in ⌘T/⌘D), and a worktree's session list and tab bar include the twin's sessions
 (primary pairs with primary, other worktrees pair by branch), each wearing the badge. So a session
 started "on findl" from the local `nebula` row appears right there — do not go looking for it under

@@ -1096,7 +1096,7 @@ fn build_palette_items(tree: &Tree, show_archived: bool, sessions_only: bool) ->
     let projects: Vec<&Project> = tree
         .projects
         .iter()
-        .filter(|p| tree.in_active_workspace(p))
+        .filter(|p| tree.is_listed(p))
         .collect();
     let mut items = Vec::new();
     if !sessions_only {
@@ -1998,6 +1998,25 @@ impl Tree {
         p.workspace_id == self.active_workspace
     }
 
+    /// A remote project whose local twin (same name, same workspace, no
+    /// host) exists is *absorbed*: the Projects panel, the palette and the
+    /// project jump show only the local row, and that row carries the
+    /// twin's remote-only checkouts and sessions (pink `@host`). One
+    /// project to look at, two checkouts behind it. The twin is still a
+    /// row in the tree — `--project name@host` reaches it — and it
+    /// resurfaces on its own the moment the local project is removed.
+    pub fn absorbed_by_twin(&self, p: &Project) -> bool {
+        p.host.is_some()
+            && self.projects.iter().any(|q| {
+                q.host.is_none() && q.name == p.name && q.workspace_id == p.workspace_id
+            })
+    }
+
+    /// What the panels list: in the open workspace and not absorbed.
+    pub fn is_listed(&self, p: &Project) -> bool {
+        self.in_active_workspace(p) && !self.absorbed_by_twin(p)
+    }
+
     /// Display name of the open workspace, for the footer and switcher.
     pub fn active_workspace_name(&self) -> &str {
         self.workspaces
@@ -2011,14 +2030,14 @@ impl Tree {
     /// empty-panel hints key off this, not the raw project list — other
     /// workspaces' projects don't count.)
     pub fn has_visible_projects(&self) -> bool {
-        self.projects.iter().any(|p| self.in_active_workspace(p))
+        self.projects.iter().any(|p| self.is_listed(p))
     }
 
     /// Visible-project count for the PROJECTS panel header.
     pub fn visible_project_count(&self) -> usize {
         self.projects
             .iter()
-            .filter(|p| self.in_active_workspace(p))
+            .filter(|p| self.is_listed(p))
             .count()
     }
 }
@@ -2731,7 +2750,7 @@ impl App {
         let mut rows = Vec::with_capacity(self.tree.projects.len() + 1);
         let mut first = true;
         for (i, p) in self.tree.projects.iter().enumerate() {
-            if !self.tree.in_active_workspace(p) {
+            if !self.tree.is_listed(p) {
                 continue;
             }
             if first && p.divider_before {
@@ -3144,6 +3163,29 @@ impl App {
         running_first(&mut unpinned);
         let mut rows = nest_by_lineage(pinned);
         rows.extend(nest_by_lineage(unpinned));
+        // Checkouts that exist only on an absorbed twin (a branch checked
+        // out on findl but not here) join the list as flat rows; a twin
+        // checkout with a local counterpart is already represented by it
+        // (their sessions merge via `worktree_family`).
+        let local_branches: Vec<&str> = rows.iter().map(|(w, _)| w.branch.as_str()).collect();
+        for twin in self
+            .tree
+            .projects
+            .iter()
+            .filter(|q| q.id != project.id && self.tree.absorbed_by_twin(q) && q.name == project.name)
+        {
+            rows.extend(
+                self.tree
+                    .worktrees
+                    .iter()
+                    .filter(|w| {
+                        w.project_id == twin.id
+                            && !w.is_main
+                            && !local_branches.contains(&w.branch.as_str())
+                    })
+                    .map(|w| (w, 0)),
+            );
+        }
         rows
     }
 

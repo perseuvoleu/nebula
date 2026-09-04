@@ -6207,7 +6207,7 @@ fn move_divider(
         .projects
         .iter()
         .enumerate()
-        .filter(|(_, p)| app.tree.in_active_workspace(p))
+        .filter(|(_, p)| app.tree.is_listed(p))
         .map(|(i, _)| i)
         .collect();
     let Some(vpos) = visible.iter().position(|&i| i == project) else {
@@ -9715,28 +9715,57 @@ mod tests {
     }
 
     #[test]
-    fn remote_rows_carry_the_host_badge() {
+    fn remote_twin_is_absorbed_into_the_local_project_row() {
+        use nebula_core::{Entity, ProjectId, Worktree, WorktreeId};
         let mut app = App::new();
         seed_tree(&mut app);
         seed_remote_twin(&mut app);
+        // A branch checked out only on findl.
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(Worktree {
+                    id: WorktreeId("w-remote-feat".into()),
+                    project_id: ProjectId("p-remote".into()),
+                    path: "/srv/demo-worktrees/feature-x".into(),
+                    branch: "feature-x".into(),
+                    is_main: false,
+                    created_from: None,
+                    pinned: false,
+                    for_branch: false,
+                    sort_order: 1,
+                }),
+            },
+        );
+        // One project row: the twin is absorbed, not listed.
+        let rows = app.project_rows();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(app.tree.visible_project_count(), 1);
+        assert!(app.tree.has_visible_projects());
+        // Under it: the local primary, then the remote-only checkout, which
+        // knows its host.
+        app.sel_project = 0;
+        let worktrees = app.visible_worktrees();
+        let branches: Vec<&str> = worktrees.iter().map(|w| w.branch.as_str()).collect();
+        assert_eq!(branches, vec!["main", "feature-x"]);
+        assert_eq!(app.worktree_host(&WorktreeId("w-remote-feat".into())), Some("findl"));
+        // The twin's primary is not a second "main" row: it merges with ours.
+        assert!(app
+            .worktree_family(&WorktreeId("w1".into()))
+            .contains(&WorktreeId("w-remote".into())));
+        // Drawn: the remote-only row and the crumb wear the badge, the
+        // project row does not.
         let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        app.sel_worktree = 1;
         terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
-        // The remote project's row wears the badge; the local twin doesn't
-        // get one by mistake (both are named "demo").
-        assert!(text.contains("demo @findl"), "{text}");
-        assert!(!text.contains("demo @findl @findl"), "{text}");
-        // Select the remote project: its worktree row and the crumb badge.
-        app.sel_project = app
-            .tree
-            .projects
-            .iter()
-            .position(|p| p.host.is_some())
-            .unwrap();
-        app.sel_worktree = 0;
-        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
-        let text = buffer_text(&terminal);
+        assert!(text.contains("feature-x"), "{text}");
         assert!(text.matches("@findl").count() >= 2, "{text}");
+        assert!(!text.contains("demo @findl"), "project row stays plain: {text}");
+        // Remove the local project: the twin resurfaces as its own row.
+        app.tree.projects.retain(|p| p.host.is_some());
+        assert_eq!(app.project_rows().len(), 1);
+        assert!(app.tree.projects.iter().all(|p| app.tree.is_listed(p)));
     }
 
     fn buffer_text(terminal: &Terminal<TestBackend>) -> String {

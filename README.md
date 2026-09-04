@@ -301,7 +301,11 @@ and logged in (`nebula ssh host` installs nebula). Local-only tools — the
 editor, file finder, tree browser, `gh` — say so instead of opening a remote
 path.
 
-A local project and its remote twin (same name, added from both places) get
+A local project and its remote twin (same name, added from both places) show
+as **one row**: the remote project is absorbed into the local one, whose
+worktree list gains the checkouts that exist only on the host (pink badge)
+and whose session lists and tabs include the remote sessions. Remove the
+local project and the remote row resurfaces on its own. They also get
 cross rows in every session picker: `Run on findl ▸` / `Run locally ▸` in the
 `n` picker, and flat `Claude on findl` … `Terminal on findl` rows in ⌘T and
 ⌘D — local ⇄ remote is one keypress inside the same flow. On the command

@@ -4326,6 +4326,11 @@ fn breadcrumb(app: &App) -> Vec<Span<'static>> {
     if let Some(worktree) = app.selected_worktree() {
         spans.push(sep());
         spans.push(seg(&worktree.branch, app.focus == Focus::Worktrees));
+        // A remote-only checkout under a local project: the host shows on
+        // the worktree crumb, since the project crumb has none.
+        if worktree.project_id != project.id {
+            spans.extend(remote_badge(app.worktree_host(&worktree.id), th));
+        }
         if let Some(session) = app.selected_session_row() {
             spans.push(sep());
             // A link's crumb is its display label, not the raw URL — the
