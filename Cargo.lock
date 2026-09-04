@@ -1156,7 +1156,7 @@ dependencies = [
 
 [[package]]
 name = "nebula"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1174,7 +1174,7 @@ dependencies = [
 
 [[package]]
 name = "nebula-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "directories",
  "rmp-serde",
@@ -1186,7 +1186,7 @@ dependencies = [
 
 [[package]]
 name = "nebula-daemon"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1212,7 +1212,7 @@ dependencies = [
 
 [[package]]
 name = "nebula-tui"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "crossterm",
