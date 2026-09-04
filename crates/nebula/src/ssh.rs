@@ -25,11 +25,21 @@ const REMOTE_SCRIPT: &str = concat!(
     "echo \"nebula not found on remote; installing...\" >&2; ",
     "curl -fsSL \"$1\" | sh || exit 1; ",
     "fi; ",
-    "cd -- \"${2:-$HOME}\" || exit 1; ",
+    // A start dir spelled `~/x` arrives quoted (the local shell may or may
+    // not have expanded it); expand the tilde here, where $HOME is the
+    // remote one.
+    "d=\"${2:-$HOME}\"; case \"$d\" in \"~\"*) d=\"$HOME${d#\"~\"}\";; esac; ",
+    "cd -- \"$d\" || exit 1; ",
     "exec nebula"
 );
 
 pub fn run_ssh(host: &str, path: Option<&str>) -> Result<()> {
+    // `nebula ssh vela ~/app`: the local shell expands `~` to *this*
+    // machine's home before we see it. A path under the local home almost
+    // certainly meant the remote home — spell it `~/…` again so the far
+    // side expands it against its own.
+    let remapped = path.map(|p| remap_home(p, std::env::var("HOME").ok().as_deref()));
+    let path = remapped.as_deref();
     // Remember the destination for the TUI's `h` picker. Before the exec on
     // purpose (there is no after); a host that fails to connect still lists,
     // and `d` can drop it.
@@ -42,6 +52,15 @@ pub fn run_ssh(host: &str, path: Option<&str>) -> Result<()> {
         bail!("ssh not found on PATH — nebula ssh requires the OpenSSH client");
     }
     Err(err).context("failed to exec ssh")
+}
+
+/// `/Users/me/app` → `~/app` when `/Users/me` is the local home.
+fn remap_home(path: &str, home: Option<&str>) -> String {
+    match home.filter(|h| !h.is_empty()) {
+        Some(h) if path == h => "~".to_string(),
+        Some(h) if path.starts_with(&format!("{h}/")) => format!("~{}", &path[h.len()..]),
+        _ => path.to_string(),
+    }
 }
 
 fn remote_command(install_url: &str, path: Option<&str>) -> String {
@@ -75,6 +94,24 @@ mod tests {
         assert!(!REMOTE_SCRIPT.contains('\''));
         assert!(!REMOTE_SCRIPT.contains('\\'));
         assert!(!REMOTE_SCRIPT.contains('\n'));
+    }
+
+    #[test]
+    fn local_home_paths_become_remote_tilde() {
+        assert_eq!(remap_home("/Users/me/app", Some("/Users/me")), "~/app");
+        assert_eq!(remap_home("/Users/me", Some("/Users/me")), "~");
+        assert_eq!(remap_home("/srv/app", Some("/Users/me")), "/srv/app");
+        assert_eq!(remap_home("/Users/meow/x", Some("/Users/me")), "/Users/meow/x");
+        assert_eq!(remap_home("/Users/me/app", None), "/Users/me/app");
+    }
+
+    #[test]
+    fn remote_script_expands_a_tilde_start_dir() {
+        // The tilde survives quoting and is expanded against the remote
+        // $HOME by the script itself.
+        assert!(REMOTE_SCRIPT.contains("case \"$d\" in \"~\"*)"));
+        let cmd = remote_command(URL, Some("~/app"));
+        assert!(cmd.ends_with("'~/app'"));
     }
 
     #[test]
