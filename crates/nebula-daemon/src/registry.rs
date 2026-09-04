@@ -127,20 +127,60 @@ impl Daemon {
 
     // ---- relays ----
 
-    /// Start a relay for every host that has a project here and none yet.
-    /// Called at boot and after a remote project is added.
+    /// Relays follow the anchors: one per host that has an anchor here,
+    /// refreshed when anchors change, torn down (ssh and all) when a host's
+    /// last anchor goes. Called at boot and after any anchor add/remove.
     pub fn ensure_relays(self: &Arc<Self>) {
         let Ok((projects, ..)) = self.store.load_tree() else {
             return;
         };
+        let hosts: std::collections::HashSet<String> =
+            projects.iter().filter_map(|p| p.host.clone()).collect();
         let mut relays = self.relays.lock().unwrap();
-        for host in projects.iter().filter_map(|p| p.host.clone()) {
-            if !relays.contains_key(&host) {
-                tracing::info!(host = %host, "starting relay");
-                let relay = crate::relay::Relay::spawn(self.clone(), host.clone());
-                relays.insert(host, relay);
+        for host in &hosts {
+            match relays.get(host) {
+                Some(relay) => relay.refresh_anchors(self),
+                None => {
+                    tracing::info!(host = %host, "starting relay");
+                    let relay = crate::relay::Relay::spawn(self.clone(), host.clone());
+                    relays.insert(host.clone(), relay);
+                }
             }
         }
+        let gone: Vec<String> = relays.keys().filter(|h| !hosts.contains(*h)).cloned().collect();
+        for host in gone {
+            tracing::info!(host = %host, "stopping relay: no anchors left");
+            if let Some(relay) = relays.remove(&host) {
+                relay.stop(self);
+            }
+        }
+    }
+
+    /// Removing a mirrored project row means "stop showing this host's
+    /// checkout here", never "delete it on the host": the local anchors it
+    /// covers go, and the relay takes the rows back.
+    fn detach_mirrored_project(self: &Arc<Self>, id: &ProjectId) -> Option<Result<()>> {
+        let relays = self.relays.lock().unwrap();
+        let (host, root) = relays.values().find_map(|r| {
+            let m = r.mirror.lock().unwrap();
+            m.projects
+                .iter()
+                .find(|p| &p.id == id)
+                .map(|p| (r.host.clone(), p.repo_path.clone()))
+        })?;
+        drop(relays);
+        Some((|| {
+            let (projects, ..) = self.store.load_tree()?;
+            for anchor in projects
+                .iter()
+                .filter(|p| p.host.as_deref() == Some(&host) && p.repo_path.starts_with(&root))
+            {
+                self.store.delete_project(&anchor.id)?;
+            }
+            self.refresh_remote_hosts();
+            self.ensure_relays();
+            Ok(())
+        })())
     }
 
     /// The relay whose mirror a request addresses, if any.
@@ -854,6 +894,9 @@ impl Daemon {
     }
 
     pub fn remove_project(self: &Arc<Self>, id: &ProjectId) -> Result<()> {
+        if let Some(result) = self.detach_mirrored_project(id) {
+            return result;
+        }
         // Kill any live sessions under this project first.
         let (all_projects, worktrees, agents, terminals) = self.store.load_tree()?;
         // Divider bookkeeping is per-workspace: the list clients see is the

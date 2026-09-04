@@ -79,6 +79,8 @@ pub struct Relay {
     /// Everything the host reports, in scope or not, kept current from its
     /// deltas; the mirror is a pure function of it (`compute_scope`).
     host_tree: Mutex<Mirror>,
+    /// The run loop, so a host with no anchors left can be dropped.
+    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 const RECONNECT_MIN: Duration = Duration::from_secs(2);
@@ -98,9 +100,35 @@ impl Relay {
             pending_adds: Mutex::new(HashMap::new()),
             adopted: Mutex::new(HashSet::new()),
             host_tree: Mutex::new(Mirror::default()),
+            task: Mutex::new(None),
         });
-        tokio::spawn(run(relay.clone(), daemon, out_rx));
+        let task = tokio::spawn(run(relay.clone(), daemon, out_rx));
+        *relay.task.lock().unwrap() = Some(task);
         relay
+    }
+
+    /// The anchors for this host changed: mirror what they now cover, ask
+    /// the host to adopt any it doesn't have, and take back rows that no
+    /// anchor covers any more.
+    pub fn refresh_anchors(&self, daemon: &Daemon) {
+        rescope(self, daemon, false);
+        for req in missing_adds(self, daemon) {
+            let _ = self.out.try_send(req);
+        }
+    }
+
+    /// Tear the link down (its ssh dies with the task) and take every
+    /// mirrored row off the subscribers' screens. For a host with no
+    /// anchors left — it also stops us from keeping a daemon alive there.
+    pub fn stop(&self, daemon: &Daemon) {
+        if let Some(task) = self.task.lock().unwrap().take() {
+            task.abort();
+        }
+        self.connected.store(false, Ordering::Relaxed);
+        let old = std::mem::take(&mut *self.mirror.lock().unwrap());
+        for id in old.all_entity_ids() {
+            daemon.broadcast(ServerEvent::EntityRemoved { id });
+        }
     }
 
     /// Does this request name something mirrored from this host?
@@ -445,12 +473,60 @@ fn apply_scope(relay: &Relay, daemon: &Daemon, fresh: Mirror, announce_all: bool
 /// anchors changed) and announce the difference.
 fn rescope(relay: &Relay, daemon: &Daemon, announce_all: bool) {
     let wanted = wanted_paths(daemon, &relay.host);
-    let adopted = relay.adopted.lock().unwrap().clone();
+    // An adopted id is a bridge until its anchor takes the host's spelling;
+    // once no anchor names that directory at all, the bridge is gone too
+    // (a detached anchor must not keep its project in scope).
+    let adopted = {
+        let mut adopted = relay.adopted.lock().unwrap();
+        let tree = relay.host_tree.lock().unwrap();
+        adopted.retain(|id| {
+            tree.projects.iter().any(|p| {
+                p.id.as_str() == id
+                    && wanted.iter().any(|w| {
+                        w.starts_with(&p.repo_path) || w.file_name() == p.repo_path.file_name()
+                    })
+            })
+        });
+        adopted.clone()
+    };
     let fresh = {
         let host = relay.host_tree.lock().unwrap();
         compute_scope(&host, &wanted, &adopted, &relay.host)
     };
     apply_scope(relay, daemon, fresh, announce_all);
+}
+
+/// AddProject requests for anchors no mirrored project covers yet: the
+/// host has never seen that checkout, so it adopts it on our behalf and
+/// the Ack's id enters the adopted set. Already-asked paths are skipped.
+fn missing_adds(relay: &Relay, daemon: &Daemon) -> Vec<ClientRequest> {
+    let wanted = wanted_paths(daemon, &relay.host);
+    let known: Vec<PathBuf> = relay
+        .mirror
+        .lock()
+        .unwrap()
+        .projects
+        .iter()
+        .map(|p| p.repo_path.clone())
+        .collect();
+    let mut out = Vec::new();
+    for path in &wanted {
+        let covered = known.iter().any(|root| path.starts_with(root));
+        let asked = relay.pending_adds.lock().unwrap().values().any(|p| p == path);
+        if covered || asked {
+            continue;
+        }
+        let req_id = relay.next_req.fetch_add(1, Ordering::Relaxed);
+        relay.pending_adds.lock().unwrap().insert(req_id, path.clone());
+        out.push(ClientRequest::AddProject {
+            req_id,
+            path: path.clone(),
+            name: None,
+            create_missing: false,
+            host: None,
+        });
+    }
+    out
 }
 
 /// The anchor row for a mirrored project takes the host's own spelling of
@@ -513,31 +589,7 @@ async fn handle_event(
             *relay.host_tree.lock().unwrap() = tree;
             rescope(relay, daemon, true);
 
-            let mut follow_ups = Vec::new();
-            let wanted = wanted_paths(daemon, &relay.host);
-            let known: Vec<PathBuf> = relay
-                .mirror
-                .lock()
-                .unwrap()
-                .projects
-                .iter()
-                .map(|p| p.repo_path.clone())
-                .collect();
-            for path in &wanted {
-                if !known.iter().any(|root| path.starts_with(root)) && !relay.pending_adds.lock().unwrap().values().any(|p| p == path) {
-                    // The host has never seen this checkout: register it
-                    // there; the Ack's id enters the adopted set.
-                    let req_id = relay.next_req.fetch_add(1, Ordering::Relaxed);
-                    relay.pending_adds.lock().unwrap().insert(req_id, path.clone());
-                    follow_ups.push(ClientRequest::AddProject {
-                        req_id,
-                        path: path.clone(),
-                        name: None,
-                        create_missing: false,
-                        host: None,
-                    });
-                }
-            }
+            let mut follow_ups = missing_adds(relay, daemon);
             // Re-attach what clients still watch: the host replays each
             // ring and the panes repaint.
             let attached = relay.attached.lock().unwrap();

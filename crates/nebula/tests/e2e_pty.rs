@@ -3907,6 +3907,105 @@ async fn relay_mirrors_a_host_and_its_sessions_outlive_the_viewer() {
     wait_for_exit(&mut host_daemon);
 }
 
+/// Relays follow the anchors: a second `host:/path` added while the link
+/// is up gets mirrored without a restart, and removing a mirrored project
+/// row detaches the anchor here — the host keeps its project.
+#[tokio::test]
+async fn relay_follows_anchor_adds_and_removes() {
+    let host_env = TestEnv::new();
+    let repo_a = host_env.make_repo();
+    let repo_b = host_env.tmp.path().join("repo-b");
+    std::fs::create_dir_all(&repo_b).unwrap();
+    for args in [
+        vec!["init", "-q", "-b", "main"],
+        vec!["-c", "user.email=e@x", "-c", "user.name=n", "commit", "-q", "--allow-empty", "-m", "init"],
+    ] {
+        assert!(std::process::Command::new("git").arg("-C").arg(&repo_b).args(&args).status().unwrap().success());
+    }
+    let mut host_daemon = host_env.spawn_daemon();
+    let proxy = format!(
+        "NEBULA_RUNTIME_DIR='{}' NEBULA_DATA_DIR='{}' '{}' proxy",
+        host_env.runtime_dir.display(),
+        host_env.tmp.path().join("data").display(),
+        env!("CARGO_BIN_EXE_nebula")
+    );
+    let env = TestEnv::new();
+    let relay_env = [("NEBULA_RELAY_CMD", proxy.as_str())];
+    let mut daemon = env.spawn_daemon_with("/bin/sh", &relay_env);
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    write_frame(&mut c, &ClientRequest::Subscribe).await.unwrap();
+    read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        evs.iter().any(|e| matches!(e, ServerEvent::Snapshot { .. }))
+    })
+    .await;
+
+    let add = |req_id: u64, path: &PathBuf| ClientRequest::AddProject {
+        req_id,
+        path: path.clone(),
+        name: None,
+        create_missing: false,
+        host: Some("testhost".into()),
+    };
+    let mirrored_named = |evs: &[ServerEvent], name: &str| {
+        evs.iter().find_map(|e| match e {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Project(p),
+            } if p.name == name && p.host.is_some() => Some(p.clone()),
+            _ => None,
+        })
+    };
+    write_frame(&mut c, &add(1, &repo_a)).await.unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(15), |evs| {
+        mirrored_named(evs, "repo").is_some()
+    })
+    .await;
+    assert!(mirrored_named(&events, "repo").is_some());
+
+    // Second anchor on the same host, link already up.
+    write_frame(&mut c, &add(2, &repo_b)).await.unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(15), |evs| {
+        mirrored_named(evs, "repo-b").is_some()
+    })
+    .await;
+    let b = mirrored_named(&events, "repo-b").unwrap();
+
+    // Removing the mirrored row detaches the anchor: its rows leave, the
+    // host still has the project.
+    write_frame(
+        &mut c,
+        &ClientRequest::RemoveProject {
+            req_id: 3,
+            id: b.id.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(10), |evs| {
+        find_ack(evs, 3).is_some()
+            && evs.iter().any(|e| matches!(e, ServerEvent::EntityRemoved { id: EntityId::Project(p) } if *p == b.id))
+    })
+    .await;
+    assert!(matches!(find_ack(&events, 3), Some(ServerEvent::Ack { .. })), "{events:#?}");
+    let mut h = connect(&host_env.sock()).await;
+    handshake(&mut h).await;
+    write_frame(&mut h, &ClientRequest::Subscribe).await.unwrap();
+    let events = read_events_until(&mut h, Duration::from_secs(5), |evs| {
+        evs.iter().any(|e| matches!(e, ServerEvent::Snapshot { .. }))
+    })
+    .await;
+    assert!(
+        events.iter().any(|e| matches!(e, ServerEvent::Snapshot { projects, .. }
+            if projects.iter().any(|p| p.id == b.id))),
+        "the host keeps its project: {events:#?}"
+    );
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+    write_frame(&mut h, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut host_daemon);
+}
+
 /// A remote project whose host ssh can't reach: the anchor row is stored
 /// (the relay keeps retrying in the background), nothing is created on
 /// this machine, and the panels show no phantom rows for it.
