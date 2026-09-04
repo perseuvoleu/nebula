@@ -2796,6 +2796,39 @@ impl App {
         self.worktree_host(worktree)
     }
 
+    /// A worktree and its counterparts on the project's twins (the same
+    /// project added from other hosts): primary ↔ primary, otherwise the
+    /// twin's worktree on the same branch. The session panels list the
+    /// whole family under each member, so a session started "on findl"
+    /// from here shows up right here, badge and all, instead of only
+    /// under the twin project row.
+    pub fn worktree_family(&self, id: &WorktreeId) -> Vec<WorktreeId> {
+        let mut family = vec![id.clone()];
+        let Some(w) = self.tree.worktrees.iter().find(|w| &w.id == id) else {
+            return family;
+        };
+        let Some(project) = self.tree.projects.iter().find(|p| p.id == w.project_id) else {
+            return family;
+        };
+        for twin in self.tree.projects.iter().filter(|p| {
+            p.id != project.id
+                && p.name == project.name
+                && p.workspace_id == project.workspace_id
+                && p.host != project.host
+        }) {
+            let counterpart = self.tree.worktrees.iter().find(|x| {
+                x.project_id == twin.id
+                    && if w.is_main {
+                        x.is_main
+                    } else {
+                        !x.is_main && x.branch == w.branch
+                    }
+            });
+            family.extend(counterpart.map(|x| x.id.clone()));
+        }
+        family
+    }
+
     /// Push every remote checkout path into the process-wide host map so
     /// the git-backed panels reach the right machine. Called whenever the
     /// tree's projects or worktrees change.
@@ -3023,10 +3056,11 @@ impl App {
     }
 
     fn terminals_for_worktree(&self, worktree: &WorktreeId) -> Vec<TerminalTab> {
+        let family = self.worktree_family(worktree);
         self.tree
             .terminals
             .iter()
-            .filter(|t| &t.worktree_id == worktree)
+            .filter(|t| family.contains(&t.worktree_id))
             .cloned()
             .collect()
     }
@@ -3269,6 +3303,8 @@ impl App {
 
     fn sessions_for_worktree(&self, worktree: &WorktreeId, show_archived: bool) -> Vec<Agent> {
         let now = now_ms();
+        let family = self.worktree_family(worktree);
+        let worktree = &family;
         // Stable throughout, so ties — never-run rows especially, which all
         // stamp 0 — keep tree order instead of shuffling between frames.
         let collect = |keep: &dyn Fn(&Agent) -> bool| {
@@ -3276,7 +3312,7 @@ impl App {
                 .tree
                 .agents
                 .iter()
-                .filter(|a| &a.worktree_id == worktree && keep(a))
+                .filter(|a| worktree.contains(&a.worktree_id) && keep(a))
                 .cloned()
                 .collect();
             group.sort_by_key(|a| recency_key(a, now));
@@ -3290,7 +3326,7 @@ impl App {
                 .tree
                 .agents
                 .iter()
-                .filter(|a| &a.worktree_id == worktree && a.archived)
+                .filter(|a| worktree.contains(&a.worktree_id) && a.archived)
                 .cloned()
                 .collect();
             // Most recently archived first; pre-`archived_at` rows (stamp 0)
@@ -3313,31 +3349,33 @@ impl App {
         &self,
         worktree: &WorktreeId,
     ) -> (usize, usize, usize, usize) {
+        let family = self.worktree_family(worktree);
+        let worktree = &family;
         let pinned = self
             .tree
             .agents
             .iter()
-            .filter(|a| &a.worktree_id == worktree && !a.archived && a.pinned)
+            .filter(|a| worktree.contains(&a.worktree_id) && !a.archived && a.pinned)
             .count();
         let recent = self
             .tree
             .agents
             .iter()
-            .filter(|a| &a.worktree_id == worktree && self.is_recent(a))
+            .filter(|a| worktree.contains(&a.worktree_id) && self.is_recent(a))
             .count();
         let unpinned = self
             .tree
             .agents
             .iter()
             .filter(|a| {
-                &a.worktree_id == worktree && !a.archived && !a.pinned && !self.is_recent(a)
+                worktree.contains(&a.worktree_id) && !a.archived && !a.pinned && !self.is_recent(a)
             })
             .count();
         let archived = self
             .tree
             .agents
             .iter()
-            .filter(|a| &a.worktree_id == worktree && a.archived)
+            .filter(|a| worktree.contains(&a.worktree_id) && a.archived)
             .count();
         (pinned, recent, unpinned, archived)
     }

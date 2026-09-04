@@ -9673,6 +9673,48 @@ mod tests {
     }
 
     #[test]
+    fn twin_sessions_share_one_list() {
+        use nebula_core::{Agent, AgentStatus, Entity, WorktreeId};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_remote_twin(&mut app);
+        // A session started "on findl" lives on the twin's primary…
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(Agent {
+                    id: AgentId("a-remote".into()),
+                    worktree_id: WorktreeId("w-remote".into()),
+                    name: "remote-one".into(),
+                    status: AgentStatus::Fresh,
+                    archived: false,
+                    archived_at: 0,
+                    pinned: false,
+                    kind: AgentKind::Pi,
+                    model: None,
+                    effort: None,
+                    session_id: None,
+                    sort_order: 0,
+                    status_changed_at: 0,
+                    alive: false,
+                }),
+            },
+        );
+        // …but lists under the local primary too, wearing its host.
+        app.sel_project = app.tree.projects.iter().position(|p| p.host.is_none()).unwrap();
+        app.sel_worktree = 0;
+        let rows = app.visible_session_rows();
+        let remote = rows
+            .iter()
+            .find(|r| r.name() == "remote-one")
+            .expect("twin session listed under the local worktree");
+        assert_eq!(app.session_host(remote), Some("findl"));
+        assert!(rows.iter().any(|r| r.name() == "agent-one" || matches!(r, SessionRow::Agent(a) if a.worktree_id.as_str() == "w1")), "local rows stay");
+        // The twin's own list shows the same family.
+        assert!(app.worktree_family(&WorktreeId("w-remote".into())).contains(&WorktreeId("w1".into())));
+    }
+
+    #[test]
     fn remote_rows_carry_the_host_badge() {
         let mut app = App::new();
         seed_tree(&mut app);
