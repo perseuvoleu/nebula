@@ -460,7 +460,7 @@ pub const ACTIONS: &[ActionSpec] = &[
         action: Action::QuickTerminal,
         id: "quick_terminal",
         label: "Quick terminal",
-        hint: "New shell terminal tab in the current worktree, no prompt (closes the floating shell if open; that one lives on the palette's t alias)",
+        hint: "New tab in the current worktree: pick Claude, Codex, Pi or a shell (shell pre-hovered, so ⌘T-Enter is a terminal), no name prompt — the full picker is on t (closes the floating shell if open; that one lives on the palette's t alias)",
         group: "SESSIONS",
         scope: Scope::Global,
         defaults: &["cmd+t", "ctrl+t"],

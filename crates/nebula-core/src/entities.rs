@@ -125,6 +125,12 @@ pub struct Project {
     pub divider_before: bool,
     /// Optional group label for the leading divider.
     pub divider_before_label: Option<String>,
+    /// ssh destination when the checkout lives on another machine
+    /// (`nebula add host:/path`). None = this machine. Every path under
+    /// the project — the root and its worktrees — is then a remote path,
+    /// and git, agent CLIs and shells for it run over `ssh host`.
+    #[serde(default)]
+    pub host: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

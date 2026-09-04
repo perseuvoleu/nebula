@@ -1,11 +1,11 @@
 //! The main TUI loop: terminal setup/teardown, message routing, update logic.
 
 use crate::app::{
-    App, AttachedTerm, ConfirmDialog, ConnState, ContextMenu, DiffView, FileFinder, Focus,
-    GrepView, HitTarget, LinkRow, MenuAction, MenuItem, MetricsView, NoteInput, NoteView, Overlay,
-    Palette, PaletteTarget, PendingAction, PendingIntent, PointerShape, ProjectRow, PromptDialog,
-    PromptKind, SessionRow, SettingsView, SplitterDrag, SubmenuKind, TermSelection, TodoInput,
-    TodoInputTarget, TodoView, WorktreeRollback,
+    AfterCheckout, App, AttachedTerm, ConfirmDialog, ConnState, ContextMenu, DiffView, FileFinder,
+    Focus, GrepView, HitTarget, LinkRow, MenuAction, MenuItem, MetricsView, NoteInput, NoteView,
+    Overlay, Palette, PaletteTarget, PendingAction, PendingIntent, PointerShape, ProjectRow,
+    PromptDialog, PromptKind, SessionRow, SettingsView, SplitterDrag, SubmenuKind, TermSelection,
+    TodoInput, TodoInputTarget, TodoView, WorktreeRollback,
 };
 use crate::pull_request::PullRequest;
 use crate::text_input::TextInput;
@@ -437,7 +437,7 @@ async fn main_loop(
             ev = branch_rx.recv() => {
                 // Never None: App holds a sender for the loop's lifetime.
                 if let Some(ev) = ev {
-                    handle_branch_event(&mut app, ev);
+                    handle_branch_event(&mut app, ev, &mut out);
                 }
             }
             answer = pr_rx.recv() => {
@@ -573,8 +573,14 @@ pub enum BranchEvent {
     /// `git for-each-ref` answer for this project's repo, each branch
     /// carrying the creation base its reflog names.
     List(nebula_core::ProjectId, Vec<crate::branches::LocalBranch>),
-    /// A `git branch` op finished; `message` is the flash to show.
-    Op { message: String, error: bool },
+    /// A `git branch` op finished; `message` is the flash to show. A
+    /// successful create carries the branch to check out on the primary
+    /// next — the `nebula switch` shape, create then land there.
+    Op {
+        message: String,
+        error: bool,
+        checkout: Option<(nebula_core::ProjectId, String)>,
+    },
 }
 
 /// Kick a local-branch listing for the panel's checkout-less branch rows,
@@ -603,14 +609,15 @@ fn spawn_branch_list(app: &mut App) {
         }
         None => {
             let list = crate::branches::local_branches_with_bases(&repo);
-            handle_branch_event(app, BranchEvent::List(id, list));
+            handle_branch_event(app, BranchEvent::List(id, list), &mut Vec::new());
         }
     }
 }
 
 /// Land a branch-channel answer: refresh the cache, or flash an op's
-/// outcome and re-list so the new/removed branch row shows right away.
-fn handle_branch_event(app: &mut App, ev: BranchEvent) {
+/// outcome and re-list so the new/removed branch row shows right away. A
+/// create's follow-up checkout goes out from here.
+fn handle_branch_event(app: &mut App, ev: BranchEvent, out: &mut Vec<ClientRequest>) {
     match ev {
         BranchEvent::List(project, branches) => {
             app.branch_inflight = false;
@@ -620,10 +627,20 @@ fn handle_branch_event(app: &mut App, ev: BranchEvent) {
                 app.dirty = true;
             }
         }
-        BranchEvent::Op { message, .. } => {
-            app.flash = Some(message);
+        BranchEvent::Op {
+            message,
+            error,
+            checkout,
+        } => {
             app.dirty = true;
             spawn_branch_list(app);
+            match (error, checkout) {
+                (false, Some((project, branch))) => {
+                    checkout_primary_then(app, project, branch, AfterCheckout::Land, out);
+                    app.flash = Some(format!("{message} · checking out on the primary…"));
+                }
+                _ => app.flash = Some(message),
+            }
         }
     }
 }
@@ -632,7 +649,12 @@ fn handle_branch_event(app: &mut App, ev: BranchEvent) {
 /// (create), or the lossless delete that knows when `-D` can't lose
 /// commits.
 enum BranchCmd {
-    Op(Vec<String>),
+    /// `git branch <name> <base>`; on success the branch is checked out
+    /// on the primary, like `nebula switch`.
+    Create {
+        name: String,
+        base: String,
+    },
     Delete(String),
 }
 
@@ -644,6 +666,7 @@ fn spawn_branch_op(
     project: &nebula_core::ProjectId,
     cmd: BranchCmd,
     done: String,
+    out: &mut Vec<ClientRequest>,
 ) {
     let repo = app
         .tree
@@ -662,22 +685,25 @@ fn spawn_branch_op(
         app.flash = Some("project has no primary checkout".into());
         return;
     };
+    let project = project.clone();
     let run = move || {
-        let result = match &cmd {
-            BranchCmd::Op(args) => {
-                let args: Vec<&str> = args.iter().map(String::as_str).collect();
-                crate::branches::branch_op(&repo, &args)
-            }
-            BranchCmd::Delete(branch) => crate::branches::delete_branch(&repo, branch),
+        let (result, checkout) = match &cmd {
+            BranchCmd::Create { name, base } => (
+                crate::branches::branch_op(&repo, &[name, base]),
+                Some((project, name.clone())),
+            ),
+            BranchCmd::Delete(branch) => (crate::branches::delete_branch(&repo, branch), None),
         };
         match result {
             Ok(()) => BranchEvent::Op {
                 message: done,
                 error: false,
+                checkout,
             },
             Err(e) => BranchEvent::Op {
                 message: e,
                 error: true,
+                checkout: None,
             },
         }
     };
@@ -689,7 +715,7 @@ fn spawn_branch_op(
         }
         None => {
             let ev = run();
-            handle_branch_event(app, ev);
+            handle_branch_event(app, ev, out);
         }
     }
 }
@@ -893,6 +919,10 @@ fn resize_term(term: &mut AttachedTerm, area: ratatui::layout::Rect, out: &mut V
     term.cols = area.width;
     term.rows = area.height;
     term.parser.screen_mut().set_size(area.height, area.width);
+    #[cfg(feature = "ghostty")]
+    if let Some(gh) = &mut term.gh {
+        gh.set_size(area.width, area.height);
+    }
     term.touch();
     out.push(ClientRequest::Resize {
         session: term.sref.clone(),
@@ -1615,8 +1645,11 @@ fn open_new_worktree_or_branch_picker(app: &mut App, project: nebula_core::Proje
     app.overlay = Some(Overlay::Menu(ContextMenu {
         title: Some("New worktree or branch".into()),
         items: vec![
-            row("Worktree", MenuAction::NewWorktree(project.clone())),
-            row("Branch", MenuAction::NewBranch(project)),
+            row(
+                "Worktree (own directory)",
+                MenuAction::NewWorktree(project.clone()),
+            ),
+            row("Branch (on the primary)", MenuAction::NewBranch(project)),
         ],
         at: None,
         hover: 0,
@@ -1654,7 +1687,7 @@ fn open_prompt(app: &mut App, kind: PromptKind) {
         // prefill (see the Char arm), and Ctrl+u clears it.
         PromptKind::AddProject => (
             "Add project".to_string(),
-            "path to a git repository".to_string(),
+            "path to a git repository (or host:/path over ssh)".to_string(),
             if std::env::var_os("HOME").is_some() {
                 "~/".to_string()
             } else {
@@ -1688,7 +1721,7 @@ fn open_prompt(app: &mut App, kind: PromptKind) {
         ),
         PromptKind::NewBranch { .. } => (
             "New branch".to_string(),
-            "branch name (no checkout is created)".to_string(),
+            "branch name (checked out on the primary, like nebula switch)".to_string(),
             String::new(),
         ),
         PromptKind::NewAgent {
@@ -1801,8 +1834,8 @@ fn open_diff_view(app: &mut App) {
         app.flash = Some("no worktree selected".into());
         return;
     };
-    if !path.is_dir() {
-        app.flash = Some(format!("worktree path missing on disk: {}", path.display()));
+    if let Some(msg) = checkout_unreachable(&path) {
+        app.flash = Some(msg);
         return;
     }
     let files = match crate::git_diff::changed_files(&path) {
@@ -1812,18 +1845,67 @@ fn open_diff_view(app: &mut App) {
             return;
         }
     };
-    if files.is_empty() {
-        app.flash = Some(format!("no changes in {branch}"));
-        return;
-    }
+    // A clean tree still opens: the ^g picker can switch to the upstream
+    // or a past commit from there.
     let head = crate::git_diff::head_oid(&path);
     let head_ok = head.is_some();
     let mut view = DiffView::new(path, branch, files, head_ok);
     view.head_key = head.unwrap_or_default();
     view.files_width = app.diff_files_width;
+    view.upstream = crate::git_diff::upstream_name(&view.root);
     restore_reviewed_marks(&mut view);
     crate::git_diff::load_selected_diff(&mut view);
     app.overlay = Some(Overlay::Diff(view));
+}
+
+/// Open the diff viewer's ^g base picker, loading the commit rows on
+/// first use. A `git log` failure flashes and leaves the picker closed.
+fn open_diff_base_picker(app: &mut App) {
+    let Some(Overlay::Diff(view)) = &mut app.overlay else {
+        return;
+    };
+    if view.commits.is_empty() && view.head_ok {
+        match crate::git_diff::recent_commits(&view.root) {
+            Ok(commits) => view.commits = commits,
+            Err(msg) => {
+                app.flash = Some(msg);
+                return;
+            }
+        }
+    }
+    view.open_picker();
+}
+
+/// Switch what the diff viewer compares: reload the file list for `base`,
+/// keep the filter, and re-select the top row. Reviewed ✓ marks only
+/// apply to the working-tree view (they are keyed to HEAD's uncommitted
+/// diff), so they clear for any other base and come back when it returns.
+/// A git failure flashes and leaves the current base in place.
+fn set_diff_base(app: &mut App, base: crate::git_diff::DiffBase) {
+    use crate::git_diff::DiffBase;
+    let Some(Overlay::Diff(view)) = &mut app.overlay else {
+        return;
+    };
+    let files = match &base {
+        DiffBase::WorkingTree => crate::git_diff::changed_files(&view.root),
+        DiffBase::Upstream(rev) => crate::git_diff::files_since(&view.root, rev),
+        DiffBase::Commit(c) => crate::git_diff::commit_files(&view.root, c),
+    };
+    let files = match files {
+        Ok(files) => files,
+        Err(msg) => {
+            app.flash = Some(msg);
+            return;
+        }
+    };
+    view.base = base;
+    view.files = files;
+    view.reviewed.clear();
+    if view.base.is_working_tree() {
+        restore_reviewed_marks(view);
+    }
+    view.apply_filter();
+    crate::git_diff::load_selected_diff(view);
 }
 
 /// Restore the worktree's reviewed ✓ marks into `view.reviewed`, dropping
@@ -1842,7 +1924,12 @@ fn restore_reviewed_marks(view: &mut DiffView) {
         .iter()
         .filter_map(|file| {
             let mark = *stored.get(&file.path)?;
-            let diff = crate::git_diff::diff_for(&view.root, file, view.head_ok);
+            let diff = crate::git_diff::diff_for(
+                &view.root,
+                file,
+                &crate::git_diff::DiffBase::WorkingTree,
+                view.head_ok,
+            );
             (crate::review::fingerprint(&diff) == mark).then(|| (file.path.clone(), mark))
         })
         .collect();
@@ -1972,8 +2059,8 @@ fn open_file_finder(app: &mut App) {
         app.flash = Some("no worktree selected".into());
         return;
     };
-    if !path.is_dir() {
-        app.flash = Some(format!("worktree path missing on disk: {}", path.display()));
+    if let Some(msg) = checkout_unreachable(&path) {
+        app.flash = Some(msg);
         return;
     }
     let files = match crate::git_diff::list_files(&path) {
@@ -2004,8 +2091,8 @@ fn open_tree_browser(app: &mut App) {
         app.flash = Some("no worktree selected".into());
         return;
     };
-    if !path.is_dir() {
-        app.flash = Some(format!("worktree path missing on disk: {}", path.display()));
+    if let Some(msg) = checkout_unreachable(&path) {
+        app.flash = Some(msg);
         return;
     }
     let files = match crate::git_diff::list_files(&path) {
@@ -2034,8 +2121,8 @@ fn open_grep_view(app: &mut App) {
         app.flash = Some("no worktree selected".into());
         return;
     };
-    if !path.is_dir() {
-        app.flash = Some(format!("worktree path missing on disk: {}", path.display()));
+    if let Some(msg) = checkout_unreachable(&path) {
+        app.flash = Some(msg);
         return;
     }
     let editor = crate::config::Config::load().editor_command();
@@ -2156,6 +2243,10 @@ fn open_file_link(app: &mut App, path: &str, line: Option<u64>) {
         app.flash = Some("no worktree for this session".into());
         return;
     };
+    if let Some(host) = nebula_core::remote::host_for(&root) {
+        app.flash = Some(format!("{path} is on {host} — open it from a shell tab there"));
+        return;
+    }
     let Some(file) = resolve_file_link(&root, path) else {
         app.flash = Some(format!("file not found: {path}"));
         return;
@@ -2179,6 +2270,22 @@ fn open_file_link(app: &mut App, path: &str, line: Option<u64>) {
         Ok(vim) => app.vim = Some(vim),
         Err(msg) => app.flash = Some(msg),
     }
+}
+
+/// Why a checkout can't be opened from here, as a flash: it sits on
+/// another machine (the editor, file finder and tree browser are local
+/// tools — git-backed views still work over ssh), or its directory is
+/// gone. None = fine to open.
+fn checkout_unreachable(path: &std::path::Path) -> Option<String> {
+    if let Some(host) = nebula_core::remote::host_for(path) {
+        return Some(format!(
+            "checkout lives on {host} — open files from a shell tab there"
+        ));
+    }
+    if !path.is_dir() {
+        return Some(format!("worktree path missing on disk: {}", path.display()));
+    }
+    None
 }
 
 /// Worktree root of the attached session; falls back to the selected
@@ -2337,8 +2444,10 @@ fn open_session_picker_for_context(app: &mut App, out: &mut Vec<ClientRequest>) 
 }
 
 /// The session picker on a branch: an existing checkout (the primary
-/// included) goes straight to the picker; a checkout-less branch gets a
-/// worktree created checking it out, and the picker follows its Ack.
+/// included) goes straight to the picker; a checkout-less branch is
+/// checked out on the primary — a branch is a branch, not a reason for a
+/// separate checkout — and the picker follows the Ack there. An explicit
+/// worktree is the menu's other item.
 fn pick_agent_on_branch(
     app: &mut App,
     project: nebula_core::ProjectId,
@@ -2354,22 +2463,90 @@ fn pick_agent_on_branch(
     {
         open_new_agent_picker(app, worktree);
     } else {
-        let req_id = app.alloc_req_id(PendingIntent::PickAgentOnCreatedWorktree);
-        out.push(ClientRequest::CreateWorktree {
-            req_id,
-            project,
-            branch,
-            base: None,
-        });
+        checkout_primary_then(app, project, branch, AfterCheckout::PickAgent, out);
     }
 }
 
-/// Shift+T: create a shell terminal whose pwd is the selection's checkout —
-/// the selected worktree, or the project's main checkout (root) when the
-/// Projects panel has focus. The daemon names it (`term-N`) and the Ack
-/// attaches it, so one keypress lands in a ready shell.
-fn create_terminal_for_context(app: &mut App, out: &mut Vec<ClientRequest>) {
-    let worktree = match app.focus {
+/// Check `branch` out on the project's primary checkout, then carry on with
+/// `next` there — the `nebula switch` shape. Sessions already working on
+/// the primary would have the branch change under them, so the move is
+/// confirmed first whenever one of them is busy; an idle primary moves
+/// straight away.
+fn checkout_primary_then(
+    app: &mut App,
+    project: nebula_core::ProjectId,
+    branch: String,
+    next: AfterCheckout,
+    out: &mut Vec<ClientRequest>,
+) {
+    let primary = app
+        .tree
+        .worktrees
+        .iter()
+        .find(|w| w.project_id == project && w.is_main);
+    let busy: Vec<&str> = primary
+        .map(|p| {
+            app.tree
+                .agents
+                .iter()
+                .filter(|a| a.worktree_id == p.id && !a.archived)
+                .filter(|a| {
+                    matches!(
+                        a.status,
+                        nebula_core::AgentStatus::Running | nebula_core::AgentStatus::NeedsFeedback
+                    )
+                })
+                .map(|a| a.name.as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    if busy.is_empty() {
+        request_checkout_primary(app, project, branch, next, out);
+        return;
+    }
+    let current = primary.map(|p| p.branch.as_str()).unwrap_or("?");
+    app.overlay = Some(Overlay::Confirm(ConfirmDialog {
+        title: "Move primary checkout".into(),
+        message: format!(
+            "The primary is on {current} with {} busy session(s): {}.\nCheck out {branch} under them?",
+            busy.len(),
+            busy.join(", ")
+        ),
+        action: PendingAction::CheckoutPrimary {
+            project,
+            branch,
+            next,
+        },
+    }));
+    app.dirty = true;
+}
+
+/// The `CheckoutPrimary` request itself; the Ack lands on the primary and
+/// runs `next`.
+fn request_checkout_primary(
+    app: &mut App,
+    project: nebula_core::ProjectId,
+    branch: String,
+    next: AfterCheckout,
+    out: &mut Vec<ClientRequest>,
+) {
+    let req_id = app.alloc_req_id(PendingIntent::CheckoutPrimaryThen {
+        project: project.clone(),
+        next,
+    });
+    app.flash = Some(format!("checking out {branch} on the primary checkout…"));
+    app.dirty = true;
+    out.push(ClientRequest::CheckoutPrimary {
+        req_id,
+        project,
+        branch,
+    });
+}
+
+/// The checkout a "new session here" keypress means: the selected worktree,
+/// or the project's main checkout when the Projects panel has focus.
+fn context_worktree(app: &App) -> Option<nebula_core::WorktreeId> {
+    match app.focus {
         Focus::Projects => app.selected_project().and_then(|p| {
             app.tree
                 .worktrees
@@ -2378,8 +2555,26 @@ fn create_terminal_for_context(app: &mut App, out: &mut Vec<ClientRequest>) {
                 .map(|w| w.id.clone())
         }),
         _ => app.selected_worktree().map(|w| w.id.clone()),
-    };
-    let Some(worktree) = worktree else {
+    }
+}
+
+/// Shift+T: create a shell terminal whose pwd is the selection's checkout —
+/// the selected worktree, or the project's main checkout (root) when the
+/// Projects panel has focus. The daemon names it (`term-N`) and the Ack
+/// attaches it, so one keypress lands in a ready shell.
+fn create_terminal_for_context(app: &mut App, out: &mut Vec<ClientRequest>) {
+    // A checkout-less branch row: the shell wants that branch, on the
+    // primary — check it out there first, the Ack creates the terminal.
+    if app.focus == Focus::Worktrees {
+        if let (Some(branch), Some(project)) = (
+            app.selected_branch_row(),
+            app.selected_project().map(|p| p.id.clone()),
+        ) {
+            checkout_primary_then(app, project, branch, AfterCheckout::Terminal, out);
+            return;
+        }
+    }
+    let Some(worktree) = context_worktree(app) else {
         app.flash = Some("select a project or worktree first".into());
         return;
     };
@@ -2439,17 +2634,50 @@ fn select_session_tab(app: &mut App, idx: usize, out: &mut Vec<ClientRequest>) {
     }
 }
 
-/// ⌘T: spawn a fresh unnamed shell terminal in the current worktree — a
-/// new tab in the session bar, no name prompt (the daemon numbers it, and
-/// it auto-attaches). The floating quick terminal lives on the palette's
-/// `t` alias instead; when that window is up, ⌘T closes it.
+/// ⌘T: ask what the new tab runs — Claude, Codex, Pi or a plain shell —
+/// and create it in the current worktree. The shell row starts hovered, so
+/// ⌘T-Enter is still "give me a terminal", and no row stops for a name
+/// prompt (the daemon names it, and the Ack attaches it). The full picker
+/// with Cursor, model and effort submenus stays on `t`. The floating
+/// quick terminal lives on the palette's `t` alias; when that window is up,
+/// ⌘T closes it.
 fn quick_terminal_shortcut(app: &mut App, out: &mut Vec<ClientRequest>) {
     if app.quick_term {
         close_quick_terminal(app, out);
         return;
     }
+    let Some(worktree) = context_worktree(app) else {
+        app.flash = Some("select a project or worktree first".into());
+        return;
+    };
     app.collapsed = false;
-    create_terminal_for_context(app, out);
+    let kind_row = |label: &str, kind: AgentKind| MenuItem {
+        label: label.into(),
+        action: MenuAction::QuickAgentOfKind {
+            worktree: worktree.clone(),
+            kind,
+        },
+        destructive: false,
+    };
+    let items = vec![
+        kind_row("Claude", AgentKind::Claude),
+        kind_row("Codex", AgentKind::Codex),
+        kind_row("Pi", AgentKind::Pi),
+        MenuItem {
+            label: "Terminal (shell)".into(),
+            action: MenuAction::NewTerminal(worktree),
+            destructive: false,
+        },
+    ];
+    app.overlay = Some(Overlay::Menu(ContextMenu {
+        title: Some("New tab".into()),
+        hover: items.len() - 1, // the shell row: ⌘T's historical behaviour
+        items,
+        at: None,
+        area: ratatui::layout::Rect::default(),
+        parent: None,
+        filter: None,
+    }));
 }
 
 fn toggle_quick_terminal(app: &mut App, out: &mut Vec<ClientRequest>) {
@@ -3320,11 +3548,27 @@ fn open_agent_picker(app: &mut App, worktree: WorktreeId) {
     ];
     items.push(MenuItem {
         label: "Terminal (shell)".into(),
-        action: MenuAction::NewTerminal(worktree),
+        action: MenuAction::NewTerminal(worktree.clone()),
         destructive: false,
     });
+    // Where else this project lives: its twins on other machines (same
+    // name, a different host) get a row that re-opens this picker on
+    // their primary checkout — local ⇄ remote is one keypress inside the
+    // same flow, no separate TUI to hop into.
+    let host = app.worktree_host(&worktree).map(str::to_owned);
+    for (label, twin_main) in project_twins(app, &worktree) {
+        items.push(MenuItem {
+            label,
+            action: MenuAction::NewAgent(twin_main),
+            destructive: false,
+        });
+    }
+    let title = match host {
+        Some(h) => format!("New session on {h}"),
+        None => "New session".to_string(),
+    };
     app.overlay = Some(Overlay::Menu(ContextMenu {
-        title: Some("New session".into()),
+        title: Some(title),
         items,
         at: None,
         hover: 0,
@@ -3332,6 +3576,41 @@ fn open_agent_picker(app: &mut App, worktree: WorktreeId) {
         parent: None,
         filter: None,
     }));
+}
+
+/// Twins of the worktree's project — projects of the same name in this
+/// workspace on a different host (a local checkout and its `nebula add
+/// findl:/path` counterpart, say) — as (`Run on …` label, primary
+/// worktree id) pairs for the new-session picker.
+fn project_twins(app: &App, worktree: &WorktreeId) -> Vec<(String, WorktreeId)> {
+    let Some(w) = app.tree.worktrees.iter().find(|w| &w.id == worktree) else {
+        return Vec::new();
+    };
+    let Some(project) = app.tree.projects.iter().find(|p| p.id == w.project_id) else {
+        return Vec::new();
+    };
+    app.tree
+        .projects
+        .iter()
+        .filter(|p| {
+            p.id != project.id
+                && p.name == project.name
+                && p.workspace_id == project.workspace_id
+                && p.host != project.host
+        })
+        .filter_map(|p| {
+            let main = app
+                .tree
+                .worktrees
+                .iter()
+                .find(|x| x.project_id == p.id && x.is_main)?;
+            let label = match &p.host {
+                Some(h) => format!("Run on {h} ▸"),
+                None => "Run locally ▸".to_string(),
+            };
+            Some((label, main.id.clone()))
+        })
+        .collect()
 }
 
 /// The project's local branches and the primary checkout's branch. The
@@ -3439,7 +3718,8 @@ fn open_agent_branch_picker(app: &mut App, project: nebula_core::ProjectId) {
 /// FROM. Same rule as the `ab` picker — the primary
 /// checkout's branch leads the list and starts hovered, the rest stay
 /// newest commit first. The pick runs `git branch <name> <base>` in the
-/// primary checkout; nothing is checked out.
+/// primary checkout and then checks the branch out there, the
+/// `nebula switch` shape.
 fn open_new_branch_base_picker(app: &mut App, project: nebula_core::ProjectId, name: String) {
     let Some((branches, root_branch)) = project_local_branches(app, &project) else {
         app.flash = Some("no local branches found".into());
@@ -3477,7 +3757,7 @@ fn open_new_branch_base_picker(app: &mut App, project: nebula_core::ProjectId, n
 fn branch_row_menu(project: nebula_core::ProjectId, branch: String) -> Vec<MenuItem> {
     vec![
         MenuItem {
-            label: "New agent here".into(),
+            label: "New agent here (checks out on primary)".into(),
             action: MenuAction::AgentOnBranch {
                 project: project.clone(),
                 branch: branch.clone(),
@@ -3890,6 +4170,18 @@ fn open_context_menu_for_selection(app: &mut App) {
                     },
                 ];
                 if !w.is_main {
+                    // A branch parked in its own checkout can move onto the
+                    // primary; a detached checkout has no branch to move.
+                    if !w.branch.starts_with("detached") && !w.branch.starts_with('(') {
+                        items.push(MenuItem {
+                            label: "Check out on primary".into(),
+                            action: MenuAction::CheckoutPrimary {
+                                project: w.project_id.clone(),
+                                branch: w.branch.clone(),
+                            },
+                            destructive: false,
+                        });
+                    }
                     items.push(MenuItem {
                         // A row presenting as a branch deletes as one.
                         label: if w.for_branch {
@@ -4166,9 +4458,42 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
         Overlay::Diff(view) => {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+            // ⌘G is the ^g picker's mac-native spelling.
+            let cmd_or_ctrl = ctrl || key.modifiers.contains(KeyModifiers::SUPER);
             let half = (view.view_height / 2).max(1) as i32;
             let page = view.view_height.max(1) as i32;
+            // The ^g base picker sits above the viewer and takes every key
+            // while open: ↑/↓ move, Enter picks, Esc (or ^g again) closes.
+            if let Some(picker) = &view.picker {
+                let hover = picker.hover as i64;
+                let rows = view.picker_rows() as i64;
+                match key.code {
+                    KeyCode::Esc => view.picker = None,
+                    KeyCode::Char('g') if cmd_or_ctrl => view.picker = None,
+                    KeyCode::Enter => {
+                        let base = view.picker_base(picker.hover);
+                        view.picker = None;
+                        if let Some(base) = base {
+                            set_diff_base(app, base);
+                        }
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => view.picker_hover(hover + 1),
+                    KeyCode::Up | KeyCode::Char('k') => view.picker_hover(hover - 1),
+                    KeyCode::Char('n') if ctrl => view.picker_hover(hover + 1),
+                    KeyCode::Char('p') if ctrl => view.picker_hover(hover - 1),
+                    KeyCode::PageDown => view.picker_hover(hover + 10),
+                    KeyCode::PageUp => view.picker_hover(hover - 10),
+                    KeyCode::Home => view.picker_hover(0),
+                    KeyCode::End => view.picker_hover(rows - 1),
+                    _ => {}
+                }
+                app.dirty = true;
+                return;
+            }
             match key.code {
+                // ^g: pick what the diff compares (working tree, upstream,
+                // a commit).
+                KeyCode::Char('g') if cmd_or_ctrl => open_diff_base_picker(app),
                 // Two-stage escape: an active filter is cleared before the
                 // second Esc closes the modal.
                 KeyCode::Esc if !view.filter.is_empty() => {
@@ -4188,7 +4513,7 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 // next file and unmarking to the next still-marked file, so
                 // held Ctrl+r sweeps either way (see
                 // `DiffView::toggle_reviewed`).
-                KeyCode::Char('r') if ctrl => {
+                KeyCode::Char('r') if ctrl && view.base.is_working_tree() => {
                     if let Some(changed) = view.toggle_reviewed() {
                         crate::review::store_marks(&view.root, &view.head_key, &view.reviewed);
                         if changed {
@@ -5075,6 +5400,19 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
     match prompt.kind {
         PromptKind::DividerLabel { .. } => unreachable!("handled above (empty input allowed)"),
         PromptKind::AddProject => {
+            // `host:/path`: a checkout on another machine — the daemon
+            // reads it over ssh, so there is nothing to check or create.
+            if let Some((host, remote_path)) = nebula_core::remote::parse_spec(&value) {
+                let req_id = app.alloc_req_id(PendingIntent::None);
+                out.push(ClientRequest::AddProject {
+                    req_id,
+                    path: std::path::PathBuf::from(remote_path),
+                    name: None,
+                    create_missing: false,
+                    host: Some(host),
+                });
+                return;
+            }
             let expanded = shellexpand_home(&value);
             if !expanded.exists() {
                 app.overlay = Some(Overlay::Confirm(ConfirmDialog {
@@ -5093,6 +5431,7 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                 path: expanded,
                 name: None,
                 create_missing: false,
+                host: None,
             });
         }
         PromptKind::NewWorktree {
@@ -5213,6 +5552,7 @@ fn run_pending_action(app: &mut App, action: PendingAction, out: &mut Vec<Client
                 path,
                 name: None,
                 create_missing: true,
+                host: None,
             });
         }
         PendingAction::DeleteAgent(id) => {
@@ -5305,8 +5645,13 @@ fn run_pending_action(app: &mut App, action: PendingAction, out: &mut Vec<Client
         }
         PendingAction::DeleteBranch { project, branch } => {
             let done = format!("branch {branch} deleted");
-            spawn_branch_op(app, &project, BranchCmd::Delete(branch), done);
+            spawn_branch_op(app, &project, BranchCmd::Delete(branch), done, out);
         }
+        PendingAction::CheckoutPrimary {
+            project,
+            branch,
+            next,
+        } => request_checkout_primary(app, project, branch, next, out),
         PendingAction::Quit => app.should_quit = true,
     }
 }
@@ -5375,9 +5720,7 @@ fn delete_worktree_confirm(app: &App, w: &nebula_core::Worktree) -> ConfirmDialo
         } else {
             "will be LOST"
         };
-        message.push_str(&format!(
-            "\nWARNING: {dirty} uncommitted change(s) {fate}."
-        ));
+        message.push_str(&format!("\nWARNING: {dirty} uncommitted change(s) {fate}."));
     }
     ConfirmDialog {
         title: title.into(),
@@ -5454,6 +5797,25 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                 name: None,
             });
         }
+        MenuAction::QuickAgentOfKind { worktree, kind } => {
+            // Like the ⌘D rows: configured defaults, generated name,
+            // auto-title, attached by its Ack — ⌘T never prompts.
+            let cfg = crate::config::Config::load();
+            let req_id = app.alloc_req_id(PendingIntent::AttachCreated);
+            out.push(ClientRequest::CreateAgent {
+                req_id,
+                worktree: worktree.clone(),
+                name: app.default_session_name("agent"),
+                kind,
+                model: cfg.default_model(kind),
+                effort: cfg.default_effort(kind),
+                auto_title: true,
+                prompt: None,
+            });
+            if kind == AgentKind::Claude {
+                out.push(default_claude_prewarm(worktree));
+            }
+        }
         MenuAction::SplitAgentOfKind { worktree, kind } => {
             // Straight to the create — the split skips the name prompt and
             // model submenus on purpose: configured defaults, generated
@@ -5516,15 +5878,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             // warm slot gets adopted where it matches, and the refill
             // behind the create re-warms it either way.
             if cfg.skip_session_naming {
-                create_agent(
-                    app,
-                    worktree,
-                    kind,
-                    model,
-                    effort,
-                    String::new(),
-                    out,
-                );
+                create_agent(app, worktree, kind, model, effort, String::new(), out);
                 return;
             }
             // Warm the CLI while the user types the name: the daemon
@@ -5572,7 +5926,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             base,
         } => {
             let done = format!("branch {name} created from {base}");
-            spawn_branch_op(app, &project, BranchCmd::Op(vec![name, base]), done);
+            spawn_branch_op(app, &project, BranchCmd::Create { name, base }, done, out);
         }
         MenuAction::DeleteBranch { project, branch } => {
             app.overlay = Some(Overlay::Confirm(ConfirmDialog {
@@ -5600,6 +5954,9 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
         MenuAction::SetWorktreePinned(id, pinned) => {
             let req_id = app.alloc_req_id(PendingIntent::None);
             out.push(ClientRequest::SetWorktreePinned { req_id, id, pinned });
+        }
+        MenuAction::CheckoutPrimary { project, branch } => {
+            checkout_primary_then(app, project, branch, AfterCheckout::Land, out);
         }
         MenuAction::DeleteWorktree(id) => {
             if let Some(w) = app.tree.worktrees.iter().find(|w| w.id == id).cloned() {
@@ -6056,6 +6413,7 @@ fn land_open_at(app: &mut App, dir: &std::path::Path, out: &mut Vec<ClientReques
         path: dir,
         name: None,
         create_missing: false,
+        host: None,
     });
 }
 
@@ -7107,7 +7465,56 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
     // selects that file, a drag on the files/diff border resizes the file
     // list; everything else is swallowed.
     if let Some(Overlay::Diff(view)) = &mut app.overlay {
+        // The ^g base picker on top: the wheel moves the hover, a click on
+        // a row picks it, a click outside closes; everything else is
+        // swallowed.
+        if let Some(picker) = &view.picker {
+            let hover = picker.hover as i64;
+            match mouse.kind {
+                MouseEventKind::ScrollUp => view.picker_hover(hover - 1),
+                MouseEventKind::ScrollDown => view.picker_hover(hover + 1),
+                MouseEventKind::Down(MouseButton::Left) => {
+                    let list = picker.list_area;
+                    let inside = |r: ratatui::layout::Rect| {
+                        r.width > 0
+                            && mouse.column >= r.x
+                            && mouse.column < r.x + r.width
+                            && mouse.row >= r.y
+                            && mouse.row < r.y + r.height
+                    };
+                    if inside(list) {
+                        let row = picker.scroll_offset(list.height as usize)
+                            + (mouse.row - list.y) as usize;
+                        if let Some(base) = view.picker_base(row) {
+                            view.picker = None;
+                            set_diff_base(app, base);
+                        }
+                    } else if !inside(picker.area) {
+                        view.picker = None;
+                    }
+                }
+                _ => return,
+            }
+            app.dirty = true;
+            return;
+        }
+        // The wheel over the file panel (left of the splitter) scrolls the
+        // list without moving the selection; anywhere else it scrolls the
+        // diff.
+        let over_files = view.area.width > 0
+            && mouse.column >= view.area.x
+            && mouse.column < view.splitter_x()
+            && mouse.row >= view.area.y
+            && mouse.row < view.area.y + view.area.height;
         match mouse.kind {
+            MouseEventKind::ScrollUp if over_files => {
+                view.scroll_list_by(-3);
+                app.dirty = true;
+            }
+            MouseEventKind::ScrollDown if over_files => {
+                view.scroll_list_by(3);
+                app.dirty = true;
+            }
             MouseEventKind::ScrollUp => {
                 view.scroll_by(-3);
                 app.dirty = true;
@@ -7122,6 +7529,17 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 let bx = view.splitter_x();
                 if on_vsplit(bx, view.area, mouse.column, mouse.row) {
                     view.files_drag = Some(bx as i32 - mouse.column as i32);
+                    return;
+                }
+                // The ▾ base row under the filter opens the ^g picker.
+                let b = view.base_area;
+                if b.width > 0
+                    && mouse.row == b.y
+                    && mouse.column >= b.x
+                    && mouse.column < b.x + b.width
+                {
+                    open_diff_base_picker(app);
+                    app.dirty = true;
                     return;
                 }
                 let area = view.list_area;
@@ -7965,18 +8383,17 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 // The wheel over a sidebar section walks its rows, same
                 // as j/k there — the draw keeps the moved selection
                 // visible, which is what scrolls an overflowing section.
-                let section = match &over {
-                    Some(HitTarget::Project(_)) | Some(HitTarget::PanelBg(Focus::Projects)) => {
-                        Some(Focus::Projects)
-                    }
-                    Some(HitTarget::Worktree(_)) | Some(HitTarget::PanelBg(Focus::Worktrees)) => {
-                        Some(Focus::Worktrees)
-                    }
-                    Some(HitTarget::WorktreeSession(_, _)) | Some(HitTarget::WorktreeBranch(_)) => {
-                        Some(Focus::Worktrees)
-                    }
-                    _ => None,
-                };
+                let section =
+                    match &over {
+                        Some(HitTarget::Project(_)) | Some(HitTarget::PanelBg(Focus::Projects)) => {
+                            Some(Focus::Projects)
+                        }
+                        Some(HitTarget::Worktree(_))
+                        | Some(HitTarget::PanelBg(Focus::Worktrees)) => Some(Focus::Worktrees),
+                        Some(HitTarget::WorktreeSession(_, _))
+                        | Some(HitTarget::WorktreeBranch(_)) => Some(Focus::Worktrees),
+                        _ => None,
+                    };
                 if let Some(section) = section {
                     app.focus = section;
                     move_selection(app, if up { -1 } else { 1 }, out);
@@ -8297,6 +8714,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             app.tree.notes = notes;
             app.tree.todos = todos;
             app.tree.links = links;
+            app.sync_remote_hosts();
             app.pr_seen = pr_seen.into_iter().map(|s| (s.url, s.marker)).collect();
             // A snapshot means a fresh subscription; if the daemon restarted
             // behind it, ring seqs restarted too — parked parsers can't be
@@ -8436,6 +8854,36 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                         app.select_worktree_when_seen = Some(id.clone());
                     }
                     open_new_agent_picker(app, id);
+                }
+                (Some(PendingIntent::CheckoutPrimaryThen { project, next }), _) => {
+                    // The branch now sits on the primary checkout (its row's
+                    // branch label follows via the reconcile upsert). Land
+                    // there and carry on; the old primary branch becomes a
+                    // checkout-less row on the next listing.
+                    app.branch_inflight = false;
+                    spawn_branch_list(app);
+                    let Some(primary) = app
+                        .tree
+                        .worktrees
+                        .iter()
+                        .find(|w| w.project_id == project && w.is_main)
+                        .map(|w| w.id.clone())
+                    else {
+                        return;
+                    };
+                    select_worktree_by_id(app, &primary, out);
+                    match next {
+                        AfterCheckout::Land => {}
+                        AfterCheckout::PickAgent => open_new_agent_picker(app, primary),
+                        AfterCheckout::Terminal => {
+                            let req_id = app.alloc_req_id(PendingIntent::AttachCreated);
+                            out.push(ClientRequest::CreateTerminal {
+                                req_id,
+                                worktree: primary,
+                                name: None,
+                            });
+                        }
+                    }
                 }
                 (Some(PendingIntent::SelectCreatedWorktree), Some(EntityId::Worktree(id))) => {
                     // Its upsert usually lands just before this Ack; if not,
@@ -8598,6 +9046,7 @@ fn apply_upsert(app: &mut App, entity: nebula_core::Entity) {
                 Some(existing) => *existing = p,
                 None => app.tree.projects.push(p),
             }
+            app.sync_remote_hosts();
             // Reorders arrive as plain upserts with new sort_orders; stable
             // sort keeps snapshot order for legacy all-zero ties. The
             // selection follows the row it was on, so children stay put; a
@@ -8629,10 +9078,13 @@ fn apply_upsert(app: &mut App, entity: nebula_core::Entity) {
                 }
             }
         }
-        Entity::Worktree(w) => match app.tree.worktrees.iter_mut().find(|x| x.id == w.id) {
-            Some(existing) => *existing = w,
-            None => app.tree.worktrees.push(w),
-        },
+        Entity::Worktree(w) => {
+            match app.tree.worktrees.iter_mut().find(|x| x.id == w.id) {
+                Some(existing) => *existing = w,
+                None => app.tree.worktrees.push(w),
+            }
+            app.sync_remote_hosts();
+        }
         Entity::Agent(a) => {
             let id = a.id.clone();
             let prev = app
@@ -9066,6 +9518,88 @@ mod tests {
         handle_server_event(app, ev, &mut out);
     }
 
+    /// A remote twin of seed_tree's `demo` project: same name, on `findl`.
+    fn seed_remote_twin(app: &mut App) {
+        use nebula_core::{Entity, Project, ProjectId, Worktree, WorktreeId};
+        hse(
+            app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Project(Project {
+                    workspace_id: Default::default(),
+                    id: ProjectId("p-remote".into()),
+                    name: "demo".into(),
+                    repo_path: "/srv/demo".into(),
+                    sort_order: 1,
+                    divider_after: false,
+                    divider_label: None,
+                    divider_before: false,
+                    divider_before_label: None,
+                    host: Some("findl".into()),
+                }),
+            },
+        );
+        hse(
+            app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(Worktree {
+                    id: WorktreeId("w-remote".into()),
+                    project_id: ProjectId("p-remote".into()),
+                    path: "/srv/demo".into(),
+                    branch: "main".into(),
+                    is_main: true,
+                    created_from: None,
+                    pinned: false,
+                    for_branch: false,
+                    sort_order: 0,
+                }),
+            },
+        );
+    }
+
+    #[test]
+    fn new_session_picker_offers_the_project_twin_on_the_other_host() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_remote_twin(&mut app);
+        // The tree sync taught the host map where /srv/demo lives.
+        assert_eq!(
+            nebula_core::remote::host_for(std::path::Path::new("/srv/demo/src")).as_deref(),
+            Some("findl")
+        );
+
+        // Local picker: the kinds, the shell, then "Run on findl".
+        open_agent_picker(&mut app, WorktreeId("w1".into()));
+        let Some(Overlay::Menu(menu)) = &app.overlay else {
+            panic!("expected the picker");
+        };
+        assert_eq!(menu.title.as_deref(), Some("New session"));
+        let twin = menu
+            .items
+            .iter()
+            .find(|i| i.label == "Run on findl ▸")
+            .expect("twin row");
+        assert!(matches!(&twin.action, MenuAction::NewAgent(w) if w.as_str() == "w-remote"));
+
+        // Following it lands on the remote picker, titled for its host,
+        // with the way back.
+        let action = twin.action.clone();
+        let mut out = Vec::new();
+        run_menu_action(&mut app, action, &mut out);
+        let Some(Overlay::Menu(menu)) = &app.overlay else {
+            panic!("expected the remote picker");
+        };
+        assert_eq!(menu.title.as_deref(), Some("New session on findl"));
+        assert!(menu
+            .items
+            .iter()
+            .any(|i| i.label == "Run locally ▸"
+                && matches!(&i.action, MenuAction::NewAgent(w) if w.as_str() == "w1")));
+        assert!(menu.items.iter().any(|i| matches!(
+            &i.action,
+            MenuAction::NewAgentOfKind { worktree, kind: AgentKind::Pi, .. } if worktree.as_str() == "w-remote"
+        )));
+    }
+
     fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
         let buffer = terminal.backend().buffer();
         let mut out = String::new();
@@ -9109,6 +9643,7 @@ mod tests {
                     divider_label: None,
                     divider_before: false,
                     divider_before_label: None,
+                    host: None,
                 }),
             },
         );
@@ -9145,7 +9680,7 @@ mod tests {
                     session_id: None,
                     sort_order: 0,
                     status_changed_at: 0,
-                                        alive: true,
+                    alive: true,
                 }),
             },
         );
@@ -10563,7 +11098,7 @@ mod tests {
                     kind: AgentKind::Claude,
                     model: Some("opus".into()),
                     effort: Some("high".into()),
-                                    },
+                },
             )));
             let mut out = Vec::new();
             press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
@@ -10720,7 +11255,7 @@ mod tests {
                     session_id: None,
                     sort_order: 2,
                     status_changed_at: 0,
-                                        alive: true,
+                    alive: true,
                 }),
             },
         );
@@ -10804,7 +11339,7 @@ mod tests {
                     session_id: None,
                     sort_order: 1,
                     status_changed_at: 0,
-                                        alive: true,
+                    alive: true,
                 }),
             },
         );
@@ -10908,7 +11443,7 @@ mod tests {
                 session_id: None,
                 sort_order: sort,
                 status_changed_at: changed_at,
-                                alive: true,
+                alive: true,
             }),
         };
         // Pinned with a fresh change: must stay in PINNED, not RECENT.
@@ -10972,7 +11507,7 @@ mod tests {
                     session_id: None,
                     sort_order: sort,
                     status_changed_at: changed_at,
-                                        alive: true,
+                    alive: true,
                 }),
             }
         };
@@ -11040,7 +11575,7 @@ mod tests {
                     session_id: None,
                     sort_order: sort,
                     status_changed_at: at,
-                                        alive: true,
+                    alive: true,
                 }),
             }
         };
@@ -11137,7 +11672,7 @@ mod tests {
                     session_id: None,
                     sort_order: 1,
                     status_changed_at: 0,
-                                        alive: true,
+                    alive: true,
                 }),
             },
         );
@@ -11508,7 +12043,7 @@ mod tests {
                     session_id: None,
                     sort_order: 0,
                     status_changed_at: 0,
-                                        alive: true,
+                    alive: true,
                 }),
             },
         );
@@ -12739,9 +13274,9 @@ mod tests {
             menu.items[0].action
         );
         assert!(
-            menu.items
-                .iter()
-                .any(|i| matches!(&i.action, MenuAction::NewTerminal(w) if w == &WorktreeId("w1".into()))),
+            menu.items.iter().any(
+                |i| matches!(&i.action, MenuAction::NewTerminal(w) if w == &WorktreeId("w1".into()))
+            ),
             "the picker keeps a Terminal row"
         );
     }
@@ -13147,7 +13682,7 @@ mod tests {
                 session_id: None,
                 sort_order: sort,
                 status_changed_at: 0,
-                                alive: true,
+                alive: true,
             })
         };
         hse(
@@ -13217,7 +13752,7 @@ mod tests {
             session_id: None,
             sort_order: sort,
             status_changed_at: 0,
-                        alive: false,
+            alive: false,
         })
     }
 
@@ -14120,6 +14655,7 @@ mod tests {
             divider_label: divider_label.map(String::from),
             divider_before: false,
             divider_before_label: None,
+            host: None,
         })
     }
 
@@ -14219,7 +14755,7 @@ mod tests {
                     session_id: None,
                     sort_order: 0,
                     status_changed_at: crate::app::now_ms() - 2 * 60_000,
-                                        alive: true,
+                    alive: true,
                 }),
             },
         );
@@ -14268,17 +14804,35 @@ mod tests {
         );
     }
 
-    /// ⌘T spawns a fresh unnamed terminal tab in the current worktree, no
-    /// name prompt, whatever panel is focused; when the floating quick
-    /// terminal (palette `t`) is up, ⌘T closes it instead.
+    /// ⌘T asks what the new tab runs, with the shell row pre-hovered — so
+    /// ⌘T-Enter still lands in a fresh unnamed terminal in the current
+    /// worktree, no name prompt, whatever panel is focused; when the
+    /// floating quick terminal (palette `t`) is up, ⌘T closes it instead.
     #[test]
-    fn cmd_t_creates_an_unnamed_terminal_tab() {
+    fn cmd_t_picks_the_new_tab_kind_defaulting_to_a_terminal() {
         let mut app = App::new();
         seed_tree(&mut app);
         for focus in [Focus::Worktrees, Focus::Sessions, Focus::Projects] {
             app.focus = focus;
             let mut out = Vec::new();
             press(&mut app, KeyCode::Char('t'), KeyModifiers::SUPER, &mut out);
+            match &app.overlay {
+                Some(Overlay::Menu(m)) => {
+                    assert_eq!(m.title.as_deref(), Some("New tab"));
+                    let labels: Vec<_> = m.items.iter().map(|i| i.label.clone()).collect();
+                    assert_eq!(labels, ["Claude", "Codex", "Pi", "Terminal (shell)"]);
+                    assert!(
+                        matches!(m.items[m.hover].action, MenuAction::NewTerminal(_)),
+                        "{focus:?}: the shell row starts hovered"
+                    );
+                }
+                other => panic!("{focus:?}: ⌘T opens the new-tab picker: {other:?}"),
+            }
+            assert!(out.is_empty(), "{focus:?}: nothing is created until a pick");
+
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(app.overlay.is_none(), "the pick closes the menu");
             assert!(
                 matches!(
                     out.last(),
@@ -14288,6 +14842,29 @@ mod tests {
             );
             assert!(!app.quick_term, "the floating window stays closed");
         }
+
+        // Picking Claude creates a normal agent tab right away — configured
+        // defaults, generated name, no name prompt (plus the warm-slot
+        // refill), the same deal the ⌘D rows get.
+        app.focus = Focus::Worktrees;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::SUPER, &mut out);
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
+        }
+        out.clear();
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(
+                out.first(),
+                Some(ClientRequest::CreateAgent {
+                    kind: nebula_core::AgentKind::Claude,
+                    auto_title: true,
+                    ..
+                })
+            ),
+            "the Claude row creates an agent tab: {out:?}"
+        );
 
         // With the floating window up, ⌘T is the close.
         app.quick_term = true;
@@ -14855,7 +15432,7 @@ mod tests {
                     session_id: None,
                     sort_order: 0,
                     status_changed_at: 0,
-                                        alive: true,
+                    alive: true,
                 }),
             },
         );
@@ -15511,7 +16088,7 @@ mod tests {
                     session_id: None,
                     sort_order: 0,
                     status_changed_at: 0,
-                                        alive: true,
+                    alive: true,
                 }),
             },
         );
@@ -15603,7 +16180,7 @@ mod tests {
                     session_id: None,
                     sort_order: 1,
                     status_changed_at: 0,
-                                        alive: false,
+                    alive: false,
                 }),
             },
         );
@@ -15628,8 +16205,8 @@ mod tests {
                 .unwrap_or_default()
         };
         assert!(
-            worktree_column(worktree.y + 1).contains("● main"),
-            "main worktree row is visible:\n{text}"
+            worktree_column(worktree.y + 1).contains("● demo"),
+            "primary row is visible under its project name:\n{text}"
         );
         assert!(
             worktree_column(worktree.y + worktree.height).contains("▘ ● claude "),
@@ -15682,7 +16259,7 @@ mod tests {
                     session_id: None,
                     sort_order: 0,
                     status_changed_at: 0,
-                                        alive: true,
+                    alive: true,
                 }),
             },
         );
@@ -15769,7 +16346,9 @@ mod tests {
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
         let cell = |x: u16, y: u16| terminal.backend().buffer()[(x, y)].symbol().to_string();
-        let (main_x, main_y) = find_cell(&terminal, "main");
+        // The primary row carries the project's name; its branch sits on
+        // the `on main` sub-line.
+        let (main_x, main_y) = find_cell(&terminal, "demo ⌂");
         let (child_x, child_y) = find_cell(&terminal, "n-child");
         let (grand_x, grand_y) = find_cell(&terminal, "n-grand");
         let (last_x, last_y) = find_cell(&terminal, "n-last");
@@ -15872,7 +16451,7 @@ mod tests {
                         session_id: None,
                         sort_order: i,
                         status_changed_at: 0,
-                                                alive: true,
+                        alive: true,
                     }),
                 },
             );
@@ -15993,7 +16572,7 @@ mod tests {
                         session_id: None,
                         sort_order: i as i64,
                         status_changed_at: 0,
-                                                alive: true,
+                        alive: true,
                     }),
                 },
             );
@@ -16095,11 +16674,11 @@ mod tests {
             |line: &str, needle: &str| line.find(needle).map(|b| line[..b].chars().count());
         let at = |row: usize, col: usize| lines[row].chars().nth(col);
         // rail col ▌, then dot + name: the rail sits one cell left of the dot.
-        let dot = "● main";
+        let dot = "● demo";
         let row = lines
             .iter()
             .position(|l| l.contains(dot))
-            .unwrap_or_else(|| panic!("row \"main\" not on screen:\n{text}"));
+            .unwrap_or_else(|| panic!("primary row not on screen:\n{text}"));
         let col = char_col(lines[row], dot).unwrap() - 1;
         assert_eq!(at(row, col), Some('▌'), "rail on the text row:\n{text}");
         assert_eq!(
@@ -16132,6 +16711,7 @@ mod tests {
             divider_label: None,
             divider_before: true,
             divider_before_label: label.map(String::from),
+            host: None,
         })
     }
 
@@ -16475,6 +17055,7 @@ mod tests {
                     divider_label: None,
                     divider_before: false,
                     divider_before_label: None,
+                    host: None,
                 }),
             },
         );
@@ -16948,11 +17529,11 @@ mod tests {
         assert!(out.is_empty(), "nothing goes to the daemon: {out:?}");
     }
 
-    /// The `a` flow on a branch with no checkout: the worktree is created
-    /// first (checking out the existing branch), and its Ack opens the
-    /// session picker on the fresh checkout.
+    /// The `a` flow on a branch with no checkout: the branch is checked
+    /// out on the primary (no worktree minted), and the Ack opens the
+    /// session picker on the primary checkout.
     #[test]
-    fn agent_on_branch_without_checkout_creates_worktree_then_opens_picker() {
+    fn agent_on_branch_without_checkout_checks_it_out_on_primary_then_opens_picker() {
         let mut app = App::new();
         seed_tree(&mut app);
         let mut out = Vec::new();
@@ -16964,29 +17545,29 @@ mod tests {
             },
             &mut out,
         );
-        let Some(ClientRequest::CreateWorktree {
-            req_id,
-            branch,
-            base,
-            ..
-        }) = out.first()
-        else {
-            panic!("expected CreateWorktree, got {out:?}");
+        let Some(ClientRequest::CheckoutPrimary { req_id, branch, .. }) = out.first() else {
+            panic!("expected CheckoutPrimary, got {out:?}");
         };
         assert_eq!(branch, "feature");
-        assert_eq!(
-            base, &None,
-            "the existing branch is checked out, not re-based"
+        assert!(
+            !out.iter()
+                .any(|r| matches!(r, ClientRequest::CreateWorktree { .. })),
+            "a branch gets no worktree of its own"
         );
         let req_id = *req_id;
+        let primary = app
+            .tree
+            .worktrees
+            .iter()
+            .find(|w| w.is_main)
+            .map(|w| w.id.clone())
+            .expect("seed has a primary");
         let mut out = Vec::new();
         handle_server_event(
             &mut app,
             ServerEvent::Ack {
                 req_id,
-                created: Some(nebula_core::EntityId::Worktree(nebula_core::WorktreeId(
-                    "w-feature".into(),
-                ))),
+                created: None,
             },
             &mut out,
         );
@@ -16997,8 +17578,7 @@ mod tests {
         assert!(
             matches!(
                 &menu.items[0].action,
-                MenuAction::NewAgentOfKind { worktree, .. }
-                    if worktree == &nebula_core::WorktreeId("w-feature".into())
+                MenuAction::NewAgentOfKind { worktree, .. } if worktree == &primary
             ),
             "{:?}",
             menu.items[0].action
@@ -17097,7 +17677,7 @@ mod tests {
         assert_eq!(
             labels,
             [
-                "New agent here",
+                "New agent here (checks out on primary)",
                 "New worktree from this branch",
                 "Delete branch"
             ]
@@ -17146,11 +17726,11 @@ mod tests {
     }
 
     /// `t` on a checkout-less branch row skips the "select a worktree"
-    /// flash: with no checkout for the branch, it asks the daemon for one
-    /// (the session picker follows the Ack, same as the row menu's
-    /// "New agent here").
+    /// flash: it checks the branch out on the primary (the session picker
+    /// follows the Ack, same as the row menu's "New agent here") — no
+    /// worktree is minted for a branch.
     #[test]
-    fn t_on_a_branch_row_creates_its_checkout_for_the_picker() {
+    fn t_on_a_branch_row_checks_it_out_on_primary_for_the_picker() {
         let mut app = App::new();
         seed_tree(&mut app);
         app.branch_list = Some((
@@ -17162,12 +17742,62 @@ mod tests {
         press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
         assert_eq!(app.selected_branch_row().as_deref(), Some("feature-x"));
         press(&mut app, KeyCode::Char('t'), KeyModifiers::NONE, &mut out);
-        assert!(app.flash.is_none(), "no flash: {:?}", app.flash);
+        assert!(
+            app.flash
+                .as_deref()
+                .is_some_and(|f| f.contains("checking out feature-x")),
+            "progress flash, not the select-a-worktree one: {:?}",
+            app.flash
+        );
         assert!(
             matches!(
                 out.last(),
-                Some(ClientRequest::CreateWorktree { branch, base: None, .. })
-                    if branch == "feature-x"
+                Some(ClientRequest::CheckoutPrimary { branch, .. }) if branch == "feature-x"
+            ),
+            "{out:?}"
+        );
+    }
+
+    /// ⌘T on a checkout-less branch row: the same checkout-on-primary,
+    /// and the Ack creates the shell on the primary checkout.
+    #[test]
+    fn new_terminal_on_a_branch_row_lands_on_the_primary() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.branch_list = Some((
+            nebula_core::ProjectId("p1".into()),
+            vec!["feature-x".into()],
+        ));
+        app.focus = Focus::Worktrees;
+        app.sel_worktree = app.visible_worktrees().len();
+        assert_eq!(app.selected_branch_row().as_deref(), Some("feature-x"));
+        let mut out = Vec::new();
+        create_terminal_for_context(&mut app, &mut out);
+        let Some(ClientRequest::CheckoutPrimary { req_id, .. }) = out.last() else {
+            panic!("expected CheckoutPrimary, got {out:?}");
+        };
+        let req_id = *req_id;
+        let primary = app
+            .tree
+            .worktrees
+            .iter()
+            .find(|w| w.is_main)
+            .map(|w| w.id.clone())
+            .unwrap();
+        let mut out = Vec::new();
+        handle_server_event(
+            &mut app,
+            ServerEvent::Ack {
+                req_id,
+                created: None,
+            },
+            &mut out,
+        );
+        assert!(
+            matches!(
+                out.last(),
+                Some(ClientRequest::CreateTerminal { worktree, name: None, .. })
+                    if worktree == &primary
             ),
             "{out:?}"
         );
@@ -17223,13 +17853,79 @@ mod tests {
             crate::branches::local_branches(&repo).contains(&"topic".to_string()),
             "git branch ran in the primary checkout"
         );
-        assert_eq!(app.flash.as_deref(), Some("branch topic created from main"));
+        assert_eq!(
+            app.flash.as_deref(),
+            Some("branch topic created from main · checking out on the primary…")
+        );
         assert!(
             app.branch_rows().contains(&"topic".to_string()),
             "{:?}",
             app.branch_list
         );
-        assert!(out.is_empty(), "the branch op never talks to the daemon");
+        // Then the `nebula switch` step: the fresh branch is checked out
+        // on the primary, so the user lands on it instead of on a dim row
+        // that moves the primary at some later keypress.
+        assert!(
+            matches!(
+                out.last(),
+                Some(ClientRequest::CheckoutPrimary { branch, .. }) if branch == "topic"
+            ),
+            "{out:?}"
+        );
+    }
+
+    /// Moving the primary under a busy session is not silent: the checkout
+    /// (from a branch row's `a`, or a fresh create) asks first, and `y`
+    /// sends it. An idle primary needs no question.
+    #[test]
+    fn moving_the_primary_under_a_running_session_asks_first() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let primary = app.tree.worktrees[0].id.clone();
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: nebula_core::Entity::Agent(nebula_core::Agent {
+                    id: AgentId("busy".into()),
+                    worktree_id: primary,
+                    name: "worker".into(),
+                    status: AgentStatus::Running,
+                    archived: false,
+                    archived_at: 0,
+                    pinned: false,
+                    kind: nebula_core::AgentKind::Claude,
+                    model: None,
+                    effort: None,
+                    session_id: None,
+                    sort_order: 0,
+                    status_changed_at: 0,
+                    alive: true,
+                }),
+            },
+        );
+        let mut out = Vec::new();
+        run_menu_action(
+            &mut app,
+            MenuAction::AgentOnBranch {
+                project: nebula_core::ProjectId("p1".into()),
+                branch: "feature".into(),
+            },
+            &mut out,
+        );
+        assert!(out.is_empty(), "nothing moves before the answer: {out:?}");
+        let Some(Overlay::Confirm(c)) = &app.overlay else {
+            panic!("expected a confirm, got {:?}", app.overlay);
+        };
+        assert!(c.message.contains("worker"), "{}", c.message);
+        assert!(c.message.contains("feature"), "{}", c.message);
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(
+                out.last(),
+                Some(ClientRequest::CheckoutPrimary { branch, .. }) if branch == "feature"
+            ),
+            "{out:?}"
+        );
     }
 
     /// The branch row's destructive verb: a confirm first (its text warns
@@ -17356,23 +18052,155 @@ mod tests {
         );
     }
 
+    /// A clean tree still opens the viewer (empty list) so ^g can switch
+    /// to a commit from there.
     #[test]
-    fn g_with_clean_repo_flashes_no_changes() {
+    fn g_with_clean_repo_opens_an_empty_viewer() {
         let dir = tempfile::tempdir().unwrap();
         let repo = test_repo(&dir);
         let mut app = App::new();
         seed_repo_tree(&mut app, &repo);
         let mut out = Vec::new();
         press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
-        assert!(app.overlay.is_none(), "clean tree opens no modal");
-        assert!(
-            app.flash
-                .as_deref()
-                .unwrap_or("")
-                .contains("no changes in main"),
-            "{:?}",
-            app.flash
+        match &app.overlay {
+            Some(Overlay::Diff(v)) => {
+                assert!(v.files.is_empty(), "{:?}", v.files);
+                assert!(v.base.is_working_tree());
+            }
+            other => panic!("expected the diff modal, got {other:?}"),
+        }
+        assert!(app.flash.is_none(), "{:?}", app.flash);
+    }
+
+    /// The wheel over the file panel scrolls the list and leaves the
+    /// selection alone; a key move pulls the window back to the selection.
+    #[test]
+    fn wheel_over_the_file_list_scrolls_it_without_selecting() {
+        use crate::git_diff::DiffFile;
+        let files = (0..30)
+            .map(|i| DiffFile {
+                path: format!("f{i:02}.rs"),
+                orig_path: None,
+                xy: ['M', ' '],
+            })
+            .collect();
+        let mut view = DiffView::new(
+            "/nonexistent-nebula-diff-test".into(),
+            "main".into(),
+            files,
+            true,
         );
+        view.area = ratatui::layout::Rect::new(0, 0, 80, 30);
+        view.files_width = 30;
+        view.list_area = ratatui::layout::Rect::new(1, 3, 28, 10);
+        let mut app = App::new();
+        app.overlay = Some(Overlay::Diff(view));
+        let wheel = |app: &mut App, col: u16, kind: MouseEventKind| {
+            handle_mouse(
+                app,
+                MouseEvent {
+                    kind,
+                    column: col,
+                    row: 5,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &mut Vec::new(),
+            );
+        };
+        wheel(&mut app, 5, MouseEventKind::ScrollDown);
+        wheel(&mut app, 5, MouseEventKind::ScrollDown);
+        {
+            let v = diff_view(&app);
+            assert_eq!(v.list_scroll, 6, "two wheel ticks of three");
+            assert_eq!(v.selected, 0, "selection untouched");
+            assert_eq!(v.scroll, 0, "diff pane untouched");
+        }
+        // Past the end clamps so the last page stays full.
+        for _ in 0..20 {
+            wheel(&mut app, 5, MouseEventKind::ScrollDown);
+        }
+        assert_eq!(diff_view(&app).list_scroll, 20);
+        // Over the diff pane the wheel scrolls the diff instead.
+        wheel(&mut app, 60, MouseEventKind::ScrollUp);
+        assert_eq!(diff_view(&app).list_scroll, 20);
+        // ↓ from row 0 pulls the window back to the selection.
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        let v = diff_view(&app);
+        assert_eq!(v.selected, 1);
+        assert_eq!(v.list_scroll, 1, "window follows the selection");
+    }
+
+    /// ^g in the viewer opens the base picker: row 0 is the working tree
+    /// (hovered by default), then the commits newest first. Enter on a
+    /// commit shows that commit's own changes; going back to row 0
+    /// restores the uncommitted view.
+    #[test]
+    fn ctrl_g_picks_a_commit_to_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo(&dir);
+        std::fs::write(repo.join("a.txt"), "committed\n").unwrap();
+        run_git(&repo, &["commit", "-am", "second"]);
+        std::fs::write(repo.join("z.txt"), "fresh\n").unwrap();
+        let mut app = App::new();
+        seed_repo_tree(&mut app, &repo);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
+        assert_eq!(diff_view(&app).files.len(), 1, "only the untracked file");
+
+        press(
+            &mut app,
+            KeyCode::Char('g'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
+        {
+            let v = diff_view(&app);
+            let picker = v.picker.as_ref().expect("picker open");
+            assert_eq!(picker.hover, 0, "working tree hovered by default");
+            assert_eq!(v.commits.len(), 2, "{:?}", v.commits);
+            assert_eq!(v.commits[0].subject, "second");
+            assert!(v.upstream.is_none(), "no tracking branch in the test repo");
+            assert_eq!(v.picker_rows(), 3);
+        }
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        {
+            let v = diff_view(&app);
+            assert!(v.picker.is_none(), "enter closes the picker");
+            assert!(
+                matches!(&v.base, crate::git_diff::DiffBase::Commit(c) if c.subject == "second")
+            );
+            assert_eq!(v.files.len(), 1);
+            assert_eq!(v.files[0].path, "a.txt");
+            assert!(v.diff.contains("+committed"), "{}", v.diff);
+        }
+        // Reopening hovers the current base; Esc leaves it alone.
+        press(
+            &mut app,
+            KeyCode::Char('g'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
+        assert_eq!(diff_view(&app).picker.as_ref().unwrap().hover, 1);
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        assert!(diff_view(&app).picker.is_none());
+        assert!(
+            !diff_view(&app).base.is_working_tree(),
+            "esc keeps the base"
+        );
+        // Back to the working tree.
+        press(
+            &mut app,
+            KeyCode::Char('g'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
+        press(&mut app, KeyCode::Home, KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        let v = diff_view(&app);
+        assert!(v.base.is_working_tree());
+        assert_eq!(v.files[0].path, "z.txt");
     }
 
     /// `G` turns the checkout's remote into a page and hands it to the
@@ -18023,6 +18851,7 @@ mod tests {
                     divider_label: None,
                     divider_before: false,
                     divider_before_label: None,
+                    host: None,
                 }),
             },
         );
@@ -18059,7 +18888,7 @@ mod tests {
                     session_id: None,
                     sort_order: 0,
                     status_changed_at: 0,
-                                        alive: true,
+                    alive: true,
                 }),
             },
         );
@@ -18080,7 +18909,7 @@ mod tests {
                     session_id: None,
                     sort_order: 1,
                     status_changed_at: 0,
-                                        alive: false,
+                    alive: false,
                 }),
             },
         );
@@ -18361,6 +19190,7 @@ mod tests {
                     divider_label: None,
                     divider_before: false,
                     divider_before_label: None,
+                    host: None,
                 }),
             },
         );
@@ -18441,7 +19271,7 @@ mod tests {
                     session_id: None,
                     sort_order: 0,
                     status_changed_at: 0,
-                                        alive: true,
+                    alive: true,
                 }),
             },
         );
@@ -19994,7 +20824,7 @@ mod tests {
                         session_id: None,
                         sort_order: 1,
                         status_changed_at: 0,
-                                                alive: true,
+                        alive: true,
                     }),
                 },
             );
@@ -20066,7 +20896,7 @@ mod tests {
             session_id: None,
             sort_order: 1,
             status_changed_at: 0,
-                        alive: true,
+            alive: true,
         })
     }
 
@@ -20382,6 +21212,7 @@ mod tests {
                     divider_label: None,
                     divider_before: false,
                     divider_before_label: None,
+                    host: None,
                 }),
             },
         );

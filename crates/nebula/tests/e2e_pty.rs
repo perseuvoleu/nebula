@@ -235,6 +235,7 @@ async fn full_crud_attach_and_restart_persistence() {
             path: repo.clone(),
             name: None,
             create_missing: false,
+            host: None,
         },
     )
     .await
@@ -508,6 +509,7 @@ async fn kitty_keyboard_negotiation_passthrough() {
             path: repo.clone(),
             name: None,
             create_missing: false,
+            host: None,
         },
     )
     .await
@@ -689,6 +691,7 @@ async fn hook_post_from_agent_pty_drives_status() {
             path: repo.clone(),
             name: None,
             create_missing: false,
+            host: None,
         },
     )
     .await
@@ -988,8 +991,10 @@ async fn pty_progress_marks_a_shell_terminal_busy() {
     )
     .await
     .unwrap();
-    let events =
-        read_events_until(&mut c, Duration::from_secs(5), |evs| find_ack(evs, 2).is_some()).await;
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        find_ack(evs, 2).is_some()
+    })
+    .await;
     let ServerEvent::Ack {
         created: Some(EntityId::Terminal(term_id)),
         ..
@@ -1029,7 +1034,10 @@ async fn pty_progress_marks_a_shell_terminal_busy() {
     )
     .await
     .unwrap();
-    read_events_until(&mut c, Duration::from_secs(10), |evs| busy_upsert(evs, true)).await;
+    read_events_until(&mut c, Duration::from_secs(10), |evs| {
+        busy_upsert(evs, true)
+    })
+    .await;
 
     write_frame(
         &mut c,
@@ -1040,7 +1048,10 @@ async fn pty_progress_marks_a_shell_terminal_busy() {
     )
     .await
     .unwrap();
-    read_events_until(&mut c, Duration::from_secs(10), |evs| busy_upsert(evs, false)).await;
+    read_events_until(&mut c, Duration::from_secs(10), |evs| {
+        busy_upsert(evs, false)
+    })
+    .await;
 
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
     wait_for_exit(&mut daemon);
@@ -1097,10 +1108,18 @@ async fn agent_wait_cli_blocks_until_worker_settles() {
 
     let wait_cmd = |timeout: &str| {
         let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"));
-        cmd.args(["agent", "wait", "worker", "--project", "repo", "--timeout", timeout])
-            .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+        cmd.args([
+            "agent",
+            "wait",
+            "worker",
+            "--project",
+            "repo",
+            "--timeout",
+            timeout,
+        ])
+        .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
         cmd
     };
 
@@ -1140,12 +1159,20 @@ async fn agent_wait_cli_blocks_until_worker_settles() {
         let status = waiting.wait().unwrap();
         let mut stdout = Vec::new();
         use std::io::Read;
-        waiting.stdout.take().unwrap().read_to_end(&mut stdout).unwrap();
+        waiting
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_end(&mut stdout)
+            .unwrap();
         (status, stdout)
     })
     .await
     .unwrap();
-    assert!(out.0.success(), "wait should exit 0 once the worker settles");
+    assert!(
+        out.0.success(),
+        "wait should exit 0 once the worker settles"
+    );
     let rows: serde_json::Value = serde_json::from_slice(&out.1).unwrap();
     let rows = rows.as_array().unwrap();
     assert_eq!(rows.len(), 1);
@@ -1181,6 +1208,7 @@ async fn hook_cwd_rehomes_agent_to_other_worktree() {
             path: repo.clone(),
             name: None,
             create_missing: false,
+            host: None,
         },
     )
     .await
@@ -1346,6 +1374,7 @@ async fn move_agent_respawns_live_session_in_target_worktree() {
             path: repo.clone(),
             name: None,
             create_missing: false,
+            host: None,
         },
     )
     .await
@@ -1555,6 +1584,7 @@ async fn codex_hooks_install_and_drive_status() {
             path: repo.clone(),
             name: None,
             create_missing: false,
+            host: None,
         },
     )
     .await
@@ -1753,6 +1783,7 @@ async fn external_worktrees_are_adopted_and_dropped() {
             path: repo.clone(),
             name: None,
             create_missing: false,
+            host: None,
         },
     )
     .await
@@ -1883,6 +1914,7 @@ async fn upgrade_shuts_down_idle_daemon_but_spares_live_sessions() {
             path: repo.clone(),
             name: None,
             create_missing: false,
+            host: None,
         },
     )
     .await
@@ -2029,6 +2061,7 @@ async fn add_project_creates_missing_dir_and_inits() {
             path: new_dir.clone(),
             name: None,
             create_missing: true,
+            host: None,
         },
     )
     .await
@@ -2063,6 +2096,7 @@ async fn add_project_creates_missing_dir_and_inits() {
             path: bare_dir.clone(),
             name: None,
             create_missing: true,
+            host: None,
         },
     )
     .await
@@ -2097,6 +2131,7 @@ async fn add_project_get_main_worktree(c: &mut UnixStream, repo: &Path) -> nebul
             path: repo.to_path_buf(),
             name: None,
             create_missing: false,
+            host: None,
         },
     )
     .await
@@ -2374,7 +2409,7 @@ async fn create_agent_refuses_when_the_cli_is_not_installed() {
                 model: None,
                 effort: None,
                 auto_title: false,
-                    prompt: None,
+                prompt: None,
             },
         )
         .await
@@ -3163,6 +3198,7 @@ async fn read_session_returns_screen_text() {
             path: repo.clone(),
             name: None,
             create_missing: false,
+            host: None,
         },
     )
     .await
@@ -3268,7 +3304,9 @@ async fn read_session_returns_screen_text() {
     let text = events
         .iter()
         .find_map(|e| match e {
-            ServerEvent::SessionText { req_id: 3, text, .. } => Some(text.clone()),
+            ServerEvent::SessionText {
+                req_id: 3, text, ..
+            } => Some(text.clone()),
             _ => None,
         })
         .unwrap();
@@ -3292,11 +3330,17 @@ async fn read_session_returns_screen_text() {
     let tail = events
         .iter()
         .find_map(|e| match e {
-            ServerEvent::SessionText { req_id: 4, text, .. } => Some(text.clone()),
+            ServerEvent::SessionText {
+                req_id: 4, text, ..
+            } => Some(text.clone()),
             _ => None,
         })
         .unwrap();
-    assert_eq!(tail.lines().count(), 1, "lines:1 tails to one line: {tail:?}");
+    assert_eq!(
+        tail.lines().count(),
+        1,
+        "lines:1 tails to one line: {tail:?}"
+    );
 
     // A session with no live PTY answers with an Error, not a spawn.
     write_frame(
@@ -3552,8 +3596,14 @@ async fn worktree_delete_cli_removes_checkout_and_row() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("\"deleted\":true"), "stdout: {stdout}");
     read_events_until(&mut c, Duration::from_secs(10), |evs| {
-        evs.iter()
-            .any(|e| matches!(e, ServerEvent::EntityRemoved { id: EntityId::Worktree(_) }))
+        evs.iter().any(|e| {
+            matches!(
+                e,
+                ServerEvent::EntityRemoved {
+                    id: EntityId::Worktree(_)
+                }
+            )
+        })
     })
     .await;
     assert!(!path.exists(), "checkout should be gone from {path:?}");
@@ -3678,6 +3728,64 @@ async fn worktree_new_skips_node_modules_when_seeding_is_disabled() {
 }
 
 /// `nebula add <dir>` and the bare `nebula <dir>` shorthand: the one-shot CLI
+/// A remote project on a host ssh can't reach: the daemon answers with
+/// ssh's own complaint (BatchMode + ConnectTimeout keep it from hanging on
+/// a prompt), never touches the local filesystem for the remote path, and
+/// records nothing. `.invalid` is reserved by RFC 6761 to never resolve.
+#[tokio::test]
+async fn remote_add_project_unreachable_host_errors_cleanly() {
+    let env = TestEnv::new();
+    let mut daemon = env.spawn_daemon();
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    write_frame(&mut c, &ClientRequest::Subscribe)
+        .await
+        .unwrap();
+    read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        evs.iter()
+            .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
+    })
+    .await;
+
+    let remote_path = env.tmp.path().join("never-created-here");
+    write_frame(
+        &mut c,
+        &ClientRequest::AddProject {
+            req_id: 1,
+            path: remote_path.clone(),
+            name: None,
+            create_missing: true,
+            host: Some("nobody@nebula-e2e.invalid".into()),
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(30), |evs| {
+        find_ack(evs, 1).is_some()
+    })
+    .await;
+    let Some(ServerEvent::Error { message, .. }) = find_ack(&events, 1) else {
+        panic!("expected an error for the unreachable host: {events:#?}");
+    };
+    assert!(
+        message.contains("not a git repository") || message.contains("ssh"),
+        "ssh's complaint should reach the client: {message}"
+    );
+    assert!(
+        !remote_path.exists(),
+        "create_missing must not apply to a remote path"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, ServerEvent::EntityUpserted { entity: Entity::Project(_) })),
+        "no project row for a failed remote add"
+    );
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
 /// resolves the path against its own cwd (the daemon's differs), registers
 /// the repo over IPC, and surfaces daemon rejections as nonzero exits.
 #[tokio::test]

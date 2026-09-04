@@ -285,12 +285,13 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     path,
                     name,
                     create_missing,
+                    host,
                 } => {
                     reply(
                         &out_tx,
                         req_id,
                         daemon
-                            .add_project(&path, name, create_missing)
+                            .add_project(&path, name, create_missing, host)
                             .await
                             .map(Some),
                     )
@@ -368,6 +369,25 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         .await;
                     });
                 }
+                ClientRequest::CheckoutPrimary {
+                    req_id,
+                    project,
+                    branch,
+                } => {
+                    let daemon = daemon.clone();
+                    let out_tx = out_tx.clone();
+                    tokio::spawn(async move {
+                        reply(
+                            &out_tx,
+                            req_id,
+                            daemon
+                                .checkout_primary(&project, &branch)
+                                .await
+                                .map(|_| None),
+                        )
+                        .await;
+                    });
+                }
                 ClientRequest::SetWorktreePinned { req_id, id, pinned } => {
                     reply(
                         &out_tx,
@@ -390,15 +410,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         &out_tx,
                         req_id,
                         daemon
-                            .create_agent(
-                                &worktree,
-                                &name,
-                                kind,
-                                model,
-                                effort,
-                                auto_title,
-                                prompt,
-                            )
+                            .create_agent(&worktree, &name, kind, model, effort, auto_title, prompt)
                             .await
                             .map(Some),
                     )

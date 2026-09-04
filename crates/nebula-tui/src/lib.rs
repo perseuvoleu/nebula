@@ -5,6 +5,8 @@ pub mod completion;
 pub mod config;
 pub mod event_loop;
 pub mod fuzzy;
+#[cfg(feature = "ghostty")]
+pub mod ghostty_pane;
 pub mod git_diff;
 pub mod grep_search;
 pub mod hosts;
@@ -87,6 +89,22 @@ pub fn run_worktree_new(name: String, from: Option<String>, project: Option<Stri
 /// `nebula worktree delete` — the daemon's delete flow (checkout + row).
 pub fn run_worktree_delete(name: String, force: bool, project: Option<String>) -> Result<()> {
     runtime()?.block_on(ipc::worktree_delete(name, force, project))
+}
+
+/// `nebula worktree checkout` — a branch onto the primary checkout.
+pub fn run_worktree_checkout(branch: String, project: Option<String>) -> Result<()> {
+    runtime()?.block_on(ipc::worktree_checkout(branch, project))
+}
+
+/// `nebula switch` — a branch's checkout (made if missing), and the calling
+/// shell tab `cd`-ed into it.
+pub fn run_switch(
+    branch: String,
+    from: Option<String>,
+    worktree: bool,
+    project: Option<String>,
+) -> Result<()> {
+    runtime()?.block_on(ipc::switch(branch, from, worktree, project))
 }
 
 /// `nebula agent new` — spawn a session.

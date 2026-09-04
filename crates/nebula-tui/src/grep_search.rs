@@ -35,10 +35,10 @@ pub fn search(root: &Path, query: &str) -> Result<(Vec<GrepHit>, bool), String> 
         args.push("-i");
     }
     args.extend(["-e", query, "--", "."]);
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(&args)
+    // Over ssh for a remote checkout — same argv, other machine.
+    let (program, argv) = nebula_core::remote::git_command(root, &args);
+    let output = Command::new(program)
+        .args(argv)
         .output()
         .map_err(|e| format!("failed to run git: {e}"))?;
     // git grep exits 1 for "no matches" — only >= 2 is an error.

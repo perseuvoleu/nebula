@@ -26,20 +26,29 @@ impl From<&str> for LocalBranch {
     }
 }
 
+/// `git -C repo args…` wherever the checkout lives — over ssh for a remote
+/// project (`nebula_core::remote` keeps the path→host map).
+fn git(repo: &Path, args: &[&str]) -> std::process::Command {
+    let (program, argv) = nebula_core::remote::git_command(repo, args);
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(argv);
+    cmd
+}
+
 /// Local branches of `repo`, ordered newest-committed first. Empty when the
 /// path isn't a git repo (or git is missing) — callers fall back to the
 /// branches nebula already knows from the project's worktrees.
 pub fn local_branches(repo: &Path) -> Vec<String> {
-    std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args([
+    git(
+        repo,
+        &[
             "for-each-ref",
             "--sort=-committerdate",
             "refs/heads/",
             "--format=%(refname:short)",
-        ])
-        .output()
+        ],
+    )
+    .output()
         .ok()
         .filter(|o| o.status.success())
         .map(|o| {
@@ -71,11 +80,7 @@ pub fn local_branches_with_bases(repo: &Path) -> Vec<LocalBranch> {
 /// the branch name, while creation from an implicit HEAD records the
 /// literal `HEAD` — useless for lineage, so it maps to None.
 fn branch_creation_base(repo: &Path, branch: &str) -> Option<String> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["reflog", "show", "--format=%gs"])
-        .arg(branch)
+    let out = git(repo, &["reflog", "show", "--format=%gs", branch])
         .output()
         .ok()
         .filter(|o| o.status.success())?;
@@ -102,11 +107,9 @@ pub fn delete_branch(repo: &Path, branch: &str) -> Result<(), String> {
 /// git's own stderr — "not fully merged", "already exists" — so the toast
 /// says exactly why the branch didn't change.
 pub fn branch_op(repo: &Path, args: &[&str]) -> Result<(), String> {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .arg("branch")
-        .args(args)
+    let mut argv = vec!["branch"];
+    argv.extend(args);
+    let out = git(repo, &argv)
         .output()
         .map_err(|e| format!("git: {e}"))?;
     if out.status.success() {

@@ -1,6 +1,6 @@
 //! TUI state: the Elm-ish Model.
 
-use crate::git_diff::DiffFile;
+use crate::git_diff::{CommitEntry, DiffBase, DiffFile};
 use crate::pull_request::PullRequest;
 use crate::text_input::TextInput;
 use nebula_core::{
@@ -115,6 +115,14 @@ pub enum MenuAction {
     /// Shell terminal in the worktree's directory; created immediately with
     /// a default name (no prompt), renameable later.
     NewTerminal(WorktreeId),
+    /// ⌘T picker row: create an agent of this kind as a normal tab —
+    /// configured default model/effort, generated name, auto-title, no name
+    /// prompt. ⌘T's promise is "one keypress lands in a ready session", so
+    /// the picker only chooses WHAT runs, never stops to ask for a name.
+    QuickAgentOfKind {
+        worktree: WorktreeId,
+        kind: AgentKind,
+    },
     /// ⌘D picker row: create an agent of this kind — configured default
     /// model/effort, generated name, auto-title — and mount it in the
     /// split's right pane. No name prompt: the split is a "work now" pane.
@@ -132,14 +140,22 @@ pub enum MenuAction {
         branch: String,
     },
     /// Open the new-branch name prompt (chains into the base-branch
-    /// picker; the branch is created with `git branch`, no checkout).
+    /// picker; the branch is created with `git branch` and checked out on
+    /// the primary, like `nebula switch`).
     NewBranch(ProjectId),
     /// A base-branch-picker row (new-branch flow): run
-    /// `git branch <name> <base>` in the project's primary checkout.
+    /// `git branch <name> <base>` in the project's primary checkout, then
+    /// check it out there.
     CreateBranchFrom {
         project: ProjectId,
         name: String,
         base: String,
+    },
+    /// Check this row's branch out in the primary checkout: the daemon
+    /// removes the session-free worktree holding it and keeps the branch.
+    CheckoutPrimary {
+        project: ProjectId,
+        branch: String,
     },
     /// Delete a checkout-less local branch (`git branch -d` after a
     /// confirm — git itself refuses an unmerged branch).
@@ -413,6 +429,13 @@ pub enum PendingAction {
         project: ProjectId,
         branch: String,
     },
+    /// Confirmed move of the primary checkout onto `branch` while busy
+    /// sessions sit on it; `next` runs there once the Ack lands.
+    CheckoutPrimary {
+        project: ProjectId,
+        branch: String,
+        next: AfterCheckout,
+    },
     Quit,
 }
 
@@ -438,7 +461,8 @@ pub enum PromptKind {
         id: ProjectId,
         before: bool,
     },
-    /// Name for a new local branch (no checkout); submit chains into the
+    /// Name for a new local branch (checked out on the primary once
+    /// created, like `nebula switch`); submit chains into the
     /// base-branch picker, which leads with the primary checkout's branch.
     NewBranch {
         project: ProjectId,
@@ -672,9 +696,92 @@ pub struct DiffView {
     /// HEAD OID the marks are scoped to (empty on an unborn HEAD). A moved
     /// HEAD — commit, checkout — resets the worktree's marks on next open.
     pub head_key: String,
+    /// What `files` and `diff` compare (see `DiffBase`); the ^g picker
+    /// switches it. Default: the working tree against HEAD.
+    pub base: DiffBase,
+    /// The branch's tracking ref, if any — the picker's "vs upstream" row.
+    pub upstream: Option<String>,
+    /// Picker rows below the working-tree ones; loaded on the first ^g.
+    pub commits: Vec<CommitEntry>,
+    /// The ^g base picker while it is open.
+    pub picker: Option<BasePicker>,
+    /// Screen rect of the "compare with" row under the filter (the ▾ base
+    /// line), written back during draw so a click can open the picker.
+    pub base_area: Rect,
+    /// First visible file-list row. The wheel moves it freely; a selection
+    /// change pulls it back so the selected row stays on screen
+    /// (`follow_selection`).
+    pub list_scroll: usize,
+}
+
+/// The ^g popup over the diff viewer: pick what the diff compares.
+/// Row 0 is the working tree vs HEAD, row 1 the upstream (when there is
+/// one), then the commits newest first.
+#[derive(Debug, Clone, Default)]
+pub struct BasePicker {
+    pub hover: usize,
+    /// Screen rect of the rows (border excluded), written back during
+    /// draw for click hit-testing.
+    pub list_area: Rect,
+    /// Full popup rect, written back during draw; a click outside closes.
+    pub area: Rect,
+}
+
+impl BasePicker {
+    /// First visible row for a window `visible` rows tall (the
+    /// `ContextMenu::scroll_offset` pattern).
+    pub fn scroll_offset(&self, visible: usize) -> usize {
+        if visible == 0 {
+            return self.hover;
+        }
+        (self.hover + 1).saturating_sub(visible)
+    }
 }
 
 impl DiffView {
+    /// Number of ^g picker rows: working tree, optional upstream, commits.
+    pub fn picker_rows(&self) -> usize {
+        1 + usize::from(self.upstream.is_some()) + self.commits.len()
+    }
+
+    /// The base a picker row stands for.
+    pub fn picker_base(&self, row: usize) -> Option<DiffBase> {
+        if row == 0 {
+            return Some(DiffBase::WorkingTree);
+        }
+        let mut row = row - 1;
+        if let Some(up) = &self.upstream {
+            if row == 0 {
+                return Some(DiffBase::Upstream(up.clone()));
+            }
+            row -= 1;
+        }
+        self.commits.get(row).cloned().map(DiffBase::Commit)
+    }
+
+    /// The picker row for the current base (its initial hover).
+    pub fn picker_row_of_base(&self) -> usize {
+        (0..self.picker_rows())
+            .find(|&r| self.picker_base(r).as_ref() == Some(&self.base))
+            .unwrap_or(0)
+    }
+
+    /// Open the ^g picker hovering the current base.
+    pub fn open_picker(&mut self) {
+        self.picker = Some(BasePicker {
+            hover: self.picker_row_of_base(),
+            ..BasePicker::default()
+        });
+    }
+
+    /// Clamped move of the picker hover.
+    pub fn picker_hover(&mut self, row: i64) {
+        let max = self.picker_rows().saturating_sub(1) as i64;
+        if let Some(p) = &mut self.picker {
+            p.hover = row.clamp(0, max) as usize;
+        }
+    }
+
     pub fn new(root: PathBuf, branch: String, files: Vec<DiffFile>, head_ok: bool) -> Self {
         let mut view = Self {
             root,
@@ -694,6 +801,12 @@ impl DiffView {
             head_ok,
             reviewed: HashMap::new(),
             head_key: String::new(),
+            base: DiffBase::WorkingTree,
+            upstream: None,
+            commits: Vec::new(),
+            picker: None,
+            base_area: Rect::default(),
+            list_scroll: 0,
         };
         view.apply_filter();
         view
@@ -732,7 +845,30 @@ impl DiffView {
         let clamped = index.clamp(0, max) as usize;
         let changed = clamped != self.selected;
         self.selected = clamped;
+        self.follow_selection();
         changed
+    }
+
+    /// Pull `list_scroll` so the selected row is inside the list window
+    /// (`list_area` tall; a no-op before the first draw).
+    pub fn follow_selection(&mut self) {
+        let height = self.list_area.height as usize;
+        if height == 0 {
+            return;
+        }
+        if self.selected < self.list_scroll {
+            self.list_scroll = self.selected;
+        } else if self.selected >= self.list_scroll + height {
+            self.list_scroll = self.selected + 1 - height;
+        }
+    }
+
+    /// Wheel over the file list: move the window without touching the
+    /// selection, clamped so the last page stays full.
+    pub fn scroll_list_by(&mut self, delta: i32) {
+        let height = (self.list_area.height as usize).max(1);
+        let max = self.matches.len().saturating_sub(height) as i32;
+        self.list_scroll = (self.list_scroll as i32 + delta).clamp(0, max) as usize;
     }
 
     /// The file behind the current selection, if any row is visible.
@@ -740,10 +876,12 @@ impl DiffView {
         self.files.get(self.matches.get(self.selected)?.file)
     }
 
-    /// First visible row of the file list's stateless follow-window for a
-    /// list of `height` rows.
+    /// First visible row of the file list for a list `height` rows tall:
+    /// `list_scroll`, re-clamped so a resize never strands the window past
+    /// the end.
     pub fn window_start(&self, height: usize) -> usize {
-        (self.selected + 1).saturating_sub(height)
+        let max = self.matches.len().saturating_sub(height.max(1));
+        self.list_scroll.min(max)
     }
 
     /// Recompute `matches` from `filter` and reset the selection to the top
@@ -753,6 +891,7 @@ impl DiffView {
         let before = self.matches.get(self.selected).map(|m| m.file);
         self.recompute_matches();
         self.selected = 0;
+        self.list_scroll = 0;
         before != self.matches.first().map(|m| m.file)
     }
 
@@ -807,6 +946,7 @@ impl DiffView {
         } else {
             self.selected = self.selected.min(self.matches.len().saturating_sub(1));
         }
+        self.follow_selection();
         Some(before != self.matches.get(self.selected).map(|m| m.file))
     }
 }
@@ -1503,7 +1643,26 @@ pub enum PendingIntent {
     /// The `a` palette flow picked a branch with no checkout: once the
     /// worktree's Ack lands, open the new-session picker on it.
     PickAgentOnCreatedWorktree,
+    /// A new-session keypress on a checkout-less branch row: the daemon is
+    /// checking the branch out on the primary; once the Ack lands, carry on
+    /// with the session on the primary checkout.
+    CheckoutPrimaryThen {
+        project: ProjectId,
+        next: AfterCheckout,
+    },
     None,
+}
+
+/// What a branch row's new-session keypress does once its branch sits on
+/// the primary checkout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AfterCheckout {
+    /// Just select the primary row — the branch is where the user now is.
+    Land,
+    /// Open the new-session picker (agent kind) on the primary.
+    PickAgent,
+    /// Create and attach a shell terminal on the primary.
+    Terminal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1884,6 +2043,11 @@ pub struct AttachedTerm {
     /// resize, scrollback), so screen-derived work can be memoized per
     /// change instead of per frame.
     pub screen_gen: u64,
+    /// The Ghostty VT engine for this pane, when the `ghostty` feature is
+    /// built and enabled at runtime. Fed the same bytes as `parser`; only
+    /// the drawing switches (see `crate::ghostty_pane`).
+    #[cfg(feature = "ghostty")]
+    pub gh: Option<crate::ghostty_pane::GhosttyPane>,
     /// Link-scan memo: the generation it was computed at, plus the scan.
     links_cache: Option<(
         u64,
@@ -1897,6 +2061,10 @@ impl AttachedTerm {
         Self {
             sref,
             parser: vt100::Parser::new(rows, cols, 10_000),
+            #[cfg(feature = "ghostty")]
+            gh: crate::ghostty_pane::enabled_by_env()
+                .then(|| crate::ghostty_pane::GhosttyPane::new(cols, rows))
+                .flatten(),
             exited: false,
             cols,
             rows,
@@ -1911,6 +2079,10 @@ impl AttachedTerm {
     /// Reset the parser (fresh replay is about to arrive).
     pub fn reset(&mut self) {
         self.parser = vt100::Parser::new(self.rows, self.cols, 10_000);
+        #[cfg(feature = "ghostty")]
+        if self.gh.is_some() {
+            self.gh = crate::ghostty_pane::GhosttyPane::new(self.cols, self.rows);
+        }
         self.exited = false;
         self.scroll = 0;
         self.touch();
@@ -1919,12 +2091,20 @@ impl AttachedTerm {
     pub fn set_scroll(&mut self, scroll: usize) {
         self.scroll = scroll;
         self.parser.screen_mut().set_scrollback(scroll);
+        #[cfg(feature = "ghostty")]
+        if let Some(gh) = &mut self.gh {
+            gh.set_scroll(scroll);
+        }
         self.touch();
     }
 
     /// Feed PTY bytes to the parser, invalidating screen-derived memos.
     pub fn feed(&mut self, data: &[u8]) {
         self.parser.process(data);
+        #[cfg(feature = "ghostty")]
+        if let Some(gh) = &mut self.gh {
+            gh.feed(data);
+        }
         self.touch();
     }
 
@@ -2594,6 +2774,36 @@ impl App {
         self.tree.projects.get(row.project_index())
     }
 
+    /// The ssh host a worktree's project lives on; None = this machine.
+    pub fn worktree_host(&self, id: &WorktreeId) -> Option<&str> {
+        let w = self.tree.worktrees.iter().find(|w| &w.id == id)?;
+        self.tree
+            .projects
+            .iter()
+            .find(|p| p.id == w.project_id)?
+            .host
+            .as_deref()
+    }
+
+    /// Push every remote checkout path into the process-wide host map so
+    /// the git-backed panels reach the right machine. Called whenever the
+    /// tree's projects or worktrees change.
+    pub fn sync_remote_hosts(&self) {
+        let entries = self.tree.projects.iter().filter_map(|p| {
+            let host = p.host.clone()?;
+            let mut paths = vec![p.repo_path.clone()];
+            paths.extend(
+                self.tree
+                    .worktrees
+                    .iter()
+                    .filter(|w| w.project_id == p.id)
+                    .map(|w| w.path.clone()),
+            );
+            Some(paths.into_iter().map(move |path| (path, host.clone())))
+        });
+        nebula_core::remote::replace_all(entries.flatten());
+    }
+
     /// Index into `visible_worktrees()`.
     pub fn selected_worktree_index(&self) -> Option<usize> {
         Some(self.sel_worktree)
@@ -3237,6 +3447,7 @@ mod tests {
             divider_label: None,
             divider_before: false,
             divider_before_label: None,
+            host: None,
         });
         app.tree.worktrees.push(Worktree {
             id: worktree_id.clone(),

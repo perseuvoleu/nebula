@@ -33,6 +33,7 @@
 //! env-guarded, so they remain inert in codex sessions outside nebula.
 
 use anyhow::{bail, Context, Result};
+use nebula_core::AgentKind;
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
 
@@ -113,6 +114,7 @@ const CLAUDE_ALLOW_WORKTREE: &str = "Bash(nebula worktree:*)";
 const CLAUDE_ALLOW_AGENT: &str = "Bash(nebula agent:*)";
 const CLAUDE_ALLOW_NOTES: &str = "Bash(nebula notes:*)";
 const CLAUDE_ALLOW_TODO: &str = "Bash(nebula todo:*)";
+const CLAUDE_ALLOW_SWITCH: &str = "Bash(nebula switch:*)";
 
 /// Cursor variant: the payload arrives on stdin like Claude's, but cursor
 /// expects a JSON response on stdout — `{"continue": true}` keeps gating
@@ -166,6 +168,30 @@ fn managed_group(endpoint: &str, event: &str, matcher: Option<&str>) -> Value {
 /// Merge nebula's managed hooks for Claude Code into
 /// `<cwd>/.claude/settings.local.json`, plus the permission rule that lets
 /// the auto-title `nebula rename` run unprompted.
+/// Everything a kind needs before its CLI starts in `cwd`: the managed
+/// status hooks (and, for cursor, the auto-title project rule). One entry
+/// point for both the daemon's spawn and `nebula hooks install`, which a
+/// remote spawn runs on the far host.
+pub fn install_for_kind(kind: AgentKind, cwd: &Path) -> Result<()> {
+    match kind {
+        AgentKind::Claude => install_claude_hooks(cwd),
+        // Codex's hooks live in its home, not the worktree, so one trust
+        // approval covers every worktree (see below); any per-worktree
+        // copy an older nebula left is pruned.
+        AgentKind::Codex => {
+            install_codex_hooks(&codex_home()).and_then(|()| prune_codex_worktree_hooks(cwd))
+        }
+        // Cursor also gets the managed auto-title project rule — its hook
+        // dialect has no context-injection channel.
+        AgentKind::Cursor => {
+            install_cursor_hooks(cwd).and_then(|()| install_cursor_title_rule(cwd))
+        }
+        // Pi has no hooks — a managed extension in its global extensions
+        // dir phones the same endpoints home.
+        AgentKind::Pi => install_pi_extension(&pi_agent_dir()),
+    }
+}
+
 pub fn install_claude_hooks(cwd: &Path) -> Result<()> {
     let dir = cwd.join(".claude");
     let path = dir.join("settings.local.json");
@@ -182,6 +208,7 @@ pub fn install_claude_hooks(cwd: &Path) -> Result<()> {
     ensure_permission_allow(root_obj, CLAUDE_ALLOW_AGENT, &path)?;
     ensure_permission_allow(root_obj, CLAUDE_ALLOW_NOTES, &path)?;
     ensure_permission_allow(root_obj, CLAUDE_ALLOW_TODO, &path)?;
+    ensure_permission_allow(root_obj, CLAUDE_ALLOW_SWITCH, &path)?;
     write_hooks_root(&dir, "settings.local.json", &root)
 }
 
@@ -469,7 +496,11 @@ pub fn install_pi_extension(agent_dir: &Path) -> Result<()> {
             agent_dir.display()
         );
     }
-    write_text_atomic(&agent_dir.join("extensions"), PI_EXTENSION_FILE, PI_EXTENSION)
+    write_text_atomic(
+        &agent_dir.join("extensions"),
+        PI_EXTENSION_FILE,
+        PI_EXTENSION,
+    )
 }
 
 #[cfg(test)]
@@ -644,7 +675,9 @@ mod tests {
         // A user edit is overwritten on the next spawn — the file is ours.
         std::fs::write(&path, "// edited").unwrap();
         install_pi_extension(tmp.path()).unwrap();
-        assert!(std::fs::read_to_string(&path).unwrap().contains("managed by nebula"));
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("managed by nebula"));
     }
 
     /// No `~/.pi/agent` means pi has never run — refuse instead of

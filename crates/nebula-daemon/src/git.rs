@@ -37,18 +37,66 @@ fn spawn_err(e: std::io::Error) -> anyhow::Error {
     }
 }
 
+/// `git -C repo args…` where the repo lives: locally, or over `ssh host`
+/// for a remote project (`nebula_core::remote` knows which paths are
+/// which). A remote hop that fails to connect surfaces ssh's own stderr,
+/// which names the host — the right explanation there.
 async fn git(repo: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
+    let (program, argv) = nebula_core::remote::git_command(repo, args);
+    let output = Command::new(&program)
+        .args(&argv)
         .output()
         .await
-        .map_err(spawn_err)?;
+        .map_err(|e| {
+            if program == "ssh" {
+                anyhow::Error::new(e).context("run ssh")
+            } else {
+                spawn_err(e)
+            }
+        })?;
     if !output.status.success() {
         bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// A plain command on the host owning `repo` (remote projects only).
+async fn ssh_run(repo: &Path, words: &[&str]) -> Result<()> {
+    let host = nebula_core::remote::host_for(repo)
+        .ok_or_else(|| anyhow!("{} is not a remote checkout", repo.display()))?;
+    let mut argv: Vec<String> = nebula_core::remote::SSH_BATCH_OPTS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    argv.extend([
+        "--".to_string(),
+        host,
+        nebula_core::remote::join_quoted(words.iter().copied()),
+    ]);
+    let output = Command::new("ssh").args(&argv).output().await?;
+    if !output.status.success() {
+        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    Ok(())
+}
+
+/// `$HOME` on `host`, for expanding a `~/…` spelling in `nebula add
+/// host:~/repo` — only the remote shell knows it.
+pub async fn remote_home(host: &str) -> Result<PathBuf> {
+    let mut argv: Vec<String> = nebula_core::remote::SSH_BATCH_OPTS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    argv.extend(["--".to_string(), host.to_string(), "printf %s \"$HOME\"".into()]);
+    let output = Command::new("ssh").args(&argv).output().await?;
+    if !output.status.success() {
+        bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
+    }
+    let home = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if home.is_empty() {
+        bail!("could not resolve $HOME on {host}");
+    }
+    Ok(PathBuf::from(home))
 }
 
 /// `git init` an existing directory.
@@ -210,11 +258,19 @@ pub fn worktree_dir(repo: &Path, branch: &str) -> PathBuf {
 /// existing branch when `-b` fails because it already exists.
 pub async fn add_worktree(repo: &Path, branch: &str, base: Option<&str>) -> Result<PathBuf> {
     let path = worktree_dir(repo, branch);
-    if path.exists() {
+    let remote = nebula_core::remote::is_remote(repo);
+    if !remote && path.exists() {
         bail!("worktree path already exists: {}", path.display());
     }
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        if remote {
+            // The parent dir is on the far side; `git worktree add` creates
+            // the leaf but not missing ancestors, so make them there.
+            let parent = parent.to_string_lossy().into_owned();
+            ssh_run(repo, &["mkdir", "-p", &parent]).await?;
+        } else {
+            std::fs::create_dir_all(parent)?;
+        }
     }
     let path_str = path.to_string_lossy().into_owned();
     let mut args = vec!["worktree", "add", &path_str, "-b", branch];
@@ -366,8 +422,10 @@ fn cleanup_partial_node_modules(path: &Path) -> Option<String> {
 pub async fn remove_worktree(repo: &Path, worktree_path: &Path, force: bool) -> Result<()> {
     // Checkout already gone (manual rm -rf): `git worktree remove` would fail,
     // but the user's intent is already satisfied — just drop git's stale
-    // bookkeeping so the entry leaves `git worktree list`.
-    if !worktree_path.exists() {
+    // bookkeeping so the entry leaves `git worktree list`. (A remote
+    // checkout can't be stat'ed from here; git's own "does not exist"
+    // below covers it.)
+    if !nebula_core::remote::is_remote(repo) && !worktree_path.exists() {
         let _ = git(repo, &["worktree", "prune"]).await;
         return Ok(());
     }

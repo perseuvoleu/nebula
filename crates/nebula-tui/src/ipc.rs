@@ -159,6 +159,12 @@ pub async fn rename_current_agent(title: String, force: bool) -> Result<()> {
         "NEBULA_AGENT_ID is not set — `nebula rename` only works from inside a \
              nebula agent session",
     )?;
+    // Inside a remote spawn the local socket belongs to this host's own
+    // daemon; the session's daemon is the one behind the tunnelled hook
+    // endpoint.
+    if std::env::var_os(nebula_core::remote::REMOTE_ENV).is_some() {
+        return rename_over_tunnel(&agent_id, &title, force).await;
+    }
     let sock = paths::socket_path();
     let Ok(stream) = try_connect(&sock).await else {
         bail!("no nebula daemon is running — title unchanged");
@@ -206,15 +212,23 @@ pub async fn rename_current_agent(title: String, force: bool) -> Result<()> {
 /// after the directory, rejecting non-repos and duplicates. Spawns a daemon
 /// when none is running, same as launching the TUI would.
 pub async fn add_project(path: String) -> Result<()> {
-    let expanded = match (path.strip_prefix("~/"), std::env::var("HOME")) {
-        (Some(rest), Ok(home)) => std::path::PathBuf::from(home).join(rest),
-        _ => std::path::PathBuf::from(&path),
+    // `host:/path` is a checkout on another machine — nothing to check
+    // here; the daemon reads it over ssh (and expands a `~`).
+    let (dir, host) = match nebula_core::remote::parse_spec(&path) {
+        Some((host, remote_path)) => (std::path::PathBuf::from(remote_path), Some(host)),
+        None => {
+            let expanded = match (path.strip_prefix("~/"), std::env::var("HOME")) {
+                (Some(rest), Ok(home)) => std::path::PathBuf::from(home).join(rest),
+                _ => std::path::PathBuf::from(&path),
+            };
+            let dir = std::fs::canonicalize(&expanded)
+                .with_context(|| format!("{} does not exist", expanded.display()))?;
+            if !dir.is_dir() {
+                bail!("{} is not a directory", dir.display());
+            }
+            (dir, None)
+        }
     };
-    let dir = std::fs::canonicalize(&expanded)
-        .with_context(|| format!("{} does not exist", expanded.display()))?;
-    if !dir.is_dir() {
-        bail!("{} is not a directory", dir.display());
-    }
     let mut conn = connect_or_spawn().await?;
     let req_id = 1u64;
     write_frame(
@@ -224,13 +238,17 @@ pub async fn add_project(path: String) -> Result<()> {
             path: dir.clone(),
             name: None,
             create_missing: false,
+            host: host.clone(),
         },
     )
     .await?;
     loop {
         match read_frame::<ServerEvent, _>(&mut conn.stream).await? {
             Some(ServerEvent::Ack { req_id: r, .. }) if r == req_id => {
-                println!("added project {}", dir.display());
+                match host {
+                    Some(h) => println!("added remote project {h}:{}", dir.display()),
+                    None => println!("added project {}", dir.display()),
+                }
                 return Ok(());
             }
             Some(ServerEvent::Error {
@@ -586,19 +604,39 @@ pub async fn worktree_new(
     if branch.is_empty() {
         bail!("worktree name slugifies to nothing: {name:?}");
     }
+    let path = create_worktree_path(&mut conn, &project.id, &branch, from).await?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "project": project.name,
+            "branch": branch,
+            "path": path,
+        })
+    );
+    Ok(())
+}
+
+/// Ask the daemon for a worktree on `branch` (created from `base`, or the
+/// primary's HEAD) and return the checkout's path once its row lands.
+async fn create_worktree_path(
+    conn: &mut Connection,
+    project: &nebula_core::ProjectId,
+    branch: &str,
+    base: Option<String>,
+) -> Result<Option<String>> {
     let req_id = 1u64;
     write_frame(
         &mut conn.stream,
         &ClientRequest::CreateWorktree {
             req_id,
-            project: project.id.clone(),
-            branch: branch.clone(),
-            base: from,
+            project: project.clone(),
+            branch: branch.to_string(),
+            base,
         },
     )
     .await?;
     let mut upserts = Vec::new();
-    let created = await_ack(&mut conn, req_id, &mut upserts).await?;
+    let created = await_ack(conn, req_id, &mut upserts).await?;
     let find_path = |upserts: &[nebula_core::Entity]| {
         upserts.iter().find_map(|e| match e {
             nebula_core::Entity::Worktree(w)
@@ -627,15 +665,245 @@ pub async fn worktree_new(
             path = find_path(&upserts);
         }
     }
+    Ok(path)
+}
+
+/// `nebula switch <branch> [--from <base>] [--worktree] [--project <name>]`
+/// — land the calling shell on a branch. A branch is *where the project
+/// is*: without `--worktree` it is checked out in the primary checkout
+/// (created first, like `git checkout -b`, from the branch the caller is
+/// on) and the shell `cd`s to the project's own path. `--worktree` gives
+/// the branch its own directory instead — the way parallel work runs. A
+/// branch that already has a checkout (a nebula worktree, or the primary
+/// sitting on it) is simply entered. Inside a nebula terminal the `cd` is
+/// typed into that tab's PTY, so the shell lands there once this command
+/// returns; elsewhere the path is printed for the caller to `cd` into.
+pub async fn switch(
+    branch: String,
+    from: Option<String>,
+    worktree: bool,
+    project_flag: Option<String>,
+) -> Result<()> {
+    let branch = branch.trim().to_string();
+    if branch.is_empty() {
+        bail!("branch name is empty");
+    }
+    let sock = paths::socket_path();
+    let Ok(stream) = try_connect(&sock).await else {
+        bail!("no nebula daemon is running");
+    };
+    let mut conn = handshake(stream).await?;
+    let (projects, worktrees, agents) = subscribe_snapshot(&mut conn).await?;
+    let project = match resolve_project(&projects, &worktrees, &agents, project_flag.as_deref()) {
+        Ok(p) => p,
+        // A shell tab (or any shell) names no agent: the checkout the
+        // caller stands in picks the project.
+        Err(e) => project_owning_cwd(&projects, &worktrees).ok_or(e)?,
+    };
+    let primary = worktrees
+        .iter()
+        .find(|w| w.project_id == project.id && w.is_main)
+        .context("the project has no primary checkout row")?;
+    let existing = worktrees
+        .iter()
+        .find(|w| w.project_id == project.id && w.branch == branch);
+    let base = from.or_else(current_branch_here);
+    let pre_existing = git_branch_exists(&project.repo_path, &branch);
+    let (path, created, checked_out) = match existing {
+        Some(w) => (Some(w.path.display().to_string()), false, false),
+        None if worktree => (
+            create_worktree_path(
+                &mut conn,
+                &project.id,
+                &branch,
+                base.filter(|_| !pre_existing),
+            )
+            .await?,
+            true,
+            false,
+        ),
+        None => {
+            if !pre_existing {
+                git_create_branch(&project.repo_path, &branch, base.as_deref())?;
+            }
+            let req_id = 1u64;
+            write_frame(
+                &mut conn.stream,
+                &ClientRequest::CheckoutPrimary {
+                    req_id,
+                    project: project.id.clone(),
+                    branch: branch.clone(),
+                },
+            )
+            .await?;
+            let mut upserts = Vec::new();
+            await_ack(&mut conn, req_id, &mut upserts).await?;
+            (
+                Some(primary.path.display().to_string()),
+                !pre_existing,
+                true,
+            )
+        }
+    };
+    let Some(path) = path else {
+        bail!("the daemon created the checkout but never reported its path");
+    };
+    let terminal = std::env::var("NEBULA_AGENT_ID")
+        .ok()
+        .and_then(|v| v.strip_prefix("term:").map(str::to_owned))
+        .filter(|id| !id.is_empty());
+    if let Some(id) = &terminal {
+        // The shell is blocked on this very command; the tty queues the
+        // line and the shell runs it at its next prompt, like typed-ahead
+        // input.
+        let line = format!("cd '{}'\n", path.replace('\'', "'\\''"));
+        write_frame(
+            &mut conn.stream,
+            &ClientRequest::Input {
+                session: nebula_core::SessionRef::Terminal(nebula_core::TerminalId(id.clone())),
+                data: line.into_bytes(),
+            },
+        )
+        .await?;
+    }
     println!(
         "{}",
         serde_json::json!({
             "project": project.name,
             "branch": branch,
             "path": path,
+            "created": created,
+            "checked_out_in_primary": checked_out,
+            "cd": terminal.is_some(),
         })
     );
+    if terminal.is_none() {
+        eprintln!("cd '{path}'");
+    }
     Ok(())
+}
+
+/// `POST /api/agent/rename` on the daemon's hook receiver, reached through
+/// the reverse tunnel a remote spawn opens (`NEBULA_API_URL` names it).
+/// Minimal HTTP/1.1 by hand — the hooks' own one-liners do the same, and a
+/// client crate for one request isn't worth the dependency.
+async fn rename_over_tunnel(agent_id: &str, title: &str, force: bool) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let url = std::env::var("NEBULA_API_URL").context("NEBULA_API_URL is not set")?;
+    let token = std::env::var("NEBULA_API_TOKEN").context("NEBULA_API_TOKEN is not set")?;
+    let authority = url
+        .strip_prefix("http://")
+        .with_context(|| format!("unsupported NEBULA_API_URL: {url}"))?
+        .trim_end_matches('/');
+    let body = serde_json::json!({ "title": title, "force": force }).to_string();
+    let request = format!(
+        "POST /api/agent/rename?agent={} HTTP/1.1\r\nHost: {authority}\r\n\
+         Authorization: Bearer {token}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        percent_encode(agent_id),
+        body.len()
+    );
+    let mut stream = tokio::net::TcpStream::connect(authority)
+        .await
+        .context("no nebula daemon reachable through the ssh tunnel — title unchanged")?;
+    stream.write_all(request.as_bytes()).await?;
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await?;
+    let text = String::from_utf8_lossy(&raw);
+    let (head, reply) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+    let status: u16 = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if status == 200 {
+        println!("session renamed to \"{title}\"");
+        Ok(())
+    } else {
+        bail!("{}", reply.trim())
+    }
+}
+
+/// Query-string escape for the agent id (ULIDs are plain, but a `term:`
+/// prefix carries a colon).
+fn percent_encode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+fn git_branch_exists(repo: &std::path::Path, branch: &str) -> bool {
+    std::process::Command::new("git")
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ])
+        .current_dir(repo)
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// `git branch <name> [<base>]` in the repo — no base means the primary's
+/// HEAD, like git itself.
+fn git_create_branch(repo: &std::path::Path, branch: &str, base: Option<&str>) -> Result<()> {
+    let mut args = vec!["branch", branch];
+    args.extend(base);
+    let out = std::process::Command::new("git")
+        .args(&args)
+        .current_dir(repo)
+        .output()
+        .context("running git")?;
+    if !out.status.success() {
+        bail!(
+            "git branch {branch} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// The branch checked out in the current directory; `None` when detached
+/// or outside a checkout (the daemon then branches from the primary's
+/// HEAD).
+fn current_branch_here() -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["symbolic-ref", "--short", "-q", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let name = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
+/// The project whose checkout contains the current directory (deepest
+/// match), for verbs run from a plain shell.
+fn project_owning_cwd(
+    projects: &[nebula_core::Project],
+    worktrees: &[nebula_core::Worktree],
+) -> Option<nebula_core::Project> {
+    let cwd = std::env::current_dir().ok()?;
+    let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+    let owner = worktrees
+        .iter()
+        .map(|w| {
+            (
+                w,
+                std::fs::canonicalize(&w.path).unwrap_or_else(|_| w.path.clone()),
+            )
+        })
+        .filter(|(_, p)| cwd.starts_with(p))
+        .max_by_key(|(_, p)| p.components().count())?
+        .0;
+    projects.iter().find(|p| p.id == owner.project_id).cloned()
 }
 
 /// `nebula worktree delete <name> [--force] [--project <name>]` — the
@@ -653,23 +921,9 @@ pub async fn worktree_delete(sel: String, force: bool, project_flag: Option<Stri
         .iter()
         .filter(|w| w.project_id == project.id)
         .collect();
-    // Match by branch or directory name — the same selectors `agent new
-    // --worktree` takes, minus "root"/"primary" (the main checkout is
-    // never deletable).
-    let worktree = of_project
-        .iter()
-        .find(|w| w.branch == sel || w.path.file_name().is_some_and(|n| n == sel.as_str()))
-        .with_context(|| {
-            format!(
-                "no worktree \"{sel}\" in {} (have: {})",
-                project.name,
-                of_project
-                    .iter()
-                    .map(|w| w.branch.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        })?;
+    // The same selectors `agent new --worktree` takes, minus
+    // "root"/"primary" (the main checkout is never deletable).
+    let worktree = resolve_worktree(&of_project, &sel, &project.name, false)?;
     if worktree.is_main {
         bail!("cannot delete the primary checkout — remove the project instead");
     }
@@ -701,6 +955,104 @@ pub async fn worktree_delete(sel: String, force: bool, project_flag: Option<Stri
             "project": project.name,
             "branch": worktree.branch,
             "deleted": true,
+        })
+    );
+    Ok(())
+}
+
+/// Resolve one worktree row of a project by selector: a branch name, a
+/// directory name, or (when `allow_primary`) "root"/"primary" for the main
+/// checkout ("root" is the historical spelling, kept). A selector that
+/// names one row by branch and a *different* row by directory is refused
+/// rather than silently picking either — that happens after a branch
+/// moves between checkouts (say `feature/x` now on the primary while
+/// nebula's `feature-x` checkout sits detached), and a worker landing on
+/// the wrong one is exactly the confusion the error prevents.
+fn resolve_worktree<'a>(
+    of_project: &[&'a nebula_core::Worktree],
+    sel: &str,
+    project_name: &str,
+    allow_primary: bool,
+) -> Result<&'a nebula_core::Worktree> {
+    let by_branch = of_project.iter().copied().find(|w| w.branch == sel);
+    let by_primary = (allow_primary && (sel == "root" || sel == "primary"))
+        .then(|| of_project.iter().copied().find(|w| w.is_main))
+        .flatten();
+    let by_dir = of_project
+        .iter()
+        .copied()
+        .find(|w| w.path.file_name().is_some_and(|n| n == sel));
+    let mut hits: Vec<&nebula_core::Worktree> = Vec::new();
+    for w in [by_branch, by_primary, by_dir].into_iter().flatten() {
+        if !hits.iter().any(|h| h.id == w.id) {
+            hits.push(w);
+        }
+    }
+    match hits.as_slice() {
+        [one] => Ok(one),
+        [] => bail!(
+            "no worktree \"{sel}\" in {project_name} (have: {})",
+            of_project
+                .iter()
+                .map(|w| w.branch.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        many => bail!(
+            "\"{sel}\" is ambiguous in {project_name}: {} — pass the directory name or the exact branch",
+            many.iter()
+                .map(|w| format!("{} at {}", w.branch, w.path.display()))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ),
+    }
+}
+
+/// `nebula worktree checkout <branch> [--project <name>]` — check a branch
+/// out in the primary checkout through the daemon, which first removes the
+/// session-free nebula worktree holding it (git allows one checkout per
+/// branch) and keeps the branch. Refused while sessions run there.
+pub async fn worktree_checkout(branch: String, project_flag: Option<String>) -> Result<()> {
+    let sock = paths::socket_path();
+    let Ok(stream) = try_connect(&sock).await else {
+        bail!("no nebula daemon is running");
+    };
+    let mut conn = handshake(stream).await?;
+    let (projects, worktrees, agents) = subscribe_snapshot(&mut conn).await?;
+    let project = resolve_project(&projects, &worktrees, &agents, project_flag.as_deref())?;
+    // The caller's own checkout is the one about to be removed: refuse
+    // rather than saw off the branch this session sits on.
+    if let Ok(agent_id) = std::env::var("NEBULA_AGENT_ID") {
+        let own = agents.iter().find(|a| a.id.as_str() == agent_id);
+        if let Some(w) = own.and_then(|a| worktrees.iter().find(|w| w.id == a.worktree_id)) {
+            if !w.is_main && w.branch == branch {
+                bail!("that is this session's own worktree — run this from the primary checkout");
+            }
+        }
+    }
+    let req_id = 1u64;
+    write_frame(
+        &mut conn.stream,
+        &ClientRequest::CheckoutPrimary {
+            req_id,
+            project: project.id.clone(),
+            branch: branch.clone(),
+        },
+    )
+    .await?;
+    let mut upserts = Vec::new();
+    await_ack(&mut conn, req_id, &mut upserts).await?;
+    let primary = worktrees
+        .iter()
+        .find(|w| w.project_id == project.id && w.is_main)
+        .map(|w| w.path.display().to_string());
+    println!(
+        "{}",
+        serde_json::json!({
+            "project": project.name,
+            "branch": branch,
+            "path": primary,
+            "checked_out": true,
         })
     );
     Ok(())
@@ -870,7 +1222,9 @@ pub async fn agent_read(
         .await
         .context("timed out waiting for the session text")??;
         match event {
-            Some(ServerEvent::SessionText { req_id: r, text, .. }) if r == req_id => {
+            Some(ServerEvent::SessionText {
+                req_id: r, text, ..
+            }) if r == req_id => {
                 println!("{text}");
                 return Ok(());
             }
@@ -1060,26 +1414,7 @@ pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
         .filter(|w| w.project_id == project.id)
         .collect();
     let target = match opts.worktree.as_deref() {
-        // Match by branch, by directory name, or "root"/"primary" for the
-        // primary checkout ("root" is the historical spelling, kept).
-        Some(sel) => of_project
-            .iter()
-            .find(|w| {
-                w.branch == sel
-                    || ((sel == "root" || sel == "primary") && w.is_main)
-                    || w.path.file_name().is_some_and(|n| n == sel)
-            })
-            .with_context(|| {
-                format!(
-                    "no worktree \"{sel}\" in {} (have: {})",
-                    project.name,
-                    of_project
-                        .iter()
-                        .map(|w| w.branch.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            })?,
+        Some(sel) => resolve_worktree(&of_project, sel, &project.name, true)?,
         None => bail!("pass --worktree <branch>"),
     };
     let auto_title = opts.name.is_none();

@@ -119,6 +119,25 @@ impl Daemon {
         })
     }
 
+    /// Rebuild the process-wide checkout→host map from the store: every
+    /// remote project's root plus each of its worktrees. Called at boot and
+    /// after anything that adds a project or worktree row, so the git
+    /// runner and the spawners route by path without being told a host.
+    pub fn refresh_remote_hosts(&self) {
+        let Ok((projects, worktrees, _, _)) = self.store.load_tree() else {
+            return;
+        };
+        let mut entries = Vec::new();
+        for project in projects.iter().filter(|p| p.host.is_some()) {
+            let host = project.host.clone().unwrap_or_default();
+            entries.push((project.repo_path.clone(), host.clone()));
+            for w in worktrees.iter().filter(|w| w.project_id == project.id) {
+                entries.push((w.path.clone(), host.clone()));
+            }
+        }
+        nebula_core::remote::replace_all(entries);
+    }
+
     // ---- status machine plumbing ----
 
     /// Feed one hook (or synthetic) event through the agent's status machine
@@ -150,8 +169,16 @@ impl Daemon {
                     // Lazily seed from the persisted row.
                     match self.store.get_agent(agent_id) {
                         Ok(Some(agent)) => Outcome::Effects(
-                            slot.insert(AgentStatusMachine::new(agent.status, agent.session_id))
-                                .handle(event, session_id.as_deref(), Instant::now()),
+                            slot.insert(AgentStatusMachine::for_kind(
+                                agent.status,
+                                agent.session_id,
+                                agent.kind,
+                            ))
+                            .handle(
+                                event,
+                                session_id.as_deref(),
+                                Instant::now(),
+                            ),
                         ),
                         _ => Outcome::UnknownAgent(event, session_id),
                     }
@@ -620,8 +647,29 @@ impl Daemon {
         path: &Path,
         name: Option<String>,
         create_missing: bool,
+        host: Option<String>,
     ) -> Result<EntityId> {
-        if create_missing && !path.exists() {
+        // A remote checkout: every git call below hops over ssh once the
+        // path is on the host map. Registered before the toplevel probe so
+        // the probe itself goes to the right machine; `refresh_remote_hosts`
+        // rebuilds the map from the store afterwards either way.
+        let expanded;
+        let path = match &host {
+            // `host:~/repo`: only the remote shell knows its $HOME.
+            Some(host) if path.starts_with("~") => {
+                let rest = path.strip_prefix("~").unwrap_or(path);
+                expanded = git::remote_home(host)
+                    .await
+                    .with_context(|| format!("resolve ~ on {host}"))?
+                    .join(rest);
+                expanded.as_path()
+            }
+            _ => path,
+        };
+        if let Some(host) = &host {
+            nebula_core::remote::register(path, host);
+        }
+        if host.is_none() && create_missing && !path.exists() {
             tokio::fs::create_dir_all(path)
                 .await
                 .with_context(|| format!("create {}", path.display()))?;
@@ -639,12 +687,15 @@ impl Daemon {
                 e.context(format!("{} is not a git repository", path.display()))
             }
         })?;
+        if let Some(host) = &host {
+            nebula_core::remote::register(&toplevel, host);
+        }
         // New projects land in whichever workspace is open; the same repo
         // may be added to any number of workspaces, just not twice to one.
         let workspace_id = self.store.active_workspace_id()?;
         if self
             .store
-            .project_in_workspace(&toplevel, &workspace_id)?
+            .project_in_workspace_on(&toplevel, &workspace_id, host.as_deref())?
             .is_some()
         {
             bail!(
@@ -668,6 +719,7 @@ impl Daemon {
             divider_label: None,
             divider_before: false,
             divider_before_label: None,
+            host,
         };
         self.store.insert_project(&project)?;
         self.broadcast(ServerEvent::EntityUpserted {
@@ -699,6 +751,7 @@ impl Daemon {
             };
             first = false;
             self.store.insert_worktree(&worktree)?;
+            self.refresh_remote_hosts();
             self.broadcast(ServerEvent::EntityUpserted {
                 entity: Entity::Worktree(worktree),
             });
@@ -1032,7 +1085,7 @@ impl Daemon {
         // root checkout's HEAD (which `git worktree add` reads too).
         let pre_existing = git::branch_exists(&project.repo_path, branch).await;
         let path = git::add_worktree(&project.repo_path, branch, base).await?;
-        if let Some(primary) = seed_primary {
+        if let Some(primary) = seed_primary.filter(|_| project.host.is_none()) {
             git::seed_node_modules_in_background(&primary, &path);
         }
         let created_from = match base {
@@ -1058,6 +1111,7 @@ impl Daemon {
             sort_order: 0,
         };
         self.store.insert_worktree(&worktree)?;
+        self.refresh_remote_hosts();
         self.broadcast(ServerEvent::EntityUpserted {
             entity: Entity::Worktree(worktree.clone()),
         });
@@ -1148,6 +1202,70 @@ impl Daemon {
         self.broadcast(ServerEvent::EntityUpserted {
             entity: Entity::Worktree(worktree),
         });
+        Ok(())
+    }
+
+    /// Check `branch` out in the project's primary checkout — the way to
+    /// bring a branch that nebula parked in its own worktree back onto the
+    /// main checkout without the detach dance git otherwise forces (a
+    /// branch can be checked out in one working tree at a time). The
+    /// parked checkout is removed first, its row dropped, the branch kept.
+    /// Refused while sessions still run there: removing the checkout under
+    /// them (or detaching it) leaves their commits on a stray HEAD.
+    pub async fn checkout_primary(
+        self: &Arc<Self>,
+        project_id: &ProjectId,
+        branch: &str,
+    ) -> Result<()> {
+        let branch = branch.trim();
+        if branch.is_empty() {
+            bail!("branch name is empty");
+        }
+        let _ops = self.worktree_ops.lock().await;
+        let project = self
+            .store
+            .get_project(project_id)?
+            .context("project not found")?;
+        if !git::branch_exists(&project.repo_path, branch).await {
+            bail!("no local branch \"{branch}\"");
+        }
+        let (_, worktrees, agents, terminals) = self.store.load_tree()?;
+        let parked: Vec<&Worktree> = worktrees
+            .iter()
+            .filter(|w| w.project_id == *project_id && !w.is_main && w.branch == branch)
+            .collect();
+        for w in &parked {
+            let live = agents
+                .iter()
+                .filter(|a| a.worktree_id == w.id)
+                .filter(|a| self.is_alive(&SessionRef::Agent(a.id.clone())))
+                .count()
+                + terminals
+                    .iter()
+                    .filter(|t| t.worktree_id == w.id)
+                    .filter(|t| self.is_alive(&SessionRef::Terminal(t.id.clone())))
+                    .count();
+            if live > 0 {
+                bail!(
+                    "branch \"{branch}\" is checked out in {} with {live} live session(s); \
+                     finish or kill them first",
+                    w.path.display()
+                );
+            }
+        }
+        for w in &parked {
+            // Not forced: uncommitted work in the parked checkout would be
+            // lost, and that's the caller's call to make by committing.
+            git::remove_worktree(&project.repo_path, &w.path, false).await?;
+            self.kill_prewarmed_in(std::slice::from_ref(&w.id));
+            self.store.delete_worktree(&w.id)?;
+            self.broadcast(ServerEvent::EntityRemoved {
+                id: EntityId::Worktree(w.id.clone()),
+            });
+        }
+        git::checkout(&project.repo_path, branch).await?;
+        // The main row's branch label follows the checkout via reconcile.
+        self.reconcile_project_worktrees(&project).await?;
         Ok(())
     }
 
@@ -1256,6 +1374,7 @@ impl Daemon {
                 sort_order: 0,
             };
             self.store.insert_worktree(&worktree)?;
+            self.refresh_remote_hosts();
             adopted = true;
             self.broadcast(ServerEvent::EntityUpserted {
                 entity: Entity::Worktree(worktree),
@@ -1308,7 +1427,14 @@ impl Daemon {
         // the CLI runs. Without this, a missing CLI still "succeeds" — the
         // login shell prints `command not found` into a PTY that dies at
         // once, leaving a dead row that looks identical to a fresh one.
-        if adopted.is_none() && !self.cli_available_for_create(kind).await {
+        // (A remote project's CLI lives on the far host, where the login
+        // shell there is the only honest probe — a missing CLI shows up as
+        // ssh's `command not found` in the pane instead.)
+        let remote = self
+            .store
+            .get_project(&worktree.project_id)?
+            .is_some_and(|p| p.host.is_some());
+        if adopted.is_none() && !remote && !self.cli_available_for_create(kind).await {
             bail!("{}", cli_missing_message(kind));
         }
         let agent = Agent {
@@ -1672,6 +1798,81 @@ impl Daemon {
         Ok(())
     }
 
+    /// Re-home every live shell tab under the worktree its shell process
+    /// currently sits in. Terminals have no hooks to report a cwd, so the
+    /// daemon reads the shell's working directory straight from the kernel
+    /// each sync tick: a `cd` into another checkout (by hand, or via
+    /// `nebula switch`) moves the tab under that row in the panel, and a
+    /// `cd` back moves it home. Directories outside every worktree of the
+    /// project leave the row where it is. Fail-soft per terminal.
+    pub fn sync_terminal_cwds(self: &Arc<Self>) {
+        let live: Vec<(TerminalId, u32)> = {
+            let sessions = self.sessions.lock().unwrap();
+            sessions
+                .iter()
+                .filter_map(|(sref, s)| match sref {
+                    SessionRef::Terminal(id) => s.child_pid.map(|pid| (id.clone(), pid)),
+                    SessionRef::Agent(_) => None,
+                })
+                .collect()
+        };
+        for (id, pid) in live {
+            let Some(cwd) = process_cwd(pid) else {
+                continue;
+            };
+            if let Err(e) = self.reparent_terminal_to_cwd(&id, &canonical_or_raw(&cwd)) {
+                tracing::warn!(terminal = %id, error = %e, "terminal cwd reparent failed");
+            }
+        }
+    }
+
+    /// Move a shell tab's row under the worktree owning `cwd` when that is
+    /// a different worktree of the same project. `cwd` must already be
+    /// canonicalized. The PTY is untouched — only the row moves.
+    fn reparent_terminal_to_cwd(self: &Arc<Self>, id: &TerminalId, cwd: &Path) -> Result<()> {
+        let Some(terminal) = self.store.get_terminal(id)? else {
+            return Ok(());
+        };
+        let Some(current) = self.store.get_worktree(&terminal.worktree_id)? else {
+            return Ok(());
+        };
+        let Some(target) = self.worktree_owning(&current.project_id, cwd)? else {
+            return Ok(());
+        };
+        if target.id == terminal.worktree_id {
+            return Ok(());
+        }
+        tracing::info!(
+            terminal = %id,
+            from = %current.branch,
+            to = %target.branch,
+            "terminal re-homed by shell cwd"
+        );
+        self.store.set_terminal_worktree(id, &target.id)?;
+        let entity = self.terminal_entity(id)?;
+        self.broadcast(ServerEvent::EntityUpserted {
+            entity: Entity::Terminal(entity),
+        });
+        Ok(())
+    }
+
+    /// Deepest worktree of `project` whose path contains `cwd` — nested
+    /// layouts (checkouts under the repo root) must not resolve to the
+    /// root row just because the root path is also a prefix.
+    fn worktree_owning(&self, project_id: &ProjectId, cwd: &Path) -> Result<Option<Worktree>> {
+        let (_, worktrees, _, _) = self.store.load_tree()?;
+        Ok(worktrees
+            .into_iter()
+            .filter(|w| w.project_id == *project_id)
+            .map(|w| {
+                let canonical = canonical_or_raw(&w.path);
+                (w, canonical)
+            })
+            .filter(|(_, canonical)| cwd.starts_with(canonical))
+            .max_by_key(|(_, canonical)| canonical.components().count())
+            .map(|(w, _)| w))
+    }
+
     /// A hook payload reported the agent CLI's working directory. When that
     /// directory sits inside a *different* worktree of the same project (the
     /// session entered a worktree it created mid-conversation), re-home the
@@ -1735,20 +1936,8 @@ impl Daemon {
         let Some(current) = self.store.get_worktree(&agent.worktree_id)? else {
             return Ok(());
         };
-        let (_, worktrees, _, _) = self.store.load_tree()?;
-        // Deepest worktree of the same project containing cwd — nested
-        // layouts (checkouts under the repo root) must not resolve to the
-        // root row just because the root path is also a prefix.
-        let target = worktrees
-            .into_iter()
-            .filter(|w| w.project_id == current.project_id)
-            .map(|w| {
-                let canonical = canonical_or_raw(&w.path);
-                (w, canonical)
-            })
-            .filter(|(_, canonical)| cwd.starts_with(canonical))
-            .max_by_key(|(_, canonical)| canonical.components().count());
-        if let Some((worktree, _)) = target {
+        let target = self.worktree_owning(&current.project_id, cwd)?;
+        if let Some(worktree) = target {
             if worktree.id != agent.worktree_id {
                 tracing::info!(
                     agent = %agent.id,
@@ -2180,29 +2369,19 @@ impl Daemon {
         rows: u16,
         initial_prompt: Option<&str>,
     ) -> Result<Arc<PtySession>> {
+        // A remote project's checkout is on another machine: the CLI runs
+        // there under ssh, and its hooks are installed there too (by the
+        // remote `nebula hooks install` the spawn script runs first).
+        let host = self
+            .store
+            .get_project(&worktree.project_id)?
+            .and_then(|p| p.host);
         // Managed status hooks; a failure here degrades to "no status
         // updates", never blocks the spawn.
-        let install_result = match agent.kind {
-            AgentKind::Claude => hooks::installer::install_claude_hooks(&worktree.path),
-            // Codex's hooks live in its home, not the worktree, so one
-            // trust approval covers every worktree (see installer docs);
-            // any per-worktree copy an older nebula left is pruned.
-            AgentKind::Codex => {
-                hooks::installer::install_codex_hooks(&hooks::installer::codex_home())
-                    .and_then(|()| hooks::installer::prune_codex_worktree_hooks(&worktree.path))
+        if host.is_none() {
+            if let Err(e) = hooks::installer::install_for_kind(agent.kind, &worktree.path) {
+                tracing::warn!(error = %e, cwd = %worktree.path.display(), "hook install failed");
             }
-            // Cursor also gets the managed auto-title project rule — its
-            // hook dialect has no context-injection channel.
-            AgentKind::Cursor => hooks::installer::install_cursor_hooks(&worktree.path)
-                .and_then(|()| hooks::installer::install_cursor_title_rule(&worktree.path)),
-            // Pi has no hooks — a managed extension in its global
-            // extensions dir phones the same endpoints home.
-            AgentKind::Pi => {
-                hooks::installer::install_pi_extension(&hooks::installer::pi_agent_dir())
-            }
-        };
-        if let Err(e) = install_result {
-            tracing::warn!(error = %e, cwd = %worktree.path.display(), "hook install failed");
         }
 
         // NEBULA_AGENT_CMD overrides for tests; default is the kind's CLI.
@@ -2215,6 +2394,22 @@ impl Daemon {
             cmd_override.as_deref(),
             initial_prompt,
         );
+        let hook_env = self.hook_env_pairs(&agent.id.to_string());
+        // Remote: the whole command line moves to the far side under ssh,
+        // hook env and all (the tunnel brings the hooks back here). Local:
+        // the CLI's own argv.
+        let (program, args) = match &host {
+            Some(host) => remote_spawn_command(
+                host,
+                self.hook_env.port,
+                &hook_env,
+                &worktree.path,
+                Some(agent.kind),
+                &program,
+                &args,
+            ),
+            None => (program, args),
+        };
         // Run the agent through the user's login+interactive shell so it sees
         // the same env as a Terminal.app tab (~/.zprofile, ~/.zshrc,
         // path_helper) instead of the daemon's inherited-at-boot env.
@@ -2228,15 +2423,8 @@ impl Daemon {
         let spec = SpawnSpec {
             program,
             args,
-            cwd: worktree.path.clone(),
-            env: vec![
-                ("NEBULA_AGENT_ID".into(), agent.id.to_string()),
-                (
-                    "NEBULA_API_URL".into(),
-                    format!("http://127.0.0.1:{}", self.hook_env.port),
-                ),
-                ("NEBULA_API_TOKEN".into(), self.hook_env.token.clone()),
-            ],
+            cwd: spawn_cwd(host.as_deref(), &worktree.path),
+            env: hook_env,
             scrub_env: scrubbed_env_names(),
             cols,
             rows,
@@ -2312,21 +2500,31 @@ impl Daemon {
         // The hook env carries a `term:`-prefixed id: an agent CLI run by
         // hand inside this shell reports through the same globally-installed
         // hooks, and the daemon routes those onto the terminal's status.
+        let host = self
+            .store
+            .get_project(&worktree.project_id)?
+            .and_then(|p| p.host);
+        let hook_env =
+            self.hook_env_pairs(&format!("{TERMINAL_HOOK_PREFIX}{}", terminal.id.as_str()));
+        // Remote: an ssh session that lands in the checkout and execs the
+        // remote user's login shell (the spawn script's no-argv case).
+        let (program, args) = match &host {
+            Some(host) => remote_spawn_command(
+                host,
+                self.hook_env.port,
+                &hook_env,
+                &worktree.path,
+                None,
+                "",
+                &[],
+            ),
+            None => (user_shell(), vec!["-l".into()]),
+        };
         let spec = SpawnSpec {
-            program: user_shell(),
-            args: vec!["-l".into()],
-            cwd: worktree.path.clone(),
-            env: vec![
-                (
-                    "NEBULA_AGENT_ID".into(),
-                    format!("{TERMINAL_HOOK_PREFIX}{}", terminal.id.as_str()),
-                ),
-                (
-                    "NEBULA_API_URL".into(),
-                    format!("http://127.0.0.1:{}", self.hook_env.port),
-                ),
-                ("NEBULA_API_TOKEN".into(), self.hook_env.token.clone()),
-            ],
+            program,
+            args,
+            cwd: spawn_cwd(host.as_deref(), &worktree.path),
+            env: hook_env,
             scrub_env: scrubbed_env_names(),
             cols,
             rows,
@@ -2335,6 +2533,19 @@ impl Daemon {
         let session = PtySession::spawn(sref, spec)?;
         self.install_session(session.clone());
         Ok(session)
+    }
+
+    /// The hook env every nebula-spawned PTY gets: who it is and where to
+    /// report. A remote spawn ships the same three across ssh.
+    fn hook_env_pairs(&self, agent_id: &str) -> Vec<(String, String)> {
+        vec![
+            ("NEBULA_AGENT_ID".into(), agent_id.to_string()),
+            (
+                "NEBULA_API_URL".into(),
+                format!("http://127.0.0.1:{}", self.hook_env.port),
+            ),
+            ("NEBULA_API_TOKEN".into(), self.hook_env.token.clone()),
+        ]
     }
 
     fn install_session(self: &Arc<Self>, session: Arc<PtySession>) {
@@ -2544,6 +2755,43 @@ fn sanitize_title(raw: &str) -> String {
 /// Canonicalize for path containment tests, falling back to the raw path
 /// when it doesn't resolve (deleted checkout, not-yet-created dir). macOS
 /// symlinks (`/tmp` → `/private/tmp`) otherwise break `starts_with`.
+/// Working directory of a live process, read from the kernel: the shell
+/// tab re-homing signal. `None` when the process is gone or unreadable.
+pub fn process_cwd(pid: u32) -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use nix::libc;
+        // SAFETY: proc_vnodepathinfo is plain data; proc_pidinfo fills at
+        // most `size` bytes of it and reports how many it wrote.
+        unsafe {
+            let mut info: libc::proc_vnodepathinfo = std::mem::zeroed();
+            let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+            let n = libc::proc_pidinfo(
+                pid as libc::c_int,
+                libc::PROC_PIDVNODEPATHINFO,
+                0,
+                &mut info as *mut _ as *mut libc::c_void,
+                size,
+            );
+            if n <= 0 {
+                return None;
+            }
+            let raw = std::ffi::CStr::from_ptr(info.pvi_cdir.vip_path.as_ptr().cast());
+            let path = raw.to_str().ok()?;
+            (!path.is_empty()).then(|| std::path::PathBuf::from(path))
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 fn canonical_or_raw(path: &Path) -> std::path::PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
@@ -2617,6 +2865,99 @@ fn cli_missing_message(kind: AgentKind) -> String {
     )
 }
 
+/// Working directory for the local side of a spawn. A remote checkout's
+/// path doesn't exist here, and portable-pty refuses a missing cwd, so
+/// the ssh client starts in $HOME (or `/`) — the far side `cd`s.
+fn spawn_cwd(host: Option<&str>, checkout: &Path) -> PathBuf {
+    match host {
+        None => checkout.to_path_buf(),
+        Some(_) => std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|h| h.is_dir())
+            .unwrap_or_else(|| PathBuf::from("/")),
+    }
+}
+
+/// Runs under `sh -c` on the remote host. Positional parameters:
+/// `$1` agent id, `$2` api url, `$3` api token, `$4` checkout dir, `$5`
+/// agent kind ("" for a shell tab), then the CLI's own argv. It exports the
+/// hook env (plus `NEBULA_REMOTE`, so the remote `nebula rename` reports
+/// through the tunnel instead of the remote daemon), has the remote nebula
+/// install that kind's status hooks, enters the checkout and execs the CLI
+/// — or the user's login shell when no argv follows.
+///
+/// Same quoting contract as `nebula ssh`: no single quotes, backslashes or
+/// newlines, wrapped once in '...'; user data rides only as quoted
+/// positionals. Hook-install failure is a warning, not a stop — a session
+/// without status beats no session.
+const REMOTE_SPAWN_SCRIPT: &str = concat!(
+    "export PATH=\"$HOME/.local/bin:$PATH\"; ",
+    "export NEBULA_REMOTE=1 NEBULA_AGENT_ID=\"$1\" NEBULA_API_URL=\"$2\" NEBULA_API_TOKEN=\"$3\"; ",
+    "if [ -n \"$5\" ]; then ",
+    "nebula hooks install \"$5\" \"$4\" >/dev/null 2>&1 || ",
+    "echo \"nebula: could not install $5 status hooks on this host (is nebula installed here?)\" >&2; ",
+    "fi; ",
+    "cd -- \"$4\" || exit 1; ",
+    "shift 5; ",
+    "if [ $# -eq 0 ]; then exec \"${SHELL:-sh}\" -l; fi; ",
+    "exec \"$@\""
+);
+
+/// `ssh -t -R port:127.0.0.1:port host 'sh -c SCRIPT nebula-remote …'`:
+/// the local argv that runs `program args…` inside `checkout` on `host`.
+/// The reverse forward puts this daemon's hook receiver on the remote's
+/// loopback at the same port, so the hook env crosses unchanged. `-t`
+/// forces a remote tty (the CLI is interactive); `BatchMode` keeps a
+/// daemon with no terminal from hanging on a password prompt.
+fn remote_spawn_command(
+    host: &str,
+    port: u16,
+    hook_env: &[(String, String)],
+    checkout: &Path,
+    kind: Option<AgentKind>,
+    program: &str,
+    args: &[String],
+) -> (String, Vec<String>) {
+    let env = |name: &str| {
+        hook_env
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("")
+    };
+    let mut words: Vec<&str> = vec![
+        env("NEBULA_AGENT_ID"),
+        env("NEBULA_API_URL"),
+        env("NEBULA_API_TOKEN"),
+    ];
+    let checkout = checkout.to_string_lossy();
+    words.push(&checkout);
+    words.push(kind.map(|k| k.as_str()).unwrap_or(""));
+    if !program.is_empty() {
+        words.push(program);
+        words.extend(args.iter().map(String::as_str));
+    }
+    let remote = format!(
+        "sh -c {} nebula-remote {}",
+        nebula_core::remote::ssh_quote(REMOTE_SPAWN_SCRIPT),
+        nebula_core::remote::join_quoted(words)
+    );
+    let mut argv: Vec<String> = vec!["-t".into()];
+    argv.extend(
+        nebula_core::remote::SSH_BATCH_OPTS
+            .iter()
+            .map(|s| s.to_string()),
+    );
+    argv.extend([
+        "-R".to_string(),
+        format!("{port}:127.0.0.1:{port}"),
+        "--".to_string(),
+        host.to_string(),
+        remote,
+    ]);
+    ("ssh".into(), argv)
+}
+
 /// Wrap `program args…` in a login + interactive shell (`$SHELL -l -i -c
 /// 'exec …'`) so the child gets the user's real environment — ~/.zprofile
 /// and ~/.zshrc on zsh — rather than the daemon's. `exec` keeps the child
@@ -2649,6 +2990,65 @@ mod tests {
     use super::*;
 
     #[test]
+    fn remote_spawn_script_survives_single_quoting() {
+        // Same contract as `nebula ssh`: the script rides inside one '...'
+        // under any login shell, so it can't contain what would end it.
+        assert!(!REMOTE_SPAWN_SCRIPT.contains('\''));
+        assert!(!REMOTE_SPAWN_SCRIPT.contains('\\'));
+        assert!(!REMOTE_SPAWN_SCRIPT.contains('\n'));
+    }
+
+    #[test]
+    fn remote_spawn_command_tunnels_hooks_and_quotes_argv() {
+        let env = vec![
+            ("NEBULA_AGENT_ID".to_string(), "a1".to_string()),
+            ("NEBULA_API_URL".to_string(), "http://127.0.0.1:4242".to_string()),
+            ("NEBULA_API_TOKEN".to_string(), "tok".to_string()),
+        ];
+        let (program, args) = remote_spawn_command(
+            "findl",
+            4242,
+            &env,
+            Path::new("/srv/my app"),
+            Some(AgentKind::Claude),
+            "claude",
+            &["--dangerously-skip-permissions".to_string(), "it's".to_string()],
+        );
+        assert_eq!(program, "ssh");
+        // A tty for the interactive CLI, no password prompts, and the
+        // hook receiver reverse-forwarded at the same port.
+        assert_eq!(args[0], "-t");
+        assert!(args.contains(&"BatchMode=yes".to_string()));
+        let r = args.iter().position(|a| a == "-R").unwrap();
+        assert_eq!(args[r + 1], "4242:127.0.0.1:4242");
+        assert_eq!(args[args.len() - 2], "findl");
+        let remote = args.last().unwrap();
+        assert!(remote.starts_with("sh -c '"), "{remote}");
+        // Positionals: id, url, token, dir, kind, then the CLI argv — each
+        // single-quoted, embedded quotes escaped.
+        assert!(remote.ends_with(
+            "nebula-remote 'a1' 'http://127.0.0.1:4242' 'tok' '/srv/my app' 'claude' \
+             'claude' '--dangerously-skip-permissions' 'it'\\''s'"
+        ), "{remote}");
+    }
+
+    #[test]
+    fn remote_terminal_spawn_has_no_kind_and_no_argv() {
+        let (_, args) = remote_spawn_command("box", 1, &[], Path::new("/w"), None, "", &[]);
+        let remote = args.last().unwrap();
+        // Empty kind → no hook install; empty argv → the script execs the
+        // remote login shell.
+        assert!(remote.ends_with("nebula-remote '' '' '' '/w' ''"), "{remote}");
+    }
+
+    #[test]
+    fn spawn_cwd_falls_back_to_home_for_remote_checkouts() {
+        assert_eq!(spawn_cwd(None, Path::new("/x")), PathBuf::from("/x"));
+        let cwd = spawn_cwd(Some("findl"), Path::new("/remote/only"));
+        assert!(cwd.is_dir(), "local side starts somewhere that exists: {cwd:?}");
+    }
+
+    #[test]
     fn spawn_command_per_kind_resume_shapes() {
         // Fresh sessions: CLI plus its skip-permissions flag.
         assert_eq!(
@@ -2662,7 +3062,14 @@ mod tests {
         // An initial prompt rides as the positional arg on a fresh spawn —
         // and is dropped on a resume, which continues the old conversation.
         assert_eq!(
-            agent_spawn_command(AgentKind::Claude, None, None, None, None, Some("do the task")),
+            agent_spawn_command(
+                AgentKind::Claude,
+                None,
+                None,
+                None,
+                None,
+                Some("do the task")
+            ),
             (
                 "claude".into(),
                 vec![
@@ -2672,8 +3079,14 @@ mod tests {
                 false
             )
         );
-        let (_, resumed_args, resumed) =
-            agent_spawn_command(AgentKind::Claude, Some("sid"), None, None, None, Some("do it"));
+        let (_, resumed_args, resumed) = agent_spawn_command(
+            AgentKind::Claude,
+            Some("sid"),
+            None,
+            None,
+            None,
+            Some("do it"),
+        );
         assert!(resumed);
         assert!(
             !resumed_args.contains(&"do it".to_string()),
@@ -2755,7 +3168,14 @@ mod tests {
             ("/bin/sh".into(), vec!["-i".to_string()], false)
         );
         assert_eq!(
-            agent_spawn_command(AgentKind::Codex, Some("sid"), None, None, Some("/bin/sh"), None),
+            agent_spawn_command(
+                AgentKind::Codex,
+                Some("sid"),
+                None,
+                None,
+                Some("/bin/sh"),
+                None
+            ),
             ("/bin/sh".into(), vec![], false)
         );
     }
@@ -2764,7 +3184,14 @@ mod tests {
     fn spawn_command_model_and_effort_flags() {
         // Claude gets --model/--effort; either alone works.
         assert_eq!(
-            agent_spawn_command(AgentKind::Claude, None, Some("opus"), Some("high"), None, None),
+            agent_spawn_command(
+                AgentKind::Claude,
+                None,
+                Some("opus"),
+                Some("high"),
+                None,
+                None
+            ),
             (
                 "claude".into(),
                 vec![
@@ -2791,7 +3218,14 @@ mod tests {
         );
         // Codex takes --model plus a config override for effort, after --yolo.
         assert_eq!(
-            agent_spawn_command(AgentKind::Codex, None, Some("gpt-5.5"), Some("high"), None, None),
+            agent_spawn_command(
+                AgentKind::Codex,
+                None,
+                Some("gpt-5.5"),
+                Some("high"),
+                None,
+                None
+            ),
             (
                 "codex".into(),
                 vec![
@@ -2807,7 +3241,14 @@ mod tests {
         // Resume keeps the model/effort flags (a fallback fresh spawn needs
         // them, and the CLIs accept them alongside resume).
         assert_eq!(
-            agent_spawn_command(AgentKind::Claude, Some("sid"), Some("sonnet"), None, None, None),
+            agent_spawn_command(
+                AgentKind::Claude,
+                Some("sid"),
+                Some("sonnet"),
+                None,
+                None,
+                None
+            ),
             (
                 "claude".into(),
                 vec![
@@ -2827,7 +3268,14 @@ mod tests {
         );
         // Pi's effort rides its --thinking flag.
         assert_eq!(
-            agent_spawn_command(AgentKind::Pi, None, Some("gpt-5.5"), Some("high"), None, None),
+            agent_spawn_command(
+                AgentKind::Pi,
+                None,
+                Some("gpt-5.5"),
+                Some("high"),
+                None,
+                None
+            ),
             (
                 "pi".into(),
                 vec![
@@ -2841,7 +3289,14 @@ mod tests {
         );
         // Override still wins over everything.
         assert_eq!(
-            agent_spawn_command(AgentKind::Claude, None, Some("opus"), None, Some("/bin/sh"), None),
+            agent_spawn_command(
+                AgentKind::Claude,
+                None,
+                Some("opus"),
+                None,
+                Some("/bin/sh"),
+                None
+            ),
             ("/bin/sh".into(), vec![], false)
         );
     }
@@ -2888,6 +3343,7 @@ mod tests {
                     divider_label: None,
                     divider_before: false,
                     divider_before_label: None,
+                    host: None,
                 })
                 .unwrap();
         }
@@ -3232,6 +3688,32 @@ mod tests {
             .unwrap();
     }
 
+    fn seed_terminal(daemon: &Daemon, id: &str, worktree: &str) {
+        daemon
+            .store
+            .insert_terminal(&TerminalTab {
+                id: TerminalId(id.into()),
+                worktree_id: WorktreeId(worktree.into()),
+                name: id.into(),
+                sort_order: 0,
+                alive: false,
+                busy: false,
+                status: None,
+                status_changed_at: 0,
+            })
+            .unwrap();
+    }
+
+    fn terminal_worktree(daemon: &Daemon, id: &str) -> String {
+        daemon
+            .store
+            .get_terminal(&TerminalId(id.into()))
+            .unwrap()
+            .unwrap()
+            .worktree_id
+            .to_string()
+    }
+
     fn agent_worktree(daemon: &Daemon, id: &str) -> String {
         daemon
             .store
@@ -3379,6 +3861,55 @@ mod tests {
     }
 
     #[test]
+    fn terminal_follows_its_shell_cwd_between_checkouts() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p", "q"]);
+        seed_worktree(&daemon, "p", "root", "/nebula-test/p", true);
+        seed_worktree(&daemon, "p", "feat", "/nebula-test/p/.wt/feat", false);
+        seed_worktree(&daemon, "q", "q-root", "/nebula-test/q", true);
+        seed_terminal(&daemon, "t1", "root");
+        let t1 = TerminalId("t1".into());
+
+        // A subdirectory of the root checkout is home already.
+        daemon
+            .reparent_terminal_to_cwd(&t1, Path::new("/nebula-test/p/src"))
+            .unwrap();
+        assert_eq!(terminal_worktree(&daemon, "t1"), "root");
+        // `cd` into the nested worktree moves the tab under it (deepest
+        // match wins over the root prefix).
+        daemon
+            .reparent_terminal_to_cwd(&t1, Path::new("/nebula-test/p/.wt/feat/src"))
+            .unwrap();
+        assert_eq!(terminal_worktree(&daemon, "t1"), "feat");
+        // …and `cd` back moves it home again.
+        daemon
+            .reparent_terminal_to_cwd(&t1, Path::new("/nebula-test/p"))
+            .unwrap();
+        assert_eq!(terminal_worktree(&daemon, "t1"), "root");
+        // Outside every checkout, and inside another project, the row
+        // stays put.
+        daemon
+            .reparent_terminal_to_cwd(&t1, Path::new("/elsewhere"))
+            .unwrap();
+        daemon
+            .reparent_terminal_to_cwd(&t1, Path::new("/nebula-test/q/src"))
+            .unwrap();
+        assert_eq!(terminal_worktree(&daemon, "t1"), "root");
+    }
+
+    #[test]
+    fn process_cwd_reads_our_own_working_directory() {
+        let me = std::process::id();
+        let cwd = process_cwd(me).expect("own cwd is readable");
+        assert_eq!(
+            canonical_or_raw(&cwd),
+            canonical_or_raw(&std::env::current_dir().unwrap())
+        );
+        // A pid nobody owns reads as nothing rather than garbage.
+        assert!(process_cwd(u32::MAX - 1).is_none());
+    }
+
+    #[test]
     fn reparent_by_cwd_picks_deepest_matching_worktree() {
         let daemon = test_daemon();
         seed_projects(&daemon, &["p"]);
@@ -3432,6 +3963,7 @@ mod tests {
             divider_label: None,
             divider_before: false,
             divider_before_label: None,
+            host: None,
         };
         daemon.store.insert_project(&project).unwrap();
         seed_worktree(&daemon, "p", "root", &repo.to_string_lossy(), true);
@@ -3503,6 +4035,7 @@ mod tests {
             divider_label: None,
             divider_before: false,
             divider_before_label: None,
+            host: None,
         };
         daemon.store.insert_project(&project).unwrap();
         seed_worktree(&daemon, "p", "root", &repo.to_string_lossy(), true);
@@ -3541,6 +4074,71 @@ mod tests {
     /// existing branch keeps its reflog base, a fresh branch records the
     /// root checkout's HEAD it was cut from.
     #[tokio::test]
+    async fn checkout_primary_moves_a_parked_branch_onto_the_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo = root.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-b", "main"]);
+        git_in(&repo, &["commit", "--allow-empty", "-m", "init"]);
+        git_in(&repo, &["branch", "feat", "main"]);
+
+        let daemon = test_daemon();
+        let pid = ProjectId("p".into());
+        let project = Project {
+            workspace_id: Default::default(),
+            id: pid.clone(),
+            name: "p".into(),
+            repo_path: repo.clone(),
+            sort_order: 0,
+            divider_after: false,
+            divider_before: false,
+            divider_label: None,
+            divider_before_label: None,
+            host: None,
+        };
+        daemon.store.insert_project(&project).unwrap();
+        daemon
+            .store
+            .insert_worktree(&Worktree {
+                id: WorktreeId("root".into()),
+                project_id: pid.clone(),
+                path: repo.clone(),
+                branch: "main".into(),
+                is_main: true,
+                created_from: None,
+                pinned: false,
+                for_branch: false,
+                sort_order: 0,
+            })
+            .unwrap();
+        daemon.create_worktree(&pid, "feat", None).await.unwrap();
+        let (_, worktrees, _, _) = daemon.store.load_tree().unwrap();
+        let parked = worktrees
+            .iter()
+            .find(|w| w.branch == "feat")
+            .unwrap()
+            .clone();
+        assert!(parked.path.exists());
+
+        // git itself refuses the plain checkout while the branch is parked.
+        assert!(git::checkout(&repo, "feat").await.is_err());
+
+        daemon.checkout_primary(&pid, "feat").await.unwrap();
+
+        let (_, worktrees, _, _) = daemon.store.load_tree().unwrap();
+        assert!(!parked.path.exists(), "parked checkout removed");
+        assert!(worktrees.iter().all(|w| w.id != parked.id), "row dropped");
+        let main = worktrees.iter().find(|w| w.is_main).unwrap();
+        assert_eq!(main.branch, "feat", "main row follows the checkout");
+        assert!(git::branch_exists(&repo, "feat").await, "branch kept");
+        assert_eq!(git::current_branch(&repo).await.unwrap(), "feat");
+
+        // Unknown branch: refused, nothing touched.
+        assert!(daemon.checkout_primary(&pid, "nope").await.is_err());
+    }
+
+    #[tokio::test]
     async fn create_worktree_derives_a_base_when_none_is_given() {
         let tmp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(tmp.path()).unwrap();
@@ -3561,6 +4159,7 @@ mod tests {
             divider_label: None,
             divider_before: false,
             divider_before_label: None,
+            host: None,
         };
         daemon.store.insert_project(&project).unwrap();
 
@@ -3628,6 +4227,7 @@ mod tests {
             divider_label: None,
             divider_before: false,
             divider_before_label: None,
+            host: None,
         };
         daemon.store.insert_project(&project).unwrap();
         daemon
@@ -3653,7 +4253,10 @@ mod tests {
             .find(|w| w.id == WorktreeId("wt-dad".into()))
             .unwrap();
         assert_eq!(row.branch, "feat", "row tracks the in-place switch");
-        assert!(row.for_branch, "a branch made in the terminal stays a branch");
+        assert!(
+            row.for_branch,
+            "a branch made in the terminal stays a branch"
+        );
         assert_eq!(
             row.created_from.as_deref(),
             Some("dad"),
@@ -3711,6 +4314,7 @@ mod tests {
             divider_label: None,
             divider_before: false,
             divider_before_label: None,
+            host: None,
         };
         daemon.store.insert_project(&project).unwrap();
         daemon
@@ -4088,6 +4692,7 @@ mod tests {
                 divider_label: None,
                 divider_before: false,
                 divider_before_label: None,
+                host: None,
             })
             .unwrap();
 

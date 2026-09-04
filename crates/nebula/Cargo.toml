@@ -18,6 +18,11 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+[features]
+# Passthrough for the TUI's Ghostty pane engine (on by default there too).
+default = ["ghostty"]
+ghostty = ["nebula-tui/ghostty"]
+
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }

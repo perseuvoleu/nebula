@@ -74,6 +74,11 @@ impl PullRequest {
 /// Ask `gh` for the pull request on `dir`'s current branch. `None` covers
 /// every ordinary miss: no PR, no `gh`, no remote, not logged in.
 pub async fn lookup(dir: &Path) -> Option<PullRequest> {
+    // A remote checkout has no local `gh` context (and its dir isn't
+    // here); the branch's PR is a miss, like a checkout without a remote.
+    if nebula_core::remote::is_remote(dir) {
+        return None;
+    }
     let run = tokio::process::Command::new("gh")
         .args([
             "pr",

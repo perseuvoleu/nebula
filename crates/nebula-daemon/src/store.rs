@@ -252,6 +252,11 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE terminals ADD COLUMN status TEXT;
     ALTER TABLE terminals ADD COLUMN status_changed_at INTEGER NOT NULL DEFAULT 0;
     ",
+    // 23: remote projects — the ssh destination whose filesystem the
+    // project's paths belong to. NULL = this machine.
+    "
+    ALTER TABLE projects ADD COLUMN host TEXT;
+    ",
 ];
 
 pub struct Store {
@@ -416,8 +421,8 @@ impl Store {
 
     pub fn insert_project(&self, p: &Project) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO projects (id, name, workspace_id, repo_path, sort_order, divider_after, divider_label, divider_before, divider_before_label, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![p.id.as_str(), p.name, p.workspace_id.as_str(), p.repo_path.to_string_lossy(), p.sort_order, p.divider_after as i64, p.divider_label, p.divider_before as i64, p.divider_before_label, now_ms()],
+            "INSERT INTO projects (id, name, workspace_id, repo_path, sort_order, divider_after, divider_label, divider_before, divider_before_label, created_at, host) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![p.id.as_str(), p.name, p.workspace_id.as_str(), p.repo_path.to_string_lossy(), p.sort_order, p.divider_after as i64, p.divider_label, p.divider_before as i64, p.divider_before_label, now_ms(), p.host],
         )?;
         Ok(())
     }
@@ -463,14 +468,27 @@ impl Store {
         path: &Path,
         workspace: &WorkspaceId,
     ) -> Result<Option<ProjectId>> {
+        self.project_in_workspace_on(path, workspace, None)
+    }
+
+    /// Same lookup for a remote checkout: the path is only a duplicate on
+    /// the same host (`/srv/app` here and `/srv/app` on findl are two
+    /// different repositories).
+    pub fn project_in_workspace_on(
+        &self,
+        path: &Path,
+        workspace: &WorkspaceId,
+        host: Option<&str>,
+    ) -> Result<Option<ProjectId>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id FROM projects WHERE repo_path = ?1 AND COALESCE(workspace_id, ?3) = ?2",
+            "SELECT id FROM projects WHERE repo_path = ?1 AND COALESCE(workspace_id, ?3) = ?2 AND host IS ?4",
         )?;
         let mut rows = stmt.query(params![
             path.to_string_lossy(),
             workspace.as_str(),
-            DEFAULT_WORKSPACE_ID
+            DEFAULT_WORKSPACE_ID,
+            host
         ])?;
         Ok(rows
             .next()?
@@ -617,6 +635,14 @@ impl Store {
     pub fn set_agent_worktree(&self, id: &AgentId, worktree_id: &WorktreeId) -> Result<()> {
         self.conn.lock().unwrap().execute(
             "UPDATE agents SET worktree_id = ?2 WHERE id = ?1",
+            params![id.as_str(), worktree_id.as_str()],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_terminal_worktree(&self, id: &TerminalId, worktree_id: &WorktreeId) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE terminals SET worktree_id = ?2 WHERE id = ?1",
             params![id.as_str(), worktree_id.as_str()],
         )?;
         Ok(())
@@ -1079,7 +1105,7 @@ impl Store {
     pub fn get_project(&self, id: &ProjectId) -> Result<Option<Project>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare("SELECT id, name, repo_path, sort_order, divider_after, divider_label, divider_before, divider_before_label, COALESCE(workspace_id, 'default') FROM projects WHERE id = ?1")?;
+            .prepare("SELECT id, name, repo_path, sort_order, divider_after, divider_label, divider_before, divider_before_label, COALESCE(workspace_id, 'default'), host FROM projects WHERE id = ?1")?;
         let mut rows = stmt.query(params![id.as_str()])?;
         Ok(rows.next()?.map(|r| Project {
             id: ProjectId(r.get::<_, String>(0).unwrap()),
@@ -1091,6 +1117,7 @@ impl Store {
             divider_before: r.get::<_, i64>(6).unwrap() != 0,
             divider_before_label: r.get(7).unwrap(),
             workspace_id: WorkspaceId(r.get::<_, String>(8).unwrap()),
+            host: r.get(9).unwrap(),
         }))
     }
 
@@ -1116,9 +1143,8 @@ impl Store {
     /// Return the original checkout path for a project, if it is registered.
     pub fn get_primary_worktree_path(&self, project_id: &ProjectId) -> Result<Option<PathBuf>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT path FROM worktrees WHERE project_id = ?1 AND is_main = 1 LIMIT 1",
-        )?;
+        let mut stmt = conn
+            .prepare("SELECT path FROM worktrees WHERE project_id = ?1 AND is_main = 1 LIMIT 1")?;
         let mut rows = stmt.query(params![project_id.as_str()])?;
         Ok(rows
             .next()?
@@ -1207,7 +1233,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
 
         let projects = conn
-            .prepare("SELECT id, name, repo_path, sort_order, divider_after, divider_label, divider_before, divider_before_label, COALESCE(workspace_id, 'default') FROM projects ORDER BY sort_order, created_at")?
+            .prepare("SELECT id, name, repo_path, sort_order, divider_after, divider_label, divider_before, divider_before_label, COALESCE(workspace_id, 'default'), host FROM projects ORDER BY sort_order, created_at")?
             .query_map([], |r| {
                 Ok(Project {
                     id: ProjectId(r.get(0)?),
@@ -1219,6 +1245,7 @@ impl Store {
                     divider_before: r.get::<_, i64>(6)? != 0,
                     divider_before_label: r.get(7)?,
                     workspace_id: WorkspaceId(r.get(8)?),
+                    host: r.get(9)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1317,6 +1344,7 @@ mod tests {
             divider_label: None,
             divider_before: false,
             divider_before_label: None,
+            host: None,
         };
         store.insert_project(&project).unwrap();
         let worktree = Worktree {
@@ -1411,6 +1439,7 @@ mod tests {
             divider_label: None,
             divider_before: false,
             divider_before_label: None,
+            host: None,
         };
         store.insert_project(&project).unwrap();
         let worktree = Worktree {
@@ -1482,6 +1511,7 @@ mod tests {
             divider_label: None,
             divider_before: false,
             divider_before_label: None,
+            host: None,
         };
         store.insert_project(&project).unwrap();
         let worktree = Worktree {
@@ -1522,7 +1552,9 @@ mod tests {
         let read = store.get_todo(&project_todo.id).unwrap().unwrap();
         assert_eq!(read.owner, p_owner);
 
-        store.set_todo_text(&todo.id, "ship the WHOLE feature").unwrap();
+        store
+            .set_todo_text(&todo.id, "ship the WHOLE feature")
+            .unwrap();
         store.set_todo_done(&todo.id, true).unwrap();
         let read = store.get_todo(&todo.id).unwrap().unwrap();
         assert_eq!(read.text, "ship the WHOLE feature");
@@ -1585,6 +1617,7 @@ mod tests {
             divider_label: None,
             divider_before: false,
             divider_before_label: None,
+            host: None,
         };
         store.insert_project(&project).unwrap();
         let wt = |id: &str, path: &str| Worktree {
@@ -1750,6 +1783,7 @@ mod tests {
             divider_label: None,
             divider_before: false,
             divider_before_label: None,
+            host: None,
         };
         store.insert_project(&project).unwrap();
         let worktree = Worktree {
@@ -1920,6 +1954,7 @@ mod tests {
             divider_label: None,
             divider_before: false,
             divider_before_label: None,
+            host: None,
         };
         store.insert_project(&dup("p2", "w2")).unwrap();
         // …but still refused twice in the same one.
@@ -2003,6 +2038,7 @@ mod tests {
             divider_label: None,
             divider_before: false,
             divider_before_label: None,
+            host: None,
         };
         store.insert_project(&project).unwrap();
         assert_eq!(store.count_workspace_projects(&client.id).unwrap(), 1);
@@ -2035,6 +2071,7 @@ mod tests {
             divider_label: None,
             divider_before: false,
             divider_before_label: None,
+            host: None,
         };
         store.insert_project(&project).unwrap();
         let wt = Worktree {
@@ -2148,6 +2185,7 @@ mod tests {
             divider_label: None,
             divider_before: false,
             divider_before_label: None,
+            host: None,
         };
         store.insert_project(&project).unwrap();
         let worktree = Worktree {
@@ -2197,6 +2235,7 @@ mod tests {
             divider_label: None,
             divider_before: false,
             divider_before_label: None,
+            host: None,
         };
         store.insert_project(&project).unwrap();
         let worktree = Worktree {
@@ -2266,6 +2305,7 @@ mod tests {
             divider_label: None,
             divider_before: false,
             divider_before_label: None,
+            host: None,
         };
         store.insert_project(&project).unwrap();
         let wt = Worktree {

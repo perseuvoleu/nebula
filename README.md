@@ -100,7 +100,10 @@ right-click) opens a context menu for whatever's selected.
 The panels aren't the only view. With a worktree selected, from any panel:
 
 - **`g` — git diff.** Changed files down the left, the diff on the right, with
-  a live fuzzy filter. `Ctrl+r` marks a file reviewed ✓ and sinks it to the
+  a live fuzzy filter. It opens on the working tree (uncommitted changes vs
+  HEAD); `Ctrl+g` picks something else to compare — the working tree against
+  the branch's upstream, or any recent commit on its own (what that commit
+  changed vs its parent). `Ctrl+r` marks a file reviewed ✓ and sinks it to the
   bottom — nebula-side bookkeeping only, no git state is touched — and every
   mark clears itself when HEAD moves or the file changes again, so what's left
   unticked is genuinely what you haven't read.
@@ -226,7 +229,7 @@ Defaults — every one of them is rebindable in Settings → Hotkeys (`s`).
 | Sessions | `n` | new session (agent or shell terminal) |
 | Sessions | `r`, `a`, `u`, `d`, `A` | rename, archive, unarchive, delete, toggle archived |
 | Any panel | `Shift+D` | delete every row of the focused panel (confirm lists the casualties) |
-| Any panel | `g` | git diff for the selected worktree: filter, `↑↓` files, `Shift+↑↓`/`PgUp/PgDn`/`Ctrl+d/u` scroll, `Ctrl+r` marks a file reviewed ✓ |
+| Any panel | `g` | git diff for the selected worktree: filter, `↑↓` files, `Shift+↑↓`/`PgUp/PgDn`/`Ctrl+d/u` scroll, `Ctrl+g` picks what to compare (working tree, upstream, a commit), `Ctrl+r` marks a file reviewed ✓ |
 | Any panel | `Shift+G` | open the selected repo's page on its git host — the `origin` remote (`git@github.com:o/r.git`, `ssh://`, `https://`) turned into a browsable URL, credentials stripped |
 | Any panel | `f` / `F` / `b` | find file / find in files (`git grep`) / file tree browser, all scoped to the selected worktree — `Enter` opens the file in an editor modal (at the matched line, for `F`); in `f` and `b`, `Ctrl+y` copies the path |
 | Any panel | `l` | attach a link (pull request, doc, ticket) to the selected worktree — it lands in the Sessions panel's LINKS group, above any open pull request nebula finds with `gh` |
@@ -257,6 +260,8 @@ bypass — same as tmux).
 ```
 nebula                    # launch the TUI (auto-starts the daemon)
 nebula add <dir>          # add a repo as a project, named after its root directory
+nebula add <host>:<dir>   # add a checkout on another machine (an ssh destination); its
+                          # sessions, shells and git all run there over ssh — see below
 nebula add .              # same, for the repo you're in (bare `nebula <dir>` / `nebula .` also work)
 nebula daemon             # run the daemon (normally auto-spawned)
 nebula daemon --foreground  # daemon with logs to stderr, for debugging
@@ -269,8 +274,33 @@ nebula workspace rename <a> <b> # rename a workspace
 nebula workspace delete <name>  # delete an empty workspace
 nebula ssh <host> [dir]   # open nebula on a remote machine over ssh (installs it there if
                           # missing); destinations are remembered for the TUI's `h` picker
+nebula hooks install <kind> [dir]  # install an agent CLI's status hooks (what a spawn does;
+                          # remote spawns run it on the far host)
 nebula upgrade            # install the latest release (--force on a dev build)
 ```
+
+### Remote projects
+
+`nebula add findl:/srv/app` (any `ssh` destination — an alias from
+`~/.ssh/config` works) adds a checkout that lives on another machine. It shows
+in the Projects panel as `app @findl`, and everything under it happens over
+ssh from this daemon: `git` for the diff, branch and grep views; `t` shells
+that land in the remote checkout; and agent sessions, which run the CLI on
+the far host with the same status hooks (the spawn reverse-forwards the hook
+receiver through the ssh connection, so dots, auto-titles and `nebula rename`
+work unchanged). The remote host needs `nebula` and the agent CLIs installed
+and logged in (`nebula ssh host` installs nebula). Local-only tools — the
+editor, file finder, tree browser, `gh` — say so instead of opening a remote
+path.
+
+A local project and its remote twin (same name, added from both places) get
+cross rows in the new-session picker: `Run on findl ▸` under the local one,
+`Run locally ▸` under the remote one — local ⇄ remote is one keypress inside
+the same flow. Give the host `ControlMaster auto` in `~/.ssh/config` so the
+many short git hops share one connection. The per-run hook token rides the
+ssh command line, so other accounts on the remote host could read it from
+`ps` — it only lets them post status for your sessions, but treat shared
+boxes accordingly.
 
 Settings: `~/.local/share/nebula/config.json` (or the platform equivalent),
 beside the database — hand-editable, and what the `s` overlay writes.

@@ -34,6 +34,13 @@ jobs:
         if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
+      # The default build compiles libghostty-vt (the pane's terminal engine)
+      # from ghostty sources; that needs this exact zig, cross-targets
+      # included.
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
       - name: Add rust target
         run: rustup target add ${{ matrix.target }}
 

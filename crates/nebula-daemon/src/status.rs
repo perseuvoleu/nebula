@@ -18,8 +18,15 @@
 //!   (OSC 9;4, see `pty::progress`). It is the only signal that survives a
 //!   user cancel — no hook fires at all there, and Claude suppresses
 //!   `idle_prompt` precisely because the user just touched the keyboard.
+//! - The subagent hold is Claude-only (`track_subagents`). Codex fires
+//!   `SubagentStart` from a spawned child thread but no `SubagentStop` when
+//!   the parent aborts that child's turn (verified on 0.152: every wedged
+//!   session had a child rollout ending in `turn_aborted`), and it emits
+//!   neither `idle_prompt` nor OSC 9;4, so a held `Stop` had nothing to
+//!   release it short of the 2h subagent TTL. For those CLIs `Stop` is the
+//!   only end-of-turn signal there is, so it is authoritative.
 
-use nebula_core::AgentStatus;
+use nebula_core::{AgentKind, AgentStatus};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -144,6 +151,9 @@ pub struct AgentStatusMachine {
     stop_held: bool,
     /// When the subagent set last became empty during a held Stop.
     drain_idle_since: Option<Instant>,
+    /// Whether subagent events are tracked at all. Off, `Stop` finishes the
+    /// turn regardless of children and SubagentStart never heals.
+    track_subagents: bool,
 }
 
 impl AgentStatusMachine {
@@ -155,7 +165,17 @@ impl AgentStatusMachine {
             finished_at: None,
             stop_held: false,
             drain_idle_since: None,
+            track_subagents: true,
         }
+    }
+
+    /// Only Claude's Stop can precede live Task subagents *and* has the
+    /// idle/progress backstops that release a held Stop; every other CLI
+    /// gets `Stop` as the authoritative end of turn. See the module doc.
+    pub fn for_kind(status: AgentStatus, session_id: Option<String>, kind: AgentKind) -> Self {
+        let mut m = Self::new(status, session_id);
+        m.track_subagents = kind == AgentKind::Claude;
+        m
     }
 
     pub fn status(&self) -> AgentStatus {
@@ -246,6 +266,8 @@ impl AgentStatusMachine {
                     self.set_status(AgentStatus::Running, &mut effects);
                 }
             }
+            HookEvent::SubagentStart { .. } | HookEvent::SubagentStop { .. }
+                if !self.track_subagents => {}
             HookEvent::SubagentStart { subagent_id } => {
                 self.subagents.start(subagent_id, now);
                 if self.status == AgentStatus::Finished {
@@ -592,6 +614,52 @@ mod tests {
         assert!(fx.is_empty(), "grace not elapsed yet");
         let fx = m.tick(now + Duration::from_secs(61) + DRAIN_GRACE);
         assert_eq!(status_of(&fx), Some(AgentStatus::Finished));
+    }
+
+    #[test]
+    fn codex_stop_is_authoritative_despite_unstopped_subagents() {
+        // Codex 0.152: a child thread whose turn the parent aborts fires
+        // SubagentStart but never SubagentStop, and codex has no idle or
+        // progress signal to release a held Stop.
+        let mut m = AgentStatusMachine::for_kind(AgentStatus::Fresh, None, AgentKind::Codex);
+        let now = t0();
+        m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
+        m.handle(
+            HookEvent::SubagentStart {
+                subagent_id: Some("child".into()),
+            },
+            Some("s1"),
+            now,
+        );
+        let fx = m.handle(HookEvent::Stop, Some("s1"), now + Duration::from_secs(5));
+        assert_eq!(status_of(&fx), Some(AgentStatus::Finished));
+
+        // A late SubagentStart must not heal it back either.
+        let fx = m.handle(
+            HookEvent::SubagentStart {
+                subagent_id: Some("child2".into()),
+            },
+            Some("s1"),
+            now + Duration::from_secs(6),
+        );
+        assert!(fx.is_empty(), "{fx:?}");
+        assert_eq!(m.status(), AgentStatus::Finished);
+    }
+
+    #[test]
+    fn claude_keeps_the_subagent_hold_via_for_kind() {
+        let mut m = AgentStatusMachine::for_kind(AgentStatus::Fresh, None, AgentKind::Claude);
+        let now = t0();
+        m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
+        m.handle(
+            HookEvent::SubagentStart {
+                subagent_id: Some("sub1".into()),
+            },
+            Some("s1"),
+            now,
+        );
+        m.handle(HookEvent::Stop, Some("s1"), now + Duration::from_secs(5));
+        assert_eq!(m.status(), AgentStatus::Running);
     }
 
     #[test]

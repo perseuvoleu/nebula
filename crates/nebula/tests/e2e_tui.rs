@@ -387,7 +387,8 @@ fn tui_projects_worktrees_agents_navigation() {
     tui.send(b"\r");
     tui.wait_for_gone("Add project");
     tui.wait_for_text("alpha-proj");
-    tui.wait_for_text("main ⌂ primary"); // main checkout appears as the root row
+    tui.wait_for_text("⌂ primary"); // the primary checkout is the root row
+    tui.wait_for_text("on main"); // …with its branch on the sub-line
 
     // The live directory browser: typing "…/T/.tmpX/" lists both repos as
     // rows (no Tab needed), then Esc cancels.
@@ -435,7 +436,7 @@ fn tui_projects_worktrees_agents_navigation() {
     tui.send(b"k");
     tui.wait_for_selected("feat-a");
     tui.send(b"k");
-    tui.wait_for_selected("main ⌂ primary");
+    tui.wait_for_selected("⌂ primary");
     tui.send(b"j");
     tui.wait_for_selected("feat-a");
 
@@ -489,12 +490,12 @@ fn tui_projects_worktrees_agents_navigation() {
     tui.send(b"j"); // select beta-proj
     tui.wait_for_selected("beta-proj");
     tui.wait_for_gone("feat-a"); // beta has only its main checkout
-    tui.wait_for_text("main ⌂ primary");
+    tui.wait_for_text("⌂ primary");
     tui.wait_for_sessions_row_gone("agent-1");
 
     // ---- the root row tracks live branch switches, no restart needed ----
     repo_git(&beta, &["checkout", "-b", "hotfix"]);
-    tui.wait_for_text("hotfix ⌂ primary");
+    tui.wait_for_text("on hotfix"); // the sub-line follows; the row keeps its name
     tui.send(b"k"); // back to alpha-proj
     tui.wait_for_selected("alpha-proj");
     tui.wait_for_text("feat-a");
@@ -794,13 +795,20 @@ fn tui_git_diff_modal() {
         tui.screen_text()
     );
 
-    // ---- clean tree flashes instead of opening ----
+    // ---- clean tree opens an empty viewer; ^g picks the commit ----
     repo_git(&repo, &["add", "."]);
     repo_git(&repo, &["commit", "-m", "wip"]);
     // The commit empties the badge on the next poll.
     tui.wait_for_gone("+2 files");
     tui.send(b"g");
-    tui.wait_for_text("no changes in main");
+    tui.wait_for_text("working tree clean");
+    tui.send(b"\x07"); // ^g
+    tui.wait_for_text("Compare with");
+    tui.send(b"\x1b[B"); // ↓ onto the "wip" commit
+    tui.send(b"\r");
+    tui.wait_for_text("Files (2)");
+    tui.send(b"\x1b");
+    tui.wait_for_gone("Files (2)");
 }
 
 /// Killing the daemon out from under a running TUI (what `nebula kill`

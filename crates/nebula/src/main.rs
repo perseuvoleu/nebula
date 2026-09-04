@@ -1,7 +1,7 @@
 mod ssh;
 mod upgrade;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -66,6 +66,26 @@ enum Command {
         #[command(subcommand)]
         command: WorktreeCommand,
     },
+    /// Move this shell onto a branch. A branch lives where the project
+    /// is: it is checked out in the primary checkout (created first like
+    /// `git checkout -b`, from the branch this shell is on) and the shell
+    /// `cd`s there. `--worktree` gives it its own directory instead, for
+    /// parallel work. A branch that already has a checkout is entered
+    /// as-is. Inside a nebula terminal the `cd` is typed into the tab.
+    Switch {
+        /// Local branch name (created when missing).
+        branch: String,
+        /// Base for a new branch (default: the branch checked out here).
+        #[arg(long)]
+        from: Option<String>,
+        /// Give the branch its own worktree directory (`(wt)` row) instead
+        /// of checking it out in the primary.
+        #[arg(long)]
+        worktree: bool,
+        /// Project name (default: the project owning this shell or cwd).
+        #[arg(long)]
+        project: Option<String>,
+    },
     /// Spawn and inspect agent sessions from the command line — how a
     /// session delegates work to and manages its workers.
     Agent {
@@ -84,6 +104,13 @@ enum Command {
     Todo {
         #[command(subcommand)]
         command: Option<TodoCommand>,
+    },
+    /// Install an agent CLI's nebula status hooks into a checkout — what
+    /// the daemon does before every spawn; run on the far host by a remote
+    /// session's ssh spawn, where this daemon's installer can't reach.
+    Hooks {
+        #[command(subcommand)]
+        command: HooksCommand,
     },
     /// Open nebula on a remote host over ssh (installs it there if missing).
     Ssh {
@@ -145,6 +172,17 @@ enum WorktreeCommand {
         /// Remove even with uncommitted changes.
         #[arg(long)]
         force: bool,
+        /// Project name (default: the calling session's project).
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Check a branch out in the primary checkout. A nebula worktree
+    /// holding that branch is removed first (the branch is kept); refused
+    /// while sessions still run on it. Never detach a worktree by hand to
+    /// free a branch — this is the supported route.
+    Checkout {
+        /// Local branch name.
+        branch: String,
         /// Project name (default: the calling session's project).
         #[arg(long)]
         project: Option<String>,
@@ -326,6 +364,17 @@ enum TodoCommand {
 }
 
 #[derive(Subcommand)]
+enum HooksCommand {
+    /// Install `kind`'s hooks (claude, codex, cursor, pi) for `dir`.
+    Install {
+        kind: String,
+        /// The checkout the CLI will run in (default: the current directory).
+        #[arg(default_value = ".")]
+        dir: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum WorkspaceCommand {
     /// Create a workspace (does not open it).
     Add { name: String },
@@ -350,6 +399,15 @@ fn main() -> Result<()> {
             )
         }
         Some(Command::Add { path }) => nebula_tui::run_add_project(path),
+        Some(Command::Hooks {
+            command: HooksCommand::Install { kind, dir },
+        }) => {
+            let kind = nebula_core::AgentKind::parse(&kind)
+                .ok_or_else(|| anyhow::anyhow!("unknown agent kind: {kind}"))?;
+            let dir = std::fs::canonicalize(&dir)
+                .with_context(|| format!("{dir} does not exist"))?;
+            nebula_daemon::hooks::installer::install_for_kind(kind, &dir)
+        }
         Some(Command::Open { path }) => {
             // Absolute before the TUI starts: the daemon and the panels
             // both need a path that survives any later cwd changes.
@@ -382,7 +440,16 @@ fn main() -> Result<()> {
                 force,
                 project,
             } => nebula_tui::run_worktree_delete(name, force, project),
+            WorktreeCommand::Checkout { branch, project } => {
+                nebula_tui::run_worktree_checkout(branch, project)
+            }
         },
+        Some(Command::Switch {
+            branch,
+            from,
+            worktree,
+            project,
+        }) => nebula_tui::run_switch(branch, from, worktree, project),
         Some(Command::Agent { command }) => match command {
             AgentCommand::New {
                 worktree,
@@ -513,7 +580,10 @@ fn run_tui_and_handoff(open_at: Option<std::path::PathBuf>) -> Result<()> {
             let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
             eprintln!("nebula: reloading…");
             let err = std::process::Command::new(&exe).args(&args).exec();
-            Err(anyhow::anyhow!("re-exec of {} failed: {err}", exe.display()))
+            Err(anyhow::anyhow!(
+                "re-exec of {} failed: {err}",
+                exe.display()
+            ))
         }
         Handoff::None => Ok(()),
     }

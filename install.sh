@@ -51,11 +51,27 @@ install_from_release() {
     install -m 755 "$tmp/nebula" "$INSTALL_DIR/nebula"
 }
 
+# The pane's terminal engine (libghostty-vt) is compiled from ghostty sources
+# by zig 0.15.x. Only that build needs zig — released binaries ship it linked
+# in already.
+has_zig_0_15() {
+    command -v zig >/dev/null 2>&1 || return 1
+    case "$(zig version 2>/dev/null)" in
+    0.15.*) return 0 ;;
+    *) return 1 ;;
+    esac
+}
+
 install_from_source() {
     command -v cargo >/dev/null 2>&1 ||
         err "no prebuilt binary available and cargo is not installed — get Rust from https://rustup.rs and re-run"
+    features=""
+    if ! has_zig_0_15; then
+        say "zig 0.15 not found — building the vt100 pane instead of the Ghostty one"
+        features="--no-default-features"
+    fi
     say "building from source (this takes a few minutes)…"
-    cargo install --git "https://github.com/$REPO" nebula --locked --force
+    cargo install --git "https://github.com/$REPO" nebula --locked --force $features
 }
 
 main() {

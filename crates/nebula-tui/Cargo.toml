@@ -19,6 +19,17 @@ tui-term = "0.3"
 vt100 = "0.16"
 portable-pty = "0.9"
 futures = "0.3"
+# The Ghostty VT engine (feature `ghostty`, on by default) renders the
+# attached pane; vt100 + tui-term stay as the fallback and still back links,
+# selection and mouse modes. Needs zig 0.15.2 to build — see the Makefile.
+libghostty-vt = { version = "0.2.1", optional = true }
+
+[features]
+# On by default: the pane renders through Ghostty's VT engine. Building it
+# needs zig 0.15.2 on PATH (`brew install zig@0.15`); `cargo build
+# --no-default-features` drops it and falls back to vt100 + tui-term.
+default = ["ghostty"]
+ghostty = ["dep:libghostty-vt"]
 
 [dev-dependencies]
 tempfile = "3"

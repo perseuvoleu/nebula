@@ -56,10 +56,11 @@ async fn serve() -> Result<()> {
     // Hook receiver: loopback HTTP endpoint the claude hook one-liners hit.
     // It shares the store to answer UserPromptSubmit hooks with the
     // auto-title instruction while a session is still untitled.
-    let (hook_env, mut hook_rx) = hooks::start_hook_server(store.clone()).await?;
+    let (hook_env, mut hook_rx, mut cmd_rx) = hooks::start_hook_server(store.clone()).await?;
     tracing::info!(port = hook_env.port, "hook receiver listening");
 
     let daemon = registry::Daemon::new(store, hook_env);
+    daemon.refresh_remote_hosts();
 
     // Drain hook events into the status machines; a payload that reports a
     // cwd inside another worktree of the same project re-homes the agent row.
@@ -82,6 +83,31 @@ async fn serve() -> Result<()> {
                         session_id.as_deref(),
                         captures_session,
                     );
+                }
+            }
+        });
+    }
+
+    // Verbs tunnelled in from remote sessions (`nebula rename` on the far
+    // side of an ssh spawn).
+    {
+        let daemon = daemon.clone();
+        tokio::spawn(async move {
+            while let Some(cmd) = cmd_rx.recv().await {
+                match cmd {
+                    hooks::RemoteCommand::Rename {
+                        agent_id,
+                        title,
+                        force,
+                        reply,
+                    } => {
+                        let result = if force {
+                            daemon.rename_agent(&agent_id, &title)
+                        } else {
+                            daemon.auto_rename_agent(&agent_id, &title)
+                        };
+                        let _ = reply.send(result.map_err(|e| e.to_string()));
+                    }
                 }
             }
         });
@@ -157,6 +183,10 @@ async fn serve() -> Result<()> {
                     _ = daemon.shutdown.cancelled() => break,
                     _ = interval.tick() => {}
                 }
+                // Shell tabs follow their shell's cwd across checkouts —
+                // every tick, since the kernel read costs nothing and the
+                // shell reports no event of its own.
+                daemon.sync_terminal_cwds();
                 let Ok((projects, _, _, _)) = daemon.store.load_tree() else {
                     continue;
                 };

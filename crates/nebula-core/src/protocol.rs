@@ -80,6 +80,11 @@ pub enum ClientRequest {
         /// Create `path` (and `git init` it, per config) when it doesn't
         /// exist on disk. Set only after the user confirmed in the client.
         create_missing: bool,
+        /// ssh destination when `path` is on another machine (`nebula add
+        /// host:/path`). The daemon reads the repo over ssh and never
+        /// creates a missing remote directory.
+        #[serde(default)]
+        host: Option<String>,
     },
     RemoveProject {
         req_id: u64,
@@ -121,6 +126,15 @@ pub enum ClientRequest {
         req_id: u64,
         id: WorktreeId,
         force: bool,
+    },
+    /// Check `branch` out in the project's primary checkout. When the
+    /// branch lives in a nebula worktree, that checkout is removed first
+    /// (the branch itself is kept) — refused while sessions still run on
+    /// it, so nobody is left on a detached HEAD.
+    CheckoutPrimary {
+        req_id: u64,
+        project: ProjectId,
+        branch: String,
     },
     /// Pin/unpin the worktree in the worktrees list (pure metadata).
     SetWorktreePinned {
