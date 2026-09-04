@@ -87,7 +87,11 @@ pub async fn remote_home(host: &str) -> Result<PathBuf> {
         .iter()
         .map(|s| s.to_string())
         .collect();
-    argv.extend(["--".to_string(), host.to_string(), "printf %s \"$HOME\"".into()]);
+    argv.extend([
+        "--".to_string(),
+        host.to_string(),
+        "printf %s \"$HOME\"".into(),
+    ]);
     let output = Command::new("ssh").args(&argv).output().await?;
     if !output.status.success() {
         bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
@@ -128,6 +132,17 @@ pub async fn branch_exists(repo: &Path, branch: &str) -> bool {
     git(repo, &["show-ref", "--verify", "--quiet", &head])
         .await
         .is_ok()
+}
+
+/// Bring `branch` here from `origin` as a tracking branch — the
+/// checkout-on-another-host case, where the branch was pushed from the
+/// laptop but this clone has never fetched it. Fails when origin has no
+/// such branch (nothing was pushed yet).
+pub async fn fetch_branch(repo: &Path, branch: &str) -> Result<()> {
+    git(repo, &["fetch", "--quiet", "origin", branch]).await?;
+    let upstream = format!("origin/{branch}");
+    git(repo, &["branch", "--track", branch, &upstream]).await?;
+    Ok(())
 }
 
 /// The base a branch's oldest reflog entry names. Git writes

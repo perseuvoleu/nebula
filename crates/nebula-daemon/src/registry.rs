@@ -147,7 +147,11 @@ impl Daemon {
                 }
             }
         }
-        let gone: Vec<String> = relays.keys().filter(|h| !hosts.contains(*h)).cloned().collect();
+        let gone: Vec<String> = relays
+            .keys()
+            .filter(|h| !hosts.contains(*h))
+            .cloned()
+            .collect();
         for host in gone {
             tracing::info!(host = %host, "stopping relay: no anchors left");
             if let Some(relay) = relays.remove(&host) {
@@ -782,7 +786,10 @@ impl Daemon {
                 .project_in_workspace_on(&path, &workspace_id, Some(&host))?
                 .is_some()
             {
-                bail!("project already added to this workspace: {host}:{}", path.display());
+                bail!(
+                    "project already added to this workspace: {host}:{}",
+                    path.display()
+                );
             }
             let name = name.unwrap_or_else(|| {
                 path.file_name()
@@ -1364,7 +1371,12 @@ impl Daemon {
             .get_project(project_id)?
             .context("project not found")?;
         if !git::branch_exists(&project.repo_path, branch).await {
-            bail!("no local branch \"{branch}\"");
+            // Not here yet — a branch pushed from another machine can be
+            // fetched into place; one that was never pushed cannot.
+            if let Err(e) = git::fetch_branch(&project.repo_path, branch).await {
+                tracing::debug!(branch, error = %e, "fetch from origin failed");
+                bail!("no branch \"{branch}\" here or on origin — push it first, then retry");
+            }
         }
         let (_, worktrees, agents, terminals) = self.store.load_tree()?;
         let parked: Vec<&Worktree> = worktrees
@@ -4072,6 +4084,32 @@ mod tests {
 
         // Unknown branch: refused, nothing touched.
         assert!(daemon.checkout_primary(&pid, "nope").await.is_err());
+
+        // A branch that only origin has (pushed from another machine) is
+        // fetched into place and checked out — the "run on findl from a
+        // branch findl never saw" case.
+        let origin = root.join("origin.git");
+        git_in(
+            &root,
+            &[
+                "clone",
+                "--bare",
+                "-q",
+                repo.to_str().unwrap(),
+                "origin.git",
+            ],
+        );
+        git_in(
+            &repo,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        git_in(&origin, &["branch", "pushed", "main"]);
+        assert!(!git::branch_exists(&repo, "pushed").await);
+        daemon.checkout_primary(&pid, "pushed").await.unwrap();
+        assert_eq!(git::current_branch(&repo).await.unwrap(), "pushed");
+        // Still unknown everywhere: the error says what to do.
+        let err = daemon.checkout_primary(&pid, "nope").await.unwrap_err();
+        assert!(err.to_string().contains("push it first"), "{err}");
     }
 
     #[tokio::test]

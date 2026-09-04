@@ -405,7 +405,12 @@ fn wanted_paths(daemon: &Daemon, host: &str) -> Vec<PathBuf> {
 
 /// The slice of the host tree this daemon shows: projects that cover a
 /// wanted path or were adopted on our request, and everything under them.
-fn compute_scope(host: &Mirror, wanted: &[PathBuf], adopted: &HashSet<String>, host_name: &str) -> Mirror {
+fn compute_scope(
+    host: &Mirror,
+    wanted: &[PathBuf],
+    adopted: &HashSet<String>,
+    host_name: &str,
+) -> Mirror {
     let mut m = Mirror::default();
     for p in &host.projects {
         if covers(&p.repo_path, wanted) || adopted.contains(p.id.as_str()) {
@@ -435,12 +440,18 @@ fn compute_scope(host: &Mirror, wanted: &[PathBuf], adopted: &HashSet<String>, h
         }
     }
     for t in &host.todos {
-        if parent_ids(&Entity::Todo(t.clone())).iter().any(|id| m.ids.contains(id)) {
+        if parent_ids(&Entity::Todo(t.clone()))
+            .iter()
+            .any(|id| m.ids.contains(id))
+        {
             m.upsert(Entity::Todo(t.clone()));
         }
     }
     for n in &host.notes {
-        if parent_ids(&Entity::Note(n.clone())).iter().any(|id| m.ids.contains(id)) {
+        if parent_ids(&Entity::Note(n.clone()))
+            .iter()
+            .any(|id| m.ids.contains(id))
+        {
             m.upsert(Entity::Note(n.clone()));
         }
     }
@@ -512,12 +523,21 @@ fn missing_adds(relay: &Relay, daemon: &Daemon) -> Vec<ClientRequest> {
     let mut out = Vec::new();
     for path in &wanted {
         let covered = known.iter().any(|root| path.starts_with(root));
-        let asked = relay.pending_adds.lock().unwrap().values().any(|p| p == path);
+        let asked = relay
+            .pending_adds
+            .lock()
+            .unwrap()
+            .values()
+            .any(|p| p == path);
         if covered || asked {
             continue;
         }
         let req_id = relay.next_req.fetch_add(1, Ordering::Relaxed);
-        relay.pending_adds.lock().unwrap().insert(req_id, path.clone());
+        relay
+            .pending_adds
+            .lock()
+            .unwrap()
+            .insert(req_id, path.clone());
         out.push(ClientRequest::AddProject {
             req_id,
             path: path.clone(),
@@ -648,7 +668,14 @@ async fn handle_event(
             status,
             changed_at,
         } => {
-            if let Some(a) = relay.host_tree.lock().unwrap().agents.iter_mut().find(|a| a.id == agent) {
+            if let Some(a) = relay
+                .host_tree
+                .lock()
+                .unwrap()
+                .agents
+                .iter_mut()
+                .find(|a| a.id == agent)
+            {
                 a.status = status;
                 a.status_changed_at = changed_at;
             }
@@ -671,12 +698,18 @@ async fn handle_event(
             if asked.is_some() {
                 // Our own AddProject: the host's id is in scope from now on.
                 if let Some(EntityId::Project(id)) = &created {
-                    relay.adopted.lock().unwrap().insert(id.as_str().to_string());
+                    relay
+                        .adopted
+                        .lock()
+                        .unwrap()
+                        .insert(id.as_str().to_string());
                     rescope(relay, daemon, false);
                 }
                 return None;
             }
-            relay.answer(req_id, ServerEvent::Ack { req_id, created }).await;
+            relay
+                .answer(req_id, ServerEvent::Ack { req_id, created })
+                .await;
             None
         }
         ServerEvent::Error {
@@ -698,14 +731,19 @@ async fn handle_event(
                         .unwrap()
                         .projects
                         .iter()
-                        .find(|p| p.repo_path.file_name().map(|n| n.to_os_string()) == name && p.host.is_none())
+                        .find(|p| {
+                            p.repo_path.file_name().map(|n| n.to_os_string()) == name
+                                && p.host.is_none()
+                        })
                         .map(|p| p.id.as_str().to_string());
                     match candidate {
                         Some(id) => {
                             relay.adopted.lock().unwrap().insert(id);
                             rescope(relay, daemon, false);
                         }
-                        None => tracing::warn!(host = %relay.host, path = %path.display(), "host says the repo is already added but no project matches its name"),
+                        None => {
+                            tracing::warn!(host = %relay.host, path = %path.display(), "host says the repo is already added but no project matches its name")
+                        }
                     }
                 } else {
                     tracing::warn!(host = %relay.host, path = %path.display(), error = %message, "host refused the checkout");
@@ -772,10 +810,22 @@ impl Mirror {
 
     fn all_entity_ids(&self) -> Vec<EntityId> {
         let mut out = Vec::new();
-        out.extend(self.projects.iter().map(|p| EntityId::Project(p.id.clone())));
-        out.extend(self.worktrees.iter().map(|w| EntityId::Worktree(w.id.clone())));
+        out.extend(
+            self.projects
+                .iter()
+                .map(|p| EntityId::Project(p.id.clone())),
+        );
+        out.extend(
+            self.worktrees
+                .iter()
+                .map(|w| EntityId::Worktree(w.id.clone())),
+        );
         out.extend(self.agents.iter().map(|a| EntityId::Agent(a.id.clone())));
-        out.extend(self.terminals.iter().map(|t| EntityId::Terminal(t.id.clone())));
+        out.extend(
+            self.terminals
+                .iter()
+                .map(|t| EntityId::Terminal(t.id.clone())),
+        );
         out.extend(self.notes.iter().map(|n| EntityId::Note(n.id.clone())));
         out.extend(self.todos.iter().map(|t| EntityId::Todo(t.id.clone())));
         out.extend(self.links.iter().map(|l| EntityId::Link(l.id.clone())));
@@ -971,7 +1021,9 @@ mod tests {
         assert_eq!(request_req_id(&req), Some(7));
         let re = with_req_id(&req, 99).unwrap();
         assert_eq!(request_req_id(&re), Some(99));
-        assert!(matches!(re, ClientRequest::CreateTerminal { worktree, .. } if worktree.as_str() == "w1"));
+        assert!(
+            matches!(re, ClientRequest::CreateTerminal { worktree, .. } if worktree.as_str() == "w1")
+        );
         assert_eq!(request_req_id(&ClientRequest::Subscribe), None);
     }
 }
