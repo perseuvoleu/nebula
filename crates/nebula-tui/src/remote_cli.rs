@@ -109,7 +109,8 @@ fn ssh(host: &str, script: &str, tty: bool) -> Result<String> {
 /// Agent CLI processes on the host: (pid, cli, NEBULA_AGENT_ID or "").
 /// Linux `/proc` only — which is what a nebula server is.
 fn remote_agent_procs(host: &str) -> Result<Vec<(u32, String, String)>> {
-    let script = r#"for p in $(pgrep -x -d ' ' claude codex cursor-agent pi 2>/dev/null); do
+    // One regex — pgrep takes a single pattern; -x anchors it whole.
+    let script = r#"for p in $(pgrep -x -d ' ' 'claude|codex|cursor-agent|pi' 2>/dev/null); do
   c=$(ps -o comm= -p $p 2>/dev/null); id=$(tr '\0' '\n' < /proc/$p/environ 2>/dev/null | sed -n 's/^NEBULA_AGENT_ID=//p');
   echo "$p $c $id"; done"#;
     let out = ssh(host, script, false)?;
