@@ -106,6 +106,23 @@ fn ssh(host: &str, script: &str, tty: bool) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Agent ids with a live ssh client from this machine right now — every
+/// remote spawn's argv carries `nebula-remote '<id>'`. Prewarmed slots
+/// have such a client but no row in the snapshot, so this, not the
+/// snapshot, is what says a remote process is still ours.
+fn tunnelled_ids() -> Vec<String> {
+    let out = Command::new("ps").args(["-eo", "args"]).output();
+    let Ok(out) = out else { return Vec::new() };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| l.contains("ssh") && l.contains("nebula-remote '"))
+        .filter_map(|l| {
+            let rest = l.split("nebula-remote '").nth(1)?;
+            Some(rest.split('\'').next()?.to_string())
+        })
+        .collect()
+}
+
 /// Agent CLI processes on the host: (pid, cli, NEBULA_AGENT_ID or "").
 /// Linux `/proc` only — which is what a nebula server is.
 fn remote_agent_procs(host: &str) -> Result<Vec<(u32, String, String)>> {
@@ -147,11 +164,7 @@ async fn status(host: &str) -> Result<()> {
     }
     print_sessions(host, &snap, false).await?;
     // Processes the tunnel left behind.
-    let live: Vec<String> = sessions_on(&snap, host)
-        .iter()
-        .filter(|(a, ..)| a.alive)
-        .map(|(a, ..)| a.id.to_string())
-        .collect();
+    let live = tunnelled_ids();
     if let Ok(procs) = remote_agent_procs(host) {
         let orphans: Vec<_> = procs
             .iter()
@@ -294,16 +307,11 @@ fn upgrade(host: &str) -> Result<()> {
     Ok(())
 }
 
-/// Kill agent CLI processes on the host that carry a NEBULA_AGENT_ID this
-/// daemon no longer has a live PTY for — a tunnel that dropped without
+/// Kill agent CLI processes on the host that carry a NEBULA_AGENT_ID with
+/// no ssh client left on this machine — a tunnel that dropped without
 /// taking its CLI down. Processes without the marker are left alone.
 async fn clean(host: &str) -> Result<()> {
-    let snap = snapshot().await?;
-    let live: Vec<String> = sessions_on(&snap, host)
-        .iter()
-        .filter(|(a, ..)| a.alive)
-        .map(|(a, ..)| a.id.to_string())
-        .collect();
+    let live = tunnelled_ids();
     let orphans: Vec<(u32, String, String)> = remote_agent_procs(host)?
         .into_iter()
         .filter(|(_, _, id)| !id.is_empty() && !live.contains(id))
