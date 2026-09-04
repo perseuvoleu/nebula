@@ -283,7 +283,9 @@ nebula upgrade            # install the latest release (--force on a dev build)
 
 `nebula add findl:/srv/app` (any `ssh` destination — an alias from
 `~/.ssh/config` works) adds a checkout that lives on another machine. It shows
-in the Projects panel as `app @findl`, and everything under it happens over
+in the Projects panel as `app` with a pink `@findl` badge — the same badge
+marks its worktree rows, its sessions (in the tree, the global list and the
+tabs) and the breadcrumb — and everything under it happens over
 ssh from this daemon: `git` for the diff, branch and grep views; `t` shells
 that land in the remote checkout; and agent sessions, which run the CLI on
 the far host with the same status hooks (the spawn reverse-forwards the hook
@@ -294,9 +296,11 @@ editor, file finder, tree browser, `gh` — say so instead of opening a remote
 path.
 
 A local project and its remote twin (same name, added from both places) get
-cross rows in the new-session picker: `Run on findl ▸` under the local one,
-`Run locally ▸` under the remote one — local ⇄ remote is one keypress inside
-the same flow. Give the host `ControlMaster auto` in `~/.ssh/config` so the
+cross rows in every session picker: `Run on findl ▸` / `Run locally ▸` in the
+`n` picker, and flat `Claude on findl` … `Terminal on findl` rows in ⌘T and
+⌘D — local ⇄ remote is one keypress inside the same flow. On the command
+line, `--project name@host` picks the remote twin (`nebula agent new
+--project nebula@findl --kind pi`). Give the host `ControlMaster auto` in `~/.ssh/config` so the
 many short git hops share one connection. The per-run hook token rides the
 ssh command line, so other accounts on the remote host could read it from
 `ps` — it only lets them post status for your sessions, but treat shared

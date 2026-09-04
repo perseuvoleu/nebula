@@ -2390,6 +2390,18 @@ fn note_badge((open, total): (usize, usize), th: Theme) -> Option<(String, Style
     }
 }
 
+/// The remote badge: ` @host` in the theme's pink, on every row, tab and
+/// crumb that stands for something running on another machine. One shape
+/// everywhere so the eye learns it once. None for local things.
+fn remote_badge(host: Option<&str>, th: Theme) -> Option<Span<'static>> {
+    host.map(|h| {
+        Span::styled(
+            format!(" @{h}"),
+            Style::default().fg(th.remote).add_modifier(Modifier::BOLD),
+        )
+    })
+}
+
 /// Sweep shades for a status that animates: running rows shimmer yellow,
 /// needs-feedback rows red; every other status holds still. `enabled` is
 /// the animations setting — off, nothing animates.
@@ -2783,7 +2795,7 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
                 let p = &app.tree.projects[i];
                 (
                     row,
-                    project_label(p),
+                    p.name.clone(),
                     app.project_rollup(&p.id),
                     app.note_stats(&nebula_core::NoteOwner::Project(p.id.clone())),
                 )
@@ -2828,7 +2840,15 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
                 // Same note-count badge as worktree rows: the project's own
                 // notes only (worktree notes badge on their worktree).
                 let note_badge = note_badge(*notes, th);
-                let badge_len = note_badge.as_ref().map_or(0, |(s, _)| s.chars().count());
+                let remote = remote_badge(
+                    match row {
+                        ProjectRow::Project(i) => app.tree.projects[*i].host.as_deref(),
+                        ProjectRow::Divider { .. } => None,
+                    },
+                    th,
+                );
+                let badge_len = note_badge.as_ref().map_or(0, |(s, _)| s.chars().count())
+                    + remote.as_ref().map_or(0, |s| s.content.chars().count());
                 // Bold name: the top of the tree reads "biggest".
                 let mut spans = vec![status_dot(*roll, th)];
                 spans.extend(status_name_spans(
@@ -2837,6 +2857,7 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
                     sweep_ramp(*roll, th, app.animations),
                     app.sweep_phase(),
                 ));
+                spans.extend(remote);
                 if let Some((text, style)) = note_badge {
                     spans.push(Span::styled(text, style));
                 }
@@ -2950,13 +2971,16 @@ fn draw_global_sessions(f: &mut Frame, app: &mut App, inner: Rect, mid: usize) {
         }
         let roll = Some(a.status);
         let unseen = app.unseen_finished.contains(&a.id);
+        let remote = remote_badge(app.worktree_host(&a.worktree_id), th);
+        let remote_w = remote.as_ref().map_or(0, |s| s.content.chars().count());
         let mut spans = vec![unseen_dot(unseen, roll, th)];
         spans.extend(status_name_spans(
-            truncate(&a.name, (inner.width as usize).saturating_sub(3)),
+            truncate(&a.name, (inner.width as usize).saturating_sub(3 + remote_w)),
             unseen_or(unseen, th, Style::default().fg(th.muted)),
             sweep_ramp(roll, th, app.animations),
             app.sweep_phase(),
         ));
+        spans.extend(remote);
         let selected = selected_id.as_ref() == Some(&a.id);
         render_pill(f, inner, screen_row as isize, spans, selected, false, th);
         // Sub-line: which project it belongs to, and how long since it
@@ -3277,6 +3301,14 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             spans.push(Span::styled(guides, guide));
         }
         spans.push(status_dot(*roll, th));
+        // Remote checkouts carry the pink host badge after their tag.
+        let remote = remote_badge(
+            app.visible_worktrees()
+                .get(i)
+                .and_then(|w| app.worktree_host(&w.id)),
+            th,
+        );
+        let badge_len = badge_len + remote.as_ref().map_or(0, |s| s.content.chars().count());
         // Name budget: the rail marker render_pill prepends (1) plus the
         // status dot and its space (2), the row's tag, and any note badge.
         const RAIL_AND_DOT: usize = 3;
@@ -3310,6 +3342,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             ));
             spans.push(Span::styled(tag, Style::default().fg(tag_color)));
         }
+        spans.extend(remote);
         if let Some((text, style)) = note_badge {
             spans.push(Span::styled(text, style));
         }
@@ -3439,11 +3472,13 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                 }
             }
             let detail = detail.map(|label| format!("{label} "));
+            let remote = remote_badge(app.session_host(session), th);
             let name = truncate(
                 &name,
                 (inner.width as usize).saturating_sub(
                     4 + nest
                         + detail.as_ref().map_or(0, |label| label.chars().count())
+                        + remote.as_ref().map_or(0, |s| s.content.chars().count())
                         + usize::from(attached),
                 ),
             );
@@ -3460,6 +3495,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                     unseen_or(unseen, th, dim)
                 },
             ));
+            spans.extend(remote);
             f.render_widget(Paragraph::new(Line::from(spans)), r);
             if attached && r.width > 1 {
                 // Right side of the frame, flush with the panel edge.
@@ -3741,6 +3777,11 @@ fn session_tab(
             )
         }
     };
+    // Remote sessions: the pink host badge in the same slot the PR badge
+    // uses, so a tab says where it runs even when the title truncates.
+    if badge.is_none() {
+        badge = remote_badge(app.session_host(row), th);
+    }
     let badge_w = badge.as_ref().map_or(0, |b| b.content.chars().count());
     let top_w = 2 + name.content.chars().count() + badge_w;
     // The kind trails the model with one space between (or stands alone
@@ -4280,7 +4321,8 @@ fn breadcrumb(app: &App) -> Vec<Span<'static>> {
     let Some(project) = app.selected_project() else {
         return spans;
     };
-    spans.push(seg(&project_label(project), app.focus == Focus::Projects));
+    spans.push(seg(&project.name, app.focus == Focus::Projects));
+    spans.extend(remote_badge(project.host.as_deref(), th));
     if let Some(worktree) = app.selected_worktree() {
         spans.push(sep());
         spans.push(seg(&worktree.branch, app.focus == Focus::Worktrees));
@@ -4850,14 +4892,6 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 
-/// A project's row text: its name, plus `@host` when the checkout lives
-/// on another machine — the one cue that a session under it runs remote.
-pub fn project_label(p: &nebula_core::Project) -> String {
-    match &p.host {
-        Some(host) => format!("{} @{host}", p.name),
-        None => p.name.clone(),
-    }
-}
 
 #[cfg(test)]
 mod tests {

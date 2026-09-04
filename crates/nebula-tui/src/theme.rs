@@ -60,6 +60,11 @@ pub struct Theme {
     /// a dark ground, filling the whole focused panel so it reads as a
     /// faintly lit surface. Truecolor by necessity (see module docs).
     pub focus_tint: Color,
+    /// The remote badge (`@host` on rows, tabs and the crumb): hot pink in
+    /// every theme, so "this runs on another machine" is recognisable at a
+    /// glance regardless of the accent — it is a fact about the session,
+    /// not a look.
+    pub remote: Color,
 }
 
 impl Default for Theme {
@@ -82,6 +87,7 @@ impl Default for Theme {
             warn_sweep: [Color::Yellow, Color::Indexed(220), Color::Indexed(230)],
             err_sweep: [Color::Red, Color::Indexed(203), Color::Indexed(217)],
             focus_tint: Color::Rgb(4, 15, 16),
+            remote: Color::Indexed(205), // hot pink
         }
     }
 }

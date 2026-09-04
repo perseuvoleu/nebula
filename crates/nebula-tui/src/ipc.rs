@@ -529,14 +529,34 @@ fn resolve_project(
     agents: &[nebula_core::Agent],
     project_flag: Option<&str>,
 ) -> Result<nebula_core::Project> {
-    if let Some(name) = project_flag {
-        let mut hits = projects.iter().filter(|p| p.name == name);
-        let hit = hits.next().with_context(|| {
+    if let Some(flag) = project_flag {
+        // `name@host` picks a remote project's twin; a bare name means the
+        // local one when both exist (the panel's `name @host` spelling,
+        // minus the space).
+        let (name, host) = match flag.rsplit_once('@') {
+            Some((n, h)) if !n.is_empty() && !h.is_empty() => (n, Some(h)),
+            _ => (flag, None),
+        };
+        let mut named = projects.iter().filter(|p| p.name == name);
+        let hit = match host {
+            Some(h) => named.find(|p| p.host.as_deref() == Some(h)),
+            None => {
+                let all: Vec<_> = named.collect();
+                all.iter()
+                    .find(|p| p.host.is_none())
+                    .or_else(|| all.first())
+                    .copied()
+            }
+        };
+        let hit = hit.with_context(|| {
             format!(
-                "no project named \"{name}\" (have: {})",
+                "no project named \"{flag}\" (have: {})",
                 projects
                     .iter()
-                    .map(|p| p.name.as_str())
+                    .map(|p| match &p.host {
+                        Some(h) => format!("{}@{h}", p.name),
+                        None => p.name.clone(),
+                    })
                     .collect::<Vec<_>>()
                     .join(", ")
             )

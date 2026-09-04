@@ -141,7 +141,8 @@ enum Command {
 enum WorktreeCommand {
     /// List worktrees as JSON (branch, path, sessions living on each).
     List {
-        /// Project name (default: the calling session's project).
+        /// Project name, or `name@host` for a remote project (default: the
+        /// calling session's project).
         #[arg(long)]
         project: Option<String>,
         /// Every project, not just one.
@@ -159,7 +160,8 @@ enum WorktreeCommand {
         /// checkout's HEAD).
         #[arg(long)]
         from: Option<String>,
-        /// Project name (default: the calling session's project).
+        /// Project name, or `name@host` for a remote project (default: the
+        /// calling session's project).
         #[arg(long)]
         project: Option<String>,
     },
@@ -172,7 +174,8 @@ enum WorktreeCommand {
         /// Remove even with uncommitted changes.
         #[arg(long)]
         force: bool,
-        /// Project name (default: the calling session's project).
+        /// Project name, or `name@host` for a remote project (default: the
+        /// calling session's project).
         #[arg(long)]
         project: Option<String>,
     },
@@ -183,7 +186,8 @@ enum WorktreeCommand {
     Checkout {
         /// Local branch name.
         branch: String,
-        /// Project name (default: the calling session's project).
+        /// Project name, or `name@host` for a remote project (default: the
+        /// calling session's project).
         #[arg(long)]
         project: Option<String>,
     },
@@ -198,7 +202,8 @@ enum AgentCommand {
         /// "root"/"primary" for the primary checkout.
         #[arg(long)]
         worktree: Option<String>,
-        /// Project name (default: the calling session's project).
+        /// Project name, or `name@host` for a remote project (default: the
+        /// calling session's project).
         #[arg(long)]
         project: Option<String>,
         /// claude | codex | cursor | pi.
@@ -227,13 +232,15 @@ enum AgentCommand {
         /// Give up after this many seconds (nonzero exit).
         #[arg(long, default_value_t = 600)]
         timeout: u64,
-        /// Project name (default: the calling session's project).
+        /// Project name, or `name@host` for a remote project (default: the
+        /// calling session's project).
         #[arg(long)]
         project: Option<String>,
     },
     /// List agent sessions as JSON (name, kind, status, worktree, path).
     List {
-        /// Project name (default: the calling session's project).
+        /// Project name, or `name@host` for a remote project (default: the
+        /// calling session's project).
         #[arg(long)]
         project: Option<String>,
         /// Every project, not just one.
@@ -248,7 +255,8 @@ enum AgentCommand {
     Show {
         /// Session name (as shown in the panels).
         name: String,
-        /// Project name (default: the calling session's project).
+        /// Project name, or `name@host` for a remote project (default: the
+        /// calling session's project).
         #[arg(long)]
         project: Option<String>,
     },
@@ -260,7 +268,8 @@ enum AgentCommand {
         /// Keep only the last N lines (default: everything retained).
         #[arg(long)]
         lines: Option<usize>,
-        /// Project name (default: the calling session's project).
+        /// Project name, or `name@host` for a remote project (default: the
+        /// calling session's project).
         #[arg(long)]
         project: Option<String>,
     },
@@ -272,7 +281,8 @@ enum AgentCommand {
         /// The prompt; multiple words need no quotes.
         #[arg(required = true, num_args = 1..)]
         text: Vec<String>,
-        /// Project name (default: the calling session's project).
+        /// Project name, or `name@host` for a remote project (default: the
+        /// calling session's project).
         #[arg(long)]
         project: Option<String>,
     },
@@ -280,7 +290,8 @@ enum AgentCommand {
     Archive {
         /// Session name (as shown in the panels).
         name: String,
-        /// Project name (default: the calling session's project).
+        /// Project name, or `name@host` for a remote project (default: the
+        /// calling session's project).
         #[arg(long)]
         project: Option<String>,
     },
@@ -288,7 +299,8 @@ enum AgentCommand {
     Unarchive {
         /// Session name (as shown in the panels).
         name: String,
-        /// Project name (default: the calling session's project).
+        /// Project name, or `name@host` for a remote project (default: the
+        /// calling session's project).
         #[arg(long)]
         project: Option<String>,
     },
@@ -296,7 +308,8 @@ enum AgentCommand {
     Delete {
         /// Session name (as shown in the panels).
         name: String,
-        /// Project name (default: the calling session's project).
+        /// Project name, or `name@host` for a remote project (default: the
+        /// calling session's project).
         #[arg(long)]
         project: Option<String>,
     },
@@ -304,7 +317,8 @@ enum AgentCommand {
     Restart {
         /// Session name (as shown in the panels).
         name: String,
-        /// Project name (default: the calling session's project).
+        /// Project name, or `name@host` for a remote project (default: the
+        /// calling session's project).
         #[arg(long)]
         project: Option<String>,
     },

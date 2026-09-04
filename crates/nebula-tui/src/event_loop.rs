@@ -2659,19 +2659,43 @@ fn quick_terminal_shortcut(app: &mut App, out: &mut Vec<ClientRequest>) {
         },
         destructive: false,
     };
-    let items = vec![
+    let mut items = vec![
         kind_row("Claude", AgentKind::Claude),
         kind_row("Codex", AgentKind::Codex),
         kind_row("Pi", AgentKind::Pi),
         MenuItem {
             label: "Terminal (shell)".into(),
-            action: MenuAction::NewTerminal(worktree),
+            action: MenuAction::NewTerminal(worktree.clone()),
             destructive: false,
         },
     ];
+    let hover = items.len() - 1; // the shell row: ⌘T's historical behaviour
+    // The project's twins on other machines get the same rows, flat —
+    // ⌘T's promise is one keypress to a ready tab, so no submenu.
+    for (place, twin) in project_twins(app, &worktree) {
+        for (label, kind) in [
+            ("Claude", AgentKind::Claude),
+            ("Codex", AgentKind::Codex),
+            ("Pi", AgentKind::Pi),
+        ] {
+            items.push(MenuItem {
+                label: format!("{label} {}", on(&place)),
+                action: MenuAction::QuickAgentOfKind {
+                    worktree: twin.clone(),
+                    kind,
+                },
+                destructive: false,
+            });
+        }
+        items.push(MenuItem {
+            label: format!("Terminal {}", on(&place)),
+            action: MenuAction::NewTerminal(twin),
+            destructive: false,
+        });
+    }
     app.overlay = Some(Overlay::Menu(ContextMenu {
         title: Some("New tab".into()),
-        hover: items.len() - 1, // the shell row: ⌘T's historical behaviour
+        hover,
         items,
         at: None,
         area: ratatui::layout::Rect::default(),
@@ -2748,17 +2772,42 @@ fn toggle_split_terminal(app: &mut App, out: &mut Vec<ClientRequest>) {
         },
         destructive: false,
     };
-    let items = vec![
+    let mut items = vec![
         kind_row("Claude", AgentKind::Claude),
         kind_row("Codex", AgentKind::Codex),
         kind_row("Cursor", AgentKind::Cursor),
         kind_row("Pi", AgentKind::Pi),
         MenuItem {
             label: "Terminal (shell)".into(),
-            action: MenuAction::SplitShell(worktree),
+            action: MenuAction::SplitShell(worktree.clone()),
             destructive: false,
         },
     ];
+    let shell_row = items.len() - 1;
+    // Twins on other machines: the same rows, flat, so a local pane and a
+    // remote one sit side by side from one picker.
+    for (place, twin) in project_twins(app, &worktree) {
+        for (label, kind) in [
+            ("Claude", AgentKind::Claude),
+            ("Codex", AgentKind::Codex),
+            ("Cursor", AgentKind::Cursor),
+            ("Pi", AgentKind::Pi),
+        ] {
+            items.push(MenuItem {
+                label: format!("{label} {}", on(&place)),
+                action: MenuAction::SplitAgentOfKind {
+                    worktree: twin.clone(),
+                    kind,
+                },
+                destructive: false,
+            });
+        }
+        items.push(MenuItem {
+            label: format!("Terminal {}", on(&place)),
+            action: MenuAction::SplitShell(twin),
+            destructive: false,
+        });
+    }
     // Start on "another one of these": the attached agent's kind row, or
     // the shell row when a terminal (or nothing) is attached.
     let hover = match app.term.as_ref().map(|t| &t.sref) {
@@ -2774,7 +2823,7 @@ fn toggle_split_terminal(app: &mut App, out: &mut Vec<ClientRequest>) {
                 AgentKind::Pi => 3,
             })
             .unwrap_or(0),
-        Some(SessionRef::Terminal(_)) => items.len() - 1,
+        Some(SessionRef::Terminal(_)) => shell_row,
         None => 0,
     };
     app.overlay = Some(Overlay::Menu(ContextMenu {
@@ -3556,9 +3605,9 @@ fn open_agent_picker(app: &mut App, worktree: WorktreeId) {
     // their primary checkout — local ⇄ remote is one keypress inside the
     // same flow, no separate TUI to hop into.
     let host = app.worktree_host(&worktree).map(str::to_owned);
-    for (label, twin_main) in project_twins(app, &worktree) {
+    for (place, twin_main) in project_twins(app, &worktree) {
         items.push(MenuItem {
-            label,
+            label: format!("Run {} ▸", on(&place)),
             action: MenuAction::NewAgent(twin_main),
             destructive: false,
         });
@@ -3580,8 +3629,9 @@ fn open_agent_picker(app: &mut App, worktree: WorktreeId) {
 
 /// Twins of the worktree's project — projects of the same name in this
 /// workspace on a different host (a local checkout and its `nebula add
-/// findl:/path` counterpart, say) — as (`Run on …` label, primary
-/// worktree id) pairs for the new-session picker.
+/// findl:/path` counterpart, say) — as (where, primary worktree id) pairs
+/// for the session pickers; `where` is the host name, or "locally" for
+/// the checkout on this machine.
 fn project_twins(app: &App, worktree: &WorktreeId) -> Vec<(String, WorktreeId)> {
     let Some(w) = app.tree.worktrees.iter().find(|w| &w.id == worktree) else {
         return Vec::new();
@@ -3604,13 +3654,22 @@ fn project_twins(app: &App, worktree: &WorktreeId) -> Vec<(String, WorktreeId)> 
                 .worktrees
                 .iter()
                 .find(|x| x.project_id == p.id && x.is_main)?;
-            let label = match &p.host {
-                Some(h) => format!("Run on {h} ▸"),
-                None => "Run locally ▸".to_string(),
+            let place = match &p.host {
+                Some(h) => h.clone(),
+                None => "locally".to_string(),
             };
-            Some((label, main.id.clone()))
+            Some((place, main.id.clone()))
         })
         .collect()
+}
+
+/// "on findl" / "locally" — the twin rows' wording.
+fn on(place: &str) -> String {
+    if place == "locally" {
+        place.to_string()
+    } else {
+        format!("on {place}")
+    }
 }
 
 /// The project's local branches and the primary checkout's branch. The
@@ -9598,6 +9657,46 @@ mod tests {
             &i.action,
             MenuAction::NewAgentOfKind { worktree, kind: AgentKind::Pi, .. } if worktree.as_str() == "w-remote"
         )));
+
+        // ⌘T from the local worktree: flat "Pi on findl" / "Terminal on
+        // findl" rows aimed at the twin, shell row still hovered first.
+        app.overlay = None;
+        app.sel_worktree = 0;
+        let mut out = Vec::new();
+        quick_terminal_shortcut(&mut app, &mut out);
+        let Some(Overlay::Menu(menu)) = &app.overlay else {
+            panic!("expected the ⌘T picker");
+        };
+        assert_eq!(menu.items[menu.hover].label, "Terminal (shell)");
+        assert!(menu.items.iter().any(|i| i.label == "Pi on findl"
+            && matches!(&i.action, MenuAction::QuickAgentOfKind { worktree, kind: AgentKind::Pi } if worktree.as_str() == "w-remote")));
+        assert!(menu.items.iter().any(|i| i.label == "Terminal on findl"
+            && matches!(&i.action, MenuAction::NewTerminal(w) if w.as_str() == "w-remote")));
+    }
+
+    #[test]
+    fn remote_rows_carry_the_host_badge() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_remote_twin(&mut app);
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        // The remote project's row wears the badge; the local twin doesn't
+        // get one by mistake (both are named "demo").
+        assert!(text.contains("demo @findl"), "{text}");
+        assert!(!text.contains("demo @findl @findl"), "{text}");
+        // Select the remote project: its worktree row and the crumb badge.
+        app.sel_project = app
+            .tree
+            .projects
+            .iter()
+            .position(|p| p.host.is_some())
+            .unwrap();
+        app.sel_worktree = 0;
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.matches("@findl").count() >= 2, "{text}");
     }
 
     fn buffer_text(terminal: &Terminal<TestBackend>) -> String {

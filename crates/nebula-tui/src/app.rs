@@ -2785,6 +2785,17 @@ impl App {
             .as_deref()
     }
 
+    /// The ssh host a session runs on (via its worktree's project); None
+    /// for local sessions and links.
+    pub fn session_host(&self, row: &SessionRow) -> Option<&str> {
+        let worktree = match row {
+            SessionRow::Agent(a) => &a.worktree_id,
+            SessionRow::Terminal(t) => &t.worktree_id,
+            SessionRow::Link(_) => return None,
+        };
+        self.worktree_host(worktree)
+    }
+
     /// Push every remote checkout path into the process-wide host map so
     /// the git-backed panels reach the right machine. Called whenever the
     /// tree's projects or worktrees change.
