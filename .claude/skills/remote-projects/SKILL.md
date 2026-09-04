@@ -11,6 +11,16 @@ mirrors through a relay. The row shows as `repo` with a pink `@findl` badge (abs
 project of the same name when one exists). The host needs `nebula`, the agent CLIs and their logins
 installed; `nebula remote <host> upgrade` keeps nebula current there.
 
+## The host is findl. Always.
+
+Remote work goes to **findl** (ssh alias in `~/.ssh/config`, key on disk, no touch needed). Do not
+install nebula on, or anchor projects to, any other server unless the user names it explicitly for
+that purpose — other hosts in `~/.ssh/config` (vela, hetzner, …) are production or client machines.
+A project that should also run remotely is **cloned on findl under the same directory name as the
+local checkout** (so the rows merge into one), with its own read-write deploy key there
+(`gh repo deploy-key add … --allow-write`; one key per repo, aliased in findl's `~/.ssh/config`),
+then anchored with `nebula add findl:~/<name>`. Existing on findl: `nebula`, `vela-hub-fork`.
+
 ## The model (why it behaves the way it does)
 
 | Thing | Where it lives | Reached how |

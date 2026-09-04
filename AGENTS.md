@@ -27,7 +27,8 @@ Shared by every agent kind (claude, codex, cursor, pi). Open one only when its t
 - `.claude/skills/release/SKILL.md` — trigger: "release", "ship it", a new version, or questions
   about the release process.
 - `.claude/skills/remote-projects/SKILL.md` — trigger: "remote", "pe server", findl / `@host`,
-  `nebula remote`, sessions or checkouts on another machine, remote status stuck on fresh.
+  `nebula remote`, sessions or checkouts on another machine, remote rows missing. The remote host
+  is always findl; never set up another server for this without being told to.
 - `.claude/skills/sync-skills/SKILL.md` — trigger: "sync skills", updating skills on the server /
   findl, `nss`, or a remote agent missing a skill.
 - `.claude/skills/recall/SKILL.md` — Mission Control sessions only (MC_* env vars present):
