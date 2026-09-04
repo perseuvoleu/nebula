@@ -3750,9 +3750,12 @@ async fn relay_mirrors_a_host_and_its_sessions_outlive_the_viewer() {
     let mut daemon = env.spawn_daemon_with("/bin/sh", &relay_env);
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
-    write_frame(&mut c, &ClientRequest::Subscribe).await.unwrap();
+    write_frame(&mut c, &ClientRequest::Subscribe)
+        .await
+        .unwrap();
     read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        evs.iter().any(|e| matches!(e, ServerEvent::Snapshot { .. }))
+        evs.iter()
+            .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
     })
     .await;
 
@@ -3777,7 +3780,10 @@ async fn relay_mirrors_a_host_and_its_sessions_outlive_the_viewer() {
             })
     })
     .await;
-    assert!(matches!(find_ack(&events, 1), Some(ServerEvent::Ack { .. })), "{events:#?}");
+    assert!(
+        matches!(find_ack(&events, 1), Some(ServerEvent::Ack { .. })),
+        "{events:#?}"
+    );
     let project = events
         .iter()
         .find_map(|e| match e {
@@ -3860,23 +3866,31 @@ async fn relay_mirrors_a_host_and_its_sessions_outlive_the_viewer() {
     wait_for_exit(&mut daemon);
     let mut h = connect(&host_env.sock()).await;
     handshake(&mut h).await;
-    write_frame(&mut h, &ClientRequest::Subscribe).await.unwrap();
+    write_frame(&mut h, &ClientRequest::Subscribe)
+        .await
+        .unwrap();
     let events = read_events_until(&mut h, Duration::from_secs(5), |evs| {
-        evs.iter().any(|e| matches!(e, ServerEvent::Snapshot { .. }))
+        evs.iter()
+            .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
     })
     .await;
     let alive = events.iter().any(|e| {
         matches!(e, ServerEvent::Snapshot { terminals, .. }
             if terminals.iter().any(|t| t.id == term_id && t.alive))
     });
-    assert!(alive, "the host keeps the session after the viewer's daemon exits: {events:#?}");
+    assert!(
+        alive,
+        "the host keeps the session after the viewer's daemon exits: {events:#?}"
+    );
 
     // Back (laptop open): a fresh daemon mirrors the same rows and an
     // attach replays the ring — the marker is still on screen.
     let mut daemon = env.spawn_daemon_with("/bin/sh", &relay_env);
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
-    write_frame(&mut c, &ClientRequest::Subscribe).await.unwrap();
+    write_frame(&mut c, &ClientRequest::Subscribe)
+        .await
+        .unwrap();
     read_events_until(&mut c, Duration::from_secs(15), |evs| {
         evs.iter().any(|e| {
             matches!(e, ServerEvent::EntityUpserted { entity: Entity::Terminal(t) } if t.id == term_id)
@@ -3918,9 +3932,25 @@ async fn relay_follows_anchor_adds_and_removes() {
     std::fs::create_dir_all(&repo_b).unwrap();
     for args in [
         vec!["init", "-q", "-b", "main"],
-        vec!["-c", "user.email=e@x", "-c", "user.name=n", "commit", "-q", "--allow-empty", "-m", "init"],
+        vec![
+            "-c",
+            "user.email=e@x",
+            "-c",
+            "user.name=n",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ],
     ] {
-        assert!(std::process::Command::new("git").arg("-C").arg(&repo_b).args(&args).status().unwrap().success());
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo_b)
+            .args(&args)
+            .status()
+            .unwrap()
+            .success());
     }
     let mut host_daemon = host_env.spawn_daemon();
     let proxy = format!(
@@ -3934,9 +3964,12 @@ async fn relay_follows_anchor_adds_and_removes() {
     let mut daemon = env.spawn_daemon_with("/bin/sh", &relay_env);
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
-    write_frame(&mut c, &ClientRequest::Subscribe).await.unwrap();
+    write_frame(&mut c, &ClientRequest::Subscribe)
+        .await
+        .unwrap();
     read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        evs.iter().any(|e| matches!(e, ServerEvent::Snapshot { .. }))
+        evs.iter()
+            .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
     })
     .await;
 
@@ -3986,16 +4019,24 @@ async fn relay_follows_anchor_adds_and_removes() {
             && evs.iter().any(|e| matches!(e, ServerEvent::EntityRemoved { id: EntityId::Project(p) } if *p == b.id))
     })
     .await;
-    assert!(matches!(find_ack(&events, 3), Some(ServerEvent::Ack { .. })), "{events:#?}");
+    assert!(
+        matches!(find_ack(&events, 3), Some(ServerEvent::Ack { .. })),
+        "{events:#?}"
+    );
     let mut h = connect(&host_env.sock()).await;
     handshake(&mut h).await;
-    write_frame(&mut h, &ClientRequest::Subscribe).await.unwrap();
+    write_frame(&mut h, &ClientRequest::Subscribe)
+        .await
+        .unwrap();
     let events = read_events_until(&mut h, Duration::from_secs(5), |evs| {
-        evs.iter().any(|e| matches!(e, ServerEvent::Snapshot { .. }))
+        evs.iter()
+            .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
     })
     .await;
     assert!(
-        events.iter().any(|e| matches!(e, ServerEvent::Snapshot { projects, .. }
+        events
+            .iter()
+            .any(|e| matches!(e, ServerEvent::Snapshot { projects, .. }
             if projects.iter().any(|p| p.id == b.id))),
         "the host keeps its project: {events:#?}"
     );
@@ -4041,12 +4082,21 @@ async fn remote_add_project_unreachable_host_is_an_anchor_only() {
         find_ack(evs, 1).is_some()
     })
     .await;
-    assert!(matches!(find_ack(&events, 1), Some(ServerEvent::Ack { .. })), "{events:#?}");
-    assert!(!remote_path.exists(), "create_missing never applies to a remote path");
     assert!(
-        !events
-            .iter()
-            .any(|e| matches!(e, ServerEvent::EntityUpserted { entity: Entity::Project(_) })),
+        matches!(find_ack(&events, 1), Some(ServerEvent::Ack { .. })),
+        "{events:#?}"
+    );
+    assert!(
+        !remote_path.exists(),
+        "create_missing never applies to a remote path"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Project(_)
+            }
+        )),
         "no local project row is announced for a remote anchor"
     );
 

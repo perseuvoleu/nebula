@@ -17,7 +17,11 @@ pub enum RemoteOp {
     Sessions,
     /// Every ~2s until Ctrl-C.
     Watch,
-    Sync,
+    /// Skills, `git pull` on every remote checkout, and the local
+    /// project's `.env` files to the host (`force_env` overwrites).
+    Sync {
+        force_env: bool,
+    },
     Upgrade,
     /// `nebula kill` on the host: restarts its daemon, ending every
     /// session there.
@@ -32,7 +36,7 @@ pub async fn run(host: String, op: RemoteOp) -> Result<()> {
             print_sessions(&host, &snap, true).await
         }
         RemoteOp::Watch => watch(&host).await,
-        RemoteOp::Sync => sync(&host).await,
+        RemoteOp::Sync { force_env } => sync(&host, force_env).await,
         RemoteOp::Upgrade => upgrade(&host),
         RemoteOp::Restart => restart(&host),
     }
@@ -196,7 +200,7 @@ fn chrono_now() -> String {
 /// Skills (the same mirror `nss` runs) and a fast-forward pull on every
 /// remote checkout of the host's projects, so the server never trails the
 /// laptop by a stale branch or a missing skill.
-async fn sync(host: &str) -> Result<()> {
+async fn sync(host: &str, force_env: bool) -> Result<()> {
     match which("nebula-sync-skills") {
         Some(script) => {
             println!("skills → {host}");
@@ -232,6 +236,54 @@ async fn sync(host: &str) -> Result<()> {
         match ssh(host, &script, false) {
             Ok(out) => println!("git {}: {}", path, out.trim()),
             Err(e) => println!("git {}: {}", path, e),
+        }
+    }
+    // `.env`s: the laptop's checkout of the same project lends the host
+    // its env files — git never carries them, and a fresh clone on the
+    // host has none. Existing ones stay unless --force-env.
+    for remote in projects_on(&snap, host) {
+        let Some(local) = snap.0.iter().find(|p| {
+            p.host.is_none() && p.name == remote.name && p.workspace_id == remote.workspace_id
+        }) else {
+            continue;
+        };
+        let files = match nebula_core::envfiles::list_local(&local.repo_path) {
+            Ok(files) => files,
+            Err(e) => {
+                println!("env {}: {e}", remote.name);
+                continue;
+            }
+        };
+        if files.is_empty() {
+            println!("env {}: no local .env files", remote.name);
+            continue;
+        }
+        match nebula_core::envfiles::push(
+            &local.repo_path,
+            host,
+            &remote.repo_path,
+            &files,
+            force_env,
+        ) {
+            Ok(p) => {
+                let list = |v: &[std::path::PathBuf]| {
+                    v.iter()
+                        .map(|f| f.to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                if !p.sent.is_empty() {
+                    println!("env {} → {host}: sent {}", remote.name, list(&p.sent));
+                }
+                if !p.kept.is_empty() {
+                    println!(
+                        "env {}: kept on {host} (differs? --force-env overwrites): {}",
+                        remote.name,
+                        list(&p.kept)
+                    );
+                }
+            }
+            Err(e) => println!("env {} → {host}: {e}", remote.name),
         }
     }
     Ok(())

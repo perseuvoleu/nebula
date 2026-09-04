@@ -101,7 +101,10 @@ mod tests {
         assert_eq!(remap_home("/Users/me/app", Some("/Users/me")), "~/app");
         assert_eq!(remap_home("/Users/me", Some("/Users/me")), "~");
         assert_eq!(remap_home("/srv/app", Some("/Users/me")), "/srv/app");
-        assert_eq!(remap_home("/Users/meow/x", Some("/Users/me")), "/Users/meow/x");
+        assert_eq!(
+            remap_home("/Users/meow/x", Some("/Users/me")),
+            "/Users/meow/x"
+        );
         assert_eq!(remap_home("/Users/me/app", None), "/Users/me/app");
     }
 

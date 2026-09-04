@@ -398,8 +398,14 @@ enum RemoteCommand {
     Sessions,
     /// Live session list, refreshed every 2s.
     Watch,
-    /// Mirror skills (nebula-sync-skills) and fast-forward every remote checkout.
-    Sync,
+    /// Mirror skills (nebula-sync-skills), fast-forward every remote
+    /// checkout, and send the local `.env` files of each project to its
+    /// checkout on the host (ones the host already has are kept).
+    Sync {
+        /// Overwrite `.env` files the host already has with the local ones.
+        #[arg(long)]
+        force_env: bool,
+    },
     /// `nebula upgrade` on the host (its daemon keeps running the old
     /// build until `restart`).
     Upgrade,
@@ -449,8 +455,8 @@ fn main() -> Result<()> {
         }) => {
             let kind = nebula_core::AgentKind::parse(&kind)
                 .ok_or_else(|| anyhow::anyhow!("unknown agent kind: {kind}"))?;
-            let dir = std::fs::canonicalize(&dir)
-                .with_context(|| format!("{dir} does not exist"))?;
+            let dir =
+                std::fs::canonicalize(&dir).with_context(|| format!("{dir} does not exist"))?;
             nebula_daemon::hooks::installer::install_for_kind(kind, &dir)
         }
         Some(Command::Open { path }) => {
@@ -586,7 +592,7 @@ fn main() -> Result<()> {
                 RemoteCommand::Status => nebula_tui::RemoteOp::Status,
                 RemoteCommand::Sessions => nebula_tui::RemoteOp::Sessions,
                 RemoteCommand::Watch => nebula_tui::RemoteOp::Watch,
-                RemoteCommand::Sync => nebula_tui::RemoteOp::Sync,
+                RemoteCommand::Sync { force_env } => nebula_tui::RemoteOp::Sync { force_env },
                 RemoteCommand::Upgrade => nebula_tui::RemoteOp::Upgrade,
                 RemoteCommand::Restart => nebula_tui::RemoteOp::Restart,
             },

@@ -59,7 +59,10 @@ nebula agent send "fix login" "run the tests" --project nebula@findl
 status    nebula + daemon on the host, the sessions there (live; archived as a count)
 sessions  every session there, archived included
 watch     `sessions`, live, every 2s
-sync      skills (nebula-sync-skills) + `git pull --ff-only` on every remote checkout
+sync      skills (nebula-sync-skills) + `git pull --ff-only` on every remote checkout + the
+          local project's `.env*` files to its checkout on the host (existing ones kept;
+          `--force-env` overwrites). New worktrees, local or remote, get the primary's `.env*`s
+          copied in automatically; `nebula add host:…` pushes them once when a local twin exists.
 upgrade   `nebula upgrade` on the host; its daemon keeps the old build until `restart`
 restart   `nebula kill` on the host — ends every session there
 ```

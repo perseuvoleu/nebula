@@ -811,6 +811,31 @@ impl Daemon {
             self.store.insert_project(&project)?;
             self.refresh_remote_hosts();
             self.ensure_relays();
+            // A local checkout of the same project lends the new anchor
+            // its `.env`s — the host's clone has none — in the background,
+            // and never over ones the host already has.
+            let (projects, ..) = self.store.load_tree()?;
+            if let Some(twin) = projects.iter().find(|p| {
+                p.host.is_none() && p.name == project.name && p.workspace_id == project.workspace_id
+            }) {
+                let local = twin.repo_path.clone();
+                let host = project.host.clone().unwrap_or_default();
+                let remote = project.repo_path.clone();
+                tokio::task::spawn_blocking(move || {
+                    let result = nebula_core::envfiles::list_local(&local).and_then(|files| {
+                        nebula_core::envfiles::push(&local, &host, &remote, &files, false)
+                    });
+                    match result {
+                        Ok(p) => tracing::info!(
+                            host,
+                            sent = p.sent.len(),
+                            kept = p.kept.len(),
+                            "env files pushed to the new anchor"
+                        ),
+                        Err(error) => tracing::warn!(host, error = %error, "env files not pushed"),
+                    }
+                });
+            }
             return Ok(EntityId::Project(project.id));
         }
         if create_missing && !path.exists() {
@@ -1229,6 +1254,17 @@ impl Daemon {
         // root checkout's HEAD (which `git worktree add` reads too).
         let pre_existing = git::branch_exists(&project.repo_path, branch).await;
         let path = git::add_worktree(&project.repo_path, branch, base).await?;
+        // The root checkout's `.env`s come along — synchronously, they are
+        // tiny, and a session started right after must find them.
+        match git::seed_env_files(&project.repo_path, &path).await {
+            Ok(files) if !files.is_empty() => {
+                tracing::info!(project = %project.name, count = files.len(), "env files seeded")
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(project = %project.name, error = %error, "env files not seeded")
+            }
+        }
         if let Some(primary) = seed_primary.filter(|_| project.host.is_none()) {
             git::seed_node_modules_in_background(&primary, &path);
         }
@@ -4110,6 +4146,70 @@ mod tests {
         // Still unknown everywhere: the error says what to do.
         let err = daemon.checkout_primary(&pid, "nope").await.unwrap_err();
         assert!(err.to_string().contains("push it first"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn create_worktree_seeds_the_primary_env_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo = root.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-b", "main"]);
+        std::fs::write(repo.join(".gitignore"), ".env*\nnode_modules/\n").unwrap();
+        git_in(&repo, &["add", ".gitignore"]);
+        git_in(&repo, &["commit", "-q", "-m", "init"]);
+        std::fs::write(repo.join(".env"), "A=1").unwrap();
+        std::fs::create_dir_all(repo.join("apps/web")).unwrap();
+        std::fs::write(repo.join("apps/web/.env.local"), "B=2").unwrap();
+        std::fs::create_dir_all(repo.join("node_modules/x")).unwrap();
+        std::fs::write(repo.join("node_modules/x/.env"), "nope").unwrap();
+
+        let daemon = test_daemon();
+        let pid = ProjectId("p".into());
+        daemon
+            .store
+            .insert_project(&Project {
+                workspace_id: Default::default(),
+                id: pid.clone(),
+                name: "p".into(),
+                repo_path: repo.clone(),
+                sort_order: 0,
+                divider_after: false,
+                divider_before: false,
+                divider_label: None,
+                divider_before_label: None,
+                host: None,
+            })
+            .unwrap();
+        daemon
+            .store
+            .insert_worktree(&Worktree {
+                id: WorktreeId("root".into()),
+                project_id: pid.clone(),
+                path: repo.clone(),
+                branch: "main".into(),
+                is_main: true,
+                created_from: None,
+                pinned: false,
+                for_branch: false,
+                sort_order: 0,
+            })
+            .unwrap();
+        daemon.create_worktree(&pid, "feat", None).await.unwrap();
+        let (_, worktrees, _, _) = daemon.store.load_tree().unwrap();
+        let wt = worktrees.iter().find(|w| w.branch == "feat").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(wt.path.join(".env")).unwrap(),
+            "A=1"
+        );
+        assert_eq!(
+            std::fs::read_to_string(wt.path.join("apps/web/.env.local")).unwrap(),
+            "B=2"
+        );
+        assert!(
+            !wt.path.join("node_modules").exists(),
+            "dependency dirs stay out"
+        );
     }
 
     #[tokio::test]

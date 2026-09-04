@@ -1,6 +1,7 @@
 pub mod codec;
 pub mod crashlog;
 pub mod entities;
+pub mod envfiles;
 pub mod host;
 pub mod ids;
 pub mod mem;

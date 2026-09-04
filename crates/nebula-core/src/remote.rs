@@ -47,9 +47,7 @@ pub fn replace_all(entries: impl IntoIterator<Item = (PathBuf, String)>) {
 /// The host owning `path`, by longest registered prefix. None = local.
 pub fn host_for(path: &Path) -> Option<String> {
     let reg = registry().read().unwrap();
-    path.ancestors()
-        .find_map(|p| reg.get(p))
-        .cloned()
+    path.ancestors().find_map(|p| reg.get(p)).cloned()
 }
 
 /// Whether `path` is a remote checkout (or lives under one).
@@ -144,7 +142,10 @@ mod tests {
         let root = Path::new("/definitely/not/registered");
         let (prog, argv) = git_command(root, &["status", "-z"]);
         assert_eq!(prog, "git");
-        assert_eq!(argv, vec!["-C", "/definitely/not/registered", "status", "-z"]);
+        assert_eq!(
+            argv,
+            vec!["-C", "/definitely/not/registered", "status", "-z"]
+        );
     }
 
     #[test]
@@ -164,7 +165,11 @@ mod tests {
                 "'git' '-C' '/remote/repo/sub dir' 'log' '-1'"
             ]
         );
-        assert_eq!(host_for(Path::new("/remote")), None, "parent is not covered");
+        assert_eq!(
+            host_for(Path::new("/remote")),
+            None,
+            "parent is not covered"
+        );
         assert!(is_remote(Path::new("/remote/repo")));
     }
 }

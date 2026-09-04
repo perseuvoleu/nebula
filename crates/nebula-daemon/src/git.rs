@@ -303,6 +303,56 @@ pub async fn add_worktree(repo: &Path, branch: &str, base: Option<&str>) -> Resu
     }
 }
 
+/// The git-ignored env files of `repo` (local or remote), repo-relative.
+pub async fn env_files(repo: &Path) -> Result<Vec<PathBuf>> {
+    let out = git(
+        repo,
+        &[
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+        ],
+    )
+    .await?;
+    Ok(nebula_core::envfiles::env_paths_from_listing(
+        out.as_bytes(),
+    ))
+}
+
+/// Copy the primary checkout's env files into a fresh worktree, same
+/// relative paths — a worktree is a bare clone of the tree, and `.env`
+/// is exactly what git leaves out. Works where the checkout lives: a
+/// remote primary seeds its remote worktree over one ssh hop. Returns
+/// what was copied.
+pub async fn seed_env_files(primary: &Path, worktree: &Path) -> Result<Vec<PathBuf>> {
+    let files = env_files(primary).await?;
+    if files.is_empty() {
+        return Ok(files);
+    }
+    if nebula_core::remote::is_remote(primary) {
+        let src = primary.to_string_lossy();
+        let dst = worktree.to_string_lossy();
+        let script = format!(
+            "cd {} && tar -cf - {} | tar -C {} -xf -",
+            nebula_core::remote::ssh_quote(&src),
+            nebula_core::remote::join_quoted(files.iter().map(|f| f.to_str().unwrap_or(""))),
+            nebula_core::remote::ssh_quote(&dst),
+        );
+        ssh_run(primary, &["sh", "-c", &script]).await?;
+    } else {
+        for rel in &files {
+            let to = worktree.join(rel);
+            if let Some(parent) = to.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(primary.join(rel), &to)?;
+        }
+    }
+    Ok(files)
+}
+
 /// Best-effort clone of a primary checkout's top-level `node_modules` into a
 /// new worktree when their first package-manager lockfile matches exactly.
 /// The blocking filesystem work runs detached so worktree creation can reply
