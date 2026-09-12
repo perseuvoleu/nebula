@@ -52,6 +52,9 @@ pub struct SyncOpts {
     pub skills: bool,
     /// Project name when the cwd is not a checkout.
     pub project: Option<String>,
+    /// Which local checkout of the project: a branch, a directory name, or
+    /// `root`/`primary`. Default: the calling session's, else the cwd's.
+    pub worktree: Option<String>,
 }
 
 /// One action of a plan, in execution order. `Push*` sends a side's
@@ -699,9 +702,16 @@ pub fn sync_target(
 
 /// Which pair of checkouts: `--project` wins; otherwise the calling
 /// session's worktree, else the deepest local checkout holding the cwd.
-/// The twin is the same-named project of the same workspace with a host;
-/// the remote checkout is its worktree on this checkout's branch.
-pub fn resolve_target(snap: &Snapshot, project_flag: Option<&str>) -> Result<SyncTarget> {
+/// `--worktree` then picks one checkout of that project by branch,
+/// directory name or `root`/`primary` — the explicit form, for a sync
+/// from anywhere. The twin is the same-named project of the same
+/// workspace with a host; the remote checkout is its worktree on this
+/// checkout's branch, and nothing else on the host is touched.
+pub fn resolve_target(
+    snap: &Snapshot,
+    project_flag: Option<&str>,
+    worktree_flag: Option<&str>,
+) -> Result<SyncTarget> {
     let (projects, worktrees, agents) = snap;
     let cwd = std::env::current_dir().ok();
     let deepest_local = |filter: &dyn Fn(&nebula_core::Worktree) -> bool| {
@@ -750,6 +760,18 @@ pub fn resolve_target(snap: &Snapshot, project_flag: Option<&str>) -> Result<Syn
             bail!("this session lives on {h}; `nebula sync` runs from the local side");
         }
         (p, w.path.clone())
+    };
+    let local_path = match worktree_flag {
+        Some(sel) => {
+            let of_project: Vec<&nebula_core::Worktree> = worktrees
+                .iter()
+                .filter(|w| w.project_id == project.id)
+                .collect();
+            crate::ipc::resolve_worktree(&of_project, sel, &project.name, true)?
+                .path
+                .clone()
+        }
+        None => local_path,
     };
     let branch = git_local(&local_path, &["rev-parse", "--abbrev-ref", "HEAD"])?;
     if branch == "HEAD" {
@@ -801,7 +823,7 @@ pub fn resolve_target(snap: &Snapshot, project_flag: Option<&str>) -> Result<Syn
 
 pub async fn run(opts: SyncOpts) -> Result<()> {
     let snap = remote_cli::snapshot().await?;
-    let target = resolve_target(&snap, opts.project.as_deref())?;
+    let target = resolve_target(&snap, opts.project.as_deref(), opts.worktree.as_deref())?;
     if let Some(named) = opts.named_host.as_deref().filter(|h| *h != target.host) {
         bail!(
             "{} has its twin on {}, not {named} — say `--to {}` / `--from {}` (or no host at all)",
@@ -1201,6 +1223,7 @@ mod tests {
             force_env: false,
             skills: true,
             project: None,
+            worktree: None,
         }
     }
 
@@ -1523,6 +1546,94 @@ mod tests {
             err.contains("refused: findl is unreachable: ssh findl: connect timed out"),
             "{err}"
         );
+    }
+
+    /// `--project` + `--worktree` pick one local checkout by branch, dir
+    /// name or `root`, and pair it with the twin's checkout of the same
+    /// branch only; a branch the twin lacks is a refusal, not a guess.
+    #[test]
+    fn resolve_target_pairs_one_checkout_with_the_twin_of_its_branch() {
+        use nebula_core::{Project, ProjectId, Worktree, WorktreeId};
+        let dir = tempfile::tempdir().unwrap();
+        let (_, laptop, host) = two_clones(&dir);
+        // A second local checkout on branch `feat`, with no twin checkout.
+        let feat = dir.path().join("p-feat");
+        git(
+            &laptop,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feat",
+                feat.to_str().unwrap(),
+            ],
+        );
+        let project = |id: &str, path: &Path, host: Option<&str>| Project {
+            workspace_id: Default::default(),
+            id: ProjectId(id.into()),
+            name: "p".into(),
+            repo_path: path.to_path_buf(),
+            sort_order: 0,
+            divider_after: false,
+            divider_label: None,
+            divider_before: false,
+            divider_before_label: None,
+            host: host.map(str::to_string),
+        };
+        let worktree =
+            |id: &str, project: &str, path: &Path, branch: &str, is_main: bool| Worktree {
+                id: WorktreeId(id.into()),
+                project_id: ProjectId(project.into()),
+                path: path.to_path_buf(),
+                branch: branch.into(),
+                is_main,
+                created_from: None,
+                pinned: false,
+                for_branch: false,
+                sort_order: 0,
+            };
+        let snap: Snapshot = (
+            vec![
+                project("l", &laptop, None),
+                project("t", &host, Some("findl")),
+            ],
+            vec![
+                worktree("lw", "l", &laptop, "main", true),
+                worktree("lf", "l", &feat, "feat", false),
+                worktree("tw", "t", &host, "main", true),
+            ],
+            vec![],
+        );
+        for sel in ["main", "root", "primary", "laptop"] {
+            let t = resolve_target(&snap, Some("p"), Some(sel)).unwrap();
+            assert_eq!(
+                (
+                    t.local_path.as_path(),
+                    t.remote_path.as_path(),
+                    t.branch.as_str(),
+                    t.host.as_str()
+                ),
+                (laptop.as_path(), host.as_path(), "main", "findl"),
+                "{sel}"
+            );
+        }
+        let err = resolve_target(&snap, Some("p"), Some("feat"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("twin on findl has no checkout of feat"),
+            "{err}"
+        );
+        assert!(err.contains("--project p@findl"), "{err}");
+        let err = resolve_target(&snap, Some("p"), Some("nope"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no worktree \"nope\" in p"), "{err}");
+        let err = resolve_target(&snap, Some("p@findl"), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("runs from the local side"), "{err}");
     }
 
     #[test]

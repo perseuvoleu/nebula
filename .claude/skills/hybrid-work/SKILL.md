@@ -27,6 +27,14 @@ nebula sync --status          # both sides: branch, head, dirty, ahead, sessions
 nebula agent list --project <name>@findl
 ```
 
+One run of `nebula sync` is one project, one branch, one pair of checkouts: the local checkout
+you name (or the one you are in) and the twin's checkout of the **same branch**. Nothing else on
+the host is touched. The explicit form, from anywhere:
+
+```bash
+nebula sync --project <name> --worktree <branch|dir|root> [--to findl|--from findl] [--no-skills] --dry-run
+```
+
 Completion criterion: each planned worker has a side, and `--status` shows the branch it will use
 exists on that side (`nebula worktree list --project <name>@findl` otherwise).
 

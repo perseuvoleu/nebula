@@ -155,6 +155,12 @@ enum Command {
         /// Project name when run outside any checkout.
         #[arg(long)]
         project: Option<String>,
+        /// Which local checkout of the project: a branch name, a directory
+        /// name, or "root"/"primary" (default: the calling session's, else
+        /// the one holding the cwd). Only its twin checkout of the same
+        /// branch is touched on the host.
+        #[arg(long)]
+        worktree: Option<String>,
     },
     /// Open nebula on a remote host over ssh (installs it there if missing).
     Ssh {
@@ -642,6 +648,7 @@ fn main() -> Result<()> {
             force_env,
             no_skills,
             project,
+            worktree,
         }) => {
             // `--to`/`--from` name the host for the reader; the twin decides
             // which host it is, so a mismatch is an error, not a redirect.
@@ -659,6 +666,7 @@ fn main() -> Result<()> {
                 force_env,
                 skills: !no_skills,
                 project,
+                worktree,
             })
         }
         Some(Command::Ssh { host, path }) => ssh::run_ssh(&host, path.as_deref()),

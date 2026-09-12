@@ -954,7 +954,7 @@ pub async fn worktree_delete(sel: String, force: bool, project_flag: Option<Stri
 /// moves between checkouts (say `feature/x` now on the primary while
 /// nebula's `feature-x` checkout sits detached), and a worker landing on
 /// the wrong one is exactly the confusion the error prevents.
-fn resolve_worktree<'a>(
+pub(crate) fn resolve_worktree<'a>(
     of_project: &[&'a nebula_core::Worktree],
     sel: &str,
     project_name: &str,
