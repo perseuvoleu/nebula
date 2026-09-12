@@ -42,9 +42,9 @@ pub async fn run(host: String, op: RemoteOp) -> Result<()> {
     }
 }
 
-type Snapshot = (Vec<Project>, Vec<Worktree>, Vec<Agent>);
+pub(crate) type Snapshot = (Vec<Project>, Vec<Worktree>, Vec<Agent>);
 
-async fn snapshot() -> Result<Snapshot> {
+pub(crate) async fn snapshot() -> Result<Snapshot> {
     let Ok(stream) = try_connect(&paths::socket_path()).await else {
         bail!("no nebula daemon is running");
     };
@@ -76,7 +76,7 @@ fn sessions_on<'a>(snap: &'a Snapshot, host: &str) -> Vec<(&'a Agent, &'a Worktr
 /// `ssh host <script>` with the remote `~/.local/bin` on PATH (where
 /// install.sh puts nebula and where the CLIs usually live). Stdout on
 /// success; the host's stderr as the error otherwise.
-fn ssh(host: &str, script: &str, tty: bool) -> Result<String> {
+pub(crate) fn ssh(host: &str, script: &str, tty: bool) -> Result<String> {
     let mut cmd = Command::new("ssh");
     if tty {
         cmd.arg("-t");
@@ -304,7 +304,7 @@ fn restart(host: &str) -> Result<()> {
     Ok(())
 }
 
-fn which(bin: &str) -> Option<std::path::PathBuf> {
+pub(crate) fn which(bin: &str) -> Option<std::path::PathBuf> {
     std::env::var_os("PATH").and_then(|p| {
         std::env::split_paths(&p)
             .map(|d| d.join(bin))

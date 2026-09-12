@@ -20,6 +20,7 @@ pub mod remote;
 pub mod remote_cli;
 pub mod review;
 pub mod splash;
+pub mod sync_cli;
 pub mod syntax;
 pub mod text_input;
 pub mod theme;
@@ -125,6 +126,14 @@ pub fn run_remote(host: String, op: remote_cli::RemoteOp) -> Result<()> {
 }
 
 pub use remote_cli::RemoteOp;
+
+/// `nebula sync` — one project, both machines: report, move commits the
+/// safe way through origin, carry `.env*` / `.scratch/` / skills.
+pub fn run_sync(opts: sync_cli::SyncOpts) -> Result<()> {
+    runtime()?.block_on(sync_cli::run(opts))
+}
+
+pub use sync_cli::{Direction as SyncDirection, SyncOpts};
 
 /// `nebula proxy` — stdin/stdout ↔ the local daemon socket (see `ipc::proxy`).
 pub fn run_proxy() -> Result<()> {

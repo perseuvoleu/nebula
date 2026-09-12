@@ -280,6 +280,7 @@ nebula remote <host> status    # nebula + daemon on the host, the sessions there
 nebula remote <host> sessions  # every session on the host, archived included
 nebula remote <host> watch     # the same, live
 nebula remote <host> sync      # mirror skills (nebula-sync-skills) + ff-pull every remote checkout
+nebula sync [--status|--to <host>|--from <host>|--dry-run|--rebase]   # one project: commits via origin, .env*, .scratch/, skills
 nebula remote <host> upgrade   # nebula upgrade on the host (its daemon keeps the old build until restart)
 nebula remote <host> restart   # nebula kill on the host — ends every session there
 nebula upgrade            # install the latest release (--force on a dev build)

@@ -67,6 +67,12 @@ upgrade   `nebula upgrade` on the host; its daemon keeps the old build until `re
 restart   `nebula kill` on the host — ends every session there
 ```
 
+`nebula remote <host> sync` is the **host-wide sweep** for the user. The **per-project verb** for
+agents is `nebula sync` (run from a local checkout, no host argument needed): it reports both
+sides (`--status`, JSON), moves commits the safe way through origin in either direction, carries
+`.env*`, `.scratch/` and skills, and refuses with the fix when moving would lose work. The
+hybrid-work skill is its runbook.
+
 ## What does not work remotely, on purpose
 
 The editor, file finder, tree browser and `gh` are local tools; on a remote checkout they flash

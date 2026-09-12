@@ -31,6 +31,9 @@ Shared by every agent kind (claude, codex, cursor, pi). Open one only when its t
   is always findl; never set up another server for this without being told to.
 - `.claude/skills/sync-skills/SKILL.md` — trigger: "sync skills", updating skills on the server /
   findl, `nss`, or a remote agent missing a skill.
+- `.claude/skills/hybrid-work/SKILL.md` — trigger: "remote worker", "findl worker", "handoff",
+  "continuă pe server", "adu ce a făcut agentul de pe findl", sync between machines, the
+  `[nebula] This project has a twin on <host>` prompt line, or a `nebula sync` refusal.
 - `.claude/skills/recall/SKILL.md` — Mission Control sessions only (MC_* env vars present):
   saving a durable project fact, or code questions via the graph_* MCP tools.
 - `.claude/skills/diagram/SKILL.md` — Mission Control sessions only: diagram requests, rendered

@@ -79,6 +79,36 @@ pub fn siblings_instruction(others: usize) -> String {
     )
 }
 
+/// Twin pointer, injected on every prompt while the agent's project has a
+/// twin on a host. Says the remote exists, which branch each of its
+/// checkouts is on and how many sessions run there, and where the sync
+/// verb and the runbook are — built from the mirrored tree, so no git or
+/// ssh runs per prompt. Deciding when to sync stays the agent's call.
+pub fn twin_instruction(host: &str, name: &str, checkouts: &[(String, usize)]) -> String {
+    let checkouts = if checkouts.is_empty() {
+        "It has no mirrored checkouts yet.".to_string()
+    } else {
+        format!(
+            "Its checkouts: {}.",
+            checkouts
+                .iter()
+                .map(|(branch, n)| match n {
+                    0 => format!("{branch} (no sessions)"),
+                    1 => format!("{branch} (1 running session)"),
+                    n => format!("{branch} ({n} running sessions)"),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    format!(
+        "[nebula] This project has a twin on {host} ({name}@{host}). {checkouts} \
+         Work there and here never merges by itself: `nebula sync --status` \
+         shows both sides, `nebula sync` moves commits the safe way. Follow the \
+         hybrid-work skill before writing to a branch a remote session is on."
+    )
+}
+
 /// Instructions as a UserPromptSubmit hook's stdout. Codex only reads
 /// injected context out of this JSON envelope (its hook output schema is
 /// strict — bare text is discarded); Claude Code documents the same shape
@@ -532,6 +562,159 @@ mod tests {
         assert_eq!(body, "");
     }
 
+    #[test]
+    fn twin_instruction_counts_sessions_per_checkout() {
+        let one = twin_instruction("findl", "p", &[("main".into(), 1)]);
+        assert!(one.contains("twin on findl (p@findl)"), "{one}");
+        assert!(
+            one.contains("Its checkouts: main (1 running session)."),
+            "{one}"
+        );
+        assert!(one.contains("nebula sync --status"), "{one}");
+        assert!(one.contains("hybrid-work skill"), "{one}");
+        let many = twin_instruction("findl", "p", &[("main".into(), 2), ("fix-login".into(), 0)]);
+        assert!(
+            many.contains("Its checkouts: main (2 running sessions), fix-login (no sessions)."),
+            "{many}"
+        );
+        let none = twin_instruction("findl", "p", &[]);
+        assert!(none.contains("It has no mirrored checkouts yet."), "{none}");
+    }
+
+    /// The twin pointer rides UserPromptSubmit for an agent whose project
+    /// has a same-named project on a host; it lists the host's checkouts
+    /// with their unarchived session counts. An untwinned project's agent
+    /// gets nothing.
+    #[tokio::test]
+    async fn user_prompt_submit_injects_twin_pointer_when_twinned() {
+        let store = seeded_store();
+        let (env, _rx) = start_hook_server(store.clone()).await.unwrap();
+        let payload = r#"{"session_id":"s1"}"#;
+        let post = |port, token: String, agent: &'static str| async move {
+            http_post(
+                port,
+                &format!("/api/hooks/claude?agentId={agent}&hookEvent=UserPromptSubmit"),
+                &token,
+                payload,
+            )
+            .await
+        };
+
+        // No twin yet: silence.
+        let (_, body) = post(env.port, env.token.clone(), "titled").await;
+        assert_eq!(body, "");
+
+        // The twin: same name, same workspace, on findl, with two mirrored
+        // checkouts — main carries one live and one archived session.
+        store
+            .insert_project(&Project {
+                workspace_id: Default::default(),
+                id: ProjectId("t1".into()),
+                name: "p".into(),
+                repo_path: "/home/me/p".into(),
+                sort_order: 1,
+                divider_after: false,
+                divider_label: None,
+                divider_before: false,
+                divider_before_label: None,
+                host: Some("findl".into()),
+            })
+            .unwrap();
+        let worktree = |id: &str, branch: &str, is_main: bool| Worktree {
+            id: WorktreeId(id.into()),
+            project_id: ProjectId("t1".into()),
+            path: format!("/home/me/p-{branch}").into(),
+            branch: branch.into(),
+            is_main,
+            created_from: None,
+            pinned: false,
+            for_branch: false,
+            sort_order: 0,
+        };
+        store
+            .insert_worktree(&worktree("tw1", "main", true))
+            .unwrap();
+        store
+            .insert_worktree(&worktree("tw2", "fix-login", false))
+            .unwrap();
+        let remote_agent = |id: &str, wt: &str, archived: bool| Agent {
+            id: AgentId(id.into()),
+            worktree_id: WorktreeId(wt.into()),
+            name: "remote".into(),
+            status: AgentStatus::Running,
+            archived,
+            archived_at: 0,
+            pinned: false,
+            kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            session_id: None,
+            sort_order: 0,
+            status_changed_at: 0,
+            alive: true,
+        };
+        store
+            .insert_agent(&remote_agent("r1", "tw1", false))
+            .unwrap();
+        store
+            .insert_agent(&remote_agent("r2", "tw1", true))
+            .unwrap();
+
+        let (status, body) = post(env.port, env.token.clone(), "titled").await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            body,
+            context_injection(&[twin_instruction(
+                "findl",
+                "p",
+                &[("main".into(), 1), ("fix-login".into(), 0)]
+            )])
+        );
+        assert!(body.contains("nebula sync"), "cli pointer: {body}");
+
+        // An agent on an untwinned project stays silent.
+        store
+            .insert_project(&Project {
+                workspace_id: Default::default(),
+                id: ProjectId("q1".into()),
+                name: "q".into(),
+                repo_path: "/tmp/q".into(),
+                sort_order: 2,
+                divider_after: false,
+                divider_label: None,
+                divider_before: false,
+                divider_before_label: None,
+                host: None,
+            })
+            .unwrap();
+        store
+            .insert_worktree(&Worktree {
+                id: WorktreeId("qw1".into()),
+                project_id: ProjectId("q1".into()),
+                path: "/tmp/q".into(),
+                branch: "main".into(),
+                is_main: true,
+                created_from: None,
+                pinned: false,
+                for_branch: false,
+                sort_order: 0,
+            })
+            .unwrap();
+        store
+            .insert_agent(&Agent {
+                worktree_id: WorktreeId("qw1".into()),
+                ..remote_agent("lonely", "qw1", false)
+            })
+            .unwrap();
+        let (_, body) = post(env.port, env.token.clone(), "lonely").await;
+        assert_eq!(body, "");
+
+        // The host's own agent sees nothing new: its project is the local
+        // one there, and the laptop is not in its tree.
+        let (_, body) = post(env.port, env.token.clone(), "r1").await;
+        assert_eq!(body, "");
+    }
+
     #[tokio::test]
     async fn bash_tool_use_carries_cwd_but_subagent_traffic_does_not() {
         let store = seeded_store();
@@ -689,10 +872,11 @@ async fn receive_hook(
 
     if injectable {
         // Titling instruction while the session is untitled, the notes and
-        // todos pointers while the project/worktree has undone entries, and
-        // the shared-checkout pointer while sibling sessions have run on the
-        // same worktree. Unknown ids (prewarm, stale env) and store errors
-        // degrade to no injection.
+        // todos pointers while the project/worktree has undone entries, the
+        // shared-checkout pointer while sibling sessions have run on the
+        // same worktree, and the twin pointer while the project has a
+        // checkout on a host. Unknown ids (prewarm, stale env) and store
+        // errors degrade to no injection.
         let mut parts = Vec::new();
         if state
             .store
@@ -721,6 +905,9 @@ async fn receive_hook(
             .unwrap_or(0);
         if siblings > 0 {
             parts.push(siblings_instruction(siblings));
+        }
+        if let Ok(Some(twin)) = state.store.twin_for_agent(&agent_id) {
+            parts.push(twin_instruction(&twin.host, &twin.name, &twin.checkouts));
         }
         let body = if parts.is_empty() {
             String::new()

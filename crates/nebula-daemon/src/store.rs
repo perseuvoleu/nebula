@@ -266,6 +266,16 @@ const MIGRATIONS: &[&str] = &[
     ",
 ];
 
+/// A project's twin on a host, as the hook pointer needs it: the host, the
+/// project name there, and each mirrored checkout's branch with the
+/// unarchived sessions on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TwinPointer {
+    pub host: String,
+    pub name: String,
+    pub checkouts: Vec<(String, usize)>,
+}
+
 pub struct Store {
     conn: Mutex<Connection>,
 }
@@ -812,6 +822,53 @@ impl Store {
             |r| r.get(0),
         )?;
         Ok(count as usize)
+    }
+
+    /// The agent's project's twin on a host — the same-named project of
+    /// the same workspace with a host — with the host's mirrored checkouts
+    /// and the unarchived sessions on each. Drives the hook-side twin
+    /// pointer from what the relay already mirrored: no git, no ssh. None
+    /// for unknown agents, remote agents (the host daemon has no view of
+    /// the laptop) and projects without a twin.
+    pub fn twin_for_agent(&self, id: &AgentId) -> Result<Option<TwinPointer>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT t.host, t.name, w.branch,
+                    (SELECT COUNT(*) FROM agents b WHERE b.worktree_id = w.id AND b.archived = 0)
+             FROM agents a
+             JOIN worktrees aw ON aw.id = a.worktree_id
+             JOIN projects p ON p.id = aw.project_id AND p.host IS NULL
+             JOIN projects t ON t.name = p.name AND t.host IS NOT NULL
+                  AND COALESCE(t.workspace_id, 'default') = COALESCE(p.workspace_id, 'default')
+             LEFT JOIN worktrees w ON w.project_id = t.id
+             WHERE a.id = ?1
+             ORDER BY t.host, w.is_main DESC, w.branch",
+        )?;
+        let rows = stmt.query_map(params![id.as_str()], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })?;
+        let mut twin: Option<TwinPointer> = None;
+        for row in rows {
+            let (host, name, branch, sessions) = row?;
+            let t = twin.get_or_insert_with(|| TwinPointer {
+                host: host.clone(),
+                name,
+                checkouts: Vec::new(),
+            });
+            // One host per pointer; a second twin host is out of scope.
+            if t.host != host {
+                continue;
+            }
+            if let Some(branch) = branch {
+                t.checkouts.push((branch, sessions.max(0) as usize));
+            }
+        }
+        Ok(twin)
     }
 
     pub fn insert_note(&self, t: &Note) -> Result<()> {

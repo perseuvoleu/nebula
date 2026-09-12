@@ -120,6 +120,42 @@ enum Command {
         #[command(subcommand)]
         command: RemoteCommand,
     },
+    /// Bring this project's checkout and its twin on a host in step: report
+    /// both sides, move commits the safe way through origin, carry `.env*`
+    /// (laptop → host, existing kept), `.scratch/` (both ways, newer wins,
+    /// nothing deleted) and skills. Refuses, naming the reason and the fix,
+    /// whenever moving would lose work. Inside a session the project is the
+    /// caller's; outside, the checkout holding the cwd, else --project.
+    Sync {
+        /// Only send: this checkout → the host (refuses when the host is
+        /// ahead).
+        #[arg(long, value_name = "HOST", conflicts_with = "from")]
+        to: Option<String>,
+        /// Only collect: the host → this checkout (refuses when this side
+        /// is ahead; sends no `.env*` or skills).
+        #[arg(long, value_name = "HOST")]
+        from: Option<String>,
+        /// Print both sides' state and the plan as JSON, change nothing
+        /// (exit 0 even with the host unreachable).
+        #[arg(long)]
+        status: bool,
+        /// Print the plan, change nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Diverged branches: rebase this checkout onto the host's commits
+        /// (never the reverse). Never the default.
+        #[arg(long)]
+        rebase: bool,
+        /// Overwrite `.env` files the host already has with the local ones.
+        #[arg(long)]
+        force_env: bool,
+        /// Skip the skills mirror (nebula-sync-skills).
+        #[arg(long)]
+        no_skills: bool,
+        /// Project name when run outside any checkout.
+        #[arg(long)]
+        project: Option<String>,
+    },
     /// Open nebula on a remote host over ssh (installs it there if missing).
     Ssh {
         /// ssh destination, passed verbatim (e.g. user@server).
@@ -597,6 +633,34 @@ fn main() -> Result<()> {
                 RemoteCommand::Restart => nebula_tui::RemoteOp::Restart,
             },
         ),
+        Some(Command::Sync {
+            to,
+            from,
+            status,
+            dry_run,
+            rebase,
+            force_env,
+            no_skills,
+            project,
+        }) => {
+            // `--to`/`--from` name the host for the reader; the twin decides
+            // which host it is, so a mismatch is an error, not a redirect.
+            let direction = match (&to, &from) {
+                (Some(_), _) => nebula_tui::SyncDirection::To,
+                (_, Some(_)) => nebula_tui::SyncDirection::From,
+                _ => nebula_tui::SyncDirection::Both,
+            };
+            nebula_tui::run_sync(nebula_tui::SyncOpts {
+                direction,
+                named_host: to.or(from),
+                status,
+                dry_run,
+                rebase,
+                force_env,
+                skills: !no_skills,
+                project,
+            })
+        }
         Some(Command::Ssh { host, path }) => ssh::run_ssh(&host, path.as_deref()),
         Some(Command::Upgrade { force }) => upgrade::run_upgrade(force),
         Some(Command::Proxy) => nebula_tui::run_proxy(),
