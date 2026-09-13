@@ -3,6 +3,7 @@ import { GitBranchIcon } from "lucide-react";
 import { api, describeError, isUncertain } from "@/lib/api";
 import type { Worktree } from "@/lib/types";
 import { Button } from "./ui/button";
+import { DeleteCheckoutButton } from "./DeleteCheckoutButton";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "./ui/dialog";
 
 export function CheckoutPanel({ project, currentPath, onSelect }: {
@@ -61,6 +62,14 @@ export function CheckoutPanel({ project, currentPath, onSelect }: {
         onClick={() => { setSourcePath(current!.path); setMode("worktree"); setPhase("idle"); setError(null); setOpen(true); }}>
         <GitBranchIcon aria-hidden /> Branch / worktree nou
       </Button>
+      {current && <DeleteCheckoutButton project={project} tree={current} onDeleted={deleted => {
+        const remaining = trees.filter(w => w.path !== deleted.path);
+        setTrees(remaining);
+        const next = remaining.find(w => w.is_main) ?? remaining[0];
+        if (next) onSelect(next);
+        void api<{ worktrees: Worktree[] }>("worktrees", { project }).then(data => setTrees(data.worktrees))
+          .catch(failure => setError(`Worktree eliminat. Reîncărcarea listei a eșuat: ${describeError(failure)}`));
+      }} />}
       {!open && error && <p role="alert" className="mt-1 text-xs text-muted-foreground">{error}</p>}
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent className="max-h-[90dvh] overflow-y-auto">

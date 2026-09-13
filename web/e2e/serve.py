@@ -75,9 +75,9 @@ def seed():
     ]
     (STATE / "agents.json").write_text(json.dumps(agents, indent=1))
     (STATE / "worktrees.json").write_text(json.dumps([
-        {"path": "/srv/alpha", "branch": "main", "is_main": True, "project": "alpha", "pinned": False, "created_from": None},
-        {"path": "/srv/alpha-wt", "branch": "feature/homepage", "is_main": False, "project": "alpha", "pinned": False, "created_from": "main"},
-        {"path": "/srv/beta", "branch": "main", "is_main": True, "project": "beta", "pinned": False, "created_from": None},
+        {"id": "wt-alpha", "path": "/srv/alpha", "branch": "main", "is_main": True, "project": "alpha", "pinned": False, "created_from": None},
+        {"id": "wt-feature", "path": "/srv/alpha-wt", "branch": "feature/homepage", "is_main": False, "project": "alpha", "pinned": False, "created_from": "main"},
+        {"id": "wt-beta", "path": "/srv/beta", "branch": "main", "is_main": True, "project": "beta", "pinned": False, "created_from": None},
     ]))
     big = "\n".join(f"[{i:04d}] compiling module {i} … ok" for i in range(400))
     write_session(STATE / "pi", "/srv/alpha", SID["pi-1"], [

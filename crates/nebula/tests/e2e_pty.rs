@@ -4408,3 +4408,128 @@ done
         wait_for_exit(&mut child);
     }
 }
+
+
+struct MobileFixtureDaemon(std::process::Child);
+impl Drop for MobileFixtureDaemon {
+    fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+}
+
+/// Fixtures only: no real agent, trust choice, user process or checkout.
+#[tokio::test]
+async fn mobile_keys_and_id_deletion_use_the_exact_pty() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let capture = env.tmp.path().join("keys");
+    let ready = env.tmp.path().join("ready");
+    let script = env.tmp.path().join("recorder");
+    std::fs::write(&script, format!("#!/usr/bin/python3\nimport os, tty\ntty.setraw(0)\nopen({:?}, 'w').close()\nwhile True:\n with open({:?}, 'ab', buffering=0) as f: f.write(os.read(0, 1024))\n", ready, capture)).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut daemon = MobileFixtureDaemon(env.spawn_daemon_with_agent_cmd(script.to_str().unwrap()));
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let main = add_project_get_main_worktree(&mut c, &repo).await;
+    let id = create_agent_get_id(&mut c, &main.id, "fixture", 90).await;
+    let cli = |args: &[&str]| std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        .args(args).env("NEBULA_RUNTIME_DIR", &env.runtime_dir).output().unwrap();
+    for _ in 0..100 {
+        if ready.exists() { break; }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(ready.exists());
+    let result = cli(&["agent", "key", "--project", "repo", "--", id.as_str(), "Space"]);
+    assert!(!result.status.success());
+    for key in ["Up", "Down", "Left", "Right", "Enter", "Escape", "Tab"] {
+        let result = cli(&["agent", "key", "--project", "repo", "--", id.as_str(), key]);
+        assert!(result.status.success(), "key {key}: {result:?}");
+    }
+    let expected = b"\x1b[A\x1b[B\x1b[D\x1b[C\r\x1b\t";
+    for _ in 0..100 {
+        if std::fs::read(&capture).unwrap_or_default().len() >= expected.len() { break; }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(std::fs::read(&capture).unwrap(), expected);
+    // A caller cannot use a valid ID to delete a session in another project.
+    write_frame(&mut c, &ClientRequest::DeleteAgentScoped {
+        req_id: 91, id: id.clone(), project: nebula_core::ProjectId("other-project".into()),
+    }).await.unwrap();
+    read_events_until(&mut c, Duration::from_secs(5), |events| events.iter().any(|e|
+        matches!(e, ServerEvent::Error { req_id: Some(91), .. }))).await;
+    write_frame(&mut c, &ClientRequest::RenameAgent { req_id: 92, id: id.clone(), name: "renamed fixture".into() }).await.unwrap();
+    read_events_until(&mut c, Duration::from_secs(5), |events| events.iter().any(|e|
+        matches!(e, ServerEvent::Ack { req_id: 92, .. }))).await;
+    let result = cli(&["agent", "delete-id", "--project", "repo", "--", id.as_str()]);
+    assert!(result.status.success(), "{result:?}");
+    let result = cli(&["agent", "key", "--project", "repo", "--", id.as_str(), "Enter"]);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("no longer available"));
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon.0);
+}
+
+#[tokio::test]
+async fn mobile_safe_removal_preserves_dirty_unmerged_occupied_and_protected_checkouts() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let mut daemon = MobileFixtureDaemon(env.spawn_daemon());
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let main = add_project_get_main_worktree(&mut c, &repo).await;
+    let cli = |args: &[&str]| std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        .args(args).env("NEBULA_RUNTIME_DIR", &env.runtime_dir).output().unwrap();
+    let result = cli(&["worktree", "new", "fixture", "--project", "repo"]);
+    assert!(result.status.success(), "{result:?}");
+    let result = cli(&["worktree", "list", "--project", "repo"]);
+    let trees: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    let tree = trees.as_array().unwrap().iter().find(|w| w["branch"] == "fixture").unwrap();
+    let id = tree["id"].as_str().unwrap();
+    let path = tree["path"].as_str().unwrap();
+    let remove = || cli(&["worktree", "delete-safe", "--project", "repo", "--", id, "fixture", path]);
+    let result = cli(&["worktree", "delete-safe", "--project", "repo", "--", main.id.as_str(), "main", main.path.to_str().unwrap()]);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("protected"));
+    let result = cli(&["worktree", "delete-safe", "--project", "repo", "--", id, "stale-branch", path]);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("changed"));
+    std::fs::write(Path::new(path).join("untracked"), "keep me").unwrap();
+    let result = remove();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("Dirty checkout"));
+    commit_file(Path::new(path), "untracked", "keep this commit");
+    let result = remove();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("Unmerged commits"));
+    let status = std::process::Command::new("git").arg("-C").arg(&repo).args(["merge", "--ff-only", "fixture"]).status().unwrap();
+    assert!(status.success());
+    let agent = create_agent_get_id(&mut c, &nebula_core::WorktreeId(id.into()), "fixture agent", 93).await;
+    let result = remove();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("Sessions still exist"));
+    assert!(Path::new(path).join("untracked").exists());
+    let result = cli(&["agent", "delete-id", "--project", "repo", "--", agent.as_str()]);
+    assert!(result.status.success(), "{result:?}");
+    // Claude's fixture hook installer left ignored configuration: preserve-by-default applies to it too.
+    let result = remove();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("Dirty checkout"));
+    std::fs::remove_dir_all(Path::new(path).join(".claude")).unwrap();
+    let result = cli(&["worktree", "delete-safe", "--check", "--project", "repo", "--", id, "fixture", path]);
+    assert!(result.status.success(), "{result:?}");
+    assert!(Path::new(path).exists(), "check is side-effect-free");
+    assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(["worktree", "lock", path]).status().unwrap().success());
+    let result = remove();
+    assert!(!result.status.success(), "safe removal must not silently unlock and retry: {result:?}");
+    assert!(Path::new(path).exists());
+    let listing = std::process::Command::new("git").arg("-C").arg(&repo).args(["worktree", "list", "--porcelain"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&listing.stdout).contains("locked"));
+    assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(["worktree", "unlock", path]).status().unwrap().success());
+    let result = remove();
+    assert!(result.status.success(), "{result:?}");
+    assert!(!Path::new(path).exists());
+    assert!(repo.exists());
+    let status = std::process::Command::new("git").arg("-C").arg(&repo).args(["show-ref", "--verify", "refs/heads/fixture"]).status().unwrap();
+    assert!(status.success(), "branch is always kept");
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon.0);
+}

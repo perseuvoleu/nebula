@@ -910,6 +910,21 @@ fn project_owning_cwd(
 /// `nebula worktree delete <name> [--force] [--project <name>]` — the
 /// daemon's delete flow, so the checkout AND nebula's row go together
 /// (raw `git worktree remove` leaves a ghost row in the Worktrees panel).
+pub async fn worktree_delete_safe(id: String, branch: String, path: std::path::PathBuf, check: bool, project_flag: Option<String>) -> Result<()> {
+    let stream = try_connect(&paths::socket_path()).await.context("no nebula daemon is running")?;
+    let mut conn = handshake(stream).await?;
+    let (projects, worktrees, agents) = subscribe_snapshot(&mut conn).await?;
+    let project = resolve_project(&projects, &worktrees, &agents, project_flag.as_deref())?;
+    let worktree = worktrees.iter().find(|w| w.id.as_str() == id && w.project_id == project.id)
+        .context("Checkout no longer available in this project")?;
+    write_frame(&mut conn.stream, &ClientRequest::CheckWorktreeRemoval {
+        req_id: 1, id: worktree.id.clone(), branch, path, delete: !check,
+    }).await?;
+    await_ack(&mut conn, 1, &mut Vec::new()).await?;
+    println!("{}", serde_json::json!({"ok": true}));
+    Ok(())
+}
+
 pub async fn worktree_delete(sel: String, force: bool, project_flag: Option<String>) -> Result<()> {
     let sock = paths::socket_path();
     let Ok(stream) = try_connect(&sock).await else {
@@ -1142,6 +1157,7 @@ pub async fn worktree_list(project_flag: Option<String>, all: bool) -> Result<()
                 "branch": w.branch,
                 "path": w.path.display().to_string(),
                 "is_main": w.is_main,
+                "id": w.id,
                 "pinned": w.pinned,
                 "created_from": w.created_from,
                 "sessions": sessions,
@@ -1294,6 +1310,36 @@ pub async fn agent_send(name: String, text: String, project_flag: Option<String>
             "sent": text,
         })
     );
+    Ok(())
+}
+
+/// ID-only mutation surface for clients that retain selection across renames.
+pub async fn agent_action_id(id: String, key: Option<String>, project_flag: Option<String>) -> Result<()> {
+    let stream = try_connect(&paths::socket_path()).await.context("no nebula daemon is running")?;
+    let mut conn = handshake(stream).await?;
+    let (projects, worktrees, agents) = subscribe_snapshot(&mut conn).await?;
+    let project = resolve_project(&projects, &worktrees, &agents, project_flag.as_deref())?;
+    let agent = agents.iter().find(|a| a.id.as_str() == id && !a.archived &&
+        worktrees.iter().any(|w| w.id == a.worktree_id && w.project_id == project.id))
+        .context("Session no longer available in this project")?;
+    let req_id = 1;
+    let request = if let Some(key) = key {
+        if !agent.alive { bail!("Session has no live PTY"); }
+        let data: &[u8] = match key.as_str() {
+            "Up" => b"\x1b[A", "Down" => b"\x1b[B", "Right" => b"\x1b[C", "Left" => b"\x1b[D",
+            "Enter" => b"\r", "Escape" => b"\x1b", "Tab" => b"\t",
+            _ => bail!("Unsupported terminal key"),
+        };
+        ClientRequest::InputAcknowledged { req_id, id: agent.id.clone(), project: project.id.clone(), data: data.to_vec() }
+    } else {
+        if std::env::var("NEBULA_AGENT_ID").is_ok_and(|own| own == id) {
+            bail!("Cannot delete this session itself");
+        }
+        ClientRequest::DeleteAgentScoped { req_id, id: agent.id.clone(), project: project.id.clone() }
+    };
+    write_frame(&mut conn.stream, &request).await?;
+    await_ack(&mut conn, req_id, &mut Vec::new()).await?;
+    println!("{}", serde_json::json!({"ok": true}));
     Ok(())
 }
 

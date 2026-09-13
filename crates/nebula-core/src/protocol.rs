@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 28;
+pub const PROTOCOL_VERSION: u32 = 29;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -40,6 +40,14 @@ pub enum ClientRequest {
     },
     Input {
         session: SessionRef,
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+    },
+    /// One explicit key/input write, acknowledged only after the PTY accepted it.
+    InputAcknowledged {
+        req_id: u64,
+        id: AgentId,
+        project: ProjectId,
         #[serde(with = "serde_bytes")]
         data: Vec<u8>,
     },
@@ -121,6 +129,14 @@ pub enum ClientRequest {
         project: ProjectId,
         branch: String,
         base: Option<String>,
+    },
+    /// Conservative web removal: no sessions, clean and merged, branch preserved.
+    CheckWorktreeRemoval {
+        req_id: u64,
+        id: WorktreeId,
+        branch: String,
+        path: PathBuf,
+        delete: bool,
     },
     DeleteWorktree {
         req_id: u64,
@@ -229,6 +245,11 @@ pub enum ClientRequest {
         req_id: u64,
         id: AgentId,
         pinned: bool,
+    },
+    DeleteAgentScoped {
+        req_id: u64,
+        id: AgentId,
+        project: ProjectId,
     },
     DeleteAgent {
         req_id: u64,

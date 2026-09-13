@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { LogOutIcon, MenuIcon } from "lucide-react";
 import { api, ApiError, describeError, getToken, onAuthChange, setToken } from "@/lib/api";
 import { useConversation } from "@/lib/conversation";
@@ -63,7 +63,8 @@ function useSessions(project: string | null) {
     window.addEventListener("online", wake);
     return () => { cancelled = true; generation.current += 1; if (timer) clearTimeout(timer); document.removeEventListener("visibilitychange", wake); window.removeEventListener("online", wake); };
   }, [refresh]);
-  return { rows, phase, error, refresh };
+  const remove = (id: string) => { generation.current += 1; setRows(old => old.filter(r => r.id !== id)); void refresh(); };
+  return { rows, phase, error, refresh, remove };
 }
 
 export default function App() {
@@ -96,6 +97,13 @@ function Shell({ workspace }: { workspace: Workspace }) {
   const [selection, navigate] = useSelection();
   const project = selection.project && workspace.projects.includes(selection.project) ? selection.project : workspace.projects[0];
   const sessions = useSessions(project);
+  const latestSelection = useRef(selection);
+  useLayoutEffect(() => { latestSelection.current = selection; }, [selection]);
+  const onDeleted = (id: string) => {
+    if (latestSelection.current.project !== project) return;
+    sessions.remove(id);
+    if (latestSelection.current.session === id) navigate({ project, session: null });
+  };
   const desktop = useMediaQuery("(min-width: 768px)");
   const [menuOpen, setMenuOpen] = useState(false);
   const [creating, setCreating] = useState(false);
@@ -109,6 +117,7 @@ function Shell({ workspace }: { workspace: Workspace }) {
   const row = sessions.rows.find((r) => r.id === selection.session) ?? null;
   const currentPath = row?.path ?? (checkout?.project === project ? checkout.path : undefined);
   const chooseCheckout = (tree: Worktree) => {
+    void sessions.refresh();
     setCheckout({ project, path: tree.path });
     navigate({ project, session: null });
     setMenuOpen(false);
@@ -151,7 +160,7 @@ function Shell({ workspace }: { workspace: Workspace }) {
       </div>
       {checkoutPanel}
       {created && <p role="status" className="border-b border-sidebar-border px-3 py-2 text-xs">Agent pornit ca „{created}”. Identitatea nu a putut fi confirmată încă: alege-l din listă.</p>}
-      <SessionList sessions={sessions.rows} phase={sessions.phase} error={sessions.error} selected={sessionId} unseen={unseenFinished} onSelect={select} onNew={() => setCreating(true)} project={project} />
+      <SessionList sessions={sessions.rows} phase={sessions.phase} error={sessions.error} selected={sessionId} unseen={unseenFinished} onSelect={select} onNew={() => setCreating(true)} project={project} onDeleted={onDeleted} />
       <InstallApp />
       <p className="border-t border-sidebar-border px-3 py-2 text-[11px] text-muted-foreground">Telefonul se poate deconecta. Agenții rămân pe server.</p>
     </aside>
@@ -209,7 +218,7 @@ function Shell({ workspace }: { workspace: Workspace }) {
             </label>
           </div>
           {checkoutPanel}
-          <SessionList sessions={sessions.rows} phase={sessions.phase} error={sessions.error} selected={sessionId} unseen={unseenFinished} onSelect={select} onNew={() => setCreating(true)} project={project} />
+          <SessionList sessions={sessions.rows} phase={sessions.phase} error={sessions.error} selected={sessionId} unseen={unseenFinished} onSelect={select} onNew={() => setCreating(true)} project={project} onDeleted={onDeleted} />
           <InstallApp />
         </main>
       )}
