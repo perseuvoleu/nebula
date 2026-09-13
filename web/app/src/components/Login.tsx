@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { api, ApiError, setToken } from "@/lib/api";
 import { Button } from "@/components/ui/button";
+import { InstallApp } from "./InstallApp";
 
 export function Login({ onAuthenticated }: { onAuthenticated: (projects: string[], host: string) => void }) {
   const [value, setValue] = useState("");
@@ -43,6 +44,7 @@ export function Login({ onAuthenticated }: { onAuthenticated: (projects: string[
         <Button type="submit" size="lg" className="mt-6 h-12 w-full text-base" disabled={busy || value.trim().length < 32}>
           {busy ? "Se conectează…" : "Conectare"}
         </Button>
+        <InstallApp />
       </form>
     </main>
   );

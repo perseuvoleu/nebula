@@ -1,6 +1,6 @@
 // Public app shell only. Hashed /assets/* files are cache-first (immutable); the shell document is
 // network-first with an offline fallback. /api/*, POSTs and cross-origin requests are never touched.
-const CACHE = "nebula-shell-v3";
+const CACHE = "nebula-shell-v4";
 
 self.addEventListener("install", (event) => {
   event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(["/", "/manifest.webmanifest", "/icon.svg"])).then(() => self.skipWaiting()));

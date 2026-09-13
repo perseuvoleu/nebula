@@ -87,15 +87,16 @@ class Gateway:
         self.slots = threading.BoundedSemaphore(4)
         self.identities = {}  # agent id -> (native session id | None, reason, expires)
         self.lock = threading.Lock()
+        self.checkout_lock = threading.Lock()
 
-    def run(self, *args, json_output=True):
+    def run(self, *args, json_output=True, binary=None):
         if not self.slots.acquire(blocking=False):
             raise Problem(503, "Gateway busy; try again shortly")
         try:
             # Never inherit the parent agent's identity or pass gateway credentials to CLIs.
             env = {k: v for k, v in os.environ.items()
                    if not k.startswith(("NEBULA_", "MC_", "PI_"))}
-            result = subprocess.run([self.binary, *args], capture_output=True, text=True,
+            result = subprocess.run([binary or self.binary, *args], capture_output=True, text=True,
                                     errors="replace", timeout=20, env=env)
             if result.returncode:
                 raise Problem(502, result.stderr.strip()[:2000] or "Nebula command failed")
@@ -215,8 +216,11 @@ class Gateway:
             return {"worktrees": self.run("worktree", "list", "--project", project)}
         if path == "/api/output":
             name = self.session_name(project, first.get("id"))
-            return {"output": self.run("agent", "read", "--project", project,
-                                       "--lines", "250", "--", name, json_output=False)}
+            lines = first.get("lines", "250")
+            if not isinstance(lines, str) or not lines.isdigit() or not 250 <= int(lines) <= 10000:
+                raise Problem(400, "Output limit must be between 250 and 10000 lines")
+            output = self.run("agent", "read", "--project", project, "--lines", lines, "--", name, json_output=False)
+            return {"output": output, "hasMore": len(output.splitlines()) >= int(lines) and int(lines) < 10000}
         if path in {"/api/conversation", "/api/conversation/updates", "/api/conversation/tool"}:
             row, native, file, reason = self.conversation_source(project, first.get("id"))
             row = public(row)
@@ -240,8 +244,47 @@ class Gateway:
                 raise Problem(409, str(error))
         raise Problem(404, "Unknown endpoint")
 
+    def create_checkout(self, project, body):
+        name, mode = body.get("name"), body.get("mode")
+        if (not isinstance(name, str) or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", name)
+                or len(name) > 80 or name in {"main", "master"}):
+            raise Problem(400, "Folosește un nume nou: litere mici, cifre și cratime (maxim 80).")
+        if not isinstance(mode, str) or mode not in {"branch", "worktree"}:
+            raise Problem(400, "Alege Branch sau Worktree")
+        # Serialize only creation, not ordinary reads/sends. No mutation retries.
+        if not self.checkout_lock.acquire(blocking=False):
+            raise Problem(503, "O creare este deja în curs; verifică lista înainte de a reîncerca")
+        try:
+            trees = self.run("worktree", "list", "--project", project)
+            source = next((w for w in trees if w["path"] == body.get("source")), None)
+            primary = next((w for w in trees if w["is_main"]), None)
+            if not source or not primary:
+                raise Problem(400, "Alege un checkout existent din acest proiect")
+            if source["branch"] != body.get("base"):
+                raise Problem(409, "Branch-ul de bază s-a schimbat; reîncarcă lista")
+            if mode == "branch" and any(s.get("alive") for s in primary.get("sessions", [])):
+                raise Problem(409, "Checkout-ul principal are sesiuni deschise. Alege Worktree pentru a nu le schimba fișierele.")
+            # Read-only Git checks against the daemon-resolved project path, never a user path.
+            refs = self.run("-C", primary["path"], "for-each-ref", "--format=%(refname:short)",
+                            "refs/heads/", binary="git", json_output=False).splitlines()
+            if name in refs:
+                raise Problem(409, "Branch-ul există deja; alege un nume nou")
+            if mode == "branch" and self.run("-C", primary["path"], "status", "--porcelain",
+                                              binary="git", json_output=False).strip():
+                raise Problem(409, "Checkout-ul principal are modificări necomise. Alege Worktree.")
+            args = ("worktree", "new") if mode == "worktree" else ("switch",)
+            created = self.run(*args, "--project", project, f"--from={source['branch']}", "--", name)
+            if not isinstance(created, dict) or not isinstance(created.get("path"), str) or not created["path"] or created.get("branch") != name:
+                raise Problem(504, "Crearea poate să fi reușit; verifică lista înainte de a reîncerca")
+            return {"worktree": {"path": created["path"], "branch": name, "project": project,
+                                 "is_main": mode == "branch", "sessions": []}}
+        finally:
+            self.checkout_lock.release()
+
     def post(self, path, body):
         project = self.project(body.get("project"))
+        if path == "/api/worktrees":
+            return self.create_checkout(project, body)
         text = body.get("text")
         if not isinstance(text, str) or not text.strip() or len(text) > 16000 or "\0" in text:
             raise Problem(400, "Message must contain 1–16000 characters without NUL")

@@ -12,7 +12,7 @@ export const MessageItem = memo(function MessageItem({ message, project, session
   if (message.role === "user") {
     return (
       <article className="flex flex-col items-end gap-1" data-role="user" aria-label="Mesajul tău">
-        <div className="max-w-[min(85%,72ch)] rounded-2xl rounded-br-md bg-secondary px-4 py-2.5 text-[15px] leading-relaxed whitespace-pre-wrap break-words">
+        <div className="max-w-[min(85%,72ch)] rounded-2xl rounded-br-md bg-white text-black px-4 py-2.5 text-[15px] leading-relaxed whitespace-pre-wrap break-words">
           {text || <span className="text-muted-foreground">[conținut fără text]</span>}
         </div>
         <time className="px-1 text-[11px] text-muted-foreground">{formatTime(message.timestamp)}</time>

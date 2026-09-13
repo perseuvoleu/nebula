@@ -62,7 +62,7 @@ test("phone: list → conversation → back, sheet navigation, project switch an
   await page.context().setOffline(true);
   await page.getByRole("button", { name: "Înapoi la sesiuni" }).click();
   await page.getByRole("combobox", { name: "Proiect", exact: true }).selectOption("alpha");
-  await expect(page.getByRole("status").filter({ hasText: /Fără conexiune|Reconectare/ }).or(page.getByRole("alert"))).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByRole("status").filter({ hasText: /Fără conexiune|Reconectare/ }).or(page.getByRole("alert")).first()).toBeVisible({ timeout: 15_000 });
   await shot(page, "phone-390-offline");
   await page.context().setOffline(false);
 });

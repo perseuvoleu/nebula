@@ -48,7 +48,6 @@ export const POLL_IDLE_MS = 2500;
 export const POLL_ACTIVE_MS = 1500;
 const ACTIVE_ATTEMPT_MS = 60000;
 /** Rendering bound: older messages fall off the front and become pageable again. */
-export const MAX_MESSAGES = 400;
 
 export function messageText(message: Message): string {
   return message.parts.filter((p) => p.type === "text").map((p) => (p.type === "text" ? p.text : "")).join("\n");
@@ -139,10 +138,8 @@ export class ConversationController {
 
   private applyMessages(messages: Message[], extra: Partial<ConversationState> = {}): void {
     const attempts = reconcileAttempts(this.state.attempts, messages);
-    if (messages.length > MAX_MESSAGES) {
-      messages = messages.slice(messages.length - MAX_MESSAGES);
-      extra = { hasMore: true, ...extra, ...(extra.hasMore === false ? { hasMore: true } : {}) };
-    }
+    // Keep explicitly paged history. A live update must not evict the older
+    // messages the reader just loaded or jump their scroll position.
     this.set({ messages, attempts, ...extra });
   }
 
@@ -237,7 +234,10 @@ export class ConversationController {
   async send(text: string): Promise<Attempt> {
     const attempt: Attempt = { id: attemptId(), text, createdAt: new Date().toISOString(), state: "sending",
       knownIds: this.state.messages.map((m) => m.id) };
-    this.set({ attempts: [...this.state.attempts, attempt] });
+    const attempts = this.state.phase === "unsupported"
+      ? this.state.attempts.filter((a, i, all) => a.state !== "accepted" || i >= all.length - 9)
+      : this.state.attempts;
+    this.set({ attempts: [...attempts, attempt] });
     const update = (patch: Partial<Attempt>) =>
       this.set({ attempts: this.state.attempts.map((a) => (a.id === attempt.id ? { ...a, ...patch } : a)) });
     try {

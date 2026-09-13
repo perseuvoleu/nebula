@@ -59,7 +59,16 @@ def main(argv):
     project = arg("--project", argv)
     agents = load("agents.json")
     behaviour = (STATE / "behaviour").read_text().strip() if (STATE / "behaviour").exists() else "ok"
-    if command == ("agent", "list"):
+    if argv[0] == "-C":  # read-only git checks through the harness-only PATH shim
+        trees = load("worktrees.json")
+        primary = next(w for w in trees if w["path"] == argv[1])
+        if "for-each-ref" in argv:
+            print("\n".join(w["branch"] for w in trees if w["project"] == primary["project"]))
+        elif "status" in argv:
+            print("")
+        else:
+            return 2
+    elif command == ("agent", "list"):
         print(json.dumps([a for a in agents if a["project"] == project]))  # rows carry session_id, as on this branch
     elif command == ("agent", "show"):
         name = positionals(argv[2:])[0]
@@ -70,7 +79,9 @@ def main(argv):
         print(json.dumps(hits[0]))  # includes session_id, like `agent show` on this branch
     elif command == ("agent", "read"):
         name = positionals(argv[2:])[0]
-        print(f"$ terminal snapshot for {name}\n" + "\n".join(f"line {i}: build step {i} ok" for i in range(1, 40)))
+        count = int((STATE / "output-lines").read_text()) if (STATE / "output-lines").exists() else 40
+        lines = [f"$ terminal snapshot for {name}"] + [f"line {i}: build step {i} ok" for i in range(1, count)]
+        print("\n".join(lines[-int(arg("--lines", argv) or len(lines)):]))
     elif command == ("agent", "send"):
         name, text = positionals(argv[2:])[:2]
         with open(STATE / "sends.log", "a") as handle:
@@ -105,6 +116,19 @@ def main(argv):
         with open(STATE / "sends.log", "a") as handle:
             handle.write(json.dumps({"new": name, "kind": kind, "text": prompt}) + "\n")
         print(json.dumps({"ok": True}))
+    elif command == ("worktree", "new") or argv[0] == "switch":
+        name, base = positionals(argv)[-1], arg("--from", argv)
+        trees = load("worktrees.json")
+        primary = next(w for w in trees if w["project"] == project and w["is_main"])
+        if argv[0] == "switch":
+            primary["branch"] = name
+            row = primary
+        else:
+            row = {"path": f"/srv/{project}-worktrees/{name}", "branch": name, "is_main": False,
+                   "project": project, "created_from": base}
+            trees.append(row)
+        save("worktrees.json", trees)
+        print(json.dumps({**row, "created": True}))
     elif command == ("worktree", "list"):
         trees = [w for w in load("worktrees.json") if w["project"] == project]
         for tree in trees:

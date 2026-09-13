@@ -80,6 +80,45 @@ class GatewayTests(unittest.TestCase):
         self.assertIn("--prompt=--help", new_call.args)
         self.assertEqual(result["id"], "fresh-id")
 
+    def test_create_worktree_uses_selected_checkout_branch_not_primary(self):
+        trees = TREES + [{**TREES[0], "path": "/srv/feature", "branch": "feature-base", "is_main": False}]
+        created = {"project": "project", "branch": "fresh-task", "path": "/srv/new-wt"}
+        with patch.object(self.gateway, "run", side_effect=[trees, "main\nfeature-base\n", created]) as run:
+            result = self.gateway.post("/api/worktrees", {"project": "project", "source": "/srv/feature",
+                "base": "feature-base", "name": "fresh-task", "mode": "worktree"})
+        self.assertEqual(run.call_args.args, ("worktree", "new", "--project", "project", "--from=feature-base", "--", "fresh-task"))
+        self.assertEqual(result["worktree"]["path"], "/srv/new-wt")
+        self.assertFalse(result["worktree"]["is_main"])
+
+    def test_branch_uses_primary_and_refuses_live_sessions_or_dirty_work(self):
+        body = {"project": "project", "source": "/srv/project", "base": "main", "name": "fresh-task", "mode": "branch"}
+        busy = [{**TREES[0], "sessions": [{"alive": True, "status": "finished"}]}]
+        with patch.object(self.gateway, "run", return_value=busy) as run:
+            with self.assertRaises(Problem) as ctx:
+                self.gateway.post("/api/worktrees", body)
+            self.assertEqual(ctx.exception.status, 409)
+            self.assertEqual(run.call_count, 1)
+        with patch.object(self.gateway, "run", side_effect=[TREES, "main\n", " M README.md\n"]):
+            with self.assertRaises(Problem) as ctx: self.gateway.post("/api/worktrees", body)
+            self.assertEqual(ctx.exception.status, 409)
+        created = {"project": "project", "branch": "fresh-task", "path": "/srv/project", "created": True}
+        with patch.object(self.gateway, "run", side_effect=[TREES, "main\n", "", created]) as run:
+            result = self.gateway.post("/api/worktrees", body)
+        self.assertEqual(run.call_args.args, ("switch", "--project", "project", "--from=main", "--", "fresh-task"))
+        self.assertTrue(result["worktree"]["is_main"])
+
+    def test_checkout_creation_scope_names_and_stale_base_fail_closed(self):
+        body = {"project": "project", "source": "/srv/project", "base": "main", "name": "fresh-task", "mode": "worktree"}
+        for changed in [{"project": "secret"}, {"name": "--help"}, {"name": "a;touch x"}, {"name": "main"},
+                        {"name": "../escape"}, {"mode": "bogus"}, {"source": "/etc"}, {"base": "stale"}]:
+            with patch.object(self.gateway, "run", return_value=TREES) as run:
+                with self.assertRaises(Problem): self.gateway.post("/api/worktrees", {**body, **changed})
+                self.assertLessEqual(run.call_count, 1)
+        with patch.object(self.gateway, "run", side_effect=[TREES, "main\nfresh-task\n"]) as run:
+            with self.assertRaises(Problem) as ctx: self.gateway.post("/api/worktrees", body)
+            self.assertEqual(ctx.exception.status, 409)
+            self.assertEqual(run.call_count, 2)
+
     def test_new_rejects_unknown_checkout(self):
         with patch.object(self.gateway, "run", return_value=TREES) as run:
             with self.assertRaises(Problem):

@@ -15,7 +15,18 @@ Radix, the AI Elements conversation primitive), Python 3.10+ standard-library ga
   by the native session id Nebula stored — never from terminal screen text. Details and
   limits: `docs/specs/mobile-chat-redesign-pi-source.md`.
 - Other agent kinds (Claude, Codex, Cursor) and Pi sessions without persisted history show an
-  explicitly labelled terminal snapshot (last 250 rendered lines), not chat.
+  explicitly labelled terminal snapshot, not reconstructed chat. It starts with 250 lines;
+  scrolling to the top (or “Output mai vechi”) expands up to 10,000 retained lines while
+  preserving the reading position. Older discarded terminal output cannot be recovered.
+- Pi history loads older pages as you reach the top; polling does not evict pages already read.
+- Sidebar branch/worktree selector and creation dialog: the selected session's checkout is the
+  default base. New names use lowercase letters, digits and hyphens. Worktree mode creates an
+  isolated directory; Branch mode switches the primary and refuses open agent sessions or dirty
+  files there. Creation is never automatically retried. Only existing, enabled-project bases are
+  accepted; read-only Git preflight and normal Nebula CLI commands run on the gateway host.
+- Horizontal session tabs above conversations, yellow names for working sessions, white/black
+  outgoing messages and composer, hidden scrollbar chrome (scrolling remains enabled). In terminal
+  mode, sends from this browser are shown separately, not inferred from terminal text.
 - Send a prompt with a delivery attempt id: `sending → accepted → observed in history`, or
   `uncertain` (timeout/lost acknowledgement) / `failed`, always keeping the text. Nothing is
   ever retried automatically. Repeated taps cannot double-send.
@@ -25,11 +36,15 @@ Radix, the AI Elements conversation primitive), Python 3.10+ standard-library ga
   URL carries `/p/<project>/s/<session id>` (no secrets). Per-session drafts in memory.
 - Offline/resume: cursor-based resync without duplicate messages; stale state is labelled.
 - Installable app shell; the service worker caches only public assets, never `/api/*`.
+  iPhone: Safari → Share → Add to Home Screen. A visible “Instalează pe telefon” guide is
+  available on login and in session navigation; standalone mode, touch icon and HTTPS are supported.
+  The installed app may require the same token again; physical iPhone installation/keyboard checks
+  remain manual.
 - Bearer token in browser **sessionStorage** only, cleared on logout together with drafts and
   subscriptions. No token in URLs, cookies or caches.
 
 Not included: live token streaming (see the Pi source note), archive/delete/restart, file
-access, shell endpoints, worktree creation, notifications, offline actions, multi-user.
+access, shell creation/endpoints, notifications, offline actions, multi-user.
 
 ## Build and run locally
 
@@ -116,7 +131,7 @@ are content-hashed and served with immutable caching, everything else is `no-cac
 
 **Rollback:** check out the previous commit (`44b3f7a`) in the deploy checkout and restart
 `nebula-web`; the old static app is tracked there and needs no build. Remove `NEBULA_WEB_DB`
-if desired (harmless if kept). The service worker cache name changed (`nebula-shell-v3`); the
+if desired (harmless if kept). The service worker cache name changed (`nebula-shell-v4`); the
 old worker replaces it on the next load.
 
 **The token grants agent control as the server's OS user.** Project allowlisting is an API

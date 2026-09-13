@@ -1,5 +1,5 @@
 // Mounted with key={project/session} by the shell, so draft/terminal state resets per session without effects.
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ArrowLeftIcon, RefreshCwIcon, TerminalIcon } from "lucide-react";
 import { useStickToBottomContext } from "use-stick-to-bottom";
 import { Conversation, ConversationContent, ConversationScrollButton } from "@/components/ai-elements/conversation";
@@ -11,6 +11,7 @@ import type { SessionRow } from "@/lib/types";
 import { Composer } from "./Composer";
 import { MessageItem } from "./MessageItem";
 import { TerminalView } from "./TerminalView";
+import { SessionTabs } from "./SessionTabs";
 
 const ATTEMPT_LABEL: Record<Attempt["state"], string> = {
   sending: "Se trimite…",
@@ -19,14 +20,15 @@ const ATTEMPT_LABEL: Record<Attempt["state"], string> = {
   failed: "Trimiterea a eșuat",
 };
 
-function PendingAttempt({ attempt, onDismiss, onRetry }: { attempt: Attempt; onDismiss: () => void; onRetry: () => void }) {
+function PendingAttempt({ attempt, onDismiss, onRetry, snapshotOnly = false }: { attempt: Attempt; onDismiss: () => void; onRetry: () => void; snapshotOnly?: boolean }) {
   return (
     <article className="flex flex-col items-end gap-1" data-attempt={attempt.state} aria-live="polite">
-      <div className="max-w-[min(85%,72ch)] rounded-2xl rounded-br-md border border-dashed border-border px-4 py-2.5 text-[15px] leading-relaxed whitespace-pre-wrap break-words text-foreground/90">
+      <div className="max-w-[min(85%,72ch)] rounded-2xl rounded-br-md border border-dashed border-border bg-white px-4 py-2.5 text-[15px] leading-relaxed whitespace-pre-wrap break-words text-black">
         {attempt.text}
       </div>
       <div className="flex flex-wrap items-center justify-end gap-2 px-1 text-[11px] text-muted-foreground">
-        <span>{ATTEMPT_LABEL[attempt.state]}{attempt.error ? ` · ${attempt.error}` : ""}</span>
+        <span>{snapshotOnly && attempt.state === "accepted" ? "Trimis către sesiune · din acest browser" : ATTEMPT_LABEL[attempt.state]}{attempt.error ? ` · ${attempt.error}` : ""}</span>
+        {snapshotOnly && attempt.state === "accepted" && <Button type="button" size="xs" variant="ghost" onClick={onDismiss}>Ascunde</Button>}
         {(attempt.state === "uncertain" || attempt.state === "failed") && (
           <>
             {attempt.state === "uncertain" && <span>Verifică istoricul înainte de a retrimite.</span>}
@@ -42,16 +44,28 @@ function PendingAttempt({ attempt, onDismiss, onRetry }: { attempt: Attempt; onD
 /** Prepends older history while keeping the reader's position anchored to the same message. */
 function LoadOlder({ controller, loading }: { controller: ConversationController; loading: boolean }) {
   const { scrollRef } = useStickToBottomContext();
-  const load = async () => {
+  const sentinel = useRef<HTMLDivElement>(null);
+  const inFlight = useRef(false);
+  const load = useCallback(async () => {
+    if (inFlight.current) return;
+    inFlight.current = true;
     const element = scrollRef.current;
     const before = element ? element.scrollHeight - element.scrollTop : 0;
     await controller.loadOlder();
     requestAnimationFrame(() => {
       if (element) element.scrollTop = element.scrollHeight - before;
+      inFlight.current = false;
     });
-  };
+  }, [controller, scrollRef]);
+  useEffect(() => {
+    const observer = new IntersectionObserver(entries => {
+      if (entries.some(entry => entry.isIntersecting)) void load();
+    }, { root: scrollRef.current, rootMargin: "80px 0px 0px 0px" });
+    if (sentinel.current) observer.observe(sentinel.current);
+    return () => observer.disconnect();
+  }, [load, scrollRef]);
   return (
-    <div className="flex justify-center">
+    <div ref={sentinel} className="flex justify-center">
       <Button type="button" variant="outline" size="sm" onClick={() => void load()} disabled={loading}>
         {loading ? "Se încarcă…" : "Încarcă mesaje mai vechi"}
       </Button>
@@ -81,13 +95,15 @@ function ConnectionLine({ state }: { state: ConversationState }) {
   );
 }
 
-export function ConversationView({ project, row, state, controller, onBack, showBack }: {
+export function ConversationView({ project, row, state, controller, onBack, showBack, sessions, onSelect }: {
   project: string;
   row: SessionRow | null;
   state: ConversationState;
   controller: ConversationController;
   onBack: () => void;
   showBack: boolean;
+  sessions: SessionRow[];
+  onSelect: (row: SessionRow) => void;
 }) {
   const session = state.session ?? row;
   const sessionId = controller.sessionId;
@@ -112,7 +128,7 @@ export function ConversationView({ project, row, state, controller, onBack, show
   )), [state.messages, project, sessionId]);
 
   return (
-    <section className="flex min-h-0 flex-1 flex-col" aria-label={`Conversație: ${title}`}>
+    <section id="conversation-panel" role="tabpanel" className="flex min-h-0 min-w-0 flex-1 flex-col" aria-label={`Conversație: ${title}`}>
       <header className="flex min-h-14 items-center gap-2 border-b border-border px-2 sm:px-4">
         {showBack && (
           <Button type="button" variant="ghost" size="icon-lg" aria-label="Înapoi la sesiuni" onClick={onBack} className="size-11">
@@ -124,6 +140,7 @@ export function ConversationView({ project, row, state, controller, onBack, show
           {session && (
             <p className="truncate text-xs text-muted-foreground">
               {kindLabel(session.kind)} · <span className="font-mono">{session.worktree}</span> · {statusLabel(session.status)}
+              {showTerminal && <span title={state.capabilities?.reason ?? "Output brut al sesiunii, nu istoric de chat"}> · Terminal</span>}
             </p>
           )}
         </div>
@@ -134,6 +151,7 @@ export function ConversationView({ project, row, state, controller, onBack, show
           </Button>
         )}
       </header>
+      <SessionTabs sessions={sessions} selected={sessionId} onSelect={onSelect} />
 
       {state.phase === "loading" && (
         <div className="flex-1 space-y-4 px-4 py-6" aria-busy="true" aria-label="Se încarcă conversația">
@@ -150,7 +168,7 @@ export function ConversationView({ project, row, state, controller, onBack, show
         </div>
       )}
 
-      {state.phase === "unsupported" && (
+      {state.phase === "unsupported" && session?.kind === "pi" && (
         <p role="status" className="border-b border-border px-4 py-2 text-xs text-muted-foreground">
           Conversație structurată indisponibilă: {state.capabilities?.reason}
         </p>
@@ -174,6 +192,12 @@ export function ConversationView({ project, row, state, controller, onBack, show
         </Conversation>
       )}
 
+      {showTerminal && state.attempts.length > 0 && (
+        <div className="max-h-40 shrink-0 space-y-3 overflow-y-auto border-t border-border px-4 py-3" aria-label="Mesaje trimise din acest browser">
+          {state.attempts.map(attempt => <PendingAttempt key={attempt.id} attempt={attempt} snapshotOnly
+            onDismiss={() => controller.dismissAttempt(attempt.id)} onRetry={() => retry(attempt)} />)}
+        </div>
+      )}
       {state.phase !== "loading" && state.phase !== "error" && (
         <>
           <ConnectionLine state={state} />

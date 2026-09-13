@@ -10,8 +10,9 @@ import { MAX_MESSAGE } from "./Composer";
 
 const KINDS = ["pi", "claude", "codex", "cursor"] as const;
 
-export function NewAgentDialog({ project, open, onOpenChange, onCreated }: {
+export function NewAgentDialog({ project, initialWorktree, open, onOpenChange, onCreated }: {
   project: string;
+  initialWorktree?: string;
   open: boolean;
   onOpenChange: (open: boolean) => void;
   onCreated: (result: NewResponse) => void;
@@ -31,11 +32,12 @@ export function NewAgentDialog({ project, open, onOpenChange, onCreated }: {
       .then((data) => {
         setTrees(data.worktrees);
         // A remembered path only survives if it still belongs to this project's checkouts.
-        setWorktree((w) => (data.worktrees.some((t) => t.path === w) ? w : data.worktrees[0]?.path ?? ""));
+        setWorktree((w) => data.worktrees.some(t => t.path === initialWorktree) ? initialWorktree!
+          : data.worktrees.some(t => t.path === w) ? w : data.worktrees[0]?.path ?? "");
       })
       .catch((failure) => { if (!abort.signal.aborted) setError(describeError(failure)); });
     return () => abort.abort();
-  }, [open, project]);
+  }, [open, project, initialWorktree]);
 
   const selected = trees?.find((w) => w.path === worktree);
   const existing = selected?.sessions.filter((s) => s.alive) ?? [];
@@ -68,7 +70,7 @@ export function NewAgentDialog({ project, open, onOpenChange, onCreated }: {
         <form className="flex flex-col gap-4" onSubmit={(e) => { e.preventDefault(); void submit(); }}>
           <label className="flex flex-col gap-1.5 text-sm">
             <span className="font-medium">Checkout</span>
-            <select value={worktree} onChange={(e) => setWorktree(e.target.value)} required disabled={!trees}
+            <select aria-label="Checkout" value={worktree} onChange={(e) => setWorktree(e.target.value)} required disabled={!trees}
               className="h-11 rounded-lg border border-input bg-card px-3 text-base outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/60">
               {!trees && <option value="">Se încarcă…</option>}
               {trees?.map((w) => <option key={w.path} value={w.path}>{w.branch}{w.is_main ? " (principal)" : ""} · {w.sessions.length} sesiuni</option>)}

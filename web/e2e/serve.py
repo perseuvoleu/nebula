@@ -55,6 +55,8 @@ def seed():
         shutil.rmtree(STATE)
     STATE.mkdir(parents=True)
     (STATE / "pi").mkdir()
+    (STATE / "bin").mkdir()
+    (STATE / "bin" / "git").symlink_to(HERE / "fake_nebula.py")
     (STATE / "sends.log").write_text("")
     (STATE / "behaviour").write_text("ok")
     agents = [
@@ -109,7 +111,7 @@ def main():
            "NEBULA_WEB_PORT": str(PORT), "NEBULA_WEB_ORIGIN": f"http://127.0.0.1:{PORT}",
            "NEBULA_WEB_BINARY": str(HERE / "fake_nebula.py"), "NEBULA_WEB_PI_AGENT_DIR": str(STATE / "pi"),
            "FAKE_NEBULA_STATE": str(STATE), "PYTHONDONTWRITEBYTECODE": "1",
-           "PYTHONPATH": str(WEB)}
+           "PYTHONPATH": str(WEB), "PATH": str(STATE / "bin") + os.pathsep + os.environ["PATH"]}
     os.execve(sys.executable, [sys.executable, str(WEB / "server.py")], env)
 
 
