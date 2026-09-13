@@ -15,6 +15,7 @@ export interface SessionRow {
 }
 
 export interface Worktree {
+  id?: string; // Older CLIs cannot safely delete checkouts.
   path: string;
   branch: string;
   is_main: boolean;

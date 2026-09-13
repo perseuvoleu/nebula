@@ -54,6 +54,68 @@ class GatewayTests(unittest.TestCase):
                 self.gateway.get(path, {"project": ["secret"], "id": ["one"]})
             self.assertEqual(ctx.exception.status, 403)
 
+    def test_terminal_keys_dispatch_once_by_id_without_prompt(self):
+        for key in ["Up", "Down", "Left", "Right", "Enter", "Escape", "Tab"]:
+            with self.subTest(key=key), patch("server.subprocess.run", side_effect=[
+                subprocess.CompletedProcess([], 0, json.dumps(ROWS), ""),
+                subprocess.CompletedProcess([], 0, '{"ok":true}', ""),
+            ]) as run:
+                self.assertTrue(self.gateway.post("/api/key", {"project": "project", "id": "one", "key": key})["ok"])
+                self.assertEqual(run.call_args.args[0], ["nebula", "agent", "key", "--project", "project", "--", "one", key])
+                self.assertEqual(run.call_count, 2)
+        for changed in [{"key": "Space"}, {"key": []}, {"project": "secret"}, {"id": "deleted"}]:
+            with patch("server.subprocess.run", return_value=subprocess.CompletedProcess([], 0, json.dumps(ROWS), "")) as run:
+                with self.assertRaises(Problem):
+                    self.gateway.post("/api/key", {"project": "project", "id": "one", "key": "Enter", **changed})
+                self.assertLessEqual(run.call_count, 1)
+        with patch("server.subprocess.run", side_effect=[
+            subprocess.CompletedProcess([], 0, json.dumps(ROWS), ""),
+            subprocess.CompletedProcess([], 1, "", "PTY disconnected"),
+        ]) as run:
+            with self.assertRaises(Problem) as error:
+                self.gateway.post("/api/key", {"project": "project", "id": "one", "key": "Enter"})
+            self.assertEqual(error.exception.message, "PTY disconnected")
+            self.assertEqual(run.call_count, 2)
+
+    def test_delete_session_is_project_scoped_and_id_only(self):
+        body = {"project": "project", "id": "one"}
+        renamed = [{**ROWS[0], "name": "Renamed"}]
+        with patch("server.subprocess.run", side_effect=[
+            subprocess.CompletedProcess([], 0, json.dumps(renamed), ""),
+            subprocess.CompletedProcess([], 0, '{"ok":true}', ""),
+        ]) as run:
+            self.assertTrue(self.gateway.post("/api/sessions/delete", body)["ok"])
+            self.assertEqual(run.call_args.args[0], ["nebula", "agent", "delete-id", "--project", "project", "--", "one"])
+        for changed in [{"id": "gone"}, {"project": "secret"}]:
+            with patch("server.subprocess.run", return_value=subprocess.CompletedProcess([], 0, json.dumps(ROWS), "")) as run:
+                with self.assertRaises(Problem): self.gateway.post("/api/sessions/delete", {**body, **changed})
+                self.assertLessEqual(run.call_count, 1)
+
+    def test_safe_checkout_delete_checks_identity_and_never_forces_or_retries(self):
+        tree = {"id": "wt-one", "path": "/srv/feature", "branch": "feature", "is_main": False, "sessions": []}
+        body = {"project": "project", "id": "wt-one", "path": "/srv/feature", "branch": "feature"}
+        for path in ["/api/worktrees/check-delete", "/api/worktrees/delete"]:
+            for changed in [{"is_main": True}, {"branch": "main"}, {"branch": "master"}, {"id": "replacement"}]:
+                with patch("server.subprocess.run", return_value=subprocess.CompletedProcess([], 0, json.dumps([{**tree, **changed}]), "")) as run:
+                    with self.assertRaises(Problem): self.gateway.post(path, body)
+                    self.assertEqual(run.call_count, 1)
+            for failure in ["Dirty checkout", "Unmerged commits", "Sessions still exist"]:
+                with patch("server.subprocess.run", side_effect=[
+                    subprocess.CompletedProcess([], 0, json.dumps([tree]), ""),
+                    subprocess.CompletedProcess([], 1, "", failure),
+                ]) as run:
+                    with self.assertRaises(Problem) as error: self.gateway.post(path, body)
+                    self.assertEqual(error.exception.message, failure)
+                    self.assertEqual(run.call_count, 2)
+            with patch("server.subprocess.run", side_effect=[
+                subprocess.CompletedProcess([], 0, json.dumps([tree]), ""),
+                subprocess.CompletedProcess([], 0, '{"ok":true}', ""),
+            ]) as run:
+                self.assertTrue(self.gateway.post(path, body)["ok"])
+                expected = ["nebula", "worktree", "delete-safe", "--project", "project"]
+                if path.endswith("check-delete"): expected += ["--check"]
+                self.assertEqual(run.call_args.args[0], expected + ["--", "wt-one", "feature", "/srv/feature"])
+
     def test_send_treats_input_as_positional_not_flags(self):
         text = '--project=secret; $(touch /tmp/never)'
         with patch.object(self.gateway, "run", side_effect=[ROWS, "ok"]) as run:
@@ -275,7 +337,10 @@ class HTTPTests(unittest.TestCase):
     def test_wrong_host_and_origin(self):
         self.assertEqual(self.request("/", headers={"Host": "evil.example"})[0], 403)
         self.assertEqual(self.request("/api/projects", headers=self.auth(Origin="https://evil.example"))[0], 403)
-        self.assertEqual(self.request("/api/send", "POST", "{}", {"Authorization": "Bearer " + TOKEN})[0], 403)
+        for path in ["/api/send", "/api/key", "/api/sessions/delete", "/api/worktrees/delete", "/api/worktrees/check-delete"]:
+            self.assertEqual(self.request(path, "POST", "{}")[0], 401)
+            self.assertEqual(self.request(path, "POST", "{}", {"Authorization": "Bearer " + TOKEN})[0], 403)
+            self.assertEqual(self.request(path, "POST", "{}", self.auth(Origin="https://evil.example"))[0], 403)
 
     def test_malformed_body(self):
         for body in ["{", "[]", '"hello"']:

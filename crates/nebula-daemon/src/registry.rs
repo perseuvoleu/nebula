@@ -1428,6 +1428,30 @@ impl Daemon {
         Ok(EntityId::Worktree(worktree.id))
     }
 
+    /// Unlike legacy delete, never stops user sessions or deletes a branch.
+    // ponytail: reuse the global checkout lock; split per-project only if contention matters.
+    // Create/move/reparent also take it so a session cannot arrive after the safety check.
+    pub async fn check_worktree_removal(self: &Arc<Self>, id: &WorktreeId, branch: &str, path: &Path, delete: bool) -> Result<()> {
+        let _ops = self.worktree_ops.lock().await;
+        let w = self.store.get_worktree(id)?.context("Checkout no longer available")?;
+        let project = self.store.get_project(&w.project_id)?.context("Project unavailable")?;
+        if w.is_main || matches!(w.branch.as_str(), "main" | "master") || w.path == project.repo_path {
+            bail!("Primary checkout and main/master are protected");
+        }
+        if w.branch != branch || w.path != path { bail!("Checkout changed; refresh before confirming"); }
+        let (_, _, agents, terminals) = self.store.load_tree()?;
+        if agents.iter().any(|a| a.worktree_id == *id) || terminals.iter().any(|t| t.worktree_id == *id) {
+            bail!("Sessions still exist in this checkout (including archived sessions and terminals); delete or move them explicitly first");
+        }
+        git::safe_remove_worktree(&project.repo_path, &w.path, branch, delete).await?;
+        if delete {
+            self.kill_prewarmed_in(std::slice::from_ref(id));
+            self.store.delete_worktree(id)?;
+            self.broadcast(ServerEvent::EntityRemoved { id: EntityId::Worktree(id.clone()) });
+        }
+        Ok(())
+    }
+
     pub async fn delete_worktree(self: &Arc<Self>, id: &WorktreeId, force: bool) -> Result<()> {
         let _ops = self.worktree_ops.lock().await;
         let worktree = self.store.get_worktree(id)?.context("worktree not found")?;
@@ -1757,6 +1781,7 @@ impl Daemon {
         auto_title: bool,
         prompt: Option<String>,
     ) -> Result<EntityId> {
+        let _ops = self.worktree_ops.lock().await;
         let worktree = self
             .store
             .get_worktree(worktree_id)?
@@ -2090,6 +2115,7 @@ impl Daemon {
     /// degrades to a dead session the next attach/prewarm revives via
     /// `ensure_session`.
     pub fn move_agent(self: &Arc<Self>, id: &AgentId, worktree_id: &WorktreeId) -> Result<()> {
+        let _ops = self.worktree_ops.try_lock().context("Checkout operation in progress; try again later")?;
         let agent = self.store.get_agent(id)?.context("agent not found")?;
         if &agent.worktree_id == worktree_id {
             return Ok(());
@@ -2133,6 +2159,7 @@ impl Daemon {
     /// target checkout and only the row is stale, so killing it would
     /// interrupt a live conversation for nothing.
     fn move_agent_row(self: &Arc<Self>, id: &AgentId, worktree_id: &WorktreeId) -> Result<()> {
+        let _ops = self.worktree_ops.try_lock().context("Checkout operation in progress; try again later")?;
         self.store.set_agent_worktree(id, worktree_id)?;
         // The process moved into another checkout: its chat now belongs
         // to that checkout's branch.
@@ -2178,6 +2205,7 @@ impl Daemon {
     /// a different worktree of the same project. `cwd` must already be
     /// canonicalized. The PTY is untouched — only the row moves.
     fn reparent_terminal_to_cwd(self: &Arc<Self>, id: &TerminalId, cwd: &Path) -> Result<()> {
+        let _ops = self.worktree_ops.try_lock().context("Checkout operation in progress; try again later")?;
         let Some(terminal) = self.store.get_terminal(id)? else {
             return Ok(());
         };
@@ -2366,6 +2394,13 @@ impl Daemon {
         Ok(())
     }
 
+    pub fn validate_agent_project(&self, id: &AgentId, project: &ProjectId) -> Result<()> {
+        let agent = self.store.get_agent(id)?.context("Session no longer available")?;
+        let w = self.store.get_worktree(&agent.worktree_id)?.context("Checkout unavailable")?;
+        if agent.archived || w.project_id != *project { bail!("Session no longer available in this project"); }
+        Ok(())
+    }
+
     pub fn delete_agent(self: &Arc<Self>, id: &AgentId) -> Result<()> {
         self.kill_session(&SessionRef::Agent(id.clone()));
         self.last_cwd.lock().unwrap().remove(id);
@@ -2402,6 +2437,7 @@ impl Daemon {
         worktree_id: &WorktreeId,
         name: Option<String>,
     ) -> Result<EntityId> {
+        let _ops = self.worktree_ops.try_lock().context("Checkout operation in progress; try again later")?;
         let worktree = self
             .store
             .get_worktree(worktree_id)?

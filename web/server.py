@@ -116,13 +116,13 @@ class Gateway:
     def sessions(self, project):
         return self.run("agent", "list", "--project", project)
 
-    def session_row(self, project, session_id):
+    def session_row(self, project, session_id, *, by_name=True):
         rows = self.sessions(project)
         row = next((r for r in rows if r["id"] == session_id and not r["archived"]), None)
         if not row:
             raise Problem(404, "Session no longer available")
-        # The current CLI selects by name, not id. Refuse ambiguous names.
-        if sum(r["name"] == row["name"] for r in rows) != 1:
+        # Legacy read/show/send select by name; ID-only controls do not.
+        if by_name and sum(r["name"] == row["name"] for r in rows) != 1:
             raise Problem(409, "Duplicate session name; rename it in Nebula first")
         return row
 
@@ -285,6 +285,30 @@ class Gateway:
         project = self.project(body.get("project"))
         if path == "/api/worktrees":
             return self.create_checkout(project, body)
+        if path in {"/api/worktrees/check-delete", "/api/worktrees/delete"}:
+            trees = self.run("worktree", "list", "--project", project)
+            tree = next((w for w in trees if w.get("id") and w["id"] == body.get("id")), None)
+            if not tree:
+                raise Problem(409, "Checkout unavailable or CLI too old; refresh and check installation")
+            if tree["is_main"] or tree["branch"] in {"main", "master"}:
+                raise Problem(409, "Primary checkout and main/master are protected")
+            if tree["path"] != body.get("path") or tree["branch"] != body.get("branch"):
+                raise Problem(409, "Checkout changed; refresh before confirming")
+            args = ("--check",) if path.endswith("check-delete") else ()
+            self.run("worktree", "delete-safe", "--project", project, *args,
+                     "--", tree["id"], tree["branch"], tree["path"])
+            return {"ok": True}
+        if path == "/api/sessions/delete":
+            row = self.session_row(project, body.get("id"), by_name=False)
+            self.run("agent", "delete-id", "--project", project, "--", row["id"])
+            return {"ok": True}
+        if path == "/api/key":
+            key = body.get("key")
+            if not isinstance(key, str) or key not in {"Up", "Down", "Left", "Right", "Enter", "Escape", "Tab"}:
+                raise Problem(400, "Unsupported terminal key")
+            row = self.session_row(project, body.get("id"), by_name=False)
+            self.run("agent", "key", "--project", project, "--", row["id"], key)
+            return {"ok": True}
         text = body.get("text")
         if not isinstance(text, str) or not text.strip() or len(text) > 16000 or "\0" in text:
             raise Problem(400, "Message must contain 1–16000 characters without NUL")

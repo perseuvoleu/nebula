@@ -6,6 +6,19 @@ import { Button } from "./ui/button";
 export function TerminalView({ project, session }: { project: string; session: string }) {
   const [output, setOutput] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [keyState, setKeyState] = useState<string | null>(null);
+  const [keyError, setKeyError] = useState<string | null>(null);
+  const [sending, setSending] = useState(false);
+  const keyBusy = useRef(false);
+  const sendKey = async (key: string) => {
+    if (keyBusy.current) return;
+    keyBusy.current = true; setSending(true); setKeyError(null); setKeyState(`Se trimite ${key}…`);
+    try {
+      await api("key", {}, { project, id: session, key });
+      setKeyState(`${key}: livrat către PTY`);
+    } catch (failure) { setKeyState(null); setKeyError(describeError(failure)); }
+    finally { keyBusy.current = false; setSending(false); }
+  };
   const [limit, setLimit] = useState(250);
   const [hasMore, setHasMore] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
@@ -54,6 +67,12 @@ export function TerminalView({ project, session }: { project: string; session: s
           {loadingOlder ? "Se încarcă…" : "Output mai vechi"}
         </Button> : <span title="Doar scrollback-ul păstrat de daemon; nu reconstruim mesaje din text">Istoric păstrat de terminal</span>}
         {error && <span role="alert" className="text-foreground">{error}</span>}
+      </div>
+      <div className="flex shrink-0 flex-wrap gap-1 px-3 py-2" role="group" aria-label="Taste terminal">
+        {["Up", "Down", "Left", "Right", "Enter", "Escape", "Tab"].map(key =>
+          <Button key={key} type="button" variant="outline" className="min-h-11 min-w-11" disabled={sending} onClick={() => void sendKey(key)}>{key}</Button>)}
+        {keyState && <p role="status" className="w-full text-xs">{keyState}</p>}
+        {keyError && <p role="alert" className="w-full text-xs">{keyError}</p>}
       </div>
       <pre ref={pre} tabIndex={0} aria-live="off" onScroll={event => { if (event.currentTarget.scrollTop < 80) more(); }}
         className="min-h-0 flex-1 overflow-auto bg-black px-4 py-3 font-mono text-[12.5px] leading-[1.45] whitespace-pre-wrap break-words text-foreground">
