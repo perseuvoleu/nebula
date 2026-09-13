@@ -1,5 +1,5 @@
 // Cache only the public app shell. Never cache API traffic or replay POSTs.
-const CACHE = 'nebula-shell-v1';
+const CACHE = 'nebula-shell-v2';
 const SHELL = ['/', '/app.js', '/style.css', '/manifest.webmanifest', '/icon.svg', '/icon-192.png', '/icon-512.png'];
 self.addEventListener('install', event => {
   event.waitUntil(caches.open(CACHE).then(cache => cache.addAll(SHELL)).then(() => self.skipWaiting()));

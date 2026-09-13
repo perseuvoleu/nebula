@@ -108,12 +108,17 @@ shell, never outputs or messages. Offline mode offers no agent functionality.
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s web -v
 node --check web/static/app.js
 node --check web/static/sw.js
+node --test web/test_app.cjs
 ```
 
 Tests exercise HTTP authentication, exact Host/Origin checks, project scope,
 request validation, cache policy, static assets, session ambiguity, subprocess
 argument boundaries, environment stripping and checkout selector resolution.
 They mock mutating CLI operations: no real agents are spawned or sent prompts.
+The JavaScript regression tests execute the actual app script with a minimal DOM
+and mocked API, checking selected-session output, repeated polling and stale-response
+suppression. They cover the `data` shadowing bug that previously left output stuck
+on “Se încarcă…” before the browser could even request `/api/output`.
 
 Before production use, verify on real iOS/Android: install, login/logout, switch
 sessions while polling, background/resume, loss of network during send, creation

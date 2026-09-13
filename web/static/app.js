@@ -74,10 +74,10 @@ async function refresh() {
     if (selected) {
       const row = data.sessions.find(r => r.id === selected.id);
       $('session-title').textContent = row.name;
-      const data = await api('output', null, {project, id: selected.id});
+      const outputData = await api('output', null, {project, id: selected.id});
       if (version !== generation) return;
       const output = $('output'), bottom = output.scrollHeight - output.scrollTop - output.clientHeight < 60;
-      if (output.textContent !== data.output) output.textContent = data.output;
+      if (output.textContent !== outputData.output) output.textContent = outputData.output;
       if (bottom) output.scrollTop = output.scrollHeight;
     }
     notice('Conectat · ' + new Date().toLocaleTimeString('ro-RO'));
