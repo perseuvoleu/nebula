@@ -1163,6 +1163,9 @@ pub async fn agent_show(name: String, project_flag: Option<String>) -> Result<()
             "archived": a.archived,
             "pinned": a.pinned,
             "alive": a.alive,
+            // Native CLI session id (claude/codex/cursor/pi) the daemon stored for
+            // resume; read-only consumers (the web gateway) map it to native history.
+            "session_id": a.session_id,
         })
     );
     Ok(())
@@ -1499,6 +1502,7 @@ pub async fn agent_list(
                 "worktree": worktree.branch,
                 "path": worktree.path.display().to_string(),
                 "archived": a.archived,
+                "session_id": a.session_id,
             }))
         })
         .collect();
@@ -1652,6 +1656,7 @@ pub async fn agent_wait(
                 "worktree": worktree.branch,
                 "path": worktree.path.display().to_string(),
                 "archived": a.archived,
+                "session_id": a.session_id,
             }))
         })
         .collect();

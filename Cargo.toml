@@ -18,7 +18,7 @@ license = "MIT"
 [workspace.dependencies]
 nebula-core = { path = "crates/nebula-core" }
 nebula-daemon = { path = "crates/nebula-daemon" }
-nebula-tui = { path = "crates/nebula-tui" }
+nebula-tui = { path = "crates/nebula-tui", default-features = false }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
