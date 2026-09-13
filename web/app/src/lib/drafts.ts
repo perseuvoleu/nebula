@@ -1,0 +1,10 @@
+// Per-session composer drafts, in memory only for this authenticated page (cleared on logout).
+const drafts = new Map<string, string>();
+
+export const draftKey = (project: string, session: string): string => `${project}/${session}`;
+export const getDraft = (key: string): string => drafts.get(key) ?? "";
+export const setDraft = (key: string, value: string): void => {
+  if (value) drafts.set(key, value);
+  else drafts.delete(key);
+};
+export const clearDrafts = (): void => drafts.clear();
