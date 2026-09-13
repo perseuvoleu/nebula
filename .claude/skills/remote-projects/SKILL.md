@@ -42,8 +42,10 @@ anchor's path is rewritten to the host's spelling of the repo root the first tim
 ## Twins: local ⇄ remote in one list
 
 A local project and a remote one **with the same name** in the same workspace are twins: one row
-in Projects, the remote-only checkouts join the worktree list with the badge, remote sessions join
-the session lists and tabs. Every session picker offers the other side (`Run on findl ▸` in `n`;
+in Projects. Every local and remote checkout retains its own row and id, including primary
+checkouts and matching worktree branches. Twins show `@local` / `@findl` badges; identity is host
+plus absolute checkout path. Sessions and tabs stay associated with their host-owned checkout.
+Every session picker offers the other side (`Run on findl ▸` in `n`;
 flat `Claude on findl` … rows in ⌘T/⌘D). On the command line two projects share the name, so say
 which: `--project nebula@findl` is the remote twin, `--project nebula` the local one.
 
@@ -66,6 +68,16 @@ sync      skills (nebula-sync-skills) + `git pull --ff-only` on every remote che
 upgrade   `nebula upgrade` on the host; its daemon keeps the old build until `restart`
 restart   `nebula kill` on the host — ends every session there
 ```
+
+`nebula remote <host> sync` is the **host-wide sweep** for the user. The **per-project verb** for
+agents is `nebula sync` (run from a local checkout, no host argument needed): it reports both
+sides (`--status`, JSON), moves commits the safe way through origin in either direction, carries
+`.env*`, `.scratch/` and skills, and refuses with the fix when moving would lose work. The
+hybrid-work skill is its runbook. For remote → local handoff, use `nebula collect <selector>`
+with `--branch` for the primary or `--worktree` for a separate directory; consult `nebula collect
+--help` for current flags. Collection preserves both rows and all remote sessions, and refuses
+unsafe ownership/history rather than replacing a checkout. The canonical local runbook is
+`/Users/andrei/Desktop/nebula/.claude/skills/hybrid-work/SKILL.md`, reachable from other projects.
 
 ## What does not work remotely, on purpose
 
