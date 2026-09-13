@@ -4,6 +4,27 @@ Branch `mobile-chat-redesign` (worktree on findl). Canonical spec:
 `mobile-chat-redesign.md`; Pi source proof: `mobile-chat-redesign-pi-source.md`;
 operations, promotion and rollback: `web/README.md`.
 
+## Local integration verification — 2026-09-13
+
+The remote handover below is the original candidate report. During integration with the
+local TUI/collect changes, the laptop ran the previously pending browser checks:
+
+- 24/24 Playwright E2E tests passed against the real gateway and synthetic native-agent data.
+- 27/27 Python tests and 5/5 TypeScript unit tests passed; production build/typecheck passed.
+- Rust: 705 library tests (core 12, daemon 151, TUI 542), plus 31 PTY and 8 TUI E2E tests passed.
+- Browser verification exposed and fixed an invalid-login error lost by premature auth-state
+  publication and a session-switch race mounting the next composer with the previous draft.
+- E2E fixtures now reset native-agent state per test; selectors identify actual controls and
+  exact messages; the branch-reset test really branches instead of merely appending.
+- A long hostname no longer squeezes the project picker below a usable width.
+- Screenshots were reviewed for phone and desktop monochrome layouts. Artifacts live under
+  `.scratch/mobile-chat-e2e/`, not tracked source directories. Physical iOS/Android keyboard,
+  installation and background checks remain pending. Source integration is not live deployment.
+- Local tooling used Node 24.20 and pnpm 10.34; `--ignore-workspace` isolated dependency
+  installation from the laptop's unrelated parent pnpm workspace. Rust tests use their normal
+  isolated temporary directories (placing non-repository fixtures inside this repo breaks
+  ancestor-discovery assumptions); command logs remain in project scratch.
+
 ## What is delivered
 
 | Slice | Content | Status |
@@ -28,7 +49,7 @@ operations, promotion and rollback: `web/README.md`.
   status, create → resolved id, unsupported reasons for Claude and for a Pi session without
   identity.
 
-## Pending (must run from the laptop, findl has no browser)
+## Original browser handoff (completed locally above; physical phone still pending)
 
 `pnpm --dir web/app exec playwright install chromium` once, then `pnpm --dir web/app test:e2e`
 on the collected checkout. Expected coverage and screenshot set are described in
@@ -64,8 +85,8 @@ loopback preview + SSH tunnel recipe in `web/README.md`.
   conversation with back; project selector and host badge in both; new-agent dialog;
   composer pinned above the keyboard with safe-area padding; jump-to-latest pill only when
   scrolled up; reduced-motion honoured globally.
-- Screenshots: produced by the Playwright suite (`web/e2e/screenshots/`) — pending until run on
-  the laptop; none were captured on findl.
+- Screenshots: produced by the Playwright suite (`.scratch/mobile-chat-e2e/screenshots/`) on
+  the laptop during integration; none were captured on findl.
 
 ## Review outcome
 

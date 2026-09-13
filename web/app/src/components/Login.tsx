@@ -11,13 +11,12 @@ export function Login({ onAuthenticated }: { onAuthenticated: (projects: string[
     const token = value.trim();
     if (token.length < 32 || busy) return;
     setBusy(true); setError(null);
-    setToken(token);
     try {
-      const data = await api<{ projects: string[]; host: string }>("projects");
+      const data = await api<{ projects: string[]; host: string }>("projects", {}, undefined, { token });
+      setToken(token);
       setValue("");
       onAuthenticated(data.projects, data.host);
     } catch (failure) {
-      setToken("");
       const problem = failure instanceof ApiError ? failure : null;
       setError(problem?.status === 401
         ? "Token respins. Folosește tokenul privat al gateway-ului Nebula (NEBULA_WEB_TOKEN), nu un token Cloudflare sau de model."

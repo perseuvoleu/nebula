@@ -1,5 +1,5 @@
-import { expect, test, type Page } from "@playwright/test";
-import { appendEntry, assistantText, login, noHorizontalOverflow, shot } from "./helpers";
+import { expect, type Page } from "@playwright/test";
+import { test, appendEntry, assistantText, login, noHorizontalOverflow, shot } from "./helpers";
 
 const VIEWPORTS = {
   "phone-320": { width: 320, height: 568 },
@@ -53,15 +53,15 @@ test("phone: list → conversation → back, sheet navigation, project switch an
   await page.goBack();
   await expect(page.getByRole("heading", { name: "Sesiuni" })).toBeVisible();
   // Second project on the phone.
-  await page.getByLabel("Proiect").selectOption("beta");
+  await page.getByRole("combobox", { name: "Proiect", exact: true }).selectOption("beta");
   await page.getByRole("button", { name: /Beta migration/ }).click();
-  await expect(page.getByRole("log").getByText("Migrarea")).toBeVisible();
+  await expect(page.getByRole("log").getByText("Migrarea beta este pregătită: 3 tabele, 0 conflicte.", { exact: true })).toBeVisible();
   await noHorizontalOverflow(page);
   await shot(page, "phone-390-beta-conversation");
   // Network error state is distinguishable from an empty list.
   await page.context().setOffline(true);
   await page.getByRole("button", { name: "Înapoi la sesiuni" }).click();
-  await page.getByLabel("Proiect").selectOption("alpha");
+  await page.getByRole("combobox", { name: "Proiect", exact: true }).selectOption("alpha");
   await expect(page.getByRole("status").filter({ hasText: /Fără conexiune|Reconectare/ }).or(page.getByRole("alert"))).toBeVisible({ timeout: 15_000 });
   await shot(page, "phone-390-offline");
   await page.context().setOffline(false);
@@ -98,6 +98,8 @@ test("desktop: Enter sends, Shift+Enter inserts a newline, sidebar stays beside 
   await page.setViewportSize(VIEWPORTS["desktop-1440"]);
   await login(page, "/p/alpha/s/pi-2");
   await expect(page.getByRole("navigation", { name: /Sesiuni în alpha/ })).toBeVisible();
+  const projectBox = await page.getByRole("combobox", { name: "Proiect", exact: true }).boundingBox();
+  expect(projectBox!.width, "host metadata must leave the project picker readable").toBeGreaterThanOrEqual(100);
   const composer = page.getByLabel("Mesaj către agent");
   await composer.focus();
   await page.keyboard.type("prima");

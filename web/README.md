@@ -73,7 +73,7 @@ fake `nebula` CLI and synthetic Pi session files (`web/e2e/serve.py`). It covers
 second project → nonempty structured conversation, rename/stale-response protection,
 terminal-originated messages, tool completion, single send / uncertain / failed delivery,
 drafts, creation, offline/resume, logout, service-worker and unsafe-Markdown invariants, and
-phone/tablet/desktop/landscape layouts with screenshots in `web/e2e/screenshots/`. Run it on a
+phone/tablet/desktop/landscape layouts with screenshots in `.scratch/mobile-chat-e2e/screenshots/`. Run it on a
 machine with a browser (`pnpm --dir web/app exec playwright install chromium` once).
 **findl has no browser: those checks stay pending until run from the laptop.**
 

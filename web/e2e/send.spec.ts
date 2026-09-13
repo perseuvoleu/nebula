@@ -1,5 +1,5 @@
-import { expect, test } from "@playwright/test";
-import { appendEntry, assistantText, login, sends, setBehaviour, setStatus } from "./helpers";
+import { expect } from "@playwright/test";
+import { test, appendEntry, assistantText, login, sends, setBehaviour, setStatus } from "./helpers";
 
 test.describe("sending", () => {
   test.afterEach(() => setBehaviour("ok"));

@@ -1,10 +1,10 @@
-import { expect, test } from "@playwright/test";
-import { appendEntry, assistantText, login, readAgents, shot, writeAgents } from "./helpers";
+import { expect } from "@playwright/test";
+import { test, appendEntry, assistantText, login, readAgents, shot, writeAgents } from "./helpers";
 
 test.describe("selection and structured conversation", () => {
   test("login → second project → existing session renders real structured reply, not loading", async ({ page }) => {
     await login(page);
-    await page.getByLabel("Proiect").first().selectOption("beta");
+    await page.getByRole("combobox", { name: "Proiect", exact: true }).selectOption("beta");
     await expect(page).toHaveURL(/\/p\/beta$/);
     await page.getByRole("button", { name: /Beta migration/ }).click();
     await expect(page).toHaveURL(/\/p\/beta\/s\/pi-b$/);

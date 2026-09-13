@@ -1,16 +1,29 @@
 import fs from "node:fs";
 import path from "node:path";
-import { expect, type Page } from "@playwright/test";
+import { execFileSync } from "node:child_process";
+import { expect, test as base, type Page } from "@playwright/test";
 
 export const TOKEN = "e2e-synthetic-token-not-a-secret-0123456789";
-export const STATE = path.join(__dirname, ".state");
-export const SHOTS = path.join(__dirname, "screenshots");
+const SCRATCH = path.resolve(__dirname, "../../.scratch/mobile-chat-e2e");
+export const STATE = path.join(SCRATCH, "state");
+export const SHOTS = path.join(SCRATCH, "screenshots");
+
+// Every scenario gets a fresh external-agent state; browser contexts alone do
+// not isolate transcript appends, renames or sends persisted by the fake CLI.
+export const test = base.extend({
+  page: async ({ page }, use) => {
+    execFileSync("python3", ["-c", "from serve import seed; seed()"], { cwd: __dirname });
+    await use(page);
+  },
+});
 
 export async function login(page: Page, url = "/") {
   await page.goto(url);
   await page.getByLabel("Token de acces").fill(TOKEN);
   await page.getByRole("button", { name: "Conectare" }).click();
-  await expect(page.getByLabel("Proiect").first()).toBeVisible();
+  await expect(page.getByLabel("Token de acces")).toHaveCount(0);
+  if (/\/s\//.test(url)) await expect(page.getByLabel("Mesaj către agent")).toBeVisible();
+  else await expect(page.getByRole("combobox", { name: "Proiect", exact: true })).toBeVisible();
 }
 
 export function readAgents(): Array<Record<string, unknown> & { id: string; name: string; status: string; path: string; session_id: string | null }> {
@@ -36,10 +49,10 @@ function sessionFile(agentId: string): string {
 }
 
 /** Simulate the host agent persisting an entry (what Pi does when a message completes). */
-export function appendEntry(agentId: string, message: Record<string, unknown>, id = Math.random().toString(16).slice(2, 10)): void {
+export function appendEntry(agentId: string, message: Record<string, unknown>, id = Math.random().toString(16).slice(2, 10), parentId?: string): void {
   const file = sessionFile(agentId);
   const lines = fs.readFileSync(file, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
-  const parent = lines.length > 1 ? lines[lines.length - 1].id : null;
+  const parent = parentId ?? (lines.length > 1 ? lines[lines.length - 1].id : null);
   fs.appendFileSync(file, JSON.stringify({ type: "message", id, parentId: parent, timestamp: new Date().toISOString(), message }) + "\n");
 }
 

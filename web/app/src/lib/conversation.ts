@@ -267,9 +267,12 @@ export function useConversation(project: string | null, sessionId: string | null
     setController(next);
     return () => { next?.dispose(); setController(null); };
   }, [project, sessionId]);
+  // The route changes before the effect replaces its controller. Never mount
+  // the new session's composer with the old session's draft/control identity.
+  const current = controller?.project === project && controller?.sessionId === sessionId ? controller : null;
   const state = useSyncExternalStore(
-    controller ? controller.subscribe : () => () => {},
-    controller ? controller.getSnapshot : () => null,
+    current ? current.subscribe : () => () => {},
+    current ? current.getSnapshot : () => null,
   );
-  return { state, controller };
+  return { state, controller: current };
 }

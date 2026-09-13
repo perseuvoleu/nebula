@@ -1,5 +1,5 @@
-import { expect, test } from "@playwright/test";
-import { appendEntry, assistantText, login, TOKEN } from "./helpers";
+import { expect } from "@playwright/test";
+import { test, appendEntry, assistantText, login, TOKEN } from "./helpers";
 
 test.describe("reconnection, logout and PWA/security invariants", () => {
   test("offline → online restores the authoritative conversation without duplicates and keeps the draft", async ({ page }) => {
@@ -23,10 +23,19 @@ test.describe("reconnection, logout and PWA/security invariants", () => {
     await login(page, "/p/alpha/s/pi-2");
     const log = page.getByRole("log");
     await expect(log.locator("article")).toHaveCount(2);
-    // Simulate a Pi branch jump (parent = the first entry): the gateway answers with a reset.
-    appendEntry("pi-2", { role: "user", content: "Reluăm de la început", timestamp: Date.now() }, "branch1");
+    await page.evaluate(() => {
+      Object.defineProperty(document, "hidden", { configurable: true, value: true });
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
+    // Branch from the first user entry, abandoning the old assistant reply.
+    appendEntry("pi-2", { role: "user", content: "Reluăm de la început", timestamp: Date.now() }, "branch1", "x1");
+    await page.evaluate(() => {
+      Object.defineProperty(document, "hidden", { configurable: true, value: false });
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
     await expect(log.getByText("Reluăm de la început")).toBeVisible();
-    await expect(log.locator("article")).toHaveCount(3);
+    await expect(log.locator("article")).toHaveCount(2);
+    await expect(log.getByText("A doua sesiune Pi lucrează la altceva pe același checkout.")).toHaveCount(0);
   });
 
   test("logout clears credentials and late responses cannot repopulate the UI", async ({ page }) => {
@@ -49,8 +58,8 @@ test.describe("reconnection, logout and PWA/security invariants", () => {
 
   test("service worker caches only the public shell, never API responses; token never in URL", async ({ page }) => {
     await login(page, "/p/beta/s/pi-b");
-    await expect(page.getByRole("log").getByText("Migrarea")).toBeVisible();
-    await page.waitForFunction(() => navigator.serviceWorker?.controller !== null || navigator.serviceWorker?.getRegistrations().then((r) => r.length > 0));
+    await expect(page.getByRole("log").getByText("Migrarea beta este pregătită: 3 tabele, 0 conflicte.", { exact: true })).toBeVisible();
+    await page.evaluate(async () => { await navigator.serviceWorker.ready; });
     await page.waitForTimeout(1500);
     const cached = await page.evaluate(async () => {
       const keys = await caches.keys();
@@ -71,5 +80,9 @@ test.describe("reconnection, logout and PWA/security invariants", () => {
     await page.getByRole("button", { name: "Conectare" }).click();
     await expect(page.getByRole("alert")).toContainText("NEBULA_WEB_TOKEN");
     expect(await page.evaluate(() => sessionStorage.getItem("nebula-token"))).toBeNull();
+    // The same mounted form can recover with valid credentials.
+    await page.getByLabel("Token de acces").fill(TOKEN);
+    await page.getByRole("button", { name: "Conectare" }).click();
+    await expect(page.getByRole("combobox", { name: "Proiect", exact: true })).toBeVisible();
   });
 });

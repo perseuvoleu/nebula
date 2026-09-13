@@ -57,6 +57,8 @@ export function isUncertain(error: unknown): boolean {
 export interface RequestOptions {
   signal?: AbortSignal;
   timeoutMs?: number;
+  /** Validate login credentials without publishing authenticated application state. */
+  token?: string;
 }
 
 export async function api<T>(
@@ -70,13 +72,14 @@ export async function api<T>(
   const url = `/api/${path}${params.size ? `?${params}` : ""}`;
   const timeout = AbortSignal.timeout(options.timeoutMs ?? 30000);
   const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
+  const requestToken = options.token ?? token;
   let response: Response;
   try {
     response = await fetch(url, {
       method: body === undefined ? "GET" : "POST",
       cache: "no-store",
       headers: {
-        Authorization: `Bearer ${token}`,
+        Authorization: `Bearer ${requestToken}`,
         ...(body === undefined ? {} : { "Content-Type": "application/json" }),
       },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
@@ -96,7 +99,9 @@ export async function api<T>(
     if (response.ok) throw new ApiError("Răspuns invalid de la server", response.status);
   }
   if (response.status === 401) {
-    setToken("");
+    // A failed login must stay mounted to show its error. A stale request must
+    // also not clear credentials accepted by a newer login.
+    if (options.token === undefined && requestToken === token) setToken("");
     throw new ApiError("Token respins. Autentifică-te din nou.", 401);
   }
   if (!response.ok) throw new ApiError(typeof data.error === "string" ? data.error : "Cererea a eșuat", response.status);

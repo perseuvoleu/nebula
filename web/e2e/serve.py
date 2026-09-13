@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Start the real gateway on a loopback port against the fake CLI and synthetic Pi files.
 
-State dir: web/e2e/.state (recreated on every start). Token is a fixed synthetic test value.
+State dir: .scratch/mobile-chat-e2e/state (recreated on every start). Token is synthetic.
 """
 import json
 import os
@@ -14,7 +14,7 @@ WEB = HERE.parent
 sys.path.insert(0, str(WEB))
 from test_pi_history import assistant, entry, tool_result, user, write_session  # noqa: E402
 
-STATE = HERE / ".state"
+STATE = WEB.parent / ".scratch" / "mobile-chat-e2e" / "state"
 TOKEN = "e2e-synthetic-token-not-a-secret-0123456789"
 PORT = int(os.environ.get("E2E_PORT", "8790"))
 SID = {"pi-1": "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa", "pi-2": "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb",

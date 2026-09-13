@@ -5,7 +5,7 @@ const PORT = 8790;
 
 export default defineConfig({
   testDir: "../e2e",
-  outputDir: "../e2e/.results",
+  outputDir: "../../.scratch/mobile-chat-e2e/results",
   timeout: 60_000,
   expect: { timeout: 10_000 },
   fullyParallel: false,
