@@ -40,6 +40,12 @@ class GatewayTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_static_files_survive_build_directory_replacement(self):
+        root = make_static(Path(self.tmp.name) / "replaceable")
+        static = StaticFiles(root)
+        (root / "index.html").unlink()
+        self.assertTrue(static.lookup("/")[0].startswith(b"<!doctype"))
+
     def test_configuration(self):
         for token, origin, projects in [("short", "https://example.com", ["p"]),
                                         (TOKEN, "http://example.com", ["p"]),

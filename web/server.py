@@ -52,18 +52,18 @@ class StaticFiles:
                 relative = "/" + path.relative_to(self.root).as_posix()
                 if (path.is_file() and not path.is_symlink() and path.suffix in ASSET_TYPES
                         and not any(part.startswith(".") for part in path.relative_to(self.root).parts)):
-                    self.files[relative] = path
+                    self.files[relative] = (path.read_bytes(), path.suffix)
 
     def lookup(self, path):
         """(file, mime, cache) for an asset, the app shell for client routes, else None."""
         if path == "/" or (path not in self.files and ROUTE.fullmatch(path)):
             shell = self.files.get("/index.html")
-            return (shell, "text/html", "no-cache") if shell else None
+            return (shell[0], "text/html", "no-cache") if shell else None
         file = self.files.get(path)
         if not file:
             return None
         immutable = path.startswith("/assets/") and re.search(r"-[A-Za-z0-9_-]{6,}\.\w+$", path)
-        return file, ASSET_TYPES[file.suffix], "public, max-age=31536000, immutable" if immutable else "no-cache"
+        return file[0], ASSET_TYPES[file[1]], "public, max-age=31536000, immutable" if immutable else "no-cache"
 
 
 class Gateway:
@@ -372,7 +372,7 @@ class Handler(BaseHTTPRequestHandler):
                 if asset is None:
                     raise Problem(404, "Not found")
                 file, mime, cache = asset
-                return self.reply(200, file.read_bytes(), mime, cache)
+                return self.reply(200, file, mime, cache)
             if not path.startswith("/api/"):
                 raise Problem(404, "Not found")
             if not hmac.compare_digest(self.headers.get("Authorization", "").encode(),

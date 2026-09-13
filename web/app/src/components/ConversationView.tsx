@@ -95,7 +95,7 @@ function ConnectionLine({ state }: { state: ConversationState }) {
   );
 }
 
-export function ConversationView({ project, row, state, controller, onBack, showBack, sessions, onSelect }: {
+export function ConversationView({ project, row, state, controller, onBack, showBack, sessions, unseen, onSelect }: {
   project: string;
   row: SessionRow | null;
   state: ConversationState;
@@ -103,6 +103,7 @@ export function ConversationView({ project, row, state, controller, onBack, show
   onBack: () => void;
   showBack: boolean;
   sessions: SessionRow[];
+  unseen: Set<string>;
   onSelect: (row: SessionRow) => void;
 }) {
   const session = state.session ?? row;
@@ -151,7 +152,7 @@ export function ConversationView({ project, row, state, controller, onBack, show
           </Button>
         )}
       </header>
-      <SessionTabs sessions={sessions} selected={sessionId} onSelect={onSelect} />
+      <SessionTabs sessions={sessions} selected={sessionId} unseen={unseen} onSelect={onSelect} />
 
       {state.phase === "loading" && (
         <div className="flex-1 space-y-4 px-4 py-6" aria-busy="true" aria-label="Se încarcă conversația">

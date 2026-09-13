@@ -5,6 +5,7 @@ import { useConversation } from "@/lib/conversation";
 import { clearDrafts } from "@/lib/drafts";
 import { useSelection } from "@/lib/route";
 import type { NewResponse, SessionRow, Worktree } from "@/lib/types";
+import { loadUnseen, reconcileUnseen, saveUnseen } from "@/lib/unseen";
 import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
 import { ConversationView } from "./components/ConversationView";
@@ -100,6 +101,7 @@ function Shell({ workspace }: { workspace: Workspace }) {
   const [creating, setCreating] = useState(false);
   const [created, setCreated] = useState<string | null>(null);
   const [checkout, setCheckout] = useState<{ project: string; path: string } | null>(null);
+  const [unseenState, setUnseenState] = useState(loadUnseen);
 
   // Normalise the URL to a valid project once the allowlist is known.
   useEffect(() => { if (selection.project !== project) navigate({ project, session: selection.session }, true); }, [project, selection.project, selection.session, navigate]);
@@ -115,6 +117,15 @@ function Shell({ workspace }: { workspace: Workspace }) {
   const sessionId = selection.session;
   const missing = sessionId !== null && sessions.phase === "ready" && !row;
   const { state, controller } = useConversation(project, sessionId && !missing ? sessionId : null);
+  useEffect(() => {
+    if (sessions.phase !== "ready") return;
+    setUnseenState((previous) => {
+      const next = reconcileUnseen(previous, project, sessions.rows, sessionId);
+      saveUnseen(next);
+      return next;
+    });
+  }, [project, sessionId, sessions.phase, sessions.rows]);
+  const unseenFinished = new Set(unseenState.unseen.filter((id) => id.startsWith(`${project}/`)).map((id) => id.slice(project.length + 1)));
 
   const select = (r: SessionRow) => { navigate({ project, session: r.id }); setMenuOpen(false); setCreated(null); };
   const onCreated = (result: NewResponse) => {
@@ -140,14 +151,14 @@ function Shell({ workspace }: { workspace: Workspace }) {
       </div>
       {checkoutPanel}
       {created && <p role="status" className="border-b border-sidebar-border px-3 py-2 text-xs">Agent pornit ca „{created}”. Identitatea nu a putut fi confirmată încă: alege-l din listă.</p>}
-      <SessionList sessions={sessions.rows} phase={sessions.phase} error={sessions.error} selected={sessionId} onSelect={select} onNew={() => setCreating(true)} project={project} />
+      <SessionList sessions={sessions.rows} phase={sessions.phase} error={sessions.error} selected={sessionId} unseen={unseenFinished} onSelect={select} onNew={() => setCreating(true)} project={project} />
       <InstallApp />
       <p className="border-t border-sidebar-border px-3 py-2 text-[11px] text-muted-foreground">Telefonul se poate deconecta. Agenții rămân pe server.</p>
     </aside>
   );
 
   const conversation = sessionId && controller && state ? (
-    <ConversationView key={`${project}/${sessionId}`} project={project} row={row} state={state} controller={controller} sessions={sessions.rows} onSelect={select} showBack={!desktop} onBack={() => navigate({ project, session: null })} />
+    <ConversationView key={`${project}/${sessionId}`} project={project} row={row} state={state} controller={controller} sessions={sessions.rows} unseen={unseenFinished} onSelect={select} showBack={!desktop} onBack={() => navigate({ project, session: null })} />
   ) : (
     <section className="flex min-h-0 flex-1 flex-col">
       {!desktop && (
@@ -198,7 +209,7 @@ function Shell({ workspace }: { workspace: Workspace }) {
             </label>
           </div>
           {checkoutPanel}
-          <SessionList sessions={sessions.rows} phase={sessions.phase} error={sessions.error} selected={sessionId} onSelect={select} onNew={() => setCreating(true)} project={project} />
+          <SessionList sessions={sessions.rows} phase={sessions.phase} error={sessions.error} selected={sessionId} unseen={unseenFinished} onSelect={select} onNew={() => setCreating(true)} project={project} />
           <InstallApp />
         </main>
       )}
