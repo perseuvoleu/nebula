@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { LogOutIcon, MenuIcon } from "lucide-react";
-import { api, ApiError, getToken, onAuthChange, setToken } from "@/lib/api";
+import { api, ApiError, describeError, getToken, onAuthChange, setToken } from "@/lib/api";
 import { useConversation } from "@/lib/conversation";
 import { clearDrafts } from "@/lib/drafts";
 import { useSelection } from "@/lib/route";
@@ -42,19 +42,23 @@ function useSessions(project: string | null) {
     } catch (failure) {
       if (version !== generation.current) return;
       if (failure instanceof ApiError && failure.status === 401) return;
-      setError(failure instanceof ApiError ? failure.message : "Eroare neașteptată");
+      setError(describeError(failure));
       setPhase((p) => (p === "loading" ? "error" : navigator.onLine ? p : "offline"));
     }
   }, [project]);
   useEffect(() => {
     setRows([]); setPhase("loading"); setError(null);
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const loop = async () => { if (!document.hidden) await refresh(); timer = setTimeout(loop, SESSIONS_POLL_MS); };
+    let cancelled = false;
+    const loop = async () => {
+      if (!document.hidden) await refresh();
+      if (!cancelled) timer = setTimeout(loop, SESSIONS_POLL_MS);
+    };
     void loop();
-    const wake = () => { if (!document.hidden) void refresh(); };
+    const wake = () => { if (!document.hidden && !cancelled) void refresh(); };
     document.addEventListener("visibilitychange", wake);
     window.addEventListener("online", wake);
-    return () => { generation.current += 1; if (timer) clearTimeout(timer); document.removeEventListener("visibilitychange", wake); window.removeEventListener("online", wake); };
+    return () => { cancelled = true; generation.current += 1; if (timer) clearTimeout(timer); document.removeEventListener("visibilitychange", wake); window.removeEventListener("online", wake); };
   }, [refresh]);
   return { rows, phase, error, refresh };
 }
@@ -74,7 +78,7 @@ export default function App() {
     if (!authed || workspace) return;
     let cancelled = false;
     api<Workspace>("projects").then((data) => { if (!cancelled) setWorkspace(data); })
-      .catch((failure) => { if (!cancelled && !(failure instanceof ApiError && failure.status === 401)) setNotice(failure instanceof ApiError ? failure.message : "Eroare neașteptată"); });
+      .catch((failure) => { if (!cancelled && !(failure instanceof ApiError && failure.status === 401)) setNotice(describeError(failure)); });
     return () => { cancelled = true; };
   }, [authed, workspace]);
 
@@ -92,7 +96,7 @@ function Shell({ workspace }: { workspace: Workspace }) {
   const desktop = useMediaQuery("(min-width: 768px)");
   const [menuOpen, setMenuOpen] = useState(false);
   const [creating, setCreating] = useState(false);
-  const [pendingName, setPendingName] = useState<string | null>(null);
+  const [created, setCreated] = useState<string | null>(null);
 
   // Normalise the URL to a valid project once the allowlist is known.
   useEffect(() => { if (selection.project !== project) navigate({ project, session: selection.session }, true); }, [project, selection.project, selection.session, navigate]);
@@ -102,17 +106,11 @@ function Shell({ workspace }: { workspace: Workspace }) {
   const missing = sessionId !== null && sessions.phase === "ready" && !row;
   const { state, controller } = useConversation(project, sessionId && !missing ? sessionId : null);
 
-  // A freshly created session is selected once its id is known (immediately, or by name after the next list).
-  useEffect(() => {
-    if (!pendingName) return;
-    const match = sessions.rows.find((r) => r.name === pendingName);
-    if (match) { setPendingName(null); navigate({ project, session: match.id }); }
-  }, [pendingName, sessions.rows, project, navigate]);
-
-  const select = (r: SessionRow) => { navigate({ project, session: r.id }); setMenuOpen(false); };
+  const select = (r: SessionRow) => { navigate({ project, session: r.id }); setMenuOpen(false); setCreated(null); };
   const onCreated = (result: NewResponse) => {
     void sessions.refresh();
-    if (result.id) navigate({ project, session: result.id }); else setPendingName(result.name);
+    // Identity comes from the gateway; a title is never used to guess it (the agent may rename).
+    if (result.id) navigate({ project, session: result.id }); else setCreated(result.name);
     setMenuOpen(false);
   };
   const logout = () => { controller?.dispose(); setToken(""); navigate({ project: null, session: null }, true); };
@@ -130,6 +128,7 @@ function Shell({ workspace }: { workspace: Workspace }) {
         <span className="shrink-0 rounded border border-border px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground" title="Execuția are loc pe acest server">@{workspace.host}</span>
         <Button type="button" variant="ghost" size="icon-lg" aria-label="Deconectare" onClick={logout} className="size-10"><LogOutIcon aria-hidden /></Button>
       </div>
+      {created && <p role="status" className="border-b border-sidebar-border px-3 py-2 text-xs">Agent pornit ca „{created}”. Identitatea nu a putut fi confirmată încă: alege-l din listă.</p>}
       <SessionList sessions={sessions.rows} phase={sessions.phase} error={sessions.error} selected={sessionId} onSelect={select} onNew={() => setCreating(true)} project={project} />
       <p className="border-t border-sidebar-border px-3 py-2 text-[11px] text-muted-foreground">Telefonul se poate deconecta. Agenții rămân pe server.</p>
     </aside>

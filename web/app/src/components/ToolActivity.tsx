@@ -1,6 +1,6 @@
 import { memo, useState } from "react";
 import { ChevronRightIcon } from "lucide-react";
-import { api, ApiError } from "@/lib/api";
+import { api, describeError } from "@/lib/api";
 import type { ToolPart, ToolResult } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { CopyButton } from "./Markdown";
@@ -36,7 +36,7 @@ export const ToolActivity = memo(function ToolActivity({ part, project, session 
       const data = await api<{ tool: ToolResult }>("conversation/tool", { project, id: session, call: part.callId });
       setFull(data.tool);
     } catch (failure) {
-      setError(failure instanceof ApiError ? failure.message : "Nu s-a putut încărca");
+      setError(describeError(failure));
     } finally {
       setLoading(false);
     }

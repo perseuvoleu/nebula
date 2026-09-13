@@ -39,6 +39,26 @@ function PendingAttempt({ attempt, onDismiss, onRetry }: { attempt: Attempt; onD
   );
 }
 
+/** Prepends older history while keeping the reader's position anchored to the same message. */
+function LoadOlder({ controller, loading }: { controller: ConversationController; loading: boolean }) {
+  const { scrollRef } = useStickToBottomContext();
+  const load = async () => {
+    const element = scrollRef.current;
+    const before = element ? element.scrollHeight - element.scrollTop : 0;
+    await controller.loadOlder();
+    requestAnimationFrame(() => {
+      if (element) element.scrollTop = element.scrollHeight - before;
+    });
+  };
+  return (
+    <div className="flex justify-center">
+      <Button type="button" variant="outline" size="sm" onClick={() => void load()} disabled={loading}>
+        {loading ? "Se încarcă…" : "Încarcă mesaje mai vechi"}
+      </Button>
+    </div>
+  );
+}
+
 function JumpToLatest({ generation }: { generation: number }) {
   const { scrollToBottom } = useStickToBottomContext();
   useEffect(() => { void scrollToBottom({ animation: "instant" }); }, [generation, scrollToBottom]);
@@ -141,13 +161,7 @@ export function ConversationView({ project, row, state, controller, onBack, show
       {structured && !showTerminal && (
         <Conversation className="min-h-0 flex-1" initial="instant" resize="instant">
           <ConversationContent className="mx-auto w-full max-w-[86ch] gap-5 px-4 py-4 sm:px-6">
-            {state.hasMore && (
-              <div className="flex justify-center">
-                <Button type="button" variant="outline" size="sm" onClick={() => void controller.loadOlder()} disabled={state.loadingOlder}>
-                  {state.loadingOlder ? "Se încarcă…" : "Încarcă mesaje mai vechi"}
-                </Button>
-              </div>
-            )}
+            {state.hasMore && <LoadOlder controller={controller} loading={state.loadingOlder} />}
             {state.messages.length === 0 && state.attempts.length === 0 && (
               <p className="py-10 text-center text-sm text-muted-foreground">Sesiunea nu are încă mesaje persistate. Pi scrie istoricul după primul răspuns.</p>
             )}
@@ -164,7 +178,7 @@ export function ConversationView({ project, row, state, controller, onBack, show
         <>
           <ConnectionLine state={state} />
           <Composer draft={draft} onDraft={onDraft} onSend={(text) => void send(text)} busy={sending}
-            disabled={!state.capabilities?.send} autoFocus={!showBack} />
+            disabled={!state.capabilities?.send || state.connection === "offline"} autoFocus={!showBack} />
         </>
       )}
     </section>

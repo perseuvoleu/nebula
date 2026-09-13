@@ -25,7 +25,7 @@ export function sends(): Array<Record<string, string>> {
   return fs.readFileSync(path.join(STATE, "sends.log"), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
 }
 
-export function setBehaviour(value: "ok" | "fail" | "hang"): void {
+export function setBehaviour(value: "ok" | "fail" | "hang" | "silent"): void {
   fs.writeFileSync(path.join(STATE, "behaviour"), value);
 }
 

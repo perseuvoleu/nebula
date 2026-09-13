@@ -27,11 +27,12 @@ test.describe("sending", () => {
   });
 
   test("a lost acknowledgement shows uncertain delivery, keeps the text and never resends on its own", async ({ page }) => {
+    setBehaviour("silent"); // accepted by the PTY, not yet persisted by Pi
     await login(page, "/p/alpha/s/pi-2");
     const before = sends().length;
     await page.route("**/api/send", async (route) => {
-      // The gateway receives the request (the fake CLI logs it) but the browser never sees the reply.
-      await new Promise((resolve) => setTimeout(resolve, 300));
+      // The gateway executes the request (the fake CLI logs it) but the browser never sees the reply.
+      await route.fetch();
       await route.abort("connectionreset");
     });
     await page.getByLabel("Mesaj către agent").fill("Instrucțiune cu confirmare pierdută");

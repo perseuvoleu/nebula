@@ -40,7 +40,7 @@ export const MessageItem = memo(function MessageItem({ message, project, session
         <time>{formatTime(message.timestamp)}</time>
         {message.model && <span className="hidden sm:inline">{message.model}</span>}
         {tools.length > 0 && <span>{tools.length} {tools.length === 1 ? "unealtă" : "unelte"}</span>}
-        {text && <span className="opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100"><CopyButton text={text} label="Copiază răspunsul" /></span>}
+        {text && <CopyButton text={text} label="Copiază răspunsul" />}
       </div>
     </article>
   );

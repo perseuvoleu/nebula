@@ -13,3 +13,4 @@ design-screenshots/
 /web/e2e/.state/
 /web/e2e/.results/
 /web/e2e/screenshots/
+__pycache__/

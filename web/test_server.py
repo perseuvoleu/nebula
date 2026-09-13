@@ -152,6 +152,20 @@ class GatewayTests(unittest.TestCase):
             reset = self.gateway.get("/api/conversation/updates", {**query, "generation": ["stale"]})
         self.assertEqual(reset["kind"], "reset")
 
+    def test_transient_gateway_failures_are_errors_not_unsupported(self):
+        with patch.object(self.gateway, "run", side_effect=[ROWS, Problem(503, "Gateway busy; try again shortly")]):
+            with self.assertRaises(Problem) as ctx:
+                self.gateway.get("/api/conversation", {"project": ["project"], "id": ["one"]})
+        self.assertEqual(ctx.exception.status, 503)
+        self.assertNotIn("one", self.gateway.identities)  # nothing cached from a transient failure
+        show = {**SHOW, "session_id": SID_A}
+        rows = [{**ROWS[0], "session_id": SID_A}]
+        with patch.object(self.gateway, "run", side_effect=[rows]):
+            self.assertNotIn("session_id", self.gateway.get("/api/sessions", {"project": ["project"]})["sessions"][0])
+        with patch.object(self.gateway, "run", side_effect=[rows, show]):
+            result = self.gateway.get("/api/conversation", {"project": ["project"], "id": ["one"]})
+        self.assertNotIn("session_id", result["session"])
+
     def test_native_identity_db_fallback_is_read_only_and_schema_checked(self):
         db = Path(self.tmp.name) / "nebula.db"
         con = sqlite3.connect(db)

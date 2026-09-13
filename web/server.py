@@ -31,6 +31,7 @@ ASSET_TYPES = {".html": "text/html", ".js": "text/javascript", ".css": "text/css
                ".json": "application/json", ".woff2": "font/woff2", ".woff": "font/woff", ".txt": "text/plain",
                ".map": "application/json"}
 IDENTITY_TTL = 5.0
+TRANSIENT = {502, 503, 504}  # gateway/CLI trouble: reported as an error, not as a capability
 CSP = ("default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; "
        "worker-src 'self'; manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 
@@ -154,6 +155,8 @@ class Gateway:
             if not value:
                 raise Problem(409, "Nebula has not recorded a native Pi session identity for this session yet")
         except Problem as error:
+            if error.status in TRANSIENT:
+                raise  # busy/timeout/CLI failure: not an identity fact, never cached or "unsupported"
             with self.lock:
                 self.identities[row["id"]] = (None, error.message, time.monotonic() + IDENTITY_TTL)
             raise
@@ -192,6 +195,8 @@ class Gateway:
             native = self.native_session_id(project, row)
             path = pi_history.locate_session_file(self.pi_agent_dir, row["path"], native)
         except Problem as error:
+            if error.status in TRANSIENT:
+                raise
             return row, None, None, error.message
         except pi_history.PiHistoryError as error:
             return row, None, None, str(error)
@@ -205,7 +210,7 @@ class Gateway:
         project = self.project(query.get("project", [None])[0])
         first = {k: v[0] for k, v in query.items()}
         if path == "/api/sessions":
-            return {"sessions": [r for r in self.sessions(project) if not r["archived"]]}
+            return {"sessions": [public(r) for r in self.sessions(project) if not r["archived"]]}
         if path == "/api/worktrees":
             return {"worktrees": self.run("worktree", "list", "--project", project)}
         if path == "/api/output":
@@ -214,6 +219,7 @@ class Gateway:
                                        "--lines", "250", "--", name, json_output=False)}
         if path in {"/api/conversation", "/api/conversation/updates", "/api/conversation/tool"}:
             row, native, file, reason = self.conversation_source(project, first.get("id"))
+            row = public(row)
             if reason:
                 return {"session": row, "capabilities": self.capabilities(row, False, reason)}
             try:
@@ -269,9 +275,18 @@ class Gateway:
             name = "Mobile " + secrets.token_hex(6)
             self.run("agent", "new", "--project", project, f"--worktree={selector}",
                      f"--kind={kind}", f"--name={name}", f"--prompt={text}", json_output=False)
-            matches = [r for r in self.sessions(project) if r["name"] == name and not r["archived"]]
-            return {"ok": True, "name": name, "id": matches[0]["id"] if len(matches) == 1 else None}
+            for attempt in range(3):
+                matches = [r for r in self.sessions(project) if r["name"] == name and not r["archived"]]
+                if len(matches) == 1:
+                    return {"ok": True, "name": name, "id": matches[0]["id"]}
+                time.sleep(0.3 * (attempt + 1))
+            return {"ok": True, "name": name, "id": None}
         raise Problem(404, "Unknown endpoint")
+
+
+def public(row):
+    """Session row for the browser: native ids stay server-side."""
+    return {k: v for k, v in row.items() if k != "session_id"}
 
 
 def default_pi_agent_dir():

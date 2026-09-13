@@ -1,7 +1,9 @@
 # Pi native-source spike (mobile chat redesign, slice 1)
 
 Inspected on the server: pi-coding-agent **0.84.4** (`~/.local/share/pi-node/current/...`),
-session format **v3**, Nebula CLI/daemon **0.6.0** (IPC protocol 27, unchanged since v0.4.0).
+session format **v3**, Nebula CLI/daemon **0.6.0**. Note: the running daemon reports IPC protocol **28** while every
+committed source here (branch, main, origin/main, the primary checkout) says 27, so the installed
+binary was built from newer source; a CLI built from this branch cannot talk to that daemon.
 Sources: installed `docs/session-format.md`, `docs/sessions.md`, `docs/extensions.md`,
 `README.md` (message queue), `dist/core/session-manager.js`; Nebula
 `crates/nebula-daemon/src/hooks/nebula_pi.ts`, `status.rs`, `registry.rs`,
@@ -20,7 +22,8 @@ Sources: installed `docs/session-format.md`, `docs/sessions.md`, `docs/extension
    installed `nebula agent show` JSON omits the stored id, so the gateway reads the field when the
    CLI provides it and otherwise falls back to a **read-only** (`mode=ro`) SQLite lookup guarded by
    a schema check (`NEBULA_WEB_DB`). A CLI-only addition exposing `session_id` is part of this
-   branch; it does not need a daemon restart because the protocol version is unchanged.
+   branch (verified to build without zig; it could not be exercised against the live daemon
+   because of the protocol mismatch above). The DB fallback is the promotion path today.
    Real check: every non-archived Pi agent on the host mapped to one file with matching header id
    and cwd; one archived pre-extension agent has no stored id and reports "unavailable".
 2. **Persisted history.** Complete entries only: `message` (user, assistant with text/thinking/

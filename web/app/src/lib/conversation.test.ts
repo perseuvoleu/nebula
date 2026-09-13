@@ -17,11 +17,12 @@ test("an accepted attempt is resolved by a new authoritative user message, once"
   assert.equal(left.length, 0);
 });
 
-test("repeated identical instructions need one new message each; older history never claims an attempt", () => {
+test("repeated identical instructions need one new message each; known history never claims an attempt", () => {
   const two = [attempt("go", ["u1"]), { ...attempt("go", ["u1"]), id: "att-2" }];
   assert.equal(reconcileAttempts(two, [user("u1", "go"), user("u2", "go")]).length, 1);
   assert.equal(reconcileAttempts(two, [user("u1", "go"), user("u2", "go"), user("u3", "go")]).length, 0);
-  assert.equal(reconcileAttempts([attempt("go", [])], [user("old", "go", "2026-09-13T09:59:00.000Z")]).length, 1);
+  // Timestamps play no part (phone/server clocks may differ); identity does.
+  assert.equal(reconcileAttempts([attempt("go", ["old"])], [user("old", "go", "2026-09-13T11:59:00.000Z")]).length, 1);
 });
 
 test("uncertain deliveries resolve when observed; sending and failed attempts are kept", () => {

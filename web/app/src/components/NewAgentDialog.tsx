@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, ApiError } from "@/lib/api";
+import { api, describeError, isUncertain } from "@/lib/api";
 import type { NewResponse, Worktree } from "@/lib/types";
 import { kindLabel, statusLabel } from "@/lib/status";
 import { Button } from "@/components/ui/button";
@@ -28,8 +28,12 @@ export function NewAgentDialog({ project, open, onOpenChange, onCreated }: {
     const abort = new AbortController();
     setTrees(null); setError(null); setState("idle");
     api<{ worktrees: Worktree[] }>("worktrees", { project }, undefined, { signal: abort.signal })
-      .then((data) => { setTrees(data.worktrees); setWorktree((w) => w || data.worktrees[0]?.path || ""); })
-      .catch((failure) => { if (!abort.signal.aborted) setError(failure instanceof ApiError ? failure.message : "Eroare neașteptată"); });
+      .then((data) => {
+        setTrees(data.worktrees);
+        // A remembered path only survives if it still belongs to this project's checkouts.
+        setWorktree((w) => (data.worktrees.some((t) => t.path === w) ? w : data.worktrees[0]?.path ?? ""));
+      })
+      .catch((failure) => { if (!abort.signal.aborted) setError(describeError(failure)); });
     return () => abort.abort();
   }, [open, project]);
 
@@ -46,11 +50,11 @@ export function NewAgentDialog({ project, open, onOpenChange, onCreated }: {
       onCreated(result);
       onOpenChange(false);
     } catch (failure) {
-      const problem = failure instanceof ApiError ? failure : new ApiError("Eroare neașteptată", 0);
-      setState(problem.uncertain || problem.status === 504 ? "uncertain" : "idle");
-      setError(problem.uncertain || problem.status === 504
-        ? `${problem.message} Pornirea poate să fi reușit: verifică lista de sesiuni înainte de a reîncerca.`
-        : problem.message);
+      const uncertain = isUncertain(failure);
+      setState(uncertain ? "uncertain" : "idle");
+      setError(uncertain
+        ? `${describeError(failure)} Pornirea poate să fi reușit: verifică lista de sesiuni înainte de a reîncerca.`
+        : describeError(failure));
     }
   };
 

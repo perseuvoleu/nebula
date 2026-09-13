@@ -1,5 +1,5 @@
 // Selection ↔ URL: /p/<project>/s/<session id>. Non-secret identifiers only.
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 export interface Selection {
   project: string | null;
@@ -25,13 +25,13 @@ export function useSelection(): [Selection, (next: Selection, replace?: boolean)
     window.addEventListener("popstate", onPop);
     return () => window.removeEventListener("popstate", onPop);
   }, []);
-  const navigate = (next: Selection, replace = false) => {
+  const navigate = useCallback((next: Selection, replace = false) => {
     const path = selectionPath(next);
     if (path !== window.location.pathname) {
       if (replace) window.history.replaceState(null, "", path);
       else window.history.pushState(null, "", path);
     }
     setSelection(next);
-  };
+  }, []);
   return [selection, navigate];
 }

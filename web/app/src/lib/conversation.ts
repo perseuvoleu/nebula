@@ -3,8 +3,8 @@
 // Chosen over AI SDK UI's useChat: the conversation already exists on the host, messages
 // arrive from the terminal without a web send, and reconnects must resume from a gateway
 // cursor. Modelling that as request/response chat would add state instead of removing it.
-import { useEffect, useMemo, useSyncExternalStore } from "react";
-import { ApiError, api, attemptId } from "./api.ts";
+import { useEffect, useState, useSyncExternalStore } from "react";
+import { ApiError, api, attemptId, describeError, isUncertain } from "./api.ts";
 import type {
   Capabilities, ConversationResponse, Cursor, Message, SendResponse, SessionRow, ToolResult, UpdatesResponse,
 } from "./types.ts";
@@ -46,6 +46,9 @@ const initial = (): ConversationState => ({
 
 export const POLL_IDLE_MS = 2500;
 export const POLL_ACTIVE_MS = 1500;
+const ACTIVE_ATTEMPT_MS = 60000;
+/** Rendering bound: older messages fall off the front and become pageable again. */
+export const MAX_MESSAGES = 400;
 
 export function messageText(message: Message): string {
   return message.parts.filter((p) => p.type === "text").map((p) => (p.type === "text" ? p.text : "")).join("\n");
@@ -78,8 +81,10 @@ export function reconcileAttempts(attempts: Attempt[], messages: Message[]): Att
   return attempts.filter((attempt) => {
     if (attempt.state === "sending" || attempt.state === "failed") return true;
     const known = new Set(attempt.knownIds);
+    // Identity, not time: ids known when the attempt was made (and history paged in later) can
+    // never satisfy it, so phone/server clock skew cannot leave a resolved attempt dangling.
     const match = messages.find((m) => m.role === "user" && !known.has(m.id) && !claimed.has(m.id)
-      && messageText(m) === attempt.text && (!m.timestamp || m.timestamp >= attempt.createdAt.slice(0, 19)));
+      && messageText(m) === attempt.text);
     if (match) claimed.add(match.id);
     return !match;
   });
@@ -133,7 +138,12 @@ export class ConversationController {
   private onOffline = () => this.set({ connection: "offline" });
 
   private applyMessages(messages: Message[], extra: Partial<ConversationState> = {}): void {
-    this.set({ messages, attempts: reconcileAttempts(this.state.attempts, messages), ...extra });
+    const attempts = reconcileAttempts(this.state.attempts, messages);
+    if (messages.length > MAX_MESSAGES) {
+      messages = messages.slice(messages.length - MAX_MESSAGES);
+      extra = { hasMore: true, ...extra, ...(extra.hasMore === false ? { hasMore: true } : {}) };
+    }
+    this.set({ messages, attempts, ...extra });
   }
 
   async load(): Promise<void> {
@@ -151,9 +161,8 @@ export class ConversationController {
       }
     } catch (error) {
       if (this.abort.signal.aborted) return;
-      const message = error instanceof ApiError ? error.message : "Eroare neașteptată";
       if (error instanceof ApiError && error.status === 401) return;
-      this.set({ phase: this.state.phase === "loading" ? "error" : this.state.phase, error: message,
+      this.set({ phase: this.state.phase === "loading" ? "error" : this.state.phase, error: describeError(error),
         connection: navigator.onLine ? "stale" : "offline" });
     }
     this.pollSoon();
@@ -162,7 +171,9 @@ export class ConversationController {
   pollSoon(delay?: number): void {
     if (this.disposed) return;
     if (this.timer) clearTimeout(this.timer);
-    const active = this.state.session?.status === "running" || this.state.attempts.some((a) => a.state !== "failed");
+    const recent = (a: Attempt) => Date.now() - Date.parse(a.createdAt) < ACTIVE_ATTEMPT_MS;
+    const active = this.state.session?.status === "running"
+      || this.state.attempts.some((a) => a.state === "sending" || (a.state !== "failed" && recent(a)));
     this.timer = setTimeout(() => void this.poll(), delay ?? (active ? POLL_ACTIVE_MS : POLL_IDLE_MS));
   }
 
@@ -196,8 +207,7 @@ export class ConversationController {
     } catch (error) {
       if (this.abort.signal.aborted) return;
       if (error instanceof ApiError && error.status === 401) return;
-      const message = error instanceof ApiError ? error.message : "Eroare neașteptată";
-      this.set({ error: message, connection: navigator.onLine ? "stale" : "offline" });
+      this.set({ error: describeError(error), connection: navigator.onLine ? "stale" : "offline" });
     } finally {
       this.polling = false;
       this.pollSoon();
@@ -214,10 +224,12 @@ export class ConversationController {
       if (this.abort.signal.aborted || !("snapshot" in data)) return;
       const known = new Set(this.state.messages.map((m) => m.id));
       const older = data.snapshot.messages.filter((m) => !known.has(m.id));
-      this.set({ messages: [...older, ...this.state.messages], hasMore: data.snapshot.hasMore, loadingOlder: false });
+      const olderIds = older.map((m) => m.id);
+      this.set({ messages: [...older, ...this.state.messages], hasMore: data.snapshot.hasMore, loadingOlder: false,
+        attempts: this.state.attempts.map((a) => ({ ...a, knownIds: [...a.knownIds, ...olderIds] })) });
     } catch (error) {
       if (this.abort.signal.aborted) return;
-      this.set({ loadingOlder: false, error: error instanceof ApiError ? error.message : "Eroare neașteptată" });
+      this.set({ loadingOlder: false, error: describeError(error) });
     }
   }
 
@@ -233,8 +245,7 @@ export class ConversationController {
         { signal: this.abort.signal });
       update({ state: "accepted" });
     } catch (error) {
-      const failure = error instanceof ApiError ? error : new ApiError("Eroare neașteptată", 0);
-      update({ state: failure.uncertain || failure.status === 504 ? "uncertain" : "failed", error: failure.message });
+      update({ state: isUncertain(error) ? "uncertain" : "failed", error: describeError(error) });
     }
     this.pollSoon(400);
     return this.state.attempts.find((a) => a.id === attempt.id) ?? attempt;
@@ -248,11 +259,14 @@ export class ConversationController {
 export function useConversation(project: string | null, sessionId: string | null): {
   state: ConversationState | null; controller: ConversationController | null;
 } {
-  const controller = useMemo(
-    () => (project && sessionId ? new ConversationController(project, sessionId) : null),
-    [project, sessionId],
-  );
-  useEffect(() => () => controller?.dispose(), [controller]);
+  // Created in an effect (not useMemo): the controller polls and listens, so StrictMode's
+  // double render must not leak one and the cleanup must dispose exactly the one in use.
+  const [controller, setController] = useState<ConversationController | null>(null);
+  useEffect(() => {
+    const next = project && sessionId ? new ConversationController(project, sessionId) : null;
+    setController(next);
+    return () => { next?.dispose(); setController(null); };
+  }, [project, sessionId]);
   const state = useSyncExternalStore(
     controller ? controller.subscribe : () => () => {},
     controller ? controller.getSnapshot : () => null,

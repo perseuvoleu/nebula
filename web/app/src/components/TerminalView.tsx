@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { api, ApiError } from "@/lib/api";
+import { api, describeError } from "@/lib/api";
 
 // Explicitly labelled terminal snapshot (last 250 rendered lines). Not chat history.
 export function TerminalView({ project, session }: { project: string; session: string }) {
@@ -22,7 +22,7 @@ export function TerminalView({ project, session }: { project: string; session: s
         if (follow && element) requestAnimationFrame(() => { element.scrollTop = element.scrollHeight; });
       } catch (failure) {
         if (abort.signal.aborted) return;
-        setError(failure instanceof ApiError ? failure.message : "Eroare neașteptată");
+        setError(describeError(failure));
       }
       timer = setTimeout(tick, 2500);
     };

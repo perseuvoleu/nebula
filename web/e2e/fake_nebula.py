@@ -60,8 +60,7 @@ def main(argv):
     agents = load("agents.json")
     behaviour = (STATE / "behaviour").read_text().strip() if (STATE / "behaviour").exists() else "ok"
     if command == ("agent", "list"):
-        rows = [{k: v for k, v in a.items() if k != "session_id"} for a in agents if a["project"] == project]
-        print(json.dumps(rows))
+        print(json.dumps([a for a in agents if a["project"] == project]))  # rows carry session_id, as on this branch
     elif command == ("agent", "show"):
         name = positionals(argv[2:])[0]
         hits = [a for a in agents if a["project"] == project and a["name"] == name and not a["archived"]]
@@ -82,7 +81,8 @@ def main(argv):
         if behaviour == "hang":
             time.sleep(30)
         agent = next(a for a in agents if a["project"] == project and a["name"] == name)
-        if agent["kind"] == "pi" and session_file(agent):
+        # "silent": the PTY accepted the text but Pi has not persisted a user entry (yet).
+        if agent["kind"] == "pi" and session_file(agent) and behaviour != "silent":
             append(agent, {"role": "user", "content": text, "timestamp": int(time.time() * 1000)})
         agent["status"] = "running"
         save("agents.json", agents)

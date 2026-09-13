@@ -44,6 +44,16 @@ export class ApiError extends Error {
   }
 }
 
+/** User-facing text for any failure; unknown errors get one generic label. */
+export function describeError(error: unknown): string {
+  return error instanceof ApiError ? error.message : "Eroare neașteptată";
+}
+
+/** The request may have been executed although no acknowledgement arrived. */
+export function isUncertain(error: unknown): boolean {
+  return error instanceof ApiError && (error.uncertain || error.status === 504);
+}
+
 export interface RequestOptions {
   signal?: AbortSignal;
   timeoutMs?: number;
@@ -72,10 +82,12 @@ export async function api<T>(
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
       signal,
     });
-  } catch (error) {
+  } catch {
     if (options.signal?.aborted) throw new ApiError("Anulat", 0);
+    // A mutation is "uncertain" only when it could have reached the gateway: online, and either
+    // timed out or dropped mid-flight. A request made while offline never left the phone.
     const message = timeout.aborted ? "Serverul nu a răspuns la timp" : "Fără conexiune la server";
-    throw new ApiError(message, 0, body !== undefined);
+    throw new ApiError(message, 0, body !== undefined && navigator.onLine);
   }
   let data: { error?: string } & Record<string, unknown> = {};
   try {
