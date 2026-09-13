@@ -1,24 +1,38 @@
 #!/usr/bin/env python3
-"""Single-user Nebula mobile gateway. Bind only to loopback behind HTTPS."""
+"""Single-user Nebula mobile gateway. Bind only to loopback behind HTTPS.
+
+Owns authentication, the enabled-project scope, argument-safe Nebula CLI control and the
+read-only Pi conversation contract (see pi_history.py). Serves the built React app from
+`web/static` through a startup allowlist: no directory listing, no arbitrary file reads.
+"""
+import datetime
 import hmac
 import json
 import os
 from pathlib import Path
 import re
 import secrets
+import socket
+import sqlite3
 import subprocess
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
+import pi_history
+
 STATIC = Path(__file__).parent / "static"
-FILES = {"/": ("index.html", "text/html"), "/app.js": ("app.js", "text/javascript"),
-         "/style.css": ("style.css", "text/css"), "/sw.js": ("sw.js", "text/javascript"),
-         "/manifest.webmanifest": ("manifest.webmanifest", "application/manifest+json"),
-         "/icon.svg": ("icon.svg", "image/svg+xml"),
-         "/icon-192.png": ("icon-192.png", "image/png"),
-         "/icon-512.png": ("icon-512.png", "image/png")}
 KINDS = {"pi", "claude", "codex", "cursor"}
+ATTEMPT = re.compile(r"[A-Za-z0-9_-]{4,64}")
+ROUTE = re.compile(r"/(?:p/[A-Za-z0-9._@-]{1,80}(?:/s/[A-Za-z0-9._-]{1,80})?)?/?")
+ASSET_TYPES = {".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml",
+               ".png": "image/png", ".ico": "image/x-icon", ".webmanifest": "application/manifest+json",
+               ".json": "application/json", ".woff2": "font/woff2", ".woff": "font/woff", ".txt": "text/plain",
+               ".map": "application/json"}
+IDENTITY_TTL = 5.0
+CSP = ("default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; "
+       "worker-src 'self'; manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 
 
 class Problem(Exception):
@@ -26,8 +40,33 @@ class Problem(Exception):
         self.status, self.message = status, message
 
 
+class StaticFiles:
+    """Startup allowlist of regular files under the build directory (never symlinks, never re-scanned)."""
+
+    def __init__(self, root):
+        self.root = Path(root)
+        self.files = {}
+        if self.root.is_dir():
+            for path in sorted(self.root.rglob("*")):
+                relative = "/" + path.relative_to(self.root).as_posix()
+                if (path.is_file() and not path.is_symlink() and path.suffix in ASSET_TYPES
+                        and not any(part.startswith(".") for part in path.relative_to(self.root).parts)):
+                    self.files[relative] = path
+
+    def lookup(self, path):
+        """(file, mime, cache) for an asset, the app shell for client routes, else None."""
+        if path == "/" or (path not in self.files and ROUTE.fullmatch(path)):
+            shell = self.files.get("/index.html")
+            return (shell, "text/html", "no-cache") if shell else None
+        file = self.files.get(path)
+        if not file:
+            return None
+        immutable = path.startswith("/assets/") and re.search(r"-[A-Za-z0-9_-]{6,}\.\w+$", path)
+        return file, ASSET_TYPES[file.suffix], "public, max-age=31536000, immutable" if immutable else "no-cache"
+
+
 class Gateway:
-    def __init__(self, token, origin, projects, binary="nebula"):
+    def __init__(self, token, origin, projects, binary="nebula", static=None, pi_agent_dir=None, db_path=None):
         if len(token) < 32:
             raise ValueError("NEBULA_WEB_TOKEN must contain at least 32 characters")
         parsed = urlsplit(origin)
@@ -40,7 +79,13 @@ class Gateway:
             raise ValueError("NEBULA_WEB_PROJECTS must list at least one project")
         self.token, self.origin, self.host = token, origin, parsed.netloc
         self.projects, self.binary = projects, binary
+        self.static = static or StaticFiles(STATIC)
+        self.pi_agent_dir = Path(pi_agent_dir) if pi_agent_dir else default_pi_agent_dir()
+        self.db_path = Path(db_path) if db_path else None
+        self.hostname = socket.gethostname()
         self.slots = threading.BoundedSemaphore(4)
+        self.identities = {}  # agent id -> (native session id | None, reason, expires)
+        self.lock = threading.Lock()
 
     def run(self, *args, json_output=True):
         if not self.slots.acquire(blocking=False):
@@ -69,7 +114,7 @@ class Gateway:
     def sessions(self, project):
         return self.run("agent", "list", "--project", project)
 
-    def session_name(self, project, session_id):
+    def session_row(self, project, session_id):
         rows = self.sessions(project)
         row = next((r for r in rows if r["id"] == session_id and not r["archived"]), None)
         if not row:
@@ -77,20 +122,116 @@ class Gateway:
         # The current CLI selects by name, not id. Refuse ambiguous names.
         if sum(r["name"] == row["name"] for r in rows) != 1:
             raise Problem(409, "Duplicate session name; rename it in Nebula first")
-        return row["name"]
+        return row
+
+    def session_name(self, project, session_id):
+        return self.session_row(project, session_id)["name"]
+
+    # --- native identity -------------------------------------------------------------------
+
+    def native_session_id(self, project, row, detail=None):
+        """Stored native Pi session id for a Nebula agent, cached briefly.
+
+        Source order: the `agent show` JSON field `session_id` (CLI ≥ this branch), else a
+        read-only lookup of the daemon's SQLite row when NEBULA_WEB_DB is configured.
+        """
+        with self.lock:
+            cached = self.identities.get(row["id"])
+            if cached and cached[2] > time.monotonic():
+                if cached[1]:
+                    raise Problem(409, cached[1])
+                return cached[0]
+        try:
+            detail = detail if detail is not None else self.run("agent", "show", "--project", project, "--", row["name"])
+            if detail.get("id") not in (None, row["id"]):
+                raise Problem(409, "Session name resolved to a different agent; retry")
+            if "session_id" in detail:
+                value = detail["session_id"]
+            elif self.db_path:
+                value = self.db_session_id(row["id"])
+            else:
+                value = None
+            if not value:
+                raise Problem(409, "Nebula has not recorded a native Pi session identity for this session yet")
+        except Problem as error:
+            with self.lock:
+                self.identities[row["id"]] = (None, error.message, time.monotonic() + IDENTITY_TTL)
+            raise
+        with self.lock:
+            self.identities[row["id"]] = (value, None, time.monotonic() + IDENTITY_TTL)
+        return value
+
+    def db_session_id(self, agent_id):
+        try:
+            con = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True, timeout=1)
+            try:
+                columns = {r[1] for r in con.execute("PRAGMA table_info(agents)")}
+                column = next((c for c in ("session_id", "claude_session_id") if c in columns), None)
+                if column is None or "id" not in columns:
+                    raise Problem(500, "Nebula database schema is not recognised; upgrade the gateway")
+                found = con.execute(f"select {column} from agents where id = ?", (agent_id,)).fetchone()
+            finally:
+                con.close()
+        except sqlite3.Error:
+            raise Problem(502, "Cannot read the Nebula database")
+        if found is None:
+            raise Problem(404, "Session no longer available")
+        return found[0]
+
+    def capabilities(self, row, structured, reason=None):
+        return {"structured": structured, "reason": reason, "liveText": False,
+                "liveTextReason": "Nebula's managed Pi extension reports lifecycle only; partial text needs a new "
+                                  "extension and a daemon restart, so replies appear once each message completes",
+                "tools": structured, "send": True, "terminal": True, "kind": row["kind"]}
+
+    def conversation_source(self, project, session_id):
+        row = self.session_row(project, session_id)
+        if row["kind"] != "pi":
+            return row, None, None, f"Structured history is only implemented for Pi; {row['kind']} sessions use terminal output"
+        try:
+            native = self.native_session_id(project, row)
+            path = pi_history.locate_session_file(self.pi_agent_dir, row["path"], native)
+        except Problem as error:
+            return row, None, None, error.message
+        except pi_history.PiHistoryError as error:
+            return row, None, None, str(error)
+        return row, native, path, None
+
+    # --- HTTP verbs ------------------------------------------------------------------------
 
     def get(self, path, query):
         if path == "/api/projects":
-            return {"projects": self.projects}
+            return {"projects": self.projects, "host": self.hostname}
         project = self.project(query.get("project", [None])[0])
+        first = {k: v[0] for k, v in query.items()}
         if path == "/api/sessions":
             return {"sessions": [r for r in self.sessions(project) if not r["archived"]]}
         if path == "/api/worktrees":
             return {"worktrees": self.run("worktree", "list", "--project", project)}
         if path == "/api/output":
-            name = self.session_name(project, query.get("id", [None])[0])
+            name = self.session_name(project, first.get("id"))
             return {"output": self.run("agent", "read", "--project", project,
                                        "--lines", "250", "--", name, json_output=False)}
+        if path in {"/api/conversation", "/api/conversation/updates", "/api/conversation/tool"}:
+            row, native, file, reason = self.conversation_source(project, first.get("id"))
+            if reason:
+                return {"session": row, "capabilities": self.capabilities(row, False, reason)}
+            try:
+                if path == "/api/conversation/tool":
+                    call = first.get("call", "")
+                    if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", call):
+                        raise Problem(400, "Invalid tool call id")
+                    return {"session": row, "tool": pi_history.tool_output(file, call)}
+                if path == "/api/conversation":
+                    limit = first.get("limit", "")
+                    snapshot = pi_history.snapshot(file, native, int(limit) if limit.isdigit() else None,
+                                                   first.get("before"))
+                    return {"session": row, "capabilities": self.capabilities(row, True), "snapshot": snapshot}
+                cursor = {"generation": first.get("generation"), "leaf": first.get("leaf") or None,
+                          "offset": int(first["offset"]) if first.get("offset", "").isdigit() else -1}
+                return {"session": row, **pi_history.apply_cursor(file, native, cursor)}
+            except pi_history.PiHistoryError as error:
+                raise Problem(409, str(error))
         raise Problem(404, "Unknown endpoint")
 
     def post(self, path, body):
@@ -99,9 +240,13 @@ class Gateway:
         if not isinstance(text, str) or not text.strip() or len(text) > 16000 or "\0" in text:
             raise Problem(400, "Message must contain 1–16000 characters without NUL")
         if path == "/api/send":
+            attempt = body.get("attempt", "")
+            if not isinstance(attempt, str) or not ATTEMPT.fullmatch(attempt):
+                raise Problem(400, "Delivery attempt id is required")
             name = self.session_name(project, body.get("id"))
             self.run("agent", "send", "--project", project, "--", name, text, json_output=False)
-            return {"ok": True}
+            return {"ok": True, "attempt": attempt,
+                    "acceptedAt": datetime.datetime.now(datetime.timezone.utc).isoformat()}
         if path == "/api/new":
             kind, worktree = body.get("kind"), body.get("worktree")
             if not isinstance(kind, str) or kind not in KINDS:
@@ -124,8 +269,14 @@ class Gateway:
             name = "Mobile " + secrets.token_hex(6)
             self.run("agent", "new", "--project", project, f"--worktree={selector}",
                      f"--kind={kind}", f"--name={name}", f"--prompt={text}", json_output=False)
-            return {"ok": True, "name": name}
+            matches = [r for r in self.sessions(project) if r["name"] == name and not r["archived"]]
+            return {"ok": True, "name": name, "id": matches[0]["id"] if len(matches) == 1 else None}
         raise Problem(404, "Unknown endpoint")
+
+
+def default_pi_agent_dir():
+    configured = os.environ.get("NEBULA_WEB_PI_AGENT_DIR") or os.environ.get("PI_CODING_AGENT_DIR")
+    return Path(configured) if configured else Path.home() / ".pi" / "agent"
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -139,16 +290,16 @@ class Handler(BaseHTTPRequestHandler):
         # No request paths, tokens, message content, or Nebula output in access logs.
         pass
 
-    def reply(self, status, data, content_type="application/json"):
+    def reply(self, status, data, content_type="application/json", cache="no-store"):
         if not isinstance(data, bytes):
             data = json.dumps(data).encode()
         self.send_response(status)
         self.send_header("Content-Type", content_type + "; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", cache)
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; worker-src 'self'; manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
+        self.send_header("Content-Security-Policy", CSP)
         self.end_headers()
         self.wfile.write(data)
 
@@ -158,9 +309,12 @@ class Handler(BaseHTTPRequestHandler):
             if self.headers.get("Host") != gateway.host:
                 raise Problem(403, "Invalid host")
             path = urlsplit(self.path).path
-            if method == "GET" and path in FILES:
-                filename, mime = FILES[path]
-                return self.reply(200, (STATIC / filename).read_bytes(), mime)
+            if method == "GET" and not path.startswith("/api/"):
+                asset = gateway.static.lookup(path)
+                if asset is None:
+                    raise Problem(404, "Not found")
+                file, mime, cache = asset
+                return self.reply(200, file.read_bytes(), mime, cache)
             if not path.startswith("/api/"):
                 raise Problem(404, "Not found")
             if not hmac.compare_digest(self.headers.get("Authorization", "").encode(),
@@ -206,7 +360,10 @@ def main():
     gateway = Gateway(os.environ.get("NEBULA_WEB_TOKEN", ""),
                       os.environ.get("NEBULA_WEB_ORIGIN", f"http://127.0.0.1:{port}"),
                       [p.strip() for p in os.environ.get("NEBULA_WEB_PROJECTS", "").split(",") if p.strip()],
-                      os.environ.get("NEBULA_WEB_BINARY", "nebula"))
+                      os.environ.get("NEBULA_WEB_BINARY", "nebula"),
+                      db_path=os.environ.get("NEBULA_WEB_DB") or None)
+    if not gateway.static.files.get("/index.html"):
+        raise SystemExit(f"No built app in {gateway.static.root}; run `pnpm --dir web/app build` first")
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     server.gateway = gateway
     print(f"Nebula web listening on 127.0.0.1:{port}", flush=True)
