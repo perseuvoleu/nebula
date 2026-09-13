@@ -1,0 +1,13 @@
+[Unit]
+Description=Forward Docker bridge traffic to loopback Nebula gateway
+Requires=nebula-web-bridge.socket
+After=nebula-web-bridge.socket
+
+[Service]
+ExecStart=/usr/lib/systemd/systemd-socket-proxyd 127.0.0.1:8765
+DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX

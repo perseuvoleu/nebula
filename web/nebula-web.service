@@ -1,0 +1,17 @@
+[Unit]
+Description=Nebula Mobile gateway (loopback only)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/nebula
+EnvironmentFile=%h/.config/nebula-web.env
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 %h/nebula/web/server.py
+Restart=on-failure
+RestartSec=5
+UMask=0077
+
+[Install]
+WantedBy=default.target

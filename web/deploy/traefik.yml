@@ -1,0 +1,47 @@
+http:
+  routers:
+    nebula-web-http:
+      rule: Host(`code.possu.dev`)
+      entryPoints: [web]
+      service: nebula-web
+      middlewares: [nebula-web-redirect]
+    nebula-web-https:
+      rule: Host(`code.possu.dev`)
+      entryPoints: [websecure]
+      service: nebula-web
+      middlewares: [nebula-web-rate, nebula-web-connections, nebula-web-body, nebula-web-headers]
+      tls:
+        certResolver: letsencrypt
+  services:
+    nebula-web:
+      loadBalancer:
+        passHostHeader: true
+        serversTransport: nebula-web-timeouts
+        servers:
+          - url: http://172.18.0.1:8766
+  serversTransports:
+    nebula-web-timeouts:
+      forwardingTimeouts:
+        dialTimeout: 5s
+        responseHeaderTimeout: 65s
+  middlewares:
+    nebula-web-redirect:
+      redirectScheme:
+        scheme: https
+        permanent: true
+    nebula-web-rate:
+      rateLimit:
+        average: 5
+        burst: 20
+    nebula-web-connections:
+      inFlightReq:
+        amount: 16
+    nebula-web-body:
+      buffering:
+        maxRequestBodyBytes: 100000
+        memRequestBodyBytes: 100000
+    nebula-web-headers:
+      headers:
+        stsSeconds: 31536000
+        contentTypeNosniff: true
+        referrerPolicy: no-referrer

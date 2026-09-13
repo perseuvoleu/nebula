@@ -1,0 +1,12 @@
+[Unit]
+Description=Private Docker bridge socket for Nebula Mobile
+After=docker.service
+Requires=docker.service
+
+[Socket]
+ListenStream=172.18.0.1:8766
+BindToDevice=docker_gwbridge
+NoDelay=true
+
+[Install]
+WantedBy=sockets.target
