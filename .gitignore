@@ -7,3 +7,9 @@
 CLAUDE.local.md
 design-screenshots/
 .DS_Store
+
+# Built frontend (web/app → web/static); produced by `pnpm --dir web/app build`
+/web/static/
+/web/e2e/.state/
+/web/e2e/.results/
+/web/e2e/screenshots/
