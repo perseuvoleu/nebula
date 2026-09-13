@@ -13,7 +13,7 @@ use nebula_core::{
     NoteOwner, Project, ProjectId, ServerEvent, SessionRef, TerminalId, TerminalTab, Todo, TodoId,
     TodoOwner, Workspace, WorkspaceId, Worktree, WorktreeId,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -64,6 +64,11 @@ fn epoch_ms() -> i64 {
 }
 
 pub struct Daemon {
+    /// Runtime handoff reservations and accepted prompt notifications.
+    pub(crate) collect_owners: Mutex<HashSet<AgentId>>,
+    pub(crate) collect_events: broadcast::Sender<crate::collect::CollectEvent>,
+    /// Orders source-side prompt/status delivery with guarded collect input.
+    status_delivery: Mutex<()>,
     sessions: Mutex<HashMap<SessionRef, Arc<PtySession>>>,
     status_machines: Mutex<HashMap<AgentId, AgentStatusMachine>>,
     /// Status machines for agent CLIs run by hand inside shell tabs (hook
@@ -108,6 +113,9 @@ impl Daemon {
     pub fn new(store: Arc<Store>, hook_env: HookEnv) -> Arc<Self> {
         let (events, _) = broadcast::channel(1024);
         Arc::new(Self {
+            collect_owners: Mutex::new(HashSet::new()),
+            collect_events: broadcast::channel(1024).0,
+            status_delivery: Mutex::new(()),
             sessions: Mutex::new(HashMap::new()),
             status_machines: Mutex::new(HashMap::new()),
             terminal_status_machines: Mutex::new(HashMap::new()),
@@ -249,6 +257,8 @@ impl Daemon {
             self.apply_terminal_hook_event(&TerminalId(tid.to_string()), event, session_id);
             return;
         }
+        let _delivery = self.status_delivery.lock().unwrap();
+        let submitted = matches!(event, HookEvent::UserPromptSubmit);
         enum Outcome {
             Effects(Vec<Effect>),
             UnknownAgent(HookEvent, Option<String>),
@@ -281,7 +291,15 @@ impl Daemon {
             }
         };
         match outcome {
-            Outcome::Effects(effects) => self.apply_status_effects(agent_id, effects),
+            Outcome::Effects(effects) => {
+                self.apply_status_effects(agent_id, effects);
+                // UserPromptSubmit is a session-capturing event, always
+                // accepted for a known row. PTY progress may already have
+                // set Running, leaving no SetStatus effect for this hook.
+                if submitted {
+                    let _ = self.collect_events.send(crate::collect::CollectEvent::Prompt(agent_id.clone()));
+                }
+            },
             // Ids with no row are prewarmed sessions (buffer for replay at
             // adoption) or stale env / deleted agents (dropped, as before).
             Outcome::UnknownAgent(event, session_id) => {
@@ -307,6 +325,7 @@ impl Daemon {
 
     /// Deferred-finish recheck across all machines (runs on a timer).
     pub fn tick_status_machines(&self) {
+        let _delivery = self.status_delivery.lock().unwrap();
         let now = Instant::now();
         let ticked: Vec<(AgentId, Vec<Effect>)> = {
             let mut machines = self.status_machines.lock().unwrap();
@@ -409,6 +428,7 @@ impl Daemon {
                         status,
                         changed_at,
                     });
+                    let _ = self.collect_events.send(crate::collect::CollectEvent::Status(agent_id.clone(), status));
                 }
                 Effect::SaveSessionId(sid) => {
                     if let Err(e) = self.store.set_agent_session_id(agent_id, Some(&sid)) {
@@ -417,6 +437,116 @@ impl Daemon {
                 }
             }
         }
+    }
+
+    /// Read-only source validation for clean collection, including parked
+    /// branch writers. Runs on the owning daemon, not the relay mirror.
+    pub fn inspect_collect(&self, worktree: &WorktreeId, branch: &str) -> Result<()> {
+        let _delivery = self.status_delivery.lock().unwrap();
+        let row = self
+            .store
+            .get_worktree(worktree)?
+            .context("source checkout disappeared")?;
+        if row.branch != branch {
+            bail!("source checkout changed branch; refresh and retry");
+        }
+        let ServerEvent::Snapshot {
+            worktrees,
+            agents,
+            terminals,
+            ..
+        } = self.snapshot()?
+        else {
+            unreachable!()
+        };
+        let owns = |wid: &WorktreeId, remembered: Option<&str>| {
+            wid == worktree
+                || worktrees.iter().any(|w| {
+                    &w.id == wid
+                        && w.project_id == row.project_id
+                        && (w.branch == branch || remembered == Some(branch))
+                })
+        };
+        let owners: Vec<_> = agents
+            .iter()
+            .filter(|a| a.alive && !a.archived && owns(&a.worktree_id, a.branch.as_deref()))
+            .collect();
+        if owners.len() > 1
+            || owners.iter().any(|a| {
+                self.collect_owners.lock().unwrap().contains(&a.id)
+                    || &a.worktree_id != worktree
+                    || a.status != AgentStatus::Finished
+                    || a.branch.as_deref().is_some_and(|b| b != branch)
+            })
+            || terminals
+                .iter()
+                .any(|t| owns(&t.worktree_id, t.branch.as_deref()))
+        {
+            bail!("source has busy, ambiguous, or parked writers; settle its sessions before collecting");
+        }
+        Ok(())
+    }
+
+    /// Validate source ownership and atomically check status before writing
+    /// handoff input. Called on the source daemon, never its cached mirror.
+    pub(crate) fn collect_input(
+        &self,
+        id: &AgentId,
+        worktree: &WorktreeId,
+        branch: &str,
+        revision: i64,
+        data: &[u8],
+    ) -> Result<()> {
+        let _delivery = self.status_delivery.lock().unwrap();
+        let machines = self.status_machines.lock().unwrap();
+        let agent = self.agent_entity(id)?;
+        if agent.archived
+            || !agent.alive
+            || agent.status != AgentStatus::Finished
+            || agent.status_changed_at != revision
+            || &agent.worktree_id != worktree
+            || machines
+                .get(id)
+                .is_some_and(|m| m.status() != AgentStatus::Finished)
+        {
+            bail!("source owner changed or is busy; inspect its session and retry");
+        }
+        let row = self
+            .store
+            .get_worktree(worktree)?
+            .context("source checkout disappeared")?;
+        if row.branch != branch || agent.branch.as_deref().is_some_and(|b| b != branch) {
+            bail!("source checkout/owner changed branch; retry after inspecting ownership");
+        }
+        let ServerEvent::Snapshot {
+            worktrees,
+            agents,
+            terminals,
+            ..
+        } = self.snapshot()?
+        else {
+            unreachable!()
+        };
+        let owns = |wid: &WorktreeId, remembered: Option<&str>| {
+            wid == worktree
+                || worktrees.iter().any(|w| {
+                    &w.id == wid
+                        && w.project_id == row.project_id
+                        && (w.branch == branch || remembered == Some(branch))
+                })
+        };
+        if agents.iter().any(|a| {
+            &a.id != id && a.alive && !a.archived && owns(&a.worktree_id, a.branch.as_deref())
+        }) || terminals
+            .iter()
+            .any(|t| owns(&t.worktree_id, t.branch.as_deref()))
+        {
+            bail!("multiple source writers; settle ownership before collecting");
+        }
+        self.session(&SessionRef::Agent(id.clone()))
+            .context("source PTY disappeared")?
+            .write_input(data)?;
+        Ok(())
     }
 
     pub fn broadcast(&self, ev: ServerEvent) {
@@ -1396,6 +1526,7 @@ impl Daemon {
         self: &Arc<Self>,
         project_id: &ProjectId,
         branch: &str,
+        mover: Option<&SessionRef>,
     ) -> Result<()> {
         let branch = branch.trim();
         if branch.is_empty() {
@@ -1451,6 +1582,34 @@ impl Daemon {
         git::checkout(&project.repo_path, branch).await?;
         // The main row's branch label follows the checkout via reconcile.
         self.reconcile_project_worktrees(&project).await?;
+        // Sessions keep the branch they were on — the panel lists them
+        // there still. Only the one that asked for the switch from inside
+        // its own shell goes along with the checkout.
+        if let Some(mover) = mover {
+            self.follow_branch(mover, branch)?;
+        }
+        Ok(())
+    }
+
+    /// Re-list `session` under `branch` (see `Agent::branch`).
+    fn follow_branch(self: &Arc<Self>, session: &SessionRef, branch: &str) -> Result<()> {
+        let entity = match session {
+            SessionRef::Agent(id) => {
+                if self.store.get_agent(id)?.is_none() {
+                    return Ok(());
+                }
+                self.store.set_agent_branch(id, Some(branch))?;
+                Entity::Agent(self.agent_entity(id)?)
+            }
+            SessionRef::Terminal(id) => {
+                if self.store.get_terminal(id)?.is_none() {
+                    return Ok(());
+                }
+                self.store.set_terminal_branch(id, Some(branch))?;
+                Entity::Terminal(self.terminal_entity(id)?)
+            }
+        };
+        self.broadcast(ServerEvent::EntityUpserted { entity });
         Ok(())
     }
 
@@ -1509,8 +1668,10 @@ impl Daemon {
                 // it) backfill from the reflog, so the panel's tree lines
                 // appear without recreating the worktree. An in-place branch
                 // switch re-derives too — the stored base described the old
-                // branch.
-                if !known.is_main && (known.created_from.is_none() || changed) {
+                // branch. The primary checkout gets the same treatment: the
+                // branch it holds nests under the branch it was cut from,
+                // so `nebula switch` on the primary keeps the tree intact.
+                if known.created_from.is_none() || changed {
                     let mut base =
                         git::branch_creation_base(&project.repo_path, &entry.branch).await;
                     if base.is_none() && known.branch != entry.branch {
@@ -1528,13 +1689,14 @@ impl Daemon {
                             base = Some(known.branch.clone());
                         }
                     }
-                    if let Some(base) = base
-                        .filter(|b| b != &entry.branch)
-                        .filter(|b| known.created_from.as_ref() != Some(b))
-                    {
+                    let base = base.filter(|b| b != &entry.branch);
+                    if base != known.created_from {
+                        // A switch onto a branch with no recorded base
+                        // clears the old one rather than keeping a
+                        // lineage that described the previous branch.
                         self.store
-                            .set_worktree_created_from(&known.id, Some(&base))?;
-                        updated.created_from = Some(base);
+                            .set_worktree_created_from(&known.id, base.as_deref())?;
+                        updated.created_from = base;
                         changed = true;
                     }
                 }
@@ -1637,6 +1799,7 @@ impl Daemon {
             sort_order: 0,
             status_changed_at: epoch_ms(),
             alive: false,
+            branch: Some(worktree.branch.clone()),
         };
         self.store
             .insert_agent_with_auto_title(&agent, auto_title)?;
@@ -1717,6 +1880,7 @@ impl Daemon {
             sort_order: 0,
             status_changed_at: 0,
             alive: false,
+            branch: None,
         };
         self.spawn_agent_session(&agent, &worktree, 80, 24)?;
         tracing::info!(agent = %agent.id, kind = kind.as_str(), worktree = %worktree.branch, "prewarmed agent session");
@@ -1951,6 +2115,7 @@ impl Daemon {
         // replay it straight back over the user's choice.
         self.last_cwd.lock().unwrap().remove(id);
         self.store.set_agent_worktree(id, worktree_id)?;
+        self.store.set_agent_branch(id, Some(&target.branch))?;
         if was_alive {
             if let Err(e) = self.spawn_agent_session(&agent, &target, 80, 24) {
                 tracing::warn!(agent = %id, error = %e, "respawn after move failed");
@@ -1969,6 +2134,11 @@ impl Daemon {
     /// interrupt a live conversation for nothing.
     fn move_agent_row(self: &Arc<Self>, id: &AgentId, worktree_id: &WorktreeId) -> Result<()> {
         self.store.set_agent_worktree(id, worktree_id)?;
+        // The process moved into another checkout: its chat now belongs
+        // to that checkout's branch.
+        if let Some(target) = self.store.get_worktree(worktree_id)? {
+            self.store.set_agent_branch(id, Some(&target.branch))?;
+        }
         let agent = self.agent_entity(id)?;
         self.broadcast(ServerEvent::EntityUpserted {
             entity: Entity::Agent(agent),
@@ -2027,6 +2197,7 @@ impl Daemon {
             "terminal re-homed by shell cwd"
         );
         self.store.set_terminal_worktree(id, &target.id)?;
+        self.store.set_terminal_branch(id, Some(&target.branch))?;
         let entity = self.terminal_entity(id)?;
         self.broadcast(ServerEvent::EntityUpserted {
             entity: Entity::Terminal(entity),
@@ -2248,6 +2419,7 @@ impl Daemon {
             busy: false,
             status: None,
             status_changed_at: 0,
+            branch: Some(worktree.branch.clone()),
         };
         self.store.insert_terminal(&terminal)?;
         self.spawn_terminal_session(&terminal, &worktree, 80, 24)?;
@@ -3668,6 +3840,7 @@ mod tests {
                 sort_order: 0,
                 status_changed_at: 0,
                 alive: false,
+                branch: None,
             })
             .unwrap();
     }
@@ -3681,6 +3854,7 @@ mod tests {
                 name: id.into(),
                 sort_order: 0,
                 alive: false,
+                branch: None,
                 busy: false,
                 status: None,
                 status_changed_at: 0,
@@ -3754,6 +3928,7 @@ mod tests {
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: false,
+                    branch: None,
                 },
                 true,
             )
@@ -4108,7 +4283,7 @@ mod tests {
         // git itself refuses the plain checkout while the branch is parked.
         assert!(git::checkout(&repo, "feat").await.is_err());
 
-        daemon.checkout_primary(&pid, "feat").await.unwrap();
+        daemon.checkout_primary(&pid, "feat", None).await.unwrap();
 
         let (_, worktrees, _, _) = daemon.store.load_tree().unwrap();
         assert!(!parked.path.exists(), "parked checkout removed");
@@ -4119,7 +4294,7 @@ mod tests {
         assert_eq!(git::current_branch(&repo).await.unwrap(), "feat");
 
         // Unknown branch: refused, nothing touched.
-        assert!(daemon.checkout_primary(&pid, "nope").await.is_err());
+        assert!(daemon.checkout_primary(&pid, "nope", None).await.is_err());
 
         // A branch that only origin has (pushed from another machine) is
         // fetched into place and checked out — the "run on findl from a
@@ -4141,11 +4316,129 @@ mod tests {
         );
         git_in(&origin, &["branch", "pushed", "main"]);
         assert!(!git::branch_exists(&repo, "pushed").await);
-        daemon.checkout_primary(&pid, "pushed").await.unwrap();
+        daemon.checkout_primary(&pid, "pushed", None).await.unwrap();
         assert_eq!(git::current_branch(&repo).await.unwrap(), "pushed");
         // Still unknown everywhere: the error says what to do.
-        let err = daemon.checkout_primary(&pid, "nope").await.unwrap_err();
+        let err = daemon
+            .checkout_primary(&pid, "nope", None)
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("push it first"), "{err}");
+    }
+
+    /// `nebula switch` on the primary: the chats stay listed on the branch
+    /// they were on, only the session that asked follows the checkout, and
+    /// the main row records the branch it was cut from (so the panel keeps
+    /// it under its parent). Switching back onto a base-less branch clears
+    /// the stale lineage.
+    #[tokio::test]
+    async fn checkout_primary_leaves_sessions_on_their_branch_but_moves_the_mover() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo = root.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-b", "main"]);
+        git_in(&repo, &["commit", "--allow-empty", "-m", "init"]);
+        git_in(&repo, &["branch", "feat", "main"]);
+
+        let daemon = test_daemon();
+        let pid = ProjectId("p".into());
+        daemon
+            .store
+            .insert_project(&Project {
+                workspace_id: Default::default(),
+                id: pid.clone(),
+                name: "p".into(),
+                repo_path: repo.clone(),
+                sort_order: 0,
+                divider_after: false,
+                divider_before: false,
+                divider_label: None,
+                divider_before_label: None,
+                host: None,
+            })
+            .unwrap();
+        daemon
+            .store
+            .insert_worktree(&Worktree {
+                id: WorktreeId("root".into()),
+                project_id: pid.clone(),
+                path: repo.clone(),
+                branch: "main".into(),
+                is_main: true,
+                created_from: None,
+                pinned: false,
+                for_branch: false,
+                sort_order: 0,
+            })
+            .unwrap();
+        for id in ["mover", "stays"] {
+            seed_agent(&daemon, id, "root", None);
+            daemon
+                .store
+                .set_agent_branch(&AgentId(id.into()), Some("main"))
+                .unwrap();
+        }
+        seed_terminal(&daemon, "shell", "root");
+        daemon
+            .store
+            .set_terminal_branch(&TerminalId("shell".into()), Some("main"))
+            .unwrap();
+
+        let mover = SessionRef::Agent(AgentId("mover".into()));
+        daemon
+            .checkout_primary(&pid, "feat", Some(&mover))
+            .await
+            .unwrap();
+
+        let branch_of = |id: &str| {
+            daemon
+                .store
+                .get_agent(&AgentId(id.into()))
+                .unwrap()
+                .unwrap()
+                .branch
+        };
+        assert_eq!(branch_of("mover").as_deref(), Some("feat"), "follows");
+        assert_eq!(branch_of("stays").as_deref(), Some("main"), "left behind");
+        assert_eq!(
+            daemon
+                .store
+                .get_terminal(&TerminalId("shell".into()))
+                .unwrap()
+                .unwrap()
+                .branch
+                .as_deref(),
+            Some("main")
+        );
+        let main = daemon
+            .store
+            .get_worktree(&WorktreeId("root".into()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(main.branch, "feat");
+        assert_eq!(
+            main.created_from.as_deref(),
+            Some("main"),
+            "the primary records the branch it was cut from"
+        );
+
+        daemon.checkout_primary(&pid, "main", None).await.unwrap();
+        let main = daemon
+            .store
+            .get_worktree(&WorktreeId("root".into()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(main.branch, "main");
+        assert_eq!(
+            main.created_from, None,
+            "no base: the old lineage is cleared"
+        );
+        assert_eq!(
+            branch_of("mover").as_deref(),
+            Some("feat"),
+            "no mover this time"
+        );
     }
 
     #[tokio::test]

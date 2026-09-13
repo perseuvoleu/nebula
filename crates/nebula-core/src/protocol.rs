@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 27;
+pub const PROTOCOL_VERSION: u32 = 28;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -135,6 +135,12 @@ pub enum ClientRequest {
         req_id: u64,
         project: ProjectId,
         branch: String,
+        /// The session that asked for the switch from inside its own
+        /// shell (`nebula switch`): it follows the branch, so its row
+        /// moves with the checkout while every other session on the old
+        /// branch stays listed there.
+        #[serde(default)]
+        mover: Option<SessionRef>,
     },
     /// Pin/unpin the worktree in the worktrees list (pure metadata).
     SetWorktreePinned {
@@ -337,6 +343,37 @@ pub enum ClientRequest {
         session: SessionRef,
         /// Keep only the last N lines; None = everything retained.
         lines: Option<usize>,
+    },
+
+    /// Read-only source ownership check, answered by correlated Ack/Error.
+    /// A relay's cached snapshot cannot establish that a source is settled.
+    InspectCollect {
+        /// Correlates the source response through the relay.
+        req_id: u64,
+        /// Source checkout id (used for host routing).
+        worktree: WorktreeId,
+        /// Branch whose writers must all be settled.
+        branch: String,
+    },
+
+    /// Source-daemon guarded handoff. Ack is emitted only after this request
+    /// observes a new prompt submission and its completed turn; a cached
+    /// remote status is never sufficient. No lifecycle operation is performed.
+    CollectHandoff {
+        /// Correlates the completion response through relays.
+        req_id: u64,
+        /// Sole owning agent on the source daemon.
+        id: AgentId,
+        /// Reject if the source owner's revision differs from the caller's.
+        expected_status_changed_at: i64,
+        /// Expected checkout identity and branch, validated at the source.
+        worktree: WorktreeId,
+        /// Expected source branch, checked again before submission.
+        branch: String,
+        /// Explicit-file handoff instruction, passed as PTY text only.
+        prompt: String,
+        /// Maximum wait, in milliseconds; timeout leaves all sessions intact.
+        timeout_ms: u64,
     },
 
     Shutdown,

@@ -102,6 +102,7 @@ pub enum Action {
     FindFile,
     Grep,
     TreeBrowser,
+    ViewFile,
     // terminal
     ToggleTerminalFullscreen,
     UnlockTerminal,
@@ -591,6 +592,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         group: "FILES",
         scope: Scope::Global,
         defaults: &["b"],
+    },
+    ActionSpec {
+        action: Action::ViewFile,
+        id: "view_file",
+        label: "View file by path",
+        hint: "Type or paste a path (relative to the worktree, absolute, or ~/…) and read it",
+        group: "FILES",
+        scope: Scope::Global,
+        defaults: &["cmd+i", "shift+i"],
     },
     // ---- TERMINAL ----
     ActionSpec {

@@ -2,8 +2,10 @@ pub mod app;
 pub mod branch_name;
 pub mod branches;
 pub mod completion;
+pub mod collect_cli;
 pub mod config;
 pub mod event_loop;
+pub mod file_view;
 pub mod fuzzy;
 #[cfg(feature = "ghostty")]
 pub mod ghostty_pane;
@@ -186,4 +188,9 @@ pub fn run_kill() -> Result<()> {
         }
         Ok(())
     })
+}
+
+/// Collect a remote branch or worktree into a safe local destination.
+pub fn run_collect(opts: collect_cli::CollectOpts) -> Result<()> {
+    runtime()?.block_on(collect_cli::run(opts))
 }

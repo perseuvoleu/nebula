@@ -193,6 +193,25 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         daemon.note_detached(&session);
                     }
                 }
+                ClientRequest::InspectCollect { req_id, worktree, branch } => {
+                    let reply = match daemon.inspect_collect(&worktree, &branch) {
+                        Ok(()) => ServerEvent::Ack { req_id, created: None },
+                        Err(e) => ServerEvent::Error { req_id: Some(req_id), message: format!("{e:#}") },
+                    };
+                    let _ = out_tx.send(reply).await;
+                }
+                ClientRequest::CollectHandoff { req_id, id, expected_status_changed_at, worktree, branch, prompt, timeout_ms } => {
+                    let daemon = daemon.clone();
+                    let out = out_tx.clone();
+                    tokio::spawn(async move {
+                        let result = daemon.collect_handoff(&id, &worktree, &branch, expected_status_changed_at, &prompt, std::time::Duration::from_millis(timeout_ms)).await;
+                        let reply = match result {
+                            Ok(()) => ServerEvent::Ack { req_id, created: None },
+                            Err(e) => ServerEvent::Error { req_id: Some(req_id), message: format!("{e:#}") },
+                        };
+                        let _ = out.send(reply).await;
+                    });
+                }
                 ClientRequest::Input { session, data } => {
                     if let Some(s) = daemon.session(&session) {
                         if let Err(e) = s.write_input(&data) {
@@ -385,6 +404,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     req_id,
                     project,
                     branch,
+                    mover,
                 } => {
                     let daemon = daemon.clone();
                     let out_tx = out_tx.clone();
@@ -393,7 +413,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                             &out_tx,
                             req_id,
                             daemon
-                                .checkout_primary(&project, &branch)
+                                .checkout_primary(&project, &branch, mover.as_ref())
                                 .await
                                 .map(|_| None),
                         )

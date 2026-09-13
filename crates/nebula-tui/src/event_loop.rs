@@ -3,9 +3,9 @@
 use crate::app::{
     AfterCheckout, App, AttachedTerm, ConfirmDialog, ConnState, ContextMenu, DiffView, FileFinder,
     Focus, GrepView, HitTarget, LinkRow, MenuAction, MenuItem, MetricsView, NoteInput, NoteView,
-    Overlay, Palette, PaletteTarget, PendingAction, PendingIntent, PointerShape, ProjectRow,
-    PromptDialog, PromptKind, SessionRow, SettingsView, SplitterDrag, SubmenuKind, TermSelection,
-    TodoInput, TodoInputTarget, TodoView, WorktreeRollback,
+    Overlay, Palette, PaletteTarget, PanelEntry, PanelRow, PendingAction, PendingIntent,
+    PointerShape, ProjectRow, PromptDialog, PromptKind, SessionRow, SettingsView, SplitterDrag,
+    SubmenuKind, TermSelection, TodoInput, TodoInputTarget, TodoView, WorktreeRollback,
 };
 use crate::pull_request::PullRequest;
 use crate::text_input::TextInput;
@@ -18,7 +18,7 @@ use crossterm::event::{
 };
 use futures::StreamExt;
 use nebula_core::{
-    AgentId, AgentKind, AgentStatus, ClientRequest, EntityId, LinkId, NoteId, NoteOwner,
+    AgentId, AgentKind, AgentStatus, ClientRequest, EntityId, LinkId, NoteId, NoteOwner, ProjectId,
     ServerEvent, SessionRef, TodoId, TodoOwner, WorktreeId,
 };
 use ratatui::backend::CrosstermBackend;
@@ -821,6 +821,16 @@ fn ui_state_json(app: &App) -> String {
             ids.sort();
             ids
         },
+        hidden_projects: {
+            let mut ids: Vec<String> = app
+                .tree
+                .hidden_projects
+                .iter()
+                .map(|id| id.to_string())
+                .collect();
+            ids.sort();
+            ids
+        },
     };
     serde_json::to_string(&state).unwrap_or_else(|_| "{}".into())
 }
@@ -853,11 +863,7 @@ fn restore_ui_state(app: &mut App, json: &str) {
         }
     }
     if let Some(wid) = &state.worktree {
-        if let Some(i) = app
-            .visible_worktrees()
-            .iter()
-            .position(|w| w.id.as_str() == wid)
-        {
+        if let Some(i) = app.worktree_row_index(&nebula_core::WorktreeId(wid.clone())) {
             app.sel_worktree = i;
         }
     }
@@ -879,6 +885,15 @@ fn restore_ui_state(app: &mut App, json: &str) {
         return;
     }
     app.unseen_restored = true;
+    // Same first-snapshot rule for hidden projects: a reconnect must not
+    // undo hides/unhides made since launch. Ids the snapshot no longer
+    // knows are dropped.
+    for id in state.hidden_projects {
+        let id = ProjectId(id);
+        if app.tree.projects.iter().any(|p| p.id == id) {
+            app.tree.hidden_projects.insert(id);
+        }
+    }
     for id in state.unseen_finished {
         let id = AgentId(id);
         let still_finished =
@@ -1050,6 +1065,12 @@ fn paste_into_overlay(app: &mut App, text: &str) -> bool {
             view.filter.insert_str(text);
             view.apply_filter();
         }
+        Overlay::FileView(view) => {
+            // Pasting a path is the main way in: trim the newline a
+            // terminal copy tends to carry.
+            view.path.insert_str(text.trim());
+            view.refresh();
+        }
         Overlay::Diff(view) => {
             view.filter.insert_str(text);
             if view.apply_filter() {
@@ -1188,6 +1209,13 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                     app.term_locked = false;
                     app.focus = Focus::Sessions;
                     open_diff_view(app);
+                    return;
+                }
+                Some(crate::keymap::Action::ViewFile) => {
+                    app.collapsed = false;
+                    app.term_locked = false;
+                    app.focus = Focus::Sessions;
+                    open_file_view(app);
                     return;
                 }
                 Some(crate::keymap::Action::CommandPalette) => {
@@ -1389,14 +1417,17 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 _ => app.focus = Focus::Worktrees,
             },
             Focus::Worktrees => {
-                // A checkout-less branch row has no sessions to enter —
-                // Enter opens its action menu instead.
-                if let Some(branch) = app.selected_branch_row() {
-                    if let Some(project) = app.selected_project().map(|p| p.id.clone()) {
-                        open_menu(app, branch_row_menu(project, branch), (30, 4));
+                // A checkout-less branch row with nothing parked on it has
+                // no sessions to enter — Enter opens its action menu
+                // instead. One holding chats left behind by a checkout
+                // switch enters them like any checkout row.
+                match app.selected_branch_row() {
+                    Some(branch) if app.visible_session_rows().is_empty() => {
+                        if let Some(project) = app.selected_project().map(|p| p.id.clone()) {
+                            open_menu(app, branch_row_menu(project, branch), (30, 4));
+                        }
                     }
-                } else {
-                    app.focus = Focus::Sessions;
+                    _ => app.focus = Focus::Sessions,
                 }
             }
             Focus::Sessions => attach_selected(app, out),
@@ -1599,6 +1630,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         Action::Notes => open_note_view(app),
         Action::Todos => open_todo_view(app),
         Action::TreeBrowser => open_tree_browser(app),
+        Action::ViewFile => open_file_view(app),
         // t: the new-session picker (agents + shell) on the selection's
         // checkout — complements n, which creates worktrees/branches when
         // that panel has focus.
@@ -2078,6 +2110,26 @@ fn open_file_finder(app: &mut App) {
     app.overlay = Some(Overlay::Files(FileFinder::new(path, branch, editor, files)));
 }
 
+/// Path viewer (⌘I): a path box over the file's contents, read straight
+/// from disk so ignored/untracked files show too. Same shell as
+/// `open_diff_view`: flash instead of opening without a worktree.
+fn open_file_view(app: &mut App) {
+    let Some((path, branch)) = app
+        .selected_worktree()
+        .map(|w| (w.path.clone(), w.branch.clone()))
+    else {
+        app.flash = Some("no worktree selected".into());
+        return;
+    };
+    if let Some(msg) = checkout_unreachable(&path) {
+        app.flash = Some(msg);
+        return;
+    }
+    app.overlay = Some(Overlay::FileView(crate::file_view::FileView::new(
+        path, branch,
+    )));
+}
+
 /// Tree browser (`b`): full file tree of the selected worktree with a
 /// content preview, filterable by file name. Same shell as `open_diff_view`:
 /// flash instead of opening when there's no worktree, the path is gone, or
@@ -2406,6 +2458,61 @@ fn archive_agent(app: &mut App, id: AgentId, out: &mut Vec<ClientRequest>) {
 /// Expand/collapse the ARCHIVED group (A key, header click, context menu).
 /// Collapsing while the cursor sits on an archived row re-lands it on a
 /// surviving row and previews it, same as any other regroup.
+/// Hide/unhide a project row (the `Hide` menu row and the header
+/// dropdown). Client-side only: the selection is reconciled like an
+/// archive toggle, and the UI-state blob is saved right away so the hide
+/// survives a crash, not just a clean quit.
+fn set_project_hidden(app: &mut App, id: ProjectId, hidden: bool, out: &mut Vec<ClientRequest>) {
+    let before = selection_snapshot(app);
+    if hidden {
+        app.tree.hidden_projects.insert(id);
+    } else {
+        app.tree.hidden_projects.remove(&id);
+        // Land on the row that just came back.
+        if let Some(i) = app
+            .project_rows()
+            .iter()
+            .position(|r| matches!(r, ProjectRow::Project(i) if app.tree.projects[*i].id == id))
+        {
+            app.sel_project = i;
+            app.sel_worktree = 0;
+            app.sel_session = 0;
+        }
+    }
+    reconcile_selection(app, before, out);
+    out.push(ClientRequest::SaveUiState {
+        json: ui_state_json(app),
+    });
+    app.dirty = true;
+}
+
+/// The `▾ n` chip: a dropdown of hidden projects, one row each; picking
+/// one lists it again.
+fn open_hidden_projects_menu(app: &mut App, at: (u16, u16)) {
+    let items: Vec<MenuItem> = app
+        .tree
+        .hidden_listed_projects()
+        .into_iter()
+        .map(|p| MenuItem {
+            label: p.name.clone(),
+            action: MenuAction::UnhideProject(p.id.clone()),
+            destructive: false,
+        })
+        .collect();
+    if items.is_empty() {
+        return;
+    }
+    app.overlay = Some(Overlay::Menu(ContextMenu {
+        title: Some("Hidden projects".into()),
+        items,
+        at: Some(at),
+        hover: 0,
+        area: ratatui::layout::Rect::default(),
+        parent: None,
+        filter: None,
+    }));
+}
+
 fn toggle_archived(app: &mut App, out: &mut Vec<ClientRequest>) {
     let before = selection_snapshot(app);
     app.show_archived = !app.show_archived;
@@ -2542,6 +2649,7 @@ fn request_checkout_primary(
         req_id,
         project,
         branch,
+        mover: None,
     });
 }
 
@@ -4225,6 +4333,11 @@ fn open_context_menu_for_selection(app: &mut App) {
                 });
                 items.push(divider_menu_item(p));
                 items.push(MenuItem {
+                    label: "Hide".into(),
+                    action: MenuAction::HideProject(p.id.clone()),
+                    destructive: false,
+                });
+                items.push(MenuItem {
                     label: "Remove from list".into(),
                     action: MenuAction::RemoveProject(p.id.clone()),
                     destructive: true,
@@ -4765,6 +4878,48 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 _ => {
                     if view.query.handle_key(&key).changed() {
                         view.run_search();
+                    }
+                }
+            }
+        }
+        Overlay::FileView(view) => {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            let half = (view.view_height / 2).max(1) as i32;
+            let page = view.view_height.max(1) as i32;
+            match key.code {
+                // Two-stage escape: a typed path is cleared before the
+                // second Esc closes the modal.
+                KeyCode::Esc if !view.path.is_empty() => {
+                    view.path.clear();
+                    view.refresh();
+                }
+                KeyCode::Esc => app.overlay = None,
+                KeyCode::Tab | KeyCode::Enter => view.complete(),
+                KeyCode::Down => view.step(1),
+                KeyCode::Up => view.step(-1),
+                KeyCode::Char('n') if ctrl => view.step(1),
+                KeyCode::Char('p') if ctrl => view.step(-1),
+                KeyCode::Char('d') if ctrl => view.scroll_by(half),
+                KeyCode::Char('u') if ctrl && view.path.is_empty() => view.scroll_by(-half),
+                KeyCode::PageDown => view.scroll_by(page),
+                KeyCode::PageUp => view.scroll_by(-page),
+                KeyCode::Home => view.scroll = 0,
+                KeyCode::End => view.scroll = view.max_scroll(),
+                // Ctrl+y copies the shown file's path as typed.
+                KeyCode::Char('y') if ctrl => {
+                    let path = view.path.as_str().to_string();
+                    if !path.is_empty() {
+                        app.overlay = None;
+                        app.flash = Some(if copy_to_clipboard(&path) {
+                            format!("copied {path}")
+                        } else {
+                            "copy failed (clipboard unavailable)".into()
+                        });
+                    }
+                }
+                _ => {
+                    if view.path.handle_key(&key).changed() {
+                        view.refresh();
                     }
                 }
             }
@@ -6089,6 +6244,8 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             open_prompt(app, PromptKind::DividerLabel { id, before })
         }
         MenuAction::ToggleArchived => toggle_archived(app, out),
+        MenuAction::HideProject(id) => set_project_hidden(app, id, true, out),
+        MenuAction::UnhideProject(id) => set_project_hidden(app, id, false, out),
         MenuAction::Command(cmd) => {
             use crate::app::PaletteCommand;
             match cmd {
@@ -6622,15 +6779,13 @@ fn jump_to_target(
                 .map(|a| a.worktree_id.clone())
                 .and_then(|wid| app.listed_worktree_for(&wid));
             let found = worktree.as_ref().is_some_and(|wid| {
-                app.tree
-                    .worktrees
-                    .iter()
-                    .find(|w| &w.id == wid)
-                    .map(|w| w.project_id.clone())
+                app.listed_project_for(wid)
                     .is_some_and(|pid| select_project_row_by_id(app, &pid))
             });
+            // The row that lists it: its checkout's, or the branch row its
+            // chat was parked on when the checkout moved to another branch.
             let wt_index = found
-                .then(|| worktree.as_ref().and_then(|id| app.worktree_row_index(id)))
+                .then(|| app.row_index_for_session(&SessionRef::Agent(id.clone())))
                 .flatten();
             let Some(wt_index) = wt_index else {
                 app.flash = Some("session no longer exists".into());
@@ -6680,16 +6835,10 @@ fn open_session(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
     }
     .and_then(|wid| app.listed_worktree_for(&wid));
     let found = worktree.as_ref().is_some_and(|wid| {
-        app.tree
-            .worktrees
-            .iter()
-            .find(|w| &w.id == wid)
-            .map(|w| w.project_id.clone())
+        app.listed_project_for(wid)
             .is_some_and(|pid| select_project_row_by_id(app, &pid))
     });
-    let wt_index = found
-        .then(|| worktree.as_ref().and_then(|id| app.worktree_row_index(id)))
-        .flatten();
+    let wt_index = found.then(|| app.row_index_for_session(&sref)).flatten();
     let Some(wt_index) = wt_index else {
         app.flash = Some("session no longer exists".into());
         return;
@@ -7823,6 +7972,43 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
     // (folding/unfolding directories), a drag on the tree/preview border
     // resizes the tree panel, a click outside the modal closes; everything
     // else is swallowed.
+    if let Some(Overlay::FileView(view)) = &mut app.overlay {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                view.scroll_by(-3);
+                app.dirty = true;
+            }
+            MouseEventKind::ScrollDown => {
+                view.scroll_by(3);
+                app.dirty = true;
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let c = view.content_area;
+                let inside_content = c.width > 0
+                    && mouse.column >= c.x
+                    && mouse.column < c.x + c.width
+                    && mouse.row >= c.y
+                    && mouse.row < c.y + c.height;
+                let area = view.area;
+                let inside_modal = mouse.column >= area.x
+                    && mouse.column < area.x + area.width
+                    && mouse.row >= area.y
+                    && mouse.row < area.y + area.height;
+                if inside_content {
+                    // A click on a candidate row completes to it.
+                    if let Some(i) = view.candidate_at_row((mouse.row - c.y) as usize) {
+                        view.selected = i;
+                        view.complete();
+                    }
+                } else if !inside_modal {
+                    app.overlay = None;
+                }
+                app.dirty = true;
+            }
+            _ => {}
+        }
+        return;
+    }
     if let Some(Overlay::Tree(view)) = &mut app.overlay {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
@@ -8266,9 +8452,10 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     }
                 }
                 Some(HitTarget::WorktreeBranch(i)) => {
-                    // Selection only — a checkout-less branch has no
-                    // session to preview; Enter/right-click open its menu.
-                    let target = app.visible_worktrees().len() + i;
+                    // Selection only — `restore_session` previews a parked
+                    // chat when the branch has one; Enter/right-click open
+                    // its menu.
+                    let target = i;
                     let section_changed = app.focus != Focus::Worktrees;
                     app.focus = Focus::Worktrees;
                     if app.sel_worktree != target || section_changed {
@@ -8278,34 +8465,38 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                         restore_session(app, out);
                     }
                 }
-                Some(HitTarget::WorktreeSession(worktree_index, session_index)) => {
+                Some(HitTarget::WorktreeSession(row_index, session_index)) => {
                     let target = app
-                        .visible_worktrees()
-                        .get(worktree_index)
-                        .map(|worktree| worktree.id.clone())
-                        .and_then(|worktree| {
-                            app.worktree_session_rows(&worktree)
-                                .get(session_index)
-                                .cloned()
-                                .map(|row| (worktree, row))
-                        });
+                        .panel_row_sessions(row_index)
+                        .get(session_index)
+                        .cloned();
                     match target {
-                        Some((_, SessionRow::Agent(agent))) => {
+                        Some(SessionRow::Agent(agent)) => {
                             jump_to_target(app, PaletteTarget::Session(agent.id), true, out);
                         }
-                        Some((_, SessionRow::Terminal(terminal))) => {
+                        Some(SessionRow::Terminal(terminal)) => {
                             open_session(app, SessionRef::Terminal(terminal.id), out);
                         }
-                        Some((worktree, SessionRow::Link(link))) => {
-                            let key = SessionRow::Link(link).click_key();
-                            jump_to_target(app, PaletteTarget::Worktree(worktree), false, out);
-                            if let Some(index) = app
-                                .visible_session_rows()
-                                .iter()
-                                .position(|row| row.click_key() == key)
-                            {
-                                app.sel_session = index;
-                                attach_selected(app, out);
+                        Some(SessionRow::Link(link)) => {
+                            // Links hang off checkouts only.
+                            let worktree = match app.panel_entries().get(row_index) {
+                                Some(PanelEntry {
+                                    row: PanelRow::Worktree(id),
+                                    ..
+                                }) => Some(id.clone()),
+                                _ => None,
+                            };
+                            if let Some(worktree) = worktree {
+                                let key = SessionRow::Link(link).click_key();
+                                jump_to_target(app, PaletteTarget::Worktree(worktree), false, out);
+                                if let Some(index) = app
+                                    .visible_session_rows()
+                                    .iter()
+                                    .position(|row| row.click_key() == key)
+                                {
+                                    app.sel_session = index;
+                                    attach_selected(app, out);
+                                }
                             }
                         }
                         None => {}
@@ -8354,6 +8545,10 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 Some(HitTarget::ArchivedHeader) => {
                     app.focus = Focus::Sessions;
                     toggle_archived(app, out);
+                }
+                Some(HitTarget::HiddenProjects) => {
+                    app.focus = Focus::Projects;
+                    open_hidden_projects_menu(app, (mouse.column, mouse.row));
                 }
                 Some(HitTarget::GlobalSessionsBg) => {
                     // The section's empty space: just take the column's
@@ -8551,6 +8746,11 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                             },
                             divider_menu_item(p),
                             MenuItem {
+                                label: "Hide".into(),
+                                action: MenuAction::HideProject(p.id.clone()),
+                                destructive: false,
+                            },
+                            MenuItem {
                                 label: "Remove from list".into(),
                                 action: MenuAction::RemoveProject(p.id.clone()),
                                 destructive: true,
@@ -8605,7 +8805,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 Some(HitTarget::WorktreeSession(_, _)) => {}
                 Some(HitTarget::WorktreeBranch(i)) => {
                     app.focus = Focus::Worktrees;
-                    app.sel_worktree = app.visible_worktrees().len() + i;
+                    app.sel_worktree = i;
                     if let Some((project, branch)) = app
                         .selected_project()
                         .map(|p| p.id.clone())
@@ -9638,7 +9838,7 @@ fn clamp_selections(app: &mut App) {
     if app.sel_project >= project_rows {
         app.sel_project = project_rows.saturating_sub(1);
     }
-    let wt_len = app.visible_worktrees().len();
+    let wt_len = app.worktree_panel_len();
     if app.sel_worktree >= wt_len {
         app.sel_worktree = wt_len.saturating_sub(1);
     }
@@ -9776,13 +9976,12 @@ mod tests {
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: false,
+                    branch: None,
                 }),
             },
         );
-        // The twin's checkout is absorbed — no project row of its own —
-        // yet its session row under the local worktree must still be a
-        // click away, like any local row (the sidebar's sublist click,
-        // the palette pick and Space all funnel through this jump).
+        // The project is grouped with its local twin, but the remote
+        // checkout and session retain their own identity on a jump.
         app.sel_project = 0;
         app.sel_worktree = 0;
         app.flash = None;
@@ -9801,7 +10000,7 @@ mod tests {
         );
         assert_eq!(
             app.listed_worktree_for(&WorktreeId("w-remote".into())),
-            Some(WorktreeId("w1".into()))
+            Some(WorktreeId("w-remote".into()))
         );
     }
 
@@ -9908,7 +10107,7 @@ mod tests {
     }
 
     #[test]
-    fn twin_sessions_share_one_list() {
+    fn twin_sessions_stay_in_their_host_checkout_lists() {
         use nebula_core::{Agent, AgentStatus, Entity, WorktreeId};
         let mut app = App::new();
         seed_tree(&mut app);
@@ -9932,10 +10131,11 @@ mod tests {
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: false,
+                    branch: None,
                 }),
             },
         );
-        // …but lists under the local primary too, wearing its host.
+        // Local rows list local sessions only. The remote row owns its session.
         app.sel_project = app
             .tree
             .projects
@@ -9944,20 +10144,97 @@ mod tests {
             .unwrap();
         app.sel_worktree = 0;
         let rows = app.visible_session_rows();
-        let remote = rows
-            .iter()
-            .find(|r| r.name() == "remote-one")
-            .expect("twin session listed under the local worktree");
+        assert!(!rows.iter().any(|r| r.name() == "remote-one"));
+        assert!(rows.iter().any(|r| matches!(r, SessionRow::Agent(a) if a.worktree_id.as_str() == "w1")));
+        app.sel_worktree = app.visible_worktrees().iter().position(|w| w.id.as_str() == "w-remote").unwrap();
+        let remote_rows = app.visible_session_rows();
+        let remote = remote_rows.iter().find(|r| r.name() == "remote-one").expect("remote checkout lists its own session");
         assert_eq!(app.session_host(remote), Some("findl"));
-        assert!(
-            rows.iter().any(|r| r.name() == "agent-one"
-                || matches!(r, SessionRow::Agent(a) if a.worktree_id.as_str() == "w1")),
-            "local rows stay"
+        assert!(!remote_rows.iter().any(|r| matches!(r, SessionRow::Agent(a) if a.worktree_id.as_str() == "w1")));
+    }
+
+    /// A session on a checkout that exists only on findl (no local
+    /// counterpart on its branch) is still reachable from the all-projects
+    /// list: the jump lands on the local project row, on the remote-only
+    /// checkout's row, on that session. Its status rolls into the local
+    /// project's dot too.
+    #[test]
+    fn remote_only_checkout_sessions_are_jump_targets() {
+        use nebula_core::{Agent, AgentStatus, Entity, ProjectId, Worktree, WorktreeId};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_remote_twin(&mut app);
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(Worktree {
+                    id: WorktreeId("w-remote-feat".into()),
+                    project_id: ProjectId("p-remote".into()),
+                    path: "/srv/demo-worktrees/feature-x".into(),
+                    branch: "feature-x".into(),
+                    is_main: false,
+                    created_from: None,
+                    pinned: false,
+                    for_branch: false,
+                    sort_order: 1,
+                }),
+            },
         );
-        // The twin's own list shows the same family.
-        assert!(app
-            .worktree_family(&WorktreeId("w-remote".into()))
-            .contains(&WorktreeId("w1".into())));
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(Agent {
+                    id: AgentId("a-remote-feat".into()),
+                    worktree_id: WorktreeId("w-remote-feat".into()),
+                    name: "remote-feat".into(),
+                    status: AgentStatus::Running,
+                    archived: false,
+                    archived_at: 0,
+                    pinned: false,
+                    kind: AgentKind::Pi,
+                    model: None,
+                    effort: None,
+                    session_id: None,
+                    sort_order: 0,
+                    status_changed_at: 0,
+                    alive: true,
+                    branch: Some("feature-x".into()),
+                }),
+            },
+        );
+        assert_eq!(
+            app.listed_project_for(&WorktreeId("w-remote-feat".into())),
+            Some(ProjectId("p1".into())),
+            "listed under the local namesake"
+        );
+        assert_eq!(
+            app.project_rollup(&ProjectId("p1".into())),
+            Some(AgentStatus::Running),
+            "the twin's running session lights the local project dot"
+        );
+        let mut out = Vec::new();
+        jump_to_target(
+            &mut app,
+            PaletteTarget::Session(AgentId("a-remote-feat".into())),
+            false,
+            &mut out,
+        );
+        assert_ne!(
+            app.flash.as_deref(),
+            Some("session no longer exists"),
+            "{:?}",
+            app.flash
+        );
+        assert_eq!(app.selected_project().map(|p| p.id.as_str()), Some("p1"));
+        assert_eq!(
+            app.selected_worktree().map(|w| w.id.as_str()),
+            Some("w-remote-feat")
+        );
+        assert!(
+            matches!(app.selected_session_row(), Some(SessionRow::Agent(a)) if a.name == "remote-feat"),
+            "{:?}",
+            app.selected_session_row()
+        );
     }
 
     #[test]
@@ -9988,27 +10265,25 @@ mod tests {
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(app.tree.visible_project_count(), 1);
         assert!(app.tree.has_visible_projects());
-        // Under it: the local primary, then the remote-only checkout, which
-        // knows its host.
+        // Under it: both primary checkouts, then the remote linked checkout.
         app.sel_project = 0;
         let worktrees = app.visible_worktrees();
         let branches: Vec<&str> = worktrees.iter().map(|w| w.branch.as_str()).collect();
-        assert_eq!(branches, vec!["main", "feature-x"]);
+        assert_eq!(branches, vec!["main", "main", "feature-x"]);
         assert_eq!(
             app.worktree_host(&WorktreeId("w-remote-feat".into())),
             Some("findl")
         );
-        // The twin's primary is not a second "main" row: it merges with ours.
-        assert!(app
-            .worktree_family(&WorktreeId("w1".into()))
-            .contains(&WorktreeId("w-remote".into())));
+        assert!(worktrees.iter().any(|w| w.id.as_str() == "w1"));
+        assert!(worktrees.iter().any(|w| w.id.as_str() == "w-remote"));
         // Drawn: the remote-only row and the crumb wear the badge, the
         // project row does not.
         let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
-        app.sel_worktree = 1;
+        app.sel_worktree = 2;
         terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
         assert!(text.contains("feature-x"), "{text}");
+        assert!(text.contains("@local"), "{text}");
         assert!(text.matches("@findl").count() >= 2, "{text}");
         assert!(
             !text.contains("demo @findl"),
@@ -10018,6 +10293,26 @@ mod tests {
         app.tree.projects.retain(|p| p.host.is_some());
         assert_eq!(app.project_rows().len(), 1);
         assert!(app.tree.projects.iter().all(|p| app.tree.is_listed(p)));
+    }
+
+    #[test]
+    fn branch_badge_does_not_label_remote_parked_sessions_as_local() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_remote_twin(&mut app);
+        app.branch_list = Some((nebula_core::ProjectId("p1".into()), vec!["develop".into()]));
+        app.desired_panel_widths = [30, 50];
+        let mut terminal = Terminal::new(TestBackend::new(180, 40)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(buffer_text(&terminal).contains("develop (branch) @local"), "{}", buffer_text(&terminal));
+        let mut remote = app.tree.agents[0].clone();
+        remote.id = AgentId("remote-parked".into());
+        remote.worktree_id = nebula_core::WorktreeId("w-remote".into());
+        remote.branch = Some("develop".into());
+        app.tree.agents.push(remote);
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(!text.contains("develop (branch) @local"), "{text}");
     }
 
     fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
@@ -10101,6 +10396,7 @@ mod tests {
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
+                    branch: None,
                 }),
             },
         );
@@ -11676,6 +11972,7 @@ mod tests {
                     sort_order: 2,
                     status_changed_at: 0,
                     alive: true,
+                    branch: None,
                 }),
             },
         );
@@ -11760,6 +12057,7 @@ mod tests {
                     sort_order: 1,
                     status_changed_at: 0,
                     alive: true,
+                    branch: None,
                 }),
             },
         );
@@ -11864,6 +12162,7 @@ mod tests {
                 sort_order: sort,
                 status_changed_at: changed_at,
                 alive: true,
+                branch: None,
             }),
         };
         // Pinned with a fresh change: must stay in PINNED, not RECENT.
@@ -11928,6 +12227,7 @@ mod tests {
                     sort_order: sort,
                     status_changed_at: changed_at,
                     alive: true,
+                    branch: None,
                 }),
             }
         };
@@ -11996,6 +12296,7 @@ mod tests {
                     sort_order: sort,
                     status_changed_at: at,
                     alive: true,
+                    branch: None,
                 }),
             }
         };
@@ -12093,6 +12394,7 @@ mod tests {
                     sort_order: 1,
                     status_changed_at: 0,
                     alive: true,
+                    branch: None,
                 }),
             },
         );
@@ -12145,6 +12447,7 @@ mod tests {
                         sort_order: 0,
                         status_changed_at: 0,
                         alive: true,
+                        branch: None,
                     }),
                 },
             );
@@ -12221,6 +12524,7 @@ mod tests {
                     sort_order: 1,
                     status_changed_at: 0,
                     alive: true,
+                    branch: None,
                 }),
             },
         );
@@ -12464,6 +12768,7 @@ mod tests {
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
+                    branch: None,
                 }),
             },
         );
@@ -12893,6 +13198,7 @@ mod tests {
                     name: "quick".into(),
                     sort_order: 0,
                     alive: true,
+                    branch: None,
                     busy: false,
                     status: None,
                     status_changed_at: 0,
@@ -12932,6 +13238,7 @@ mod tests {
                     name: "quick".into(),
                     sort_order: 0,
                     alive: false,
+                    branch: None,
                     busy: false,
                     status: None,
                     status_changed_at: 0,
@@ -12970,6 +13277,7 @@ mod tests {
                     name: "quick".into(),
                     sort_order: 0,
                     alive: true,
+                    branch: None,
                     busy: false,
                     status: None,
                     status_changed_at: 0,
@@ -13022,6 +13330,7 @@ mod tests {
                     name: "quick".into(),
                     sort_order: 0,
                     alive: true,
+                    branch: None,
                     busy: false,
                     status: None,
                     status_changed_at: 0,
@@ -13659,6 +13968,7 @@ mod tests {
                     name: name.into(),
                     sort_order: 0,
                     alive: true,
+                    branch: None,
                     busy: false,
                     status: None,
                     status_changed_at: 0,
@@ -14103,6 +14413,7 @@ mod tests {
                 sort_order: sort,
                 status_changed_at: 0,
                 alive: true,
+                branch: None,
             })
         };
         hse(
@@ -14173,6 +14484,7 @@ mod tests {
             sort_order: sort,
             status_changed_at: 0,
             alive: false,
+            branch: None,
         })
     }
 
@@ -15007,6 +15319,41 @@ mod tests {
         assert!(out.is_empty(), "no requests from a splitter grab");
     }
 
+    /// Hide takes the project off the panel and persists in the UI-state
+    /// blob; the dropdown row brings it back and lands the cursor on it.
+    #[test]
+    fn hide_project_roundtrips_through_ui_state() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        let id = nebula_core::ProjectId("p1".into());
+        assert_eq!(app.tree.visible_project_count(), 1);
+
+        run_menu_action(&mut app, MenuAction::HideProject(id.clone()), &mut out);
+        assert_eq!(app.tree.visible_project_count(), 0);
+        assert_eq!(app.tree.hidden_listed_projects().len(), 1);
+        assert!(app.project_rows().is_empty());
+        assert!(
+            out.iter()
+                .any(|r| matches!(r, ClientRequest::SaveUiState { .. })),
+            "hide saves the UI state right away"
+        );
+        let json = ui_state_json(&app);
+        assert!(json.contains(r#""hidden_projects":["p1"]"#), "{json}");
+
+        // A fresh app restoring that blob starts with the project hidden.
+        let mut fresh = App::new();
+        seed_tree(&mut fresh);
+        restore_ui_state(&mut fresh, &json);
+        assert!(fresh.tree.is_hidden(&fresh.tree.projects[0]));
+
+        out.clear();
+        run_menu_action(&mut app, MenuAction::UnhideProject(id), &mut out);
+        assert_eq!(app.tree.visible_project_count(), 1);
+        assert!(app.tree.hidden_listed_projects().is_empty());
+        assert_eq!(app.sel_project, 0);
+    }
+
     #[test]
     fn normalize_panel_widths_shrinks_rightmost_first() {
         let mut app = App::new();
@@ -15096,6 +15443,7 @@ mod tests {
                     name: "term-1".into(),
                     sort_order: 0,
                     alive: true,
+                    branch: None,
                     busy: false,
                     status: None,
                     status_changed_at: 0,
@@ -15176,6 +15524,7 @@ mod tests {
                     sort_order: 0,
                     status_changed_at: crate::app::now_ms() - 2 * 60_000,
                     alive: true,
+                    branch: None,
                 }),
             },
         );
@@ -15853,6 +16202,7 @@ mod tests {
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
+                    branch: None,
                 }),
             },
         );
@@ -16509,6 +16859,7 @@ mod tests {
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
+                    branch: None,
                 }),
             },
         );
@@ -16566,6 +16917,7 @@ mod tests {
                     name: "shell-1".into(),
                     sort_order: 0,
                     alive: true,
+                    branch: None,
                     busy: false,
                     status: None,
                     status_changed_at: 0,
@@ -16601,6 +16953,7 @@ mod tests {
                     sort_order: 1,
                     status_changed_at: 0,
                     alive: false,
+                    branch: None,
                 }),
             },
         );
@@ -16625,8 +16978,8 @@ mod tests {
                 .unwrap_or_default()
         };
         assert!(
-            worktree_column(worktree.y + 1).contains("● demo"),
-            "primary row is visible under its project name:\n{text}"
+            worktree_column(worktree.y + 1).contains("● main ⌂ primary"),
+            "primary row is visible under its branch name:\n{text}"
         );
         assert!(
             worktree_column(worktree.y + worktree.height).contains("▘ ● claude "),
@@ -16680,6 +17033,7 @@ mod tests {
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
+                    branch: None,
                 }),
             },
         );
@@ -16768,7 +17122,7 @@ mod tests {
         let cell = |x: u16, y: u16| terminal.backend().buffer()[(x, y)].symbol().to_string();
         // The primary row carries the project's name; its branch sits on
         // the `on main` sub-line.
-        let (main_x, main_y) = find_cell(&terminal, "demo ⌂");
+        let (main_x, main_y) = find_cell(&terminal, "main ⌂");
         let (child_x, child_y) = find_cell(&terminal, "n-child");
         let (grand_x, grand_y) = find_cell(&terminal, "n-grand");
         let (last_x, last_y) = find_cell(&terminal, "n-last");
@@ -16872,6 +17226,7 @@ mod tests {
                         sort_order: i,
                         status_changed_at: 0,
                         alive: true,
+                        branch: None,
                     }),
                 },
             );
@@ -16993,6 +17348,7 @@ mod tests {
                         sort_order: i as i64,
                         status_changed_at: 0,
                         alive: true,
+                        branch: None,
                     }),
                 },
             );
@@ -18031,7 +18387,7 @@ mod tests {
         let rect = app
             .hits
             .iter()
-            .find_map(|(r, t)| matches!(t, HitTarget::WorktreeBranch(0)).then_some(*r))
+            .find_map(|(r, t)| matches!(t, HitTarget::WorktreeBranch(_)).then_some(*r))
             .expect("the branch row registers a hit rect");
         let mut out = Vec::new();
         handle_mouse(
@@ -18320,6 +18676,7 @@ mod tests {
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
+                    branch: None,
                 }),
             },
         );
@@ -19309,6 +19666,7 @@ mod tests {
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
+                    branch: None,
                 }),
             },
         );
@@ -19330,6 +19688,7 @@ mod tests {
                     sort_order: 1,
                     status_changed_at: 0,
                     alive: false,
+                    branch: None,
                 }),
             },
         );
@@ -19692,6 +20051,7 @@ mod tests {
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: true,
+                    branch: None,
                 }),
             },
         );
@@ -20764,6 +21124,56 @@ mod tests {
         assert!(app.overlay.is_none(), "second Esc closes the browser");
     }
 
+    /// ⌘I: the path box fuzzy-finds an ignored file, Tab opens it, ↓
+    /// scrolls the contents, Esc clears then closes.
+    #[test]
+    fn file_view_reads_a_path_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo(&dir);
+        std::fs::create_dir_all(repo.join(".scratch")).unwrap();
+        std::fs::write(repo.join(".gitignore"), ".scratch/\n").unwrap();
+        let body: String = (1..=50).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(repo.join(".scratch/notes.md"), &body).unwrap();
+        let mut app = App::new();
+        seed_repo_tree(&mut app, &repo);
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Char('i'), KeyModifiers::SUPER, &mut out);
+        let view = |app: &App| match &app.overlay {
+            Some(Overlay::FileView(v)) => v.clone(),
+            other => panic!("expected file view, got {other:?}"),
+        };
+        assert_eq!(view(&app).mode, crate::file_view::FileViewMode::Candidates);
+
+        for c in "scrnotes".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        assert_eq!(
+            view(&app).candidate_path(0),
+            Some(".scratch/notes.md"),
+            "fuzzy match over an ignored file"
+        );
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+        let v = view(&app);
+        assert_eq!(v.path.as_str(), ".scratch/notes.md");
+        assert_eq!(v.mode, crate::file_view::FileViewMode::File);
+        assert_eq!(v.lines.len(), 50);
+
+        // Paging needs a drawn height; stand in for the draw write-back.
+        if let Some(Overlay::FileView(v)) = &mut app.overlay {
+            v.view_height = 10;
+        }
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        assert_eq!(view(&app).scroll, 1, "↓ scrolls a shown file");
+        press(&mut app, KeyCode::End, KeyModifiers::NONE, &mut out);
+        assert_eq!(view(&app).scroll, 40);
+
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        assert!(view(&app).path.is_empty(), "first Esc clears the path");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none(), "second Esc closes");
+    }
+
     #[test]
     fn tree_browser_ctrl_u_clears_filter() {
         let dir = tempfile::tempdir().unwrap();
@@ -21245,6 +21655,7 @@ mod tests {
                         sort_order: 1,
                         status_changed_at: 0,
                         alive: true,
+                        branch: None,
                     }),
                 },
             );
@@ -21317,6 +21728,7 @@ mod tests {
             sort_order: 1,
             status_changed_at: 0,
             alive: true,
+            branch: None,
         })
     }
 

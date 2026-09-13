@@ -105,7 +105,7 @@ pub fn twin_instruction(host: &str, name: &str, checkouts: &[(String, usize)]) -
         "[nebula] This project has a twin on {host} ({name}@{host}). {checkouts} \
          Work there and here never merges by itself: `nebula sync --status` \
          shows both sides, `nebula sync` moves commits the safe way. Follow the \
-         hybrid-work skill before writing to a branch a remote session is on."
+         hybrid-work skill at /Users/andrei/Desktop/nebula/.claude/skills/hybrid-work/SKILL.md before writing to a branch a remote session is on."
     )
 }
 
@@ -349,6 +349,7 @@ mod tests {
             sort_order: 0,
             status_changed_at: 0,
             alive: false,
+            branch: None,
         };
         store
             .insert_agent_with_auto_title(&agent("pending"), true)
@@ -652,6 +653,7 @@ mod tests {
             sort_order: 0,
             status_changed_at: 0,
             alive: true,
+            branch: None,
         };
         store
             .insert_agent(&remote_agent("r1", "tw1", false))

@@ -1,4 +1,5 @@
 pub mod config;
+mod collect;
 pub mod git;
 pub mod hooks;
 pub mod lifecycle;

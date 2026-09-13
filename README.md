@@ -281,6 +281,7 @@ nebula remote <host> sessions  # every session on the host, archived included
 nebula remote <host> watch     # the same, live
 nebula remote <host> sync      # mirror skills (nebula-sync-skills) + ff-pull every remote checkout
 nebula sync [--status|--to <host>|--from <host>|--dry-run|--rebase]   # one project: commits via origin, .env*, .scratch/, skills
+nebula collect <branch-or-worktree> [--branch|--worktree] [--project <name>] [--dry-run]  # guarded remote handoff, JSON report
 nebula remote <host> upgrade   # nebula upgrade on the host (its daemon keeps the old build until restart)
 nebula remote <host> restart   # nebula kill on the host — ends every session there
 nebula upgrade            # install the latest release (--force on a dev build)
@@ -300,7 +301,13 @@ so nothing is tunnelled.
 What you see: one project row — the remote checkout is absorbed into the
 local project of the same name (or stands on its own when there is none) —
 with the host's worktrees, sessions and tabs under it wearing a pink `@findl`
-badge. Every session picker offers the other side (`Run on findl ▸` in `n`,
+badge. Matching branch names retain separate checkout rows (`@local` and `@findl`)
+and host-specific session ownership. `nebula collect` brings committed remote work into a local
+primary branch or separate worktree, preserving both checkouts and all remote sessions.
+Use `nebula collect --help` for mode, owner, host, dry-run and timeout options.
+Guarded collection requires compatible local and remote daemons (protocol 28); updating the
+CLI alone does not update a running daemon. Plan restarts only when sessions can safely stop.
+Every session picker offers the other side (`Run on findl ▸` in `n`,
 flat `Claude on findl` … rows in ⌘T/⌘D), `--project name@host` picks the
 remote twin on the command line, and `nebula remote <host> …` is the
 host-side view: status, sessions, a live watch, skills + fast-forward sync of

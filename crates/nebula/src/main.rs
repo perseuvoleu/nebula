@@ -120,6 +120,34 @@ enum Command {
         #[command(subcommand)]
         command: RemoteCommand,
     },
+    /// Collect a settled remote checkout through origin, preserving both
+    /// checkouts and all sessions. Prints JSON on success, dry-run, and refusal.
+    Collect {
+        /// Remote branch, checkout id, directory name, absolute path, or primary.
+        selector: String,
+        /// Collect into the local primary checkout (refuses shared/dirty primary).
+        #[arg(long, conflicts_with = "worktree")]
+        branch: bool,
+        /// Collect into a separate local worktree. Without a mode flag, infer
+        /// primary vs worktree from the remote source checkout.
+        #[arg(long)]
+        worktree: bool,
+        /// Local project name or id (default: calling session, then cwd).
+        #[arg(long)]
+        project: Option<String>,
+        /// Configured twin host; inferred when exactly one twin exists.
+        #[arg(long)]
+        host: Option<String>,
+        /// Sole owning remote agent id or name. Multiple live owners refuse.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Inspect without prompts, fetches, or filesystem changes.
+        #[arg(long)]
+        dry_run: bool,
+        /// Seconds to wait for a new handoff turn (busy agents refuse immediately).
+        #[arg(long, default_value_t = 600)]
+        timeout: u64,
+    },
     /// Bring this project's checkout and its twin on a host in step: report
     /// both sides, move commits the safe way through origin, carry `.env*`
     /// (laptop → host, existing kept), `.scratch/` (both ways, newer wins,
@@ -639,6 +667,13 @@ fn main() -> Result<()> {
                 RemoteCommand::Restart => nebula_tui::RemoteOp::Restart,
             },
         ),
+        Some(Command::Collect { selector, branch, worktree, project, host, agent, dry_run, timeout }) => {
+            use nebula_tui::collect_cli::{CollectOpts, Mode};
+            nebula_tui::run_collect(CollectOpts {
+                selector, mode: if branch { Some(Mode::Branch) } else if worktree { Some(Mode::Worktree) } else { None },
+                project, host, agent, dry_run, timeout: std::time::Duration::from_secs(timeout),
+            })
+        }
         Some(Command::Sync {
             to,
             from,

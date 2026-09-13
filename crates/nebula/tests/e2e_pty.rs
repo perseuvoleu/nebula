@@ -3807,6 +3807,12 @@ async fn relay_mirrors_a_host_and_its_sessions_outlive_the_viewer() {
         })
         .unwrap();
 
+    // Collect's ownership check must reach the source daemon and correlate
+    // its response, rather than consult the viewer's cached mirror.
+    write_frame(&mut c, &ClientRequest::InspectCollect { req_id: 80, worktree: main_worktree.id.clone(), branch: "main".into() }).await.unwrap();
+    let inspected = read_events_until(&mut c, Duration::from_secs(5), |evs| find_ack(evs, 80).is_some()).await;
+    assert!(matches!(find_ack(&inspected, 80), Some(ServerEvent::Ack { .. })), "{inspected:?}");
+
     // A terminal on the mirrored worktree: created by the host daemon,
     // attached through ours, echoing through two daemons and a pipe.
     write_frame(
@@ -3831,6 +3837,9 @@ async fn relay_mirrors_a_host_and_its_sessions_outlive_the_viewer() {
         panic!("CreateTerminal over the relay failed: {events:#?}");
     };
     let term_id = term_id.clone();
+    write_frame(&mut c, &ClientRequest::InspectCollect { req_id: 81, worktree: main_worktree.id.clone(), branch: "main".into() }).await.unwrap();
+    let inspected = read_events_until(&mut c, Duration::from_secs(5), |evs| find_ack(evs, 81).is_some()).await;
+    assert!(matches!(find_ack(&inspected, 81), Some(ServerEvent::Error { message, .. }) if message.contains("source has busy")), "{inspected:?}");
     let sref = SessionRef::Terminal(term_id.clone());
     write_frame(
         &mut c,
@@ -4254,4 +4263,148 @@ async fn cli_add_project() {
 
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
     wait_for_exit(&mut daemon);
+}
+
+/// The real source daemon must correlate a handoff with its new hook turn,
+/// reject stale revisions, and preserve the PTY on feedback and timeout.
+#[tokio::test]
+async fn collect_guarded_handoff_uses_new_source_turn_and_preserves_sessions() {
+    use nebula_core::AgentStatus;
+    use std::os::unix::fs::PermissionsExt;
+    for mode in ["complete", "feedback", "no-hook"] {
+        let env = TestEnv::new();
+        let repo = env.make_repo();
+        let script = env.tmp.path().join("collect-agent.sh");
+        std::fs::write(&script, r##"#!/bin/sh
+post() {
+  curl -sf -o /dev/null -X POST -H "Authorization: Bearer $NEBULA_API_TOKEN" -H 'Content-Type: application/json' \
+    -d '{"session_id":"collect-fixture"}' "$NEBULA_API_URL/api/hooks/claude?agentId=$NEBULA_AGENT_ID&hookEvent=$1"
+}
+post Stop
+while IFS= read -r line; do
+  case "$line" in
+    *no-hook*) continue ;;
+    *feedback*) post UserPromptSubmit; post PermissionRequest ;;
+    *) printf '\033]9;4;1;0\007'; sleep 0.1; post UserPromptSubmit; post Stop ;;
+  esac
+done
+"##).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut child = env.spawn_daemon_with_agent_cmd(script.to_str().unwrap());
+        let mut c = connect(&env.sock()).await;
+        handshake(&mut c).await;
+        let wt = add_project_get_main_worktree(&mut c, &repo).await;
+        let id = create_agent_get_id(&mut c, &wt.id, "collect-owner", 2).await;
+        let owner = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                write_frame(&mut c, &ClientRequest::Subscribe)
+                    .await
+                    .unwrap();
+                let events = read_events_until(&mut c, Duration::from_secs(2), |evs| {
+                    evs.iter()
+                        .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
+                })
+                .await;
+                let found = events.into_iter().find_map(|e| match e {
+                    ServerEvent::Snapshot { agents, .. } => agents
+                        .into_iter()
+                        .find(|a| a.id == id && a.status == AgentStatus::Finished),
+                    _ => None,
+                });
+                if let Some(a) = found {
+                    break a;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("fake source owner never settled");
+        // A stale mirrored revision must refuse without sending any prompt.
+        write_frame(
+            &mut c,
+            &ClientRequest::CollectHandoff {
+                req_id: 10,
+                id: id.clone(),
+                worktree: wt.id.clone(),
+                branch: "main".into(),
+                expected_status_changed_at: owner.status_changed_at - 1,
+                prompt: "complete".into(),
+                timeout_ms: 500,
+            },
+        )
+        .await
+        .unwrap();
+        let stale = read_events_until(&mut c, Duration::from_secs(2), |evs| {
+            evs.iter().any(|e| {
+                matches!(
+                    e,
+                    ServerEvent::Error {
+                        req_id: Some(10),
+                        ..
+                    } | ServerEvent::Ack { req_id: 10, .. }
+                )
+            })
+        })
+        .await;
+        assert!(
+            stale.iter().any(|e| matches!(
+                e,
+                ServerEvent::Error {
+                    req_id: Some(10),
+                    ..
+                }
+            )),
+            "{stale:?}"
+        );
+        write_frame(
+            &mut c,
+            &ClientRequest::CollectHandoff {
+                req_id: 11,
+                id: id.clone(),
+                worktree: wt.id.clone(),
+                branch: "main".into(),
+                expected_status_changed_at: owner.status_changed_at,
+                prompt: mode.into(),
+                timeout_ms: 1000,
+            },
+        )
+        .await
+        .unwrap();
+        let result = read_events_until(&mut c, Duration::from_secs(3), |evs| {
+            evs.iter().any(|e| {
+                matches!(
+                    e,
+                    ServerEvent::Error {
+                        req_id: Some(11),
+                        ..
+                    } | ServerEvent::Ack { req_id: 11, .. }
+                )
+            })
+        })
+        .await;
+        assert_eq!(
+            matches!(find_ack(&result, 11), Some(ServerEvent::Ack { .. })),
+            mode == "complete",
+            "{mode}: {result:?}"
+        );
+        write_frame(&mut c, &ClientRequest::Subscribe)
+            .await
+            .unwrap();
+        let after = read_events_until(&mut c, Duration::from_secs(2), |evs| {
+            evs.iter()
+                .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
+        })
+        .await;
+        assert!(
+            after.iter().any(
+                |e| matches!(e, ServerEvent::Snapshot { agents, worktrees, .. } if
+            agents.iter().any(|a| a.id == id && a.alive && !a.archived && a.worktree_id == wt.id)
+            && worktrees.iter().any(|w| w.id == wt.id))
+            ),
+            "{after:?}"
+        );
+        // This is only the isolated fixture daemon, never the user's daemon.
+        write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+        wait_for_exit(&mut child);
+    }
 }

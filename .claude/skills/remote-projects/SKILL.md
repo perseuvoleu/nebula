@@ -11,6 +11,30 @@ mirrors through a relay. The row shows as `repo` with a pink `@findl` badge (abs
 project of the same name when one exists). The host needs `nebula`, the agent CLIs and their logins
 installed; `nebula remote <host> upgrade` keeps nebula current there.
 
+## Protected branches: NEVER push main or master
+
+**Never push to `main` or `master`, on any Git remote, from either machine. No exceptions.**
+The protected names are the **destination refs** (`refs/heads/main`, `refs/heads/master`),
+not just the currently checked-out branch. This covers creating, updating or deleting those
+refs, normal/force pushes, an explicit refspec such as `HEAD:main`, and implicit pushes through
+`nebula sync`, `nebula collect`, scripts, aliases or other automation. Use neither broad
+`--all` / `--mirror` pushes nor an API/automation workaround to bypass this rule.
+
+Before an operation that can publish commits:
+
+1. Resolve its destination remote and branch/ref, including pushes performed on findl by a
+   wrapper. For sync/collect, inspect the scoped status/dry-run and the actual branch, not the
+   checkout selector `root` / `primary`.
+2. Proceed only when every pushed destination is an explicit non-protected task/feature branch.
+   If a destination is protected or cannot be established, stop before the write.
+3. Publish the task branch and open a PR when requested; leave integration into `main` / `master`
+   to the user. If asked to push a protected branch, explain this standing prohibition and offer
+   the task-branch/PR route instead. Reading/fetching a protected branch as a base is allowed.
+
+Completion criterion: no command or delegated worker can publish to either protected ref.
+Include this guardrail in remote worker handoffs. A needed sync never overrides it; the
+hybrid-work skill determines whether any transfer is needed in the first place.
+
 ## The host is findl. Always.
 
 Remote work goes to **findl** (ssh alias in `~/.ssh/config`, key on disk, no touch needed). Do not
@@ -42,8 +66,10 @@ anchor's path is rewritten to the host's spelling of the repo root the first tim
 ## Twins: local ⇄ remote in one list
 
 A local project and a remote one **with the same name** in the same workspace are twins: one row
-in Projects, the remote-only checkouts join the worktree list with the badge, remote sessions join
-the session lists and tabs. Every session picker offers the other side (`Run on findl ▸` in `n`;
+in Projects. Every local and remote checkout retains its own row and id, including primary
+checkouts and matching worktree branches. Twins show `@local` / `@findl` badges; identity is host
+plus absolute checkout path. Sessions and tabs stay associated with their host-owned checkout.
+Every session picker offers the other side (`Run on findl ▸` in `n`;
 flat `Claude on findl` … rows in ⌘T/⌘D). On the command line two projects share the name, so say
 which: `--project nebula@findl` is the remote twin, `--project nebula` the local one.
 
@@ -71,7 +97,11 @@ restart   `nebula kill` on the host — ends every session there
 agents is `nebula sync` (run from a local checkout, no host argument needed): it reports both
 sides (`--status`, JSON), moves commits the safe way through origin in either direction, carries
 `.env*`, `.scratch/` and skills, and refuses with the fix when moving would lose work. The
-hybrid-work skill is its runbook.
+hybrid-work skill is its runbook. For remote → local handoff, use `nebula collect <selector>`
+with `--branch` for the primary or `--worktree` for a separate directory; consult `nebula collect
+--help` for current flags. Collection preserves both rows and all remote sessions, and refuses
+unsafe ownership/history rather than replacing a checkout. The canonical local runbook is
+`/Users/andrei/Desktop/nebula/.claude/skills/hybrid-work/SKILL.md`, reachable from other projects.
 
 ## What does not work remotely, on purpose
 
@@ -79,6 +109,26 @@ The editor, file finder, tree browser and `gh` are local tools; on a remote chec
 "lives on <host>" instead of opening a path that isn't here. Use a `t` shell tab on the remote row
 and edit there. Diff, branches, grep, worktree creation and PR links all work — they are git, run
 on the host over ssh.
+
+## Browser verification runs locally
+
+**findl has no browser.** Plan browser-dependent work (UI inspection, screenshots, Playwright /
+Puppeteer browser tests, interactive web login) on the laptop, not on the server. A test runner
+being installed does not mean a browser runtime is available. Install/download a browser or its
+system dependencies on findl only with explicit user approval.
+
+Remote workers can implement, build, run non-browser tests and prepare a private preview. Inspect
+that preview from the local browser through an SSH tunnel or an already configured private route;
+keep authentication intact and the preview off the public internet. This needs no mirrored
+checkout or automatic sync. Transfer code only if the local verification actually needs it,
+following the hybrid-work skill's on-demand rule.
+
+Include this constraint in remote worker handoffs. If no local browser check can be performed,
+report it as pending with the exact preview/test instructions; a build, HTTP check or DOM-only
+test is not proof of browser behavior. Physical-phone checks are separate again.
+
+Completion criterion: report where each verification ran and distinguish browser-verified UI
+from server-only checks and pending manual checks.
 
 ## When remote rows are missing or stale
 

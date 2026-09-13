@@ -188,6 +188,14 @@ pub struct Agent {
     pub sort_order: i64,
     /// True when the daemon currently holds a live PTY for this agent.
     pub alive: bool,
+    /// The branch the checkout had when this session was spawned (or last
+    /// deliberately moved). The session stays listed under that branch
+    /// even after the checkout switches to another one — chats belong to
+    /// the branch they were had on, not to whatever the directory holds
+    /// now. None = unknown (rows from before this was recorded), which
+    /// follows the checkout's current branch.
+    #[serde(default)]
+    pub branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -214,6 +222,9 @@ pub struct TerminalTab {
     /// Epoch ms of the last `status` change; 0 = never.
     #[serde(default)]
     pub status_changed_at: i64,
+    /// Same as [`Agent::branch`]: the branch this tab was opened on.
+    #[serde(default)]
+    pub branch: Option<String>,
 }
 
 /// Who a note list hangs off: a project (high-level notes spanning its

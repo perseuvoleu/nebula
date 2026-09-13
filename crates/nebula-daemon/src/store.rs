@@ -264,6 +264,18 @@ const MIGRATIONS: &[&str] = &[
     "
     DELETE FROM worktrees WHERE project_id IN (SELECT id FROM projects WHERE host IS NOT NULL);
     ",
+    // 25: the branch a session was spawned on. The panel lists a session
+    // under that branch even after its checkout switches to another one,
+    // so a `nebula switch` on the primary leaves the chats where they
+    // were. Existing rows are pinned to their checkout's branch as of the
+    // upgrade — the first switch afterwards already leaves them behind;
+    // NULL (only rows a newer client mirrors in) follows the checkout.
+    "
+    ALTER TABLE agents ADD COLUMN branch TEXT;
+    ALTER TABLE terminals ADD COLUMN branch TEXT;
+    UPDATE agents SET branch = (SELECT w.branch FROM worktrees w WHERE w.id = agents.worktree_id);
+    UPDATE terminals SET branch = (SELECT w.branch FROM worktrees w WHERE w.id = terminals.worktree_id);
+    ",
 ];
 
 /// A project's twin on a host, as the hook pointer needs it: the host, the
@@ -595,8 +607,8 @@ impl Store {
     /// clients never see it, they only observe the eventual rename.
     pub fn insert_agent_with_auto_title(&self, a: &Agent, auto_title: bool) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO agents (id, worktree_id, name, status, archived, archived_at, pinned, kind, claude_session_id, sort_order, created_at, status_changed_at, model, effort, auto_title_pending)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            "INSERT INTO agents (id, worktree_id, name, status, archived, archived_at, pinned, kind, claude_session_id, sort_order, created_at, status_changed_at, model, effort, auto_title_pending, branch)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 a.id.as_str(),
                 a.worktree_id.as_str(),
@@ -612,7 +624,8 @@ impl Store {
                 a.status_changed_at,
                 a.model,
                 a.effort,
-                auto_title as i64
+                auto_title as i64,
+                a.branch
             ],
         )?;
         Ok(())
@@ -671,6 +684,23 @@ impl Store {
         self.conn.lock().unwrap().execute(
             "UPDATE terminals SET worktree_id = ?2 WHERE id = ?1",
             params![id.as_str(), worktree_id.as_str()],
+        )?;
+        Ok(())
+    }
+
+    /// Record the branch a session is listed under (see `Agent::branch`).
+    pub fn set_agent_branch(&self, id: &AgentId, branch: Option<&str>) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE agents SET branch = ?2 WHERE id = ?1",
+            params![id.as_str(), branch],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_terminal_branch(&self, id: &TerminalId, branch: Option<&str>) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE terminals SET branch = ?2 WHERE id = ?1",
+            params![id.as_str(), branch],
         )?;
         Ok(())
     }
@@ -743,8 +773,15 @@ impl Store {
 
     pub fn insert_terminal(&self, t: &TerminalTab) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO terminals (id, worktree_id, name, sort_order, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![t.id.as_str(), t.worktree_id.as_str(), t.name, t.sort_order, now_ms()],
+            "INSERT INTO terminals (id, worktree_id, name, sort_order, created_at, branch) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                t.id.as_str(),
+                t.worktree_id.as_str(),
+                t.name,
+                t.sort_order,
+                now_ms(),
+                t.branch
+            ],
         )?;
         Ok(())
     }
@@ -1228,7 +1265,7 @@ impl Store {
     pub fn get_agent(&self, id: &AgentId) -> Result<Option<Agent>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, worktree_id, name, status, archived, pinned, kind, claude_session_id, sort_order, status_changed_at, model, effort, archived_at FROM agents WHERE id = ?1",
+            "SELECT id, worktree_id, name, status, archived, pinned, kind, claude_session_id, sort_order, status_changed_at, model, effort, archived_at, branch FROM agents WHERE id = ?1",
         )?;
         let mut rows = stmt.query(params![id.as_str()])?;
         Ok(rows.next()?.map(|r| Agent {
@@ -1247,13 +1284,14 @@ impl Store {
             effort: r.get(11).unwrap(),
             archived_at: r.get(12).unwrap(),
             alive: false,
+            branch: r.get(13).unwrap(),
         }))
     }
 
     pub fn get_terminal(&self, id: &TerminalId) -> Result<Option<TerminalTab>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, worktree_id, name, sort_order, status, status_changed_at FROM terminals WHERE id = ?1",
+            "SELECT id, worktree_id, name, sort_order, status, status_changed_at, branch FROM terminals WHERE id = ?1",
         )?;
         let mut rows = stmt.query(params![id.as_str()])?;
         Ok(rows.next()?.map(|r| TerminalTab {
@@ -1268,6 +1306,7 @@ impl Store {
                 .unwrap()
                 .and_then(|s| AgentStatus::parse(&s)),
             status_changed_at: r.get(5).unwrap(),
+            branch: r.get(6).unwrap(),
         }))
     }
 
@@ -1342,7 +1381,7 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let agents = conn
-            .prepare("SELECT id, worktree_id, name, status, archived, pinned, kind, claude_session_id, sort_order, status_changed_at, model, effort, archived_at FROM agents ORDER BY sort_order, created_at")?
+            .prepare("SELECT id, worktree_id, name, status, archived, pinned, kind, claude_session_id, sort_order, status_changed_at, model, effort, archived_at, branch FROM agents ORDER BY sort_order, created_at")?
             .query_map([], |r| {
                 Ok(Agent {
                     id: AgentId(r.get(0)?),
@@ -1359,12 +1398,13 @@ impl Store {
                     effort: r.get(11)?,
                     archived_at: r.get(12)?,
                     alive: false,
+                    branch: r.get(13)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let terminals = conn
-            .prepare("SELECT id, worktree_id, name, sort_order, status, status_changed_at FROM terminals ORDER BY sort_order, created_at")?
+            .prepare("SELECT id, worktree_id, name, sort_order, status, status_changed_at, branch FROM terminals ORDER BY sort_order, created_at")?
             .query_map([], |r| {
                 Ok(TerminalTab {
                     id: TerminalId(r.get(0)?),
@@ -1375,6 +1415,7 @@ impl Store {
                     busy: false,
                     status: r.get::<_, Option<String>>(4)?.and_then(|s| AgentStatus::parse(&s)),
                     status_changed_at: r.get(5)?,
+                    branch: r.get(6)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1448,6 +1489,7 @@ mod tests {
             sort_order: 0,
             status_changed_at: 0,
             alive: false,
+            branch: None,
         };
         store.insert_agent(&agent).unwrap();
         let codex_agent = Agent {
@@ -1465,6 +1507,7 @@ mod tests {
             sort_order: 1,
             status_changed_at: 0,
             alive: false,
+            branch: None,
         };
         store.insert_agent(&codex_agent).unwrap();
         let cursor_agent = Agent {
@@ -1482,6 +1525,7 @@ mod tests {
             sort_order: 2,
             status_changed_at: 0,
             alive: false,
+            branch: None,
         };
         store.insert_agent(&cursor_agent).unwrap();
 
@@ -1723,6 +1767,7 @@ mod tests {
                 sort_order: 0,
                 status_changed_at: 0,
                 alive: false,
+                branch: None,
             })
             .unwrap();
 
@@ -1941,6 +1986,43 @@ mod tests {
 
     /// Real upgrade path: a v12 database (pre-workspaces) gains the
     /// 'default' workspace, marked open, with every existing project in it.
+    /// Real upgrade path: sessions from before branch tracking are pinned
+    /// to the branch their checkout held at upgrade time, so the first
+    /// switch afterwards already leaves them where they were.
+    #[test]
+    fn migration_25_pins_existing_sessions_to_their_checkout_branch() {
+        let path =
+            std::env::temp_dir().join(format!("nebula-mig25-test-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+            for (i, migration) in MIGRATIONS.iter().take(24).enumerate() {
+                conn.execute_batch(&format!(
+                    "BEGIN; {migration}; PRAGMA user_version = {}; COMMIT;",
+                    i + 1
+                ))
+                .unwrap();
+            }
+            conn.execute_batch(
+                "INSERT INTO projects (id, workspace_id, name, repo_path, sort_order, created_at) VALUES ('p1', 'default', 'p', '/tmp/p', 0, 0);
+                 INSERT INTO worktrees (id, project_id, path, branch, is_main, created_at) VALUES ('w1', 'p1', '/tmp/p', 'main', 1, 0);
+                 INSERT INTO agents (id, worktree_id, name, created_at) VALUES ('a1', 'w1', 'agent', 0);
+                 INSERT INTO terminals (id, worktree_id, name, created_at) VALUES ('t1', 'w1', 'shell', 0);",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let (_, _, agents, terminals) = store.load_tree().unwrap();
+        assert_eq!(agents[0].branch.as_deref(), Some("main"));
+        assert_eq!(terminals[0].branch.as_deref(), Some("main"));
+        drop(store);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
+        }
+    }
+
     #[test]
     fn migration_13_moves_existing_projects_into_default_workspace() {
         let path =
@@ -2175,6 +2257,7 @@ mod tests {
             sort_order: 0,
             status_changed_at: 0,
             alive: false,
+            branch: None,
         };
 
         // Default-named session: pending until the agent titles it, and the
@@ -2281,6 +2364,7 @@ mod tests {
                 name: "shell".into(),
                 sort_order: 0,
                 alive: false,
+                branch: None,
                 busy: false,
                 status: None,
                 status_changed_at: 0,
@@ -2332,6 +2416,7 @@ mod tests {
                 name: "shell".into(),
                 sort_order: 0,
                 alive: false,
+                branch: None,
                 busy: false,
                 status: None,
                 status_changed_at: 0,
@@ -2415,6 +2500,7 @@ mod tests {
                     sort_order: 0,
                     status_changed_at: 0,
                     alive: false,
+                    branch: None,
                 })
                 .unwrap();
         }

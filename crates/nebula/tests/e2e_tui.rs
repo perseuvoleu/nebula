@@ -387,8 +387,7 @@ fn tui_projects_worktrees_agents_navigation() {
     tui.send(b"\r");
     tui.wait_for_gone("Add project");
     tui.wait_for_text("alpha-proj");
-    tui.wait_for_text("⌂ primary"); // the primary checkout is the root row
-    tui.wait_for_text("on main"); // …with its branch on the sub-line
+    tui.wait_for_text("main ⌂ primary"); // the primary checkout, named by its branch
 
     // The live directory browser: typing "…/T/.tmpX/" lists both repos as
     // rows (no Tab needed), then Esc cancels.
@@ -495,7 +494,10 @@ fn tui_projects_worktrees_agents_navigation() {
 
     // ---- the root row tracks live branch switches, no restart needed ----
     repo_git(&beta, &["checkout", "-b", "hotfix"]);
-    tui.wait_for_text("on hotfix"); // the sub-line follows; the row keeps its name
+    // The row is named by its branch, nested under the branch it was cut
+    // from (`main` stays as a plain branch row above it).
+    tui.wait_for_text("hotf"); // the name may truncate in the narrow panel
+    tui.wait_for_text("○ main (branch)");
     tui.send(b"k"); // back to alpha-proj
     tui.wait_for_selected("alpha-proj");
     tui.wait_for_text("feat-a");

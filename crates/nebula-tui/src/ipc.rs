@@ -751,6 +751,24 @@ pub async fn switch(
         .find(|w| w.project_id == project.id && w.branch == branch);
     let base = from.or_else(current_branch_here);
     let pre_existing = git_branch_exists(&project.repo_path, &branch);
+    // The shell running this command: a terminal tab (`term:<id>`) or an
+    // agent session. It follows the branch it asked for; every other
+    // session on the primary stays listed under the branch it was on.
+    let own_env = std::env::var("NEBULA_AGENT_ID").ok();
+    let terminal = own_env
+        .as_deref()
+        .and_then(|v| v.strip_prefix("term:").map(str::to_owned))
+        .filter(|id| !id.is_empty());
+    let mover = match (&terminal, &own_env) {
+        (Some(id), _) => Some(nebula_core::SessionRef::Terminal(nebula_core::TerminalId(
+            id.clone(),
+        ))),
+        (None, Some(id)) => agents
+            .iter()
+            .find(|a| a.id.as_str() == id)
+            .map(|a| nebula_core::SessionRef::Agent(a.id.clone())),
+        (None, None) => None,
+    };
     let (path, created, checked_out) = match existing {
         Some(w) => (Some(w.path.display().to_string()), false, false),
         None if worktree => (
@@ -775,6 +793,7 @@ pub async fn switch(
                     req_id,
                     project: project.id.clone(),
                     branch: branch.clone(),
+                    mover: mover.clone(),
                 },
             )
             .await?;
@@ -790,10 +809,6 @@ pub async fn switch(
     let Some(path) = path else {
         bail!("the daemon created the checkout but never reported its path");
     };
-    let terminal = std::env::var("NEBULA_AGENT_ID")
-        .ok()
-        .and_then(|v| v.strip_prefix("term:").map(str::to_owned))
-        .filter(|id| !id.is_empty());
     if let Some(id) = &terminal {
         // The shell is blocked on this very command; the tty queues the
         // line and the shell runs it at its next prompt, like typed-ahead
@@ -1023,6 +1038,7 @@ pub async fn worktree_checkout(branch: String, project_flag: Option<String>) -> 
             req_id,
             project: project.id.clone(),
             branch: branch.clone(),
+            mover: None,
         },
     )
     .await?;

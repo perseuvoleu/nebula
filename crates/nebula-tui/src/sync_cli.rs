@@ -482,11 +482,12 @@ fn short(sha: &str) -> &str {
     &sha[..sha.len().min(7)]
 }
 
-fn git_local(path: &Path, args: &[&str]) -> Result<String> {
+pub(crate) fn git_local(path: &Path, args: &[&str]) -> Result<String> {
     let out = Command::new("git")
         .arg("-C")
         .arg(path)
         .args(args)
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .output()
         .context("run git")?;
     if !out.status.success() {
@@ -514,6 +515,45 @@ fn describe(step: Step, t: &SyncTarget) -> String {
     }
 }
 
+/// Push the selected remote branch through its existing origin, without
+/// interpreting branch names as shell code. Shared by sync and first collect.
+pub(crate) fn push_remote(t: &SyncTarget, host: &dyn HostRunner) -> Result<String> {
+    let rp = ssh_quote(&t.remote_path.to_string_lossy());
+    let branch = ssh_quote(&format!("refs/heads/{}:refs/heads/{}", t.branch, t.branch));
+    host.run(&format!("git -C {rp} push -q origin {branch} 2>&1 && git -C {rp} rev-parse HEAD"))
+}
+
+/// Collect only committed history using the sync planner and transport.
+/// Context transfer and rebasing are deliberately unavailable here.
+pub(crate) fn sync_commits(t: &SyncTarget, host: &dyn HostRunner) -> Result<()> {
+    let state = gather(t, host)?;
+    if state.local.branch != t.branch { bail!("local branch changed during collect; retry after inspecting ownership"); }
+    let steps = match plan(&state, Direction::From, false, false) {
+        SyncPlan::Refusal { reason, hint } => bail!("{reason}; {hint}"),
+        SyncPlan::Steps(steps) => steps,
+    };
+    for step in steps {
+        match step {
+            Step::PushRemote => { push_remote(t, host)?; },
+            Step::PullLocal => {
+                let expected = &state.remote.as_ref().context("remote disappeared")?.head;
+                git_local(&t.local_path, &["fetch", "-q", "origin"])?;
+                if git_local(&t.local_path, &["rev-parse", &format!("refs/remotes/origin/{}", t.branch)])? != *expected {
+                    bail!("origin changed during collect; inspect it before retrying");
+                }
+                if git_local(&t.local_path, &["symbolic-ref", "--short", "HEAD"])? != t.branch
+                    || !git_local(&t.local_path, &["status", "--porcelain", "--untracked-files=all"])?.is_empty() {
+                    bail!("local checkout changed during collect; retry after inspecting ownership");
+                }
+                git_local(&t.local_path, &["merge", "-q", "--ff-only", expected])?;
+            },
+            Step::CarryScratch => {},
+            _ => bail!("unexpected outbound step in collect: {step:?}"),
+        }
+    }
+    Ok(())
+}
+
 fn execute(
     step: Step,
     t: &SyncTarget,
@@ -532,14 +572,12 @@ fn execute(
         }
         Step::PullRemote => {
             let line = host.run(&format!(
-                "git -C {rp} fetch -q origin 2>&1 && git -C {rp} merge -q --ff-only origin/{b} 2>&1 && git -C {rp} log --oneline -1"
+                "git -C {rp} fetch -q origin 2>&1 && git -C {rp} merge -q --ff-only {} 2>&1 && git -C {rp} log --oneline -1", ssh_quote(&format!("refs/remotes/origin/{b}"))
             ))?;
             writeln!(out, "git {h}:{}: {}", t.remote_path.display(), line.trim())?;
         }
         Step::PushRemote => {
-            let head = host.run(&format!(
-                "git -C {rp} push -q origin {b} 2>&1 && git -C {rp} rev-parse HEAD"
-            ))?;
+            let head = push_remote(t, host)?;
             writeln!(out, "push {h} → origin: {b} @ {}", short(head.trim()))?;
         }
         Step::PullLocal => {
