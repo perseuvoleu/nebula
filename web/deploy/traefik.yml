@@ -31,8 +31,9 @@ http:
         permanent: true
     nebula-web-rate:
       rateLimit:
-        average: 5
-        burst: 20
+        # App-shell/font loads plus polling and reconnects can exceed the MVP's 5/s.
+        average: 15
+        burst: 60
     nebula-web-connections:
       inFlightReq:
         amount: 16
