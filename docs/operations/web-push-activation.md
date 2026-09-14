@@ -11,15 +11,16 @@ The base unit is `/home/andrei/.config/systemd/user/nebula-web.service`; the dep
 override is `nebula-web.service.d/90-durable-release.conf` beside it. Preserve both and
 `/home/andrei/.config/nebula-web.env` before activation. Never deploy from a worktree.
 
-Private backups and capped evidence live in this task's git-ignored
-`.scratch/web-push-activation/` (0700, backup files 0600). The saved `unit.backup`,
+Private rollback backups live outside worktrees in
+`/home/andrei/.local/share/nebula/web-rollbacks/push-20260914/` (0700, files 0600).
+Capped test evidence remains in git-ignored `.scratch/web-push-activation/`. The saved `unit.backup`,
 `override.backup` and `env.backup` restore the verified STEP1 release, not the deleted
-historical checkout. To roll back from this task checkout:
+historical checkout. To roll back from any directory:
 
 ```bash
-install -m 600 .scratch/web-push-activation/unit.backup ~/.config/systemd/user/nebula-web.service
-install -m 600 .scratch/web-push-activation/override.backup ~/.config/systemd/user/nebula-web.service.d/90-durable-release.conf
-install -m 600 .scratch/web-push-activation/env.backup ~/.config/nebula-web.env
+install -m 600 /home/andrei/.local/share/nebula/web-rollbacks/push-20260914/unit.backup ~/.config/systemd/user/nebula-web.service
+install -m 600 /home/andrei/.local/share/nebula/web-rollbacks/push-20260914/override.backup ~/.config/systemd/user/nebula-web.service.d/90-durable-release.conf
+install -m 600 /home/andrei/.local/share/nebula/web-rollbacks/push-20260914/env.backup ~/.config/nebula-web.env
 systemctl --user daemon-reload
 systemctl --user restart nebula-web.service
 ```
@@ -81,3 +82,53 @@ Primary references checked September 14, 2026 (Context7 unavailable in this sess
 - [MDN subscription JSON](https://developer.mozilla.org/en-US/docs/Web/API/PushSubscription/toJSON)
 - [pywebpush 2.3.0 source](https://github.com/web-push-libs/pywebpush/blob/2.3.0/pywebpush/__init__.py)
 - [PyPA supported bootstrap](https://pip.pypa.io/en/stable/installation/)
+
+## Completed deployment evidence — September 14, 2026
+
+Deployed source: **`bfeeb8c9c82e122b8f4244fcc4d125bd48784452`**.
+Release: `/home/andrei/.local/share/nebula/web-releases/bfeeb8c9c82e122b8f4244fcc4d125bd48784452`.
+The release contains committed web source, built static assets and a SHA-256 manifest in
+`release.json`; build-only node_modules was removed. Release directories/executables are
+0500 and files 0400. The venv remains `/home/andrei/.local/share/nebula/web-push-venv`.
+The override now points WorkingDirectory and ExecStart to that release and venv Python.
+The base unit is byte-identical to its backup, preserving every existing hardening setting.
+
+No existing VAPID config, default private key or subscriptions existed at preflight.
+Provisioned `/home/andrei/.config/nebula-web/private_key.pem` (0600, parent 0700) and
+`/home/andrei/.local/share/nebula/web-push.json` (0600). The store uses the existing shared
+Nebula data parent; no permissions on unrelated application directories changed. The only
+new environment entry is the private-key path. No token/key value was emitted in argv,
+logs or tracked files. The key and subscription file remain outside releases and rollback.
+
+Validation on findl:
+
+- Backend: 42 tests passed with the venv Python (`unittest discover -s <release>/web -v`).
+- Frontend: 8 Node tests passed (`pnpm --dir <release>/web/app test:unit`).
+- Build: TypeScript and Vite passed (`pnpm --dir <release>/web/app build`).
+- Dependency install used the pinned requirements; `pip check` passed.
+- New blocker tests demonstrated failures before fixes: browser JSON acceptance, rejected
+  arbitrary destinations, private storage with permissive umask, redirected/environment-auth
+  HTTP transport, and click navigation when badging rejects.
+- Real candidate server passed loopback checks with random synthetic token, separate key and
+  isolated store: disabled API state, enabled API/public-key validity, authenticated subscribe/
+  unsubscribe, auth and Origin denials, projects/sessions reads and static byte comparisons.
+  Repeated candidate startup retained the public key. `python3 -S` verified configured push
+  fails with an explicit missing-dependency error. The sealed read-only release also passed.
+- Rollback baseline passed trusted `https://code.possu.dev` HTML/JS/CSS/SW/manifest and
+  authentication checks before promotion. Durable unit/env/override backups were secured.
+- User-systemd daemon-reload and restart affected only `nebula-web.service`. Its running cwd
+  resolves to the durable candidate. Trusted HTTPS checks passed after promotion and again
+  after a second web-only restart; private key bytes and API public key remained stable.
+  An immediate HTTP request during the second restart hit startup timing; the readiness
+  retry passed. The existing complete process environment matched, excluding the added key
+  path and systemd invocation metadata. No other configuration was changed.
+- All 13 originally tracked related processes retained PID/start identity. All 21 running
+  containers retained full IDs and start timestamps across both restarts. No agent/daemon,
+  global CLI, Traefik, preview identity or Vela mutation was performed.
+- Authenticated `/api/push` reports available with a nonempty valid P-256 public key.
+  **Registered devices: zero. Server activation is verified; real delivery is not.**
+
+Code review used separate read-only Standards and Spec reviewers. Both identified the
+worktree-relative rollback gap; durable backups and absolute restore commands above resolve
+it. Neither found an additional activation code blocker. Browser UI, actual OS permission,
+physical iPhone receipt and notification click navigation remain pending as described above.
