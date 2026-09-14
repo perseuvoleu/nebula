@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { LogOutIcon, MenuIcon } from "lucide-react";
+import { ExternalLinkIcon, LogOutIcon, MenuIcon } from "lucide-react";
 import { api, ApiError, describeError, getToken, onAuthChange, setToken } from "@/lib/api";
 import { useConversation } from "@/lib/conversation";
 import { clearDrafts } from "@/lib/drafts";
@@ -28,6 +28,35 @@ function useMediaQuery(query: string): boolean {
     return () => media.removeEventListener("change", onChange);
   }, [query]);
   return matches;
+}
+
+function usePreview(project: string): string | null {
+  const [url, setUrl] = useState<string | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const refresh = async () => {
+      try {
+        const data = await api<{ url: string | null }>("preview", { project });
+        if (!cancelled) setUrl(data.url);
+      } catch { /* preview is optional until this project is configured */ }
+      if (!cancelled) timer = setTimeout(refresh, SESSIONS_POLL_MS);
+    };
+    setUrl(null);
+    void refresh();
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [project]);
+  return url;
+}
+
+function PreviewButton({ url, className = "size-10" }: { url: string | null; className?: string }) {
+  return url && (
+    <Button asChild variant="outline" size="icon-lg" className={className}>
+      <a href={url} target="_blank" rel="noopener noreferrer" aria-label="Deschide preview-ul proiectului" title={url}>
+        <ExternalLinkIcon aria-hidden />
+      </a>
+    </Button>
+  );
 }
 
 function useSessions(project: string | null) {
@@ -96,6 +125,7 @@ function Shell({ workspace }: { workspace: Workspace }) {
   const [selection, navigate] = useSelection();
   const project = selection.project && workspace.projects.includes(selection.project) ? selection.project : workspace.projects[0];
   const sessions = useSessions(project);
+  const previewUrl = usePreview(project);
   const desktop = useMediaQuery("(min-width: 768px)");
   const [menuOpen, setMenuOpen] = useState(false);
   const [creating, setCreating] = useState(false);
@@ -147,6 +177,7 @@ function Shell({ workspace }: { workspace: Workspace }) {
           </select>
         </label>
         <span className="max-w-24 shrink-0 truncate rounded border border-border px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground" title={`Execuția are loc pe ${workspace.host}`}>@{workspace.host}</span>
+        <PreviewButton url={previewUrl} />
         <Button type="button" variant="ghost" size="icon-lg" aria-label="Deconectare" onClick={logout} className="size-10"><LogOutIcon aria-hidden /></Button>
       </div>
       {checkoutPanel}
@@ -158,7 +189,7 @@ function Shell({ workspace }: { workspace: Workspace }) {
   );
 
   const conversation = sessionId && controller && state ? (
-    <ConversationView key={`${project}/${sessionId}`} project={project} row={row} state={state} controller={controller} sessions={sessions.rows} unseen={unseenFinished} onSelect={select} showBack={!desktop} onBack={() => navigate({ project, session: null })} />
+    <ConversationView key={`${project}/${sessionId}`} project={project} previewUrl={previewUrl} row={row} state={state} controller={controller} sessions={sessions.rows} unseen={unseenFinished} onSelect={select} showBack={!desktop} onBack={() => navigate({ project, session: null })} />
   ) : (
     <section className="flex min-h-0 flex-1 flex-col">
       {!desktop && (
@@ -207,6 +238,7 @@ function Shell({ workspace }: { workspace: Workspace }) {
                 {workspace.projects.map((p) => <option key={p} value={p}>{p}</option>)}
               </select>
             </label>
+            <PreviewButton url={previewUrl} className="size-11" />
           </div>
           {checkoutPanel}
           <SessionList sessions={sessions.rows} phase={sessions.phase} error={sessions.error} selected={sessionId} unseen={unseenFinished} onSelect={select} onNew={() => setCreating(true)} project={project} />

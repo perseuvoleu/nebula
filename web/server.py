@@ -212,6 +212,13 @@ class Gateway:
         first = {k: v[0] for k, v in query.items()}
         if path == "/api/sessions":
             return {"sessions": [public(r) for r in self.sessions(project) if not r["archived"]]}
+        if path == "/api/preview":
+            status = self.run("preview", "--project", project, "status")
+            domain = status.get("domain") if isinstance(status, dict) else None
+            phase = status.get("phase") if isinstance(status, dict) else None
+            if not isinstance(domain, str) or not re.fullmatch(r"[A-Za-z0-9.-]+", domain):
+                raise Problem(502, "Nebula returned an invalid preview status")
+            return {"url": f"https://{domain}" if phase == "running" else None, "phase": phase}
         if path == "/api/worktrees":
             return {"worktrees": self.run("worktree", "list", "--project", project)}
         if path == "/api/output":

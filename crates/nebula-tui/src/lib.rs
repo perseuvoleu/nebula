@@ -121,6 +121,11 @@ pub fn run_worktree_list(project: Option<String>, all: bool) -> Result<()> {
     runtime()?.block_on(ipc::worktree_list(project, all))
 }
 
+/// Best-effort preview bookmark used after a successful host-local promotion.
+pub fn pin_checkout_link(checkout: &std::path::Path, url: &str) -> Result<()> {
+    runtime()?.block_on(ipc::pin_checkout_link(checkout, url))
+}
+
 /// `nebula agent list` — the delegating session's JSON view of its workers.
 /// `nebula remote <host> …` — the host-side view of remote projects.
 pub fn run_remote(host: String, op: remote_cli::RemoteOp) -> Result<()> {

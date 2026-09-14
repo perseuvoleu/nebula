@@ -55,10 +55,21 @@ class GatewayTests(unittest.TestCase):
                 Gateway(token, origin, projects)
 
     def test_project_allowlist(self):
-        for path in ["/api/sessions", "/api/conversation", "/api/conversation/updates"]:
+        for path in ["/api/sessions", "/api/conversation", "/api/conversation/updates", "/api/preview"]:
             with self.assertRaises(Problem) as ctx:
                 self.gateway.get(path, {"project": ["secret"], "id": ["one"]})
             self.assertEqual(ctx.exception.status, 403)
+
+    def test_preview_exposes_only_a_running_allowlisted_domain(self):
+        with patch.object(self.gateway, "run", return_value={"domain": "demo.example.test", "phase": "running"}) as run:
+            self.assertEqual(self.gateway.get("/api/preview", {"project": ["project"]}),
+                             {"url": "https://demo.example.test", "phase": "running"})
+        self.assertEqual(run.call_args.args, ("preview", "--project", "project", "status"))
+        with patch.object(self.gateway, "run", return_value={"domain": "demo.example.test", "phase": "stopped"}):
+            self.assertIsNone(self.gateway.get("/api/preview", {"project": ["project"]})["url"])
+        with patch.object(self.gateway, "run", return_value={"domain": "evil.test/path", "phase": "running"}):
+            with self.assertRaises(Problem):
+                self.gateway.get("/api/preview", {"project": ["project"]})
 
     def test_send_treats_input_as_positional_not_flags(self):
         text = '--project=secret; $(touch /tmp/never)'

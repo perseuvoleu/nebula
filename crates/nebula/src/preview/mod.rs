@@ -167,7 +167,7 @@ fn promote(
     ownership: &Ownership,
     checkout: &Path,
     offline: bool,
-) -> Result<()> {
+) -> Result<PathBuf> {
     let checkout = fs::canonicalize(runtime::git(checkout, &["rev-parse", "--show-toplevel"])?)?;
     authorize(state, ownership, Some(&checkout))?;
     let recipe = Recipe::load(&checkout)?;
@@ -227,7 +227,7 @@ fn promote(
     state.active = state.candidate.take();
     state.publishing = false;
     save(&runtime.directory, state)?;
-    Ok(())
+    Ok(checkout)
 }
 
 /// Execute a preview operation independently of the Nebula daemon.
@@ -330,11 +330,17 @@ pub fn run(args: Args) -> Result<()> {
         _ => (),
     }
     let observing = matches!(args.command, Action::Status);
-    match args.command {
+    let promoted_checkout = match args.command {
         Action::Up {
             ownership,
             checkout,
-        } => promote(&runtime, &mut state, &ownership, &checkout, args.offline)?,
+        } => Some(promote(
+            &runtime,
+            &mut state,
+            &ownership,
+            &checkout,
+            args.offline,
+        )?),
         Action::Restart { ownership } => {
             let checkout = state
                 .active
@@ -342,13 +348,20 @@ pub fn run(args: Args) -> Result<()> {
                 .context("no preview to restart; use up")?
                 .checkout
                 .clone();
-            promote(&runtime, &mut state, &ownership, &checkout, args.offline)?;
+            Some(promote(
+                &runtime,
+                &mut state,
+                &ownership,
+                &checkout,
+                args.offline,
+            )?)
         }
         Action::Down { ownership } => {
             authorize(&state, &ownership, None)?;
             state.stopping = true;
             save(&runtime.directory, &state)?;
             reconcile(&runtime, &mut state, args.offline)?;
+            None
         }
         Action::Logs {
             service,
@@ -365,8 +378,14 @@ pub fn run(args: Args) -> Result<()> {
                 lines,
             )
         }
-        Action::Status => (),
+        Action::Status => None,
         Action::Publish { .. } => unreachable!(),
+    };
+    if let Some(checkout) = promoted_checkout {
+        let url = format!("https://{}", project.domain);
+        if let Err(error) = nebula_tui::pin_checkout_link(&checkout, &url) {
+            eprintln!("warning: preview is running but its Nebula link was not pinned: {error:#}");
+        }
     }
     let mut observation_error = None;
     let current = match ingress::current(&runtime.directory, &name, args.offline, runtime.lock) {
