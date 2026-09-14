@@ -43,6 +43,14 @@ pub enum ClientRequest {
         #[serde(with = "serde_bytes")]
         data: Vec<u8>,
     },
+    /// One explicit key/input write, acknowledged only after the PTY accepted it.
+    InputAcknowledged {
+        req_id: u64,
+        id: AgentId,
+        project: ProjectId,
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+    },
     Resize {
         session: SessionRef,
         cols: u16,
@@ -128,6 +136,14 @@ pub enum ClientRequest {
         req_id: u64,
         project: ProjectId,
         branch: String,
+    },
+    /// Conservative web removal: no sessions, clean and merged, branch preserved.
+    CheckWorktreeRemoval {
+        req_id: u64,
+        id: WorktreeId,
+        branch: String,
+        path: PathBuf,
+        delete: bool,
     },
     DeleteWorktree {
         req_id: u64,
@@ -234,6 +250,11 @@ pub enum ClientRequest {
         req_id: u64,
         id: AgentId,
         pinned: bool,
+    },
+    DeleteAgentScoped {
+        req_id: u64,
+        id: AgentId,
+        project: ProjectId,
     },
     DeleteAgent {
         req_id: u64,

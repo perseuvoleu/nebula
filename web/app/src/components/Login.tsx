@@ -10,7 +10,7 @@ export function Login({ onAuthenticated }: { onAuthenticated: (projects: string[
 
   const submit = async () => {
     const token = value.trim();
-    if (token.length < 32 || busy) return;
+    if (token.length < 8 || busy) return;
     setBusy(true); setError(null);
     try {
       const data = await api<{ projects: string[]; host: string }>("projects", {}, undefined, { token });
@@ -35,13 +35,13 @@ export function Login({ onAuthenticated }: { onAuthenticated: (projects: string[
         <p className="mt-3 text-sm text-muted-foreground">Sesiunile rulează pe server chiar și cu laptopul închis.</p>
         <label className="mt-8 block text-sm">
           <span className="font-medium">Token de acces</span>
-          <input type="password" autoComplete="off" required minLength={32} value={value} onChange={(e) => setValue(e.target.value)}
+          <input type="password" autoComplete="off" required minLength={8} value={value} onChange={(e) => setValue(e.target.value)}
             aria-describedby="token-help" aria-invalid={error ? true : undefined}
             className="mt-1.5 h-12 w-full rounded-lg border border-input bg-card px-3.5 text-base outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/60" />
         </label>
         <p id="token-help" className="mt-2 text-xs text-muted-foreground">Rămâne doar în această sesiune de browser. Nu este trimis nicăieri altundeva.</p>
         {error && <p role="alert" className="mt-3 rounded-lg border border-border px-3 py-2 text-sm">{error}</p>}
-        <Button type="submit" size="lg" className="mt-6 h-12 w-full text-base" disabled={busy || value.trim().length < 32}>
+        <Button type="submit" size="lg" className="mt-6 h-12 w-full text-base" disabled={busy || value.trim().length < 8}>
           {busy ? "Se conectează…" : "Conectare"}
         </Button>
         <InstallApp />

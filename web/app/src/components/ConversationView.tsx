@@ -97,6 +97,7 @@ function ConnectionLine({ state }: { state: ConversationState }) {
 
 export function ConversationView({ project, previewUrl, row, state, controller, onBack, showBack, sessions, unseen, onSelect }: {
   project: string;
+  /** Running preview published for this session’s project, or null when unavailable. */
   previewUrl: string | null;
   row: SessionRow | null;
   state: ConversationState;

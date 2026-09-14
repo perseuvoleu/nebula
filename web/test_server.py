@@ -47,7 +47,8 @@ class GatewayTests(unittest.TestCase):
         self.assertTrue(static.lookup("/")[0].startswith(b"<!doctype"))
 
     def test_configuration(self):
-        for token, origin, projects in [("short", "https://example.com", ["p"]),
+        Gateway("12345678", "https://example.com", ["p"])
+        for token, origin, projects in [("1234567", "https://example.com", ["p"]),
                                         (TOKEN, "http://example.com", ["p"]),
                                         (TOKEN, "https://example.com/", ["p"]),
                                         (TOKEN, "https://example.com", [])]:
@@ -60,16 +61,115 @@ class GatewayTests(unittest.TestCase):
                 self.gateway.get(path, {"project": ["secret"], "id": ["one"]})
             self.assertEqual(ctx.exception.status, 403)
 
-    def test_preview_exposes_only_a_running_allowlisted_domain(self):
-        with patch.object(self.gateway, "run", return_value={"domain": "demo.example.test", "phase": "running"}) as run:
-            self.assertEqual(self.gateway.get("/api/preview", {"project": ["project"]}),
+    def test_preview_uses_dedicated_binary_and_returns_only_running_url(self):
+        preview = Path(self.tmp.name) / "preview binary"
+        preview.write_text("#!/bin/sh\nexit 0\n")
+        preview.chmod(0o700)
+        gateway = Gateway(TOKEN, "http://127.0.0.1:8765", ["project"],
+                          binary="/home/andrei/.local/bin/nebula", preview_binary=str(preview))
+        with patch("server.subprocess.run", return_value=subprocess.CompletedProcess([], 0,
+                   '{"domain":"demo.example.test","phase":"running","credentials":"never expose"}', "")) as run:
+            self.assertEqual(gateway.get("/api/preview", {"project": ["project"]}),
                              {"url": "https://demo.example.test", "phase": "running"})
-        self.assertEqual(run.call_args.args, ("preview", "--project", "project", "status"))
-        with patch.object(self.gateway, "run", return_value={"domain": "demo.example.test", "phase": "stopped"}):
-            self.assertIsNone(self.gateway.get("/api/preview", {"project": ["project"]})["url"])
-        with patch.object(self.gateway, "run", return_value={"domain": "evil.test/path", "phase": "running"}):
-            with self.assertRaises(Problem):
-                self.gateway.get("/api/preview", {"project": ["project"]})
+            self.assertEqual(run.call_args.args[0], [str(preview), "preview", "--project", "project", "status"])
+        for path, command in [("/api/sessions", "agent"), ("/api/worktrees", "worktree")]:
+            with patch("server.subprocess.run", return_value=subprocess.CompletedProcess([], 0, '[]', "")) as run:
+                gateway.get(path, {"project": ["project"]})
+                self.assertEqual(run.call_args.args[0], ["/home/andrei/.local/bin/nebula", command, "list", "--project", "project"])
+
+    def test_preview_binary_must_be_an_absolute_executable_file(self):
+        plain = Path(self.tmp.name) / "not executable"
+        plain.write_text("not executable")
+        for binary in ["", "nebula", "./preview", str(plain), self.tmp.name, str(plain) + "-missing"]:
+            with self.subTest(binary=binary), self.assertRaises(ValueError):
+                Gateway(TOKEN, "http://127.0.0.1:8765", ["project"], preview_binary=binary)
+
+    def test_preview_fails_closed_for_bad_status_and_never_exposes_diagnostics(self):
+        gateway = Gateway(TOKEN, "http://127.0.0.1:8765", ["project"], preview_binary="/bin/true")
+        invalid = [None, [], "running", {}, {"domain": "demo.example.test", "phase": []}]
+        invalid += [{"domain": domain, "phase": "running"} for domain in [
+            None, [], "", "localhost", "evil.test/path", "user@evil.test", "evil.test:443", "a..test",
+            "-a.test", "a-.test", "a.test.", "A.test", "a" * 64 + ".test", "code.possu.dev",
+            ".".join(["a" * 63] * 4), "evil.test\n",
+        ]]
+        for status in invalid:
+            with self.subTest(status=status), patch("server.subprocess.run", return_value=
+                    subprocess.CompletedProcess([], 0, json.dumps(status), "")):
+                self.assertEqual(gateway.get("/api/preview", {"project": ["project"]}), {"url": None, "phase": None})
+        for phase in ["stopped", "stale", "recovering", "orphaned_route", "unknown"]:
+            with patch("server.subprocess.run", return_value=subprocess.CompletedProcess([], 0,
+                       json.dumps({"domain": "demo.example.test", "phase": phase}), "")):
+                self.assertEqual(gateway.get("/api/preview", {"project": ["project"]}), {"url": None, "phase": phase})
+        for result in [subprocess.CompletedProcess([], 0, "not JSON", ""),
+                       subprocess.CompletedProcess([], 1, "", "private diagnostic")]:
+            with patch("server.subprocess.run", return_value=result):
+                self.assertEqual(gateway.get("/api/preview", {"project": ["project"]}), {"url": None, "phase": None})
+        with patch("server.subprocess.run") as run:
+            self.assertEqual(self.gateway.get("/api/preview", {"project": ["project"]}), {"url": None, "phase": None})
+            with self.assertRaises(Problem): gateway.get("/api/preview", {"project": ["secret"]})
+            run.assert_not_called()
+
+    def test_terminal_keys_dispatch_once_by_id_without_prompt(self):
+        for key in ["Up", "Down", "Left", "Right", "Enter", "Escape", "Tab"]:
+            with self.subTest(key=key), patch("server.subprocess.run", side_effect=[
+                subprocess.CompletedProcess([], 0, json.dumps(ROWS), ""),
+                subprocess.CompletedProcess([], 0, '{"ok":true}', ""),
+            ]) as run:
+                self.assertTrue(self.gateway.post("/api/key", {"project": "project", "id": "one", "key": key})["ok"])
+                self.assertEqual(run.call_args.args[0], ["nebula", "agent", "key", "--project", "project", "--", "one", key])
+                self.assertEqual(run.call_count, 2)
+        for changed in [{"key": "Space"}, {"key": []}, {"project": "secret"}, {"id": "deleted"}]:
+            with patch("server.subprocess.run", return_value=subprocess.CompletedProcess([], 0, json.dumps(ROWS), "")) as run:
+                with self.assertRaises(Problem):
+                    self.gateway.post("/api/key", {"project": "project", "id": "one", "key": "Enter", **changed})
+                self.assertLessEqual(run.call_count, 1)
+        with patch("server.subprocess.run", side_effect=[
+            subprocess.CompletedProcess([], 0, json.dumps(ROWS), ""),
+            subprocess.CompletedProcess([], 1, "", "PTY disconnected"),
+        ]) as run:
+            with self.assertRaises(Problem) as error:
+                self.gateway.post("/api/key", {"project": "project", "id": "one", "key": "Enter"})
+            self.assertEqual(error.exception.message, "PTY disconnected")
+            self.assertEqual(run.call_count, 2)
+
+    def test_delete_session_is_project_scoped_and_id_only(self):
+        body = {"project": "project", "id": "one"}
+        renamed = [{**ROWS[0], "name": "Renamed"}]
+        with patch("server.subprocess.run", side_effect=[
+            subprocess.CompletedProcess([], 0, json.dumps(renamed), ""),
+            subprocess.CompletedProcess([], 0, '{"ok":true}', ""),
+        ]) as run:
+            self.assertTrue(self.gateway.post("/api/sessions/delete", body)["ok"])
+            self.assertEqual(run.call_args.args[0], ["nebula", "agent", "delete-id", "--project", "project", "--", "one"])
+        for changed in [{"id": "gone"}, {"project": "secret"}]:
+            with patch("server.subprocess.run", return_value=subprocess.CompletedProcess([], 0, json.dumps(ROWS), "")) as run:
+                with self.assertRaises(Problem): self.gateway.post("/api/sessions/delete", {**body, **changed})
+                self.assertLessEqual(run.call_count, 1)
+
+    def test_safe_checkout_delete_checks_identity_and_never_forces_or_retries(self):
+        tree = {"id": "wt-one", "path": "/srv/feature", "branch": "feature", "is_main": False, "sessions": []}
+        body = {"project": "project", "id": "wt-one", "path": "/srv/feature", "branch": "feature"}
+        for path in ["/api/worktrees/check-delete", "/api/worktrees/delete"]:
+            for changed in [{"is_main": True}, {"branch": "main"}, {"branch": "master"}, {"id": "replacement"}]:
+                with patch("server.subprocess.run", return_value=subprocess.CompletedProcess([], 0, json.dumps([{**tree, **changed}]), "")) as run:
+                    with self.assertRaises(Problem): self.gateway.post(path, body)
+                    self.assertEqual(run.call_count, 1)
+            for failure in ["Dirty checkout", "Unmerged commits", "Sessions still exist"]:
+                with patch("server.subprocess.run", side_effect=[
+                    subprocess.CompletedProcess([], 0, json.dumps([tree]), ""),
+                    subprocess.CompletedProcess([], 1, "", failure),
+                ]) as run:
+                    with self.assertRaises(Problem) as error: self.gateway.post(path, body)
+                    self.assertEqual(error.exception.message, failure)
+                    self.assertEqual(run.call_count, 2)
+            with patch("server.subprocess.run", side_effect=[
+                subprocess.CompletedProcess([], 0, json.dumps([tree]), ""),
+                subprocess.CompletedProcess([], 0, '{"ok":true}', ""),
+            ]) as run:
+                self.assertTrue(self.gateway.post(path, body)["ok"])
+                expected = ["nebula", "worktree", "delete-safe", "--project", "project"]
+                if path.endswith("check-delete"): expected += ["--check"]
+                self.assertEqual(run.call_args.args[0], expected + ["--", "wt-one", "feature", "/srv/feature"])
 
     def test_send_treats_input_as_positional_not_flags(self):
         text = '--project=secret; $(touch /tmp/never)'
@@ -292,7 +392,10 @@ class HTTPTests(unittest.TestCase):
     def test_wrong_host_and_origin(self):
         self.assertEqual(self.request("/", headers={"Host": "evil.example"})[0], 403)
         self.assertEqual(self.request("/api/projects", headers=self.auth(Origin="https://evil.example"))[0], 403)
-        self.assertEqual(self.request("/api/send", "POST", "{}", {"Authorization": "Bearer " + TOKEN})[0], 403)
+        for path in ["/api/send", "/api/key", "/api/sessions/delete", "/api/worktrees/delete", "/api/worktrees/check-delete"]:
+            self.assertEqual(self.request(path, "POST", "{}")[0], 401)
+            self.assertEqual(self.request(path, "POST", "{}", {"Authorization": "Bearer " + TOKEN})[0], 403)
+            self.assertEqual(self.request(path, "POST", "{}", self.auth(Origin="https://evil.example"))[0], 403)
 
     def test_malformed_body(self):
         for body in ["{", "[]", '"hello"']:

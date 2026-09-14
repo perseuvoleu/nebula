@@ -67,9 +67,9 @@ class StaticFiles:
 
 
 class Gateway:
-    def __init__(self, token, origin, projects, binary="nebula", static=None, pi_agent_dir=None, db_path=None):
-        if len(token) < 32:
-            raise ValueError("NEBULA_WEB_TOKEN must contain at least 32 characters")
+    def __init__(self, token, origin, projects, binary="nebula", static=None, pi_agent_dir=None, db_path=None, *, preview_binary=None):
+        if len(token) < 8:
+            raise ValueError("NEBULA_WEB_TOKEN must contain at least 8 characters")
         parsed = urlsplit(origin)
         if (parsed.scheme not in {"http", "https"} or not parsed.netloc
                 or parsed.path or parsed.query or parsed.fragment or parsed.username):
@@ -80,6 +80,11 @@ class Gateway:
             raise ValueError("NEBULA_WEB_PROJECTS must list at least one project")
         self.token, self.origin, self.host = token, origin, parsed.netloc
         self.projects, self.binary = projects, binary
+        # None explicitly disables optional preview discovery; never fall back to the main CLI.
+        if preview_binary is not None and (not Path(preview_binary).is_absolute()
+                or not Path(preview_binary).is_file() or not os.access(preview_binary, os.X_OK)):
+            raise ValueError("NEBULA_WEB_PREVIEW_BINARY must be an absolute executable file")
+        self.preview_binary = preview_binary
         self.static = static or StaticFiles(STATIC)
         self.pi_agent_dir = Path(pi_agent_dir) if pi_agent_dir else default_pi_agent_dir()
         self.db_path = Path(db_path) if db_path else None
@@ -96,7 +101,13 @@ class Gateway:
             # Never inherit the parent agent's identity or pass gateway credentials to CLIs.
             env = {k: v for k, v in os.environ.items()
                    if not k.startswith(("NEBULA_", "MC_", "PI_"))}
-            result = subprocess.run([binary or self.binary, *args], capture_output=True, text=True,
+            executable = binary or self.binary
+            if binary is None and args[:1] == ("preview",):
+                if (len(args) != 4 or args[1] != "--project" or args[2] not in self.projects
+                        or args[3] != "status" or self.preview_binary is None):
+                    raise Problem(503, "Preview status unavailable")
+                executable = self.preview_binary
+            result = subprocess.run([executable, *args], capture_output=True, text=True,
                                     errors="replace", timeout=20, env=env)
             if result.returncode:
                 raise Problem(502, result.stderr.strip()[:2000] or "Nebula command failed")
@@ -116,13 +127,13 @@ class Gateway:
     def sessions(self, project):
         return self.run("agent", "list", "--project", project)
 
-    def session_row(self, project, session_id):
+    def session_row(self, project, session_id, *, by_name=True):
         rows = self.sessions(project)
         row = next((r for r in rows if r["id"] == session_id and not r["archived"]), None)
         if not row:
             raise Problem(404, "Session no longer available")
-        # The current CLI selects by name, not id. Refuse ambiguous names.
-        if sum(r["name"] == row["name"] for r in rows) != 1:
+        # Legacy read/show/send select by name; ID-only controls do not.
+        if by_name and sum(r["name"] == row["name"] for r in rows) != 1:
             raise Problem(409, "Duplicate session name; rename it in Nebula first")
         return row
 
@@ -213,11 +224,21 @@ class Gateway:
         if path == "/api/sessions":
             return {"sessions": [public(r) for r in self.sessions(project) if not r["archived"]]}
         if path == "/api/preview":
-            status = self.run("preview", "--project", project, "status")
+            try:
+                status = self.run("preview", "--project", project, "status")
+            except Problem:
+                # CLI stderr may contain private diagnostic details. Never return it here.
+                return {"url": None, "phase": None}
             domain = status.get("domain") if isinstance(status, dict) else None
             phase = status.get("phase") if isinstance(status, dict) else None
-            if not isinstance(domain, str) or not re.fullmatch(r"[A-Za-z0-9.-]+", domain):
-                raise Problem(502, "Nebula returned an invalid preview status")
+            # Match the preview policy's DNS-label rules, including its reserved control domain.
+            if (not isinstance(phase, str) or phase not in
+                    {"running", "stopped", "stale", "recovering", "orphaned_route", "unknown"}
+                    or not isinstance(domain, str) or len(domain) > 253 or "." not in domain
+                    or domain == "code.possu.dev" or not all(
+                        re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+                        for label in domain.split("."))):
+                return {"url": None, "phase": None}
             return {"url": f"https://{domain}" if phase == "running" else None, "phase": phase}
         if path == "/api/worktrees":
             return {"worktrees": self.run("worktree", "list", "--project", project)}
@@ -292,6 +313,30 @@ class Gateway:
         project = self.project(body.get("project"))
         if path == "/api/worktrees":
             return self.create_checkout(project, body)
+        if path in {"/api/worktrees/check-delete", "/api/worktrees/delete"}:
+            trees = self.run("worktree", "list", "--project", project)
+            tree = next((w for w in trees if w.get("id") and w["id"] == body.get("id")), None)
+            if not tree:
+                raise Problem(409, "Checkout unavailable or CLI too old; refresh and check installation")
+            if tree["is_main"] or tree["branch"] in {"main", "master"}:
+                raise Problem(409, "Primary checkout and main/master are protected")
+            if tree["path"] != body.get("path") or tree["branch"] != body.get("branch"):
+                raise Problem(409, "Checkout changed; refresh before confirming")
+            args = ("--check",) if path.endswith("check-delete") else ()
+            self.run("worktree", "delete-safe", "--project", project, *args,
+                     "--", tree["id"], tree["branch"], tree["path"])
+            return {"ok": True}
+        if path == "/api/sessions/delete":
+            row = self.session_row(project, body.get("id"), by_name=False)
+            self.run("agent", "delete-id", "--project", project, "--", row["id"])
+            return {"ok": True}
+        if path == "/api/key":
+            key = body.get("key")
+            if not isinstance(key, str) or key not in {"Up", "Down", "Left", "Right", "Enter", "Escape", "Tab"}:
+                raise Problem(400, "Unsupported terminal key")
+            row = self.session_row(project, body.get("id"), by_name=False)
+            self.run("agent", "key", "--project", project, "--", row["id"], key)
+            return {"ok": True}
         text = body.get("text")
         if not isinstance(text, str) or not text.strip() or len(text) > 16000 or "\0" in text:
             raise Problem(400, "Message must contain 1–16000 characters without NUL")
@@ -426,7 +471,8 @@ def main():
                       os.environ.get("NEBULA_WEB_ORIGIN", f"http://127.0.0.1:{port}"),
                       [p.strip() for p in os.environ.get("NEBULA_WEB_PROJECTS", "").split(",") if p.strip()],
                       os.environ.get("NEBULA_WEB_BINARY", "nebula"),
-                      db_path=os.environ.get("NEBULA_WEB_DB") or None)
+                      db_path=os.environ.get("NEBULA_WEB_DB") or None,
+                      preview_binary=os.environ.get("NEBULA_WEB_PREVIEW_BINARY"))
     if not gateway.static.files.get("/index.html"):
         raise SystemExit(f"No built app in {gateway.static.root}; run `pnpm --dir web/app build` first")
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)

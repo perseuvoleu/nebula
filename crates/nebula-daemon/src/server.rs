@@ -212,6 +212,14 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         let _ = out.send(reply).await;
                     });
                 }
+                ClientRequest::InputAcknowledged { req_id, id, project, data } => {
+                    let result = daemon.validate_agent_project(&id, &project).and_then(|_| {
+                        daemon.session(&SessionRef::Agent(id))
+                            .ok_or_else(|| anyhow::anyhow!("Session has no live PTY"))
+                            .and_then(|s| s.write_input(&data))
+                    });
+                    reply(&out_tx, req_id, result.map(|_| None)).await;
+                }
                 ClientRequest::Input { session, data } => {
                     if let Some(s) = daemon.session(&session) {
                         if let Err(e) = s.write_input(&data) {
@@ -399,6 +407,13 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     )
                     .await;
                 }
+                ClientRequest::CheckWorktreeRemoval { req_id, id, branch, path, delete } => {
+                    let daemon = daemon.clone();
+                    let out_tx = out_tx.clone();
+                    tokio::spawn(async move {
+                        reply(&out_tx, req_id, daemon.check_worktree_removal(&id, &branch, &path, delete).await.map(|_| None)).await;
+                    });
+                }
                 ClientRequest::DeleteWorktree { req_id, id, force } => {
                     // `git worktree remove` can take seconds on a large
                     // checkout; run it off the request loop so Input/Attach
@@ -542,6 +557,10 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         daemon.set_agent_pinned(&id, pinned).map(|_| None),
                     )
                     .await;
+                }
+                ClientRequest::DeleteAgentScoped { req_id, id, project } => {
+                    let result = daemon.validate_agent_project(&id, &project).and_then(|_| daemon.delete_agent(&id));
+                    reply(&out_tx, req_id, result.map(|_| None)).await;
                 }
                 ClientRequest::DeleteAgent { req_id, id } => {
                     reply(&out_tx, req_id, daemon.delete_agent(&id).map(|_| None)).await;

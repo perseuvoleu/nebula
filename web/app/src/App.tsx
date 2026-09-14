@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ExternalLinkIcon, LogOutIcon, MenuIcon } from "lucide-react";
 import { api, ApiError, describeError, getToken, onAuthChange, setToken } from "@/lib/api";
 import { useConversation } from "@/lib/conversation";
@@ -31,25 +31,29 @@ function useMediaQuery(query: string): boolean {
 }
 
 function usePreview(project: string): string | null {
-  const [url, setUrl] = useState<string | null>(null);
+  const [preview, setPreview] = useState<{ project: string; url: string | null } | null>(null);
   useEffect(() => {
-    let cancelled = false;
+    const abort = new AbortController();
     let timer: ReturnType<typeof setTimeout>;
     const refresh = async () => {
+      let url: string | null = null;
       try {
-        const data = await api<{ url: string | null }>("preview", { project });
-        if (!cancelled) setUrl(data.url);
-      } catch { /* preview is optional until this project is configured */ }
-      if (!cancelled) timer = setTimeout(refresh, SESSIONS_POLL_MS);
+        const data = await api<{ url: string | null; phase: string | null }>("preview", { project }, undefined, { signal: abort.signal });
+        if (data.phase === "running" && typeof data.url === "string") url = data.url;
+      } catch { /* An unavailable preview must hide any previously published link. */ }
+      if (!abort.signal.aborted) {
+        setPreview({ project, url });
+        timer = setTimeout(refresh, SESSIONS_POLL_MS);
+      }
     };
-    setUrl(null);
     void refresh();
-    return () => { cancelled = true; clearTimeout(timer); };
+    return () => { abort.abort(); clearTimeout(timer); };
   }, [project]);
-  return url;
+  // Do not render the previous project's link while its replacement request is pending.
+  return preview?.project === project ? preview.url : null;
 }
 
-function PreviewButton({ url, className = "size-10" }: { url: string | null; className?: string }) {
+function PreviewButton({ url, className }: { url: string | null; className: string }) {
   return url && (
     <Button asChild variant="outline" size="icon-lg" className={className}>
       <a href={url} target="_blank" rel="noopener noreferrer" aria-label="Deschide preview-ul proiectului" title={url}>
@@ -92,7 +96,8 @@ function useSessions(project: string | null) {
     window.addEventListener("online", wake);
     return () => { cancelled = true; generation.current += 1; if (timer) clearTimeout(timer); document.removeEventListener("visibilitychange", wake); window.removeEventListener("online", wake); };
   }, [refresh]);
-  return { rows, phase, error, refresh };
+  const remove = (id: string) => { generation.current += 1; setRows(old => old.filter(r => r.id !== id)); void refresh(); };
+  return { rows, phase, error, refresh, remove };
 }
 
 export default function App() {
@@ -126,6 +131,13 @@ function Shell({ workspace }: { workspace: Workspace }) {
   const project = selection.project && workspace.projects.includes(selection.project) ? selection.project : workspace.projects[0];
   const sessions = useSessions(project);
   const previewUrl = usePreview(project);
+  const latestSelection = useRef(selection);
+  useLayoutEffect(() => { latestSelection.current = selection; }, [selection]);
+  const onDeleted = (id: string) => {
+    if (latestSelection.current.project !== project) return;
+    sessions.remove(id);
+    if (latestSelection.current.session === id) navigate({ project, session: null });
+  };
   const desktop = useMediaQuery("(min-width: 768px)");
   const [menuOpen, setMenuOpen] = useState(false);
   const [creating, setCreating] = useState(false);
@@ -139,6 +151,7 @@ function Shell({ workspace }: { workspace: Workspace }) {
   const row = sessions.rows.find((r) => r.id === selection.session) ?? null;
   const currentPath = row?.path ?? (checkout?.project === project ? checkout.path : undefined);
   const chooseCheckout = (tree: Worktree) => {
+    void sessions.refresh();
     setCheckout({ project, path: tree.path });
     navigate({ project, session: null });
     setMenuOpen(false);
@@ -177,12 +190,12 @@ function Shell({ workspace }: { workspace: Workspace }) {
           </select>
         </label>
         <span className="max-w-24 shrink-0 truncate rounded border border-border px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground" title={`Execuția are loc pe ${workspace.host}`}>@{workspace.host}</span>
-        <PreviewButton url={previewUrl} />
+        <PreviewButton url={previewUrl} className="size-10" />
         <Button type="button" variant="ghost" size="icon-lg" aria-label="Deconectare" onClick={logout} className="size-10"><LogOutIcon aria-hidden /></Button>
       </div>
       {checkoutPanel}
       {created && <p role="status" className="border-b border-sidebar-border px-3 py-2 text-xs">Agent pornit ca „{created}”. Identitatea nu a putut fi confirmată încă: alege-l din listă.</p>}
-      <SessionList sessions={sessions.rows} phase={sessions.phase} error={sessions.error} selected={sessionId} unseen={unseenFinished} onSelect={select} onNew={() => setCreating(true)} project={project} />
+      <SessionList sessions={sessions.rows} phase={sessions.phase} error={sessions.error} selected={sessionId} unseen={unseenFinished} onSelect={select} onNew={() => setCreating(true)} project={project} onDeleted={onDeleted} />
       <InstallApp />
       <p className="border-t border-sidebar-border px-3 py-2 text-[11px] text-muted-foreground">Telefonul se poate deconecta. Agenții rămân pe server.</p>
     </aside>
@@ -241,7 +254,7 @@ function Shell({ workspace }: { workspace: Workspace }) {
             <PreviewButton url={previewUrl} className="size-11" />
           </div>
           {checkoutPanel}
-          <SessionList sessions={sessions.rows} phase={sessions.phase} error={sessions.error} selected={sessionId} unseen={unseenFinished} onSelect={select} onNew={() => setCreating(true)} project={project} />
+          <SessionList sessions={sessions.rows} phase={sessions.phase} error={sessions.error} selected={sessionId} unseen={unseenFinished} onSelect={select} onNew={() => setCreating(true)} project={project} onDeleted={onDeleted} />
           <InstallApp />
         </main>
       )}
