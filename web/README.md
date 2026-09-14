@@ -32,6 +32,11 @@ Radix, the AI Elements conversation primitive), Python 3.10+ standard-library ga
   ever retried automatically. Repeated taps cannot double-send.
 - Start pi, Claude, Codex or Cursor on an existing checkout; existing agents on that checkout
   are shown first; the new session is selected by id.
+- Project and selected-session preview links appear only when the dedicated preview CLI reports
+  `running` with a valid policy domain. Both open the project's currently published preview;
+  selecting a session does not publish or switch its checkout. Status is polled every five seconds
+  after each response; stopped, malformed, unconfigured and failed responses hide the links.
+  The gateway reads status only and never reads preview credential files or returns CLI diagnostics.
 - Phone: session list → full-screen conversation → back; desktop: persistent sidebar.
   URL carries `/p/<project>/s/<session id>` (no secrets). Per-session drafts in memory.
 - Offline/resume: cursor-based resync without duplicate messages; stale state is labelled.
@@ -124,6 +129,15 @@ are content-hashed and served with immutable caching, everything else is `no-cac
    cannot connect to it, so the `session_id` CLI field only becomes usable after the branch is
    merged into whatever source the installed binary comes from and a matching binary is
    installed. Never restart the daemon for this.
+   For preview buttons, also set these explicit binary paths in the same env file:
+   ```dotenv
+   NEBULA_WEB_BINARY=/home/andrei/.local/bin/nebula
+   NEBULA_WEB_PREVIEW_BINARY=/opt/nebula-preview/nebula
+   ```
+   The optional preview path must be an absolute executable file or startup fails. If omitted,
+   preview discovery is disabled. Only first-argument `preview --project <allowlisted project> status`
+   calls use it; agent/worktree commands continue using the installed global binary. No shell
+   wrapper is needed. Do not change the preview installation or its credentials for this update.
 4. `systemctl --user restart nebula-web` (only the web service). Do not run `nebula kill`.
 5. Check: `systemctl --user status nebula-web`, then on the phone: login with the existing
    token, all four projects listed, an existing Pi session renders messages, a Claude session

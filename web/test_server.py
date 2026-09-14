@@ -56,10 +56,58 @@ class GatewayTests(unittest.TestCase):
                 Gateway(token, origin, projects)
 
     def test_project_allowlist(self):
-        for path in ["/api/sessions", "/api/conversation", "/api/conversation/updates"]:
+        for path in ["/api/sessions", "/api/conversation", "/api/conversation/updates", "/api/preview"]:
             with self.assertRaises(Problem) as ctx:
                 self.gateway.get(path, {"project": ["secret"], "id": ["one"]})
             self.assertEqual(ctx.exception.status, 403)
+
+    def test_preview_uses_dedicated_binary_and_returns_only_running_url(self):
+        preview = Path(self.tmp.name) / "preview binary"
+        preview.write_text("#!/bin/sh\nexit 0\n")
+        preview.chmod(0o700)
+        gateway = Gateway(TOKEN, "http://127.0.0.1:8765", ["project"],
+                          binary="/home/andrei/.local/bin/nebula", preview_binary=str(preview))
+        with patch("server.subprocess.run", return_value=subprocess.CompletedProcess([], 0,
+                   '{"domain":"demo.example.test","phase":"running","credentials":"never expose"}', "")) as run:
+            self.assertEqual(gateway.get("/api/preview", {"project": ["project"]}),
+                             {"url": "https://demo.example.test", "phase": "running"})
+            self.assertEqual(run.call_args.args[0], [str(preview), "preview", "--project", "project", "status"])
+        for path, command in [("/api/sessions", "agent"), ("/api/worktrees", "worktree")]:
+            with patch("server.subprocess.run", return_value=subprocess.CompletedProcess([], 0, '[]', "")) as run:
+                gateway.get(path, {"project": ["project"]})
+                self.assertEqual(run.call_args.args[0], ["/home/andrei/.local/bin/nebula", command, "list", "--project", "project"])
+
+    def test_preview_binary_must_be_an_absolute_executable_file(self):
+        plain = Path(self.tmp.name) / "not executable"
+        plain.write_text("not executable")
+        for binary in ["", "nebula", "./preview", str(plain), self.tmp.name, str(plain) + "-missing"]:
+            with self.subTest(binary=binary), self.assertRaises(ValueError):
+                Gateway(TOKEN, "http://127.0.0.1:8765", ["project"], preview_binary=binary)
+
+    def test_preview_fails_closed_for_bad_status_and_never_exposes_diagnostics(self):
+        gateway = Gateway(TOKEN, "http://127.0.0.1:8765", ["project"], preview_binary="/bin/true")
+        invalid = [None, [], "running", {}, {"domain": "demo.example.test", "phase": []}]
+        invalid += [{"domain": domain, "phase": "running"} for domain in [
+            None, [], "", "localhost", "evil.test/path", "user@evil.test", "evil.test:443", "a..test",
+            "-a.test", "a-.test", "a.test.", "A.test", "a" * 64 + ".test", "code.possu.dev",
+            ".".join(["a" * 63] * 4), "evil.test\n",
+        ]]
+        for status in invalid:
+            with self.subTest(status=status), patch("server.subprocess.run", return_value=
+                    subprocess.CompletedProcess([], 0, json.dumps(status), "")):
+                self.assertEqual(gateway.get("/api/preview", {"project": ["project"]}), {"url": None, "phase": None})
+        for phase in ["stopped", "stale", "recovering", "orphaned_route", "unknown"]:
+            with patch("server.subprocess.run", return_value=subprocess.CompletedProcess([], 0,
+                       json.dumps({"domain": "demo.example.test", "phase": phase}), "")):
+                self.assertEqual(gateway.get("/api/preview", {"project": ["project"]}), {"url": None, "phase": phase})
+        for result in [subprocess.CompletedProcess([], 0, "not JSON", ""),
+                       subprocess.CompletedProcess([], 1, "", "private diagnostic")]:
+            with patch("server.subprocess.run", return_value=result):
+                self.assertEqual(gateway.get("/api/preview", {"project": ["project"]}), {"url": None, "phase": None})
+        with patch("server.subprocess.run") as run:
+            self.assertEqual(self.gateway.get("/api/preview", {"project": ["project"]}), {"url": None, "phase": None})
+            with self.assertRaises(Problem): gateway.get("/api/preview", {"project": ["secret"]})
+            run.assert_not_called()
 
     def test_terminal_keys_dispatch_once_by_id_without_prompt(self):
         for key in ["Up", "Down", "Left", "Right", "Enter", "Escape", "Tab"]:

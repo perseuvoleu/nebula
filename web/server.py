@@ -67,7 +67,7 @@ class StaticFiles:
 
 
 class Gateway:
-    def __init__(self, token, origin, projects, binary="nebula", static=None, pi_agent_dir=None, db_path=None):
+    def __init__(self, token, origin, projects, binary="nebula", static=None, pi_agent_dir=None, db_path=None, *, preview_binary=None):
         if len(token) < 8:
             raise ValueError("NEBULA_WEB_TOKEN must contain at least 8 characters")
         parsed = urlsplit(origin)
@@ -80,6 +80,11 @@ class Gateway:
             raise ValueError("NEBULA_WEB_PROJECTS must list at least one project")
         self.token, self.origin, self.host = token, origin, parsed.netloc
         self.projects, self.binary = projects, binary
+        # None explicitly disables optional preview discovery; never fall back to the main CLI.
+        if preview_binary is not None and (not Path(preview_binary).is_absolute()
+                or not Path(preview_binary).is_file() or not os.access(preview_binary, os.X_OK)):
+            raise ValueError("NEBULA_WEB_PREVIEW_BINARY must be an absolute executable file")
+        self.preview_binary = preview_binary
         self.static = static or StaticFiles(STATIC)
         self.pi_agent_dir = Path(pi_agent_dir) if pi_agent_dir else default_pi_agent_dir()
         self.db_path = Path(db_path) if db_path else None
@@ -96,7 +101,13 @@ class Gateway:
             # Never inherit the parent agent's identity or pass gateway credentials to CLIs.
             env = {k: v for k, v in os.environ.items()
                    if not k.startswith(("NEBULA_", "MC_", "PI_"))}
-            result = subprocess.run([binary or self.binary, *args], capture_output=True, text=True,
+            executable = binary or self.binary
+            if binary is None and args[:1] == ("preview",):
+                if (len(args) != 4 or args[1] != "--project" or args[2] not in self.projects
+                        or args[3] != "status" or self.preview_binary is None):
+                    raise Problem(503, "Preview status unavailable")
+                executable = self.preview_binary
+            result = subprocess.run([executable, *args], capture_output=True, text=True,
                                     errors="replace", timeout=20, env=env)
             if result.returncode:
                 raise Problem(502, result.stderr.strip()[:2000] or "Nebula command failed")
@@ -212,6 +223,23 @@ class Gateway:
         first = {k: v[0] for k, v in query.items()}
         if path == "/api/sessions":
             return {"sessions": [public(r) for r in self.sessions(project) if not r["archived"]]}
+        if path == "/api/preview":
+            try:
+                status = self.run("preview", "--project", project, "status")
+            except Problem:
+                # CLI stderr may contain private diagnostic details. Never return it here.
+                return {"url": None, "phase": None}
+            domain = status.get("domain") if isinstance(status, dict) else None
+            phase = status.get("phase") if isinstance(status, dict) else None
+            # Match the preview policy's DNS-label rules, including its reserved control domain.
+            if (not isinstance(phase, str) or phase not in
+                    {"running", "stopped", "stale", "recovering", "orphaned_route", "unknown"}
+                    or not isinstance(domain, str) or len(domain) > 253 or "." not in domain
+                    or domain == "code.possu.dev" or not all(
+                        re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+                        for label in domain.split("."))):
+                return {"url": None, "phase": None}
+            return {"url": f"https://{domain}" if phase == "running" else None, "phase": phase}
         if path == "/api/worktrees":
             return {"worktrees": self.run("worktree", "list", "--project", project)}
         if path == "/api/output":
@@ -443,7 +471,8 @@ def main():
                       os.environ.get("NEBULA_WEB_ORIGIN", f"http://127.0.0.1:{port}"),
                       [p.strip() for p in os.environ.get("NEBULA_WEB_PROJECTS", "").split(",") if p.strip()],
                       os.environ.get("NEBULA_WEB_BINARY", "nebula"),
-                      db_path=os.environ.get("NEBULA_WEB_DB") or None)
+                      db_path=os.environ.get("NEBULA_WEB_DB") or None,
+                      preview_binary=os.environ.get("NEBULA_WEB_PREVIEW_BINARY"))
     if not gateway.static.files.get("/index.html"):
         raise SystemExit(f"No built app in {gateway.static.root}; run `pnpm --dir web/app build` first")
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)

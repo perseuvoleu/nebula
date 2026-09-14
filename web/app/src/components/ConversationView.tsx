@@ -1,6 +1,6 @@
 // Mounted with key={project/session} by the shell, so draft/terminal state resets per session without effects.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowLeftIcon, RefreshCwIcon, TerminalIcon } from "lucide-react";
+import { ArrowLeftIcon, ExternalLinkIcon, RefreshCwIcon, TerminalIcon } from "lucide-react";
 import { useStickToBottomContext } from "use-stick-to-bottom";
 import { Conversation, ConversationContent, ConversationScrollButton } from "@/components/ai-elements/conversation";
 import { Button } from "@/components/ui/button";
@@ -95,8 +95,10 @@ function ConnectionLine({ state }: { state: ConversationState }) {
   );
 }
 
-export function ConversationView({ project, row, state, controller, onBack, showBack, sessions, unseen, onSelect }: {
+export function ConversationView({ project, previewUrl, row, state, controller, onBack, showBack, sessions, unseen, onSelect }: {
   project: string;
+  /** Running preview published for this session’s project, or null when unavailable. */
+  previewUrl: string | null;
   row: SessionRow | null;
   state: ConversationState;
   controller: ConversationController;
@@ -145,6 +147,13 @@ export function ConversationView({ project, row, state, controller, onBack, show
             </p>
           )}
         </div>
+        {previewUrl && (
+          <Button asChild variant="outline" size="icon-lg" className="size-11">
+            <a href={previewUrl} target="_blank" rel="noopener noreferrer" aria-label="Deschide preview-ul sesiunii" title={previewUrl}>
+              <ExternalLinkIcon aria-hidden className="size-5" />
+            </a>
+          </Button>
+        )}
         {state.capabilities?.structured && (
           <Button type="button" variant={terminal ? "secondary" : "ghost"} size="icon-lg" aria-pressed={terminal}
             aria-label={terminal ? "Arată conversația" : "Arată terminalul"} onClick={() => setTerminal((v) => !v)} className="size-11">
