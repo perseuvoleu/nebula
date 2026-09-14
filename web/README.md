@@ -141,10 +141,13 @@ The origin must be exactly the tunnelled URL; no production token or port is inv
 
 ## Deploy on findl (promotion checklist)
 
-Deploy only a committed, tested release under `~/.local/share/nebula/web-releases/<sha>`.
-Never point the service at a disposable worktree. Preserve the existing unit hardening and
-all environment entries; change only the deployment paths and necessary push configuration.
-See [Web Push activation and rollback](../docs/operations/web-push-activation.md).
+The live service runs from a read-only, committed release under
+`~/.local/share/nebula/web-releases/<sha>`, never from a disposable worktree.
+See [Web Push activation and rollback](../docs/operations/web-push-activation.md) for the
+current deployment, and [the durable web recovery runbook](../docs/operations/web-service-recovery.md)
+for the earlier baseline and recovery evidence.
+Build and validate a new committed release before promotion. Preserve existing unit hardening
+and environment entries; change only deployment paths and necessary push configuration.
 Restart only `nebula-web.service`; never restart the Nebula daemon, bridge or proxy.
 
 **The token grants agent control as the server's OS user.** Project allowlisting is an API
