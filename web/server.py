@@ -18,6 +18,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import tempfile
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlsplit
@@ -56,6 +57,7 @@ class PushService:
                 from cryptography.hazmat.primitives import serialization
                 from py_vapid import Vapid
                 from pywebpush import webpush
+                from requests import Session
             except ImportError as error:
                 raise ValueError("Web Push dependencies missing; install web/requirements.txt") from error
             key = Path(private_key)
@@ -65,32 +67,45 @@ class PushService:
             raw = vapid.public_key.public_bytes(serialization.Encoding.X962,
                                                 serialization.PublicFormat.UncompressedPoint)
             public_key = base64.urlsafe_b64encode(raw).decode().rstrip("=")
+            class PushSession(Session):
+                """Send only to the validated provider, without netrc, proxies or redirects."""
+
+                def request(self, method, url, **kwargs):
+                    """Prevent a provider redirect from forwarding encrypted payloads elsewhere."""
+                    kwargs["allow_redirects"] = False
+                    return super().request(method, url, **kwargs)
+
+            transport = PushSession()
+            transport.trust_env = False
             sender = lambda subscription, data: webpush(
                 subscription_info=subscription, data=json.dumps(data), vapid_private_key=vapid,
-                vapid_claims={"sub": subject}, ttl=300, timeout=10)
+                vapid_claims={"sub": subject}, ttl=300, timeout=10, requests_session=transport)
         self.sender, self.public_key = sender, public_key
         if not isinstance(public_key, str) or len(public_key) < 80:
             raise ValueError("Invalid VAPID public key")
 
     @staticmethod
     def validate(subscription):
-        if not isinstance(subscription, dict) or set(subscription) != {"endpoint", "keys"}:
+        if not isinstance(subscription, dict) or set(subscription) not in ({"endpoint", "keys"}, {"endpoint", "keys", "expirationTime"}):
             raise Problem(400, "Invalid push subscription")
         endpoint, keys = subscription["endpoint"], subscription["keys"]
         try:
             parsed = urlsplit(endpoint) if isinstance(endpoint, str) else None
             hostname = parsed.hostname if parsed else None
+            port = parsed.port if parsed else None
         except ValueError:
             parsed, hostname = None, None
         if (parsed is None or parsed.scheme != "https" or not hostname or parsed.username
-                or parsed.password or parsed.fragment or len(endpoint) > 4096 or not isinstance(keys, dict)
+                or parsed.password or parsed.fragment or port not in (None, 443)
+                or hostname not in {"web.push.apple.com", "fcm.googleapis.com", "updates.push.services.mozilla.com"}
+                or re.search(r"[\x00-\x20\x7f\\]", endpoint) or len(endpoint) > 4096 or not isinstance(keys, dict)
                 or set(keys) != {"p256dh", "auth"}):
             raise Problem(400, "Invalid push subscription")
         for name, minimum in (("p256dh", 40), ("auth", 8)):
             value = keys.get(name)
             if not isinstance(value, str) or not minimum <= len(value) <= 256 or not re.fullmatch(r"[A-Za-z0-9_-]+", value):
                 raise Problem(400, "Invalid push subscription")
-        return subscription
+        return {"endpoint": endpoint, "keys": keys}
 
     def subscriptions(self):
         try:
@@ -108,11 +123,15 @@ class PushService:
         return valid
 
     def save(self, subscriptions):
-        self.storage.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.storage.with_suffix(".tmp")
-        temporary.write_text(json.dumps(subscriptions))
-        temporary.chmod(0o600)
-        temporary.replace(self.storage)
+        self.storage.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        descriptor, name = tempfile.mkstemp(prefix=".push-", dir=self.storage.parent)
+        temporary = Path(name)
+        try:
+            with os.fdopen(descriptor, "w") as file:
+                json.dump(subscriptions, file)
+            temporary.replace(self.storage)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def subscribe(self, subscription):
         subscription = self.validate(subscription)

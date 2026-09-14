@@ -65,14 +65,17 @@ export NEBULA_WEB_DB="$HOME/.local/share/nebula/nebula.db"   # see "Native ident
 python3 web/server.py
 ```
 
-Web Push is optional. To enable it, install its small, audited protocol implementation in a
+Web Push is optional. To enable it, install its pinned protocol dependencies in a
 venv and generate one persistent VAPID key (never commit the key):
 
 ```bash
 python3 -m venv ~/.local/share/nebula/web-venv
 ~/.local/share/nebula/web-venv/bin/pip install -r web/requirements.txt
-mkdir -p ~/.config/nebula-web && cd ~/.config/nebula-web
-~/.local/share/nebula/web-venv/bin/vapid --gen
+umask 077
+mkdir -p ~/.config/nebula-web && chmod 700 ~/.config/nebula-web
+cd ~/.config/nebula-web
+# Only when no private key already exists; never rotate an existing key.
+test -e private_key.pem || ~/.local/share/nebula/web-venv/bin/vapid --gen
 export NEBULA_WEB_VAPID_PRIVATE_KEY="$HOME/.config/nebula-web/private_key.pem"
 # Run server.py with the venv's Python. HTTPS is required on the phone.
 ```
@@ -81,6 +84,9 @@ The notification permission prompt appears only after tapping “Activează noti
 an iPhone or iPad, Web Push requires iOS/iPadOS 16.4+ and the PWA installed on the Home Screen.
 Subscriptions are stored mode `0600` in `~/.local/share/nebula/web-push.json`; override with
 `NEBULA_WEB_PUSH_STORE`. `NEBULA_WEB_VAPID_SUBJECT` may override the default HTTPS origin.
+Supported destinations are `web.push.apple.com`, `fcm.googleapis.com`, and
+`updates.push.services.mozilla.com`, over HTTPS port 443. Redirects and environment
+proxy/netrc credentials are disabled. Other push providers require a reviewed allowlist update.
 The gateway polls enabled projects every five seconds only while at least one device is subscribed.
 
 Open `http://127.0.0.1:8765` and enter the token. The gateway listens **only on 127.0.0.1**
@@ -135,42 +141,11 @@ The origin must be exactly the tunnelled URL; no production token or port is inv
 
 ## Deploy on findl (promotion checklist)
 
-The live service serves its own checkout (`~/nebula-worktrees/mobile-web-deploy`) through
-`~/.config/systemd/user/nebula-web.service`, private bridge and Traefik route. Nothing here
-requires DNS, Traefik, bridge, daemon or agent changes: no SSE was introduced, `/assets/*`
-are content-hashed and served with immutable caching, everything else is `no-cache`/`no-store`.
-
-1. Fast-forward the deploy checkout to the reviewed commit (never with uncommitted changes).
-2. `pnpm --dir web/app install --frozen-lockfile && pnpm --dir web/app build` in that checkout
-   (Node 22 + pnpm 10). The gateway refuses to start until `web/static/index.html` exists.
-   Create/update `~/.local/share/nebula/web-venv`, install `web/requirements.txt`, and install
-   the updated `web/nebula-web.service` so the gateway uses that venv.
-3. Add `NEBULA_WEB_DB=/home/<user>/.local/share/nebula/nebula.db` to `~/.config/nebula-web.env`.
-   Generate the VAPID key once as above and add
-   `NEBULA_WEB_VAPID_PRIVATE_KEY=/home/<user>/.config/nebula-web/private_key.pem`.
-   (keep the existing token, projects, origin and binary). This is the required identity source
-   for now: the running daemon speaks IPC protocol 28 and a CLI built from this branch (27)
-   cannot connect to it, so the `session_id` CLI field only becomes usable after the branch is
-   merged into whatever source the installed binary comes from and a matching binary is
-   installed. Never restart the daemon for this.
-   For preview buttons, also set these explicit binary paths in the same env file:
-   ```dotenv
-   NEBULA_WEB_BINARY=/home/andrei/.local/bin/nebula
-   NEBULA_WEB_PREVIEW_BINARY=/opt/nebula-preview/nebula
-   ```
-   The optional preview path must be an absolute executable file or startup fails. If omitted,
-   preview discovery is disabled. Only first-argument `preview --project <allowlisted project> status`
-   calls use it; agent/worktree commands continue using the installed global binary. No shell
-   wrapper is needed. Do not change the preview installation or its credentials for this update.
-4. `systemctl --user restart nebula-web` (only the web service). Do not run `nebula kill`.
-5. Check: `systemctl --user status nebula-web`, then on the phone: login with the existing
-   token, all four projects listed, an existing Pi session renders messages, a Claude session
-   shows the terminal label. Phones may need one reload for the new service worker.
-
-**Rollback:** check out the previous commit (`44b3f7a`) in the deploy checkout and restart
-`nebula-web`; the old static app is tracked there and needs no build. Remove `NEBULA_WEB_DB`
-if desired (harmless if kept). The service worker cache name changed (`nebula-shell-v5`); the
-old worker replaces it on the next load.
+Deploy only a committed, tested release under `~/.local/share/nebula/web-releases/<sha>`.
+Never point the service at a disposable worktree. Preserve the existing unit hardening and
+all environment entries; change only the deployment paths and necessary push configuration.
+See [Web Push activation and rollback](../docs/operations/web-push-activation.md).
+Restart only `nebula-web.service`; never restart the Nebula daemon, bridge or proxy.
 
 **The token grants agent control as the server's OS user.** Project allowlisting is an API
 scope, not an OS sandbox. Rotate a leaked token in the env file and restart only `nebula-web`.
