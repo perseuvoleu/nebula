@@ -115,38 +115,11 @@ The origin must be exactly the tunnelled URL; no production token or port is inv
 
 ## Deploy on findl (promotion checklist)
 
-The live service serves its own checkout (`~/nebula-worktrees/mobile-web-deploy`) through
-`~/.config/systemd/user/nebula-web.service`, private bridge and Traefik route. Nothing here
-requires DNS, Traefik, bridge, daemon or agent changes: no SSE was introduced, `/assets/*`
-are content-hashed and served with immutable caching, everything else is `no-cache`/`no-store`.
-
-1. Fast-forward the deploy checkout to the reviewed commit (never with uncommitted changes).
-2. `pnpm --dir web/app install --frozen-lockfile && pnpm --dir web/app build` in that checkout
-   (Node 22 + pnpm 10). The gateway refuses to start until `web/static/index.html` exists.
-3. Add `NEBULA_WEB_DB=/home/<user>/.local/share/nebula/nebula.db` to `~/.config/nebula-web.env`
-   (keep the existing token, projects, origin and binary). This is the required identity source
-   for now: the running daemon speaks IPC protocol 28 and a CLI built from this branch (27)
-   cannot connect to it, so the `session_id` CLI field only becomes usable after the branch is
-   merged into whatever source the installed binary comes from and a matching binary is
-   installed. Never restart the daemon for this.
-   For preview buttons, also set these explicit binary paths in the same env file:
-   ```dotenv
-   NEBULA_WEB_BINARY=/home/andrei/.local/bin/nebula
-   NEBULA_WEB_PREVIEW_BINARY=/opt/nebula-preview/nebula
-   ```
-   The optional preview path must be an absolute executable file or startup fails. If omitted,
-   preview discovery is disabled. Only first-argument `preview --project <allowlisted project> status`
-   calls use it; agent/worktree commands continue using the installed global binary. No shell
-   wrapper is needed. Do not change the preview installation or its credentials for this update.
-4. `systemctl --user restart nebula-web` (only the web service). Do not run `nebula kill`.
-5. Check: `systemctl --user status nebula-web`, then on the phone: login with the existing
-   token, all four projects listed, an existing Pi session renders messages, a Claude session
-   shows the terminal label. Phones may need one reload for the new service worker.
-
-**Rollback:** check out the previous commit (`44b3f7a`) in the deploy checkout and restart
-`nebula-web`; the old static app is tracked there and needs no build. Remove `NEBULA_WEB_DB`
-if desired (harmless if kept). The service worker cache name changed (`nebula-shell-v4`); the
-old worker replaces it on the next load.
+The live service runs from a read-only, per-commit release outside Git worktrees. See
+[the durable web deployment runbook](../docs/operations/web-service-recovery.md) for the
+active baseline, verification evidence, path-only systemd configuration and valid rollback.
+Build and validate a new committed release before promotion; preserve the existing environment.
+Restart only `nebula-web.service`, never the Nebula daemon or the bridge/proxy.
 
 **The token grants agent control as the server's OS user.** Project allowlisting is an API
 scope, not an OS sandbox. Rotate a leaked token in the env file and restart only `nebula-web`.
