@@ -1,7 +1,9 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ExternalLinkIcon, LogOutIcon, MenuIcon } from "lucide-react";
 import { api, ApiError, describeError, getToken, onAuthChange, setToken } from "@/lib/api";
 import { useConversation } from "@/lib/conversation";
+import { fetchSessionList } from "@/lib/session-fetch";
+import { orderSessions, sessionKey } from "@/lib/session-list";
 import { clearDrafts } from "@/lib/drafts";
 import { useSelection } from "@/lib/route";
 import type { NewResponse, SessionRow, Worktree } from "@/lib/types";
@@ -32,9 +34,10 @@ function useMediaQuery(query: string): boolean {
   return matches;
 }
 
-function usePreview(project: string): string | null {
+function usePreview(project: string | null): string | null {
   const [preview, setPreview] = useState<{ project: string; url: string | null } | null>(null);
   useEffect(() => {
+    if (!project) return;
     const abort = new AbortController();
     let timer: ReturnType<typeof setTimeout>;
     const refresh = async () => {
@@ -65,27 +68,34 @@ function PreviewButton({ url, className }: { url: string | null; className: stri
   );
 }
 
-function useSessions(project: string | null) {
-  const [rows, setRows] = useState<SessionRow[]>([]);
+function useSessions(projects: string[]) {
+  const [snapshot, setSnapshot] = useState<{ projects: string[]; rows: SessionRow[]; loaded: string[] } | null>(null);
   const [phase, setPhase] = useState<ListPhase>("loading");
   const [error, setError] = useState<string | null>(null);
   const generation = useRef(0);
+  const activeRequest = useRef<AbortController | null>(null);
   const refresh = useCallback(async () => {
-    if (!project) return;
     const version = ++generation.current;
+    activeRequest.current?.abort();
+    const abort = new AbortController();
+    activeRequest.current = abort;
     try {
-      const data = await api<{ sessions: SessionRow[] }>("sessions", { project }, undefined, { timeoutMs: 20000 });
+      const data = await fetchSessionList(projects, {
+        sessions: async (project) => (await api<{ sessions: SessionRow[] }>("sessions", { project }, undefined, { timeoutMs: 20000, signal: abort.signal })).sessions,
+      }, abort.signal);
       if (version !== generation.current) return;
-      setRows(data.sessions); setPhase("ready"); setError(null);
+      setSnapshot({ projects, rows: data.rows, loaded: data.loaded });
+      setPhase(data.loaded.length ? "ready" : navigator.onLine ? "error" : "offline");
+      setError(data.errors.length ? data.errors.map(e => `${e.project}: ${describeError(e.failure)}`).join("; ") : null);
     } catch (failure) {
       if (version !== generation.current) return;
       if (failure instanceof ApiError && failure.status === 401) return;
       setError(describeError(failure));
       setPhase((p) => (p === "loading" ? "error" : navigator.onLine ? p : "offline"));
     }
-  }, [project]);
+  }, [projects]);
   useEffect(() => {
-    setRows([]); setPhase("loading"); setError(null);
+    setSnapshot(null); setPhase("loading"); setError(null);
     let timer: ReturnType<typeof setTimeout> | undefined;
     let cancelled = false;
     const loop = async () => {
@@ -96,10 +106,16 @@ function useSessions(project: string | null) {
     const wake = () => { if (!document.hidden && !cancelled) void refresh(); };
     document.addEventListener("visibilitychange", wake);
     window.addEventListener("online", wake);
-    return () => { cancelled = true; generation.current += 1; if (timer) clearTimeout(timer); document.removeEventListener("visibilitychange", wake); window.removeEventListener("online", wake); };
+    return () => { cancelled = true; generation.current += 1; activeRequest.current?.abort(); if (timer) clearTimeout(timer); document.removeEventListener("visibilitychange", wake); window.removeEventListener("online", wake); };
   }, [refresh]);
-  const remove = (id: string) => { generation.current += 1; setRows(old => old.filter(r => r.id !== id)); void refresh(); };
-  return { rows, phase, error, refresh, remove };
+  const remove = (row: SessionRow) => {
+    generation.current += 1;
+    setSnapshot(old => old ? { ...old, rows: old.rows.filter(r => sessionKey(r) !== sessionKey(row)) } : old);
+    void refresh();
+  };
+  const current = snapshot?.projects === projects;
+  return { rows: current ? snapshot.rows : [], loaded: current ? snapshot.loaded : [],
+    phase: current ? phase : "loading" as ListPhase, error: current ? error : null, refresh, remove };
 }
 
 export default function App() {
@@ -131,67 +147,91 @@ export default function App() {
 function Shell({ workspace }: { workspace: Workspace }) {
   const [selection, navigate] = useSelection();
   const project = selection.project && workspace.projects.includes(selection.project) ? selection.project : workspace.projects[0];
-  const sessions = useSessions(project);
-  const previewUrl = usePreview(project);
+  const sessionId = selection.project && !workspace.projects.includes(selection.project) ? null : selection.session;
+  const listProjects = useMemo(() => selection.all ? workspace.projects : [project], [selection.all, workspace.projects, project]);
+  const sessions = useSessions(listProjects);
+  const previewUrl = usePreview(selection.all && !selection.session ? null : project);
   const latestSelection = useRef(selection);
-  useLayoutEffect(() => { latestSelection.current = selection; }, [selection]);
-  const onDeleted = (id: string) => {
-    if (latestSelection.current.project !== project) return;
-    sessions.remove(id);
-    if (latestSelection.current.session === id) navigate({ project, session: null });
+  const latestSessions = useRef(sessions);
+  useLayoutEffect(() => { latestSelection.current = selection; latestSessions.current = sessions; });
+  const onDeleted = (deleted: SessionRow) => {
+    latestSessions.current.remove(deleted);
+    const current = latestSelection.current;
+    if (current.project === deleted.project && current.session === deleted.id) navigate({ project: deleted.project, session: null, all: current.all });
   };
   const desktop = useMediaQuery("(min-width: 768px)");
   const [menuOpen, setMenuOpen] = useState(false);
+  const [chooseProject, setChooseProject] = useState(false);
   const [creating, setCreating] = useState(false);
   const [created, setCreated] = useState<string | null>(null);
   const [checkout, setCheckout] = useState<{ project: string; path: string } | null>(null);
   const [unseenState, setUnseenState] = useState(loadUnseen);
 
   // Normalise the URL to a valid project once the allowlist is known.
-  useEffect(() => { if (selection.project !== project) navigate({ project, session: selection.session }, true); }, [project, selection.project, selection.session, navigate]);
+  useEffect(() => {
+    if (selection.project && !workspace.projects.includes(selection.project)) {
+      navigate({ project: selection.all ? null : project, session: null, all: selection.all }, true);
+    } else if (!selection.all && selection.project !== project) {
+      navigate({ project, session: selection.session, all: false }, true);
+    }
+  }, [project, selection.project, selection.session, selection.all, workspace.projects, navigate]);
 
-  const row = sessions.rows.find((r) => r.id === selection.session) ?? null;
+  const row = sessions.rows.find((r) => r.project === project && r.id === sessionId) ?? null;
   const currentPath = row?.path ?? (checkout?.project === project ? checkout.path : undefined);
   const chooseCheckout = (tree: Worktree) => {
     void sessions.refresh();
     setCheckout({ project, path: tree.path });
-    navigate({ project, session: null });
+    navigate({ project, session: null, all: false });
     setMenuOpen(false);
   };
-  const checkoutPanel = <CheckoutPanel key={project} project={project} currentPath={currentPath} onSelect={chooseCheckout} />;
-  const sessionId = selection.session;
-  const missing = sessionId !== null && sessions.phase === "ready" && !row;
+  const checkoutPanel = !selection.all && <CheckoutPanel key={project} project={project} currentPath={currentPath} onSelect={chooseCheckout} />;
+  const missing = sessionId !== null && sessions.phase === "ready" && sessions.loaded.includes(project) && !row;
   const { state, controller } = useConversation(project, sessionId && !missing ? sessionId : null);
   useEffect(() => {
     if (sessions.phase !== "ready") return;
     setUnseenState((previous) => {
-      const next = reconcileUnseen(previous, project, sessions.rows, sessionId);
+      const next = sessions.loaded.reduce((state, scope) => reconcileUnseen(state, scope,
+        sessions.rows.filter(r => r.project === scope), scope === selection.project ? sessionId : null), previous);
       saveUnseen(next);
       return next;
     });
-  }, [project, sessionId, sessions.phase, sessions.rows]);
-  const unseenFinished = new Set(unseenState.unseen.filter((id) => id.startsWith(`${project}/`)).map((id) => id.slice(project.length + 1)));
+  }, [selection.project, sessionId, sessions.phase, sessions.rows, sessions.loaded]);
+  const unseenFinished = new Set(unseenState.unseen);
+  const orderedRows = orderSessions(sessions.rows, unseenFinished);
+  const selectedKey = sessionId ? sessionKey({ project, id: sessionId }) : null;
 
-  const select = (r: SessionRow) => { navigate({ project, session: r.id }); setMenuOpen(false); setCreated(null); };
+  const select = (r: SessionRow) => { navigate({ project: r.project, session: r.id, all: selection.all }); setMenuOpen(false); setCreated(null); };
   const onCreated = (result: NewResponse) => {
     void sessions.refresh();
     // Identity comes from the gateway; a title is never used to guess it (the agent may rename).
-    if (result.id) navigate({ project, session: result.id }); else setCreated(result.name);
+    if (result.id) navigate({ project, session: result.id, all: false }); else setCreated(result.name);
     setMenuOpen(false);
   };
   const logout = async () => {
     controller?.dispose();
     try { await unsubscribePush(); } catch { /* Logging out must not depend on push delivery. */ }
-    setToken(""); navigate({ project: null, session: null }, true);
+    setToken(""); navigate({ project: null, session: null, all: false }, true);
   };
+
+  const changeProject = (value: string) => {
+    navigate({ project: value || null, session: null, all: value === "" });
+    if (chooseProject && value) { setChooseProject(false); setCreating(true); }
+  };
+  const newAgent = () => {
+    if (!selection.all) { setCreating(true); return; }
+    setChooseProject(true);
+    document.querySelector<HTMLSelectElement>('select[aria-label="Proiect"]')?.focus();
+  };
+  const targetNotice = chooseProject && <p role="status" className="px-3 py-2 text-sm">Alege un proiect din selector pentru agentul nou.</p>;
 
   const sidebar = (
     <aside className="flex h-full min-h-0 flex-col bg-sidebar" aria-label="Proiecte și sesiuni">
       <div className="flex items-center gap-2 border-b border-sidebar-border px-3 py-2.5">
         <label className="min-w-0 flex-1 text-sm">
           <span className="sr-only">Proiect</span>
-          <select value={project} onChange={(e) => navigate({ project: e.target.value, session: null })} aria-label="Proiect"
+          <select value={selection.all ? "" : project} onChange={(e) => changeProject(e.target.value)} aria-label="Proiect"
             className="h-10 w-full rounded-lg border border-input bg-card px-2.5 text-[15px] font-medium outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/60">
+            <option value="">All</option>
             {workspace.projects.map((p) => <option key={p} value={p}>{p}</option>)}
           </select>
         </label>
@@ -199,9 +239,10 @@ function Shell({ workspace }: { workspace: Workspace }) {
         <PreviewButton url={previewUrl} className="size-10" />
         <Button type="button" variant="ghost" size="icon-lg" aria-label="Deconectare" onClick={logout} className="size-10"><LogOutIcon aria-hidden /></Button>
       </div>
+      {targetNotice}
       {checkoutPanel}
       {created && <p role="status" className="border-b border-sidebar-border px-3 py-2 text-xs">Agent pornit ca „{created}”. Identitatea nu a putut fi confirmată încă: alege-l din listă.</p>}
-      <SessionList sessions={sessions.rows} phase={sessions.phase} error={sessions.error} selected={sessionId} unseen={unseenFinished} onSelect={select} onNew={() => setCreating(true)} project={project} onDeleted={onDeleted} />
+      <SessionList sessions={orderedRows} phase={sessions.phase} error={sessions.error} selected={selectedKey} unseen={unseenFinished} onSelect={select} onNew={newAgent} project={selection.all ? "All" : project} showProject={selection.all} onDeleted={onDeleted} />
       {desktop && <PushNotifications />}
       <InstallApp />
       <p className="border-t border-sidebar-border px-3 py-2 text-[11px] text-muted-foreground">Telefonul se poate deconecta. Agenții rămân pe server.</p>
@@ -209,7 +250,7 @@ function Shell({ workspace }: { workspace: Workspace }) {
   );
 
   const conversation = sessionId && controller && state ? (
-    <ConversationView key={`${project}/${sessionId}`} project={project} previewUrl={previewUrl} row={row} state={state} controller={controller} sessions={sessions.rows} unseen={unseenFinished} onSelect={select} showBack={!desktop} onBack={() => navigate({ project, session: null })} />
+    <ConversationView key={`${project}/${sessionId}`} project={project} previewUrl={previewUrl} row={row} state={state} controller={controller} sessions={orderedRows} unseen={unseenFinished} onSelect={select} showProjects={selection.all} showBack={!desktop} onBack={() => navigate({ project, session: null, all: selection.all })} />
   ) : (
     <section className="flex min-h-0 flex-1 flex-col">
       {!desktop && (
@@ -237,7 +278,7 @@ function Shell({ workspace }: { workspace: Workspace }) {
       <div className="grid min-h-0 flex-1 grid-cols-[18rem_minmax(0,1fr)] xl:grid-cols-[20rem_minmax(0,1fr)]">
         <div className="min-h-0 border-r border-sidebar-border">{sidebar}</div>
         <main className="flex min-h-0 min-w-0 flex-col">{conversation}</main>
-        <NewAgentDialog project={project} initialWorktree={currentPath} open={creating} onOpenChange={setCreating} onCreated={onCreated} />
+        <NewAgentDialog key={project} project={project} initialWorktree={currentPath} open={creating && !selection.all} onOpenChange={setCreating} onCreated={onCreated} />
       </div>
     );
   }
@@ -253,15 +294,17 @@ function Shell({ workspace }: { workspace: Workspace }) {
           <div className="flex items-center gap-2 border-b border-border px-3 py-2">
             <label className="min-w-0 flex-1 text-sm">
               <span className="sr-only">Proiect</span>
-              <select value={project} onChange={(e) => navigate({ project: e.target.value, session: null })} aria-label="Proiect"
+              <select value={selection.all ? "" : project} onChange={(e) => changeProject(e.target.value)} aria-label="Proiect"
                 className="h-11 w-full rounded-lg border border-input bg-card px-3 text-base font-medium outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/60">
+                <option value="">All</option>
                 {workspace.projects.map((p) => <option key={p} value={p}>{p}</option>)}
               </select>
             </label>
             <PreviewButton url={previewUrl} className="size-11" />
           </div>
+          {targetNotice}
           {checkoutPanel}
-          <SessionList sessions={sessions.rows} phase={sessions.phase} error={sessions.error} selected={sessionId} unseen={unseenFinished} onSelect={select} onNew={() => setCreating(true)} project={project} onDeleted={onDeleted} />
+          <SessionList sessions={orderedRows} phase={sessions.phase} error={sessions.error} selected={selectedKey} unseen={unseenFinished} onSelect={select} onNew={newAgent} project={selection.all ? "All" : project} showProject={selection.all} onDeleted={onDeleted} />
           <PushNotifications />
           <InstallApp />
         </main>
@@ -272,7 +315,7 @@ function Shell({ workspace }: { workspace: Workspace }) {
           {sidebar}
         </SheetContent>
       </Sheet>
-      <NewAgentDialog project={project} initialWorktree={currentPath} open={creating} onOpenChange={setCreating} onCreated={onCreated} />
+      <NewAgentDialog key={project} project={project} initialWorktree={currentPath} open={creating && !selection.all} onOpenChange={setCreating} onCreated={onCreated} />
     </>
   );
 }

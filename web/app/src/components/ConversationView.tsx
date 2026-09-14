@@ -11,6 +11,7 @@ import type { SessionRow } from "@/lib/types";
 import { Composer } from "./Composer";
 import { MessageItem } from "./MessageItem";
 import { TerminalView } from "./TerminalView";
+import { sessionKey } from "@/lib/session-list";
 import { SessionTabs } from "./SessionTabs";
 
 const ATTEMPT_LABEL: Record<Attempt["state"], string> = {
@@ -95,7 +96,7 @@ function ConnectionLine({ state }: { state: ConversationState }) {
   );
 }
 
-export function ConversationView({ project, previewUrl, row, state, controller, onBack, showBack, sessions, unseen, onSelect }: {
+export function ConversationView({ project, previewUrl, row, state, controller, onBack, showBack, sessions, unseen, onSelect, showProjects }: {
   project: string;
   /** Running preview published for this session’s project, or null when unavailable. */
   previewUrl: string | null;
@@ -106,6 +107,8 @@ export function ConversationView({ project, previewUrl, row, state, controller, 
   showBack: boolean;
   sessions: SessionRow[];
   unseen: Set<string>;
+  /** Label tabs with their source project in the aggregate view. */
+  showProjects: boolean;
   onSelect: (row: SessionRow) => void;
 }) {
   const session = state.session ?? row;
@@ -161,7 +164,7 @@ export function ConversationView({ project, previewUrl, row, state, controller, 
           </Button>
         )}
       </header>
-      <SessionTabs sessions={sessions} selected={sessionId} unseen={unseen} onSelect={onSelect} />
+      <SessionTabs sessions={sessions} selected={sessionKey({ project, id: sessionId })} showProjects={showProjects} unseen={unseen} onSelect={onSelect} />
 
       {state.phase === "loading" && (
         <div className="flex-1 space-y-4 px-4 py-6" aria-busy="true" aria-label="Se încarcă conversația">

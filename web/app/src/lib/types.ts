@@ -12,6 +12,8 @@ export interface SessionRow {
   worktree: string;
   path: string;
   archived: boolean;
+  /** Persistent daemon status-change epoch milliseconds; missing/zero means unknown on older CLIs. */
+  status_changed_at?: number;
 }
 
 export interface Worktree {

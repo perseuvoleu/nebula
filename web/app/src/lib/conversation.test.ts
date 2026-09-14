@@ -44,8 +44,8 @@ test("tool results update the matching call without duplicating the message", ()
 });
 
 test("routes carry project and session identity only", () => {
-  assert.deepEqual(parseSelection("/p/nebula/s/01ABC"), { project: "nebula", session: "01ABC" });
-  assert.deepEqual(parseSelection("/p/nebula"), { project: "nebula", session: null });
-  assert.deepEqual(parseSelection("/nope/../x"), { project: null, session: null });
-  assert.equal(selectionPath({ project: "vela-hub-fork", session: "s1" }), "/p/vela-hub-fork/s/s1");
+  assert.deepEqual(parseSelection("/p/nebula/s/01ABC"), { project: "nebula", session: "01ABC", all: false });
+  assert.deepEqual(parseSelection("/p/nebula"), { project: "nebula", session: null, all: false });
+  assert.deepEqual(parseSelection("/nope/../x"), { project: null, session: null, all: false });
+  assert.equal(selectionPath({ project: "vela-hub-fork", session: "s1", all: false }), "/p/vela-hub-fork/s/s1");
 });
