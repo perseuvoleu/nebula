@@ -179,7 +179,19 @@ pub(super) fn publish(name: &str, operation: &str, generation: &str) -> Result<(
     let directory = Path::new(ROUTES);
     root_controlled(directory)?;
     let _lock = files::lock(&directory.join(format!(".nebula-preview-{name}.lock")))?;
-    let route_file = directory.join(format!("nebula-preview-{name}.json"));
+    // Traefik's directory provider ignores .json. JSON serialization is also
+    // valid YAML, so use its supported extension without introducing a parser.
+    let route_file = directory.join(format!("nebula-preview-{name}.yaml"));
+    match directory
+        .join(format!("nebula-preview-{name}.json"))
+        .symlink_metadata()
+    {
+        Ok(_) => anyhow::bail!(
+            "legacy preview JSON artifact exists; inspect and retire it before publication"
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        Err(error) => return Err(error.into()),
+    }
     let pending = directory.join(format!(".nebula-preview-{name}.pending"));
     // Metadata lives outside the watched directory. Read back the route itself:
     // it remains authoritative when a publisher dies after atomic replacement.
@@ -194,7 +206,7 @@ pub(super) fn publish(name: &str, operation: &str, generation: &str) -> Result<(
             .map(|bytes| decode_route(&policy, name, bytes))
             .transpose()?;
         if published.is_some() || pending.exists() {
-            verify_adoption(project, published.as_ref())?;
+            verify_adoption(project, published.as_ref(), Duration::from_secs(15))?;
             if pending.exists() {
                 fs::remove_file(&pending)?;
                 fs::File::open(directory)?.sync_all()?;
@@ -216,7 +228,7 @@ pub(super) fn publish(name: &str, operation: &str, generation: &str) -> Result<(
             fs::remove_file(&route_file)?;
             fs::File::open(directory)?.sync_all()?;
         }
-        verify_adoption(project, None)
+        verify_adoption(project, None, Duration::from_secs(15))
             .context("route withdrawal is uncertain; managed runtimes retained")?;
         fs::remove_file(&pending)?;
         fs::File::open(directory)?.sync_all()?;
@@ -252,7 +264,11 @@ pub(super) fn publish(name: &str, operation: &str, generation: &str) -> Result<(
         json!({marker: {"headers": {"customResponseHeaders": {"X-Nebula-Route": generation}}}});
     files::atomic(&pending, b"{}\n")?;
     files::atomic(&route_file, &serde_json::to_vec_pretty(&rendered)?)?;
-    if let Err(error) = verify_adoption(project, Some(&published)) {
+    // First publication may need ACME issuance. Keep each request bounded and
+    // allow a fixed longer initial window; rollback/status remain short. The
+    // candidate has already passed backend and fail-closed gateway checks.
+    let adoption_window = Duration::from_secs(if previous.is_none() { 120 } else { 15 });
+    if let Err(error) = verify_adoption(project, Some(&published), adoption_window) {
         let restored = previous
             .as_ref()
             .map(|bytes| decode_route(&policy, name, bytes))
@@ -263,7 +279,7 @@ pub(super) fn publish(name: &str, operation: &str, generation: &str) -> Result<(
             fs::remove_file(&route_file)?;
             fs::File::open(directory)?.sync_all()?;
         }
-        verify_adoption(project, restored.as_ref())
+        verify_adoption(project, restored.as_ref(), Duration::from_secs(15))
             .context("route rollback is uncertain; preserve both runtimes and retry")?;
         fs::remove_file(&pending)?;
         fs::File::open(directory)?.sync_all()?;
@@ -274,8 +290,12 @@ pub(super) fn publish(name: &str, operation: &str, generation: &str) -> Result<(
     Ok(())
 }
 
-fn verify_adoption(project: &Project, published: Option<&Published>) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(15);
+fn verify_adoption(
+    project: &Project,
+    published: Option<&Published>,
+    window: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + window;
     loop {
         let response = runtime::curl(&[
             "--resolve".into(),

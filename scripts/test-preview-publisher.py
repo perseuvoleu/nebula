@@ -39,7 +39,7 @@ shutil.copyfile(BINARY, "/etc/nebula/candidate")
 os.chmod("/etc/nebula/candidate", 0o755)
 BINARY = "/etc/nebula/candidate"
 route_dir = Path("/etc/dokploy/traefik/dynamic")
-route_file = route_dir / "nebula-preview-demo.json"
+route_file = route_dir / "nebula-preview-demo.yaml"
 policy = {"namespace": "publisher-test", "state_dir": "/etc/nebula", "bind_address": "127.0.0.1",
           "gateway_image": "nginx:1.28-alpine", "projects": {"demo": {"git_common_dir": "/etc/nebula",
           "domain": "demo.example.test", "ports": [28081, 28082], "auth_file": "/etc/nebula/owner.htpasswd"}}}
