@@ -3659,6 +3659,10 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             }
             let detail = detail.map(|label| format!("{label} "));
             let remote = remote_badge(app.session_host(session), th);
+            let name = match branch_mismatch(app, session) {
+                Some(branch) => format!("⚠ expects {branch}: {name}"),
+                None => name,
+            };
             let name = truncate(
                 &name,
                 (inner.width as usize).saturating_sub(
@@ -4360,6 +4364,17 @@ fn draw_quick_terminal(f: &mut Frame, app: &mut App) {
     app.hits.insert(0, (inner, HitTarget::TerminalPane));
 }
 
+/// Historical affinity is a warning, never a different execution destination.
+fn branch_mismatch<'a>(app: &App, session: &'a SessionRow) -> Option<&'a str> {
+    let (id, recorded) = match session {
+        SessionRow::Agent(a) => (&a.worktree_id, a.branch.as_deref()),
+        SessionRow::Terminal(t) => (&t.worktree_id, t.branch.as_deref()),
+        SessionRow::Link(_) => return None,
+    };
+    let current = app.tree.worktrees.iter().find(|w| &w.id == id)?;
+    recorded.filter(|b| *b != current.branch)
+}
+
 /// `project ▸ branch ▸ session` breadcrumb of the current selection; the
 /// segment matching the focused panel is highlighted. Sessions/Terminal
 /// focus both highlight the session segment.
@@ -4418,6 +4433,12 @@ fn breadcrumb(app: &App) -> Vec<Span<'static>> {
                 &name,
                 matches!(app.focus, Focus::Sessions | Focus::Terminal),
             ));
+            if let Some(branch) = branch_mismatch(app, &session) {
+                spans.push(Span::styled(
+                    format!(" ⚠ expects {branch} — recovery required"),
+                    Style::default().fg(th.special),
+                ));
+            }
         }
     }
     spans

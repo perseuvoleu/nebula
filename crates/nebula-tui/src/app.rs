@@ -144,30 +144,22 @@ pub enum MenuAction {
         project: ProjectId,
         branch: String,
     },
-    /// A twin row (`… on findl`) whose host has no checkout of this
-    /// branch yet: check it out on the twin's primary (the `nebula
-    /// switch` shape, same as a local checkout-less branch row) and
-    /// carry on with `next` there — never on whatever branch the
-    /// primary happened to be on.
+    /// Resolve this branch on the selected host before continuing the session action.
     CheckoutThen {
         project: ProjectId,
         branch: String,
         next: AfterCheckout,
     },
-    /// Open the new-branch name prompt (chains into the base-branch
-    /// picker; the branch is created with `git branch` and checked out on
-    /// the primary, like `nebula switch`).
+    /// Open the name/base picker and create a Git branch without moving a checkout.
     NewBranch(ProjectId),
     /// A base-branch-picker row (new-branch flow): run
-    /// `git branch <name> <base>` in the project's primary checkout, then
-    /// check it out there.
+    /// `git branch <name> <base>` without moving the primary checkout.
     CreateBranchFrom {
         project: ProjectId,
         name: String,
         base: String,
     },
-    /// Check this row's branch out in the primary checkout: the daemon
-    /// removes the session-free worktree holding it and keeps the branch.
+    /// Deliberately switch primary; the daemon refuses occupied or already hosted branches.
     CheckoutPrimary {
         project: ProjectId,
         branch: String,
@@ -450,13 +442,6 @@ pub enum PendingAction {
         project: ProjectId,
         branch: String,
     },
-    /// Confirmed move of the primary checkout onto `branch` while busy
-    /// sessions sit on it; `next` runs there once the Ack lands.
-    CheckoutPrimary {
-        project: ProjectId,
-        branch: String,
-        next: AfterCheckout,
-    },
     Quit,
 }
 
@@ -482,9 +467,8 @@ pub enum PromptKind {
         id: ProjectId,
         before: bool,
     },
-    /// Name for a new local branch (checked out on the primary once
-    /// created, like `nebula switch`); submit chains into the
-    /// base-branch picker, which leads with the primary checkout's branch.
+    /// Name for a new local branch; submit opens the base picker.
+    /// Creating the branch leaves every checkout on its current branch.
     NewBranch {
         project: ProjectId,
     },
@@ -1662,9 +1646,12 @@ pub enum PendingIntent {
     /// The `a` palette flow picked a branch with no checkout: once the
     /// worktree's Ack lands, open the new-session picker on it.
     PickAgentOnCreatedWorktree,
-    /// A new-session keypress on a checkout-less branch row: the daemon is
-    /// checking the branch out on the primary; once the Ack lands, carry on
-    /// with the session on the primary checkout.
+    /// Continue on the acknowledged checkout, retaining the requested branch for spawn validation.
+    ResolveBranchThen {
+        branch: String,
+        next: AfterCheckout,
+    },
+    /// An explicitly requested primary checkout movement.
     CheckoutPrimaryThen {
         project: ProjectId,
         next: AfterCheckout,
@@ -1672,15 +1659,14 @@ pub enum PendingIntent {
     None,
 }
 
-/// What a branch row's new-session keypress does once its branch sits on
-/// the primary checkout.
+/// What to do once the selected host acknowledges an execution checkout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AfterCheckout {
     /// Just select the primary row — the branch is where the user now is.
     Land,
-    /// Open the new-session picker (agent kind) on the primary.
+    /// Open the new-session picker on the resolved checkout.
     PickAgent,
-    /// Create and attach a shell terminal on the primary.
+    /// Create and attach a shell on the resolved checkout.
     Terminal,
     /// ⌘T row: create and attach an agent of this kind, no prompts.
     QuickAgent(AgentKind),
@@ -2136,34 +2122,15 @@ impl Tree {
         vec![id.clone()]
     }
 
-    /// The row a session lives under. Its checkout's row while the
-    /// checkout still holds the session's branch (or the session predates
-    /// branch tracking); the checkout that holds that branch now, when it
-    /// moved to one; otherwise the branch's own row, chats parked there
-    /// until something checks the branch out again.
-    pub fn session_home(&self, worktree_id: &WorktreeId, branch: Option<&str>) -> SessionHome {
-        let Some(w) = self.worktrees.iter().find(|w| &w.id == worktree_id) else {
-            return SessionHome::Worktree(worktree_id.clone());
-        };
-        let Some(branch) = branch.filter(|b| *b != w.branch) else {
-            return SessionHome::Worktree(w.id.clone());
-        };
-        match self
-            .worktrees
-            .iter()
-            .find(|x| x.project_id == w.project_id && x.branch == branch)
-        {
-            Some(x) => SessionHome::Worktree(x.id.clone()),
-            None => SessionHome::Branch(w.project_id.clone(), branch.to_owned()),
-        }
-    }
-
+    /// An agent is listed under the checkout its process actually owns.
+    /// Historical branch metadata never substitutes another working directory.
     pub fn agent_home(&self, agent: &Agent) -> SessionHome {
-        self.session_home(&agent.worktree_id, agent.branch.as_deref())
+        SessionHome::Worktree(agent.worktree_id.clone())
     }
 
+    /// A shell stays listed under its physical checkout, including after a Git switch.
     pub fn terminal_home(&self, terminal: &TerminalTab) -> SessionHome {
-        self.session_home(&terminal.worktree_id, terminal.branch.as_deref())
+        SessionHome::Worktree(terminal.worktree_id.clone())
     }
 
     /// The names of the branches in `project` (or its twins) that only
@@ -2493,6 +2460,8 @@ pub struct App {
     pub select_divider_when_seen: Option<(ProjectId, bool)>,
     /// Worktree created by us, awaiting its upsert to fix the selection.
     pub select_worktree_when_seen: Option<WorktreeId>,
+    /// Branch captured when a session picker/resolution starts, retained until spawn.
+    pub session_creation_branches: HashMap<WorktreeId, String>,
     /// Project added by `nebula open`, awaiting its upsert to land the
     /// selection on it.
     pub select_project_when_seen: Option<ProjectId>,
@@ -2722,6 +2691,7 @@ impl App {
             select_when_seen: None,
             select_divider_when_seen: None,
             select_worktree_when_seen: None,
+            session_creation_branches: HashMap::new(),
             select_project_when_seen: None,
             open_at: None,
             select_note_when_seen: None,
@@ -4254,17 +4224,13 @@ mod tests {
         }
     }
 
-    /// A checkout switching branches leaves its chats where they were: a
-    /// session records the branch it was spawned on and is listed under
-    /// that branch's row — a plain branch row when nothing checks the
-    /// branch out any more (even one the branch cache doesn't list). A
-    /// session with no recorded branch follows the checkout.
+    /// Historical branch affinity never moves a session's physical checkout identity.
     #[test]
-    fn sessions_stay_on_their_branch_when_the_primary_switches() {
+    fn sessions_stay_on_their_checkout_when_the_primary_switches() {
         let (mut app, primary) = link_app();
         app.tree
             .agents
-            .push(agent_on("parked", &primary, Some("dada")));
+            .push(agent_on("old", &primary, Some("dada")));
         app.tree
             .agents
             .push(agent_on("current", &primary, Some("main")));
@@ -4274,79 +4240,33 @@ mod tests {
             worktree_id: primary.clone(),
             name: "shell".into(),
             sort_order: 0,
-            alive: false,
+            alive: true,
             busy: false,
             status: None,
             status_changed_at: 0,
             branch: Some("dada".into()),
         });
-
-        let names = |rows: Vec<SessionRow>| -> Vec<String> {
-            rows.iter()
-                .map(|r| match r {
-                    SessionRow::Agent(a) => a.name.clone(),
-                    SessionRow::Terminal(t) => t.name.clone(),
-                    SessionRow::Link(l) => l.label(),
-                })
-                .collect()
-        };
-        assert_eq!(
-            app.panel_entries(),
-            [
-                PanelEntry {
-                    row: PanelRow::Worktree(primary.clone()),
-                    depth: 0,
-                    base: None
-                },
-                PanelEntry {
-                    row: PanelRow::Branch("dada".into()),
-                    depth: 0,
-                    base: None
-                },
-            ],
-            "the parked branch gets a row without a cache entry"
-        );
-        assert_eq!(names(app.panel_row_sessions(0)), ["current", "legacy"]);
-        assert_eq!(names(app.panel_row_sessions(1)), ["parked", "shell"]);
-        app.sel_worktree = 1;
-        assert_eq!(app.selected_branch_row().as_deref(), Some("dada"));
-        assert_eq!(names(app.visible_session_rows()), ["parked", "shell"]);
-        assert_eq!(
-            app.row_index_for_session(&SessionRef::Agent(AgentId("parked".into()))),
-            Some(1)
-        );
-        assert_eq!(
-            app.row_index_for_session(&SessionRef::Terminal(TerminalId("t1".into()))),
-            Some(1)
-        );
-        assert_eq!(app.branch_rollup("dada"), Some(AgentStatus::Finished));
-
-        // The primary switches onto `dada` (cut from main): the parked
-        // chats come back under it, the ones on main park on main's row,
-        // and the primary nests under main — the tree survives the switch.
-        app.tree.worktrees[0].branch = "dada".into();
-        app.tree.worktrees[0].created_from = Some("main".into());
-        assert_eq!(
-            app.panel_entries(),
-            [
-                PanelEntry {
-                    row: PanelRow::Branch("main".into()),
-                    depth: 0,
-                    base: None
-                },
-                PanelEntry {
-                    row: PanelRow::Worktree(primary.clone()),
-                    depth: 1,
-                    base: Some("main".into())
-                },
-            ]
-        );
-        assert_eq!(names(app.panel_row_sessions(0)), ["current"]);
-        assert_eq!(
-            names(app.panel_row_sessions(1)),
-            ["parked", "legacy", "shell"]
-        );
-        assert_eq!(app.worktree_rollup(&primary), Some(AgentStatus::Finished));
+        // Even when a different physical checkout hosts the historical branch.
+        let mut other = app.tree.worktrees[0].clone();
+        other.id = WorktreeId("other".into());
+        other.path = "/tmp/other".into();
+        other.branch = "dada".into();
+        other.is_main = false;
+        app.tree.worktrees.push(other);
+        for actual in ["main", "dada", "another"] {
+            app.tree.worktrees[0].branch = actual.into();
+            for a in &app.tree.agents {
+                assert_eq!(
+                    app.tree.agent_home(a),
+                    SessionHome::Worktree(primary.clone())
+                );
+            }
+            assert_eq!(
+                app.tree.terminal_home(&app.tree.terminals[0]),
+                SessionHome::Worktree(primary.clone())
+            );
+            assert_eq!(app.visible_session_rows().len(), 4);
+        }
     }
 
     /// Branch rows nest by their recorded creation base like worktrees do:

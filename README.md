@@ -59,11 +59,12 @@ Terminal**. `Tab` / `Shift+Tab` (or `←` / `→`) move focus between columns,
 projects yet you get the splash instead — press `n` to add one without
 leaving the TUI.
 
-**3. Choose where the agent runs.** Select your project, then a worktree. Every
-project starts with one worktree: the checkout itself. Press `n` in the
-Worktrees column to branch off into a real `git worktree` (created under
-`<repo>/../<repo-name>-worktrees/<branch>`). That's the point of the column —
-two agents in two worktrees edit two directories and never collide.
+**3. Choose where the agent runs.** Select a project and branch on the desired host.
+Viewing a branch does not run Git checkout. Starting an agent, terminal, or split reuses
+that branch's checkout, including primary, or automatically creates a managed linked
+worktree for the existing branch. Different branches use independent directories;
+sessions on the same branch and host may intentionally share one. Explicit task
+worktrees remain available through `n` in the Worktrees column.
 
 **4. Start the agent.** With a worktree selected, press `n` in the Sessions
 column. A menu asks what to run — **Claude**, **Codex**, **Cursor**, or a
@@ -94,6 +95,19 @@ From there: `t` opens a shell in the selected worktree, `/` fuzzy-jumps to any
 project, worktree or session by name, `w` switches workspaces when one project
 list gets long, `s` opens settings, `?` lists every key, and `m` (or
 right-click) opens a context menu for whatever's selected.
+
+Branch checkouts retain their files after sessions finish. `nebula agent new --worktree
+<branch>` resolves an existing branch on the chosen host; `--worktree primary` still
+selects the actual primary checkout. Invalid branches and unavailable hosts fail without
+falling back to another directory. New checkouts use the normal environment setup.
+
+`nebula switch` and `nebula worktree checkout` are explicit Git operations. Moving
+primary is refused while another live agent or shell depends on it, including a
+finished agent whose process is still alive. Existing linked checkouts are preserved.
+Sessions stay grouped under their actual host-owned checkout. A historical branch
+mismatch shows a recovery warning and blocks stopped-session resume/restart: restore
+the expected branch explicitly when safe, or open a new session on it. Running
+processes are not moved or restarted automatically.
 
 ## Working a worktree
 
@@ -305,7 +319,7 @@ badge. Matching branch names retain separate checkout rows (`@local` and `@findl
 and host-specific session ownership. `nebula collect` brings committed remote work into a local
 primary branch or separate worktree, preserving both checkouts and all remote sessions.
 Use `nebula collect --help` for mode, owner, host, dry-run and timeout options.
-Guarded collection requires compatible local and remote daemons (protocol 28); updating the
+Guarded collection requires compatible local and remote daemons (protocol 29); updating the
 CLI alone does not update a running daemon. Plan restarts only when sessions can safely stop.
 Every session picker offers the other side (`Run on findl ▸` in `n`,
 flat `Claude on findl` … rows in ⌘T/⌘D), `--project name@host` picks the

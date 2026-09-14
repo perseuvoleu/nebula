@@ -384,6 +384,21 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     )
                     .await;
                 }
+                ClientRequest::ResolveBranchCheckout {
+                    req_id,
+                    project,
+                    branch,
+                } => {
+                    reply(
+                        &out_tx,
+                        req_id,
+                        daemon
+                            .resolve_branch_checkout(&project, &branch)
+                            .await
+                            .map(Some),
+                    )
+                    .await;
+                }
                 ClientRequest::DeleteWorktree { req_id, id, force } => {
                     // `git worktree remove` can take seconds on a large
                     // checkout; run it off the request loop so Input/Attach
@@ -431,6 +446,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 ClientRequest::CreateAgent {
                     req_id,
                     worktree,
+                    expected_branch,
                     name,
                     kind,
                     model,
@@ -442,7 +458,16 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         &out_tx,
                         req_id,
                         daemon
-                            .create_agent(&worktree, &name, kind, model, effort, auto_title, prompt)
+                            .create_agent(
+                                &worktree,
+                                expected_branch.as_deref(),
+                                &name,
+                                kind,
+                                model,
+                                effort,
+                                auto_title,
+                                prompt,
+                            )
                             .await
                             .map(Some),
                     )
@@ -527,12 +552,15 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 ClientRequest::CreateTerminal {
                     req_id,
                     worktree,
+                    expected_branch,
                     name,
                 } => {
                     reply(
                         &out_tx,
                         req_id,
-                        daemon.create_terminal(&worktree, name).map(Some),
+                        daemon
+                            .create_terminal(&worktree, expected_branch.as_deref(), name)
+                            .map(Some),
                     )
                     .await;
                 }

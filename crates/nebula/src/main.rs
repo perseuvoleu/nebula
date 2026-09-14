@@ -264,10 +264,8 @@ enum WorktreeCommand {
         #[arg(long)]
         project: Option<String>,
     },
-    /// Check a branch out in the primary checkout. A nebula worktree
-    /// holding that branch is removed first (the branch is kept); refused
-    /// while sessions still run on it. Never detach a worktree by hand to
-    /// free a branch — this is the supported route.
+    /// Deliberately switch primary. Refused while another live session depends
+    /// on it or the branch already has a checkout; use that checkout instead.
     Checkout {
         /// Local branch name.
         branch: String,

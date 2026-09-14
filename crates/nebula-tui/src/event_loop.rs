@@ -573,14 +573,8 @@ pub enum BranchEvent {
     /// `git for-each-ref` answer for this project's repo, each branch
     /// carrying the creation base its reflog names.
     List(nebula_core::ProjectId, Vec<crate::branches::LocalBranch>),
-    /// A `git branch` op finished; `message` is the flash to show. A
-    /// successful create carries the branch to check out on the primary
-    /// next — the `nebula switch` shape, create then land there.
-    Op {
-        message: String,
-        error: bool,
-        checkout: Option<(nebula_core::ProjectId, String)>,
-    },
+    /// A `git branch` mutation finished; creation never moves a checkout.
+    Op { message: String },
 }
 
 /// Kick a local-branch listing for the panel's checkout-less branch rows,
@@ -617,7 +611,7 @@ fn spawn_branch_list(app: &mut App) {
 /// Land a branch-channel answer: refresh the cache, or flash an op's
 /// outcome and re-list so the new/removed branch row shows right away. A
 /// create's follow-up checkout goes out from here.
-fn handle_branch_event(app: &mut App, ev: BranchEvent, out: &mut Vec<ClientRequest>) {
+fn handle_branch_event(app: &mut App, ev: BranchEvent, _out: &mut Vec<ClientRequest>) {
     match ev {
         BranchEvent::List(project, branches) => {
             app.branch_inflight = false;
@@ -627,20 +621,10 @@ fn handle_branch_event(app: &mut App, ev: BranchEvent, out: &mut Vec<ClientReque
                 app.dirty = true;
             }
         }
-        BranchEvent::Op {
-            message,
-            error,
-            checkout,
-        } => {
+        BranchEvent::Op { message, .. } => {
             app.dirty = true;
             spawn_branch_list(app);
-            match (error, checkout) {
-                (false, Some((project, branch))) => {
-                    checkout_primary_then(app, project, branch, AfterCheckout::Land, out);
-                    app.flash = Some(format!("{message} · checking out on the primary…"));
-                }
-                _ => app.flash = Some(message),
-            }
+            app.flash = Some(message);
         }
     }
 }
@@ -650,7 +634,7 @@ fn handle_branch_event(app: &mut App, ev: BranchEvent, out: &mut Vec<ClientReque
 /// commits.
 enum BranchCmd {
     /// `git branch <name> <base>`; on success the branch is checked out
-    /// on the primary, like `nebula switch`.
+    /// without moving any checkout.
     Create {
         name: String,
         base: String,
@@ -685,26 +669,13 @@ fn spawn_branch_op(
         app.flash = Some("project has no primary checkout".into());
         return;
     };
-    let project = project.clone();
     let run = move || {
-        let (result, checkout) = match &cmd {
-            BranchCmd::Create { name, base } => (
-                crate::branches::branch_op(&repo, &[name, base]),
-                Some((project, name.clone())),
-            ),
-            BranchCmd::Delete(branch) => (crate::branches::delete_branch(&repo, branch), None),
+        let result = match &cmd {
+            BranchCmd::Create { name, base } => crate::branches::branch_op(&repo, &[name, base]),
+            BranchCmd::Delete(branch) => crate::branches::delete_branch(&repo, branch),
         };
-        match result {
-            Ok(()) => BranchEvent::Op {
-                message: done,
-                error: false,
-                checkout,
-            },
-            Err(e) => BranchEvent::Op {
-                message: e,
-                error: true,
-                checkout: None,
-            },
+        BranchEvent::Op {
+            message: result.map(|()| done).unwrap_or_else(|e| e),
         }
     };
     match app.branch_tx.clone() {
@@ -1681,7 +1652,10 @@ fn open_new_worktree_or_branch_picker(app: &mut App, project: nebula_core::Proje
                 "Worktree (own directory)",
                 MenuAction::NewWorktree(project.clone()),
             ),
-            row("Branch (on the primary)", MenuAction::NewBranch(project)),
+            row(
+                "Branch (checkout when needed)",
+                MenuAction::NewBranch(project),
+            ),
         ],
         at: None,
         hover: 0,
@@ -1753,7 +1727,7 @@ fn open_prompt(app: &mut App, kind: PromptKind) {
         ),
         PromptKind::NewBranch { .. } => (
             "New branch".to_string(),
-            "branch name (checked out on the primary, like nebula switch)".to_string(),
+            "branch name (files stay on the current branch)".to_string(),
             String::new(),
         ),
         PromptKind::NewAgent {
@@ -2552,11 +2526,8 @@ fn open_session_picker_for_context(app: &mut App, out: &mut Vec<ClientRequest>) 
     open_new_agent_picker(app, worktree);
 }
 
-/// The session picker on a branch: an existing checkout (the primary
-/// included) goes straight to the picker; a checkout-less branch is
-/// checked out on the primary — a branch is a branch, not a reason for a
-/// separate checkout — and the picker follows the Ack there. An explicit
-/// worktree is the menu's other item.
+/// A session reuses this host's branch checkout or resolves a managed linked
+/// checkout before opening the picker. Navigation alone never provisions one.
 fn pick_agent_on_branch(
     app: &mut App,
     project: nebula_core::ProjectId,
@@ -2572,15 +2543,141 @@ fn pick_agent_on_branch(
     {
         open_new_agent_picker(app, worktree);
     } else {
-        checkout_primary_then(app, project, branch, AfterCheckout::PickAgent, out);
+        resolve_branch_then(app, project, branch, AfterCheckout::PickAgent, out);
     }
 }
 
-/// Check `branch` out on the project's primary checkout, then carry on with
-/// `next` there — the `nebula switch` shape. Sessions already working on
-/// the primary would have the branch change under them, so the move is
-/// confirmed first whenever one of them is busy; an idle primary moves
-/// straight away.
+/// Resolve an execution checkout on the selected host without moving primary.
+fn resolve_branch_then(
+    app: &mut App,
+    project: nebula_core::ProjectId,
+    branch: String,
+    next: AfterCheckout,
+    out: &mut Vec<ClientRequest>,
+) {
+    let req_id = app.alloc_req_id(PendingIntent::ResolveBranchThen {
+        branch: branch.clone(),
+        next,
+    });
+    app.flash = Some(format!("resolving {branch} checkout…"));
+    app.dirty = true;
+    out.push(ClientRequest::ResolveBranchCheckout {
+        req_id,
+        project,
+        branch,
+    });
+}
+
+fn remember_session_branch(app: &mut App, id: &WorktreeId) {
+    if let Some(w) = app.tree.worktrees.iter().find(|w| &w.id == id) {
+        app.session_creation_branches
+            .insert(id.clone(), w.branch.clone());
+    }
+}
+
+fn expected_session_branch(app: &mut App, id: &WorktreeId) -> Option<String> {
+    app.session_creation_branches.remove(id).or_else(|| {
+        app.tree
+            .worktrees
+            .iter()
+            .find(|w| &w.id == id)
+            .map(|w| w.branch.clone())
+    })
+}
+
+/// Continue a session action only with the checkout id acknowledged by its host.
+fn after_checkout(
+    app: &mut App,
+    id: WorktreeId,
+    branch: String,
+    next: AfterCheckout,
+    out: &mut Vec<ClientRequest>,
+) {
+    if !select_worktree_by_id(app, &id, out) {
+        app.select_worktree_when_seen = Some(id.clone());
+    }
+    app.session_creation_branches
+        .insert(id.clone(), branch.clone());
+    match next {
+        AfterCheckout::Land => {}
+        AfterCheckout::PickAgent => {
+            open_new_agent_picker(app, id.clone());
+            app.session_creation_branches.insert(id, branch);
+        }
+        AfterCheckout::Terminal | AfterCheckout::SplitShell => {
+            let intent = if next == AfterCheckout::SplitShell {
+                PendingIntent::AttachCreatedSplit
+            } else {
+                PendingIntent::AttachCreated
+            };
+            let req_id = app.alloc_req_id(intent);
+            out.push(ClientRequest::CreateTerminal {
+                expected_branch: expected_session_branch(app, &id),
+                req_id,
+                worktree: id,
+                name: None,
+            });
+        }
+        AfterCheckout::QuickAgent(kind) | AfterCheckout::SplitAgent(kind) => {
+            let intent = if matches!(next, AfterCheckout::SplitAgent(_)) {
+                PendingIntent::AttachCreatedSplit
+            } else {
+                PendingIntent::AttachCreated
+            };
+            create_default_agent(app, id, kind, intent, out);
+        }
+    }
+}
+
+/// A checkout-less branch offers session kinds before provisioning a checkout.
+fn branch_session_menu(app: &mut App, split: bool) -> bool {
+    let Some((project, branch)) = app
+        .selected_project()
+        .map(|p| p.id.clone())
+        .zip(app.selected_branch_row())
+    else {
+        return false;
+    };
+    let target = TwinTarget::Checkout { project, branch };
+    let mut items: Vec<MenuItem> = [
+        AgentKind::Claude,
+        AgentKind::Codex,
+        AgentKind::Cursor,
+        AgentKind::Pi,
+    ]
+    .into_iter()
+    .map(|kind| MenuItem {
+        label: kind.as_str().to_owned(),
+        action: target.clone().then(if split {
+            AfterCheckout::SplitAgent(kind)
+        } else {
+            AfterCheckout::QuickAgent(kind)
+        }),
+        destructive: false,
+    })
+    .collect();
+    items.push(MenuItem {
+        label: "Terminal (shell)".into(),
+        action: target.then(if split {
+            AfterCheckout::SplitShell
+        } else {
+            AfterCheckout::Terminal
+        }),
+        destructive: false,
+    });
+    app.overlay = Some(Overlay::Menu(ContextMenu {
+        title: Some(if split { "Split pane" } else { "New session" }.into()),
+        items,
+        at: None,
+        hover: if split { 0 } else { 4 },
+        area: Default::default(),
+        parent: None,
+        filter: None,
+    }));
+    true
+}
+
+/// Explicit checkout movement is checked by the host daemon against every live PTY.
 fn checkout_primary_then(
     app: &mut App,
     project: nebula_core::ProjectId,
@@ -2588,46 +2685,7 @@ fn checkout_primary_then(
     next: AfterCheckout,
     out: &mut Vec<ClientRequest>,
 ) {
-    let primary = app
-        .tree
-        .worktrees
-        .iter()
-        .find(|w| w.project_id == project && w.is_main);
-    let busy: Vec<&str> = primary
-        .map(|p| {
-            app.tree
-                .agents
-                .iter()
-                .filter(|a| a.worktree_id == p.id && !a.archived)
-                .filter(|a| {
-                    matches!(
-                        a.status,
-                        nebula_core::AgentStatus::Running | nebula_core::AgentStatus::NeedsFeedback
-                    )
-                })
-                .map(|a| a.name.as_str())
-                .collect()
-        })
-        .unwrap_or_default();
-    if busy.is_empty() {
-        request_checkout_primary(app, project, branch, next, out);
-        return;
-    }
-    let current = primary.map(|p| p.branch.as_str()).unwrap_or("?");
-    app.overlay = Some(Overlay::Confirm(ConfirmDialog {
-        title: "Move primary checkout".into(),
-        message: format!(
-            "The primary is on {current} with {} busy session(s): {}.\nCheck out {branch} under them?",
-            busy.len(),
-            busy.join(", ")
-        ),
-        action: PendingAction::CheckoutPrimary {
-            project,
-            branch,
-            next,
-        },
-    }));
-    app.dirty = true;
+    request_checkout_primary(app, project, branch, next, out);
 }
 
 /// The `CheckoutPrimary` request itself; the Ack lands on the primary and
@@ -2673,14 +2731,13 @@ fn context_worktree(app: &App) -> Option<nebula_core::WorktreeId> {
 /// Projects panel has focus. The daemon names it (`term-N`) and the Ack
 /// attaches it, so one keypress lands in a ready shell.
 fn create_terminal_for_context(app: &mut App, out: &mut Vec<ClientRequest>) {
-    // A checkout-less branch row: the shell wants that branch, on the
-    // primary — check it out there first, the Ack creates the terminal.
+    // A checkout-less branch needs resolution before the shell can be spawned.
     if app.focus == Focus::Worktrees {
         if let (Some(branch), Some(project)) = (
             app.selected_branch_row(),
             app.selected_project().map(|p| p.id.clone()),
         ) {
-            checkout_primary_then(app, project, branch, AfterCheckout::Terminal, out);
+            resolve_branch_then(app, project, branch, AfterCheckout::Terminal, out);
             return;
         }
     }
@@ -2688,8 +2745,10 @@ fn create_terminal_for_context(app: &mut App, out: &mut Vec<ClientRequest>) {
         app.flash = Some("select a project or worktree first".into());
         return;
     };
+    remember_session_branch(app, &worktree);
     let req_id = app.alloc_req_id(PendingIntent::AttachCreated);
     out.push(ClientRequest::CreateTerminal {
+        expected_branch: expected_session_branch(app, &worktree),
         req_id,
         worktree,
         name: None,
@@ -2757,10 +2816,14 @@ fn quick_terminal_shortcut(app: &mut App, out: &mut Vec<ClientRequest>) {
         return;
     }
     let Some(worktree) = context_worktree(app) else {
+        if branch_session_menu(app, false) {
+            return;
+        }
         app.flash = Some("select a project or worktree first".into());
         return;
     };
     app.collapsed = false;
+    remember_session_branch(app, &worktree);
     let kind_row = |label: &str, kind: AgentKind| MenuItem {
         label: label.into(),
         action: MenuAction::QuickAgentOfKind {
@@ -2843,6 +2906,7 @@ fn toggle_quick_terminal(app: &mut App, out: &mut Vec<ClientRequest>) {
         None => {
             let req_id = app.alloc_req_id(PendingIntent::AttachCreated);
             out.push(ClientRequest::CreateTerminal {
+                expected_branch: expected_session_branch(app, &worktree),
                 req_id,
                 worktree,
                 name: Some(QUICK_TERMINAL_NAME.into()),
@@ -2868,9 +2932,13 @@ fn toggle_split_terminal(app: &mut App, out: &mut Vec<ClientRequest>) {
         return;
     }
     let Some(worktree) = quick_terminal_worktree(app) else {
+        if branch_session_menu(app, true) {
+            return;
+        }
         app.flash = Some("select a project or worktree first".into());
         return;
     };
+    remember_session_branch(app, &worktree);
     let kind_row = |label: &str, kind: AgentKind| MenuItem {
         label: label.into(),
         action: MenuAction::SplitAgentOfKind {
@@ -3683,6 +3751,7 @@ fn open_new_agent_picker(app: &mut App, worktree: WorktreeId) {
 }
 
 fn open_agent_picker(app: &mut App, worktree: WorktreeId) {
+    remember_session_branch(app, &worktree);
     let kind_row = |label: &str, kind: AgentKind| MenuItem {
         label: label.into(),
         action: MenuAction::NewAgentOfKind {
@@ -3732,8 +3801,7 @@ fn open_agent_picker(app: &mut App, worktree: WorktreeId) {
 }
 
 /// Where a twin row sends a new session: the twin's checkout of the same
-/// branch when it has one, otherwise a checkout of that branch on the
-/// twin's primary first (`nebula switch` there, then the session).
+/// branch when it has one, otherwise a managed linked checkout on that host.
 #[derive(Debug, Clone, PartialEq)]
 enum TwinTarget {
     Worktree(WorktreeId),
@@ -3774,7 +3842,7 @@ impl TwinTarget {
 /// session pickers; `where` is the host name, or "locally" for the
 /// checkout on this machine. The target follows the worktree's *branch*,
 /// exactly like a local pick would: the twin's checkout of that branch,
-/// or a checkout of it on the twin's primary when there is none — a
+/// or a managed linked checkout on the twin when there is none — a
 /// session started "on findl" from a feature worktree never lands on
 /// whatever findl's primary happens to be on.
 fn project_twins(app: &App, worktree: &WorktreeId) -> Vec<(String, TwinTarget)> {
@@ -5913,11 +5981,7 @@ fn run_pending_action(app: &mut App, action: PendingAction, out: &mut Vec<Client
             let done = format!("branch {branch} deleted");
             spawn_branch_op(app, &project, BranchCmd::Delete(branch), done, out);
         }
-        PendingAction::CheckoutPrimary {
-            project,
-            branch,
-            next,
-        } => request_checkout_primary(app, project, branch, next, out),
+
         PendingAction::Quit => app.should_quit = true,
     }
 }
@@ -6058,6 +6122,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
         MenuAction::NewTerminal(worktree) => {
             let req_id = app.alloc_req_id(PendingIntent::AttachCreated);
             out.push(ClientRequest::CreateTerminal {
+                expected_branch: expected_session_branch(app, &worktree),
                 req_id,
                 worktree,
                 name: None,
@@ -6077,6 +6142,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
         MenuAction::SplitShell(worktree) => {
             let req_id = app.alloc_req_id(PendingIntent::AttachCreatedSplit);
             out.push(ClientRequest::CreateTerminal {
+                expected_branch: expected_session_branch(app, &worktree),
                 req_id,
                 worktree,
                 name: None,
@@ -6086,7 +6152,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             project,
             branch,
             next,
-        } => checkout_primary_then(app, project, branch, next, out),
+        } => resolve_branch_then(app, project, branch, next, out),
         MenuAction::RenameTerminal(id) => open_prompt(app, PromptKind::RenameTerminal { id }),
         MenuAction::CloseTerminal(id) => {
             if let Some(t) = app.tree.terminals.iter().find(|t| t.id == id).cloned() {
@@ -6871,6 +6937,7 @@ fn create_default_agent(
     let cfg = crate::config::Config::load();
     let req_id = app.alloc_req_id(intent);
     out.push(ClientRequest::CreateAgent {
+        expected_branch: expected_session_branch(app, &worktree),
         req_id,
         worktree: worktree.clone(),
         name: app.default_session_name("agent"),
@@ -7164,6 +7231,7 @@ fn create_agent(
     };
     let req_id = app.alloc_req_id(PendingIntent::AttachCreated);
     out.push(ClientRequest::CreateAgent {
+        expected_branch: expected_session_branch(app, &worktree),
         req_id,
         worktree: worktree.clone(),
         name,
@@ -9175,6 +9243,12 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                     }
                     open_new_agent_picker(app, id);
                 }
+                (
+                    Some(PendingIntent::ResolveBranchThen { branch, next }),
+                    Some(EntityId::Worktree(id)),
+                ) => {
+                    after_checkout(app, id, branch, next, out);
+                }
                 (Some(PendingIntent::CheckoutPrimaryThen { project, next }), _) => {
                     // The branch now sits on the primary checkout (its row's
                     // branch label follows via the reconcile upsert). Land
@@ -9198,6 +9272,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                         AfterCheckout::Terminal => {
                             let req_id = app.alloc_req_id(PendingIntent::AttachCreated);
                             out.push(ClientRequest::CreateTerminal {
+                                expected_branch: expected_session_branch(app, &primary),
                                 req_id,
                                 worktree: primary,
                                 name: None,
@@ -9220,6 +9295,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                         AfterCheckout::SplitShell => {
                             let req_id = app.alloc_req_id(PendingIntent::AttachCreatedSplit);
                             out.push(ClientRequest::CreateTerminal {
+                                expected_branch: expected_session_branch(app, &primary),
                                 req_id,
                                 worktree: primary,
                                 name: None,
@@ -10027,8 +10103,8 @@ mod tests {
                 entity: Entity::Worktree(feature("w-feat", "p1", 1)),
             },
         );
-        // findl has no checkout of feature-x: "Run on findl" checks the
-        // branch out on findl's primary first, then picks the agent there
+        // findl has no checkout of feature-x: "Run on findl" resolves
+        // a linked branch checkout there, then picks the agent there
         // — never a session on whatever findl's primary was on.
         open_agent_picker(&mut app, WorktreeId("w-feat".into()));
         let Some(Overlay::Menu(menu)) = &app.overlay else {
@@ -10054,7 +10130,7 @@ mod tests {
         assert!(
             matches!(
                 out.last(),
-                Some(ClientRequest::CheckoutPrimary { project, branch, .. })
+                Some(ClientRequest::ResolveBranchCheckout { project, branch, .. })
                     if project.as_str() == "p-remote" && branch == "feature-x"
             ),
             "{out:?}"
@@ -10296,7 +10372,7 @@ mod tests {
     }
 
     #[test]
-    fn branch_badge_does_not_label_remote_parked_sessions_as_local() {
+    fn historical_remote_branch_does_not_change_local_branch_ownership() {
         let mut app = App::new();
         seed_tree(&mut app);
         seed_remote_twin(&mut app);
@@ -10312,7 +10388,17 @@ mod tests {
         app.tree.agents.push(remote);
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
-        assert!(!text.contains("develop (branch) @local"), "{text}");
+        assert!(text.contains("develop (branch) @local"), "{text}");
+        let remote = app
+            .tree
+            .agents
+            .iter()
+            .find(|a| a.id.as_str() == "remote-parked")
+            .unwrap();
+        assert_eq!(
+            app.tree.agent_home(remote),
+            crate::app::SessionHome::Worktree(WorktreeId("w-remote".into()))
+        );
     }
 
     fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
@@ -18305,11 +18391,9 @@ mod tests {
         assert!(out.is_empty(), "nothing goes to the daemon: {out:?}");
     }
 
-    /// The `a` flow on a branch with no checkout: the branch is checked
-    /// out on the primary (no worktree minted), and the Ack opens the
-    /// session picker on the primary checkout.
+    /// The branch action resolves a physical checkout before opening its session picker.
     #[test]
-    fn agent_on_branch_without_checkout_checks_it_out_on_primary_then_opens_picker() {
+    fn agent_on_branch_without_checkout_resolves_then_opens_picker() {
         let mut app = App::new();
         seed_tree(&mut app);
         let mut out = Vec::new();
@@ -18321,29 +18405,18 @@ mod tests {
             },
             &mut out,
         );
-        let Some(ClientRequest::CheckoutPrimary { req_id, branch, .. }) = out.first() else {
-            panic!("expected CheckoutPrimary, got {out:?}");
+        let Some(ClientRequest::ResolveBranchCheckout { req_id, branch, .. }) = out.first() else {
+            panic!("expected ResolveBranchCheckout, got {out:?}");
         };
         assert_eq!(branch, "feature");
-        assert!(
-            !out.iter()
-                .any(|r| matches!(r, ClientRequest::CreateWorktree { .. })),
-            "a branch gets no worktree of its own"
-        );
         let req_id = *req_id;
-        let primary = app
-            .tree
-            .worktrees
-            .iter()
-            .find(|w| w.is_main)
-            .map(|w| w.id.clone())
-            .expect("seed has a primary");
+        let resolved = WorktreeId("resolved-feature".into());
         let mut out = Vec::new();
         handle_server_event(
             &mut app,
             ServerEvent::Ack {
                 req_id,
-                created: None,
+                created: Some(EntityId::Worktree(resolved.clone())),
             },
             &mut out,
         );
@@ -18354,11 +18427,63 @@ mod tests {
         assert!(
             matches!(
                 &menu.items[0].action,
-                MenuAction::NewAgentOfKind { worktree, .. } if worktree == &primary
+                MenuAction::NewAgentOfKind { worktree, .. } if worktree == &resolved
             ),
             "{:?}",
             menu.items[0].action
         );
+    }
+
+    #[test]
+    fn split_on_unmaterialized_branch_retains_branch_through_late_checkout_updates() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.branch_list = Some((ProjectId("p1".into()), vec!["feature".into()]));
+        app.focus = Focus::Worktrees;
+        app.sel_worktree = app.visible_worktrees().len();
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::SUPER, &mut out);
+        assert!(out.is_empty(), "opening the picker does not mutate Git");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        let Some(ClientRequest::ResolveBranchCheckout { req_id, branch, .. }) = out.last() else {
+            panic!("{out:?}")
+        };
+        assert_eq!(branch, "feature");
+        let req_id = *req_id;
+        let id = WorktreeId("resolved".into());
+        let mut checkout = app.tree.worktrees[0].clone();
+        checkout.id = id.clone();
+        checkout.branch = "changed-after-resolution".into();
+        checkout.is_main = false;
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: nebula_core::Entity::Worktree(checkout),
+            },
+        );
+        out.clear();
+        handle_server_event(
+            &mut app,
+            ServerEvent::Ack {
+                req_id,
+                created: Some(EntityId::Worktree(id.clone())),
+            },
+            &mut out,
+        );
+        assert!(out.iter().any(|r| matches!(r, ClientRequest::CreateAgent { worktree, expected_branch: Some(branch), .. } if worktree == &id && branch == "feature")), "{out:?}");
+    }
+
+    #[test]
+    fn historical_branch_mismatch_is_visible_in_the_breadcrumb() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.tree.agents[0].branch = Some("feature".into());
+        app.focus = Focus::Sessions;
+        let mut terminal = Terminal::new(TestBackend::new(160, 35)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("expects feature"), "{text}");
+        assert_eq!(app.selected_worktree().unwrap().branch, "main");
     }
 
     /// The panel is WORKTREES & BRANCHES now: checkout-less local branches
@@ -18501,12 +18626,9 @@ mod tests {
         assert!(!text.contains("feat (wt)"), "{text}");
     }
 
-    /// `t` on a checkout-less branch row skips the "select a worktree"
-    /// flash: it checks the branch out on the primary (the session picker
-    /// follows the Ack, same as the row menu's "New agent here") — no
-    /// worktree is minted for a branch.
+    /// The session key on a checkout-less branch requests host-owned resolution.
     #[test]
-    fn t_on_a_branch_row_checks_it_out_on_primary_for_the_picker() {
+    fn t_on_a_branch_row_resolves_for_the_picker() {
         let mut app = App::new();
         seed_tree(&mut app);
         app.branch_list = Some((
@@ -18521,23 +18643,22 @@ mod tests {
         assert!(
             app.flash
                 .as_deref()
-                .is_some_and(|f| f.contains("checking out feature-x")),
+                .is_some_and(|f| f.contains("resolving feature-x")),
             "progress flash, not the select-a-worktree one: {:?}",
             app.flash
         );
         assert!(
             matches!(
                 out.last(),
-                Some(ClientRequest::CheckoutPrimary { branch, .. }) if branch == "feature-x"
+                Some(ClientRequest::ResolveBranchCheckout { branch, .. }) if branch == "feature-x"
             ),
             "{out:?}"
         );
     }
 
-    /// ⌘T on a checkout-less branch row: the same checkout-on-primary,
-    /// and the Ack creates the shell on the primary checkout.
+    /// The terminal action uses the checkout acknowledged for the requested branch.
     #[test]
-    fn new_terminal_on_a_branch_row_lands_on_the_primary() {
+    fn new_terminal_on_a_branch_row_uses_resolved_checkout() {
         let mut app = App::new();
         seed_tree(&mut app);
         app.branch_list = Some((
@@ -18549,31 +18670,25 @@ mod tests {
         assert_eq!(app.selected_branch_row().as_deref(), Some("feature-x"));
         let mut out = Vec::new();
         create_terminal_for_context(&mut app, &mut out);
-        let Some(ClientRequest::CheckoutPrimary { req_id, .. }) = out.last() else {
-            panic!("expected CheckoutPrimary, got {out:?}");
+        let Some(ClientRequest::ResolveBranchCheckout { req_id, .. }) = out.last() else {
+            panic!("expected ResolveBranchCheckout, got {out:?}");
         };
         let req_id = *req_id;
-        let primary = app
-            .tree
-            .worktrees
-            .iter()
-            .find(|w| w.is_main)
-            .map(|w| w.id.clone())
-            .unwrap();
+        let resolved = WorktreeId("resolved-feature".into());
         let mut out = Vec::new();
         handle_server_event(
             &mut app,
             ServerEvent::Ack {
                 req_id,
-                created: None,
+                created: Some(EntityId::Worktree(resolved.clone())),
             },
             &mut out,
         );
         assert!(
             matches!(
                 out.last(),
-                Some(ClientRequest::CreateTerminal { worktree, name: None, .. })
-                    if worktree == &primary
+                Some(ClientRequest::CreateTerminal { worktree, expected_branch: Some(branch), name: None, .. })
+                    if worktree == &resolved && branch == "feature-x"
             ),
             "{out:?}"
         );
@@ -18631,30 +18746,23 @@ mod tests {
         );
         assert_eq!(
             app.flash.as_deref(),
-            Some("branch topic created from main · checking out on the primary…")
+            Some("branch topic created from main")
         );
         assert!(
             app.branch_rows().contains(&"topic".to_string()),
             "{:?}",
             app.branch_list
         );
-        // Then the `nebula switch` step: the fresh branch is checked out
-        // on the primary, so the user lands on it instead of on a dim row
-        // that moves the primary at some later keypress.
         assert!(
-            matches!(
-                out.last(),
-                Some(ClientRequest::CheckoutPrimary { branch, .. }) if branch == "topic"
-            ),
+            !out.iter()
+                .any(|r| matches!(r, ClientRequest::CheckoutPrimary { .. })),
             "{out:?}"
         );
     }
 
-    /// Moving the primary under a busy session is not silent: the checkout
-    /// (from a branch row's `a`, or a fresh create) asks first, and `y`
-    /// sends it. An idle primary needs no question.
+    /// Creating on another branch leaves a running primary unchanged without confirmation.
     #[test]
-    fn moving_the_primary_under_a_running_session_asks_first() {
+    fn new_branch_session_preserves_a_running_primary_without_confirmation() {
         let mut app = App::new();
         seed_tree(&mut app);
         let primary = app.tree.worktrees[0].id.clone();
@@ -18689,17 +18797,14 @@ mod tests {
             },
             &mut out,
         );
-        assert!(out.is_empty(), "nothing moves before the answer: {out:?}");
-        let Some(Overlay::Confirm(c)) = &app.overlay else {
-            panic!("expected a confirm, got {:?}", app.overlay);
-        };
-        assert!(c.message.contains("worker"), "{}", c.message);
-        assert!(c.message.contains("feature"), "{}", c.message);
-        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE, &mut out);
+        assert!(
+            app.overlay.is_none(),
+            "no permission to move primary is needed"
+        );
         assert!(
             matches!(
                 out.last(),
-                Some(ClientRequest::CheckoutPrimary { branch, .. }) if branch == "feature"
+                Some(ClientRequest::ResolveBranchCheckout { branch, .. }) if branch == "feature"
             ),
             "{out:?}"
         );

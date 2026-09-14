@@ -272,6 +272,20 @@ pub fn worktree_dir(repo: &Path, branch: &str) -> PathBuf {
 /// `git worktree add <path> -b <branch> [base]`. Falls back to checking out an
 /// existing branch when `-b` fails because it already exists.
 pub async fn add_worktree(repo: &Path, branch: &str, base: Option<&str>) -> Result<PathBuf> {
+    add_worktree_inner(repo, branch, base, false).await
+}
+
+/// Add a linked checkout of an existing branch, without ever minting a branch.
+pub async fn add_existing_worktree(repo: &Path, branch: &str) -> Result<PathBuf> {
+    add_worktree_inner(repo, branch, None, true).await
+}
+
+async fn add_worktree_inner(
+    repo: &Path,
+    branch: &str,
+    base: Option<&str>,
+    existing: bool,
+) -> Result<PathBuf> {
     let path = worktree_dir(repo, branch);
     let remote = nebula_core::remote::is_remote(repo);
     if !remote && path.exists() {
@@ -288,6 +302,10 @@ pub async fn add_worktree(repo: &Path, branch: &str, base: Option<&str>) -> Resu
         }
     }
     let path_str = path.to_string_lossy().into_owned();
+    if existing {
+        git(repo, &["worktree", "add", "--", &path_str, branch]).await?;
+        return Ok(path);
+    }
     let mut args = vec!["worktree", "add", &path_str, "-b", branch];
     if let Some(base) = base {
         args.push(base);

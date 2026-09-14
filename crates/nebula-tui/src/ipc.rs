@@ -800,8 +800,8 @@ pub async fn switch(
     let base = from.or_else(current_branch_here);
     let pre_existing = git_branch_exists(&project.repo_path, &branch);
     // The shell running this command: a terminal tab (`term:<id>`) or an
-    // agent session. It follows the branch it asked for; every other
-    // session on the primary stays listed under the branch it was on.
+    // agent session. It may move itself only when no other live session
+    // depends on primary; stopped sessions retain their resume expectations.
     let own_env = std::env::var("NEBULA_AGENT_ID").ok();
     let terminal = own_env
         .as_deref()
@@ -1057,10 +1057,8 @@ pub(crate) fn resolve_worktree<'a>(
     }
 }
 
-/// `nebula worktree checkout <branch> [--project <name>]` — check a branch
-/// out in the primary checkout through the daemon, which first removes the
-/// session-free nebula worktree holding it (git allows one checkout per
-/// branch) and keeps the branch. Refused while sessions run there.
+/// `nebula worktree checkout <branch>` explicitly switches primary. Refused
+/// while another live session depends on it or the branch has another checkout.
 pub async fn worktree_checkout(branch: String, project_flag: Option<String>) -> Result<()> {
     let sock = paths::socket_path();
     let Ok(stream) = try_connect(&sock).await else {
@@ -1466,8 +1464,46 @@ pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
         .iter()
         .filter(|w| w.project_id == project.id)
         .collect();
-    let target = match opts.worktree.as_deref() {
-        Some(sel) => resolve_worktree(&of_project, sel, &project.name, true)?,
+    let (target, expected_branch) = match opts.worktree.as_deref() {
+        Some(sel) => match resolve_worktree(&of_project, sel, &project.name, true) {
+            Ok(w) => (
+                w.clone(),
+                (sel != "primary" && sel != "root" && sel == w.branch).then(|| sel.to_owned()),
+            ),
+            Err(error) => {
+                // An explicit checkout selector keeps its meaning, including ambiguity.
+                if sel == "root"
+                    || sel == "primary"
+                    || of_project
+                        .iter()
+                        .any(|w| w.branch == sel || w.path.file_name().is_some_and(|n| n == sel))
+                {
+                    return Err(error);
+                }
+                write_frame(
+                    &mut conn.stream,
+                    &ClientRequest::ResolveBranchCheckout {
+                        req_id: 2,
+                        project: project.id.clone(),
+                        branch: sel.to_owned(),
+                    },
+                )
+                .await?;
+                let mut upserts = Vec::new();
+                let created = await_ack(&mut conn, 2, &mut upserts).await?;
+                let Some(nebula_core::EntityId::Worktree(id)) = created else {
+                    bail!("host did not resolve a branch checkout");
+                };
+                let (_, current, _) = subscribe_snapshot(&mut conn).await?;
+                let target = current
+                    .into_iter()
+                    .find(|w| w.id == id && w.project_id == project.id)
+                    .context("host did not report the resolved checkout")?;
+                // Keep the original branch intent even if a later snapshot shows
+                // a concurrent primary switch. The host must reject that race.
+                (target, Some(sel.to_owned()))
+            }
+        },
         None => bail!("pass --worktree <branch>"),
     };
     let auto_title = opts.name.is_none();
@@ -1485,6 +1521,7 @@ pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
         &ClientRequest::CreateAgent {
             req_id,
             worktree: target.id.clone(),
+            expected_branch,
             name: name.clone(),
             kind,
             model: opts.model,
