@@ -47,7 +47,8 @@ class GatewayTests(unittest.TestCase):
         self.assertTrue(static.lookup("/")[0].startswith(b"<!doctype"))
 
     def test_configuration(self):
-        for token, origin, projects in [("short", "https://example.com", ["p"]),
+        Gateway("12345678", "https://example.com", ["p"])
+        for token, origin, projects in [("1234567", "https://example.com", ["p"]),
                                         (TOKEN, "http://example.com", ["p"]),
                                         (TOKEN, "https://example.com/", ["p"]),
                                         (TOKEN, "https://example.com", [])]:

@@ -68,8 +68,8 @@ class StaticFiles:
 
 class Gateway:
     def __init__(self, token, origin, projects, binary="nebula", static=None, pi_agent_dir=None, db_path=None):
-        if len(token) < 32:
-            raise ValueError("NEBULA_WEB_TOKEN must contain at least 32 characters")
+        if len(token) < 8:
+            raise ValueError("NEBULA_WEB_TOKEN must contain at least 8 characters")
         parsed = urlsplit(origin)
         if (parsed.scheme not in {"http", "https"} or not parsed.netloc
                 or parsed.path or parsed.query or parsed.fragment or parsed.username):
