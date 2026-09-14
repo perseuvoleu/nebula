@@ -32,6 +32,13 @@ lexical `project/id` identity, independent of input order and session names.
 Old CLIs remain usable with this unknown-time fallback; meaningful recency requires
 releasing the updated CLI used by the gateway.
 
+Each list row also shows the elapsed age of this same status timestamp beneath its
+metadata: “acum câteva secunde”, “acum 2 min”, “acum 1 h”, “acum 1 zi” / “acum 2 zile”.
+Minutes/hours/days are floored; future timestamps from clock skew clamp to zero age.
+Unknown timestamps display “Activitate necunoscută”. Existing list refreshes update
+the labels without additional requests or per-row timers. The age is also exposed
+as an accessible description, including on unread rows with explicit labels.
+
 ## All, identity, access and errors
 
 All is a virtual UI filter (`/?view=all`), not a daemon/Git project. A selected

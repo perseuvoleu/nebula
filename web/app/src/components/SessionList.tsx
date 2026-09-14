@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { PlusIcon, SearchIcon } from "lucide-react";
 import type { SessionRow } from "@/lib/types";
+import { activityAge } from "@/lib/activity-age";
 import { sessionKey } from "@/lib/session-list";
 import { kindLabel, statusLabel } from "@/lib/status";
 import { Button } from "@/components/ui/button";
@@ -23,6 +24,8 @@ export function SessionList({ sessions, phase, error, selected, unseen, onSelect
   onDeleted: (row: SessionRow) => void;
 }) {
   const [filter, setFilter] = useState("");
+  // Existing list refreshes advance relative labels without additional requests or per-row timers.
+  const now = Date.now();
   const visible = useMemo(() => {
     const needle = filter.trim().toLowerCase();
     const rows = needle ? sessions.filter((r) => `${r.project} ${r.name} ${r.kind} ${r.worktree} ${statusLabel(r.status)}`.toLowerCase().includes(needle)) : sessions;
@@ -61,9 +64,11 @@ export function SessionList({ sessions, phase, error, selected, unseen, onSelect
           {visible.map((row) => {
             const active = sessionKey(row) === selected;
             const isUnseen = unseen.has(sessionKey(row));
+            const age = activityAge(row.status_changed_at, now);
             return (
               <li key={sessionKey(row)} className="flex">
                 <button type="button" onClick={() => onSelect(row)} aria-current={active ? "page" : undefined}
+                  aria-description={`Ultima schimbare de stare: ${age}`}
                   aria-label={isUnseen ? `${showProject ? `${row.project}: ` : ""}${row.name}, finalizată și nevizualizată` : undefined}
                   className={`flex min-h-14 min-w-0 flex-1 flex-col gap-0.5 rounded-lg px-3 py-2 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${active ? "bg-secondary" : "hover:bg-muted/60"}`}>
                   <span className="flex items-center gap-2">
@@ -79,6 +84,7 @@ export function SessionList({ sessions, phase, error, selected, unseen, onSelect
                     <span aria-hidden>·</span>
                     <span className="min-w-0 truncate font-mono">{row.worktree}</span>
                   </span>
+                  <span className="text-xs text-muted-foreground" title="Ultima schimbare de stare">{age}</span>
                 </button>
                 <DeleteSessionButton project={row.project} row={row} onDeleted={() => onDeleted(row)} />
               </li>
