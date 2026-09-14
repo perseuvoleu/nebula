@@ -5,6 +5,7 @@ Owns authentication, the enabled-project scope, argument-safe Nebula CLI control
 read-only Pi conversation contract (see pi_history.py). Serves the built React app from
 `web/static` through a startup allowlist: no directory listing, no arbitrary file reads.
 """
+import base64
 import datetime
 import hmac
 import json
@@ -15,10 +16,11 @@ import secrets
 import socket
 import sqlite3
 import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
 import pi_history
 
@@ -32,6 +34,7 @@ ASSET_TYPES = {".html": "text/html", ".js": "text/javascript", ".css": "text/css
                ".map": "application/json"}
 IDENTITY_TTL = 5.0
 TRANSIENT = {502, 503, 504}  # gateway/CLI trouble: reported as an error, not as a capability
+PUSH_STATES = {"finished", "needs_feedback"}
 CSP = ("default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; "
        "worker-src 'self'; manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 
@@ -39,6 +42,137 @@ CSP = ("default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' 
 class Problem(Exception):
     def __init__(self, status, message):
         self.status, self.message = status, message
+
+
+class PushService:
+    """Persistent Web Push subscriptions and transition-based agent notifications."""
+
+    def __init__(self, private_key, subject, storage, *, sender=None, public_key=None):
+        self.storage = Path(storage)
+        self.lock = threading.Lock()
+        self.statuses = {}
+        if sender is None:
+            try:
+                from cryptography.hazmat.primitives import serialization
+                from py_vapid import Vapid
+                from pywebpush import webpush
+            except ImportError as error:
+                raise ValueError("Web Push dependencies missing; install web/requirements.txt") from error
+            key = Path(private_key)
+            if not key.is_absolute() or not key.is_file():
+                raise ValueError("NEBULA_WEB_VAPID_PRIVATE_KEY must be an absolute existing file")
+            vapid = Vapid.from_file(str(key))
+            raw = vapid.public_key.public_bytes(serialization.Encoding.X962,
+                                                serialization.PublicFormat.UncompressedPoint)
+            public_key = base64.urlsafe_b64encode(raw).decode().rstrip("=")
+            sender = lambda subscription, data: webpush(
+                subscription_info=subscription, data=json.dumps(data), vapid_private_key=vapid,
+                vapid_claims={"sub": subject}, ttl=300, timeout=10)
+        self.sender, self.public_key = sender, public_key
+        if not isinstance(public_key, str) or len(public_key) < 80:
+            raise ValueError("Invalid VAPID public key")
+
+    @staticmethod
+    def validate(subscription):
+        if not isinstance(subscription, dict) or set(subscription) != {"endpoint", "keys"}:
+            raise Problem(400, "Invalid push subscription")
+        endpoint, keys = subscription["endpoint"], subscription["keys"]
+        try:
+            parsed = urlsplit(endpoint) if isinstance(endpoint, str) else None
+            hostname = parsed.hostname if parsed else None
+        except ValueError:
+            parsed, hostname = None, None
+        if (parsed is None or parsed.scheme != "https" or not hostname or parsed.username
+                or parsed.password or parsed.fragment or len(endpoint) > 4096 or not isinstance(keys, dict)
+                or set(keys) != {"p256dh", "auth"}):
+            raise Problem(400, "Invalid push subscription")
+        for name, minimum in (("p256dh", 40), ("auth", 8)):
+            value = keys.get(name)
+            if not isinstance(value, str) or not minimum <= len(value) <= 256 or not re.fullmatch(r"[A-Za-z0-9_-]+", value):
+                raise Problem(400, "Invalid push subscription")
+        return subscription
+
+    def subscriptions(self):
+        try:
+            value = json.loads(self.storage.read_text())
+        except (OSError, ValueError):
+            return []
+        if not isinstance(value, list):
+            return []
+        valid = []
+        for subscription in value:
+            try:
+                valid.append(self.validate(subscription))
+            except Problem:
+                pass
+        return valid
+
+    def save(self, subscriptions):
+        self.storage.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.storage.with_suffix(".tmp")
+        temporary.write_text(json.dumps(subscriptions))
+        temporary.chmod(0o600)
+        temporary.replace(self.storage)
+
+    def subscribe(self, subscription):
+        subscription = self.validate(subscription)
+        with self.lock:
+            subscriptions = [s for s in self.subscriptions()
+                             if isinstance(s, dict) and s.get("endpoint") != subscription["endpoint"]]
+            subscriptions.append(subscription)
+            self.save(subscriptions[-8:])
+
+    def unsubscribe(self, endpoint):
+        if not isinstance(endpoint, str) or len(endpoint) > 4096:
+            raise Problem(400, "Invalid push endpoint")
+        with self.lock:
+            subscriptions = [s for s in self.subscriptions()
+                             if isinstance(s, dict) and s.get("endpoint") != endpoint]
+            self.save(subscriptions)
+
+    def notify(self, project, row):
+        status = row["status"]
+        data = {
+            "title": "Nebula",
+            "body": f"{row['name']}: " + ("a terminat" if status == "finished" else "așteaptă răspunsul tău"),
+            "url": f"/p/{quote(project, safe='')}/s/{quote(row['id'], safe='')}",
+            "tag": f"nebula-{row['id']}",
+        }
+        with self.lock:
+            subscriptions = self.subscriptions()
+        expired = set()
+        for subscription in subscriptions:
+            try:
+                self.sender(subscription, data)
+            except Exception as error:
+                response = getattr(error, "response", None)
+                if getattr(response, "status_code", None) in {404, 410}:
+                    expired.add(subscription["endpoint"])
+                else:
+                    print("Nebula Web Push delivery failed", file=sys.stderr, flush=True)
+        if expired:
+            with self.lock:
+                self.save([s for s in self.subscriptions() if s.get("endpoint") not in expired])
+
+    def poll(self, gateway):
+        if not self.subscriptions():
+            self.statuses.clear()
+            return
+        for project in gateway.projects:
+            try:
+                rows = [row for row in gateway.sessions(project) if not row["archived"]]
+            except Problem:
+                continue
+            present = set()
+            for row in rows:
+                key = (project, row["id"])
+                present.add(key)
+                previous = self.statuses.get(key)
+                self.statuses[key] = row["status"]
+                if previous is not None and previous != row["status"] and row["status"] in PUSH_STATES:
+                    self.notify(project, row)
+            for key in [key for key in self.statuses if key[0] == project and key not in present]:
+                del self.statuses[key]
 
 
 class StaticFiles:
@@ -67,7 +201,7 @@ class StaticFiles:
 
 
 class Gateway:
-    def __init__(self, token, origin, projects, binary="nebula", static=None, pi_agent_dir=None, db_path=None, *, preview_binary=None):
+    def __init__(self, token, origin, projects, binary="nebula", static=None, pi_agent_dir=None, db_path=None, *, preview_binary=None, push=None):
         if len(token) < 8:
             raise ValueError("NEBULA_WEB_TOKEN must contain at least 8 characters")
         parsed = urlsplit(origin)
@@ -93,6 +227,7 @@ class Gateway:
         self.identities = {}  # agent id -> (native session id | None, reason, expires)
         self.lock = threading.Lock()
         self.checkout_lock = threading.Lock()
+        self.push = push
 
     def run(self, *args, json_output=True, binary=None):
         if not self.slots.acquire(blocking=False):
@@ -219,6 +354,9 @@ class Gateway:
     def get(self, path, query):
         if path == "/api/projects":
             return {"projects": self.projects, "host": self.hostname}
+        if path == "/api/push":
+            return {"available": self.push is not None,
+                    "publicKey": self.push.public_key if self.push else None}
         project = self.project(query.get("project", [None])[0])
         first = {k: v[0] for k, v in query.items()}
         if path == "/api/sessions":
@@ -310,6 +448,15 @@ class Gateway:
             self.checkout_lock.release()
 
     def post(self, path, body):
+        if path == "/api/push/subscribe":
+            if not self.push:
+                raise Problem(503, "Push notifications are not configured")
+            self.push.subscribe(body.get("subscription"))
+            return {"ok": True}
+        if path == "/api/push/unsubscribe":
+            if self.push:
+                self.push.unsubscribe(body.get("endpoint"))
+            return {"ok": True}
         project = self.project(body.get("project"))
         if path == "/api/worktrees":
             return self.create_checkout(project, body)
@@ -467,16 +614,28 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     port = int(os.environ.get("NEBULA_WEB_PORT", "8765"))
-    gateway = Gateway(os.environ.get("NEBULA_WEB_TOKEN", ""),
-                      os.environ.get("NEBULA_WEB_ORIGIN", f"http://127.0.0.1:{port}"),
+    origin = os.environ.get("NEBULA_WEB_ORIGIN", f"http://127.0.0.1:{port}")
+    private_key = os.environ.get("NEBULA_WEB_VAPID_PRIVATE_KEY")
+    push = PushService(private_key, os.environ.get("NEBULA_WEB_VAPID_SUBJECT", origin),
+                       os.environ.get("NEBULA_WEB_PUSH_STORE", str(Path.home() / ".local/share/nebula/web-push.json"))) if private_key else None
+    gateway = Gateway(os.environ.get("NEBULA_WEB_TOKEN", ""), origin,
                       [p.strip() for p in os.environ.get("NEBULA_WEB_PROJECTS", "").split(",") if p.strip()],
                       os.environ.get("NEBULA_WEB_BINARY", "nebula"),
                       db_path=os.environ.get("NEBULA_WEB_DB") or None,
-                      preview_binary=os.environ.get("NEBULA_WEB_PREVIEW_BINARY"))
+                      preview_binary=os.environ.get("NEBULA_WEB_PREVIEW_BINARY"), push=push)
     if not gateway.static.files.get("/index.html"):
         raise SystemExit(f"No built app in {gateway.static.root}; run `pnpm --dir web/app build` first")
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     server.gateway = gateway
+    if push:
+        def monitor():
+            while True:
+                try:
+                    push.poll(gateway)
+                except Exception:
+                    print("Nebula Web Push monitor failed", file=sys.stderr, flush=True)
+                time.sleep(5)
+        threading.Thread(target=monitor, name="web-push", daemon=True).start()
     print(f"Nebula web listening on 127.0.0.1:{port}", flush=True)
     server.serve_forever()
 

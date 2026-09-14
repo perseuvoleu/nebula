@@ -6,9 +6,10 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from server import Gateway, Handler, Problem, StaticFiles, ThreadingHTTPServer
+from server import Gateway, Handler, Problem, PushService, StaticFiles, ThreadingHTTPServer
 from test_pi_history import SID_A, SID_B, assistant, user, write_session
 
 TOKEN = "test-token-" * 5
@@ -54,6 +55,37 @@ class GatewayTests(unittest.TestCase):
                                         (TOKEN, "https://example.com", [])]:
             with self.assertRaises(ValueError):
                 Gateway(token, origin, projects)
+
+    def test_push_subscriptions_persist_and_notify_only_on_lifecycle_transitions(self):
+        sent = []
+        push = PushService(None, "https://example.com", Path(self.tmp.name) / "push.json",
+                           sender=lambda subscription, data: sent.append((subscription, data)),
+                           public_key="B" * 87)
+        subscription = {"endpoint": "https://web.push.apple.com/Q", "keys": {"p256dh": "A" * 40, "auth": "b" * 8}}
+        push.subscribe(subscription)
+        push.subscribe(subscription)  # endpoint identity de-duplicates browser refreshes
+        self.assertEqual(push.subscriptions(), [subscription])
+        self.gateway.push = push
+        self.assertTrue(self.gateway.get("/api/push", {})["available"])
+        self.assertTrue(self.gateway.post("/api/push/subscribe", {"subscription": subscription})["ok"])
+
+        states = iter(["running", "needs_feedback", "finished"])
+        gateway = SimpleNamespace(projects=["project"], sessions=lambda project: [
+            {"id": "one", "name": "Agent", "status": next(states), "archived": False}
+        ])
+        push.poll(gateway)
+        self.assertEqual(sent, [])  # initial snapshot must not alert for old sessions
+        push.poll(gateway)
+        push.poll(gateway)
+        self.assertEqual([item[1]["body"] for item in sent],
+                         ["Agent: așteaptă răspunsul tău", "Agent: a terminat"])
+        self.assertEqual(sent[-1][1]["url"], "/p/project/s/one")
+
+        push.unsubscribe(subscription["endpoint"])
+        self.assertEqual(push.subscriptions(), [])
+        for invalid in [{}, {**subscription, "endpoint": "http://127.0.0.1/"},
+                        {**subscription, "keys": {"p256dh": "!", "auth": "x"}}]:
+            with self.assertRaises(Problem): push.subscribe(invalid)
 
     def test_project_allowlist(self):
         for path in ["/api/sessions", "/api/conversation", "/api/conversation/updates", "/api/preview"]:

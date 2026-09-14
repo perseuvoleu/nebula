@@ -13,3 +13,5 @@ createRoot(document.getElementById("root")!).render(
 if ("serviceWorker" in navigator && !import.meta.env.DEV) {
   window.addEventListener("load", () => { navigator.serviceWorker.register("/sw.js").catch(() => undefined); });
 }
+const badgeNavigator = navigator as Navigator & { clearAppBadge?: () => Promise<void> };
+if (badgeNavigator.clearAppBadge) void badgeNavigator.clearAppBadge();

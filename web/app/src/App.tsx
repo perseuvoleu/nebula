@@ -5,6 +5,7 @@ import { useConversation } from "@/lib/conversation";
 import { clearDrafts } from "@/lib/drafts";
 import { useSelection } from "@/lib/route";
 import type { NewResponse, SessionRow, Worktree } from "@/lib/types";
+import { unsubscribePush } from "@/lib/push";
 import { loadUnseen, reconcileUnseen, saveUnseen } from "@/lib/unseen";
 import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
@@ -14,6 +15,7 @@ import { NewAgentDialog } from "./components/NewAgentDialog";
 import { SessionList, type ListPhase } from "./components/SessionList";
 import { CheckoutPanel } from "./components/CheckoutPanel";
 import { InstallApp } from "./components/InstallApp";
+import { PushNotifications } from "./components/PushNotifications";
 
 interface Workspace { projects: string[]; host: string }
 
@@ -177,7 +179,11 @@ function Shell({ workspace }: { workspace: Workspace }) {
     if (result.id) navigate({ project, session: result.id }); else setCreated(result.name);
     setMenuOpen(false);
   };
-  const logout = () => { controller?.dispose(); setToken(""); navigate({ project: null, session: null }, true); };
+  const logout = async () => {
+    controller?.dispose();
+    try { await unsubscribePush(); } catch { /* Logging out must not depend on push delivery. */ }
+    setToken(""); navigate({ project: null, session: null }, true);
+  };
 
   const sidebar = (
     <aside className="flex h-full min-h-0 flex-col bg-sidebar" aria-label="Proiecte și sesiuni">
@@ -196,6 +202,7 @@ function Shell({ workspace }: { workspace: Workspace }) {
       {checkoutPanel}
       {created && <p role="status" className="border-b border-sidebar-border px-3 py-2 text-xs">Agent pornit ca „{created}”. Identitatea nu a putut fi confirmată încă: alege-l din listă.</p>}
       <SessionList sessions={sessions.rows} phase={sessions.phase} error={sessions.error} selected={sessionId} unseen={unseenFinished} onSelect={select} onNew={() => setCreating(true)} project={project} onDeleted={onDeleted} />
+      {desktop && <PushNotifications />}
       <InstallApp />
       <p className="border-t border-sidebar-border px-3 py-2 text-[11px] text-muted-foreground">Telefonul se poate deconecta. Agenții rămân pe server.</p>
     </aside>
@@ -255,6 +262,7 @@ function Shell({ workspace }: { workspace: Workspace }) {
           </div>
           {checkoutPanel}
           <SessionList sessions={sessions.rows} phase={sessions.phase} error={sessions.error} selected={sessionId} unseen={unseenFinished} onSelect={select} onNew={() => setCreating(true)} project={project} onDeleted={onDeleted} />
+          <PushNotifications />
           <InstallApp />
         </main>
       )}

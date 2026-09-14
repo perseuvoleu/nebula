@@ -41,6 +41,8 @@ Radix, the AI Elements conversation primitive), Python 3.10+ standard-library ga
   URL carries `/p/<project>/s/<session id>` (no secrets). Per-session drafts in memory.
 - Offline/resume: cursor-based resync without duplicate messages; stale state is labelled.
 - Installable app shell; the service worker caches only public assets, never `/api/*`.
+  Optional standards-based Web Push alerts when an agent finishes or needs feedback, including
+  while the app is closed. Tapping an alert opens that session; logging out unsubscribes the device.
   iPhone: Safari → Share → Add to Home Screen. A visible “Instalează pe telefon” guide is
   available on login and in session navigation; standalone mode, touch icon and HTTPS are supported.
   The installed app may require the same token again; physical iPhone installation/keyboard checks
@@ -48,8 +50,8 @@ Radix, the AI Elements conversation primitive), Python 3.10+ standard-library ga
 - Bearer token in browser **sessionStorage** only, cleared on logout together with drafts and
   subscriptions. No token in URLs, cookies or caches.
 
-Not included: live token streaming (see the Pi source note), archive/delete/restart, file
-access, shell creation/endpoints, notifications, offline actions, multi-user.
+Not included: live token streaming (see the Pi source note), archive/restart, file
+access, shell creation/endpoints, offline actions, multi-user.
 
 ## Build and run locally
 
@@ -62,6 +64,24 @@ export NEBULA_WEB_ORIGIN='http://127.0.0.1:8765'
 export NEBULA_WEB_DB="$HOME/.local/share/nebula/nebula.db"   # see "Native identity"
 python3 web/server.py
 ```
+
+Web Push is optional. To enable it, install its small, audited protocol implementation in a
+venv and generate one persistent VAPID key (never commit the key):
+
+```bash
+python3 -m venv ~/.local/share/nebula/web-venv
+~/.local/share/nebula/web-venv/bin/pip install -r web/requirements.txt
+mkdir -p ~/.config/nebula-web && cd ~/.config/nebula-web
+~/.local/share/nebula/web-venv/bin/vapid --gen
+export NEBULA_WEB_VAPID_PRIVATE_KEY="$HOME/.config/nebula-web/private_key.pem"
+# Run server.py with the venv's Python. HTTPS is required on the phone.
+```
+
+The notification permission prompt appears only after tapping “Activează notificările”. On
+an iPhone or iPad, Web Push requires iOS/iPadOS 16.4+ and the PWA installed on the Home Screen.
+Subscriptions are stored mode `0600` in `~/.local/share/nebula/web-push.json`; override with
+`NEBULA_WEB_PUSH_STORE`. `NEBULA_WEB_VAPID_SUBJECT` may override the default HTTPS origin.
+The gateway polls enabled projects every five seconds only while at least one device is subscribed.
 
 Open `http://127.0.0.1:8765` and enter the token. The gateway listens **only on 127.0.0.1**
 and refuses to start without a built app. `NEBULA_WEB_PORT`, `NEBULA_WEB_BINARY` (absolute
@@ -123,7 +143,11 @@ are content-hashed and served with immutable caching, everything else is `no-cac
 1. Fast-forward the deploy checkout to the reviewed commit (never with uncommitted changes).
 2. `pnpm --dir web/app install --frozen-lockfile && pnpm --dir web/app build` in that checkout
    (Node 22 + pnpm 10). The gateway refuses to start until `web/static/index.html` exists.
-3. Add `NEBULA_WEB_DB=/home/<user>/.local/share/nebula/nebula.db` to `~/.config/nebula-web.env`
+   Create/update `~/.local/share/nebula/web-venv`, install `web/requirements.txt`, and install
+   the updated `web/nebula-web.service` so the gateway uses that venv.
+3. Add `NEBULA_WEB_DB=/home/<user>/.local/share/nebula/nebula.db` to `~/.config/nebula-web.env`.
+   Generate the VAPID key once as above and add
+   `NEBULA_WEB_VAPID_PRIVATE_KEY=/home/<user>/.config/nebula-web/private_key.pem`.
    (keep the existing token, projects, origin and binary). This is the required identity source
    for now: the running daemon speaks IPC protocol 28 and a CLI built from this branch (27)
    cannot connect to it, so the `session_id` CLI field only becomes usable after the branch is
@@ -145,7 +169,7 @@ are content-hashed and served with immutable caching, everything else is `no-cac
 
 **Rollback:** check out the previous commit (`44b3f7a`) in the deploy checkout and restart
 `nebula-web`; the old static app is tracked there and needs no build. Remove `NEBULA_WEB_DB`
-if desired (harmless if kept). The service worker cache name changed (`nebula-shell-v4`); the
+if desired (harmless if kept). The service worker cache name changed (`nebula-shell-v5`); the
 old worker replaces it on the next load.
 
 **The token grants agent control as the server's OS user.** Project allowlisting is an API
