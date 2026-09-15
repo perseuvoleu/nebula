@@ -8,7 +8,7 @@ use nebula_core::codec::{read_frame, write_frame};
 use nebula_core::{ClientRequest, ServerEvent, SessionRef, PROTOCOL_VERSION};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::io::{AsyncWriteExt, BufWriter};
+use tokio::io::BufWriter;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 
@@ -41,21 +41,50 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
     // Single writer task; everything else sends frames through this channel
     // so PTY forwards and RPC replies never interleave mid-frame.
     let (out_tx, mut out_rx) = mpsc::channel::<ServerEvent>(256);
+    let closed = tokio_util::sync::CancellationToken::new();
+    let relay_client = crate::relay::RelayClient::new(out_tx.clone(), closed.clone());
+    let finished = tokio_util::sync::CancellationToken::new();
+    let writer_finished = finished.clone();
+    let writer_closed = closed.clone();
     let writer_task = tokio::spawn(async move {
         let mut w = BufWriter::new(write_half);
-        while let Some(ev) = out_rx.recv().await {
-            if write_frame(&mut w, &ev).await.is_err() {
+        // Graceful completion may drain final replies, but a slow peer must
+        // not retain the writer for one timeout per queued frame.
+        tokio::select! {
+            _ = async {
+                writer_finished.cancelled().await;
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            } => {},
+            _ = async {
+        loop {
+            let ev = tokio::select! {
+                _ = writer_closed.cancelled() => break,
+                _ = writer_finished.cancelled(), if !out_rx.is_closed() => {
+                    out_rx.close();
+                    continue;
+                }
+                ev = out_rx.recv() => match ev { Some(ev) => ev, None => break },
+            };
+            let result = tokio::select! {
+                _ = writer_closed.cancelled() => break,
+                result = tokio::time::timeout(std::time::Duration::from_secs(10), write_frame(&mut w, &ev)) => result,
+            };
+            if !matches!(result, Ok(Ok(()))) {
                 break;
             }
         }
-        let _ = w.shutdown().await;
+            } => {},
+        }
+        writer_closed.cancel();
     });
 
     // Per-connection attach state: forward-task handles keyed by session.
     let mut attached: HashMap<SessionRef, tokio::task::JoinHandle<()>> = HashMap::new();
     let mut handshaken = false;
 
-    let result: Result<()> = async {
+    let result: Result<()> = tokio::select! {
+        _ = closed.cancelled() => Ok(()),
+        result = async {
         while let Some(req) = read_frame::<ClientRequest, _>(&mut reader).await? {
             match req {
                 ClientRequest::Hello { protocol_version } => {
@@ -94,7 +123,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     && daemon.relay_for_request(&req).is_some() =>
                 {
                     if let Some(relay) = daemon.relay_for_request(&req) {
-                        relay.forward(req, &out_tx).await;
+                        relay.forward(req, &relay_client).await;
                     }
                 }
                 ClientRequest::Subscribe => {
@@ -116,7 +145,11 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     let tx = out_tx.clone();
                     tokio::spawn(async move {
                         loop {
-                            match rx.recv().await {
+                            let event = tokio::select! {
+                                _ = tx.closed() => break,
+                                event = rx.recv() => event,
+                            };
+                            match event {
                                 Ok(ev) => {
                                     if tx.send(ev).await.is_err() {
                                         break;
@@ -620,13 +653,15 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
             }
         }
         Ok(())
-    }
-    .await;
+        } => result,
+    };
 
     for (sref, h) in attached.drain() {
         h.abort();
         daemon.note_detached(&sref);
     }
+    finished.cancel();
+    drop(relay_client);
     drop(out_tx);
     let _ = writer_task.await;
     result

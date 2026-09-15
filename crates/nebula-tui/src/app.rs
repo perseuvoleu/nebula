@@ -2218,6 +2218,12 @@ impl Tree {
 }
 
 pub struct AttachedTerm {
+    /// Time the current attach started; cleared only by its Scrollback reply.
+    pub awaiting_snapshot: Option<std::time::Instant>,
+    /// Safe attach attempts in this recovery cycle, capped at three.
+    pub attach_attempts: u8,
+    /// Host outage requires replacing the parser even if sequence numbers match.
+    pub fresh_snapshot: bool,
     pub sref: SessionRef,
     pub parser: vt100::Parser,
     pub exited: bool,
@@ -2254,6 +2260,9 @@ impl AttachedTerm {
     pub fn new(sref: SessionRef, cols: u16, rows: u16) -> Self {
         Self {
             sref,
+            awaiting_snapshot: Some(std::time::Instant::now()),
+            attach_attempts: 1,
+            fresh_snapshot: false,
             parser: vt100::Parser::new(rows, cols, 10_000),
             #[cfg(feature = "ghostty")]
             gh: crate::ghostty_pane::enabled_by_env()
@@ -2464,6 +2473,8 @@ pub struct App {
     /// the focused panel, and whether input was locked.
     pub quick_term_restore: Option<QuickTermRestore>,
     pub conn: ConnState,
+    /// Hosts with a reported relay outage; cleared by a fresh screen.
+    pub unavailable_relays: std::collections::HashSet<String>,
     pub hits: Vec<(Rect, HitTarget)>,
     /// Inner rect of the terminal pane from the last draw.
     pub term_area: Rect,
@@ -2707,6 +2718,7 @@ impl App {
             quick_term: false,
             quick_term_restore: None,
             conn: ConnState::Disconnected,
+            unavailable_relays: std::collections::HashSet::new(),
             hits: Vec::new(),
             term_area: Rect::default(),
             dirty: true,
@@ -2798,6 +2810,32 @@ impl App {
         }
     }
 
+    /// Remote host owning this session, resolved through the project tree.
+    pub fn attached_session_host(&self, session: &SessionRef) -> Option<&str> {
+        let worktree = self.worktree_of_sref(session)?;
+        let worktree = self.tree.worktrees.iter().find(|w| w.id == worktree)?;
+        self.tree
+            .projects
+            .iter()
+            .find(|p| p.id == worktree.project_id)?
+            .host
+            .as_deref()
+    }
+
+    /// Persistent recovery text for a remote pane awaiting a fresh screen.
+    pub fn relay_pane_notice(&self, term: &AttachedTerm) -> Option<String> {
+        let host = self.attached_session_host(&term.sref)?;
+        let since = term.awaiting_snapshot?;
+        let state =
+            if term.attach_attempts >= 3 && since.elapsed() >= std::time::Duration::from_secs(10) {
+                "unavailable"
+            } else if self.unavailable_relays.contains(host) {
+                "reconnecting"
+            } else {
+                "connecting"
+            };
+        Some(format!("{host}: {state} — Ctrl+R to retry"))
+    }
     /// The worktree a session lives on, resolved through the tree.
     pub fn worktree_of_sref(&self, sref: &SessionRef) -> Option<WorktreeId> {
         match sref {

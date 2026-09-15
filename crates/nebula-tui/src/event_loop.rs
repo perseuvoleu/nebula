@@ -237,6 +237,7 @@ async fn main_loop(
     // re-dials (respawning the daemon if it's gone) instead of sitting on
     // a dead footer until the user restarts the TUI.
     let mut next_reconnect = tokio::time::Instant::now();
+    let mut relay_tick = tokio::time::interval(Duration::from_secs(1));
 
     loop {
         if app.dirty && tokio::time::Instant::now() >= next_draw {
@@ -261,6 +262,16 @@ async fn main_loop(
 
         let focus_before = app.focus;
         tokio::select! {
+            _ = relay_tick.tick() => {
+                let primary = app.term.as_ref().is_some_and(|t| app.attached_session_host(&t.sref).is_some());
+                let split = app.split_term.as_ref().is_some_and(|t| app.attached_session_host(&t.sref).is_some());
+                for term in [app.term.as_mut().filter(|_| primary), app.split_term.as_mut().filter(|_| split)].into_iter().flatten() {
+                    if term.awaiting_snapshot.is_some_and(|since| since.elapsed() >= Duration::from_secs(10)) {
+                        if term.attach_attempts < 3 { retry_remote_term(term, &mut out); }
+                        app.dirty = true;
+                    }
+                }
+            }
             // Pending redraw: wake at the frame boundary even if no new
             // events arrive.
             _ = tokio::time::sleep_until(next_draw), if app.dirty => {}
@@ -1108,6 +1119,16 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     if app.overlay.is_some() {
         handle_overlay_key(app, key, out);
         return;
+    }
+
+    if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        let term = if app.split_focused { app.split_term.as_ref() } else { app.term.as_ref() };
+        if term.is_some_and(|t| app.relay_pane_notice(t).is_some()) {
+            let term = if app.split_focused { app.split_term.as_mut() } else { app.term.as_mut() }.unwrap();
+            term.attach_attempts = 0;
+            retry_remote_term(term, out);
+            return;
+        }
     }
 
     // Terminal input-locked with a live session: forward everything except
@@ -7085,6 +7106,18 @@ fn attach(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
 /// Mount a session's parser: the parked one when this pane already holds
 /// its state at this exact size (then the Attach asks for a delta from
 /// `end_seq`), else a fresh parser and a full replay.
+fn retry_remote_term(term: &mut AttachedTerm, out: &mut Vec<ClientRequest>) {
+    term.awaiting_snapshot = Some(std::time::Instant::now());
+    term.attach_attempts += 1;
+    term.fresh_snapshot = true;
+    out.push(ClientRequest::Attach {
+        session: term.sref.clone(),
+        from_seq: None,
+        cols: term.cols,
+        rows: term.rows,
+    });
+}
+
 fn resume_or_fresh(
     app: &mut App,
     sref: &SessionRef,
@@ -7095,6 +7128,8 @@ fn resume_or_fresh(
         Some(mut term) => {
             // Re-attaching always lands on the live tail, like a fresh one.
             term.set_scroll(0);
+            term.awaiting_snapshot = Some(std::time::Instant::now());
+            term.attach_attempts = 1;
             let from_seq = Some(term.end_seq);
             (term, from_seq)
         }
@@ -9060,24 +9095,31 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             base_seq,
             data,
         } => {
+            if let Some(host) = app.attached_session_host(&session).map(str::to_string) {
+                app.unavailable_relays.remove(&host);
+            }
             if let Some(term) = app.term.as_mut().filter(|t| t.sref == session) {
                 // A replay whose base is exactly where the parser stopped is
                 // a delta on top of state we already hold — the whole point
                 // of a resumed attach, and usually empty. Any other base
                 // means the bytes in between fell off the ring (or this is a
                 // fresh parser): rebuild the screen from scratch.
-                if base_seq != term.end_seq {
+                if term.fresh_snapshot || base_seq != term.end_seq {
                     term.reset();
                 }
+                term.awaiting_snapshot = None;
+                term.fresh_snapshot = false;
                 term.feed(&data);
                 term.end_seq = base_seq + data.len() as u64;
                 // Either way the cells under a stored selection moved.
                 app.term_selection = None;
                 app.dirty = true;
             } else if let Some(term) = app.split_term.as_mut().filter(|t| t.sref == session) {
-                if base_seq != term.end_seq {
+                if term.fresh_snapshot || base_seq != term.end_seq {
                     term.reset();
                 }
+                term.awaiting_snapshot = None;
+                term.fresh_snapshot = false;
                 term.feed(&data);
                 term.end_seq = base_seq + data.len() as u64;
                 app.dirty = true;
@@ -9350,6 +9392,40 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             app.dirty = true;
         }
         ServerEvent::Error { req_id, message } => {
+            if req_id.is_none() {
+                if let Some(status) = nebula_core::relay_status::RelayStatus::parse(&message) {
+                    let was_unavailable = app.unavailable_relays.contains(&status.host);
+                    if status.connected {
+                        app.unavailable_relays.remove(&status.host);
+                    } else {
+                        app.unavailable_relays.insert(status.host.clone());
+                    }
+                    let primary = app
+                        .term
+                        .as_ref()
+                        .is_some_and(|t| app.attached_session_host(&t.sref) == Some(status.host.as_str()));
+                    let split = app
+                        .split_term
+                        .as_ref()
+                        .is_some_and(|t| app.attached_session_host(&t.sref) == Some(status.host.as_str()));
+                    for term in [
+                        app.term.as_mut().filter(|_| primary),
+                        app.split_term.as_mut().filter(|_| split),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        if status.connected || !was_unavailable {
+                            term.awaiting_snapshot = Some(std::time::Instant::now());
+                            term.attach_attempts = 1;
+                        }
+                        term.fresh_snapshot = true;
+                    }
+                    app.term_cache.clear();
+                    app.dirty = true;
+                    return;
+                }
+            }
             // A failed request's intent never gets an Ack; clear it — and if
             // it was an optimistic worktree delete, put the rows back.
             if let Some(PendingIntent::DeleteWorktree(rollback)) =
@@ -22610,6 +22686,78 @@ mod tests {
         });
     }
 
+    #[test]
+    fn repeated_offline_notices_preserve_exhausted_retry_budget() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.tree.projects[0].host = Some("findl".into());
+        attach(
+            &mut app,
+            SessionRef::Agent(AgentId("a1".into())),
+            &mut Vec::new(),
+        );
+        let notice = ServerEvent::Error {
+            req_id: None,
+            message: "nebula relay: {\"host\":\"findl\",\"connected\":false}".into(),
+        };
+        hse(&mut app, notice.clone());
+        // Advance the time boundary to an exhausted three-attempt cycle.
+        let term = app.term.as_mut().unwrap();
+        term.attach_attempts = 3;
+        term.awaiting_snapshot = Some(std::time::Instant::now() - Duration::from_secs(11));
+        hse(&mut app, notice);
+        app.quick_term = true;
+        let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(buffer_text(&terminal).contains("findl: unavailable"));
+    }
+
+    #[test]
+    fn remote_pane_shows_recovery_until_snapshot_and_retry_never_sends_keys() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.tree.projects[0].host = Some("findl".into());
+        let session = SessionRef::Agent(AgentId("a1".into()));
+        let mut out = Vec::new();
+        attach(&mut app, session.clone(), &mut out);
+        let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(buffer_text(&terminal).contains("findl: connecting"));
+        hse(
+            &mut app,
+            ServerEvent::Error {
+                req_id: None,
+                message: "nebula relay: {\"host\":\"findl\",\"connected\":false}".into(),
+            },
+        );
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(buffer_text(&terminal).contains("findl: reconnecting"));
+        app.focus = Focus::Terminal;
+        app.term_locked = true;
+        out.clear();
+        press(
+            &mut app,
+            KeyCode::Char('r'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
+        assert!(matches!(
+            out.as_slice(),
+            [ClientRequest::Attach { from_seq: None, .. }]
+        ));
+        hse(
+            &mut app,
+            ServerEvent::Scrollback {
+                session,
+                base_seq: 0,
+                data: b"recovered screen".to_vec(),
+            },
+        );
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let screen = buffer_text(&terminal);
+        assert!(screen.contains("recovered screen"));
+        assert!(!screen.contains("findl: reconnecting"));
+    }
     // ---- fast session re-attach: parked parsers + scrollback deltas ----
 
     fn term_screen(term: &crate::app::AttachedTerm) -> String {

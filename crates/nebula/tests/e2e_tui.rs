@@ -54,8 +54,10 @@ impl TuiHarness {
         static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let pid = std::process::id();
-        let runtime_dir = PathBuf::from(format!("/tmp/nebtui-rt-{pid}-{seq}"));
-        let data_dir = PathBuf::from(format!("/tmp/nebtui-data-{pid}-{seq}"));
+        // Honor TMPDIR so verification can keep all daemon artifacts inside
+        // its isolated scratch directory. Short leaves keep Unix sockets valid.
+        let runtime_dir = std::env::temp_dir().join(format!("nr{pid}-{seq}"));
+        let data_dir = std::env::temp_dir().join(format!("nd{pid}-{seq}"));
         let _ = std::fs::remove_dir_all(&runtime_dir);
         let _ = std::fs::remove_dir_all(&data_dir);
         let repos = tempfile::tempdir().unwrap();

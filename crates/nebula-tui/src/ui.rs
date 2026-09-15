@@ -4254,6 +4254,21 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
     }
     app.term_links = links;
     app.term_file_links = file_links;
+    for (term, rect) in [
+        (app.term.as_ref(), inner),
+        (app.split_term.as_ref(), app.split_term_area),
+    ] {
+        if let Some(notice) = term.and_then(|t| app.relay_pane_notice(t)) {
+            f.render_widget(Clear, rect);
+            f.render_widget(
+                Paragraph::new(format!("\n{notice}"))
+                    .style(Style::default().fg(th.warn))
+                    .centered(),
+                rect,
+            );
+        }
+    }
+
 }
 
 /// The ⌘T quick terminal: a centered floating window (noticeably larger
@@ -4358,6 +4373,18 @@ fn draw_quick_terminal(f: &mut Frame, app: &mut App) {
     }
     app.term_area = inner;
     app.hits.insert(0, (inner, HitTarget::TerminalPane));
+    if let Some(notice) = app.term.as_ref().and_then(|t| app.relay_pane_notice(t)) {
+        f.render_widget(Clear, inner);
+        f.render_widget(
+            Paragraph::new(format!("\n{notice}"))
+                .style(Style::default().fg(th.warn))
+                .centered(),
+            inner,
+        );
+        app.term_links.clear();
+        app.term_file_links.clear();
+    }
+
 }
 
 /// `project ▸ branch ▸ session` breadcrumb of the current selection; the

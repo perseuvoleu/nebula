@@ -692,21 +692,20 @@ async fn create_worktree_path(
     let mut path = find_path(&upserts);
     // The row's upsert can land just after the Ack — give it a moment so
     // the caller (a session about to spawn a worker) gets the path.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-    while path.is_none() && tokio::time::Instant::now() < deadline {
-        let Ok(Ok(Some(event))) = tokio::time::timeout(
-            Duration::from_millis(250),
-            read_frame::<ServerEvent, _>(&mut conn.stream),
-        )
-        .await
-        else {
-            continue;
-        };
-        if let ServerEvent::EntityUpserted { entity } = event {
-            upserts.push(entity);
-            path = find_path(&upserts);
+    // One deadline owns the whole read loop. A timeout returns an error and
+    // the caller abandons this connection; never retry a partially read frame.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while path.is_none() {
+            let Some(event) = read_frame::<ServerEvent, _>(&mut conn.stream).await? else {
+                bail!("connection closed while waiting for the created worktree row");
+            };
+            if let ServerEvent::EntityUpserted { entity } = event {
+                upserts.push(entity);
+                path = find_path(&upserts);
+            }
         }
-    }
+        Ok::<_, anyhow::Error>(())
+    }).await.context("worktree was acknowledged but its row did not arrive; inspect before retrying")??;
     Ok(path)
 }
 
