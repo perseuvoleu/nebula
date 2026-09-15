@@ -7,6 +7,10 @@ Radix, the AI Elements conversation primitive), Python 3.10+ standard-library ga
 
 ## What works
 
+- Persistent weekly Codex and Claude account quota navbar on every authenticated screen.
+  Tap for reset/freshness/errors; unavailable and stale values are explicit. Sources, caching,
+  limitations and private preview instructions: [Weekly account quotas](USAGE.md).
+
 - Explicitly enabled projects (`NEBULA_WEB_PROJECTS`), active sessions with kind, checkout,
   status and feedback requests, existing checkouts, local search.
 - **Pi sessions as real conversations**: user/assistant messages, tool activity (collapsible,

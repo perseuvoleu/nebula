@@ -29,7 +29,7 @@ class SessionActivityTests(unittest.TestCase):
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.origin = f"http://127.0.0.1:{self.server.server_port}"
         self.server.gateway = Gateway("synthetic-test-token", self.origin, ["alpha", "beta"],
-                                      binary=str(binary), static=StaticFiles(root))
+                                      binary=str(binary), static=StaticFiles(root), usage_service=None)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
 

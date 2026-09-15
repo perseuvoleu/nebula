@@ -36,7 +36,7 @@ class GatewayTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.gateway = Gateway(TOKEN, "http://127.0.0.1:8765", ["project"],
                                static=StaticFiles(make_static(Path(self.tmp.name) / "static")),
-                               pi_agent_dir=Path(self.tmp.name) / "pi")
+                               pi_agent_dir=Path(self.tmp.name) / "pi", usage_service=None)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -48,13 +48,13 @@ class GatewayTests(unittest.TestCase):
         self.assertTrue(static.lookup("/")[0].startswith(b"<!doctype"))
 
     def test_configuration(self):
-        Gateway("12345678", "https://example.com", ["p"])
+        Gateway("12345678", "https://example.com", ["p"], usage_service=None)
         for token, origin, projects in [("1234567", "https://example.com", ["p"]),
                                         (TOKEN, "http://example.com", ["p"]),
                                         (TOKEN, "https://example.com/", ["p"]),
                                         (TOKEN, "https://example.com", [])]:
             with self.assertRaises(ValueError):
-                Gateway(token, origin, projects)
+                Gateway(token, origin, projects, usage_service=None)
 
     def test_push_subscriptions_persist_and_notify_only_on_lifecycle_transitions(self):
         sent = []
@@ -98,7 +98,7 @@ class GatewayTests(unittest.TestCase):
         preview.write_text("#!/bin/sh\nexit 0\n")
         preview.chmod(0o700)
         gateway = Gateway(TOKEN, "http://127.0.0.1:8765", ["project"],
-                          binary="/home/andrei/.local/bin/nebula", preview_binary=str(preview))
+                          binary="/home/andrei/.local/bin/nebula", preview_binary=str(preview), usage_service=None)
         with patch("server.subprocess.run", return_value=subprocess.CompletedProcess([], 0,
                    '{"domain":"demo.example.test","phase":"running","credentials":"never expose"}', "")) as run:
             self.assertEqual(gateway.get("/api/preview", {"project": ["project"]}),
@@ -114,10 +114,10 @@ class GatewayTests(unittest.TestCase):
         plain.write_text("not executable")
         for binary in ["", "nebula", "./preview", str(plain), self.tmp.name, str(plain) + "-missing"]:
             with self.subTest(binary=binary), self.assertRaises(ValueError):
-                Gateway(TOKEN, "http://127.0.0.1:8765", ["project"], preview_binary=binary)
+                Gateway(TOKEN, "http://127.0.0.1:8765", ["project"], preview_binary=binary, usage_service=None)
 
     def test_preview_fails_closed_for_bad_status_and_never_exposes_diagnostics(self):
-        gateway = Gateway(TOKEN, "http://127.0.0.1:8765", ["project"], preview_binary="/bin/true")
+        gateway = Gateway(TOKEN, "http://127.0.0.1:8765", ["project"], preview_binary="/bin/true", usage_service=None)
         invalid = [None, [], "running", {}, {"domain": "demo.example.test", "phase": []}]
         invalid += [{"domain": domain, "phase": "running"} for domain in [
             None, [], "", "localhost", "evil.test/path", "user@evil.test", "evil.test:443", "a..test",
@@ -379,7 +379,7 @@ class HTTPTests(unittest.TestCase):
         cls.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         cls.port = cls.server.server_port
         cls.origin = f"http://127.0.0.1:{cls.port}"
-        cls.server.gateway = Gateway(TOKEN, cls.origin, ["project"], static=StaticFiles(make_static(cls.tmp.name)))
+        cls.server.gateway = Gateway(TOKEN, cls.origin, ["project"], static=StaticFiles(make_static(cls.tmp.name)), usage_service=None)
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
 
@@ -420,6 +420,14 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(json.loads(body)["projects"], ["project"])
         self.assertTrue(json.loads(body)["host"])
         self.assertNotIn("Access-Control-Allow-Origin", headers)
+
+    def test_usage_is_authenticated_global_and_never_cacheable(self):
+        self.assertEqual(self.request("/api/usage")[0], 401)
+        status, headers, body = self.request("/api/usage?project=not-enabled", headers=self.auth())
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertEqual(set(json.loads(body)), {"codex", "claude"})
+        self.assertEqual(self.request("/api/usage", headers=self.auth(Origin="https://evil.example"))[0], 403)
 
     def test_wrong_host_and_origin(self):
         self.assertEqual(self.request("/", headers={"Host": "evil.example"})[0], 403)

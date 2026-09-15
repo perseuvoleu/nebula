@@ -108,7 +108,7 @@ def main():
     seed()
     os.chmod(HERE / "fake_nebula.py", 0o755)
     env = {**os.environ, "NEBULA_WEB_TOKEN": TOKEN, "NEBULA_WEB_PROJECTS": "alpha,beta",
-           "NEBULA_WEB_PORT": str(PORT), "NEBULA_WEB_ORIGIN": f"http://127.0.0.1:{PORT}",
+           "NEBULA_WEB_USAGE": "0", "NEBULA_WEB_PORT": str(PORT), "NEBULA_WEB_ORIGIN": f"http://127.0.0.1:{PORT}",
            "NEBULA_WEB_BINARY": str(HERE / "fake_nebula.py"), "NEBULA_WEB_PI_AGENT_DIR": str(STATE / "pi"),
            "FAKE_NEBULA_STATE": str(STATE), "PYTHONDONTWRITEBYTECODE": "1",
            "PYTHONPATH": str(WEB), "PATH": str(STATE / "bin") + os.pathsep + os.environ["PATH"]}

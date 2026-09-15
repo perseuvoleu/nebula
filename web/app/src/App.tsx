@@ -17,6 +17,7 @@ import { NewAgentDialog } from "./components/NewAgentDialog";
 import { SessionList, type ListPhase } from "./components/SessionList";
 import { CheckoutPanel } from "./components/CheckoutPanel";
 import { InstallApp } from "./components/InstallApp";
+import { UsageNavbar } from "./components/UsageNavbar";
 import { PushNotifications } from "./components/PushNotifications";
 
 interface Workspace { projects: string[]; host: string }
@@ -141,7 +142,7 @@ export default function App() {
     if (authed) return <main className="flex flex-1 items-center justify-center text-sm text-muted-foreground" aria-busy="true">{notice ?? "Se conectează…"}</main>;
     return <Login onAuthenticated={(projects, host) => setWorkspace({ projects, host })} />;
   }
-  return <Shell workspace={workspace} />;
+  return <><UsageNavbar /><Shell workspace={workspace} /></>;
 }
 
 function Shell({ workspace }: { workspace: Workspace }) {

@@ -24,6 +24,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlsplit
 
 import pi_history
+import usage
 
 STATIC = Path(__file__).parent / "static"
 KINDS = {"pi", "claude", "codex", "cursor"}
@@ -220,7 +221,7 @@ class StaticFiles:
 
 
 class Gateway:
-    def __init__(self, token, origin, projects, binary="nebula", static=None, pi_agent_dir=None, db_path=None, *, preview_binary=None, push=None):
+    def __init__(self, token, origin, projects, binary="nebula", static=None, pi_agent_dir=None, db_path=None, *, preview_binary=None, push=None, usage_service):
         if len(token) < 8:
             raise ValueError("NEBULA_WEB_TOKEN must contain at least 8 characters")
         parsed = urlsplit(origin)
@@ -247,6 +248,8 @@ class Gateway:
         self.lock = threading.Lock()
         self.checkout_lock = threading.Lock()
         self.push = push
+        # None explicitly disables provider reads (e.g. synthetic previews).
+        self.usage = usage_service
 
     def run(self, *args, json_output=True, binary=None):
         if not self.slots.acquire(blocking=False):
@@ -371,6 +374,8 @@ class Gateway:
     # --- HTTP verbs ------------------------------------------------------------------------
 
     def get(self, path, query):
+        if path == "/api/usage":
+            return self.usage.get() if self.usage else usage.unavailable()
         if path == "/api/projects":
             return {"projects": self.projects, "host": self.hostname}
         if path == "/api/push":
@@ -641,7 +646,8 @@ def main():
                       [p.strip() for p in os.environ.get("NEBULA_WEB_PROJECTS", "").split(",") if p.strip()],
                       os.environ.get("NEBULA_WEB_BINARY", "nebula"),
                       db_path=os.environ.get("NEBULA_WEB_DB") or None,
-                      preview_binary=os.environ.get("NEBULA_WEB_PREVIEW_BINARY"), push=push)
+                      preview_binary=os.environ.get("NEBULA_WEB_PREVIEW_BINARY"), push=push,
+                      usage_service=usage.from_environment() if os.environ.get("NEBULA_WEB_USAGE", "1") != "0" else None)
     if not gateway.static.files.get("/index.html"):
         raise SystemExit(f"No built app in {gateway.static.root}; run `pnpm --dir web/app build` first")
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
