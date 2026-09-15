@@ -275,6 +275,7 @@ async fn full_crud_attach_and_restart_persistence() {
     write_frame(
         &mut c,
         &ClientRequest::CreateTerminal {
+            expected_branch: None,
             req_id: 2,
             worktree: main_worktree.id.clone(),
             name: None,
@@ -333,6 +334,7 @@ async fn full_crud_attach_and_restart_persistence() {
     write_frame(
         &mut c,
         &ClientRequest::CreateAgent {
+            expected_branch: None,
             req_id: 3,
             worktree: main_worktree.id.clone(),
             name: "agent-1".into(),
@@ -547,6 +549,7 @@ async fn kitty_keyboard_negotiation_passthrough() {
     write_frame(
         &mut c,
         &ClientRequest::CreateTerminal {
+            expected_branch: None,
             req_id: 2,
             worktree: worktree_id,
             name: None,
@@ -720,6 +723,7 @@ async fn hook_post_from_agent_pty_drives_status() {
     write_frame(
         &mut c,
         &ClientRequest::CreateAgent {
+            expected_branch: None,
             req_id: 2,
             worktree: worktree.id.clone(),
             name: "hooked".into(),
@@ -984,6 +988,7 @@ async fn pty_progress_marks_a_shell_terminal_busy() {
     write_frame(
         &mut c,
         &ClientRequest::CreateTerminal {
+            expected_branch: None,
             req_id: 2,
             worktree: worktree.id.clone(),
             name: None,
@@ -1269,6 +1274,7 @@ async fn hook_cwd_rehomes_agent_to_other_worktree() {
     write_frame(
         &mut c,
         &ClientRequest::CreateAgent {
+            expected_branch: None,
             req_id: 3,
             worktree: main_worktree.id.clone(),
             name: "mover".into(),
@@ -1431,6 +1437,7 @@ async fn move_agent_respawns_live_session_in_target_worktree() {
     write_frame(
         &mut c,
         &ClientRequest::CreateAgent {
+            expected_branch: None,
             req_id: 3,
             worktree: main_worktree.id.clone(),
             name: "mover".into(),
@@ -1613,6 +1620,7 @@ async fn codex_hooks_install_and_drive_status() {
     write_frame(
         &mut c,
         &ClientRequest::CreateAgent {
+            expected_branch: None,
             req_id: 2,
             worktree: worktree.id.clone(),
             name: "codexed".into(),
@@ -1944,6 +1952,7 @@ async fn upgrade_shuts_down_idle_daemon_but_spares_live_sessions() {
     write_frame(
         &mut c,
         &ClientRequest::CreateTerminal {
+            expected_branch: None,
             req_id: 2,
             worktree: main_worktree.id.clone(),
             name: None,
@@ -2215,6 +2224,7 @@ async fn prewarmed_session_is_adopted_by_create_agent() {
     write_frame(
         &mut c,
         &ClientRequest::CreateAgent {
+            expected_branch: None,
             req_id: 2,
             worktree: worktree.id.clone(),
             name: "warm-agent".into(),
@@ -2344,6 +2354,7 @@ async fn dead_prewarm_falls_back_to_cold_spawn() {
     write_frame(
         &mut c,
         &ClientRequest::CreateAgent {
+            expected_branch: None,
             req_id: 2,
             worktree: worktree.id.clone(),
             name: "fallback-agent".into(),
@@ -2402,6 +2413,7 @@ async fn create_agent_refuses_when_the_cli_is_not_installed() {
         write_frame(
             &mut c,
             &ClientRequest::CreateAgent {
+                expected_branch: None,
                 req_id,
                 worktree: worktree.id.clone(),
                 name: format!("agent-{req_id}"),
@@ -2494,6 +2506,7 @@ async fn create_agent_succeeds_when_the_cli_is_on_the_login_shell_path() {
     write_frame(
         &mut c,
         &ClientRequest::CreateAgent {
+            expected_branch: None,
             req_id: 7,
             worktree: worktree.id.clone(),
             name: "real-agent".into(),
@@ -2563,6 +2576,7 @@ async fn create_agent_get_id(
     write_frame(
         c,
         &ClientRequest::CreateAgent {
+            expected_branch: None,
             req_id,
             worktree: worktree.clone(),
             name: name.into(),
@@ -2740,6 +2754,7 @@ async fn archive_sigkills_an_agent_that_ignores_sighup() {
     write_frame(
         &mut c,
         &ClientRequest::CreateAgent {
+            expected_branch: None,
             req_id: 2,
             worktree: worktree.id.clone(),
             name: "stubborn".into(),
@@ -2806,6 +2821,7 @@ async fn prewarm_worktree_sessions_boots_dead_sessions() {
     write_frame(
         &mut c,
         &ClientRequest::CreateAgent {
+            expected_branch: None,
             req_id: 2,
             worktree: worktree.id.clone(),
             name: "warmed".into(),
@@ -2834,6 +2850,7 @@ async fn prewarm_worktree_sessions_boots_dead_sessions() {
     write_frame(
         &mut c,
         &ClientRequest::CreateTerminal {
+            expected_branch: None,
             req_id: 3,
             worktree: worktree.id.clone(),
             name: None,
@@ -2857,6 +2874,7 @@ async fn prewarm_worktree_sessions_boots_dead_sessions() {
     write_frame(
         &mut c,
         &ClientRequest::CreateAgent {
+            expected_branch: None,
             req_id: 4,
             worktree: worktree.id.clone(),
             name: "shelved".into(),
@@ -2976,6 +2994,7 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
     write_frame(
         &mut c,
         &ClientRequest::CreateAgent {
+            expected_branch: None,
             req_id: 2,
             worktree: worktree.id.clone(),
             name: "idler".into(),
@@ -3004,6 +3023,7 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
     write_frame(
         &mut c,
         &ClientRequest::CreateTerminal {
+            expected_branch: None,
             req_id: 3,
             worktree: worktree.id.clone(),
             name: None,
@@ -3030,6 +3050,7 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
     write_frame(
         &mut c,
         &ClientRequest::CreateAgent {
+            expected_branch: None,
             req_id: 4,
             worktree: worktree.id.clone(),
             name: "keeper".into(),
@@ -3235,6 +3256,7 @@ async fn read_session_returns_screen_text() {
     write_frame(
         &mut c,
         &ClientRequest::CreateTerminal {
+            expected_branch: None,
             req_id: 2,
             worktree: worktree_id,
             name: None,
@@ -3470,6 +3492,7 @@ async fn auto_title_instruction_and_rename_flow() {
     write_frame(
         &mut c,
         &ClientRequest::CreateAgent {
+            expected_branch: None,
             req_id: 2,
             worktree: worktree.id.clone(),
             name: "agent-1".into(),
@@ -3818,6 +3841,7 @@ async fn relay_mirrors_a_host_and_its_sessions_outlive_the_viewer() {
     write_frame(
         &mut c,
         &ClientRequest::CreateTerminal {
+            expected_branch: None,
             req_id: 2,
             worktree: main_worktree.id.clone(),
             name: Some("relayed".into()),
@@ -4407,4 +4431,529 @@ done
         write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
         wait_for_exit(&mut child);
     }
+}
+
+/// Real CLI -> daemon -> Git -> PTY regression. Every path and process is disposable.
+#[tokio::test]
+async fn branch_sessions_keep_independent_execution_directories() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    };
+    git(&["branch", "other"]);
+    git(&["checkout", "-b", "feature"]);
+    commit_file(&repo, "README.md", "feature content\n");
+    std::fs::write(repo.join("dirty.txt"), "keep me").unwrap();
+    let head = git(&["rev-parse", "HEAD"]);
+    // A failed assertion must also reap this fixture's daemon.
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let _daemon = ChildGuard(env.spawn_daemon());
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    write_frame(
+        &mut c,
+        &ClientRequest::AddProject {
+            req_id: 800,
+            path: repo.clone(),
+            name: Some("isolation".into()),
+            create_missing: false,
+            host: None,
+        },
+    )
+    .await
+    .unwrap();
+    let evs = read_events_until(&mut c, Duration::from_secs(10), |e| {
+        find_ack(e, 800).is_some()
+    })
+    .await;
+    assert!(
+        matches!(find_ack(&evs, 800), Some(ServerEvent::Ack { .. })),
+        "{evs:?}"
+    );
+    let Some(ServerEvent::Ack {
+        created: Some(EntityId::Project(project)),
+        ..
+    }) = find_ack(&evs, 800)
+    else {
+        panic!("{evs:?}")
+    };
+    let project = project.clone();
+    write_frame(&mut c, &ClientRequest::Subscribe)
+        .await
+        .unwrap();
+    read_events_until(&mut c, Duration::from_secs(5), |e| {
+        e.iter().any(|e| matches!(e, ServerEvent::Snapshot { .. }))
+    })
+    .await;
+    let new_agent = |branch: &str, name: &str| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+            .args([
+                "agent",
+                "new",
+                "--project",
+                "isolation",
+                "--worktree",
+                branch,
+                "--name",
+                name,
+            ])
+            .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
+            .env("NEBULA_DATA_DIR", env.tmp.path().join("data"))
+            .env_remove("NEBULA_AGENT_ID")
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "agent on {branch}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        SessionRef::Agent(nebula_core::AgentId(json["id"].as_str().unwrap().into()))
+    };
+    let feature = new_agent("primary", "feature-worker");
+    let main = new_agent("main", "main-worker");
+    assert_eq!(git(&["rev-parse", "HEAD"]), head);
+    assert_eq!(git(&["branch", "--show-current"]), "feature");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("README.md")).unwrap(),
+        "feature content\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("dirty.txt")).unwrap(),
+        "keep me"
+    );
+    for (session, expected, file) in [
+        (&feature, "feature content", "feature-write"),
+        (&main, "# test", "main-write"),
+    ] {
+        write_frame(
+            &mut c,
+            &ClientRequest::Attach {
+                session: session.clone(),
+                from_seq: None,
+                cols: 100,
+                rows: 24,
+            },
+        )
+        .await
+        .unwrap();
+        write_frame(&mut c, &ClientRequest::Input {
+            session: session.clone(),
+            data: format!("cat README.md; echo own > {file}; git add {file}; git commit -m {file}; printf 'done-%s\\n' {file}\n").into_bytes(),
+        }).await.unwrap();
+        let marker = format!("done-{file}");
+        let evs = read_events_until(&mut c, Duration::from_secs(10), |e| {
+            String::from_utf8_lossy(&collected_output(e)).contains(&marker)
+        })
+        .await;
+        assert!(
+            String::from_utf8_lossy(&collected_output(&evs)).contains(expected),
+            "{evs:?}"
+        );
+        write_frame(
+            &mut c,
+            &ClientRequest::Detach {
+                session: session.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(git(&["show", "feature:feature-write"]), "own");
+    assert_eq!(git(&["show", "main:main-write"]), "own");
+    assert!(!repo.join("main-write").exists());
+    let count = git(&["worktree", "list", "--porcelain"])
+        .matches("worktree ")
+        .count();
+    new_agent("main", "another-main-worker");
+    assert_eq!(
+        git(&["worktree", "list", "--porcelain"])
+            .matches("worktree ")
+            .count(),
+        count
+    );
+
+    // Status never permits moving files under a live process, including a finished agent.
+    for (i, event, status) in [
+        (0, "UserPromptSubmit", nebula_core::AgentStatus::Running),
+        (
+            1,
+            "PermissionRequest",
+            nebula_core::AgentStatus::NeedsFeedback,
+        ),
+        (2, "Stop", nebula_core::AgentStatus::Finished),
+    ] {
+        let curl = format!("curl -sS -m 3 -X POST -H \"Authorization: Bearer $NEBULA_API_TOKEN\" -H 'Content-Type: application/json' -d '{{}}' \"$NEBULA_API_URL/api/hooks/claude?agentId=$NEBULA_AGENT_ID&hookEvent={event}\"\n");
+        write_frame(
+            &mut c,
+            &ClientRequest::Input {
+                session: feature.clone(),
+                data: curl.into_bytes(),
+            },
+        )
+        .await
+        .unwrap();
+        let SessionRef::Agent(feature_id) = &feature else {
+            panic!()
+        };
+        let events = read_events_until(&mut c, Duration::from_secs(10), |e| e.iter().any(|e| matches!(e, ServerEvent::StatusChanged { agent, status: s, .. } if agent == feature_id && *s == status))).await;
+        assert!(events.iter().any(|e| matches!(e, ServerEvent::StatusChanged { agent, status: s, .. } if agent == feature_id && *s == status)));
+        new_agent("main", &format!("main-at-status-{i}"));
+        write_frame(
+            &mut c,
+            &ClientRequest::CheckoutPrimary {
+                req_id: 810 + i,
+                project: project.clone(),
+                branch: "other".into(),
+                mover: None,
+            },
+        )
+        .await
+        .unwrap();
+        let evs = read_events_until(&mut c, Duration::from_secs(10), |e| {
+            find_ack(e, 810 + i).is_some()
+        })
+        .await;
+        assert!(
+            matches!(find_ack(&evs, 810 + i), Some(ServerEvent::Error { message, .. }) if message.contains("live session")),
+            "must protect {status:?}: {evs:?}"
+        );
+        assert_eq!(git(&["branch", "--show-current"]), "feature");
+    }
+    // Simulate a legacy/external Git switch only in this disposable fixture.
+    // A restart error must leave the existing PTY intact, while stopped resume refuses.
+    git(&["checkout", "other"]);
+    let SessionRef::Agent(feature_id) = &feature else {
+        panic!()
+    };
+    write_frame(
+        &mut c,
+        &ClientRequest::RestartAgent {
+            req_id: 820,
+            id: feature_id.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(10), |e| {
+        find_ack(e, 820).is_some()
+    })
+    .await;
+    assert!(
+        matches!(find_ack(&events, 820), Some(ServerEvent::Error { message, .. }) if message.contains("expects branch \"feature\"")),
+        "{events:?}"
+    );
+    write_frame(
+        &mut c,
+        &ClientRequest::Attach {
+            session: feature.clone(),
+            from_seq: None,
+            cols: 100,
+            rows: 24,
+        },
+    )
+    .await
+    .unwrap();
+    write_frame(
+        &mut c,
+        &ClientRequest::Input {
+            session: feature.clone(),
+            data: b"printf 'still-%s\n' alive\n".to_vec(),
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(10), |e| {
+        String::from_utf8_lossy(&collected_output(e)).contains("still-alive")
+    })
+    .await;
+    assert!(String::from_utf8_lossy(&collected_output(&events)).contains("still-alive"));
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+}
+
+/// A protocol proxy orders real daemon operations around the CLI's snapshots.
+/// No Git/session implementation is substituted: both switches and the spawn
+/// request reach the real disposable daemon.
+#[tokio::test]
+async fn branch_session_cli_rejects_a_checkout_switched_after_resolution() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    for args in [&["branch", "other"][..], &["checkout", "-b", "feature"][..]] {
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .output()
+            .unwrap()
+            .status
+            .success());
+    }
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let _daemon = ChildGuard(env.spawn_daemon());
+    let mut control = connect(&env.sock()).await;
+    handshake(&mut control).await;
+    let primary = add_project_get_main_worktree(&mut control, &repo).await;
+    let project = primary.project_id.clone();
+    let proxy_dir = env.tmp.path().join("px");
+    std::fs::create_dir(&proxy_dir).unwrap();
+    let listener = tokio::net::UnixListener::bind(proxy_dir.join("daemon.sock")).unwrap();
+    let mut upstream = connect(&env.sock()).await;
+    let proxy =
+        tokio::spawn(async move {
+            let (mut client, _) = listener.accept().await.unwrap();
+            let mut resolved = false;
+            loop {
+                let request: ClientRequest = read_frame(&mut client).await.unwrap().unwrap();
+                let switch = match &request {
+                    ClientRequest::ResolveBranchCheckout { .. } => Some("main"),
+                    ClientRequest::Subscribe if resolved => Some("other"),
+                    _ => None,
+                };
+                if let Some(branch) = switch {
+                    write_frame(
+                        &mut control,
+                        &ClientRequest::CheckoutPrimary {
+                            req_id: 990,
+                            project: project.clone(),
+                            branch: branch.into(),
+                            mover: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    let events = read_events_until(&mut control, Duration::from_secs(10), |e| {
+                        find_ack(e, 990).is_some()
+                    })
+                    .await;
+                    assert!(
+                        matches!(find_ack(&events, 990), Some(ServerEvent::Ack { .. })),
+                        "{events:?}"
+                    );
+                }
+                write_frame(&mut upstream, &request).await.unwrap();
+                let events = read_events_until(&mut upstream, Duration::from_secs(10), |events| {
+                    match &request {
+                        ClientRequest::Hello { .. } => events
+                            .iter()
+                            .any(|e| matches!(e, ServerEvent::HelloOk { .. })),
+                        ClientRequest::Subscribe => events
+                            .iter()
+                            .any(|e| matches!(e, ServerEvent::Snapshot { .. })),
+                        ClientRequest::ResolveBranchCheckout { req_id, .. }
+                        | ClientRequest::CreateAgent { req_id, .. } => {
+                            find_ack(events, *req_id).is_some()
+                        }
+                        other => panic!("unexpected CLI request: {other:?}"),
+                    }
+                })
+                .await;
+                for event in events {
+                    write_frame(&mut client, &event).await.unwrap();
+                }
+                if matches!(request, ClientRequest::ResolveBranchCheckout { .. }) {
+                    resolved = true;
+                }
+                if matches!(request, ClientRequest::CreateAgent { .. }) {
+                    break;
+                }
+            }
+            control
+        });
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        .args([
+            "agent",
+            "new",
+            "--project",
+            "repo",
+            "--worktree",
+            "main",
+            "--name",
+            "race",
+        ])
+        .env("NEBULA_RUNTIME_DIR", &proxy_dir)
+        .env("NEBULA_DATA_DIR", env.tmp.path().join("data"))
+        .env_remove("NEBULA_AGENT_ID")
+        .current_dir(&repo)
+        .output()
+        .await
+        .unwrap();
+    let mut control = proxy.await.unwrap();
+    write_frame(&mut control, &ClientRequest::Shutdown)
+        .await
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "a branch request must not become a physical selector: {output:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("expects branch \"main\""),
+        "{output:?}"
+    );
+}
+
+
+struct MobileFixtureDaemon(std::process::Child);
+impl Drop for MobileFixtureDaemon {
+    fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+}
+
+/// Fixtures only: no real agent, trust choice, user process or checkout.
+#[tokio::test]
+async fn mobile_keys_and_id_deletion_use_the_exact_pty() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let capture = env.tmp.path().join("keys");
+    let ready = env.tmp.path().join("ready");
+    let script = env.tmp.path().join("recorder");
+    std::fs::write(&script, format!("#!/usr/bin/python3\nimport os, tty\ntty.setraw(0)\nopen({:?}, 'w').close()\nwhile True:\n with open({:?}, 'ab', buffering=0) as f: f.write(os.read(0, 1024))\n", ready, capture)).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut daemon = MobileFixtureDaemon(env.spawn_daemon_with_agent_cmd(script.to_str().unwrap()));
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let main = add_project_get_main_worktree(&mut c, &repo).await;
+    let id = create_agent_get_id(&mut c, &main.id, "fixture", 90).await;
+    let cli = |args: &[&str]| std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        .args(args).env("NEBULA_RUNTIME_DIR", &env.runtime_dir).output().unwrap();
+    for _ in 0..100 {
+        if ready.exists() { break; }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(ready.exists());
+    let result = cli(&["agent", "key", "--project", "repo", "--", id.as_str(), "Space"]);
+    assert!(!result.status.success());
+    for key in ["Up", "Down", "Left", "Right", "Enter", "Escape", "Tab"] {
+        let result = cli(&["agent", "key", "--project", "repo", "--", id.as_str(), key]);
+        assert!(result.status.success(), "key {key}: {result:?}");
+    }
+    let expected = b"\x1b[A\x1b[B\x1b[D\x1b[C\r\x1b\t";
+    for _ in 0..100 {
+        if std::fs::read(&capture).unwrap_or_default().len() >= expected.len() { break; }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(std::fs::read(&capture).unwrap(), expected);
+    // A caller cannot use a valid ID to delete a session in another project.
+    write_frame(&mut c, &ClientRequest::DeleteAgentScoped {
+        req_id: 91, id: id.clone(), project: nebula_core::ProjectId("other-project".into()),
+    }).await.unwrap();
+    read_events_until(&mut c, Duration::from_secs(5), |events| events.iter().any(|e|
+        matches!(e, ServerEvent::Error { req_id: Some(91), .. }))).await;
+    write_frame(&mut c, &ClientRequest::RenameAgent { req_id: 92, id: id.clone(), name: "renamed fixture".into() }).await.unwrap();
+    read_events_until(&mut c, Duration::from_secs(5), |events| events.iter().any(|e|
+        matches!(e, ServerEvent::Ack { req_id: 92, .. }))).await;
+    let result = cli(&["agent", "delete-id", "--project", "repo", "--", id.as_str()]);
+    assert!(result.status.success(), "{result:?}");
+    let result = cli(&["agent", "key", "--project", "repo", "--", id.as_str(), "Enter"]);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("no longer available"));
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon.0);
+}
+
+#[tokio::test]
+async fn mobile_safe_removal_preserves_dirty_unmerged_occupied_and_protected_checkouts() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let mut daemon = MobileFixtureDaemon(env.spawn_daemon());
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let main = add_project_get_main_worktree(&mut c, &repo).await;
+    let cli = |args: &[&str]| std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        .args(args).env("NEBULA_RUNTIME_DIR", &env.runtime_dir).output().unwrap();
+    let result = cli(&["worktree", "new", "fixture", "--project", "repo"]);
+    assert!(result.status.success(), "{result:?}");
+    let result = cli(&["worktree", "list", "--project", "repo"]);
+    let trees: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    let tree = trees.as_array().unwrap().iter().find(|w| w["branch"] == "fixture").unwrap();
+    let id = tree["id"].as_str().unwrap();
+    let path = tree["path"].as_str().unwrap();
+    let remove = || cli(&["worktree", "delete-safe", "--project", "repo", "--", id, "fixture", path]);
+    let result = cli(&["worktree", "delete-safe", "--project", "repo", "--", main.id.as_str(), "main", main.path.to_str().unwrap()]);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("protected"));
+    let result = cli(&["worktree", "delete-safe", "--project", "repo", "--", id, "stale-branch", path]);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("changed"));
+    std::fs::write(Path::new(path).join("untracked"), "keep me").unwrap();
+    let result = remove();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("Dirty checkout"));
+    commit_file(Path::new(path), "untracked", "keep this commit");
+    let result = remove();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("Unmerged commits"));
+    let status = std::process::Command::new("git").arg("-C").arg(&repo).args(["merge", "--ff-only", "fixture"]).status().unwrap();
+    assert!(status.success());
+    let agent = create_agent_get_id(&mut c, &nebula_core::WorktreeId(id.into()), "fixture agent", 93).await;
+    let result = remove();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("Sessions still exist"));
+    assert!(Path::new(path).join("untracked").exists());
+    let result = cli(&["agent", "delete-id", "--project", "repo", "--", agent.as_str()]);
+    assert!(result.status.success(), "{result:?}");
+    // Claude's fixture hook installer left ignored configuration: preserve-by-default applies to it too.
+    let result = remove();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("Dirty checkout"));
+    std::fs::remove_dir_all(Path::new(path).join(".claude")).unwrap();
+    let result = cli(&["worktree", "delete-safe", "--check", "--project", "repo", "--", id, "fixture", path]);
+    assert!(result.status.success(), "{result:?}");
+    assert!(Path::new(path).exists(), "check is side-effect-free");
+    assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(["worktree", "lock", path]).status().unwrap().success());
+    let result = remove();
+    assert!(!result.status.success(), "safe removal must not silently unlock and retry: {result:?}");
+    assert!(Path::new(path).exists());
+    let listing = std::process::Command::new("git").arg("-C").arg(&repo).args(["worktree", "list", "--porcelain"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&listing.stdout).contains("locked"));
+    assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(["worktree", "unlock", path]).status().unwrap().success());
+    let result = remove();
+    assert!(result.status.success(), "{result:?}");
+    assert!(!Path::new(path).exists());
+    assert!(repo.exists());
+    let status = std::process::Command::new("git").arg("-C").arg(&repo).args(["show-ref", "--verify", "refs/heads/fixture"]).status().unwrap();
+    assert!(status.success(), "branch is always kept");
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon.0);
+}
+
+/// Use literal peer versions so a simultaneous client/server constant change cannot mask a mismatch.
+#[tokio::test]
+async fn protocol29_handshake_accepts_repeated_probes_and_rejects_protocol28() {
+    let env = TestEnv::new();
+    let _daemon = MobileFixtureDaemon(env.spawn_daemon());
+    let mut c = connect(&env.sock()).await;
+    for _ in 0..2 {
+        write_frame(&mut c, &ClientRequest::Hello { protocol_version: 29 }).await.unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(3), read_frame::<ServerEvent, _>(&mut c)).await.unwrap().unwrap();
+        assert!(matches!(reply, Some(ServerEvent::HelloOk { protocol_version: 29, .. })), "{reply:?}");
+    }
+    let mut old = connect(&env.sock()).await;
+    write_frame(&mut old, &ClientRequest::Hello { protocol_version: 28 }).await.unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(3), read_frame::<ServerEvent, _>(&mut old)).await.unwrap().unwrap();
+    assert!(matches!(reply, Some(ServerEvent::Incompatible { daemon_protocol_version: 29 })), "{reply:?}");
 }

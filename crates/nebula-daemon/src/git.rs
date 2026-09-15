@@ -272,6 +272,20 @@ pub fn worktree_dir(repo: &Path, branch: &str) -> PathBuf {
 /// `git worktree add <path> -b <branch> [base]`. Falls back to checking out an
 /// existing branch when `-b` fails because it already exists.
 pub async fn add_worktree(repo: &Path, branch: &str, base: Option<&str>) -> Result<PathBuf> {
+    add_worktree_inner(repo, branch, base, false).await
+}
+
+/// Add a linked checkout of an existing branch, without ever minting a branch.
+pub async fn add_existing_worktree(repo: &Path, branch: &str) -> Result<PathBuf> {
+    add_worktree_inner(repo, branch, None, true).await
+}
+
+async fn add_worktree_inner(
+    repo: &Path,
+    branch: &str,
+    base: Option<&str>,
+    existing: bool,
+) -> Result<PathBuf> {
     let path = worktree_dir(repo, branch);
     let remote = nebula_core::remote::is_remote(repo);
     if !remote && path.exists() {
@@ -288,6 +302,10 @@ pub async fn add_worktree(repo: &Path, branch: &str, base: Option<&str>) -> Resu
         }
     }
     let path_str = path.to_string_lossy().into_owned();
+    if existing {
+        git(repo, &["worktree", "add", "--", &path_str, branch]).await?;
+        return Ok(path);
+    }
     let mut args = vec!["worktree", "add", &path_str, "-b", branch];
     if let Some(base) = base {
         args.push(base);
@@ -482,6 +500,30 @@ fn cleanup_partial_node_modules(path: &Path) -> Option<String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => Some(error.to_string()),
     }
+}
+
+/// Fail closed: even ignored files are user data, and only main/master is a merge baseline.
+pub async fn safe_remove_worktree(repo: &Path, path: &Path, branch: &str, delete: bool) -> Result<()> {
+    if current_branch(path).await? != branch {
+        bail!("Checkout branch changed; refresh before confirming");
+    }
+    if !git(path, &["status", "--porcelain", "--untracked-files=all", "--ignored"]).await?.trim().is_empty() {
+        bail!("Dirty checkout (including untracked/ignored files); preserve or remove those files manually first");
+    }
+    let baseline = if branch_exists(repo, "main").await { "refs/heads/main" }
+        else if branch_exists(repo, "master").await { "refs/heads/master" }
+        else { bail!("No main/master merge baseline; safe removal unsupported"); };
+    git(path, &["merge-base", "--is-ancestor", "HEAD", baseline]).await
+        .map_err(|_| anyhow!("Unmerged commits: checkout HEAD is not merged into main/master"))?;
+    let entries = list_worktrees(repo).await?;
+    if !entries.iter().any(|w| w.path == path) || entries.first().is_some_and(|w| w.path == path) {
+        bail!("Primary or unregistered checkout is protected");
+    }
+    if delete {
+        // Do not use legacy remove_worktree: it silently unlocks/retries and prunes unrelated metadata.
+        git(repo, &["worktree", "remove", "--", &path.to_string_lossy()]).await?;
+    }
+    Ok(())
 }
 
 pub async fn remove_worktree(repo: &Path, worktree_path: &Path, force: bool) -> Result<()> {

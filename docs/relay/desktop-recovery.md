@@ -43,7 +43,149 @@ was applied to this protocol-28 base; the remote branch was not merged.
   ordered bytes, cancel that local connection. Its desktop client reconnects,
   subscribes, and requests a new screen; other clients continue independently.
 
-## Compatibility and activation
+## Canonical protocol-29 compatibility (2026-09-15)
+
+Recovery base: 649d06f on protocol-28 a579456. The candidate ports only
+Rust prerequisites from 64a8981 (parent a579456) and 3f22f10, retaining recovery.
+64a8981 supplies the complete schema/handlers used by local-protocol-upgrade
+b726d85: InputAcknowledged, CheckWorktreeRemoval and DeleteAgentScoped.
+Their PTY acknowledgement, project validation and conservative worktree-removal
+safeguards are required; unrelated web controls and f5968b2 are excluded.
+
+Read-only inspection of findl source 3c6621e shows another schema also numbered
+29, introduced by 3f22f10 and preserved by merge 15f2d68. Its branch-safety
+implementation is required too: resolve a physical host checkout, preserve
+branch intent through creation, and refuse unsafe primary movement/resume.
+The candidate targets this newer schema as a matched TUI/CLI and daemon pair.
+
+| Wire surface | b726d85 | Target: findl 3c6621e |
+| --- | --- | --- |
+| CreateAgent | 8 positional fields | 9; expected_branch after worktree |
+| CreateTerminal | req_id, worktree, name | req_id, worktree, expected_branch, name |
+| ResolveBranchCheckout | Absent | req_id, project, branch |
+| CheckoutPrimary | Existing wire fields | Same fields, stricter checkout safeguards |
+| Hello / HelloOk | 29, no capabilities | 29, no capabilities |
+
+`codec.rs` uses `rmp_serde::to_vec`: variant names are tagged, but fields are
+positional. A local diagnostic compiled from both complete protocol definitions
+confirmed CreateTerminal fails in both directions: old → new reports invalid
+length 3 (expected 4); new → old reports LengthMismatch(3). Source copies and
+results are in ignored `.scratch/p29-wire-audit`. This prevents treating the
+number 29 or version 0.6.0 alone as proof of compatibility.
+
+Fresh bounded read-only Hello checks returned Incompatible(29) to Hello 28 and
+HelloOk(29) to Hello 29 on both local `/tmp/nebula-501/daemon.sock` (PID 71248)
+and findl `/run/user/1000/nebula/daemon.sock` (PID 1894421). Binary string
+inspection found ResolveBranchCheckout/expected_branch only in findl's running
+executable, supporting the source-dialect difference without claiming a complete
+running-source attestation. No remote builds, writes or synchronization occurred.
+
+**Activation constraint:** older local TUI/CLI clients use incompatible creation
+frames despite a successful Hello 29. Future activation must coordinate matching
+clients and daemon; do not use the new candidate CLI to mutate the old default
+daemon. Candidate tests use isolated state/sockets. Source tests and a release
+build cannot prove live remote-pane recovery. Installation, integration and
+activation remain separate approvals; nothing is installed or live by preparation.
+
+## Protocol-29 verification (2026-09-15)
+
+The isolated Rust port includes the daemon semantics and client branch-intent
+paths from 64a8981 and 3f22f10, without web/mobile UI or preview dependencies.
+Recovery transport, watchdogs, replay and client isolation remain intact.
+Required integration adjustments:
+
+- Add explicit expected_branch to recovery test requests.
+- Use shared execution guards for create/move/reparent/prewarm and exclusive
+  execution for safe removal, deletion and primary switching. Lifecycle locks
+  precede exclusive execution locks. Keeping the old try-lock on ordinary
+  reconciliation's mutex made moves fail and dropped hook reparenting; the
+  execution guard preserves removal safety without that contention.
+- Shorten the imported race-test proxy directory to `px` for macOS socket limits.
+- Restore displaced public API documentation from the prerequisite patches.
+
+| Verification | Result |
+| --- | --- |
+| Fixed findl MessagePack fixtures: all four new requests, CreateAgent and CreateTerminal | 1 test passed (6 fixtures; meaning and exact bytes) |
+| Literal Hello 29, repeated probes, Hello 28 rejection | 1 PTY test passed |
+| Existing relay recovery tests | 13 passed |
+| CLI unit tests | 12 passed |
+| PTY/daemon integration | 36 passed |
+| Desktop terminal E2E | 8 passed |
+| Core unit tests | 12 passed |
+| Daemon unit tests | 164 passed |
+| TUI unit tests | 546 passed across workspace run and fixture rerun |
+| Documentation tests | No failures |
+
+Total: 779 unique tests (the handshake is included in PTY tests; relay tests
+are included in daemon unit tests). The first full workspace invocation had
+three PTY failures and the known enclosing-checkout TUI fixture failure. The
+socket-path and mutex integration fixes above resolved all three PTY failures;
+the complete PTY and daemon targets then passed. The TUI fixture passed with
+ordinary filesystem fixtures in `/tmp`; Nebula data/runtime paths stayed in
+ignored project scratch. No product change was made to repository discovery.
+
+Red controls: protocol-28 source rejected InputAcknowledged; b726d85's older
+protocol-29 source decoded the new CreateAgent name as AgentKind and failed;
+a temporary protocol-28 constant made the literal Hello-29 test receive
+Incompatible(28). Each source control was restored before green verification.
+These are local serialization/fixture proofs, not live pane recovery evidence.
+
+Commands (run sequentially, never concurrently):
+
+```sh
+export CARGO_BUILD_JOBS=2
+export NEBULA_DATA_DIR="$PWD/.scratch/d"
+export NEBULA_RUNTIME_DIR="$PWD/.scratch/r"
+export TMPDIR="$PWD/.scratch/t"
+export GIT_CEILING_DIRECTORIES="$PWD/.scratch/t"
+cargo test -p nebula-core --test protocol29 -- --test-threads=1
+cargo test -p nebula --no-default-features --test e2e_pty protocol29_handshake -- --test-threads=1
+cargo test -p nebula-daemon --lib relay::tests -- --test-threads=1
+cargo test --workspace --no-default-features --no-fail-fast -- --test-threads=1
+# After resolving integration failures:
+cargo test -p nebula --no-default-features --test e2e_pty branch_session_cli_rejects_a_checkout_switched_after_resolution -- --test-threads=1
+cargo test -p nebula --no-default-features --test e2e_pty -- --test-threads=1
+cargo test -p nebula-daemon --lib -- --test-threads=1
+TMPDIR=/tmp cargo test -p nebula-tui --no-default-features --lib open_at_lands_on_the_owning_worktree_or_adds_the_repo -- --test-threads=1
+```
+
+Logs: ignored `.scratch/p29-wire-audit/` (`red-*.log`, `green-*.log`,
+`focused-relay.log`, `workspace.log`, `final-*.log`). Read-only standards and
+spec reviews were completed; the findings above were addressed and rechecked.
+
+## Release candidate and remaining activation steps
+
+Built successfully with default Ghostty support, Zig 0.15.2 and two Cargo jobs
+in 1m 42s:
+
+```sh
+PATH="/opt/homebrew/opt/zig@0.15/bin:$PATH" CARGO_BUILD_JOBS=2 \
+NEBULA_DATA_DIR="$PWD/.scratch/d" NEBULA_RUNTIME_DIR="$PWD/.scratch/r" \
+cargo build --release -p nebula --target-dir target/relay-protocol29-candidate
+```
+
+Candidate absolute path:
+`/Users/andrei/Desktop/nebula-worktrees/relay-auto-recovery/target/relay-protocol29-candidate/release/nebula`
+
+SHA-256: `195a36762320a3f63e3f919ac74536dac042f9626f3337e6b65369d44fda356b`.
+The release executable also passed repeated literal Hello 29 and rejected Hello
+28 in its own temporary `.scratch/p29-*/{d,r}` state/runtime directories. Only
+that owned fixture daemon was shut down; neither live daemon was changed.
+Smoke script/output and release build log are under `.scratch/p29-wire-audit/`.
+
+**Not installed and not live.** Next steps require separate approval:
+
+1. Review and integrate the candidate into primary while preserving its unrelated
+   Local/Remote visibility edits in app.rs, ui.rs and event_loop.rs.
+2. Plan installation and a safe local daemon activation window, coordinating
+   matching new CLI/TUI clients. Old local clients' Hello 29 is insufficient.
+   Verify the deployed findl schema/build before activation; no remote upgrade
+   or restart is included in this preparation.
+3. After approved activation, verify the actual desktop remote pane, reconnect
+   behavior and surviving findl session identity. A tested artifact does not
+   prove that the currently live remote pane recovered.
+
+## Historical protocol-28 compatibility and activation
 
 Source base: a579456, protocol 28. Version string 0.6.0 is not a build identity.
 Read-only socket handshakes on 2026-09-15 returned:
@@ -120,7 +262,7 @@ Primary main has independent uncommitted Local/Remote visibility controls in
 those changes. Preserve them explicitly when integrating these overlapping files;
 do not replace them wholesale from this worktree.
 
-## Verification commands
+## Historical protocol-28 verification commands
 
 From this worktree, keep Git fixture discovery below `.scratch/t`; otherwise
 Git legitimately discovers the enclosing Nebula checkout and the non-repository
@@ -150,7 +292,7 @@ Hello probes succeed. Its regression failed without that deadline and passes
 with it. Graceful local-client closure also has a total 10-second drain limit,
 in addition to per-write limits and immediate cancellation on relay overflow.
 
-## Verification results (2026-09-15)
+## Historical protocol-28 verification results (2026-09-15)
 
 - CLI unit tests: 12 passed.
 - Daemon PTY/relay E2E tests: 31 passed.

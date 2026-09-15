@@ -90,6 +90,11 @@ pub fn run_worktree_new(name: String, from: Option<String>, project: Option<Stri
     runtime()?.block_on(ipc::worktree_new(name, from, project))
 }
 
+/// Check or remove a clean, merged, session-free checkout by ID while keeping its branch.
+pub fn run_worktree_delete_safe(id: String, branch: String, path: std::path::PathBuf, check: bool, project: Option<String>) -> Result<()> {
+    runtime()?.block_on(ipc::worktree_delete_safe(id, branch, path, check, project))
+}
+
 /// `nebula worktree delete` — the daemon's delete flow (checkout + row).
 pub fn run_worktree_delete(name: String, force: bool, project: Option<String>) -> Result<()> {
     runtime()?.block_on(ipc::worktree_delete(name, force, project))
@@ -162,6 +167,11 @@ pub fn run_agent_send(name: String, text: String, project: Option<String>) -> Re
 }
 
 pub use ipc::AgentCtl;
+
+/// Act on an agent ID: Some(key) writes one key; None explicitly deletes it.
+pub fn run_agent_action_id(id: String, key: Option<String>, project: Option<String>) -> Result<()> {
+    runtime()?.block_on(ipc::agent_action_id(id, key, project))
+}
 
 /// `nebula agent archive|unarchive|delete|restart` — lifecycle verbs.
 pub fn run_agent_ctl(op: AgentCtl, name: String, project: Option<String>) -> Result<()> {

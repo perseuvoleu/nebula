@@ -1537,6 +1537,7 @@ mod tests {
                         relay
                             .forward(
                                 ClientRequest::CreateTerminal {
+                                    expected_branch: Some("feature".into()),
                                     req_id: 42,
                                     worktree: WorktreeId("worktree".into()),
                                     name: None,
@@ -1621,6 +1622,7 @@ mod tests {
                 relay
                     .forward(
                         ClientRequest::CreateTerminal {
+                            expected_branch: Some("feature".into()),
                             req_id: 42,
                             worktree: WorktreeId("worktree".into()),
                             name: None,
@@ -1684,6 +1686,7 @@ mod tests {
             Duration::from_millis(50),
             relay.forward(
                 ClientRequest::CreateTerminal {
+                    expected_branch: Some("feature".into()),
                     req_id: 42,
                     worktree: WorktreeId("worktree".into()),
                     name: None,
@@ -1982,6 +1985,7 @@ mod tests {
         );
         assert_eq!(
             request_ids(&ClientRequest::CreateTerminal {
+                expected_branch: None,
                 req_id: 7,
                 worktree: wt.clone(),
                 name: None
@@ -2003,6 +2007,7 @@ mod tests {
     #[test]
     fn req_id_round_trips_through_rewrite() {
         let req = ClientRequest::CreateTerminal {
+            expected_branch: None,
             req_id: 7,
             worktree: WorktreeId("w1".into()),
             name: Some("t".into()),
