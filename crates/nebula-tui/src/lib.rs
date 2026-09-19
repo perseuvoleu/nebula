@@ -4,6 +4,8 @@ pub mod branches;
 pub mod completion;
 pub mod collect_cli;
 pub mod config;
+pub mod diagram_cli;
+pub mod diagrams;
 pub mod event_loop;
 pub mod file_view;
 pub mod fuzzy;
@@ -150,6 +152,26 @@ pub use sync_cli::{Direction as SyncDirection, SyncOpts};
 pub fn run_proxy() -> Result<()> {
     runtime()?.block_on(ipc::proxy())
 }
+
+/// `nebula diagram …` — the checkout's `.scratch/diagrams/` folder: create,
+/// import, list/search, remove, and ask a running TUI to show one.
+pub fn run_diagram(op: diagram_cli::DiagramOp) -> Result<()> {
+    // Only `new` records an owner, so only it looks the caller up.
+    let owner = match &op {
+        diagram_cli::DiagramOp::New { .. } => runtime()?
+            .block_on(ipc::calling_session())
+            .map(|(id, name)| diagrams::Meta {
+                tags: Vec::new(),
+                session: name,
+                agent: Some(id),
+            })
+            .unwrap_or_default(),
+        _ => Default::default(),
+    };
+    diagram_cli::run(op, owner)
+}
+
+pub use diagram_cli::DiagramOp;
 
 pub fn run_agent_list(project: Option<String>, all: bool, worktree: Option<String>) -> Result<()> {
     runtime()?.block_on(ipc::agent_list(project, all, worktree))
