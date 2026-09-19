@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{{TITLE}}</title>
+<meta name="nebula-diagram" content='{{META}}'>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!--
+  Nebula decision page "{{SLUG}}" — rules:
+  - one self-contained file: no CDN, no network (the viewer blocks it anyway);
+  - colours only through the variables below, never hardcoded;
+  - keep the <title>: the viewer lists and searches diagrams by it;
+  - the explanation belongs HERE, on the page, not in the terminal.
+  One <article class="option" data-choice="…"> per option. "Choose" calls
+  window.nebula.decide({id, choice, label, note}); the viewer hands that to
+  the session that created this page as a "[nebula diagram] …" prompt and
+  appends it to {{SLUG}}.decisions.jsonl next to this file. Limits: id and
+  choice 64 chars, label 200, note 2000.
+-->
+<style>
+  :root {
+    --bg: #0d1118;
+    --surface: #151b26;
+    --surface-2: #1c2433;
+    --edge: #2a3345;
+    --text: #d7dce6;
+    --muted: #8b94a7;
+    --accent: #baaaeb;
+    --on-accent: #14101f;
+    --ok: #7fd1a0;
+    --warn: #e6c274;
+    --err: #ec8a8a;
+    --info: #7db7ee;
+    --radius: 10px;
+    --font: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 var(--font); }
+  main { max-width: 1100px; margin: 0 auto; padding: 28px 32px 48px; }
+  h1 { font-size: 22px; margin: 0 0 4px; color: var(--accent); font-weight: 600; }
+  .lede { color: var(--muted); margin: 0 0 24px; }
+  .options { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+  .option { background: var(--surface); border: 1px solid var(--edge); border-radius: var(--radius); padding: 16px 18px; display: flex; flex-direction: column; gap: 10px; }
+  .option:hover { border-color: var(--accent); }
+  .option.chosen { border-color: var(--ok); }
+  .option h2 { font-size: 17px; margin: 0; font-weight: 600; }
+  .option p { margin: 0; color: var(--muted); }
+  .option ul { margin: 0; padding-left: 18px; }
+  .pros li::marker { color: var(--ok); }
+  .cons li::marker { color: var(--err); }
+  .badge { align-self: flex-start; font-size: 12px; color: var(--warn); border: 1px solid var(--edge); border-radius: 999px; padding: 0 8px; }
+  button { margin-top: auto; font: 600 14px var(--font); color: var(--on-accent); background: var(--accent); border: 0; border-radius: 8px; padding: 9px 14px; cursor: pointer; }
+  button:disabled { background: var(--surface-2); color: var(--muted); cursor: default; }
+  textarea { width: 100%; margin-top: 18px; min-height: 64px; resize: vertical; background: var(--surface); color: var(--text); border: 1px solid var(--edge); border-radius: var(--radius); padding: 10px 12px; font: 14px var(--font); }
+  #status { margin-top: 14px; color: var(--ok); min-height: 1.5em; }
+</style>
+</head>
+<body>
+<!-- data-decision: the id the session gets back; one question per page. -->
+<main data-decision="{{SLUG}}">
+  <h1>{{TITLE}}</h1>
+  <p class="lede">State the question and what depends on it. Give each option its real trade-offs.</p>
+
+  <section class="options">
+    <article class="option" data-choice="a">
+      <span class="badge">recommended</span>
+      <h2>Option A</h2>
+      <p>What this option is, in one or two sentences.</p>
+      <ul class="pros"><li>A reason for it</li></ul>
+      <ul class="cons"><li>A reason against it</li></ul>
+      <button type="button">Choose A</button>
+    </article>
+    <article class="option" data-choice="b">
+      <h2>Option B</h2>
+      <p>What this option is, in one or two sentences.</p>
+      <ul class="pros"><li>A reason for it</li></ul>
+      <ul class="cons"><li>A reason against it</li></ul>
+      <button type="button">Choose B</button>
+    </article>
+  </section>
+
+  <textarea id="note" placeholder="Optional note for the agent"></textarea>
+  <div id="status" role="status"></div>
+</main>
+<script>
+  // The viewer injects window.nebula before this runs; the stub keeps the
+  // page working in an ordinary browser.
+  window.nebula = window.nebula || {
+    decide: function (d) { console.log("nebula.decide (no viewer)", d); return Promise.resolve(false); }
+  };
+  document.querySelectorAll(".option button").forEach(function (button) {
+    button.addEventListener("click", function () {
+      var option = button.closest(".option");
+      var decision = {
+        id: document.querySelector("main").dataset.decision,
+        choice: option.dataset.choice,
+        label: option.querySelector("h2").textContent.trim(),
+        note: document.getElementById("note").value.trim()
+      };
+      document.querySelectorAll(".option button").forEach(function (b) { b.disabled = true; });
+      option.classList.add("chosen");
+      document.getElementById("status").textContent = "Chosen: " + decision.label + " — waiting for the agent's next page…";
+      window.nebula.decide(decision);
+    });
+  });
+</script>
+</body>
+</html>

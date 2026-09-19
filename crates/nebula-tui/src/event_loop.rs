@@ -104,6 +104,9 @@ const SWEEP_FRAME: Duration = crate::app::SWEEP_FRAME;
 /// (`connect_or_spawn`), so the effective cadence is retry + boot-poll.
 const RECONNECT_RETRY: Duration = Duration::from_secs(2);
 
+/// How often the loop looks for a `nebula diagram open` request file.
+const DIAGRAM_REQUEST_POLL: Duration = Duration::from_millis(500);
+
 /// What the TUI asks its caller to do after teardown (the terminal is
 /// already restored when this is returned).
 #[derive(Debug)]
@@ -237,6 +240,15 @@ async fn main_loop(
     // re-dials (respawning the daemon if it's gone) instead of sitting on
     // a dead footer until the user restarts the TUI.
     let mut next_reconnect = tokio::time::Instant::now();
+    // The ⌘X diagram viewer: a local surface over the whole UI. Input never
+    // reaches the attached agent while it is open; the daemon carries on.
+    let mut html_viewer: Option<crate::html_viewer::HtmlViewer> = None;
+    let mut html_tick = tokio::time::interval(Duration::from_millis(50));
+    html_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // `nebula diagram open` leaves its request as a file in the runtime dir
+    // (no daemon protocol involved); one stat per tick finds it.
+    let diagram_request = crate::diagram_cli::open_request_path();
+    let mut next_diagram_request = tokio::time::Instant::now();
 
     loop {
         if app.dirty && tokio::time::Instant::now() >= next_draw {
@@ -246,7 +258,15 @@ async fn main_loop(
             if app.git_changes_stale() {
                 spawn_git_changes(&mut app, &git_tx);
             }
-            terminal.draw(|f| ui::draw(f, &mut app))?;
+            if let Some(html) = &mut html_viewer {
+                terminal.draw(|f| {
+                    ui::draw(f, &mut app);
+                    html.draw(f, &app.theme);
+                })?;
+                html.paint(terminal.backend_mut())?;
+            } else {
+                terminal.draw(|f| ui::draw(f, &mut app))?;
+            }
             app.dirty = false;
             next_draw = tokio::time::Instant::now() + FRAME_INTERVAL;
             sync_pty_size(&mut app, &mut out);
@@ -391,10 +411,48 @@ async fn main_loop(
                     }
                 }
             }
+            _ = html_tick.tick(), if html_viewer.is_some() => {
+                let html = html_viewer.as_mut().unwrap();
+                app.dirty |= html.poll();
+                if html.has_decisions() {
+                    send_diagram_decisions(&app, html, &mut out, &channels.tx);
+                    app.dirty = true;
+                }
+            }
+            _ = tokio::time::sleep_until(next_diagram_request) => {
+                next_diagram_request = tokio::time::Instant::now() + DIAGRAM_REQUEST_POLL;
+                if let Some((checkout, slug)) =
+                    crate::diagram_cli::take_open_request(&diagram_request, crate::app::now_ms())
+                {
+                    // Replaces an open viewer: the request names the page.
+                    if html_viewer.take().is_some() {
+                        repaint_everything(terminal)?;
+                    }
+                    match crate::html_viewer::HtmlViewer::start(checkout, slug.as_deref()) {
+                        Ok(html) => html_viewer = Some(html),
+                        Err(error) => app.flash = Some(error),
+                    }
+                    app.dirty = true;
+                }
+            }
             ev = input.next() => match ev {
                 Some(Ok(event)) => {
                     tracing::debug!(?event, "terminal event");
-                    handle_terminal_event(&mut app, event, &mut out);
+                    if let Some(html) = &mut html_viewer {
+                        if html.event(event) {
+                            html_viewer = None;
+                            repaint_everything(terminal)?;
+                        }
+                        app.dirty = true;
+                    } else if crate::html_viewer::toggle(&event) {
+                        match crate::html_viewer::HtmlViewer::start(diagram_checkout(&app), None) {
+                            Ok(html) => html_viewer = Some(html),
+                            Err(error) => app.flash = Some(error),
+                        }
+                        app.dirty = true;
+                    } else {
+                        handle_terminal_event(&mut app, event, &mut out);
+                    }
                 }
                 Some(Err(_)) | None => app.should_quit = true,
             },
@@ -517,6 +575,72 @@ async fn main_loop(
                 }
             });
         }
+    }
+}
+
+/// Wipe the screen and make the next draw paint every cell — what closing
+/// the diagram viewer needs, since its image sat on top of the UI. Not
+/// `Terminal::clear`: that asks the terminal for the cursor position first,
+/// and a reply lost to the input stream is a 2 s stall and a fatal error.
+fn repaint_everything(
+    terminal: &mut Terminal<CrosstermBackend<BufWriter<Stdout>>>,
+) -> Result<()> {
+    use ratatui::backend::{Backend, ClearType};
+    terminal.backend_mut().clear_region(ClearType::All)?;
+    // The diff base is now as blank as the screen.
+    terminal.swap_buffers();
+    Ok(())
+}
+
+/// Whose diagrams ⌘X shows: the selected row's checkout, else the project
+/// holding the TUI's cwd. A remote (`@host`) row's path is not on this
+/// machine, so it falls back as well.
+fn diagram_checkout(app: &App) -> std::path::PathBuf {
+    app.selected_worktree()
+        .filter(|w| {
+            app.tree
+                .projects
+                .iter()
+                .any(|p| p.id == w.project_id && p.host.is_none())
+        })
+        .map(|w| w.path.clone())
+        .unwrap_or_else(|| {
+            crate::diagrams::checkout_root(&std::env::current_dir().unwrap_or_default())
+        })
+}
+
+/// Hand the viewer's pending decisions to their owning sessions the way
+/// `nebula agent send` does: the prompt line as input, Enter after a beat
+/// so the CLI has ingested the text. Sessions other than a diagram's live
+/// owner never hear of it — see `HtmlViewer::deliver`.
+fn send_diagram_decisions(
+    app: &App,
+    html: &mut crate::html_viewer::HtmlViewer,
+    out: &mut Vec<ClientRequest>,
+    tx: &tokio::sync::mpsc::Sender<ClientRequest>,
+) {
+    let deliveries = html.deliver(
+        &app.tree.projects,
+        &app.tree.worktrees,
+        &app.tree.agents,
+        crate::app::now_ms(),
+    );
+    for delivery in deliveries {
+        let session = SessionRef::Agent(delivery.agent);
+        out.push(ClientRequest::Input {
+            session: session.clone(),
+            data: delivery.prompt.into_bytes(),
+        });
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let _ = tx
+                .send(ClientRequest::Input {
+                    session,
+                    data: b"\r".to_vec(),
+                })
+                .await;
+        });
     }
 }
 
