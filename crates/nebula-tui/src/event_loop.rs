@@ -426,7 +426,7 @@ async fn main_loop(
                 {
                     // Replaces an open viewer: the request names the page.
                     if html_viewer.take().is_some() {
-                        terminal.clear()?;
+                        repaint_everything(terminal)?;
                     }
                     match crate::html_viewer::HtmlViewer::start(checkout, slug.as_deref()) {
                         Ok(html) => html_viewer = Some(html),
@@ -441,7 +441,7 @@ async fn main_loop(
                     if let Some(html) = &mut html_viewer {
                         if html.event(event) {
                             html_viewer = None;
-                            terminal.clear()?;
+                            repaint_everything(terminal)?;
                         }
                         app.dirty = true;
                     } else if crate::html_viewer::toggle(&event) {
@@ -576,6 +576,20 @@ async fn main_loop(
             });
         }
     }
+}
+
+/// Wipe the screen and make the next draw paint every cell — what closing
+/// the diagram viewer needs, since its image sat on top of the UI. Not
+/// `Terminal::clear`: that asks the terminal for the cursor position first,
+/// and a reply lost to the input stream is a 2 s stall and a fatal error.
+fn repaint_everything(
+    terminal: &mut Terminal<CrosstermBackend<BufWriter<Stdout>>>,
+) -> Result<()> {
+    use ratatui::backend::{Backend, ClearType};
+    terminal.backend_mut().clear_region(ClearType::All)?;
+    // The diff base is now as blank as the screen.
+    terminal.swap_buffers();
+    Ok(())
 }
 
 /// Whose diagrams ⌘X shows: the selected row's checkout, else the project

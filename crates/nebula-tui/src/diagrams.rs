@@ -293,7 +293,16 @@ pub fn render_template(kind: Template, slug: &str, title: &str, meta: &Meta) -> 
         Template::Decision => TEMPLATE_DECISION,
     }
     .replace("{{TITLE}}", &escape(title))
-    .replace("{{META}}", &escape(&data.to_string()))
+    // Single-quoted attribute: the JSON's own double quotes stay readable.
+    .replace(
+        "{{META}}",
+        &data
+            .to_string()
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('\'', "&#39;"),
+    )
     .replace("{{SLUG}}", slug)
 }
 
