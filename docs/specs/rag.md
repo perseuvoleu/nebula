@@ -177,8 +177,11 @@ At the end of the task, list what you saved: `saved: <title> → <ws> (note:<id>
   `crates/nebula-tui/src/*_cli.rs` (pattern: `remote_cli.rs`, `diagram_cli.rs`).
 - `nebula remote` already shells `ssh <host> …` in BatchMode.
 - `rusqlite` 0.40 (bundled, FTS5 included), `axum` 0.8, `tokio`, `serde` present.
-  The `sqlite-vec` crate links against bundled rusqlite. New dependency: an HTTP client
-  (`reqwest`) for Workers AI.
+  The `sqlite-vec` crate links against bundled rusqlite. ~~New dependency: an HTTP client
+  (`reqwest`) for Workers AI.~~ **Implemented instead:** Workers AI is called by shelling
+  out to `curl` (the pattern `nebula upgrade` already uses), config and token passed on
+  curl's stdin (`-K -`), never argv. Reason: the workspace has no TLS stack, and reqwest
+  would add rustls/ring or openssl for one POST per batch.
 - Data dir on findl: `~/.local/share/nebula/` (next to `nebula.db`).
 - findl: 8 cores, 15 GiB RAM with swap in use, no GPU, 255 GB free disk.
 

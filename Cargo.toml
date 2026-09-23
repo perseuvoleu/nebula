@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/nebula-core", "crates/nebula-daemon", "crates/nebula-tui", "crates/nebula"]
+members = ["crates/nebula-core", "crates/nebula-daemon", "crates/nebula-tui", "crates/nebula-rag", "crates/nebula"]
 exclude = ["vendor/vt100"]
 
 # Vendored vt100 with one patch: rows scrolled out of a top-anchored DECSTBM
