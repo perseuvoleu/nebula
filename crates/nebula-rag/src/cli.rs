@@ -698,11 +698,16 @@ fn ws_cmd(rag: &mut Rag, cmd: WsCommand) -> Result<()> {
                     });
                 }
                 let last = !has_later_sibling(&paths, i, &r.path);
-                let counts = match (r.docs - r.notes, r.notes) {
-                    (0, 0) => String::new(),
-                    (d, 0) => format!("  ({d} docs)"),
-                    (0, n) => format!("  ({n} notes)"),
-                    (d, n) => format!("  ({d} docs, {n} notes)"),
+                let counts = [(r.docs - r.notes, "doc"), (r.notes, "note")]
+                    .iter()
+                    .filter(|(n, _)| *n > 0)
+                    .map(|(n, what)| format!("{n} {what}{}", if *n == 1 { "" } else { "s" }))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let counts = if counts.is_empty() {
+                    counts
+                } else {
+                    format!("  ({counts})")
                 };
                 println!(
                     "{prefix}{}{}{counts}",
@@ -734,6 +739,14 @@ fn ws_cmd(rag: &mut Rag, cmd: WsCommand) -> Result<()> {
 fn has_later_sibling(paths: &[&str], i: usize, path: &str) -> bool {
     let parent = ws::parent(path);
     paths[i + 1..].iter().any(|p| ws::parent(p) == parent)
+}
+
+/// `3d ago`, or `just now`.
+fn ago(t: i64) -> String {
+    match age(t).as_str() {
+        "now" => "just now".into(),
+        a => format!("{a} ago"),
+    }
 }
 
 fn note_id(s: &str) -> Result<i64> {
@@ -775,13 +788,13 @@ fn note_cmd(rag: &mut Rag, ctx: &Ctx, cmd: NoteCommand) -> Result<()> {
             }
             println!("note:{}  {}", n.id, n.title);
             println!(
-                "ws: {}  updated: {} ago  created: {} ago  source: {}{}",
+                "ws: {}  updated: {}  created: {}  source: {}{}",
                 n.ws,
-                age(n.updated),
-                age(n.created),
+                ago(n.updated),
+                ago(n.created),
                 n.source.as_deref().unwrap_or("-"),
                 n.deleted_at
-                    .map(|d| format!("  DELETED {} ago", age(d)))
+                    .map(|d| format!("  DELETED {}", ago(d)))
                     .unwrap_or_default()
             );
             println!("\n{}", n.body);
@@ -871,7 +884,7 @@ fn app_cmd(rag: &Rag, cmd: AppCommand) -> Result<()> {
                     a.branch,
                     match (&a.last_commit, a.synced_at) {
                         (Some(c), Some(t)) =>
-                            format!("synced {} ({} ago)", &c[..c.len().min(10)], age(t)),
+                            format!("synced {} ({})", &c[..c.len().min(10)], ago(t)),
                         _ => "never synced".into(),
                     }
                 );
