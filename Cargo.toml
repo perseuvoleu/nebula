@@ -19,6 +19,7 @@ license = "MIT"
 nebula-core = { path = "crates/nebula-core" }
 nebula-daemon = { path = "crates/nebula-daemon" }
 nebula-tui = { path = "crates/nebula-tui", default-features = false }
+nebula-rag = { path = "crates/nebula-rag" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

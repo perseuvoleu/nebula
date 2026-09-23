@@ -1162,6 +1162,7 @@ dependencies = [
  "clap",
  "nebula-core",
  "nebula-daemon",
+ "nebula-rag",
  "nebula-tui",
  "portable-pty",
  "serde_json",
