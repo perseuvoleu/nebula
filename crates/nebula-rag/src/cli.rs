@@ -95,6 +95,26 @@ pub enum RagCommand {
         #[arg(long)]
         full: bool,
     },
+    /// Write the RAG host's systemd user units (sync timer every 10 min,
+    /// Litestream → R2) and download the pinned Litestream. Does not start
+    /// them unless --enable.
+    Setup {
+        /// R2 key prefix for the replica. Only one replicator may write it.
+        #[arg(long, default_value = crate::setup::DEFAULT_PREFIX)]
+        prefix: String,
+        /// Print the files instead of writing them.
+        #[arg(long)]
+        dry_run: bool,
+        /// Also `systemctl --user enable --now` the timer and Litestream.
+        #[arg(long)]
+        enable: bool,
+        /// Skip downloading Litestream.
+        #[arg(long)]
+        no_download: bool,
+        /// nebula binary the units run (default: the installed one).
+        #[arg(long)]
+        exe: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -179,6 +199,22 @@ pub fn run(args: RagArgs) -> Result<()> {
         }
         return Ok(());
     }
+    if let RagCommand::Setup {
+        prefix,
+        dry_run,
+        enable,
+        no_download,
+        exe,
+    } = args.command
+    {
+        return crate::setup::run(crate::setup::Opts {
+            prefix,
+            dry_run,
+            enable,
+            download: !no_download,
+            exe,
+        });
+    }
     let mut rag = Rag::open(&crate::db::db_path(), Box::new(LazyWorkersAi::default()))?;
     let origin = args
         .origin
@@ -211,6 +247,7 @@ pub fn run(args: RagArgs) -> Result<()> {
         RagCommand::Note { command } => note_cmd(&mut rag, &ctx, command),
         RagCommand::App { command } => app_cmd(&rag, command),
         RagCommand::Sync { app, full } => crate::sync::run(&mut rag, app.as_deref(), full),
+        RagCommand::Setup { .. } => unreachable!("handled above"),
     }
 }
 

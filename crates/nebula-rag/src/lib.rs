@@ -8,6 +8,7 @@ pub mod cli;
 pub mod db;
 pub mod embed;
 pub mod ignore;
+pub mod setup;
 pub mod store;
 pub mod sync;
 pub mod ws;
