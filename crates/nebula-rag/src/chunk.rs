@@ -20,8 +20,14 @@ impl Chunk {
 
     /// Innermost heading, for `file.md#Heading` sources.
     pub fn anchor(&self) -> Option<&str> {
-        self.heading.split(" > ").skip(1).last()
+        anchor_of(&self.heading)
     }
+}
+
+/// Innermost heading of a stored `label > H1 > H2` chain (none for the
+/// label alone).
+pub fn anchor_of(heading: &str) -> Option<&str> {
+    heading.split(" > ").skip(1).last()
 }
 
 /// ~4 chars per token: the estimate the eval used; no tokenizer needed.

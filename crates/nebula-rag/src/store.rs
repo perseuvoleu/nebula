@@ -2,9 +2,9 @@
 //! over one `rag.db`. Network work (embedding) always happens before a
 //! write transaction opens; each document is replaced in one transaction.
 
-use crate::chunk::{chunk_markdown, Chunk};
+use crate::chunk::{anchor_of, chunk_markdown, Chunk};
 use crate::db::{self, now, vec_bytes};
-use crate::embed::{estimate_neurons, CapReached, Embedder};
+use crate::embed::{estimate_neurons, CapReached, Embedder, BATCH};
 use crate::ws;
 use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
@@ -145,13 +145,26 @@ impl Rag {
                 .into());
             }
         }
-        let e = self.embedder.embed(texts)?;
-        self.conn.execute(
-            "INSERT INTO embed_usage(day, neurons, tokens) VALUES (?1, ?2, ?3)
-             ON CONFLICT(day) DO UPDATE SET neurons = neurons + ?2, tokens = tokens + ?3",
-            params![utc_day(now()), e.neurons, e.tokens as i64],
-        )?;
-        Ok(e.vectors)
+        // Batch here so each batch's cost is recorded as soon as it is
+        // spent, even when a later batch fails.
+        let mut vectors = Vec::with_capacity(texts.len());
+        for batch in texts.chunks(BATCH) {
+            let e = self.embedder.embed(batch)?;
+            // No cost in the response: count the (high) estimate rather
+            // than zero, or the cap could never trigger.
+            let neurons = if e.neurons > 0.0 {
+                e.neurons
+            } else {
+                estimate_neurons(batch)
+            };
+            self.conn.execute(
+                "INSERT INTO embed_usage(day, neurons, tokens) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(day) DO UPDATE SET neurons = neurons + ?2, tokens = tokens + ?3",
+                params![utc_day(now()), neurons, e.tokens as i64],
+            )?;
+            vectors.extend(e.vectors);
+        }
+        Ok(vectors)
     }
 
     // ---- workspaces ----
@@ -284,6 +297,15 @@ impl Rag {
             tx.execute("DELETE FROM documents WHERE id = ?1", [d])?;
         }
         for id in &ids {
+            // Removing apps/<name> unregisters the app, or sync would
+            // recreate it.
+            let path: String =
+                tx.query_row("SELECT path FROM workspaces WHERE id = ?1", [id], |r| {
+                    r.get(0)
+                })?;
+            if let Some(app) = path.strip_prefix("apps/").filter(|a| !a.contains('/')) {
+                tx.execute("DELETE FROM apps WHERE name = ?1", [app])?;
+            }
             tx.execute("DELETE FROM workspaces WHERE id = ?1", [id])?;
         }
         tx.commit()?;
@@ -338,16 +360,24 @@ impl Rag {
     /// chunks with the given vectors, in one transaction.
     pub fn put_doc(&mut self, doc: &NewDoc, chunks: &[Chunk], vectors: &[Vec<f32>]) -> Result<i64> {
         let tx = self.conn.transaction()?;
-        let existing: Option<(i64, i64)> = match doc.path {
+        let existing: Option<(i64, String)> = match doc.path {
             Some(p) => tx
                 .query_row(
-                    "SELECT id, created FROM documents WHERE ws_id = ?1 AND path = ?2 AND deleted_at IS NULL",
+                    "SELECT id, kind FROM documents WHERE ws_id = ?1 AND path = ?2 AND deleted_at IS NULL",
                     params![doc.ws_id, p],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?,
             None => None,
         };
+        if let Some((id, kind)) = &existing {
+            if kind != doc.kind.as_str() {
+                bail!(
+                    "{} is already a {kind} in this workspace ({kind}:{id}); pick another workspace or name",
+                    doc.path.unwrap_or_default()
+                );
+            }
+        }
         let t = now();
         let id = match existing {
             Some((id, _)) => {
@@ -651,7 +681,7 @@ impl Rag {
                     let path: Option<String> = r.get(3)?;
                     let doc_id: i64 = r.get(4)?;
                     let heading: String = r.get(7)?;
-                    let anchor = heading.split(" > ").skip(1).last().map(|a| format!("#{a}")).unwrap_or_default();
+                    let anchor = anchor_of(&heading).map(|a| format!("#{a}")).unwrap_or_default();
                     let source = match (kind.as_str(), app, path) {
                         ("note", ..) => format!("note:{doc_id}"),
                         ("doc", Some(app), Some(path)) => format!("{app}/{path}{anchor}"),

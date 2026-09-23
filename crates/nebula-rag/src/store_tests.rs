@@ -355,3 +355,71 @@ fn utc_days_and_ages() {
     assert_eq!(utc_day(1_790_121_600), "2026-09-23");
     assert_eq!(age(now() - 3 * 86_400), "3d");
 }
+
+#[test]
+fn a_file_cannot_replace_a_synced_doc_of_the_same_path() {
+    let mut r = rag();
+    let ws_id = doc(
+        &mut r,
+        "apps/x/docs",
+        "README.md",
+        "# Readme\nfrom the repo",
+    );
+    let ws_id = r
+        .conn
+        .query_row("SELECT ws_id FROM documents WHERE id = ?1", [ws_id], |x| {
+            x.get(0)
+        })
+        .unwrap();
+    let file = NewDoc {
+        ws_id,
+        kind: Kind::File,
+        app: None,
+        path: Some("README.md"),
+        title: "README.md",
+        body: "local copy",
+        blob: None,
+        source: None,
+    };
+    let err = r.index_doc(&file, "README.md").unwrap_err().to_string();
+    assert!(err.contains("already a doc"), "{err}");
+    assert_eq!(r.search_exact("repo", None, 5).unwrap().len(), 1);
+}
+
+#[test]
+fn removing_an_app_workspace_unregisters_the_app() {
+    let mut r = rag();
+    r.ws_ensure("apps/x/docs").unwrap();
+    r.conn
+        .execute(
+            "INSERT INTO apps(name, repo, created) VALUES ('x', '/r', 0)",
+            [],
+        )
+        .unwrap();
+    r.ws_rm("apps/x", true).unwrap();
+    assert!(r.apps().unwrap().is_empty());
+}
+
+/// Workers AI without a cost in its response.
+struct NoCost;
+impl Embedder for NoCost {
+    fn embed(&self, texts: &[String]) -> Result<crate::embed::Embedded> {
+        Ok(crate::embed::Embedded {
+            vectors: texts
+                .iter()
+                .map(|t| crate::embed::fake::vector(t))
+                .collect(),
+            neurons: 0.0,
+            tokens: 0,
+        })
+    }
+}
+
+#[test]
+fn usage_falls_back_to_the_estimate_when_the_api_reports_no_cost() {
+    let r = Rag::with_conn(db::open_memory().unwrap(), Box::new(NoCost));
+    let texts = vec!["some text to embed".to_string(); 40];
+    r.embed(&texts, true).unwrap();
+    let want = estimate_neurons(&texts[..32]) + estimate_neurons(&texts[32..]);
+    assert!((r.neurons_today().unwrap() - want).abs() < 1e-9);
+}

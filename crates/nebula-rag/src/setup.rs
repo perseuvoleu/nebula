@@ -278,6 +278,17 @@ pub fn run(opts: Opts) -> Result<()> {
             l.env_file.display()
         );
     }
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&l.env_file)?.permissions().mode();
+        if mode & 0o077 != 0 {
+            println!(
+                "warning: {} is mode {:o}; chmod 600 it (it holds tokens)",
+                l.env_file.display(),
+                mode & 0o777
+            );
+        }
+    }
     if !l.nebula.exists() {
         println!(
             "warning: {} does not exist yet — the units call it",

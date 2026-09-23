@@ -1,8 +1,9 @@
 # Nebula
 
-Rust workspace: `nebula` (CLI + e2e tests), `nebula-tui`, `nebula-daemon`, `nebula-core`, vendored
-`vt100`. `make install` builds and installs the release binary; the daemon side of a change needs
-`nebula kill` (stops ALL sessions) before it takes effect — TUI-only changes just need a new `ng`.
+Rust workspace: `nebula` (CLI + e2e tests), `nebula-tui`, `nebula-daemon`, `nebula-core`,
+`nebula-rag` (`nebula rag`, see docs/specs/rag.md), vendored `vt100`. `make install` builds and
+installs the release binary; the daemon side of a change needs `nebula kill` (stops ALL sessions)
+before it takes effect — TUI-only changes just need a new `ng`.
 
 ## Ghostty pane engine
 

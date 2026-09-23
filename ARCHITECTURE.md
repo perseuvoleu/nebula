@@ -69,6 +69,7 @@ Worktrees also carry a **link list**: URLs pinned to a checkout — the pull req
 | `nebula-core` | Shared protocol, entities, IDs, paths, codec |
 | `nebula-daemon` | PTYs, SQLite, git, hook receiver, status engine |
 | `nebula-tui` | ratatui UI, keyboard/mouse, attach/scrollback |
+| `nebula-rag` | `nebula rag`: knowledge base on findl (SQLite + sqlite-vec + FTS5, Workers AI embeddings), its CLI and systemd setup |
 
 The TUI also has extras on top of the multiplexer: git diff viewer, grep, a vim-like terminal overlay, fuzzy finders — those are client-side. The daemon is the source of truth for sessions and the tree.
 

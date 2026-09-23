@@ -1,6 +1,7 @@
 # Architecture — Nebula RAG
 
-Status: design agreed (2026-09-23); credentials + bucket provisioned; spikes done; nothing implemented.
+Status: design agreed (2026-09-23); v1 implemented on branch `rag` (crate `nebula-rag`),
+not yet deployed — see "Implementation notes" at the end.
 Research backing the storage/embedding choice: `.scratch/research/rag-storage-backends.md`.
 
 ## Problem & goals
@@ -221,6 +222,43 @@ At the end of the task, list what you saved: `saved: <title> → <ws> (note:<id>
   Directional only (noisy labels, partly sparse score caches). Re-run on the production
   corpus with clean labels before calling the model final. Spike used ~408k tokens /
   ~440 neurons.
+
+## Implementation notes (v1, 2026-09-23)
+
+Where the code settles what the design left open, or deviates from it:
+
+- **Crate:** `crates/nebula-rag` (library + its clap `Args`, `cli.rs`), dispatched from
+  `crates/nebula/src/main.rs` as `Rag(nebula_rag::cli::RagArgs)`. Not a
+  `nebula-tui/src/rag_cli.rs`: the TUI crate stays free of SQLite/sqlite-vec, and the
+  command surface is big enough that mirroring it as an `Op` enum in main.rs would only
+  duplicate it.
+- **HTTP:** `curl` subprocess instead of reqwest (see "Existing infrastructure verified").
+- **sqlite-vec registration** is per connection (`sqlite3_vec_init` on the handle), not
+  `sqlite3_auto_extension`: the nebula binary also links the daemon's SQLite.
+- **Schema:** notes are `documents` rows with `kind = 'note'` (kinds: doc, note, file,
+  url) sharing the chunk/vector/FTS pipeline; ids are `note:<id>` / document ids. Soft
+  delete removes a note's chunks from the indexes at once (row kept 30 days), so search
+  never post-filters. `PRAGMA user_version` numbers the migrations.
+- **Neuron cap:** indexing stops at 8,000 neurons/UTC day (`NEBULA_RAG_NEURON_CAP`);
+  searches are never capped. Cost comes from the response's `meta.neurons` (estimate
+  ≈3 chars/token when absent). A stopped sync does not advance `last_commit`; the next
+  run re-diffs and skips blobs already indexed.
+- **Dedup** compares a new note with live notes in the **same workspace** only, on its
+  first chunk's vector (notes are one fact). The same fact in another app is kept.
+- **Sync:** branch = `origin/HEAD` of the checkout at `app add` (else `main`; `--branch`
+  overrides). Only the repo-root `.gitignore` and `.ragignore` are read (nested ignore
+  files are not); `node_modules/`, `/vendor/`, `third_party/` are always skipped;
+  `.md/.markdown/.mdx` up to 256 KiB, NUL-containing or non-UTF-8 files skipped.
+  `apps/<app>/docs` is owned by sync: `rag add <file|url>` needs an explicit `--ws` and
+  refuses that workspace.
+- **Local vs ssh:** local when `NEBULA_RAG_LOCAL=1`, the hostname equals the RAG host
+  (`NEBULA_RAG_HOST`, default `findl`), or `rag.env` exists here. A local file given to
+  `add` travels over ssh stdin. `note edit` over ssh needs `--text` or piped stdin.
+- **Default scope:** `apps/<app>` + `shared`, with the app from the registered remote or,
+  failing that, the repo name; outside any git checkout, `/`.
+- **Backup:** `nebula rag setup` writes the units and `litestream.yml` (replica
+  `<prefix>/rag.db`, default prefix `prod`) and downloads Litestream 0.5.17 to
+  `<data_dir>/bin` (sha256 pinned); `--enable` is a separate, explicit step.
 
 ## Open questions
 

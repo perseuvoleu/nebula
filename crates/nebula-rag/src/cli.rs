@@ -58,8 +58,8 @@ pub enum RagCommand {
         /// for stdin.
         #[arg(required = true, num_args = 1..)]
         target: Vec<String>,
-        /// Workspace (default: apps/<app>/notes for notes, apps/<app>/docs
-        /// for files and URLs, when inside a registered app's checkout).
+        /// Workspace. Notes default to apps/<app>/notes inside an app's
+        /// checkout; files and URLs always need it.
         #[arg(long)]
         ws: Option<String>,
         #[arg(long)]
@@ -220,14 +220,19 @@ pub fn run(args: RagArgs) -> Result<()> {
         .origin
         .clone()
         .or_else(|| std::env::current_dir().ok().and_then(|d| origin_of(&d)));
-    let source = args.source.clone().or_else(default_source);
-    let ctx = Ctx {
-        app: match &origin {
-            Some(url) => rag.app_for_remote(url)?,
-            None => None,
-        },
-        source,
+    let source = Some(args.source.clone().unwrap_or_else(default_source));
+    // A repo not registered as an app still scopes to apps/<repo> (which
+    // may not exist yet) + shared, as the spec's default says.
+    let app = match &origin {
+        Some(url) => rag.app_for_remote(url)?.or_else(|| {
+            crate::apps::remote_key(url)
+                .rsplit('/')
+                .next()
+                .map(str::to_string)
+        }),
+        None => None,
     };
+    let ctx = Ctx { app, source };
     match args.command {
         RagCommand::Search {
             query,
@@ -269,24 +274,11 @@ impl Ctx {
     }
 }
 
-fn default_source() -> Option<String> {
+fn default_source() -> String {
     match std::env::var("NEBULA_AGENT_ID") {
-        Ok(id) if !id.is_empty() => Some(format!("nebula:{id}")),
-        _ => Some(format!("cli@{}", hostname())),
+        Ok(id) if !id.is_empty() => format!("nebula:{id}"),
+        _ => format!("cli@{}", hostname()),
     }
-}
-
-fn hostname() -> String {
-    std::fs::read_to_string("/proc/sys/kernel/hostname")
-        .ok()
-        .or_else(|| {
-            Command::new("hostname")
-                .output()
-                .ok()
-                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        })
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default()
 }
 
 fn rag_host() -> String {
@@ -297,12 +289,17 @@ fn rag_host() -> String {
 }
 
 /// Run against a local `rag.db`: forced by `NEBULA_RAG_LOCAL=1`, or this is
-/// the RAG host (by name, or because the DB or its credentials are here).
+/// the RAG host — by name, or because its credentials (rag.env, which only
+/// the RAG host has) are here. A stray local rag.db does not count.
 fn is_local() -> bool {
     if let Ok(v) = std::env::var("NEBULA_RAG_LOCAL") {
         return v == "1";
     }
-    crate::db::db_path().exists() || embed::env_path().exists() || hostname() == rag_host()
+    embed::env_path().exists() || hostname() == rag_host()
+}
+
+fn hostname() -> String {
+    nebula_core::host::hostname()
 }
 
 // ---- ssh hop ----
@@ -315,9 +312,8 @@ fn proxy(args: &RagArgs) -> Result<i32> {
     if let Some(o) = std::env::current_dir().ok().and_then(|d| origin_of(&d)) {
         words.extend(["--origin".into(), o]);
     }
-    if let Some(s) = args.source.clone().or_else(default_source) {
-        words.extend(["--source".into(), s]);
-    }
+    let source = args.source.clone().unwrap_or_else(default_source);
+    words.extend(["--source".into(), source]);
     let mut rest: Vec<String> = std::env::args()
         .skip_while(|a| a != "rag")
         .skip(1)
@@ -344,14 +340,20 @@ fn proxy(args: &RagArgs) -> Result<i32> {
             }
         }
     }
-    let reads_stdin = upload.is_some()
-        || rest.iter().any(|a| a == "-")
-        || matches!(
-            &args.command,
-            RagCommand::Note {
-                command: NoteCommand::Edit { text: None, .. }
+    let edit_from_stdin = matches!(
+        &args.command,
+        RagCommand::Note {
+            command: NoteCommand::Edit {
+                text: None,
+                title: None,
+                ..
             }
-        );
+        }
+    );
+    if edit_from_stdin && std::io::stdin().is_terminal() {
+        bail!("over ssh there is no $EDITOR: pass --text \"…\" or pipe the new text on stdin");
+    }
+    let reads_stdin = upload.is_some() || rest.iter().any(|a| a == "-") || edit_from_stdin;
     words.extend(rest);
     let script = format!(
         "export PATH=\"$HOME/.local/bin:$HOME/.cargo/bin:$PATH\"; {}",
@@ -512,8 +514,20 @@ fn add(
         _ => None,
     };
     if let Some((kind, path, body)) = doc {
-        let ws_path = default_ws("docs")?;
+        // Files and URLs need an explicit workspace, and never an app's
+        // docs/, which sync owns (it would clash with the repo's own files).
+        let Some(ws_path) = ws_arg.clone() else {
+            bail!("pass --ws <path> for a file or URL (e.g. shared/<topic> or apps/<app>/notes)");
+        };
         let ws_id = rag.ws_require(&ws_path)?;
+        let norm = rag.ws_path(ws_id)?;
+        if rag
+            .apps()?
+            .iter()
+            .any(|a| norm == format!("apps/{}/docs", a.name))
+        {
+            bail!("{norm} is filled by `nebula rag sync` from the repo; pick another workspace");
+        }
         let title = title.unwrap_or_else(|| path.clone());
         let id = rag.index_doc(
             &NewDoc {
@@ -611,7 +625,8 @@ fn fetch_url(url: &str) -> Result<String> {
 /// chunker still splits on them.
 pub fn html_to_text(html: &str) -> String {
     let mut out = String::new();
-    let lower = html.to_lowercase();
+    // ASCII-only folding keeps byte offsets identical to `html`'s.
+    let lower = html.to_ascii_lowercase();
     let mut i = 0;
     let bytes = html.as_bytes();
     while i < html.len() {
@@ -625,8 +640,9 @@ pub fn html_to_text(html: &str) -> String {
                 i += n;
                 continue;
             }
-            let end = rest.find('>').map(|e| e + 1).unwrap_or(rest.len());
-            let tag = &rest[1..end.saturating_sub(1)];
+            let tag_end = rest.find('>').unwrap_or(rest.len());
+            let tag = &rest[1..tag_end];
+            let end = (tag_end + 1).min(rest.len());
             let hn = tag.as_bytes();
             if hn.len() >= 2
                 && hn[0] == b'h'
@@ -802,11 +818,13 @@ fn note_cmd(rag: &mut Rag, ctx: &Ctx, cmd: NoteCommand) -> Result<()> {
         }
         NoteCommand::Edit { id, text, title } => {
             let id = note_id(&id)?;
+            // --title alone keeps the text; no flags: stdin when piped (the
+            // ssh hop), else $EDITOR.
             let text = match (text, &title) {
                 (Some(t), _) => Some(t),
-                (None, Some(_)) if std::io::stdin().is_terminal() => None,
-                (None, _) if !std::io::stdin().is_terminal() => Some(read_stdin()?),
-                (None, _) => Some(edit_in_editor(&rag.note(id)?.body)?),
+                (None, Some(_)) => None,
+                (None, None) if !std::io::stdin().is_terminal() => Some(read_stdin()?),
+                (None, None) => Some(edit_in_editor(&rag.note(id)?.body)?),
             };
             rag.note_edit(id, title.as_deref(), text.as_deref(), ctx.source.as_deref())?;
             println!("updated note:{id}");
@@ -831,8 +849,25 @@ fn edit_in_editor(body: &str) -> Result<String> {
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
         .unwrap_or_else(|_| "vi".into());
-    let path = std::env::temp_dir().join(format!("nebula-rag-note-{}.md", std::process::id()));
-    std::fs::write(&path, body)?;
+    let path = std::env::temp_dir().join(format!(
+        "nebula-rag-note-{}-{}.md",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0)
+    ));
+    // create_new: never follow a file or symlink someone planted there.
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("create {}", path.display()))?;
+        f.write_all(body.as_bytes())?;
+    }
     let status = Command::new("sh")
         .arg("-c")
         .arg(format!("{editor} \"$1\""))
@@ -908,6 +943,14 @@ mod tests {
         assert!(t.contains("Hello & welcome"));
         assert!(!t.contains("var x"));
         assert!(!t.contains("p{}"));
+    }
+
+    #[test]
+    fn html_with_a_trailing_bracket_or_non_ascii_does_not_panic() {
+        assert_eq!(html_to_text("a <"), "a");
+        let t = html_to_text("<p>İstanbul și <b>București</b></p><h2>Ține</h2>x");
+        assert!(t.contains("İstanbul și București"), "{t}");
+        assert!(t.contains("## Ține"), "{t}");
     }
 
     #[test]
