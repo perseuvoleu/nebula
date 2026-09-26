@@ -15,8 +15,9 @@ requests synchronization. Merely having sessions on both machines is not enough:
 tasks may stay independent. An explicit local-only / remote-only / no-sync instruction takes
 precedence; report a missing input rather than silently crossing that boundary.
 
-Before any transfer that can push commits, apply [Protected branches](../remote-projects/SKILL.md#protected-branches-never-push-main-or-master): `main` / `master` are never push destinations,
-including implicit pushes performed by sync/collect. Pass this guardrail to delegated workers.
+Before any transfer that can push commits, apply [Protected branches](../remote-projects/SKILL.md#protected-branches-explicit-approval-required): writes to `main` / `master`,
+including implicit sync/collect pushes, require Andrei's explicit approval for that operation.
+Pass the resolved destination and approval scope (or its absence) to delegated workers.
 
 `nebula sync --help` and `nebula collect --help` are the source of truth for flags.
 This tracked file is the canonical runbook; from any local project read

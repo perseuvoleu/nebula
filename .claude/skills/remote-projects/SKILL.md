@@ -11,29 +11,35 @@ mirrors through a relay. The row shows as `repo` with a pink `@findl` badge (abs
 project of the same name when one exists). The host needs `nebula`, the agent CLIs and their logins
 installed; `nebula remote <host> upgrade` keeps nebula current there.
 
-## Protected branches: NEVER push main or master
+## Protected branches: explicit approval required
 
-**Never push to `main` or `master`, on any Git remote, from either machine. No exceptions.**
-The protected names are the **destination refs** (`refs/heads/main`, `refs/heads/master`),
-not just the currently checked-out branch. This covers creating, updating or deleting those
-refs, normal/force pushes, an explicit refspec such as `HEAD:main`, and implicit pushes through
-`nebula sync`, `nebula collect`, scripts, aliases or other automation. Use neither broad
-`--all` / `--mirror` pushes nor an API/automation workaround to bypass this rule.
+**Merge or push to `main` / `master` only with Andrei's explicit approval for that operation.**
+Without approval, use a task branch and offer a PR. Approval in the current conversation
+counts: a direct request to merge/push the named work into `main`, or confirmation such as
+“ai aprobarea mea, fă direct” after that operation was described, authorizes it. Proceed after
+preflight without asking for the same approval again. Approval is scoped to that work and
+resolved destination, not to unrelated projects, branches or future operations.
 
-Before an operation that can publish commits:
+Before changing a protected branch or publishing commits:
 
-1. Resolve its destination remote and branch/ref, including pushes performed on findl by a
-   wrapper. For sync/collect, inspect the scoped status/dry-run and the actual branch, not the
-   checkout selector `root` / `primary`.
-2. Proceed only when every pushed destination is an explicit non-protected task/feature branch.
-   If a destination is protected or cannot be established, stop before the write.
-3. Publish the task branch and open a PR when requested; leave integration into `main` / `master`
-   to the user. If asked to push a protected branch, explain this standing prohibition and offer
-   the task-branch/PR route instead. Reading/fetching a protected branch as a base is allowed.
+1. Resolve the checkout, source commits, destination remote and destination ref. Protection
+   follows `refs/heads/main` / `refs/heads/master`, not the currently checked-out branch; it
+   applies to local merges, direct pushes, PR/API merges and implicit pushes through
+   sync/collect or wrappers on either machine. An unknown destination is a blocker.
+2. For a protected destination, state the resolved operation and identify Andrei's approval
+   in the conversation or handoff. If approval is absent or its scope is unclear, ask before
+   writing. Carry that same scope into delegated worker prompts.
+3. Verify checkout ownership and cleanliness, inspect the commits being integrated, and
+   preserve other sessions' work. Use an explicit refspec for pushes. Normal approval does
+   not authorize force-push, history rewriting, branch deletion, `--all` / `--mirror`, or
+   bypassing repository access controls; those require separate, specific authorization.
+4. Report the resulting local/remote SHA and any remaining blocker. Read/fetch operations
+   need no protected-branch approval.
 
-Completion criterion: no command or delegated worker can publish to either protected ref.
-Include this guardrail in remote worker handoffs. A needed sync never overrides it; the
-hybrid-work skill determines whether any transfer is needed in the first place.
+Completion criterion: each protected-branch write has explicit, scoped approval and a
+verified destination; every other destination is an explicit task/feature branch. A needed
+sync does not itself supply approval. The hybrid-work skill still governs transfer need
+and one-writer ownership.
 
 ## The host is findl. Always.
 
