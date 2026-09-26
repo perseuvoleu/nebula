@@ -92,6 +92,13 @@ enum Command {
         #[command(subcommand)]
         command: AgentCommand,
     },
+    /// Diagrams for this checkout: self-contained HTML pages in
+    /// `.scratch/diagrams/`, shown inside the TUI with ⌘X. Agents create
+    /// them with `new`, edit the file, then `open` it for the user.
+    Diagram {
+        #[command(subcommand)]
+        command: DiagramCommand,
+    },
     /// Read or edit the notes for the current project/worktree (agents can
     /// too — inside a session the target is the session's own project).
     Notes {
@@ -429,6 +436,62 @@ enum AgentCommand {
 }
 
 #[derive(Subcommand)]
+enum DiagramCommand {
+    /// Write a new diagram from the template and print its absolute path.
+    /// Inside a nebula session the diagram records that session as its
+    /// owner (decision pages report back to it).
+    New {
+        /// File name without `.html`: lowercase letters, digits, hyphens.
+        slug: String,
+        /// Page title — what the viewer lists and searches (default: the slug).
+        #[arg(long)]
+        title: Option<String>,
+        /// Tag for search; repeatable.
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+        /// Decision page: option cards whose "choose" button reports the
+        /// choice back to the owning session.
+        #[arg(long)]
+        decision: bool,
+        /// Overwrite an existing diagram of the same slug.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Validate an existing HTML file (is HTML, has a <title>; warns on
+    /// network references) and copy it into the folder.
+    Add {
+        file: std::path::PathBuf,
+        /// Slug to store it under (default: derived from the file name).
+        #[arg(long)]
+        slug: Option<String>,
+        /// Overwrite an existing diagram of the same slug.
+        #[arg(long)]
+        force: bool,
+    },
+    /// List diagrams, newest first; a query fuzzy-matches slug, title, tags.
+    List {
+        query: Option<String>,
+        /// Print a JSON array (slug, title, tags, session, path, mtime_ms).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Ask the running TUI to show a diagram (default: the newest) — the
+    /// same viewer ⌘X opens.
+    Open { slug: Option<String> },
+    /// Delete a diagram (and its decisions log).
+    Rm { slug: String },
+    /// Print the diagrams folder of this checkout.
+    Path,
+    /// Print the choices the user made on a decision page, oldest first.
+    Decisions {
+        slug: String,
+        /// Print a JSON array of `{ts, slug, id, choice, label, note}`.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum NotesCommand {
     /// List the project's notes, then the current worktree's (the default).
     List,
@@ -649,6 +712,30 @@ fn main() -> Result<()> {
                 nebula_tui::run_agent_ctl(nebula_tui::AgentCtl::Restart, name, project)
             }
         },
+        Some(Command::Diagram { command }) => {
+            use nebula_tui::DiagramOp;
+            nebula_tui::run_diagram(match command {
+                DiagramCommand::New {
+                    slug,
+                    title,
+                    tags,
+                    decision,
+                    force,
+                } => DiagramOp::New {
+                    slug,
+                    title,
+                    tags,
+                    decision,
+                    force,
+                },
+                DiagramCommand::Add { file, slug, force } => DiagramOp::Add { file, slug, force },
+                DiagramCommand::List { query, json } => DiagramOp::List { query, json },
+                DiagramCommand::Open { slug } => DiagramOp::Open { slug },
+                DiagramCommand::Rm { slug } => DiagramOp::Rm { slug },
+                DiagramCommand::Path => DiagramOp::Path,
+                DiagramCommand::Decisions { slug, json } => DiagramOp::Decisions { slug, json },
+            })
+        }
         Some(Command::Notes { command }) => {
             use nebula_tui::NotesOp;
             let op = match command {

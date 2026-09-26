@@ -36,5 +36,6 @@ Shared by every agent kind (claude, codex, cursor, pi). Open one only when its t
   `[nebula] This project has a twin on <host>` prompt line, or a `nebula sync` refusal.
 - `.claude/skills/recall/SKILL.md` — Mission Control sessions only (MC_* env vars present):
   saving a durable project fact, or code questions via the graph_* MCP tools.
-- `.claude/skills/diagram/SKILL.md` — Mission Control sessions only: diagram requests, rendered
-  as Mermaid in MC's viewer.
+- `.claude/skills/diagram/SKILL.md` — trigger: any diagram request, or a choice the user should
+  make by clicking an option. `nebula diagram new` → edit the HTML in `.scratch/diagrams/` →
+  `nebula diagram open` (⌘X viewer); Mission Control sessions (MC_* env vars) use Mermaid instead.

@@ -175,6 +175,24 @@ fn env_agent_id() -> Option<String> {
         .filter(|v| !v.is_empty() && !v.starts_with("term:"))
 }
 
+/// The calling agent session as `(id, name)`, for `nebula diagram new` to
+/// record a diagram's owner. The id comes from the environment alone; the
+/// name is a best-effort daemon lookup that never blocks or fails the verb.
+pub async fn calling_session() -> Option<(String, Option<String>)> {
+    let id = env_agent_id()?;
+    let lookup = async {
+        let stream = try_connect(&paths::socket_path()).await.ok()?;
+        let mut conn = handshake(stream).await.ok()?;
+        let (_, _, agents) = subscribe_snapshot(&mut conn).await.ok()?;
+        agents.into_iter().find(|a| a.id.as_str() == id).map(|a| a.name)
+    };
+    let name = tokio::time::timeout(Duration::from_secs(2), lookup)
+        .await
+        .ok()
+        .flatten();
+    Some((id, name))
+}
+
 /// One-shot client for `nebula rename`, run from inside an agent session's
 /// CLI: resolve the agent from NEBULA_AGENT_ID and ask the daemon to title
 /// it. Never spawns a daemon — no daemon means no session worth titling.

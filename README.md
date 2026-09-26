@@ -242,6 +242,7 @@ Defaults — every one of them is rebindable in Settings → Hotkeys (`s`).
 | Any panel | `s` | settings overlay (theme, editor, agent defaults, timeouts) — its Hotkeys tab rebinds every key in this table |
 | Any panel | `Shift+M` | memory usage: RAM per agent/terminal process tree, nebula itself, and the machine-wide share; `↑/↓` + `Enter` opens the selected session |
 | Any panel | `Shift+N` | replay the startup splash (any key returns) |
+| Any panel | `⌘X` | diagram viewer (Ghostty): the selected checkout's `.scratch/diagrams/`, newest first, rendered inside the TUI — `[` `]` switch, `/` search, `Ctrl+scroll` sends the diagram’s `+`/`−` zoom shortcuts, `Ctrl+R` reload, `Esc`/`⌘X` close; needs `node` + Playwright + Chrome at runtime |
 | Any panel | `?` | help overlay |
 | Any panel | `q` / `Ctrl+c` | quit the TUI (sessions keep running) |
 | Terminal | anything | forwarded raw to the PTY |
@@ -274,6 +275,10 @@ nebula workspace rename <a> <b> # rename a workspace
 nebula workspace delete <name>  # delete an empty workspace
 nebula ssh <host> [dir]   # open nebula on a remote machine over ssh (installs it there if
                           # missing); destinations are remembered for the TUI's `h` picker
+nebula diagram new <slug> [--title ..] [--tag t].. [--decision]  # self-contained HTML diagram in
+                          # .scratch/diagrams/ (prints its path); --decision = clickable option cards
+nebula diagram list [query] [--json] | add <file.html> | rm <slug> | path | decisions <slug>
+nebula diagram open [slug]  # show it in the running TUI's ⌘X viewer (default: the newest)
 nebula hooks install <kind> [dir]  # install an agent CLI's status hooks (what a spawn does;
                           # remote spawns run it on the far host)
 nebula remote <host> status    # nebula + daemon on the host, the sessions there
