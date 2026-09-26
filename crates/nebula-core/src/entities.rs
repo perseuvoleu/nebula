@@ -169,7 +169,8 @@ pub struct Agent {
     #[serde(default)]
     pub pinned: bool,
     /// Epoch ms of the last status change; 0 = unknown (pre-upgrade rows or
-    /// never-run agents). Drives the TUI's RECENT session group.
+    /// never-run agents). Drives the TUI's "23m ago" stamps and the
+    /// all-projects SESSIONS list's recency order.
     #[serde(default)]
     pub status_changed_at: i64,
     #[serde(default)]

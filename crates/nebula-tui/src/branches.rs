@@ -13,6 +13,10 @@ pub struct LocalBranch {
     /// (`branch: Created from <base>`). None when the reflog is gone
     /// (expired, a fresh clone) or names no branch (a detached `HEAD`).
     pub created_from: Option<String>,
+    /// Epoch secs of the oldest reflog entry — the branch's creation while
+    /// the reflog reaches back that far. The panel's fixed row order sorts
+    /// on it. None when the reflog is gone.
+    pub created_at: Option<i64>,
 }
 
 /// A branch with no known base — how most test fixtures and fallbacks
@@ -22,6 +26,7 @@ impl From<&str> for LocalBranch {
         Self {
             name: name.to_owned(),
             created_from: None,
+            created_at: None,
         }
     }
 }
@@ -62,35 +67,52 @@ pub fn local_branches(repo: &Path) -> Vec<String> {
     .unwrap_or_default()
 }
 
-/// `local_branches` plus each branch's creation base — one extra `git
-/// reflog` read per branch, so this runs off-loop like the listing itself.
+/// `local_branches` plus each branch's creation base and time — one extra
+/// `git reflog` read per branch, so this runs off-loop like the listing
+/// itself.
 pub fn local_branches_with_bases(repo: &Path) -> Vec<LocalBranch> {
     local_branches(repo)
         .into_iter()
         .map(|name| {
-            let created_from = branch_creation_base(repo, &name);
-            LocalBranch { name, created_from }
+            let (created_from, created_at) = branch_creation(repo, &name);
+            LocalBranch {
+                name,
+                created_from,
+                created_at,
+            }
         })
         .collect()
 }
 
-/// The base a branch's oldest reflog entry names. Git writes
+/// The base and time of a branch's oldest reflog entry. Git writes
 /// `branch: Created from <base>` at creation; an explicit base (`git
 /// branch x y`, `git checkout -b x y`, nebula's own base picker) records
 /// the branch name, while creation from an implicit HEAD records the
 /// literal `HEAD` — useless for lineage, so it maps to None.
-fn branch_creation_base(repo: &Path, branch: &str) -> Option<String> {
-    let out = git(repo, &["reflog", "show", "--format=%gs", branch])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())?;
+fn branch_creation(repo: &Path, branch: &str) -> (Option<String>, Option<i64>) {
+    let Some(out) = git(
+        repo,
+        &["reflog", "show", "--date=unix", "--format=%gd%x09%gs", branch],
+    )
+    .output()
+    .ok()
+    .filter(|o| o.status.success()) else {
+        return (None, None);
+    };
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let base = stdout
-        .lines()
-        .last()?
-        .strip_prefix("branch: Created from ")?
-        .trim();
-    (!base.is_empty() && base != "HEAD").then(|| base.to_owned())
+    let Some((selector, subject)) = stdout.lines().last().and_then(|l| l.split_once('\t')) else {
+        return (None, None);
+    };
+    // `<branch>@{<unix secs>}`
+    let created_at = selector
+        .rsplit_once("@{")
+        .and_then(|(_, t)| t.strip_suffix('}')?.parse().ok());
+    let base = subject
+        .strip_prefix("branch: Created from ")
+        .map(str::trim)
+        .filter(|b| !b.is_empty() && *b != "HEAD")
+        .map(str::to_owned);
+    (base, created_at)
 }
 
 /// Delete a local branch: `-d` first, and when git refuses because the tip
@@ -198,6 +220,37 @@ mod tests {
             None,
             "a literal 'Created from HEAD' names no branch"
         );
+    }
+
+    /// Creation time is the oldest reflog entry's, so later commits on a
+    /// branch never move it.
+    #[test]
+    fn creation_time_is_the_oldest_reflog_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        run_git(&repo, &["init", "-b", "main"]);
+        run_git(&repo, &["config", "user.email", "t@t"]);
+        run_git(&repo, &["config", "user.name", "t"]);
+        run_git(&repo, &["commit", "--allow-empty", "-m", "init"]);
+        let git_at = |when: &str, args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .env("GIT_COMMITTER_DATE", when)
+                .args(args)
+                .output()
+                .unwrap();
+        };
+        git_at("2030-01-01T00:00:00Z", &["branch", "feat", "main"]);
+        git_at("2031-01-01T00:00:00Z", &["checkout", "feat"]);
+        git_at("2031-01-01T00:00:00Z", &["commit", "--allow-empty", "-m", "later"]);
+
+        let feat = local_branches_with_bases(&repo)
+            .into_iter()
+            .find(|b| b.name == "feat")
+            .unwrap();
+        assert_eq!(feat.created_at, Some(1_893_456_000), "2030-01-01, not the later commit");
     }
 
     #[test]
