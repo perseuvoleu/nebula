@@ -733,8 +733,8 @@ async fn create_worktree_path(
 /// (created first, like `git checkout -b`, from the branch the caller is
 /// on) and the shell `cd`s to the project's own path. `--worktree` gives
 /// the branch its own directory instead — the way parallel work runs. A
-/// branch that already has a checkout (a nebula worktree, or the primary
-/// sitting on it) is simply entered. Inside a nebula terminal the `cd` is
+/// branch always targets primary unless --worktree explicitly selects a
+/// separate checkout. Inside a nebula terminal the `cd` is
 /// typed into that tab's PTY, so the shell lands there once this command
 /// returns; elsewhere the path is printed for the caller to `cd` into.
 pub async fn switch(
@@ -766,12 +766,15 @@ pub async fn switch(
     let existing = worktrees
         .iter()
         .find(|w| w.project_id == project.id && w.branch == branch);
-    let base = from.or_else(current_branch_here);
-    let pre_existing = git_branch_exists(&project.repo_path, &branch);
+    let local = project.host.is_none();
+    let base = from.or_else(|| local.then(current_branch_here).flatten());
+    // Host paths must never be interpreted as paths on this CLI's machine.
+    // CheckoutPrimary resolves/fetches remote branches on their owning daemon.
+    let pre_existing = local && git_branch_exists(&project.repo_path, &branch);
     // The shell running this command: a terminal tab (`term:<id>`) or an
     // agent session. It may move itself only when no other live session
     // depends on primary; stopped sessions retain their resume expectations.
-    let own_env = std::env::var("NEBULA_AGENT_ID").ok();
+    let own_env = std::env::var("NEBULA_AGENT_ID").ok().filter(|_| local);
     let terminal = own_env
         .as_deref()
         .and_then(|v| v.strip_prefix("term:").map(str::to_owned))
@@ -786,7 +789,7 @@ pub async fn switch(
             .map(|a| nebula_core::SessionRef::Agent(a.id.clone())),
         (None, None) => None,
     };
-    let (path, created, checked_out) = match existing {
+    let (path, created, checked_out) = match existing.filter(|_| worktree) {
         Some(w) => (Some(w.path.display().to_string()), false, false),
         None if worktree => (
             create_worktree_path(
@@ -800,7 +803,7 @@ pub async fn switch(
             false,
         ),
         None => {
-            if !pre_existing {
+            if local && !pre_existing {
                 git_create_branch(&project.repo_path, &branch, base.as_deref())?;
             }
             let req_id = 1u64;
@@ -818,7 +821,7 @@ pub async fn switch(
             await_ack(&mut conn, req_id, &mut upserts).await?;
             (
                 Some(primary.path.display().to_string()),
-                !pre_existing,
+                local && !pre_existing,
                 true,
             )
         }
@@ -826,6 +829,20 @@ pub async fn switch(
     let Some(path) = path else {
         bail!("the daemon created the checkout but never reported its path");
     };
+    if let Some(host) = &project.host {
+        // Relay snapshots can retain vanished paths. Verify on the owning host,
+        // never against a coincident directory on this CLI's machine.
+        let git_dir = std::path::Path::new(&path).join(".git");
+        let check = format!(
+            "test -e {}",
+            nebula_core::remote::ssh_quote(&git_dir.to_string_lossy())
+        );
+        crate::remote_cli::ssh(host, &check, false).with_context(|| {
+            format!("checkout at {host}:{path} is unavailable; restore it or reconnect the host and retry; no cd was sent")
+        })?;
+    } else if !std::path::Path::new(&path).join(".git").exists() {
+        bail!("checkout at {path} is unavailable; restore it and retry; no cd was sent");
+    }
     if let Some(id) = &terminal {
         // The shell is blocked on this very command; the tty queues the
         // line and the shell runs it at its next prompt, like typed-ahead
@@ -851,7 +868,9 @@ pub async fn switch(
             "cd": terminal.is_some(),
         })
     );
-    if terminal.is_none() {
+    if let Some(host) = &project.host {
+        eprintln!("checkout on {host}: {path} (local shell unchanged)");
+    } else if terminal.is_none() {
         eprintln!("cd '{path}'");
     }
     Ok(())
@@ -1496,6 +1515,8 @@ pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
                 {
                     return Err(error);
                 }
+                // A missing selector is branch intent: the owning daemon must
+                // use guarded primary resolution, never provision a worktree.
                 write_frame(
                     &mut conn.stream,
                     &ClientRequest::ResolveBranchCheckout {

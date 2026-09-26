@@ -3339,9 +3339,8 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     enum RowKind {
         /// The primary checkout: `branch ⌂ primary`.
         Primary,
-        /// A linked worktree — `(wt)`, or `(branch)` when it exists only
-        /// to host sessions on a branch the user created as a branch.
-        Worktree { for_branch: bool },
+        /// A physical linked checkout always reads `(wt)`.
+        Worktree,
         /// A local branch no checkout holds — dim `○ branch (branch)`,
         /// with the chats parked on it (if any) listed underneath.
         Branch,
@@ -3369,13 +3368,8 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                     let w = app.tree.worktrees.iter().find(|w| &w.id == id);
                     let (label, kind) = match w {
                         Some(w) if w.is_main => (w.branch.clone(), RowKind::Primary),
-                        Some(w) => (
-                            w.branch.clone(),
-                            RowKind::Worktree {
-                                for_branch: w.for_branch,
-                            },
-                        ),
-                        None => (String::new(), RowKind::Worktree { for_branch: false }),
+                        Some(w) => (w.branch.clone(), RowKind::Worktree),
+                        None => (String::new(), RowKind::Worktree),
                     };
                     Row {
                         kind,
@@ -3575,15 +3569,9 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                     Style::default().fg(if i == app.sel_worktree { th.ok } else { th.dim }),
                 ));
             }
-            RowKind::Worktree { for_branch } => {
+            RowKind::Worktree => {
                 spans.push(status_dot(row.roll, th));
-                // A checkout that exists only to host sessions on a branch
-                // the user created as a branch keeps its (branch) identity.
-                let (tag, tag_color) = if for_branch {
-                    (BRANCH_TAG, th.special)
-                } else {
-                    (WT_TAG, th.info)
-                };
+                let (tag, tag_color) = (WT_TAG, th.info);
                 spans.extend(status_name_spans(
                     truncate(
                         &row.label,

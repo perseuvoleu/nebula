@@ -1345,8 +1345,8 @@ impl Daemon {
 
     // ---- worktrees ----
 
-    /// Resolve one host-owned checkout of an existing branch. The worktree
-    /// lifecycle lock makes concurrent requests converge on the same directory.
+    /// Resolve an existing branch onto this host's guarded primary checkout.
+    /// The lifecycle lock serializes switches; branch intent never creates a WT.
     pub async fn resolve_branch_checkout(
         self: &Arc<Self>,
         project_id: &ProjectId,
@@ -1364,22 +1364,17 @@ impl Daemon {
         if branch.trim().is_empty() || !git::branch_exists(&project.repo_path, branch).await {
             bail!("branch \"{branch}\" does not exist on this host; create or fetch it explicitly first");
         }
-        self.reconcile_project_worktrees(&project).await?;
-        let entries = git::list_worktrees(&project.repo_path).await?;
+        self.checkout_primary_locked(project_id, branch, None)
+            .await?;
         let (_, worktrees, _, _) = self.store.load_tree()?;
-        if let Some(w) = worktrees.iter().find(|w| {
-            w.project_id == *project_id
-                && entries
-                    .iter()
-                    .any(|e| e.path == w.path && e.branch == branch)
-        }) {
-            self.broadcast(ServerEvent::EntityUpserted {
-                entity: Entity::Worktree(w.clone()),
-            });
-            return Ok(EntityId::Worktree(w.id.clone()));
-        }
-        self.create_worktree_locked(project_id, branch, None, true)
-            .await
+        let primary = worktrees
+            .into_iter()
+            .find(|w| w.project_id == *project_id && w.is_main)
+            .context("primary checkout not found")?;
+        self.broadcast(ServerEvent::EntityUpserted {
+            entity: Entity::Worktree(primary.clone()),
+        });
+        Ok(EntityId::Worktree(primary.id))
     }
 
     /// Create an explicitly requested task worktree, preserving existing branch behavior.
@@ -1393,8 +1388,7 @@ impl Daemon {
             bail!("branch name is empty");
         }
         let _ops = self.worktree_ops.lock().await;
-        self.create_worktree_locked(project_id, branch, base, false)
-            .await
+        self.create_worktree_locked(project_id, branch, base).await
     }
 
     async fn create_worktree_locked(
@@ -1402,7 +1396,6 @@ impl Daemon {
         project_id: &ProjectId,
         branch: &str,
         base: Option<&str>,
-        existing_only: bool,
     ) -> Result<EntityId> {
         let project = self
             .store
@@ -1435,11 +1428,7 @@ impl Daemon {
         // the reflog, and a branch minted right here branches from the
         // root checkout's HEAD (which `git worktree add` reads too).
         let pre_existing = git::branch_exists(&project.repo_path, branch).await;
-        let path = if existing_only {
-            git::add_existing_worktree(&project.repo_path, branch).await?
-        } else {
-            git::add_worktree(&project.repo_path, branch, base).await?
-        };
+        let path = git::add_worktree(&project.repo_path, branch, base).await?;
         // The root checkout's `.env`s come along — synchronously, they are
         // tiny, and a session started right after must find them.
         match git::seed_env_files(&project.repo_path, &path).await {
@@ -1471,9 +1460,8 @@ impl Daemon {
             is_main: false,
             created_from,
             pinned: false,
-            // Automatic checkouts use ordinary worktree cleanup: removing the
-            // directory must never implicitly delete its pre-existing branch.
-            for_branch: pre_existing && !existing_only,
+            // Preserve explicit worktree metadata; deletion policy is unchanged.
+            for_branch: pre_existing,
             sort_order: 0,
         };
         self.store.insert_worktree(&worktree)?;
@@ -1608,16 +1596,30 @@ impl Daemon {
         branch: &str,
         mover: Option<&SessionRef>,
     ) -> Result<()> {
+        let _ops = self.worktree_ops.lock().await;
+        self.checkout_primary_locked(project_id, branch, mover)
+            .await
+    }
+
+    /// Caller holds worktree_ops; never reacquire it through the public wrapper.
+    async fn checkout_primary_locked(
+        self: &Arc<Self>,
+        project_id: &ProjectId,
+        branch: &str,
+        mover: Option<&SessionRef>,
+    ) -> Result<()> {
         let branch = branch.trim();
         if branch.is_empty() {
             bail!("branch name is empty");
         }
-        let _ops = self.worktree_ops.lock().await;
         let _execution = self.checkout_execution.write().await;
         let project = self
             .store
             .get_project(project_id)?
             .context("project not found")?;
+        if project.host.is_some() {
+            bail!("host checkout is unavailable; reconnect the host and retry");
+        }
         self.reconcile_project_worktrees(&project).await?;
         let (_, checkouts, _, _) = self.store.load_tree()?;
         let primary = checkouts
@@ -1652,7 +1654,7 @@ impl Daemon {
             .collect();
         if let Some(w) = parked.first() {
             bail!(
-                "branch \"{branch}\" already has a checkout at {}; use that checkout instead",
+                "branch \"{branch}\" already has a checkout at {}; primary was not switched. Explicitly select it with --worktree, or free the parked branch before retrying",
                 w.path.display()
             );
         }
@@ -1694,7 +1696,7 @@ impl Daemon {
                 w == id && self.is_alive(&SessionRef::Agent(entry.agent_id.clone()))
             });
         if occupied || warm {
-            bail!("checkout has another live session; use its branch checkout or explicitly close the other sessions first (finished agents and shells still count)");
+            bail!("primary checkout has another live session; close the other sessions or let warm PTYs expire, then retry (finished agents and shells still count); no worktree was created");
         }
         Ok(())
     }
@@ -4487,7 +4489,9 @@ mod tests {
             .checkout_primary(&pid, "feat", None)
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("use that checkout instead"));
+        assert!(err
+            .to_string()
+            .contains("Explicitly select it with --worktree"));
         let ServerEvent::Snapshot {
             worktrees, agents, ..
         } = daemon.snapshot().unwrap()
@@ -4980,14 +4984,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn branch_checkout_resolution_reuses_host_checkouts_and_preserves_branches() {
+    async fn branch_checkout_resolution_switches_primary_and_refuses_parked_branches() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         std::fs::create_dir(&repo).unwrap();
         git_in(&repo, &["init", "-b", "feature"]);
         git_in(&repo, &["commit", "--allow-empty", "-m", "init"]);
         git_in(&repo, &["branch", "manual"]);
-        git_in(&repo, &["branch", "blocked"]);
         std::fs::write(repo.join(".gitignore"), ".env\n").unwrap();
         git_in(&repo, &["add", ".gitignore"]);
         git_in(&repo, &["commit", "-m", "ignore env"]);
@@ -5021,26 +5024,23 @@ mod tests {
         let EntityId::Worktree(main) = id else {
             panic!()
         };
-        let EntityId::Worktree(adopted) = daemon
+        assert_eq!(main, primary);
+        let err = daemon
             .resolve_branch_checkout(&project, "manual")
             .await
-            .unwrap()
-        else {
-            panic!()
-        };
+            .unwrap_err();
+        assert!(err.to_string().contains("already has a checkout"), "{err}");
         let ServerEvent::Snapshot { worktrees, .. } = daemon.snapshot().unwrap() else {
             panic!()
         };
         let main_path = &worktrees.iter().find(|w| w.id == main).unwrap().path;
-        assert_eq!(worktrees.len(), 3);
+        assert_eq!(worktrees.len(), 2);
+        assert_eq!(git::list_worktrees(&repo).await.unwrap().len(), 2);
         assert_eq!(
             worktrees.iter().find(|w| w.id == primary).unwrap().path,
-            repo
+            repo.canonicalize().unwrap()
         );
-        assert_eq!(
-            worktrees.iter().find(|w| w.id == adopted).unwrap().path,
-            manual
-        );
+        assert_eq!(main_path, &repo.canonicalize().unwrap());
         assert_eq!(
             std::fs::read_to_string(main_path.join(".env")).unwrap(),
             "ISOLATION=ready\n"
@@ -5054,14 +5054,8 @@ mod tests {
             .await
             .is_err());
         assert!(!git::branch_exists(&repo, "does-not-exist").await);
-        std::fs::create_dir_all(git::worktree_dir(&repo, "blocked")).unwrap();
-        assert!(daemon
-            .resolve_branch_checkout(&project, "blocked")
-            .await
-            .is_err());
-        assert_eq!(git::current_branch(&repo).await.unwrap(), "feature");
-        // Ordinary removal of an automatically provisioned checkout retains its branch.
-        daemon.delete_worktree(&main, false).await.unwrap();
+        assert_eq!(git::current_branch(&repo).await.unwrap(), "main");
+        assert!(!git::worktree_dir(&repo, "main").exists());
         assert!(git::branch_exists(&repo, "main").await);
         assert!(manual.exists());
         // The same-named branch in another host/project never shares an identity.
@@ -5190,6 +5184,13 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("live session"));
+        let err = daemon
+            .resolve_branch_checkout(&project, "feature")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("live session"));
+        assert_eq!(git::list_worktrees(&repo).await.unwrap().len(), 1);
+        assert!(!git::worktree_dir(&repo, "feature").exists());
         assert!(Arc::ptr_eq(
             &live,
             &daemon.ensure_session(&shell, 80, 24).unwrap()

@@ -2690,28 +2690,18 @@ fn open_session_picker_for_context(app: &mut App, out: &mut Vec<ClientRequest>) 
     open_new_agent_picker(app, worktree);
 }
 
-/// A session reuses this host's branch checkout or resolves a managed linked
-/// checkout before opening the picker. Navigation alone never provisions one.
+/// Branch intent always resolves this host's guarded primary checkout.
+/// Explicit physical checkout actions use their selected checkout instead.
 fn pick_agent_on_branch(
     app: &mut App,
     project: nebula_core::ProjectId,
     branch: String,
     out: &mut Vec<ClientRequest>,
 ) {
-    if let Some(worktree) = app
-        .tree
-        .worktrees
-        .iter()
-        .find(|w| w.project_id == project && w.branch == branch)
-        .map(|w| w.id.clone())
-    {
-        open_new_agent_picker(app, worktree);
-    } else {
-        resolve_branch_then(app, project, branch, AfterCheckout::PickAgent, out);
-    }
+    resolve_branch_then(app, project, branch, AfterCheckout::PickAgent, out);
 }
 
-/// Resolve an execution checkout on the selected host without moving primary.
+/// Resolve primary on the selected host, refusing an unsafe switch.
 fn resolve_branch_then(
     app: &mut App,
     project: nebula_core::ProjectId,
@@ -3968,8 +3958,7 @@ fn open_agent_picker(app: &mut App, worktree: WorktreeId) {
     }));
 }
 
-/// Where a twin row sends a new session: the twin's checkout of the same
-/// branch when it has one, otherwise a managed linked checkout on that host.
+/// Host selection targets the twin's primary, never an implicit linked checkout.
 #[derive(Debug, Clone, PartialEq)]
 enum TwinTarget {
     Worktree(WorktreeId),
@@ -4009,8 +3998,8 @@ impl TwinTarget {
 /// findl:/path` counterpart, say) — as (where, target) pairs for the
 /// session pickers; `where` is the host name, or "locally" for the
 /// checkout on this machine. The target follows the worktree's *branch*,
-/// exactly like a local pick would: the twin's checkout of that branch,
-/// or a managed linked checkout on the twin when there is none — a
+/// exactly like a local branch pick: the twin's primary if already on that
+/// branch, or a guarded primary switch otherwise — a
 /// session started "on findl" from a feature worktree never lands on
 /// whatever findl's primary happens to be on.
 fn project_twins(app: &App, worktree: &WorktreeId) -> Vec<(String, TwinTarget)> {
@@ -4039,9 +4028,7 @@ fn project_twins(app: &App, worktree: &WorktreeId) -> Vec<(String, TwinTarget)> 
                 .tree
                 .worktrees
                 .iter()
-                .filter(|x| x.project_id == p.id && x.branch == w.branch)
-                // The primary wins over a parked worktree on the same branch.
-                .max_by_key(|x| x.is_main)
+                .find(|x| x.project_id == p.id && x.is_main && x.branch == w.branch)
                 .map(|x| x.id.clone());
             let target = match same_branch {
                 Some(id) => TwinTarget::Worktree(id),
@@ -4126,9 +4113,7 @@ fn branch_pick_label(
         .tree
         .worktrees
         .iter()
-        // A for_branch checkout hosts sessions on a branch the user made
-        // as a branch — the picker keeps calling it one.
-        .any(|w| &w.project_id == project && w.branch == branch && !w.for_branch)
+        .any(|w| &w.project_id == project && w.branch == branch && !w.is_main)
     {
         format!("{branch} (wt)")
     } else {
@@ -10498,7 +10483,7 @@ mod tests {
             },
         );
         // findl has no checkout of feature-x: "Run on findl" resolves
-        // a linked branch checkout there, then picks the agent there
+        // guarded primary resolution there, then picks the agent there
         // — never a session on whatever findl's primary was on.
         open_agent_picker(&mut app, WorktreeId("w-feat".into()));
         let Some(Overlay::Menu(menu)) = &app.overlay else {
@@ -10555,8 +10540,8 @@ mod tests {
                     branch: "feature-x".into(),
                     next: AfterCheckout::Terminal,
                 }));
-        // Once findl has the branch checked out, the rows aim straight at
-        // that checkout.
+        // A host selection is not permission to enter a parked linked checkout.
+        // Even when it exists, ask primary and let its host refuse safely.
         app.overlay = None;
         hse(
             &mut app,
@@ -10573,7 +10558,14 @@ mod tests {
             .iter()
             .find(|i| i.label == "Run on findl ▸")
             .unwrap();
-        assert!(matches!(&twin.action, MenuAction::NewAgent(w) if w.as_str() == "w-remote-feat"));
+        assert_eq!(
+            twin.action,
+            MenuAction::CheckoutThen {
+                project: ProjectId("p-remote".into()),
+                branch: "feature-x".into(),
+                next: AfterCheckout::PickAgent,
+            }
+        );
     }
 
     #[test]
@@ -11212,13 +11204,10 @@ mod tests {
             );
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
             assert!(
-                matches!(
-                    &app.overlay,
-                    Some(Overlay::Menu(m)) if m.title.as_deref() == Some("New session")
-                ),
-                "enter opens the session picker on the filtered branch's checkout: {:?}",
-                app.overlay
+                matches!(out.last(), Some(ClientRequest::ResolveBranchCheckout { branch, .. }) if branch == "feature"),
+                "branch intent must ask primary even when a linked checkout exists: {out:?}"
             );
+            assert!(app.overlay.is_none());
         })
     }
 
@@ -18646,6 +18635,19 @@ mod tests {
             assert_eq!(menu.items[0].label, "main ⌂ primary");
         }
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        let Some(ClientRequest::ResolveBranchCheckout { req_id, branch, .. }) = out.pop() else {
+            panic!("expected guarded primary resolution");
+        };
+        assert_eq!(branch, "main");
+        hse(
+            &mut app,
+            ServerEvent::Ack {
+                req_id,
+                created: Some(nebula_core::EntityId::Worktree(nebula_core::WorktreeId(
+                    "w1".into(),
+                ))),
+            },
+        );
         let Some(Overlay::Menu(menu)) = &app.overlay else {
             panic!("expected the session picker, got {:?}", app.overlay);
         };
@@ -18888,11 +18890,9 @@ mod tests {
         assert!(out.is_empty(), "opening the menu sends nothing");
     }
 
-    /// A worktree whose checkout was created for a pre-existing branch
-    /// (`for_branch`) keeps the (branch) tag — spawning a session on a
-    /// branch must not re-label it as a worktree.
+    /// Physical linked directories stay worktrees regardless of historical flags.
     #[test]
-    fn for_branch_worktree_rows_keep_the_branch_tag() {
+    fn for_branch_worktree_rows_show_the_worktree_tag() {
         use nebula_core::{Entity, Worktree, WorktreeId};
         let mut app = App::new();
         seed_tree(&mut app);
@@ -18915,8 +18915,22 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
-        assert!(text.contains("feat (branch)"), "{text}");
-        assert!(!text.contains("feat (wt)"), "{text}");
+        assert!(text.contains("feat (wt)"), "{text}");
+        assert!(!text.contains("feat (branch)"), "{text}");
+        assert_eq!(
+            branch_pick_label(&app, &nebula_core::ProjectId("p1".into()), "feat", None),
+            "feat (wt)"
+        );
+        let mut out = Vec::new();
+        pick_agent_on_branch(
+            &mut app,
+            nebula_core::ProjectId("p1".into()),
+            "feat".into(),
+            &mut out,
+        );
+        assert!(
+            matches!(out.last(), Some(ClientRequest::ResolveBranchCheckout { branch, .. }) if branch == "feat")
+        );
     }
 
     /// The session key on a checkout-less branch requests host-owned resolution.
