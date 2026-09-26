@@ -1638,6 +1638,8 @@ pub struct WorktreeRollback {
 /// What to do when an Ack (or Error) for this req_id arrives.
 #[derive(Debug, Clone)]
 pub enum PendingIntent {
+    /// Best-effort display-only read; errors stay silent even after timeout/navigation.
+    AttachPreview,
     /// Attach the created session and focus the terminal.
     AttachCreated,
     /// ⌘D: attach the created shell in the split's right pane and move the
@@ -2303,6 +2305,13 @@ pub struct AttachedTerm {
     pub awaiting_snapshot: Option<std::time::Instant>,
     /// Safe attach attempts in this recovery cycle, capped at three.
     pub attach_attempts: u8,
+    /// Compact, display-only screen while a cold attach waits for replay.
+    pub attach_preview: Option<String>,
+    /// Correlation and deadline origin; never reused across attachments.
+    pub preview_request: Option<(u64, std::time::Instant)>,
+    /// Startup ends at the first visible text, not an empty replay/control sequence.
+    pub has_content: bool,
+    pub starting_label: String,
     /// Host outage requires replacing the parser even if sequence numbers match.
     pub fresh_snapshot: bool,
     pub sref: SessionRef,
@@ -2343,6 +2352,10 @@ impl AttachedTerm {
             sref,
             awaiting_snapshot: Some(std::time::Instant::now()),
             attach_attempts: 1,
+            attach_preview: None,
+            preview_request: None,
+            has_content: false,
+            starting_label: "session".into(),
             fresh_snapshot: false,
             parser: vt100::Parser::new(rows, cols, 10_000),
             #[cfg(feature = "ghostty")]
@@ -2362,6 +2375,9 @@ impl AttachedTerm {
 
     /// Reset the parser (fresh replay is about to arrive).
     pub fn reset(&mut self) {
+        self.attach_preview = None;
+        self.preview_request = None;
+        self.has_content = false;
         self.parser = vt100::Parser::new(self.rows, self.cols, 10_000);
         #[cfg(feature = "ghostty")]
         if self.gh.is_some() {
@@ -2385,6 +2401,10 @@ impl AttachedTerm {
     /// Feed PTY bytes to the parser, invalidating screen-derived memos.
     pub fn feed(&mut self, data: &[u8]) {
         self.parser.process(data);
+        if !self.has_content && !self.parser.screen().contents().trim().is_empty() {
+            self.has_content = true;
+            self.attach_preview = None;
+        }
         #[cfg(feature = "ghostty")]
         if let Some(gh) = &mut self.gh {
             gh.feed(data);
@@ -2917,6 +2937,12 @@ impl App {
     /// Persistent recovery text for a remote pane awaiting a fresh screen.
     pub fn relay_pane_notice(&self, term: &AttachedTerm) -> Option<String> {
         let host = self.attached_session_host(&term.sref)?;
+        // A normal reconnect must not cover the cached frame/compact preview.
+        if (term.has_content || term.attach_preview.is_some())
+            && !self.unavailable_relays.contains(host)
+        {
+            return None;
+        }
         let since = term.awaiting_snapshot?;
         let state =
             if term.attach_attempts >= 3 && since.elapsed() >= std::time::Duration::from_secs(10) {
@@ -3249,10 +3275,10 @@ impl App {
     }
 
     /// Park a parser for a session we are leaving, so the next visit can
-    /// resume it from `end_seq`. Exited sessions are never parked — their
-    /// screen is final and their PTY is gone.
+    /// resume it from `end_seq`. Exited sessions and not-yet-attached preview
+    /// requests are never parked: neither has resumable live parser state.
     pub fn park_term(&mut self, term: AttachedTerm) {
-        if term.exited {
+        if term.exited || term.preview_request.is_some() {
             self.drop_cached_term(&term.sref);
             return;
         }

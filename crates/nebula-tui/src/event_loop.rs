@@ -32,6 +32,7 @@ use std::time::Duration;
 /// Redraw cap (~60fps). Output bursts coalesce into one frame; input events
 /// are still handled immediately between frames.
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+const ATTACH_PREVIEW_TIMEOUT: Duration = Duration::from_millis(150);
 
 /// How often the worktree panel's changed-file badge re-reads `git status`
 /// for the selected checkout, so agent edits surface without a keypress.
@@ -274,7 +275,20 @@ async fn main_loop(
         }
 
         let focus_before = app.focus;
+        let preview_deadline = [app.term.as_ref(), app.split_term.as_ref()]
+            .into_iter()
+            .flatten()
+            .filter_map(|t| t.preview_request)
+            .map(|(_, since)| tokio::time::Instant::from_std(since + ATTACH_PREVIEW_TIMEOUT))
+            .min();
         tokio::select! {
+            _ = tokio::time::sleep_until(preview_deadline.unwrap_or_else(tokio::time::Instant::now)), if preview_deadline.is_some() => {
+                for term in [app.term.as_mut(), app.split_term.as_mut()].into_iter().flatten() {
+                    if term.preview_request.is_some_and(|(_, since)| since.elapsed() >= ATTACH_PREVIEW_TIMEOUT) {
+                        finish_attach_preview(term, &mut out);
+                    }
+                }
+            }
             _ = relay_tick.tick() => {
                 let primary = app.term.as_ref().is_some_and(|t| app.attached_session_host(&t.sref).is_some());
                 let split = app.split_term.as_ref().is_some_and(|t| app.attached_session_host(&t.sref).is_some());
@@ -1019,6 +1033,8 @@ fn sync_pty_size(app: &mut App, out: &mut Vec<ClientRequest>) {
 fn resize_term(term: &mut AttachedTerm, area: ratatui::layout::Rect, out: &mut Vec<ClientRequest>) {
     term.cols = area.width;
     term.rows = area.height;
+    term.attach_preview = None;
+    finish_attach_preview(term, out);
     term.parser.screen_mut().set_size(area.height, area.width);
     #[cfg(feature = "ghostty")]
     if let Some(gh) = &mut term.gh {
@@ -3221,14 +3237,9 @@ fn mount_split(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>, ta
         app.split_pairs.insert(owner, sref.clone());
     }
     let (cols, rows) = split_pane_size(app);
-    let (term, from_seq) = resume_or_fresh(app, &sref, cols, rows);
+    let (mut term, from_seq) = resume_or_fresh(app, &sref, cols, rows);
+    request_attach(app, &mut term, from_seq, out);
     app.split_term = Some(term);
-    out.push(ClientRequest::Attach {
-        session: sref,
-        from_seq,
-        cols,
-        rows,
-    });
     if take_focus {
         app.split_focused = true;
         app.focus = Focus::Terminal;
@@ -7328,14 +7339,9 @@ fn attach(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
     let (cols, rows) = pane_size(app);
     // Fresh screen, so any persisted selection would point at stale cells.
     app.term_selection = None;
-    let (term, from_seq) = resume_or_fresh(app, &sref, cols, rows);
+    let (mut term, from_seq) = resume_or_fresh(app, &sref, cols, rows);
+    request_attach(app, &mut term, from_seq, out);
     app.term = Some(term);
-    out.push(ClientRequest::Attach {
-        session: sref.clone(),
-        from_seq,
-        cols,
-        rows,
-    });
     // Deliberately mounting a split session as a main tab pulls it out of
     // its pair (the visible-split case was rerouted above instead).
     app.split_pairs.retain(|_, v| v != &sref);
@@ -7357,10 +7363,54 @@ fn attach(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
     }
 }
 
-/// Mount a session's parser: the parked one when this pane already holds
-/// its state at this exact size (then the Attach asks for a delta from
-/// `end_seq`), else a fresh parser and a full replay.
+/// Warm/local attaches stream directly. A cold remote pane first asks for
+/// compact text, then replays full VT state; the preview never enters a parser.
+fn request_attach(
+    app: &mut App,
+    term: &mut AttachedTerm,
+    from_seq: Option<u64>,
+    out: &mut Vec<ClientRequest>,
+) {
+    term.starting_label = match &term.sref {
+        SessionRef::Agent(id) => app.tree.agents.iter().find(|a| &a.id == id)
+            .map(|a| a.kind.as_str().to_owned())
+            .unwrap_or_else(|| "agent".into()),
+        SessionRef::Terminal(_) => "shell".into(),
+    };
+    if from_seq.is_none() && app.attached_session_host(&term.sref).is_some() {
+        // Sending Attach in the same batch would put the large ring replay
+        // ahead of the asynchronous ReadSession result on the relay.
+        let req_id = app.alloc_req_id(PendingIntent::AttachPreview);
+        term.preview_request = Some((req_id, std::time::Instant::now()));
+        out.push(ClientRequest::ReadSession {
+            req_id,
+            session: term.sref.clone(),
+            lines: Some(term.rows.saturating_sub(1) as usize),
+        });
+    } else {
+        out.push(ClientRequest::Attach {
+            session: term.sref.clone(),
+            from_seq,
+            cols: term.cols,
+            rows: term.rows,
+        });
+    }
+}
+
+fn finish_attach_preview(term: &mut AttachedTerm, out: &mut Vec<ClientRequest>) {
+    if term.preview_request.take().is_some() {
+        out.push(ClientRequest::Attach {
+            session: term.sref.clone(),
+            from_seq: None,
+            cols: term.cols,
+            rows: term.rows,
+        });
+    }
+}
+
 fn retry_remote_term(term: &mut AttachedTerm, out: &mut Vec<ClientRequest>) {
+    term.preview_request = None;
+    term.attach_preview = None;
     term.awaiting_snapshot = Some(std::time::Instant::now());
     term.attach_attempts += 1;
     term.fresh_snapshot = true;
@@ -7372,6 +7422,7 @@ fn retry_remote_term(term: &mut AttachedTerm, out: &mut Vec<ClientRequest>) {
     });
 }
 
+/// Mount the same-size parked parser (delta from `end_seq`), or a fresh one.
 fn resume_or_fresh(
     app: &mut App,
     sref: &SessionRef,
@@ -9355,6 +9406,27 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             }
             app.dirty = true;
         }
+        ServerEvent::SessionText { req_id, text, .. } => {
+            app.pending.remove(&req_id);
+            if let Some(term) = [app.term.as_mut(), app.split_term.as_mut()].into_iter().flatten()
+                .find(|t| t.preview_request.is_some_and(|(id, _)| id == req_id)) {
+                // Plain text is clipped to this pane, never interpreted as VT
+                // state at a different grid. A resize cancels this request.
+                if !text.trim().is_empty() && !term.has_content {
+                    term.attach_preview = Some(text);
+                    app.dirty = true;
+                }
+                finish_attach_preview(term, out);
+            }
+        }
+        ServerEvent::Error { req_id: Some(req_id), .. }
+            if matches!(app.pending.get(&req_id), Some(PendingIntent::AttachPreview)) => {
+                app.pending.remove(&req_id);
+                if let Some(term) = [app.term.as_mut(), app.split_term.as_mut()].into_iter().flatten()
+                    .find(|t| t.preview_request.is_some_and(|(id, _)| id == req_id)) {
+                    finish_attach_preview(term, out);
+                }
+            }
         ServerEvent::Scrollback {
             session,
             base_seq,
@@ -9363,7 +9435,8 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             if let Some(host) = app.attached_session_host(&session).map(str::to_string) {
                 app.unavailable_relays.remove(&host);
             }
-            if let Some(term) = app.term.as_mut().filter(|t| t.sref == session) {
+            if let Some(term) = app.term.as_mut().filter(|t| t.sref == session && t.preview_request.is_none()) {
+                term.attach_preview = None;
                 // A replay whose base is exactly where the parser stopped is
                 // a delta on top of state we already hold — the whole point
                 // of a resumed attach, and usually empty. Any other base
@@ -9379,7 +9452,8 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                 // Either way the cells under a stored selection moved.
                 app.term_selection = None;
                 app.dirty = true;
-            } else if let Some(term) = app.split_term.as_mut().filter(|t| t.sref == session) {
+            } else if let Some(term) = app.split_term.as_mut().filter(|t| t.sref == session && t.preview_request.is_none()) {
+                term.attach_preview = None;
                 if term.fresh_snapshot || base_seq != term.end_seq {
                     term.reset();
                 }
@@ -9391,11 +9465,11 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             }
         }
         ServerEvent::Output { session, seq, data } => {
-            if let Some(term) = app.term.as_mut().filter(|t| t.sref == session) {
+            if let Some(term) = app.term.as_mut().filter(|t| t.sref == session && t.preview_request.is_none()) {
                 term.feed(&data);
                 term.end_seq = seq + data.len() as u64;
                 app.dirty = true;
-            } else if let Some(term) = app.split_term.as_mut().filter(|t| t.sref == session) {
+            } else if let Some(term) = app.split_term.as_mut().filter(|t| t.sref == session && t.preview_request.is_none()) {
                 term.feed(&data);
                 term.end_seq = seq + data.len() as u64;
                 app.dirty = true;
@@ -9777,6 +9851,13 @@ fn apply_upsert(app: &mut App, entity: nebula_core::Entity) {
             app.sync_remote_hosts();
         }
         Entity::Agent(a) => {
+            // Create Ack and entity broadcast race; attach may mount before
+            // the row supplying its kind arrives.
+            for term in [app.term.as_mut(), app.split_term.as_mut()].into_iter().flatten() {
+                if term.sref == SessionRef::Agent(a.id.clone()) {
+                    term.starting_label = a.kind.as_str().to_owned();
+                }
+            }
             let id = a.id.clone();
             let prev = app
                 .tree
@@ -10288,6 +10369,7 @@ mod tests {
         assert!(out.iter().all(|r| matches!(r,
             ClientRequest::Attach { .. } | ClientRequest::Detach { .. }
             | ClientRequest::Resize { .. } | ClientRequest::SaveUiState { .. }
+            | ClientRequest::ReadSession { .. }
         )), "unexpected request: {out:?}");
     }
 
@@ -23165,6 +23247,128 @@ mod tests {
         assert!(screen.contains("recovered screen"));
         assert!(!screen.contains("findl: reconnecting"));
     }
+    #[test]
+    fn empty_replay_keeps_starting_hint_until_the_child_paints() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let session = SessionRef::Agent(AgentId("a1".into()));
+        attach(&mut app, session.clone(), &mut Vec::new());
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(buffer_text(&terminal).contains("Starting claude…"));
+        hse(&mut app, ServerEvent::Scrollback {session: session.clone(), base_seq: 0, data: vec![]});
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(buffer_text(&terminal).contains("Starting claude…"), "empty replay is not app readiness");
+        hse(&mut app, ServerEvent::Output {session, seq: 0, data: b"ready for input".to_vec()});
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("ready for input"));
+        assert!(!text.contains("Starting claude…"));
+    }
+
+    #[test]
+    fn cold_remote_attach_paints_preview_then_authoritative_replay() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.tree.projects[0].host = Some("findl".into());
+        let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let session = SessionRef::Agent(AgentId("a1".into()));
+        let mut out = Vec::new();
+        attach(&mut app, session.clone(), &mut out);
+        let req_id = match out.as_slice() {
+            [ClientRequest::ReadSession {req_id, ..}] => *req_id,
+            _ => panic!("cold remote attach must request compact preview first: {out:?}"),
+        };
+        out.clear();
+        // A previous attach to this session can still have events in flight.
+        // They must not cancel the deferred Attach or become its first frame.
+        hse(&mut app, ServerEvent::Scrollback {session: session.clone(), base_seq: 900, data: b"old attachment".to_vec()});
+        hse(&mut app, ServerEvent::Output {session: session.clone(), seq: 914, data: b"old output".to_vec()});
+        let (cols, rows) = pane_size(&app);
+        handle_server_event(&mut app, ServerEvent::SessionText {req_id, text: "idle agent ready".into(), cols, rows}, &mut out);
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(buffer_text(&terminal).contains("idle agent ready"), "first reply paints useful content without a child redraw");
+        assert!(matches!(out.as_slice(), [ClientRequest::Attach {from_seq: None, ..}]));
+        hse(&mut app, ServerEvent::Scrollback {session: session.clone(), base_seq: 0, data: b"\x1b[2J".to_vec()});
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(!buffer_text(&terminal).contains("idle agent ready"), "even a blank authoritative replay replaces the preview");
+        hse(&mut app, ServerEvent::Output {session: session.clone(), seq: 4, data: b"authoritative screen".to_vec()});
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("authoritative screen"));
+        assert!(!text.contains("idle agent ready"));
+        attach(&mut app, other_session(), &mut Vec::new());
+        out.clear();
+        attach(&mut app, session, &mut out);
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(buffer_text(&terminal).contains("authoritative screen"), "warm first frame is cached, no network response needed");
+        assert!(out.iter().all(|r| !matches!(r, ClientRequest::ReadSession {..})));
+    }
+
+    #[test]
+    fn resize_discards_preview_and_rejects_its_late_reply() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.tree.projects[0].host = Some("findl".into());
+        let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let mut out = Vec::new();
+        attach(&mut app, SessionRef::Agent(AgentId("a1".into())), &mut out);
+        let req_id = match out[0] { ClientRequest::ReadSession {req_id, ..} => req_id, _ => panic!() };
+        let (cols, rows) = pane_size(&app);
+        hse(&mut app, ServerEvent::SessionText {req_id, text: "old size preview".into(), cols, rows});
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(buffer_text(&terminal).contains("old size preview"));
+        terminal.backend_mut().resize(100, 30);
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(!buffer_text(&terminal).contains("old size preview"), "even the first resized frame must discard the preview");
+        sync_pty_size(&mut app, &mut out);
+        hse(&mut app, ServerEvent::SessionText {req_id, text: "late stale preview".into(), cols, rows});
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(!text.contains("old size preview"));
+        assert!(!text.contains("late stale preview"));
+    }
+
+    #[test]
+    fn remote_split_paints_the_compact_preview() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.tree.projects[0].host = Some("findl".into());
+        app.term = Some(AttachedTerm::new(other_session(), 80, 24));
+        app.split_term = Some(AttachedTerm::new(other_session(), 40, 24));
+        let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let mut out = Vec::new();
+        attach_split(&mut app, SessionRef::Agent(AgentId("a1".into())), &mut out);
+        let req_id = out.iter().find_map(|r| match r {
+            ClientRequest::ReadSession {req_id, ..} => Some(*req_id), _ => None,
+        }).expect("split uses compact preview too");
+        hse(&mut app, ServerEvent::SessionText {req_id, text: "split ready".into(), cols: 40, rows: 24});
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("split ready"));
+        assert!(text.contains("Resuming claude…"));
+    }
+
+    #[test]
+    fn preview_error_falls_back_to_attach_without_a_flash() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.tree.projects[0].host = Some("findl".into());
+        let mut out = Vec::new();
+        attach(&mut app, SessionRef::Agent(AgentId("a1".into())), &mut out);
+        let req_id = match out[0] { ClientRequest::ReadSession {req_id, ..} => req_id, _ => panic!() };
+        out.clear();
+        handle_server_event(&mut app, ServerEvent::Error {req_id: Some(req_id), message: "no live PTY".into()}, &mut out);
+        assert!(app.flash.is_none(), "preview is best effort");
+        assert!(matches!(out.as_slice(), [ClientRequest::Attach {from_seq: None, ..}]));
+        hse(&mut app, ServerEvent::SessionText {req_id, text: "late reply".into(), cols: 80, rows: 24});
+        assert!(app.term.as_ref().unwrap().attach_preview.is_none());
+    }
+
     // ---- fast session re-attach: parked parsers + scrollback deltas ----
 
     fn term_screen(term: &crate::app::AttachedTerm) -> String {

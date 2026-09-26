@@ -15,12 +15,35 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-/// Draw the attached pane with the Ghostty VT engine when it is built in
-/// (`--features ghostty`) and enabled for this pane. Returns false when the
-/// caller should draw the vt100 + tui-term pane instead — which is always
-/// the case in a default build.
-#[cfg(feature = "ghostty")]
+/// Display-only attach state, shared by both pane renderers.
+fn draw_startup_preview(f: &mut Frame, term: &mut crate::app::AttachedTerm, area: Rect) -> bool {
+    // Size synchronization runs after drawing; invalidate before this frame.
+    if (term.cols, term.rows) != (area.width, area.height) {
+        term.attach_preview = None;
+    }
+    if !term.has_content && !term.parser.screen().contents().trim().is_empty() {
+        term.has_content = true;
+    }
+    if !term.has_content && !term.exited {
+        let text = match &term.attach_preview {
+            Some(text) => format!("Resuming {}…\n{text}", term.starting_label),
+            None => format!("Starting {}…", term.starting_label),
+        };
+        f.render_widget(
+            Paragraph::new(text).style(Style::default().add_modifier(Modifier::DIM)),
+            area,
+        );
+        return true;
+    }
+    false
+}
+
+/// Paint startup state or Ghostty; false falls back to vt100.
 fn draw_pane_ghostty(f: &mut Frame, term: &mut crate::app::AttachedTerm, area: Rect) -> bool {
+    if draw_startup_preview(f, term, area) {
+        return true;
+    }
+    #[cfg(feature = "ghostty")]
     match &mut term.gh {
         Some(gh) => {
             gh.render(area, f.buffer_mut(), true);
@@ -28,11 +51,10 @@ fn draw_pane_ghostty(f: &mut Frame, term: &mut crate::app::AttachedTerm, area: R
         }
         None => false,
     }
-}
-
-#[cfg(not(feature = "ghostty"))]
-fn draw_pane_ghostty(_f: &mut Frame, _term: &mut crate::app::AttachedTerm, _area: Rect) -> bool {
-    false
+    #[cfg(not(feature = "ghostty"))]
+    {
+        false
+    }
 }
 
 /// Outer size of the editor modal, as (width, height) percent of the frame.
@@ -4232,11 +4254,13 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
     if let Some((_, right)) = split_inner {
         app.split_term_area = right;
         app.hits.push((right, HitTarget::SplitTerminalPane));
-        if let Some(split) = &app.split_term {
-            f.render_widget(
-                tui_term::widget::PseudoTerminal::new(split.parser.screen()),
-                right,
-            );
+        if let Some(split) = &mut app.split_term {
+            if !draw_startup_preview(f, split, right) {
+                f.render_widget(
+                    tui_term::widget::PseudoTerminal::new(split.parser.screen()),
+                    right,
+                );
+            }
         }
     }
 

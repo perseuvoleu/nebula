@@ -528,6 +528,103 @@ fn tui_projects_worktrees_agents_navigation() {
 }
 
 #[test]
+fn tui_slow_agent_shows_starting_until_first_output() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = tempfile::tempdir().unwrap();
+    let gate = fixture.path().join("ready");
+    let script = fixture.path().join("slow-agent");
+    std::fs::write(&script, format!(
+        "#!/bin/sh\nwhile [ ! -f '{}' ]; do sleep 0.05; done\nprintf 'ATTACH_READY_MARKER\\r\\n'\nexec /bin/cat\n", gate.display()
+    )).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut tui = TuiHarness::spawn_with_env(&[("NEBULA_AGENT_CMD", script.display().to_string())]);
+    let repo = tui.make_repo("slow-start");
+    tui.wait_for_text("no projects yet");
+    add_project(&mut tui, &repo, "slow-start");
+    tui.send(b"\t");
+    tui.wait_for_text(FOOTER_WORKTREES);
+    tui.send(b"\r");
+    tui.wait_for_text(FOOTER_SESSIONS);
+    tui.send(b"n");
+    tui.wait_for_text("New session");
+    tui.send(b"\r");
+    tui.wait_for_text("New agent");
+    tui.send(b"\r");
+    tui.wait_for_gone("New agent");
+    tui.wait_for_text("Starting claude…");
+    assert!(!tui.screen_text().contains("ATTACH_READY_MARKER"));
+    std::fs::write(gate, "ready").unwrap();
+    tui.wait_for_text("ATTACH_READY_MARKER");
+    tui.wait_for_gone("Starting claude…");
+}
+
+/// A silent preview service must never prevent the real attach. The only
+/// substitute is the daemon socket; input, event loop, timer and renderer are real.
+#[test]
+fn tui_remote_preview_deadline_attaches_when_the_reply_never_arrives() {
+    use nebula_core::{codec::{read_frame, write_frame}, ClientRequest, ServerEvent, PROTOCOL_VERSION};
+    let runtime = tempfile::tempdir().unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(runtime.path().join("daemon.sock")).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let peer = std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async move {
+            tokio::time::timeout(WAIT, async move {
+                let listener = tokio::net::UnixListener::from_std(listener).unwrap();
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut requested = None;
+                let mut attached = false;
+                while let Some(req) = read_frame::<ClientRequest, _>(&mut stream).await.unwrap() {
+                    match req {
+                        ClientRequest::Hello { .. } => write_frame(&mut stream, &ServerEvent::HelloOk {
+                            protocol_version: PROTOCOL_VERSION, daemon_pid: std::process::id(),
+                        }).await.unwrap(),
+                        ClientRequest::Subscribe => {
+                            let snapshot: ServerEvent = serde_json::from_value(serde_json::json!({"Snapshot": {
+                                "workspaces": [{"id":"default", "name":"Default"}], "active_workspace":"default",
+                                "projects": [{"id":"p", "name":"remote", "repo_path":"/remote", "sort_order":0,
+                                    "divider_after":false, "divider_before":false, "host":"findl"}],
+                                "worktrees": [{"id":"w", "project_id":"p", "path":"/remote", "branch":"main", "is_main":true, "sort_order":0}],
+                                "agents": [{"id":"a", "worktree_id":"w", "name":"remote-agent", "status":"finished", "archived":false, "sort_order":0, "alive":true}],
+                                "terminals":[], "notes":[], "todos":[], "links":[], "pr_seen":[],
+                                "ui_state":"{\"project\":\"p\",\"worktree\":\"w\",\"session_agent\":\"a\"}"
+                            }})).unwrap();
+                            write_frame(&mut stream, &snapshot).await.unwrap();
+                        }
+                        ClientRequest::ReadSession {req_id, ..} => {
+                            requested = Some((req_id, Instant::now())); // deliberately no reply
+                        }
+                        ClientRequest::Attach {session, ..} => {
+                            assert!(!attached, "preview deadline must issue only one attach");
+                            attached = true;
+                            let (req_id, start) = requested.expect("compact preview is requested first");
+                            result_tx.send(start.elapsed()).unwrap();
+                            // A delayed error must not flash once the fallback has won.
+                            write_frame(&mut stream, &ServerEvent::Error {req_id: Some(req_id), message: "late preview failure".into()}).await.unwrap();
+                            write_frame(&mut stream, &ServerEvent::Scrollback {session, base_seq: 0, data: b"DEADLINE_READY".to_vec()}).await.unwrap();
+                        }
+                        _ => {}
+                    }
+                }
+            }).await.unwrap();
+        });
+    });
+    let mut tui = TuiHarness::spawn_with_env(&[("NEBULA_RUNTIME_DIR", runtime.path().display().to_string())]);
+    tui.wait_for_text("remote");
+    tui.send(b"\t");
+    tui.wait_for_text(FOOTER_WORKTREES);
+    tui.send(b"\r");
+    tui.wait_for_text(FOOTER_SESSIONS);
+    tui.send(b"\r");
+    let elapsed = result_rx.recv_timeout(WAIT).expect("event loop must send Attach without a preview reply");
+    assert!(elapsed >= Duration::from_millis(100) && elapsed < Duration::from_secs(2), "bounded preview deadline: {elapsed:?}");
+    tui.wait_for_text("DEADLINE_READY");
+    assert!(!tui.screen_text().contains("late preview failure"));
+    drop(tui);
+    peer.join().unwrap();
+}
+
+#[test]
 fn tui_help_modal_grouped_keymap() {
     let mut tui = TuiHarness::spawn();
     tui.wait_for_text("no projects yet");
