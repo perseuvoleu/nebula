@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, describeError } from "@/lib/api";
 import { Button } from "./ui/button";
+import { Markdown } from "./Markdown";
 
-// Read the daemon's retained scrollback, not a guessed conversation transcript.
+/** Display retained terminal output as readable Markdown or an exact raw snapshot. */
 export function TerminalView({ project, session }: { project: string; session: string }) {
   const [output, setOutput] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -23,7 +24,21 @@ export function TerminalView({ project, session }: { project: string; session: s
   const [hasMore, setHasMore] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const loadedLimit = useRef(250);
-  const pre = useRef<HTMLPreElement>(null);
+  const [reading, setReading] = useState(true);
+  const scroller = useRef<HTMLDivElement>(null);
+  const positions = useRef<{ reading: number | null; raw: number | null }>({ reading: null, raw: null });
+  const changeView = (nextReading: boolean) => {
+    const element = scroller.current;
+    if (nextReading === reading || !element) return;
+    const top = element.scrollTop;
+    const follow = element.scrollHeight - top - element.clientHeight < 80;
+    positions.current[reading ? "reading" : "raw"] = top;
+    const target = positions.current[nextReading ? "reading" : "raw"] ?? top;
+    setReading(nextReading);
+    requestAnimationFrame(() => {
+      if (scroller.current === element) element.scrollTop = follow ? element.scrollHeight : target;
+    });
+  };
   const more = useCallback(() => {
     if (hasMore && !loadingOlder && limit < 10000) {
       setLoadingOlder(true);
@@ -39,7 +54,7 @@ export function TerminalView({ project, session }: { project: string; session: s
       try {
         const data = await api<{ output: string; hasMore: boolean }>("output", { project, id: session, lines: String(limit) }, undefined, { signal: abort.signal });
         if (abort.signal.aborted) return;
-        const element = pre.current;
+        const element = scroller.current;
         const distance = element ? element.scrollHeight - element.scrollTop : 0;
         const follow = element ? distance - element.clientHeight < 80 : true;
         const expanding = limit > loadedLimit.current;
@@ -61,7 +76,7 @@ export function TerminalView({ project, session }: { project: string; session: s
   }, [project, session, limit]);
 
   return (
-    <section className="flex min-h-0 flex-1 flex-col" aria-label="Output de terminal">
+    <section className="flex min-h-0 min-w-0 flex-1 flex-col" aria-label="Output de terminal">
       <div className="flex shrink-0 items-center justify-between gap-2 px-4 py-1 text-xs text-muted-foreground">
         {hasMore ? <Button type="button" size="xs" variant="ghost" disabled={loadingOlder} onClick={more}>
           {loadingOlder ? "Se încarcă…" : "Output mai vechi"}
@@ -74,10 +89,15 @@ export function TerminalView({ project, session }: { project: string; session: s
         {keyState && <p role="status" className="w-full text-xs">{keyState}</p>}
         {keyError && <p role="alert" className="w-full text-xs">{keyError}</p>}
       </div>
-      <pre ref={pre} tabIndex={0} aria-live="off" onScroll={event => { if (event.currentTarget.scrollTop < 80) more(); }}
-        className="min-h-0 flex-1 overflow-auto bg-black px-4 py-3 font-mono text-[12.5px] leading-[1.45] whitespace-pre-wrap break-words text-foreground">
-        {output ?? "Se încarcă outputul…"}
-      </pre>
+      <div className="flex shrink-0 gap-1 px-3" role="group" aria-label="Afișare output">
+        <Button type="button" variant="ghost" className="min-h-11" aria-pressed={reading} onClick={() => changeView(true)}>Lectură</Button>
+        <Button type="button" variant="ghost" className="min-h-11" aria-pressed={!reading} onClick={() => changeView(false)}>Terminal brut</Button>
+      </div>
+      <div ref={scroller} aria-label="Conținut terminal" tabIndex={0} aria-live="off" onScroll={event => { if (event.currentTarget.scrollTop < 80) more(); }}
+        className="min-h-0 min-w-0 flex-1 overflow-auto bg-black px-4 py-3 text-foreground">
+        {reading ? <Markdown text={output ?? "Se încarcă outputul…"} /> :
+          <pre className="font-mono text-[12.5px] leading-[1.45] whitespace-pre-wrap break-words">{output ?? "Se încarcă outputul…"}</pre>}
+      </div>
     </section>
   );
 }

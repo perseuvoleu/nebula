@@ -15,7 +15,10 @@ Radix, the AI Elements conversation primitive), Python 3.10+ standard-library ga
   by the native session id Nebula stored — never from terminal screen text. Details and
   limits: `docs/specs/mobile-chat-redesign-pi-source.md`.
 - Other agent kinds (Claude, Codex, Cursor) and Pi sessions without persisted history show an
-  explicitly labelled terminal snapshot, not reconstructed chat. It starts with 250 lines;
+  explicitly labelled terminal snapshot, not reconstructed chat. The default **Lectură** view
+  renders its Markdown with reflowing prose; **Terminal brut** preserves the terminal text for
+  logs, diffs and interactive prompts. Snapshot wrapping can already have split words or
+  formatting, so this is not a substitute for native structured history. It starts with 250 lines;
   scrolling to the top (or “Output mai vechi”) expands up to 10,000 retained lines while
   preserving the reading position. Older discarded terminal output cannot be recovered.
 - Pi history loads older pages as you reach the top; polling does not evict pages already read.
@@ -169,3 +172,11 @@ Rendering never uses raw HTML; links are restricted to http(s)/mailto. A maximum
 subprocesses run concurrently with 20-second timeouts; Nebula/MC/Pi identity variables and
 web secrets are stripped from subprocess environments. Access logs contain no paths, tokens
 or content.
+
+To verify frontend changes without replacing a running checkout's `web/static`:
+
+```bash
+pnpm --dir web/app typecheck
+pnpm --dir web/app exec vite build --outDir ../../.scratch/mobile-reading-static
+E2E_STATIC_DIR="$PWD/.scratch/mobile-reading-static" pnpm --dir web/app test:e2e
+```

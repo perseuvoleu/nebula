@@ -81,6 +81,8 @@ def main(argv):
         name = positionals(argv[2:])[0]
         count = int((STATE / "output-lines").read_text()) if (STATE / "output-lines").exists() else 40
         lines = [f"$ terminal snapshot for {name}"] + [f"line {i}: build step {i} ok" for i in range(1, count)]
+        if (STATE / "output.txt").exists():
+            lines = (STATE / "output.txt").read_text().splitlines()
         print("\n".join(lines[-int(arg("--lines", argv) or len(lines)):]))
     elif command in {("agent", "key"), ("agent", "delete-id")}:
         values = positionals(argv[2:])
