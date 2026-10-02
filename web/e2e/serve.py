@@ -112,7 +112,10 @@ def main():
            "NEBULA_WEB_BINARY": str(HERE / "fake_nebula.py"), "NEBULA_WEB_PI_AGENT_DIR": str(STATE / "pi"),
            "FAKE_NEBULA_STATE": str(STATE), "PYTHONDONTWRITEBYTECODE": "1",
            "PYTHONPATH": str(WEB), "PATH": str(STATE / "bin") + os.pathsep + os.environ["PATH"]}
-    os.execve(sys.executable, [sys.executable, str(WEB / "server.py")], env)
+    # Let browser tests serve an isolated build without replacing live web/static.
+    script = "import os; from pathlib import Path; import server; " \
+             "server.STATIC = Path(os.environ.get('E2E_STATIC_DIR', str(server.STATIC))); server.main()"
+    os.execve(sys.executable, [sys.executable, "-c", script], env)
 
 
 if __name__ == "__main__":

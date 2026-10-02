@@ -12,7 +12,8 @@ test("outgoing messages and composer are white/black; terminal scrolling has no 
   await expect(input).toHaveCSS("background-color", "rgb(255, 255, 255)");
   await expect(input).toHaveCSS("color", "rgb(0, 0, 0)");
   await page.goto("/p/alpha/s/claude-1");
-  const output = page.getByLabel("Output de terminal").locator("pre");
+  await page.getByRole("button", { name: "Terminal brut", exact: true }).click();
+  const output = page.getByLabel("Conținut terminal", { exact: true });
   await expect(output).toContainText("line 39:");
   await expect(output).toHaveCSS("scrollbar-width", "none");
   expect(await output.evaluate((el) => { el.scrollTop = 50; return el.scrollTop; })).toBe(50);
@@ -46,7 +47,8 @@ test("chat tabs navigate without losing drafts; working session names are yellow
 test("scrolling up loads older retained terminal output beyond the initial 250 lines", async ({ page }) => {
   writeFileSync(`${STATE}/output-lines`, "600");
   await login(page, "/p/alpha/s/claude-1");
-  const output = page.getByLabel("Output de terminal").locator("pre");
+  await page.getByRole("button", { name: "Terminal brut", exact: true }).click();
+  const output = page.getByLabel("Conținut terminal", { exact: true });
   await expect(output).toContainText("line 599:");
   await expect(output).not.toContainText("line 1:");
   await output.evaluate(el => { el.scrollTop = 0; });
