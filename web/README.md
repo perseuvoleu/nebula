@@ -18,7 +18,17 @@ Radix, the AI Elements conversation primitive), Python 3.10+ standard-library ga
   paging, honest "agent working" state. History comes from Pi's persisted session file mapped
   by the native session id Nebula stored — never from terminal screen text. Details and
   limits: `docs/specs/mobile-chat-redesign-pi-source.md`.
-- Other agent kinds (Claude, Codex, Cursor) and Pi sessions without persisted history show an
+- **Claude sessions use their saved transcript** when Nebula has recorded the native session id.
+  The initial page contains at most 30 user/assistant text messages (120,000 characters per page,
+  40,000 per message). Scrolling upward loads older pages while preserving the reading position;
+  polling reads appended records and retains pages already loaded. This is chronological saved
+  main-session text, including retained history before compaction, not reconstructed model context.
+  Thinking, tool payloads, injected metadata, system records and sidechain/team entries are hidden.
+  Raw records larger than 2 MiB become omission notices without parsing their payloads.
+  Tool activity and interactive controls remain available through **Arată terminalul**. Claude files
+  are resolved only by the stored UUID in the selected checkout under `~/.claude/projects`;
+  `NEBULA_WEB_CLAUDE_DIR` (or `CLAUDE_CONFIG_DIR`) overrides the Claude config directory.
+- Codex/Cursor agents and Pi/Claude sessions without persisted history show an
   explicitly labelled terminal snapshot, not reconstructed chat. The default **Lectură** view
   renders its Markdown with reflowing prose; **Terminal brut** preserves the terminal text for
   logs, diffs and interactive prompts. Snapshot wrapping can already have split words or

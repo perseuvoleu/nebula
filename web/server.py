@@ -24,6 +24,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlsplit
 
 import pi_history
+import claude_history
 import usage
 
 STATIC = Path(__file__).parent / "static"
@@ -221,7 +222,7 @@ class StaticFiles:
 
 
 class Gateway:
-    def __init__(self, token, origin, projects, binary="nebula", static=None, pi_agent_dir=None, db_path=None, *, preview_binary=None, push=None, usage_service):
+    def __init__(self, token, origin, projects, binary="nebula", static=None, pi_agent_dir=None, db_path=None, *, preview_binary=None, push=None, usage_service, claude_config_dir=None):
         if len(token) < 8:
             raise ValueError("NEBULA_WEB_TOKEN must contain at least 8 characters")
         parsed = urlsplit(origin)
@@ -241,6 +242,7 @@ class Gateway:
         self.preview_binary = preview_binary
         self.static = static or StaticFiles(STATIC)
         self.pi_agent_dir = Path(pi_agent_dir) if pi_agent_dir else default_pi_agent_dir()
+        self.claude_config_dir = Path(claude_config_dir) if claude_config_dir else Path.home() / ".claude"
         self.db_path = Path(db_path) if db_path else None
         self.hostname = socket.gethostname()
         self.slots = threading.BoundedSemaphore(4)
@@ -300,7 +302,7 @@ class Gateway:
     # --- native identity -------------------------------------------------------------------
 
     def native_session_id(self, project, row, detail=None):
-        """Stored native Pi session id for a Nebula agent, cached briefly.
+        """Stored native session id for a Nebula agent, cached briefly.
 
         Source order: the `agent show` JSON field `session_id` (CLI ≥ this branch), else a
         read-only lookup of the daemon's SQLite row when NEBULA_WEB_DB is configured.
@@ -322,7 +324,7 @@ class Gateway:
             else:
                 value = None
             if not value:
-                raise Problem(409, "Nebula has not recorded a native Pi session identity for this session yet")
+                raise Problem(409, "Nebula has not recorded a native session identity for this session yet")
         except Problem as error:
             if error.status in TRANSIENT:
                 raise  # busy/timeout/CLI failure: not an identity fact, never cached or "unsupported"
@@ -352,22 +354,23 @@ class Gateway:
 
     def capabilities(self, row, structured, reason=None):
         return {"structured": structured, "reason": reason, "liveText": False,
-                "liveTextReason": "Nebula's managed Pi extension reports lifecycle only; partial text needs a new "
-                                  "extension and a daemon restart, so replies appear once each message completes",
-                "tools": structured, "send": True, "terminal": True, "kind": row["kind"]}
+                "liveTextReason": "Replies appear as complete records are saved in the agent transcript",
+                "tools": structured and row["kind"] == "pi", "send": True, "terminal": True, "kind": row["kind"]}
 
     def conversation_source(self, project, session_id):
         row = self.session_row(project, session_id)
-        if row["kind"] != "pi":
-            return row, None, None, f"Structured history is only implemented for Pi; {row['kind']} sessions use terminal output"
+        if row["kind"] not in {"pi", "claude"}:
+            return row, None, None, f"Structured history is only implemented for Pi and Claude; {row['kind']} sessions use terminal output"
         try:
             native = self.native_session_id(project, row)
-            path = pi_history.locate_session_file(self.pi_agent_dir, row["path"], native)
+            path = (claude_history.locate_session_file(self.claude_config_dir, row["path"], native)
+                    if row["kind"] == "claude" else
+                    pi_history.locate_session_file(self.pi_agent_dir, row["path"], native))
         except Problem as error:
             if error.status in TRANSIENT:
                 raise
             return row, None, None, error.message
-        except pi_history.PiHistoryError as error:
+        except (pi_history.PiHistoryError, claude_history.ClaudeHistoryError) as error:
             return row, None, None, str(error)
         return row, native, path, None
 
@@ -413,24 +416,27 @@ class Gateway:
             return {"output": output, "hasMore": len(output.splitlines()) >= int(lines) and int(lines) < 10000}
         if path in {"/api/conversation", "/api/conversation/updates", "/api/conversation/tool"}:
             row, native, file, reason = self.conversation_source(project, first.get("id"))
+            adapter = claude_history if row["kind"] == "claude" else pi_history
             row = public(row)
             if reason:
                 return {"session": row, "capabilities": self.capabilities(row, False, reason)}
             try:
                 if path == "/api/conversation/tool":
+                    if adapter is claude_history:
+                        raise Problem(404, "Claude tool output is available in the terminal view")
                     call = first.get("call", "")
                     if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", call):
                         raise Problem(400, "Invalid tool call id")
                     return {"session": row, "tool": pi_history.tool_output(file, call)}
                 if path == "/api/conversation":
                     limit = first.get("limit", "")
-                    snapshot = pi_history.snapshot(file, native, int(limit) if limit.isdigit() else None,
+                    snapshot = adapter.snapshot(file, native, int(limit) if limit.isdigit() else None,
                                                    first.get("before"))
                     return {"session": row, "capabilities": self.capabilities(row, True), "snapshot": snapshot}
                 cursor = {"generation": first.get("generation"), "leaf": first.get("leaf") or None,
                           "offset": int(first["offset"]) if first.get("offset", "").isdigit() else -1}
-                return {"session": row, **pi_history.apply_cursor(file, native, cursor)}
-            except pi_history.PiHistoryError as error:
+                return {"session": row, **adapter.apply_cursor(file, native, cursor)}
+            except (pi_history.PiHistoryError, claude_history.ClaudeHistoryError) as error:
                 raise Problem(409, str(error))
         raise Problem(404, "Unknown endpoint")
 
@@ -646,6 +652,7 @@ def main():
                       [p.strip() for p in os.environ.get("NEBULA_WEB_PROJECTS", "").split(",") if p.strip()],
                       os.environ.get("NEBULA_WEB_BINARY", "nebula"),
                       db_path=os.environ.get("NEBULA_WEB_DB") or None,
+                      claude_config_dir=os.environ.get("NEBULA_WEB_CLAUDE_DIR") or os.environ.get("CLAUDE_CONFIG_DIR"),
                       preview_binary=os.environ.get("NEBULA_WEB_PREVIEW_BINARY"), push=push,
                       usage_service=usage.from_environment() if os.environ.get("NEBULA_WEB_USAGE", "1") != "0" else None)
     if not gateway.static.files.get("/index.html"):

@@ -194,7 +194,7 @@ export function ConversationView({ project, previewUrl, row, state, controller, 
           <ConversationContent className="mx-auto w-full max-w-[86ch] gap-5 px-4 py-4 sm:px-6">
             {state.hasMore && <LoadOlder controller={controller} loading={state.loadingOlder} />}
             {state.messages.length === 0 && state.attempts.length === 0 && (
-              <p className="py-10 text-center text-sm text-muted-foreground">Sesiunea nu are încă mesaje persistate. Pi scrie istoricul după primul răspuns.</p>
+              <p className="py-10 text-center text-sm text-muted-foreground">Sesiunea nu are încă mesaje persistate. Istoricul apare după primul răspuns.</p>
             )}
             {list}
             {state.attempts.map((attempt) => (

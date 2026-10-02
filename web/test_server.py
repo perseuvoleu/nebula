@@ -312,7 +312,7 @@ class GatewayTests(unittest.TestCase):
         with patch.object(self.gateway, "run", side_effect=[claude]):
             result = self.gateway.get("/api/conversation", {"project": ["project"], "id": ["one"]})
         self.assertFalse(result["capabilities"]["structured"])
-        self.assertIn("terminal", result["capabilities"]["reason"])
+        self.assertIn("identity", result["capabilities"]["reason"])
 
     def test_conversation_reads_native_history_by_stored_identity(self):
         write_session(self.gateway.pi_agent_dir, "/srv/project", SID_B, [user("x1", None, "other session")])

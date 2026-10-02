@@ -193,7 +193,7 @@ export class ConversationController {
       if ("capabilities" in data) {
         this.set({ ...synced, phase: "unsupported", capabilities: data.capabilities });
       } else if (data.kind === "none") {
-        this.set({ ...synced, attempts: reconcileAttempts(this.state.attempts, this.state.messages) });
+        this.set({ ...synced, cursor: data.cursor, attempts: reconcileAttempts(this.state.attempts, this.state.messages) });
       } else if (data.kind === "delta") {
         const merged = mergeToolResults([...this.state.messages, ...data.messages], data.toolResults);
         this.applyMessages(merged, { ...synced, cursor: data.cursor });
