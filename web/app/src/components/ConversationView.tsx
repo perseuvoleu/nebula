@@ -10,6 +10,7 @@ import { formatTime, kindLabel, statusLabel } from "@/lib/status";
 import type { SessionRow } from "@/lib/types";
 import { Composer } from "./Composer";
 import { MessageItem } from "./MessageItem";
+import { TerminalKeys } from "./TerminalKeys";
 import { TerminalView } from "./TerminalView";
 import { sessionKey } from "@/lib/session-list";
 import { SessionTabs } from "./SessionTabs";
@@ -217,6 +218,7 @@ export function ConversationView({ project, previewUrl, row, state, controller, 
       {state.phase !== "loading" && state.phase !== "error" && (
         <>
           <ConnectionLine state={state} />
+          {state.capabilities?.terminal && <TerminalKeys project={project} session={sessionId} />}
           <Composer draft={draft} onDraft={onDraft} onSend={(text) => void send(text)} busy={sending}
             disabled={!state.capabilities?.send || state.connection === "offline"} autoFocus={!showBack} />
         </>

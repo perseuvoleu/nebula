@@ -3,8 +3,6 @@ import { api, describeError } from "@/lib/api";
 import { Button } from "./ui/button";
 import { Markdown } from "./Markdown";
 
-const KEYS = [["Up", "↑"], ["Down", "↓"], ["Left", "←"], ["Right", "→"], ["Enter", "⏎"], ["Escape", "Esc"], ["Tab", "Tab"]] as const;
-
 /** Display retained terminal output as readable Markdown or an exact raw snapshot.
  *  `children` (messages sent from this browser) scroll with the output, so phones get one view. */
 export function TerminalView({ project, session, children, revealKey = 0 }: {
@@ -14,19 +12,6 @@ export function TerminalView({ project, session, children, revealKey = 0 }: {
 }) {
   const [output, setOutput] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [keyState, setKeyState] = useState<string | null>(null);
-  const [keyError, setKeyError] = useState<string | null>(null);
-  const [sending, setSending] = useState(false);
-  const keyBusy = useRef(false);
-  const sendKey = async (key: string) => {
-    if (keyBusy.current) return;
-    keyBusy.current = true; setSending(true); setKeyError(null); setKeyState(`Se trimite ${key}…`);
-    try {
-      await api("key", {}, { project, id: session, key });
-      setKeyState(`${key}: livrat către PTY`);
-    } catch (failure) { setKeyState(null); setKeyError(describeError(failure)); }
-    finally { keyBusy.current = false; setSending(false); }
-  };
   const [limit, setLimit] = useState(250);
   const [hasMore, setHasMore] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
@@ -93,12 +78,6 @@ export function TerminalView({ project, session, children, revealKey = 0 }: {
         <div className="flex shrink-0 gap-1" role="group" aria-label="Afișare output">
           <Button type="button" variant="ghost" size="sm" className="min-h-9" aria-pressed={reading} onClick={() => changeView(true)}>Lectură</Button>
           <Button type="button" variant="ghost" size="sm" className="min-h-9" aria-pressed={!reading} onClick={() => changeView(false)}>Terminal brut</Button>
-        </div>
-        <div className="flex flex-wrap items-center gap-1" role="group" aria-label="Taste terminal">
-          {KEYS.map(([key, glyph]) =>
-            <Button key={key} type="button" variant="outline" size="sm" className="min-h-9 min-w-9 px-2" aria-label={key} title={key} disabled={sending} onClick={() => void sendKey(key)}>{glyph}</Button>)}
-          {keyState && <p role="status" className="px-1 text-xs text-muted-foreground">{keyState}</p>}
-          {keyError && <p role="alert" className="px-1 text-xs">{keyError}</p>}
         </div>
       </div>
       {error && <p role="alert" className="shrink-0 px-4 py-1 text-xs">{error}</p>}
