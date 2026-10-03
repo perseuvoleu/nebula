@@ -1,10 +1,17 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { api, describeError } from "@/lib/api";
 import { Button } from "./ui/button";
 import { Markdown } from "./Markdown";
 
-/** Display retained terminal output as readable Markdown or an exact raw snapshot. */
-export function TerminalView({ project, session }: { project: string; session: string }) {
+const KEYS = [["Up", "↑"], ["Down", "↓"], ["Left", "←"], ["Right", "→"], ["Enter", "⏎"], ["Escape", "Esc"], ["Tab", "Tab"]] as const;
+
+/** Display retained terminal output as readable Markdown or an exact raw snapshot.
+ *  `children` (messages sent from this browser) scroll with the output, so phones get one view. */
+export function TerminalView({ project, session, children, revealKey = 0 }: {
+  project: string; session: string; children?: ReactNode;
+  /** Changes when a message is sent, so the reader lands on it under the latest output. */
+  revealKey?: number;
+}) {
   const [output, setOutput] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [keyState, setKeyState] = useState<string | null>(null);
@@ -75,28 +82,36 @@ export function TerminalView({ project, session }: { project: string; session: s
     return () => { abort.abort(); if (timer) clearTimeout(timer); };
   }, [project, session, limit]);
 
+  useEffect(() => {
+    const element = scroller.current;
+    if (revealKey && element) requestAnimationFrame(() => { element.scrollTop = element.scrollHeight; });
+  }, [revealKey]);
+
   return (
     <section className="flex min-h-0 min-w-0 flex-1 flex-col" aria-label="Output de terminal">
-      <div className="flex shrink-0 items-center justify-between gap-2 px-4 py-1 text-xs text-muted-foreground">
-        {hasMore ? <Button type="button" size="xs" variant="ghost" disabled={loadingOlder} onClick={more}>
-          {loadingOlder ? "Se încarcă…" : "Output mai vechi"}
-        </Button> : <span title="Doar scrollback-ul păstrat de daemon; nu reconstruim mesaje din text">Istoric păstrat de terminal</span>}
-        {error && <span role="alert" className="text-foreground">{error}</span>}
+      <div className="flex shrink-0 flex-wrap items-center gap-1 border-b border-border px-2 py-1">
+        <div className="flex shrink-0 gap-1" role="group" aria-label="Afișare output">
+          <Button type="button" variant="ghost" size="sm" className="min-h-9" aria-pressed={reading} onClick={() => changeView(true)}>Lectură</Button>
+          <Button type="button" variant="ghost" size="sm" className="min-h-9" aria-pressed={!reading} onClick={() => changeView(false)}>Terminal brut</Button>
+        </div>
+        <div className="flex flex-wrap items-center gap-1" role="group" aria-label="Taste terminal">
+          {KEYS.map(([key, glyph]) =>
+            <Button key={key} type="button" variant="outline" size="sm" className="min-h-9 min-w-9 px-2" aria-label={key} title={key} disabled={sending} onClick={() => void sendKey(key)}>{glyph}</Button>)}
+          {keyState && <p role="status" className="px-1 text-xs text-muted-foreground">{keyState}</p>}
+          {keyError && <p role="alert" className="px-1 text-xs">{keyError}</p>}
+        </div>
       </div>
-      <div className="flex shrink-0 flex-wrap gap-1 px-3 py-2" role="group" aria-label="Taste terminal">
-        {["Up", "Down", "Left", "Right", "Enter", "Escape", "Tab"].map(key =>
-          <Button key={key} type="button" variant="outline" className="min-h-11 min-w-11" disabled={sending} onClick={() => void sendKey(key)}>{key}</Button>)}
-        {keyState && <p role="status" className="w-full text-xs">{keyState}</p>}
-        {keyError && <p role="alert" className="w-full text-xs">{keyError}</p>}
-      </div>
-      <div className="flex shrink-0 gap-1 px-3" role="group" aria-label="Afișare output">
-        <Button type="button" variant="ghost" className="min-h-11" aria-pressed={reading} onClick={() => changeView(true)}>Lectură</Button>
-        <Button type="button" variant="ghost" className="min-h-11" aria-pressed={!reading} onClick={() => changeView(false)}>Terminal brut</Button>
-      </div>
+      {error && <p role="alert" className="shrink-0 px-4 py-1 text-xs">{error}</p>}
       <div ref={scroller} aria-label="Conținut terminal" tabIndex={0} aria-live="off" onScroll={event => { if (event.currentTarget.scrollTop < 80) more(); }}
-        className="min-h-0 min-w-0 flex-1 overflow-auto bg-black px-4 py-3 text-foreground">
+        className="min-h-0 min-w-0 flex-1 overflow-auto bg-black px-3 py-2 text-foreground">
+        <div className="mb-2 flex justify-center text-xs text-muted-foreground">
+          {hasMore ? <Button type="button" size="xs" variant="ghost" disabled={loadingOlder} onClick={more}>
+            {loadingOlder ? "Se încarcă…" : "Output mai vechi"}
+          </Button> : <span title="Doar scrollback-ul păstrat de daemon; nu reconstruim mesaje din text">Istoric păstrat de terminal</span>}
+        </div>
         {reading ? <Markdown text={output ?? "Se încarcă outputul…"} /> :
           <pre className="font-mono text-[12.5px] leading-[1.45] whitespace-pre-wrap break-words">{output ?? "Se încarcă outputul…"}</pre>}
+        {children}
       </div>
     </section>
   );

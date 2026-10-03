@@ -184,7 +184,16 @@ export function ConversationView({ project, previewUrl, row, state, controller, 
         </p>
       )}
 
-      {showTerminal && state.phase !== "loading" && state.phase !== "error" && <TerminalView project={project} session={sessionId} />}
+      {showTerminal && state.phase !== "loading" && state.phase !== "error" && (
+        <TerminalView project={project} session={sessionId} revealKey={state.attempts.length}>
+          {state.attempts.length > 0 && (
+            <div className="mt-3 space-y-3 border-t border-border pt-3" aria-label="Mesaje trimise din acest browser">
+              {state.attempts.map(attempt => <PendingAttempt key={attempt.id} attempt={attempt} snapshotOnly
+                onDismiss={() => controller.dismissAttempt(attempt.id)} onRetry={() => retry(attempt)} />)}
+            </div>
+          )}
+        </TerminalView>
+      )}
 
       {structured && !showTerminal && (
         <Conversation className="min-h-0 flex-1" initial="instant" resize="instant">
@@ -202,12 +211,6 @@ export function ConversationView({ project, previewUrl, row, state, controller, 
         </Conversation>
       )}
 
-      {showTerminal && state.attempts.length > 0 && (
-        <div className="max-h-40 shrink-0 space-y-3 overflow-y-auto border-t border-border px-4 py-3" aria-label="Mesaje trimise din acest browser">
-          {state.attempts.map(attempt => <PendingAttempt key={attempt.id} attempt={attempt} snapshotOnly
-            onDismiss={() => controller.dismissAttempt(attempt.id)} onRetry={() => retry(attempt)} />)}
-        </div>
-      )}
       {state.phase !== "loading" && state.phase !== "error" && (
         <>
           <ConnectionLine state={state} />
