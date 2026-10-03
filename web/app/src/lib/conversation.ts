@@ -74,6 +74,9 @@ export function mergeToolResults(messages: Message[], results: ToolResult[]): Me
   return next;
 }
 
+/** Agents may store sent text with different line endings or trailing whitespace. */
+const normalized = (text: string): string => text.replace(/\r\n?/g, "\n").replace(/[ \t]+$/gm, "").trim();
+
 /** Drop attempts whose user message is now visible in the authoritative history. */
 export function reconcileAttempts(attempts: Attempt[], messages: Message[]): Attempt[] {
   const claimed = new Set<string>();
@@ -83,7 +86,7 @@ export function reconcileAttempts(attempts: Attempt[], messages: Message[]): Att
     // Identity, not time: ids known when the attempt was made (and history paged in later) can
     // never satisfy it, so phone/server clock skew cannot leave a resolved attempt dangling.
     const match = messages.find((m) => m.role === "user" && !known.has(m.id) && !claimed.has(m.id)
-      && messageText(m) === attempt.text);
+      && normalized(messageText(m)) === normalized(attempt.text));
     if (match) claimed.add(match.id);
     return !match;
   });

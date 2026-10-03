@@ -127,6 +127,10 @@ export function ConversationView({ project, previewUrl, row, state, controller, 
     const attempt = await controller.send(text);
     if (attempt.state === "failed" && !getDraft(key)) onDraft(text);
   };
+  // Terminal output echoes what was typed, so a delivered bubble would only sit below newer output.
+  const dismissDelivered = useCallback(() => {
+    for (const attempt of state.attempts) if (attempt.state === "accepted") controller.dismissAttempt(attempt.id);
+  }, [state.attempts, controller]);
   const retry = (attempt: Attempt) => { controller.dismissAttempt(attempt.id); void send(attempt.text); };
 
   const title = state.name || session?.name || "Sesiune";
@@ -189,7 +193,7 @@ export function ConversationView({ project, previewUrl, row, state, controller, 
       )}
 
       {showTerminal && state.phase !== "loading" && state.phase !== "error" && (
-        <TerminalView project={project} session={sessionId} revealKey={state.attempts.length}>
+        <TerminalView project={project} session={sessionId} revealKey={state.attempts.length} onOutput={dismissDelivered}>
           {state.attempts.length > 0 && (
             <div className="mt-3 space-y-3 border-t border-border pt-3" aria-label="Mesaje trimise din acest browser">
               {state.attempts.map(attempt => <PendingAttempt key={attempt.id} attempt={attempt} snapshotOnly

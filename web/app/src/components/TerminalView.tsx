@@ -5,8 +5,10 @@ import { Markdown } from "./Markdown";
 
 /** Display retained terminal output as readable Markdown or an exact raw snapshot.
  *  `children` (messages sent from this browser) scroll with the output, so phones get one view. */
-export function TerminalView({ project, session, children, revealKey = 0 }: {
+export function TerminalView({ project, session, children, revealKey = 0, onOutput }: {
   project: string; session: string; children?: ReactNode;
+  /** Called when the retained output changes; the terminal then shows what was sent. */
+  onOutput?: () => void;
   /** Changes when a message is sent, so the reader lands on it under the latest output. */
   revealKey?: number;
 }) {
@@ -66,6 +68,13 @@ export function TerminalView({ project, session, children, revealKey = 0 }: {
     void tick();
     return () => { abort.abort(); if (timer) clearTimeout(timer); };
   }, [project, session, limit]);
+
+  const lastOutput = useRef<string | null>(null);
+  useEffect(() => {
+    if (output === null || output === lastOutput.current) return;
+    if (lastOutput.current !== null) onOutput?.();
+    lastOutput.current = output;
+  }, [output, onOutput]);
 
   useEffect(() => {
     const element = scroller.current;

@@ -25,6 +25,10 @@ test("repeated identical instructions need one new message each; known history n
   assert.equal(reconcileAttempts([attempt("go", ["old"])], [user("old", "go", "2026-09-13T11:59:00.000Z")]).length, 1);
 });
 
+test("an attempt resolves when the agent stored it with other line endings or trailing whitespace", () => {
+  assert.equal(reconcileAttempts([attempt("fix it\nplease \n", [])], [user("u1", "fix it\r\nplease")]).length, 0);
+});
+
 test("uncertain deliveries resolve when observed; sending and failed attempts are kept", () => {
   const messages = [user("u9", "x")];
   assert.equal(reconcileAttempts([attempt("x", [], "uncertain")], messages).length, 0);
