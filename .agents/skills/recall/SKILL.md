@@ -1,6 +1,6 @@
 ---
 name: recall
-description: "Save durable project knowledge to Mission Control's Recall (project memory) so future sessions start already knowing it, AND navigate this project's indexed code graph. Use when you discover or decide something worth remembering about THIS project — an architecture fact, a decision and its rationale, a convention, a stack detail, a glossary term, a known issue, or a useful discovery (\"X lives in Y\", \"Z is generated\"). Also use when you need to LOCATE or READ code — where a symbol is defined (and its verbatim source), what calls it, or what a change would impact — via the graph_search / graph_node / get_neighbors / impact_of / shortest_path MCP tools instead of grepping. Requires a Mission Control agent session (MC_API_URL, MC_API_TOKEN, MC_TASK_ID are injected automatically). Not for transient to-dos, run-specific notes, or projects running outside Mission Control."
+description: "Mission Control sessions only (MC_* env vars present). Two triggers: a durable project fact/decision/convention worth saving to Recall, or a code question — where a symbol lives, what calls it, what a change impacts — answered via the graph_* MCP tools instead of grepping."
 user-invocable: true
 ---
 
