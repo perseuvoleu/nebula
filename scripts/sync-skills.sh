@@ -3,6 +3,7 @@
 # Canonical copy: nebula repo scripts/sync-skills.sh (see .claude/skills/sync-skills/SKILL.md).
 #
 # Mirrors (delete-on-remote, so removals propagate too):
+#   ~/Desktop/perseu-stack   the perseu-stack repo; ~/.agents/skills links into its skills/ (relative)
 #   ~/.agents/skills          the shared skill source (claude/codex symlink into it)
 #   ~/.claude/{skills,commands,agents,rules,shared,CLAUDE.md}
 #   ~/.codex/{skills,agents,AGENTS.md}
@@ -23,6 +24,7 @@ sync() { # sync <local path> <remote path>
   fi
 }
 
+sync ~/Desktop/perseu-stack  Desktop/perseu-stack
 sync ~/.agents/skills        .agents/skills
 sync ~/.claude/skills        .claude/skills
 sync ~/.claude/commands      .claude/commands
