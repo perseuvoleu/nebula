@@ -15,12 +15,35 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-/// Draw the attached pane with the Ghostty VT engine when it is built in
-/// (`--features ghostty`) and enabled for this pane. Returns false when the
-/// caller should draw the vt100 + tui-term pane instead — which is always
-/// the case in a default build.
-#[cfg(feature = "ghostty")]
+/// Display-only attach state, shared by both pane renderers.
+fn draw_startup_preview(f: &mut Frame, term: &mut crate::app::AttachedTerm, area: Rect) -> bool {
+    // Size synchronization runs after drawing; invalidate before this frame.
+    if (term.cols, term.rows) != (area.width, area.height) {
+        term.attach_preview = None;
+    }
+    if !term.has_content && !term.parser.screen().contents().trim().is_empty() {
+        term.has_content = true;
+    }
+    if !term.has_content && !term.exited {
+        let text = match &term.attach_preview {
+            Some(text) => format!("Resuming {}…\n{text}", term.starting_label),
+            None => format!("Starting {}…", term.starting_label),
+        };
+        f.render_widget(
+            Paragraph::new(text).style(Style::default().add_modifier(Modifier::DIM)),
+            area,
+        );
+        return true;
+    }
+    false
+}
+
+/// Paint startup state or Ghostty; false falls back to vt100.
 fn draw_pane_ghostty(f: &mut Frame, term: &mut crate::app::AttachedTerm, area: Rect) -> bool {
+    if draw_startup_preview(f, term, area) {
+        return true;
+    }
+    #[cfg(feature = "ghostty")]
     match &mut term.gh {
         Some(gh) => {
             gh.render(area, f.buffer_mut(), true);
@@ -28,11 +51,10 @@ fn draw_pane_ghostty(f: &mut Frame, term: &mut crate::app::AttachedTerm, area: R
         }
         None => false,
     }
-}
-
-#[cfg(not(feature = "ghostty"))]
-fn draw_pane_ghostty(_f: &mut Frame, _term: &mut crate::app::AttachedTerm, _area: Rect) -> bool {
-    false
+    #[cfg(not(feature = "ghostty"))]
+    {
+        false
+    }
 }
 
 /// Outer size of the editor modal, as (width, height) percent of the frame.
@@ -3407,9 +3429,8 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     enum RowKind {
         /// The primary checkout: `branch ⌂ primary`.
         Primary,
-        /// A linked worktree — `(wt)`, or `(branch)` when it exists only
-        /// to host sessions on a branch the user created as a branch.
-        Worktree { for_branch: bool },
+        /// A physical linked checkout always reads `(wt)`.
+        Worktree,
         /// A local branch no checkout holds — dim `○ branch (branch)`,
         /// with the chats parked on it (if any) listed underneath.
         Branch,
@@ -3437,13 +3458,8 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                     let w = app.tree.worktrees.iter().find(|w| &w.id == id);
                     let (label, kind) = match w {
                         Some(w) if w.is_main => (w.branch.clone(), RowKind::Primary),
-                        Some(w) => (
-                            w.branch.clone(),
-                            RowKind::Worktree {
-                                for_branch: w.for_branch,
-                            },
-                        ),
-                        None => (String::new(), RowKind::Worktree { for_branch: false }),
+                        Some(w) => (w.branch.clone(), RowKind::Worktree),
+                        None => (String::new(), RowKind::Worktree),
                     };
                     Row {
                         kind,
@@ -3652,15 +3668,9 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                     Style::default().fg(if i == app.sel_worktree { th.ok } else { th.dim }),
                 ));
             }
-            RowKind::Worktree { for_branch } => {
+            RowKind::Worktree => {
                 spans.push(status_dot(row.roll, th));
-                // A checkout that exists only to host sessions on a branch
-                // the user created as a branch keeps its (branch) identity.
-                let (tag, tag_color) = if for_branch {
-                    (BRANCH_TAG, th.special)
-                } else {
-                    (WT_TAG, th.info)
-                };
+                let (tag, tag_color) = (WT_TAG, th.info);
                 spans.extend(status_name_spans(
                     truncate(
                         &row.label,
@@ -3823,6 +3833,10 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             }
             let detail = detail.map(|label| format!("{label} "));
             let remote = remote_badge(app.session_host(session), th);
+            let name = match branch_mismatch(app, session) {
+                Some(branch) => format!("⚠ expects {branch}: {name}"),
+                None => name,
+            };
             let name = truncate(
                 &name,
                 (inner.width as usize).saturating_sub(
@@ -4318,11 +4332,13 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
     if let Some((_, right)) = split_inner {
         app.split_term_area = right;
         app.hits.push((right, HitTarget::SplitTerminalPane));
-        if let Some(split) = &app.split_term {
-            f.render_widget(
-                tui_term::widget::PseudoTerminal::new(split.parser.screen()),
-                right,
-            );
+        if let Some(split) = &mut app.split_term {
+            if !draw_startup_preview(f, split, right) {
+                f.render_widget(
+                    tui_term::widget::PseudoTerminal::new(split.parser.screen()),
+                    right,
+                );
+            }
         }
     }
 
@@ -4418,6 +4434,20 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
     }
     app.term_links = links;
     app.term_file_links = file_links;
+    for (term, rect) in [
+        (app.term.as_ref(), inner),
+        (app.split_term.as_ref(), app.split_term_area),
+    ] {
+        if let Some(notice) = term.and_then(|t| app.relay_pane_notice(t)) {
+            f.render_widget(Clear, rect);
+            f.render_widget(
+                Paragraph::new(format!("\n{notice}"))
+                    .style(Style::default().fg(th.warn))
+                    .centered(),
+                rect,
+            );
+        }
+    }
 }
 
 /// The ⌘T quick terminal: a centered floating window (noticeably larger
@@ -4522,6 +4552,28 @@ fn draw_quick_terminal(f: &mut Frame, app: &mut App) {
     }
     app.term_area = inner;
     app.hits.insert(0, (inner, HitTarget::TerminalPane));
+    if let Some(notice) = app.term.as_ref().and_then(|t| app.relay_pane_notice(t)) {
+        f.render_widget(Clear, inner);
+        f.render_widget(
+            Paragraph::new(format!("\n{notice}"))
+                .style(Style::default().fg(th.warn))
+                .centered(),
+            inner,
+        );
+        app.term_links.clear();
+        app.term_file_links.clear();
+    }
+}
+
+/// Historical affinity is a warning, never a different execution destination.
+fn branch_mismatch<'a>(app: &App, session: &'a SessionRow) -> Option<&'a str> {
+    let (id, recorded) = match session {
+        SessionRow::Agent(a) => (&a.worktree_id, a.branch.as_deref()),
+        SessionRow::Terminal(t) => (&t.worktree_id, t.branch.as_deref()),
+        SessionRow::Link(_) => return None,
+    };
+    let current = app.tree.worktrees.iter().find(|w| &w.id == id)?;
+    recorded.filter(|b| *b != current.branch)
 }
 
 /// `project ▸ branch ▸ session` breadcrumb of the current selection; the
@@ -4582,6 +4634,12 @@ fn breadcrumb(app: &App) -> Vec<Span<'static>> {
                 &name,
                 matches!(app.focus, Focus::Sessions | Focus::Terminal),
             ));
+            if let Some(branch) = branch_mismatch(app, &session) {
+                spans.push(Span::styled(
+                    format!(" ⚠ expects {branch} — recovery required"),
+                    Style::default().fg(th.special),
+                ));
+            }
         }
     }
     spans

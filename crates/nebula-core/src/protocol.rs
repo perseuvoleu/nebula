@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 28;
+pub const PROTOCOL_VERSION: u32 = 29;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -40,6 +40,14 @@ pub enum ClientRequest {
     },
     Input {
         session: SessionRef,
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+    },
+    /// One explicit key/input write, acknowledged only after the PTY accepted it.
+    InputAcknowledged {
+        req_id: u64,
+        id: AgentId,
+        project: ProjectId,
         #[serde(with = "serde_bytes")]
         data: Vec<u8>,
     },
@@ -122,23 +130,33 @@ pub enum ClientRequest {
         branch: String,
         base: Option<String>,
     },
+    /// Resolve a usable checkout of an existing branch on the project's host.
+    /// Reuses primary or a linked checkout; never switches or creates a branch.
+    ResolveBranchCheckout {
+        req_id: u64,
+        project: ProjectId,
+        branch: String,
+    },
+    /// Conservative web removal: no sessions, clean and merged, branch preserved.
+    CheckWorktreeRemoval {
+        req_id: u64,
+        id: WorktreeId,
+        branch: String,
+        path: PathBuf,
+        delete: bool,
+    },
     DeleteWorktree {
         req_id: u64,
         id: WorktreeId,
         force: bool,
     },
-    /// Check `branch` out in the project's primary checkout. When the
-    /// branch lives in a nebula worktree, that checkout is removed first
-    /// (the branch itself is kept) — refused while sessions still run on
-    /// it, so nobody is left on a detached HEAD.
+    /// Explicitly move primary, refusing other live PTYs and already hosted branches.
     CheckoutPrimary {
         req_id: u64,
         project: ProjectId,
         branch: String,
-        /// The session that asked for the switch from inside its own
-        /// shell (`nebula switch`): it follows the branch, so its row
-        /// moves with the checkout while every other session on the old
-        /// branch stays listed there.
+        /// Sole caller moving its own physical checkout. Other live sessions block
+        /// the operation, including finished agents and shell tabs.
         #[serde(default)]
         mover: Option<SessionRef>,
     },
@@ -151,6 +169,9 @@ pub enum ClientRequest {
     CreateAgent {
         req_id: u64,
         worktree: WorktreeId,
+        /// Requested branch for a branch/session action; None explicitly selects
+        /// the physical checkout regardless of branch (e.g. --worktree primary).
+        expected_branch: Option<String>,
         name: String,
         kind: AgentKind,
         /// Model the CLI launches with; None = the CLI's own default.
@@ -230,6 +251,12 @@ pub enum ClientRequest {
         id: AgentId,
         pinned: bool,
     },
+    /// Delete only a non-archived agent in the explicitly selected project.
+    DeleteAgentScoped {
+        req_id: u64,
+        id: AgentId,
+        project: ProjectId,
+    },
     DeleteAgent {
         req_id: u64,
         id: AgentId,
@@ -243,6 +270,9 @@ pub enum ClientRequest {
     CreateTerminal {
         req_id: u64,
         worktree: WorktreeId,
+        /// Requested branch for a branch/session action; None explicitly selects
+        /// the physical checkout regardless of branch (e.g. --worktree primary).
+        expected_branch: Option<String>,
         name: Option<String>,
     },
     CreateNote {

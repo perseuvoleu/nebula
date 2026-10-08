@@ -32,6 +32,7 @@ use std::time::Duration;
 /// Redraw cap (~60fps). Output bursts coalesce into one frame; input events
 /// are still handled immediately between frames.
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+const ATTACH_PREVIEW_TIMEOUT: Duration = Duration::from_millis(150);
 
 /// How often the worktree panel's changed-file badge re-reads `git status`
 /// for the selected checkout, so agent edits surface without a keypress.
@@ -239,6 +240,7 @@ async fn main_loop(
     // re-dials (respawning the daemon if it's gone) instead of sitting on
     // a dead footer until the user restarts the TUI.
     let mut next_reconnect = tokio::time::Instant::now();
+    let mut relay_tick = tokio::time::interval(Duration::from_secs(1));
     // The ⌘X diagram viewer: a local surface over the whole UI. Input never
     // reaches the attached agent while it is open; the daemon carries on.
     let mut html_viewer: Option<crate::html_viewer::HtmlViewer> = None;
@@ -273,7 +275,30 @@ async fn main_loop(
         }
 
         let focus_before = app.focus;
+        let preview_deadline = [app.term.as_ref(), app.split_term.as_ref()]
+            .into_iter()
+            .flatten()
+            .filter_map(|t| t.preview_request)
+            .map(|(_, since)| tokio::time::Instant::from_std(since + ATTACH_PREVIEW_TIMEOUT))
+            .min();
         tokio::select! {
+            _ = tokio::time::sleep_until(preview_deadline.unwrap_or_else(tokio::time::Instant::now)), if preview_deadline.is_some() => {
+                for term in [app.term.as_mut(), app.split_term.as_mut()].into_iter().flatten() {
+                    if term.preview_request.is_some_and(|(_, since)| since.elapsed() >= ATTACH_PREVIEW_TIMEOUT) {
+                        finish_attach_preview(term, &mut out);
+                    }
+                }
+            }
+            _ = relay_tick.tick() => {
+                let primary = app.term.as_ref().is_some_and(|t| app.attached_session_host(&t.sref).is_some());
+                let split = app.split_term.as_ref().is_some_and(|t| app.attached_session_host(&t.sref).is_some());
+                for term in [app.term.as_mut().filter(|_| primary), app.split_term.as_mut().filter(|_| split)].into_iter().flatten() {
+                    if term.awaiting_snapshot.is_some_and(|since| since.elapsed() >= Duration::from_secs(10)) {
+                        if term.attach_attempts < 3 { retry_remote_term(term, &mut out); }
+                        app.dirty = true;
+                    }
+                }
+            }
             // Pending redraw: wake at the frame boundary even if no new
             // events arrive.
             _ = tokio::time::sleep_until(next_draw), if app.dirty => {}
@@ -670,14 +695,8 @@ pub enum BranchEvent {
     /// `git for-each-ref` answer for this project's repo, each branch
     /// carrying the creation base its reflog names.
     List(nebula_core::ProjectId, Vec<crate::branches::LocalBranch>),
-    /// A `git branch` op finished; `message` is the flash to show. A
-    /// successful create carries the branch to check out on the primary
-    /// next — the `nebula switch` shape, create then land there.
-    Op {
-        message: String,
-        error: bool,
-        checkout: Option<(nebula_core::ProjectId, String)>,
-    },
+    /// A `git branch` mutation finished; creation never moves a checkout.
+    Op { message: String },
 }
 
 /// Kick a local-branch listing for the panel's checkout-less branch rows,
@@ -714,7 +733,7 @@ fn spawn_branch_list(app: &mut App) {
 /// Land a branch-channel answer: refresh the cache, or flash an op's
 /// outcome and re-list so the new/removed branch row shows right away. A
 /// create's follow-up checkout goes out from here.
-fn handle_branch_event(app: &mut App, ev: BranchEvent, out: &mut Vec<ClientRequest>) {
+fn handle_branch_event(app: &mut App, ev: BranchEvent, _out: &mut Vec<ClientRequest>) {
     match ev {
         BranchEvent::List(project, branches) => {
             app.branch_inflight = false;
@@ -735,20 +754,10 @@ fn handle_branch_event(app: &mut App, ev: BranchEvent, out: &mut Vec<ClientReque
                 app.dirty = true;
             }
         }
-        BranchEvent::Op {
-            message,
-            error,
-            checkout,
-        } => {
+        BranchEvent::Op { message, .. } => {
             app.dirty = true;
             spawn_branch_list(app);
-            match (error, checkout) {
-                (false, Some((project, branch))) => {
-                    checkout_primary_then(app, project, branch, AfterCheckout::Land, out);
-                    app.flash = Some(format!("{message} · checking out on the primary…"));
-                }
-                _ => app.flash = Some(message),
-            }
+            app.flash = Some(message);
         }
     }
 }
@@ -758,7 +767,7 @@ fn handle_branch_event(app: &mut App, ev: BranchEvent, out: &mut Vec<ClientReque
 /// commits.
 enum BranchCmd {
     /// `git branch <name> <base>`; on success the branch is checked out
-    /// on the primary, like `nebula switch`.
+    /// without moving any checkout.
     Create {
         name: String,
         base: String,
@@ -793,26 +802,13 @@ fn spawn_branch_op(
         app.flash = Some("project has no primary checkout".into());
         return;
     };
-    let project = project.clone();
     let run = move || {
-        let (result, checkout) = match &cmd {
-            BranchCmd::Create { name, base } => (
-                crate::branches::branch_op(&repo, &[name, base]),
-                Some((project, name.clone())),
-            ),
-            BranchCmd::Delete(branch) => (crate::branches::delete_branch(&repo, branch), None),
+        let result = match &cmd {
+            BranchCmd::Create { name, base } => crate::branches::branch_op(&repo, &[name, base]),
+            BranchCmd::Delete(branch) => crate::branches::delete_branch(&repo, branch),
         };
-        match result {
-            Ok(()) => BranchEvent::Op {
-                message: done,
-                error: false,
-                checkout,
-            },
-            Err(e) => BranchEvent::Op {
-                message: e,
-                error: true,
-                checkout: None,
-            },
+        BranchEvent::Op {
+            message: result.map(|()| done).unwrap_or_else(|e| e),
         }
     };
     match app.branch_tx.clone() {
@@ -1047,6 +1043,8 @@ fn sync_pty_size(app: &mut App, out: &mut Vec<ClientRequest>) {
 fn resize_term(term: &mut AttachedTerm, area: ratatui::layout::Rect, out: &mut Vec<ClientRequest>) {
     term.cols = area.width;
     term.rows = area.height;
+    term.attach_preview = None;
+    finish_attach_preview(term, out);
     term.parser.screen_mut().set_size(area.height, area.width);
     #[cfg(feature = "ghostty")]
     if let Some(gh) = &mut term.gh {
@@ -1227,6 +1225,25 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     if app.overlay.is_some() {
         handle_overlay_key(app, key, out);
         return;
+    }
+
+    if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        let term = if app.split_focused {
+            app.split_term.as_ref()
+        } else {
+            app.term.as_ref()
+        };
+        if term.is_some_and(|t| app.relay_pane_notice(t).is_some()) {
+            let term = if app.split_focused {
+                app.split_term.as_mut()
+            } else {
+                app.term.as_mut()
+            }
+            .unwrap();
+            term.attach_attempts = 0;
+            retry_remote_term(term, out);
+            return;
+        }
     }
 
     // Terminal input-locked with a live session: forward everything except
@@ -1806,7 +1823,10 @@ fn open_new_worktree_or_branch_picker(app: &mut App, project: nebula_core::Proje
                 "Worktree (own directory)",
                 MenuAction::NewWorktree(project.clone()),
             ),
-            row("Branch (on the primary)", MenuAction::NewBranch(project)),
+            row(
+                "Branch (checkout when needed)",
+                MenuAction::NewBranch(project),
+            ),
         ],
         at: None,
         hover: 0,
@@ -1878,7 +1898,7 @@ fn open_prompt(app: &mut App, kind: PromptKind) {
         ),
         PromptKind::NewBranch { .. } => (
             "New branch".to_string(),
-            "branch name (checked out on the primary, like nebula switch)".to_string(),
+            "branch name (files stay on the current branch)".to_string(),
             String::new(),
         ),
         PromptKind::NewAgent {
@@ -2724,35 +2744,148 @@ fn open_session_picker_for_context(app: &mut App, out: &mut Vec<ClientRequest>) 
     open_new_agent_picker(app, worktree);
 }
 
-/// The session picker on a branch: an existing checkout (the primary
-/// included) goes straight to the picker; a checkout-less branch is
-/// checked out on the primary — a branch is a branch, not a reason for a
-/// separate checkout — and the picker follows the Ack there. An explicit
-/// worktree is the menu's other item.
+/// Branch intent always resolves this host's guarded primary checkout.
+/// Explicit physical checkout actions use their selected checkout instead.
 fn pick_agent_on_branch(
     app: &mut App,
     project: nebula_core::ProjectId,
     branch: String,
     out: &mut Vec<ClientRequest>,
 ) {
-    if let Some(worktree) = app
-        .tree
-        .worktrees
-        .iter()
-        .find(|w| w.project_id == project && w.branch == branch)
-        .map(|w| w.id.clone())
-    {
-        open_new_agent_picker(app, worktree);
-    } else {
-        checkout_primary_then(app, project, branch, AfterCheckout::PickAgent, out);
+    resolve_branch_then(app, project, branch, AfterCheckout::PickAgent, out);
+}
+
+/// Resolve primary on the selected host, refusing an unsafe switch.
+fn resolve_branch_then(
+    app: &mut App,
+    project: nebula_core::ProjectId,
+    branch: String,
+    next: AfterCheckout,
+    out: &mut Vec<ClientRequest>,
+) {
+    let req_id = app.alloc_req_id(PendingIntent::ResolveBranchThen {
+        branch: branch.clone(),
+        next,
+    });
+    app.flash = Some(format!("resolving {branch} checkout…"));
+    app.dirty = true;
+    out.push(ClientRequest::ResolveBranchCheckout {
+        req_id,
+        project,
+        branch,
+    });
+}
+
+fn remember_session_branch(app: &mut App, id: &WorktreeId) {
+    if let Some(w) = app.tree.worktrees.iter().find(|w| &w.id == id) {
+        app.session_creation_branches
+            .insert(id.clone(), w.branch.clone());
     }
 }
 
-/// Check `branch` out on the project's primary checkout, then carry on with
-/// `next` there — the `nebula switch` shape. Sessions already working on
-/// the primary would have the branch change under them, so the move is
-/// confirmed first whenever one of them is busy; an idle primary moves
-/// straight away.
+fn expected_session_branch(app: &mut App, id: &WorktreeId) -> Option<String> {
+    app.session_creation_branches.remove(id).or_else(|| {
+        app.tree
+            .worktrees
+            .iter()
+            .find(|w| &w.id == id)
+            .map(|w| w.branch.clone())
+    })
+}
+
+/// Continue a session action only with the checkout id acknowledged by its host.
+fn after_checkout(
+    app: &mut App,
+    id: WorktreeId,
+    branch: String,
+    next: AfterCheckout,
+    out: &mut Vec<ClientRequest>,
+) {
+    if !select_worktree_by_id(app, &id, out) {
+        app.select_worktree_when_seen = Some(id.clone());
+    }
+    app.session_creation_branches
+        .insert(id.clone(), branch.clone());
+    match next {
+        AfterCheckout::Land => {}
+        AfterCheckout::PickAgent => {
+            open_new_agent_picker(app, id.clone());
+            app.session_creation_branches.insert(id, branch);
+        }
+        AfterCheckout::Terminal | AfterCheckout::SplitShell => {
+            let intent = if next == AfterCheckout::SplitShell {
+                PendingIntent::AttachCreatedSplit
+            } else {
+                PendingIntent::AttachCreated
+            };
+            let req_id = app.alloc_req_id(intent);
+            out.push(ClientRequest::CreateTerminal {
+                expected_branch: expected_session_branch(app, &id),
+                req_id,
+                worktree: id,
+                name: None,
+            });
+        }
+        AfterCheckout::QuickAgent(kind) | AfterCheckout::SplitAgent(kind) => {
+            let intent = if matches!(next, AfterCheckout::SplitAgent(_)) {
+                PendingIntent::AttachCreatedSplit
+            } else {
+                PendingIntent::AttachCreated
+            };
+            create_default_agent(app, id, kind, intent, out);
+        }
+    }
+}
+
+/// A checkout-less branch offers session kinds before provisioning a checkout.
+fn branch_session_menu(app: &mut App, split: bool) -> bool {
+    let Some((project, branch)) = app
+        .selected_project()
+        .map(|p| p.id.clone())
+        .zip(app.selected_branch_row())
+    else {
+        return false;
+    };
+    let target = TwinTarget::Checkout { project, branch };
+    let mut items: Vec<MenuItem> = [
+        AgentKind::Claude,
+        AgentKind::Codex,
+        AgentKind::Cursor,
+        AgentKind::Pi,
+    ]
+    .into_iter()
+    .map(|kind| MenuItem {
+        label: kind.as_str().to_owned(),
+        action: target.clone().then(if split {
+            AfterCheckout::SplitAgent(kind)
+        } else {
+            AfterCheckout::QuickAgent(kind)
+        }),
+        destructive: false,
+    })
+    .collect();
+    items.push(MenuItem {
+        label: "Terminal (shell)".into(),
+        action: target.then(if split {
+            AfterCheckout::SplitShell
+        } else {
+            AfterCheckout::Terminal
+        }),
+        destructive: false,
+    });
+    app.overlay = Some(Overlay::Menu(ContextMenu {
+        title: Some(if split { "Split pane" } else { "New session" }.into()),
+        items,
+        at: None,
+        hover: if split { 0 } else { 4 },
+        area: Default::default(),
+        parent: None,
+        filter: None,
+    }));
+    true
+}
+
+/// Explicit checkout movement is checked by the host daemon against every live PTY.
 fn checkout_primary_then(
     app: &mut App,
     project: nebula_core::ProjectId,
@@ -2760,46 +2893,7 @@ fn checkout_primary_then(
     next: AfterCheckout,
     out: &mut Vec<ClientRequest>,
 ) {
-    let primary = app
-        .tree
-        .worktrees
-        .iter()
-        .find(|w| w.project_id == project && w.is_main);
-    let busy: Vec<&str> = primary
-        .map(|p| {
-            app.tree
-                .agents
-                .iter()
-                .filter(|a| a.worktree_id == p.id && !a.archived)
-                .filter(|a| {
-                    matches!(
-                        a.status,
-                        nebula_core::AgentStatus::Running | nebula_core::AgentStatus::NeedsFeedback
-                    )
-                })
-                .map(|a| a.name.as_str())
-                .collect()
-        })
-        .unwrap_or_default();
-    if busy.is_empty() {
-        request_checkout_primary(app, project, branch, next, out);
-        return;
-    }
-    let current = primary.map(|p| p.branch.as_str()).unwrap_or("?");
-    app.overlay = Some(Overlay::Confirm(ConfirmDialog {
-        title: "Move primary checkout".into(),
-        message: format!(
-            "The primary is on {current} with {} busy session(s): {}.\nCheck out {branch} under them?",
-            busy.len(),
-            busy.join(", ")
-        ),
-        action: PendingAction::CheckoutPrimary {
-            project,
-            branch,
-            next,
-        },
-    }));
-    app.dirty = true;
+    request_checkout_primary(app, project, branch, next, out);
 }
 
 /// The `CheckoutPrimary` request itself; the Ack lands on the primary and
@@ -2845,14 +2939,13 @@ fn context_worktree(app: &App) -> Option<nebula_core::WorktreeId> {
 /// Projects panel has focus. The daemon names it (`term-N`) and the Ack
 /// attaches it, so one keypress lands in a ready shell.
 fn create_terminal_for_context(app: &mut App, out: &mut Vec<ClientRequest>) {
-    // A checkout-less branch row: the shell wants that branch, on the
-    // primary — check it out there first, the Ack creates the terminal.
+    // A checkout-less branch needs resolution before the shell can be spawned.
     if app.focus == Focus::Worktrees {
         if let (Some(branch), Some(project)) = (
             app.selected_branch_row(),
             app.selected_project().map(|p| p.id.clone()),
         ) {
-            checkout_primary_then(app, project, branch, AfterCheckout::Terminal, out);
+            resolve_branch_then(app, project, branch, AfterCheckout::Terminal, out);
             return;
         }
     }
@@ -2860,8 +2953,10 @@ fn create_terminal_for_context(app: &mut App, out: &mut Vec<ClientRequest>) {
         app.flash = Some("select a project or worktree first".into());
         return;
     };
+    remember_session_branch(app, &worktree);
     let req_id = app.alloc_req_id(PendingIntent::AttachCreated);
     out.push(ClientRequest::CreateTerminal {
+        expected_branch: expected_session_branch(app, &worktree),
         req_id,
         worktree,
         name: None,
@@ -2929,10 +3024,14 @@ fn quick_terminal_shortcut(app: &mut App, out: &mut Vec<ClientRequest>) {
         return;
     }
     let Some(worktree) = context_worktree(app) else {
+        if branch_session_menu(app, false) {
+            return;
+        }
         app.flash = Some("select a project or worktree first".into());
         return;
     };
     app.collapsed = false;
+    remember_session_branch(app, &worktree);
     let kind_row = |label: &str, kind: AgentKind| MenuItem {
         label: label.into(),
         action: MenuAction::QuickAgentOfKind {
@@ -3015,6 +3114,7 @@ fn toggle_quick_terminal(app: &mut App, out: &mut Vec<ClientRequest>) {
         None => {
             let req_id = app.alloc_req_id(PendingIntent::AttachCreated);
             out.push(ClientRequest::CreateTerminal {
+                expected_branch: expected_session_branch(app, &worktree),
                 req_id,
                 worktree,
                 name: Some(QUICK_TERMINAL_NAME.into()),
@@ -3040,9 +3140,13 @@ fn toggle_split_terminal(app: &mut App, out: &mut Vec<ClientRequest>) {
         return;
     }
     let Some(worktree) = quick_terminal_worktree(app) else {
+        if branch_session_menu(app, true) {
+            return;
+        }
         app.flash = Some("select a project or worktree first".into());
         return;
     };
+    remember_session_branch(app, &worktree);
     let kind_row = |label: &str, kind: AgentKind| MenuItem {
         label: label.into(),
         action: MenuAction::SplitAgentOfKind {
@@ -3171,14 +3275,9 @@ fn mount_split(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>, ta
         app.split_pairs.insert(owner, sref.clone());
     }
     let (cols, rows) = split_pane_size(app);
-    let (term, from_seq) = resume_or_fresh(app, &sref, cols, rows);
+    let (mut term, from_seq) = resume_or_fresh(app, &sref, cols, rows);
+    request_attach(app, &mut term, from_seq, out);
     app.split_term = Some(term);
-    out.push(ClientRequest::Attach {
-        session: sref,
-        from_seq,
-        cols,
-        rows,
-    });
     if take_focus {
         app.split_focused = true;
         app.focus = Focus::Terminal;
@@ -3859,6 +3958,7 @@ fn open_new_agent_picker(app: &mut App, worktree: WorktreeId) {
 }
 
 fn open_agent_picker(app: &mut App, worktree: WorktreeId) {
+    remember_session_branch(app, &worktree);
     let kind_row = |label: &str, kind: AgentKind| MenuItem {
         label: label.into(),
         action: MenuAction::NewAgentOfKind {
@@ -3907,9 +4007,7 @@ fn open_agent_picker(app: &mut App, worktree: WorktreeId) {
     }));
 }
 
-/// Where a twin row sends a new session: the twin's checkout of the same
-/// branch when it has one, otherwise a checkout of that branch on the
-/// twin's primary first (`nebula switch` there, then the session).
+/// Host selection targets the twin's primary, never an implicit linked checkout.
 #[derive(Debug, Clone, PartialEq)]
 enum TwinTarget {
     Worktree(WorktreeId),
@@ -3949,8 +4047,8 @@ impl TwinTarget {
 /// findl:/path` counterpart, say) — as (where, target) pairs for the
 /// session pickers; `where` is the host name, or "locally" for the
 /// checkout on this machine. The target follows the worktree's *branch*,
-/// exactly like a local pick would: the twin's checkout of that branch,
-/// or a checkout of it on the twin's primary when there is none — a
+/// exactly like a local branch pick: the twin's primary if already on that
+/// branch, or a guarded primary switch otherwise — a
 /// session started "on findl" from a feature worktree never lands on
 /// whatever findl's primary happens to be on.
 fn project_twins(app: &App, worktree: &WorktreeId) -> Vec<(String, TwinTarget)> {
@@ -3979,9 +4077,7 @@ fn project_twins(app: &App, worktree: &WorktreeId) -> Vec<(String, TwinTarget)> 
                 .tree
                 .worktrees
                 .iter()
-                .filter(|x| x.project_id == p.id && x.branch == w.branch)
-                // The primary wins over a parked worktree on the same branch.
-                .max_by_key(|x| x.is_main)
+                .find(|x| x.project_id == p.id && x.is_main && x.branch == w.branch)
                 .map(|x| x.id.clone());
             let target = match same_branch {
                 Some(id) => TwinTarget::Worktree(id),
@@ -4066,9 +4162,7 @@ fn branch_pick_label(
         .tree
         .worktrees
         .iter()
-        // A for_branch checkout hosts sessions on a branch the user made
-        // as a branch — the picker keeps calling it one.
-        .any(|w| &w.project_id == project && w.branch == branch && !w.for_branch)
+        .any(|w| &w.project_id == project && w.branch == branch && !w.is_main)
     {
         format!("{branch} (wt)")
     } else {
@@ -6134,11 +6228,7 @@ fn run_pending_action(app: &mut App, action: PendingAction, out: &mut Vec<Client
             let done = format!("branch {branch} deleted");
             spawn_branch_op(app, &project, BranchCmd::Delete(branch), done, out);
         }
-        PendingAction::CheckoutPrimary {
-            project,
-            branch,
-            next,
-        } => request_checkout_primary(app, project, branch, next, out),
+
         PendingAction::Quit => app.should_quit = true,
     }
 }
@@ -6279,6 +6369,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
         MenuAction::NewTerminal(worktree) => {
             let req_id = app.alloc_req_id(PendingIntent::AttachCreated);
             out.push(ClientRequest::CreateTerminal {
+                expected_branch: expected_session_branch(app, &worktree),
                 req_id,
                 worktree,
                 name: None,
@@ -6298,6 +6389,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
         MenuAction::SplitShell(worktree) => {
             let req_id = app.alloc_req_id(PendingIntent::AttachCreatedSplit);
             out.push(ClientRequest::CreateTerminal {
+                expected_branch: expected_session_branch(app, &worktree),
                 req_id,
                 worktree,
                 name: None,
@@ -6307,7 +6399,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             project,
             branch,
             next,
-        } => checkout_primary_then(app, project, branch, next, out),
+        } => resolve_branch_then(app, project, branch, next, out),
         MenuAction::RenameTerminal(id) => open_prompt(app, PromptKind::RenameTerminal { id }),
         MenuAction::CloseTerminal(id) => {
             if let Some(t) = app.tree.terminals.iter().find(|t| t.id == id).cloned() {
@@ -7157,6 +7249,7 @@ fn create_default_agent(
     let cfg = crate::config::Config::load();
     let req_id = app.alloc_req_id(intent);
     out.push(ClientRequest::CreateAgent {
+        expected_branch: expected_session_branch(app, &worktree),
         req_id,
         worktree: worktree.clone(),
         name: app.default_session_name("agent"),
@@ -7339,14 +7432,9 @@ fn attach(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
     let (cols, rows) = pane_size(app);
     // Fresh screen, so any persisted selection would point at stale cells.
     app.term_selection = None;
-    let (term, from_seq) = resume_or_fresh(app, &sref, cols, rows);
+    let (mut term, from_seq) = resume_or_fresh(app, &sref, cols, rows);
+    request_attach(app, &mut term, from_seq, out);
     app.term = Some(term);
-    out.push(ClientRequest::Attach {
-        session: sref.clone(),
-        from_seq,
-        cols,
-        rows,
-    });
     // Deliberately mounting a split session as a main tab pulls it out of
     // its pair (the visible-split case was rerouted above instead).
     app.split_pairs.retain(|_, v| v != &sref);
@@ -7368,9 +7456,70 @@ fn attach(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
     }
 }
 
-/// Mount a session's parser: the parked one when this pane already holds
-/// its state at this exact size (then the Attach asks for a delta from
-/// `end_seq`), else a fresh parser and a full replay.
+/// Warm/local attaches stream directly. A cold remote pane first asks for
+/// compact text, then replays full VT state; the preview never enters a parser.
+fn request_attach(
+    app: &mut App,
+    term: &mut AttachedTerm,
+    from_seq: Option<u64>,
+    out: &mut Vec<ClientRequest>,
+) {
+    term.starting_label = match &term.sref {
+        SessionRef::Agent(id) => app
+            .tree
+            .agents
+            .iter()
+            .find(|a| &a.id == id)
+            .map(|a| a.kind.as_str().to_owned())
+            .unwrap_or_else(|| "agent".into()),
+        SessionRef::Terminal(_) => "shell".into(),
+    };
+    if from_seq.is_none() && app.attached_session_host(&term.sref).is_some() {
+        // Sending Attach in the same batch would put the large ring replay
+        // ahead of the asynchronous ReadSession result on the relay.
+        let req_id = app.alloc_req_id(PendingIntent::AttachPreview);
+        term.preview_request = Some((req_id, std::time::Instant::now()));
+        out.push(ClientRequest::ReadSession {
+            req_id,
+            session: term.sref.clone(),
+            lines: Some(term.rows.saturating_sub(1) as usize),
+        });
+    } else {
+        out.push(ClientRequest::Attach {
+            session: term.sref.clone(),
+            from_seq,
+            cols: term.cols,
+            rows: term.rows,
+        });
+    }
+}
+
+fn finish_attach_preview(term: &mut AttachedTerm, out: &mut Vec<ClientRequest>) {
+    if term.preview_request.take().is_some() {
+        out.push(ClientRequest::Attach {
+            session: term.sref.clone(),
+            from_seq: None,
+            cols: term.cols,
+            rows: term.rows,
+        });
+    }
+}
+
+fn retry_remote_term(term: &mut AttachedTerm, out: &mut Vec<ClientRequest>) {
+    term.preview_request = None;
+    term.attach_preview = None;
+    term.awaiting_snapshot = Some(std::time::Instant::now());
+    term.attach_attempts += 1;
+    term.fresh_snapshot = true;
+    out.push(ClientRequest::Attach {
+        session: term.sref.clone(),
+        from_seq: None,
+        cols: term.cols,
+        rows: term.rows,
+    });
+}
+
+/// Mount the same-size parked parser (delta from `end_seq`), or a fresh one.
 fn resume_or_fresh(
     app: &mut App,
     sref: &SessionRef,
@@ -7381,6 +7530,8 @@ fn resume_or_fresh(
         Some(mut term) => {
             // Re-attaching always lands on the live tail, like a fresh one.
             term.set_scroll(0);
+            term.awaiting_snapshot = Some(std::time::Instant::now());
+            term.attach_attempts = 1;
             let from_seq = Some(term.end_seq);
             (term, from_seq)
         }
@@ -7450,6 +7601,7 @@ fn create_agent(
     };
     let req_id = app.alloc_req_id(PendingIntent::AttachCreated);
     out.push(ClientRequest::CreateAgent {
+        expected_branch: expected_session_branch(app, &worktree),
         req_id,
         worktree: worktree.clone(),
         name,
@@ -9357,40 +9509,94 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             }
             app.dirty = true;
         }
+        ServerEvent::SessionText { req_id, text, .. } => {
+            app.pending.remove(&req_id);
+            if let Some(term) = [app.term.as_mut(), app.split_term.as_mut()]
+                .into_iter()
+                .flatten()
+                .find(|t| t.preview_request.is_some_and(|(id, _)| id == req_id))
+            {
+                // Plain text is clipped to this pane, never interpreted as VT
+                // state at a different grid. A resize cancels this request.
+                if !text.trim().is_empty() && !term.has_content {
+                    term.attach_preview = Some(text);
+                    app.dirty = true;
+                }
+                finish_attach_preview(term, out);
+            }
+        }
+        ServerEvent::Error {
+            req_id: Some(req_id),
+            ..
+        } if matches!(app.pending.get(&req_id), Some(PendingIntent::AttachPreview)) => {
+            app.pending.remove(&req_id);
+            if let Some(term) = [app.term.as_mut(), app.split_term.as_mut()]
+                .into_iter()
+                .flatten()
+                .find(|t| t.preview_request.is_some_and(|(id, _)| id == req_id))
+            {
+                finish_attach_preview(term, out);
+            }
+        }
         ServerEvent::Scrollback {
             session,
             base_seq,
             data,
         } => {
-            if let Some(term) = app.term.as_mut().filter(|t| t.sref == session) {
+            if let Some(host) = app.attached_session_host(&session).map(str::to_string) {
+                app.unavailable_relays.remove(&host);
+            }
+            if let Some(term) = app
+                .term
+                .as_mut()
+                .filter(|t| t.sref == session && t.preview_request.is_none())
+            {
+                term.attach_preview = None;
                 // A replay whose base is exactly where the parser stopped is
                 // a delta on top of state we already hold — the whole point
                 // of a resumed attach, and usually empty. Any other base
                 // means the bytes in between fell off the ring (or this is a
                 // fresh parser): rebuild the screen from scratch.
-                if base_seq != term.end_seq {
+                if term.fresh_snapshot || base_seq != term.end_seq {
                     term.reset();
                 }
+                term.awaiting_snapshot = None;
+                term.fresh_snapshot = false;
                 term.feed(&data);
                 term.end_seq = base_seq + data.len() as u64;
                 // Either way the cells under a stored selection moved.
                 app.term_selection = None;
                 app.dirty = true;
-            } else if let Some(term) = app.split_term.as_mut().filter(|t| t.sref == session) {
-                if base_seq != term.end_seq {
+            } else if let Some(term) = app
+                .split_term
+                .as_mut()
+                .filter(|t| t.sref == session && t.preview_request.is_none())
+            {
+                term.attach_preview = None;
+                if term.fresh_snapshot || base_seq != term.end_seq {
                     term.reset();
                 }
+                term.awaiting_snapshot = None;
+                term.fresh_snapshot = false;
                 term.feed(&data);
                 term.end_seq = base_seq + data.len() as u64;
                 app.dirty = true;
             }
         }
         ServerEvent::Output { session, seq, data } => {
-            if let Some(term) = app.term.as_mut().filter(|t| t.sref == session) {
+            if let Some(term) = app
+                .term
+                .as_mut()
+                .filter(|t| t.sref == session && t.preview_request.is_none())
+            {
                 term.feed(&data);
                 term.end_seq = seq + data.len() as u64;
                 app.dirty = true;
-            } else if let Some(term) = app.split_term.as_mut().filter(|t| t.sref == session) {
+            } else if let Some(term) = app
+                .split_term
+                .as_mut()
+                .filter(|t| t.sref == session && t.preview_request.is_none())
+            {
                 term.feed(&data);
                 term.end_seq = seq + data.len() as u64;
                 app.dirty = true;
@@ -9477,6 +9683,12 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                     }
                     open_new_agent_picker(app, id);
                 }
+                (
+                    Some(PendingIntent::ResolveBranchThen { branch, next }),
+                    Some(EntityId::Worktree(id)),
+                ) => {
+                    after_checkout(app, id, branch, next, out);
+                }
                 (Some(PendingIntent::CheckoutPrimaryThen { project, next }), _) => {
                     // The branch now sits on the primary checkout (its row's
                     // branch label follows via the reconcile upsert). Land
@@ -9500,6 +9712,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                         AfterCheckout::Terminal => {
                             let req_id = app.alloc_req_id(PendingIntent::AttachCreated);
                             out.push(ClientRequest::CreateTerminal {
+                                expected_branch: expected_session_branch(app, &primary),
                                 req_id,
                                 worktree: primary,
                                 name: None,
@@ -9522,6 +9735,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                         AfterCheckout::SplitShell => {
                             let req_id = app.alloc_req_id(PendingIntent::AttachCreatedSplit);
                             out.push(ClientRequest::CreateTerminal {
+                                expected_branch: expected_session_branch(app, &primary),
                                 req_id,
                                 worktree: primary,
                                 name: None,
@@ -9652,6 +9866,38 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             app.dirty = true;
         }
         ServerEvent::Error { req_id, message } => {
+            if req_id.is_none() {
+                if let Some(status) = nebula_core::relay_status::RelayStatus::parse(&message) {
+                    let was_unavailable = app.unavailable_relays.contains(&status.host);
+                    if status.connected {
+                        app.unavailable_relays.remove(&status.host);
+                    } else {
+                        app.unavailable_relays.insert(status.host.clone());
+                    }
+                    let primary = app.term.as_ref().is_some_and(|t| {
+                        app.attached_session_host(&t.sref) == Some(status.host.as_str())
+                    });
+                    let split = app.split_term.as_ref().is_some_and(|t| {
+                        app.attached_session_host(&t.sref) == Some(status.host.as_str())
+                    });
+                    for term in [
+                        app.term.as_mut().filter(|_| primary),
+                        app.split_term.as_mut().filter(|_| split),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        if status.connected || !was_unavailable {
+                            term.awaiting_snapshot = Some(std::time::Instant::now());
+                            term.attach_attempts = 1;
+                        }
+                        term.fresh_snapshot = true;
+                    }
+                    app.term_cache.clear();
+                    app.dirty = true;
+                    return;
+                }
+            }
             // A failed request's intent never gets an Ack; clear it — and if
             // it was an optimistic worktree delete, put the rows back.
             if let Some(PendingIntent::DeleteWorktree(rollback)) =
@@ -9730,6 +9976,16 @@ fn apply_upsert(app: &mut App, entity: nebula_core::Entity) {
             app.sync_remote_hosts();
         }
         Entity::Agent(a) => {
+            // Create Ack and entity broadcast race; attach may mount before
+            // the row supplying its kind arrives.
+            for term in [app.term.as_mut(), app.split_term.as_mut()]
+                .into_iter()
+                .flatten()
+            {
+                if term.sref == SessionRef::Agent(a.id.clone()) {
+                    term.starting_label = a.kind.as_str().to_owned();
+                }
+            }
             let id = a.id.clone();
             let prev = app
                 .tree
@@ -10244,7 +10500,7 @@ mod tests {
                     .iter()
                     .map(|e| e.row.clone())
                     .collect::<Vec<_>>(),
-                vec![PanelRow::Branch("parked".into())]
+                vec![PanelRow::Worktree(WorktreeId("w1".into()))]
             );
             let mut restored = host_filter_fixture();
             restore_ui_state(&mut restored, &ui_state_json(&app));
@@ -10261,13 +10517,23 @@ mod tests {
     }
 
     #[test]
-    fn project_navigation_restores_parked_session_and_prefers_unread_completion() {
+    fn project_navigation_restores_linked_checkout_session_and_prefers_unread_completion() {
         let mut app = App::new();
         seed_tree(&mut app);
-        app.tree.agents[0].branch = Some("parked".into());
+        // Sessions list under their physical checkout, so the two live in
+        // linked checkouts beside the empty primary.
+        for (id, branch) in [("w-parked", "parked"), ("w-other", "other")] {
+            let mut linked = app.tree.worktrees[0].clone();
+            linked.id = WorktreeId(id.into());
+            linked.path = format!("/tmp/demo-{branch}").into();
+            linked.branch = branch.into();
+            linked.is_main = false;
+            app.tree.worktrees.push(linked);
+        }
+        app.tree.agents[0].worktree_id = WorktreeId("w-parked".into());
         let mut second = app.tree.agents[0].clone();
         second.id = AgentId("a2".into());
-        second.branch = Some("other".into());
+        second.worktree_id = WorktreeId("w-other".into());
         app.tree.agents.push(second);
         hse(
             &mut app,
@@ -10277,7 +10543,7 @@ mod tests {
         );
         app.focus = Focus::Projects;
         let mut out = Vec::new();
-        // First visit skips the empty primary and attaches a parked session.
+        // First visit skips the empty primary and attaches a linked checkout's session.
         handle_key(
             &mut app,
             KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
@@ -10292,8 +10558,10 @@ mod tests {
             app.term.as_ref().map(|t| t.sref.clone()),
             Some(SessionRef::Agent(AgentId("a1".into())))
         );
-        // A manually chosen parked session is remembered across projects.
-        app.sel_worktree = app.branch_row_index("other").unwrap();
+        // A manually chosen session is remembered across projects.
+        app.sel_worktree = app
+            .worktree_row_index(&WorktreeId("w-other".into()))
+            .unwrap();
         restore_session(&mut app, &mut out);
         handle_key(
             &mut app,
@@ -10374,13 +10642,14 @@ mod tests {
                     | ClientRequest::Detach { .. }
                     | ClientRequest::Resize { .. }
                     | ClientRequest::SaveUiState { .. }
+                    | ClientRequest::ReadSession { .. }
             )),
             "unexpected request: {out:?}"
         );
     }
 
     #[test]
-    fn host_filters_preserve_visible_parked_twin_sessions() {
+    fn host_filters_preserve_visible_twin_sessions_with_historical_branches() {
         let mut app = host_filter_fixture();
         for agent in &mut app.tree.agents {
             agent.branch = Some("parked".into());
@@ -10389,10 +10658,8 @@ mod tests {
         {
             app.hide_local = hide_local;
             app.hide_remote = hide_remote;
-            let index = app
-                .branch_row_index("parked")
-                .expect("visible parked host retains row");
-            let rows = app.panel_row_sessions(index);
+            assert!(app.branch_row_index("parked").is_none());
+            let rows = app.panel_row_sessions(0);
             assert_eq!(rows.len(), 1);
             assert_eq!(
                 rows[0].sref(),
@@ -10596,8 +10863,8 @@ mod tests {
                 entity: Entity::Worktree(feature("w-feat", "p1", 1)),
             },
         );
-        // findl has no checkout of feature-x: "Run on findl" checks the
-        // branch out on findl's primary first, then picks the agent there
+        // findl has no checkout of feature-x: "Run on findl" resolves
+        // guarded primary resolution there, then picks the agent there
         // — never a session on whatever findl's primary was on.
         open_agent_picker(&mut app, WorktreeId("w-feat".into()));
         let Some(Overlay::Menu(menu)) = &app.overlay else {
@@ -10623,7 +10890,7 @@ mod tests {
         assert!(
             matches!(
                 out.last(),
-                Some(ClientRequest::CheckoutPrimary { project, branch, .. })
+                Some(ClientRequest::ResolveBranchCheckout { project, branch, .. })
                     if project.as_str() == "p-remote" && branch == "feature-x"
             ),
             "{out:?}"
@@ -10654,8 +10921,8 @@ mod tests {
                     branch: "feature-x".into(),
                     next: AfterCheckout::Terminal,
                 }));
-        // Once findl has the branch checked out, the rows aim straight at
-        // that checkout.
+        // A host selection is not permission to enter a parked linked checkout.
+        // Even when it exists, ask primary and let its host refuse safely.
         app.overlay = None;
         hse(
             &mut app,
@@ -10672,7 +10939,14 @@ mod tests {
             .iter()
             .find(|i| i.label == "Run on findl ▸")
             .unwrap();
-        assert!(matches!(&twin.action, MenuAction::NewAgent(w) if w.as_str() == "w-remote-feat"));
+        assert_eq!(
+            twin.action,
+            MenuAction::CheckoutThen {
+                project: ProjectId("p-remote".into()),
+                branch: "feature-x".into(),
+                next: AfterCheckout::PickAgent,
+            }
+        );
     }
 
     #[test]
@@ -10876,7 +11150,7 @@ mod tests {
     }
 
     #[test]
-    fn branch_badge_does_not_label_remote_parked_sessions_as_local() {
+    fn historical_remote_branch_does_not_change_local_branch_ownership() {
         let mut app = App::new();
         seed_tree(&mut app);
         seed_remote_twin(&mut app);
@@ -10896,7 +11170,17 @@ mod tests {
         app.tree.agents.push(remote);
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
-        assert!(!text.contains("develop (branch) @local"), "{text}");
+        assert!(text.contains("develop (branch) @local"), "{text}");
+        let remote = app
+            .tree
+            .agents
+            .iter()
+            .find(|a| a.id.as_str() == "remote-parked")
+            .unwrap();
+        assert_eq!(
+            app.tree.agent_home(remote),
+            crate::app::SessionHome::Worktree(WorktreeId("w-remote".into()))
+        );
     }
 
     fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
@@ -11326,13 +11610,10 @@ mod tests {
             );
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
             assert!(
-                matches!(
-                    &app.overlay,
-                    Some(Overlay::Menu(m)) if m.title.as_deref() == Some("New session")
-                ),
-                "enter opens the session picker on the filtered branch's checkout: {:?}",
-                app.overlay
+                matches!(out.last(), Some(ClientRequest::ResolveBranchCheckout { branch, .. }) if branch == "feature"),
+                "branch intent must ask primary even when a linked checkout exists: {out:?}"
             );
+            assert!(app.overlay.is_none());
         })
     }
 
@@ -18803,6 +19084,19 @@ mod tests {
             assert_eq!(menu.items[0].label, "main ⌂ primary");
         }
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        let Some(ClientRequest::ResolveBranchCheckout { req_id, branch, .. }) = out.pop() else {
+            panic!("expected guarded primary resolution");
+        };
+        assert_eq!(branch, "main");
+        hse(
+            &mut app,
+            ServerEvent::Ack {
+                req_id,
+                created: Some(nebula_core::EntityId::Worktree(nebula_core::WorktreeId(
+                    "w1".into(),
+                ))),
+            },
+        );
         let Some(Overlay::Menu(menu)) = &app.overlay else {
             panic!("expected the session picker, got {:?}", app.overlay);
         };
@@ -18840,11 +19134,9 @@ mod tests {
         assert!(out.is_empty(), "nothing goes to the daemon: {out:?}");
     }
 
-    /// The `a` flow on a branch with no checkout: the branch is checked
-    /// out on the primary (no worktree minted), and the Ack opens the
-    /// session picker on the primary checkout.
+    /// The branch action resolves a physical checkout before opening its session picker.
     #[test]
-    fn agent_on_branch_without_checkout_checks_it_out_on_primary_then_opens_picker() {
+    fn agent_on_branch_without_checkout_resolves_then_opens_picker() {
         let mut app = App::new();
         seed_tree(&mut app);
         let mut out = Vec::new();
@@ -18856,29 +19148,18 @@ mod tests {
             },
             &mut out,
         );
-        let Some(ClientRequest::CheckoutPrimary { req_id, branch, .. }) = out.first() else {
-            panic!("expected CheckoutPrimary, got {out:?}");
+        let Some(ClientRequest::ResolveBranchCheckout { req_id, branch, .. }) = out.first() else {
+            panic!("expected ResolveBranchCheckout, got {out:?}");
         };
         assert_eq!(branch, "feature");
-        assert!(
-            !out.iter()
-                .any(|r| matches!(r, ClientRequest::CreateWorktree { .. })),
-            "a branch gets no worktree of its own"
-        );
         let req_id = *req_id;
-        let primary = app
-            .tree
-            .worktrees
-            .iter()
-            .find(|w| w.is_main)
-            .map(|w| w.id.clone())
-            .expect("seed has a primary");
+        let resolved = WorktreeId("resolved-feature".into());
         let mut out = Vec::new();
         handle_server_event(
             &mut app,
             ServerEvent::Ack {
                 req_id,
-                created: None,
+                created: Some(EntityId::Worktree(resolved.clone())),
             },
             &mut out,
         );
@@ -18889,11 +19170,63 @@ mod tests {
         assert!(
             matches!(
                 &menu.items[0].action,
-                MenuAction::NewAgentOfKind { worktree, .. } if worktree == &primary
+                MenuAction::NewAgentOfKind { worktree, .. } if worktree == &resolved
             ),
             "{:?}",
             menu.items[0].action
         );
+    }
+
+    #[test]
+    fn split_on_unmaterialized_branch_retains_branch_through_late_checkout_updates() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.branch_list = Some((ProjectId("p1".into()), vec!["feature".into()]));
+        app.focus = Focus::Worktrees;
+        app.sel_worktree = app.branch_row_index("feature").unwrap();
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::SUPER, &mut out);
+        assert!(out.is_empty(), "opening the picker does not mutate Git");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        let Some(ClientRequest::ResolveBranchCheckout { req_id, branch, .. }) = out.last() else {
+            panic!("{out:?}")
+        };
+        assert_eq!(branch, "feature");
+        let req_id = *req_id;
+        let id = WorktreeId("resolved".into());
+        let mut checkout = app.tree.worktrees[0].clone();
+        checkout.id = id.clone();
+        checkout.branch = "changed-after-resolution".into();
+        checkout.is_main = false;
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: nebula_core::Entity::Worktree(checkout),
+            },
+        );
+        out.clear();
+        handle_server_event(
+            &mut app,
+            ServerEvent::Ack {
+                req_id,
+                created: Some(EntityId::Worktree(id.clone())),
+            },
+            &mut out,
+        );
+        assert!(out.iter().any(|r| matches!(r, ClientRequest::CreateAgent { worktree, expected_branch: Some(branch), .. } if worktree == &id && branch == "feature")), "{out:?}");
+    }
+
+    #[test]
+    fn historical_branch_mismatch_is_visible_in_the_breadcrumb() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.tree.agents[0].branch = Some("feature".into());
+        app.focus = Focus::Sessions;
+        let mut terminal = Terminal::new(TestBackend::new(160, 35)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("expects feature"), "{text}");
+        assert_eq!(app.selected_worktree().unwrap().branch, "main");
     }
 
     /// The panel is WORKTREES & BRANCHES now: checkout-less local branches
@@ -19006,11 +19339,9 @@ mod tests {
         assert!(out.is_empty(), "opening the menu sends nothing");
     }
 
-    /// A worktree whose checkout was created for a pre-existing branch
-    /// (`for_branch`) keeps the (branch) tag — spawning a session on a
-    /// branch must not re-label it as a worktree.
+    /// Physical linked directories stay worktrees regardless of historical flags.
     #[test]
-    fn for_branch_worktree_rows_keep_the_branch_tag() {
+    fn for_branch_worktree_rows_show_the_worktree_tag() {
         use nebula_core::{Entity, Worktree, WorktreeId};
         let mut app = App::new();
         seed_tree(&mut app);
@@ -19033,16 +19364,27 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
-        assert!(text.contains("feat (branch)"), "{text}");
-        assert!(!text.contains("feat (wt)"), "{text}");
+        assert!(text.contains("feat (wt)"), "{text}");
+        assert!(!text.contains("feat (branch)"), "{text}");
+        assert_eq!(
+            branch_pick_label(&app, &nebula_core::ProjectId("p1".into()), "feat", None),
+            "feat (wt)"
+        );
+        let mut out = Vec::new();
+        pick_agent_on_branch(
+            &mut app,
+            nebula_core::ProjectId("p1".into()),
+            "feat".into(),
+            &mut out,
+        );
+        assert!(
+            matches!(out.last(), Some(ClientRequest::ResolveBranchCheckout { branch, .. }) if branch == "feat")
+        );
     }
 
-    /// `t` on a checkout-less branch row skips the "select a worktree"
-    /// flash: it checks the branch out on the primary (the session picker
-    /// follows the Ack, same as the row menu's "New agent here") — no
-    /// worktree is minted for a branch.
+    /// The session key on a checkout-less branch requests host-owned resolution.
     #[test]
-    fn t_on_a_branch_row_checks_it_out_on_primary_for_the_picker() {
+    fn t_on_a_branch_row_resolves_for_the_picker() {
         let mut app = App::new();
         seed_tree(&mut app);
         app.branch_list = Some((
@@ -19057,23 +19399,22 @@ mod tests {
         assert!(
             app.flash
                 .as_deref()
-                .is_some_and(|f| f.contains("checking out feature-x")),
+                .is_some_and(|f| f.contains("resolving feature-x")),
             "progress flash, not the select-a-worktree one: {:?}",
             app.flash
         );
         assert!(
             matches!(
                 out.last(),
-                Some(ClientRequest::CheckoutPrimary { branch, .. }) if branch == "feature-x"
+                Some(ClientRequest::ResolveBranchCheckout { branch, .. }) if branch == "feature-x"
             ),
             "{out:?}"
         );
     }
 
-    /// ⌘T on a checkout-less branch row: the same checkout-on-primary,
-    /// and the Ack creates the shell on the primary checkout.
+    /// The terminal action uses the checkout acknowledged for the requested branch.
     #[test]
-    fn new_terminal_on_a_branch_row_lands_on_the_primary() {
+    fn new_terminal_on_a_branch_row_uses_resolved_checkout() {
         let mut app = App::new();
         seed_tree(&mut app);
         app.branch_list = Some((
@@ -19085,31 +19426,25 @@ mod tests {
         assert_eq!(app.selected_branch_row().as_deref(), Some("feature-x"));
         let mut out = Vec::new();
         create_terminal_for_context(&mut app, &mut out);
-        let Some(ClientRequest::CheckoutPrimary { req_id, .. }) = out.last() else {
-            panic!("expected CheckoutPrimary, got {out:?}");
+        let Some(ClientRequest::ResolveBranchCheckout { req_id, .. }) = out.last() else {
+            panic!("expected ResolveBranchCheckout, got {out:?}");
         };
         let req_id = *req_id;
-        let primary = app
-            .tree
-            .worktrees
-            .iter()
-            .find(|w| w.is_main)
-            .map(|w| w.id.clone())
-            .unwrap();
+        let resolved = WorktreeId("resolved-feature".into());
         let mut out = Vec::new();
         handle_server_event(
             &mut app,
             ServerEvent::Ack {
                 req_id,
-                created: None,
+                created: Some(EntityId::Worktree(resolved.clone())),
             },
             &mut out,
         );
         assert!(
             matches!(
                 out.last(),
-                Some(ClientRequest::CreateTerminal { worktree, name: None, .. })
-                    if worktree == &primary
+                Some(ClientRequest::CreateTerminal { worktree, expected_branch: Some(branch), name: None, .. })
+                    if worktree == &resolved && branch == "feature-x"
             ),
             "{out:?}"
         );
@@ -19165,32 +19500,22 @@ mod tests {
             crate::branches::local_branches(&repo).contains(&"topic".to_string()),
             "git branch ran in the primary checkout"
         );
-        assert_eq!(
-            app.flash.as_deref(),
-            Some("branch topic created from main · checking out on the primary…")
-        );
+        assert_eq!(app.flash.as_deref(), Some("branch topic created from main"));
         assert!(
             app.branch_rows().contains(&"topic".to_string()),
             "{:?}",
             app.branch_list
         );
-        // Then the `nebula switch` step: the fresh branch is checked out
-        // on the primary, so the user lands on it instead of on a dim row
-        // that moves the primary at some later keypress.
         assert!(
-            matches!(
-                out.last(),
-                Some(ClientRequest::CheckoutPrimary { branch, .. }) if branch == "topic"
-            ),
+            !out.iter()
+                .any(|r| matches!(r, ClientRequest::CheckoutPrimary { .. })),
             "{out:?}"
         );
     }
 
-    /// Moving the primary under a busy session is not silent: the checkout
-    /// (from a branch row's `a`, or a fresh create) asks first, and `y`
-    /// sends it. An idle primary needs no question.
+    /// Creating on another branch leaves a running primary unchanged without confirmation.
     #[test]
-    fn moving_the_primary_under_a_running_session_asks_first() {
+    fn new_branch_session_preserves_a_running_primary_without_confirmation() {
         let mut app = App::new();
         seed_tree(&mut app);
         let primary = app.tree.worktrees[0].id.clone();
@@ -19225,17 +19550,14 @@ mod tests {
             },
             &mut out,
         );
-        assert!(out.is_empty(), "nothing moves before the answer: {out:?}");
-        let Some(Overlay::Confirm(c)) = &app.overlay else {
-            panic!("expected a confirm, got {:?}", app.overlay);
-        };
-        assert!(c.message.contains("worker"), "{}", c.message);
-        assert!(c.message.contains("feature"), "{}", c.message);
-        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE, &mut out);
+        assert!(
+            app.overlay.is_none(),
+            "no permission to move primary is needed"
+        );
         assert!(
             matches!(
                 out.last(),
-                Some(ClientRequest::CheckoutPrimary { branch, .. }) if branch == "feature"
+                Some(ClientRequest::ResolveBranchCheckout { branch, .. }) if branch == "feature"
             ),
             "{out:?}"
         );
@@ -23263,6 +23585,323 @@ mod tests {
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
             assert!(!app.should_quit, "Enter on an empty list is a no-op");
         });
+    }
+
+    #[test]
+    fn repeated_offline_notices_preserve_exhausted_retry_budget() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.tree.projects[0].host = Some("findl".into());
+        attach(
+            &mut app,
+            SessionRef::Agent(AgentId("a1".into())),
+            &mut Vec::new(),
+        );
+        let notice = ServerEvent::Error {
+            req_id: None,
+            message: "nebula relay: {\"host\":\"findl\",\"connected\":false}".into(),
+        };
+        hse(&mut app, notice.clone());
+        // Advance the time boundary to an exhausted three-attempt cycle.
+        let term = app.term.as_mut().unwrap();
+        term.attach_attempts = 3;
+        term.awaiting_snapshot = Some(std::time::Instant::now() - Duration::from_secs(11));
+        hse(&mut app, notice);
+        app.quick_term = true;
+        let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(buffer_text(&terminal).contains("findl: unavailable"));
+    }
+
+    #[test]
+    fn remote_pane_shows_recovery_until_snapshot_and_retry_never_sends_keys() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.tree.projects[0].host = Some("findl".into());
+        let session = SessionRef::Agent(AgentId("a1".into()));
+        let mut out = Vec::new();
+        attach(&mut app, session.clone(), &mut out);
+        let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(buffer_text(&terminal).contains("findl: connecting"));
+        hse(
+            &mut app,
+            ServerEvent::Error {
+                req_id: None,
+                message: "nebula relay: {\"host\":\"findl\",\"connected\":false}".into(),
+            },
+        );
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(buffer_text(&terminal).contains("findl: reconnecting"));
+        app.focus = Focus::Terminal;
+        app.term_locked = true;
+        out.clear();
+        press(
+            &mut app,
+            KeyCode::Char('r'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
+        assert!(matches!(
+            out.as_slice(),
+            [ClientRequest::Attach { from_seq: None, .. }]
+        ));
+        hse(
+            &mut app,
+            ServerEvent::Scrollback {
+                session,
+                base_seq: 0,
+                data: b"recovered screen".to_vec(),
+            },
+        );
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let screen = buffer_text(&terminal);
+        assert!(screen.contains("recovered screen"));
+        assert!(!screen.contains("findl: reconnecting"));
+    }
+    #[test]
+    fn empty_replay_keeps_starting_hint_until_the_child_paints() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let session = SessionRef::Agent(AgentId("a1".into()));
+        attach(&mut app, session.clone(), &mut Vec::new());
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(buffer_text(&terminal).contains("Starting claude…"));
+        hse(
+            &mut app,
+            ServerEvent::Scrollback {
+                session: session.clone(),
+                base_seq: 0,
+                data: vec![],
+            },
+        );
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(
+            buffer_text(&terminal).contains("Starting claude…"),
+            "empty replay is not app readiness"
+        );
+        hse(
+            &mut app,
+            ServerEvent::Output {
+                session,
+                seq: 0,
+                data: b"ready for input".to_vec(),
+            },
+        );
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("ready for input"));
+        assert!(!text.contains("Starting claude…"));
+    }
+
+    #[test]
+    fn cold_remote_attach_paints_preview_then_authoritative_replay() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.tree.projects[0].host = Some("findl".into());
+        let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let session = SessionRef::Agent(AgentId("a1".into()));
+        let mut out = Vec::new();
+        attach(&mut app, session.clone(), &mut out);
+        let req_id = match out.as_slice() {
+            [ClientRequest::ReadSession { req_id, .. }] => *req_id,
+            _ => panic!("cold remote attach must request compact preview first: {out:?}"),
+        };
+        out.clear();
+        // A previous attach to this session can still have events in flight.
+        // They must not cancel the deferred Attach or become its first frame.
+        hse(
+            &mut app,
+            ServerEvent::Scrollback {
+                session: session.clone(),
+                base_seq: 900,
+                data: b"old attachment".to_vec(),
+            },
+        );
+        hse(
+            &mut app,
+            ServerEvent::Output {
+                session: session.clone(),
+                seq: 914,
+                data: b"old output".to_vec(),
+            },
+        );
+        let (cols, rows) = pane_size(&app);
+        handle_server_event(
+            &mut app,
+            ServerEvent::SessionText {
+                req_id,
+                text: "idle agent ready".into(),
+                cols,
+                rows,
+            },
+            &mut out,
+        );
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(
+            buffer_text(&terminal).contains("idle agent ready"),
+            "first reply paints useful content without a child redraw"
+        );
+        assert!(matches!(
+            out.as_slice(),
+            [ClientRequest::Attach { from_seq: None, .. }]
+        ));
+        hse(
+            &mut app,
+            ServerEvent::Scrollback {
+                session: session.clone(),
+                base_seq: 0,
+                data: b"\x1b[2J".to_vec(),
+            },
+        );
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(
+            !buffer_text(&terminal).contains("idle agent ready"),
+            "even a blank authoritative replay replaces the preview"
+        );
+        hse(
+            &mut app,
+            ServerEvent::Output {
+                session: session.clone(),
+                seq: 4,
+                data: b"authoritative screen".to_vec(),
+            },
+        );
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("authoritative screen"));
+        assert!(!text.contains("idle agent ready"));
+        attach(&mut app, other_session(), &mut Vec::new());
+        out.clear();
+        attach(&mut app, session, &mut out);
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(
+            buffer_text(&terminal).contains("authoritative screen"),
+            "warm first frame is cached, no network response needed"
+        );
+        assert!(out
+            .iter()
+            .all(|r| !matches!(r, ClientRequest::ReadSession { .. })));
+    }
+
+    #[test]
+    fn resize_discards_preview_and_rejects_its_late_reply() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.tree.projects[0].host = Some("findl".into());
+        let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let mut out = Vec::new();
+        attach(&mut app, SessionRef::Agent(AgentId("a1".into())), &mut out);
+        let req_id = match out[0] {
+            ClientRequest::ReadSession { req_id, .. } => req_id,
+            _ => panic!(),
+        };
+        let (cols, rows) = pane_size(&app);
+        hse(
+            &mut app,
+            ServerEvent::SessionText {
+                req_id,
+                text: "old size preview".into(),
+                cols,
+                rows,
+            },
+        );
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(buffer_text(&terminal).contains("old size preview"));
+        terminal.backend_mut().resize(100, 30);
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(
+            !buffer_text(&terminal).contains("old size preview"),
+            "even the first resized frame must discard the preview"
+        );
+        sync_pty_size(&mut app, &mut out);
+        hse(
+            &mut app,
+            ServerEvent::SessionText {
+                req_id,
+                text: "late stale preview".into(),
+                cols,
+                rows,
+            },
+        );
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(!text.contains("old size preview"));
+        assert!(!text.contains("late stale preview"));
+    }
+
+    #[test]
+    fn remote_split_paints_the_compact_preview() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.tree.projects[0].host = Some("findl".into());
+        app.term = Some(AttachedTerm::new(other_session(), 80, 24));
+        app.split_term = Some(AttachedTerm::new(other_session(), 40, 24));
+        let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let mut out = Vec::new();
+        attach_split(&mut app, SessionRef::Agent(AgentId("a1".into())), &mut out);
+        let req_id = out
+            .iter()
+            .find_map(|r| match r {
+                ClientRequest::ReadSession { req_id, .. } => Some(*req_id),
+                _ => None,
+            })
+            .expect("split uses compact preview too");
+        hse(
+            &mut app,
+            ServerEvent::SessionText {
+                req_id,
+                text: "split ready".into(),
+                cols: 40,
+                rows: 24,
+            },
+        );
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("split ready"));
+        assert!(text.contains("Resuming claude…"));
+    }
+
+    #[test]
+    fn preview_error_falls_back_to_attach_without_a_flash() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.tree.projects[0].host = Some("findl".into());
+        let mut out = Vec::new();
+        attach(&mut app, SessionRef::Agent(AgentId("a1".into())), &mut out);
+        let req_id = match out[0] {
+            ClientRequest::ReadSession { req_id, .. } => req_id,
+            _ => panic!(),
+        };
+        out.clear();
+        handle_server_event(
+            &mut app,
+            ServerEvent::Error {
+                req_id: Some(req_id),
+                message: "no live PTY".into(),
+            },
+            &mut out,
+        );
+        assert!(app.flash.is_none(), "preview is best effort");
+        assert!(matches!(
+            out.as_slice(),
+            [ClientRequest::Attach { from_seq: None, .. }]
+        ));
+        hse(
+            &mut app,
+            ServerEvent::SessionText {
+                req_id,
+                text: "late reply".into(),
+                cols: 80,
+                rows: 24,
+            },
+        );
+        assert!(app.term.as_ref().unwrap().attach_preview.is_none());
     }
 
     // ---- fast session re-attach: parked parsers + scrollback deltas ----

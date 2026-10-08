@@ -147,9 +147,8 @@ pub struct Worktree {
     /// Pinned worktrees sort into their own PINNED group in the worktrees list.
     #[serde(default)]
     pub pinned: bool,
-    /// The checkout was created for a branch that already existed (a
-    /// session spawned on a branch row) — the panel keeps presenting the
-    /// row as a branch, not a worktree the user asked for by name.
+    /// Legacy/explicit branch presentation and deletion semantics. Automatic
+    /// session checkouts leave this false so normal removal retains the branch.
     #[serde(default)]
     pub for_branch: bool,
     pub sort_order: i64,
@@ -189,12 +188,11 @@ pub struct Agent {
     pub sort_order: i64,
     /// True when the daemon currently holds a live PTY for this agent.
     pub alive: bool,
-    /// The branch the session is listed under: its checkout's branch,
-    /// re-stamped when the checkout switches in place so chats stay on
-    /// the checkout's row. A stamp that differs from the checkout's (rows
-    /// from before the re-stamp, a `nebula switch` mover from another
-    /// checkout) lists the session under that branch instead. None =
-    /// unknown, which follows the checkout's current branch.
+    /// Branch expected at spawn/resume, or last deliberately moved to.
+    /// Execution identity is `worktree_id` on its owning host. A mismatch
+    /// is shown as a recovery warning and blocks spawning; it never moves
+    /// a live process or changes sidebar membership. None denotes legacy
+    /// rows with unknown affinity, validated against their checkout row.
     #[serde(default)]
     pub branch: Option<String>,
 }

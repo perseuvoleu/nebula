@@ -268,10 +268,18 @@ enum WorktreeCommand {
         #[arg(long)]
         project: Option<String>,
     },
-    /// Check a branch out in the primary checkout. A nebula worktree
-    /// holding that branch is removed first (the branch is kept); refused
-    /// while sessions still run on it. Never detach a worktree by hand to
-    /// free a branch — this is the supported route.
+    /// Remove only a clean, merged, session-free worktree by ID. Keeps its branch.
+    DeleteSafe {
+        id: String,
+        branch: String,
+        path: std::path::PathBuf,
+        #[arg(long)]
+        check: bool,
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Deliberately switch primary. Refused while another live session depends
+    /// on it or the branch already has a checkout; use that checkout instead.
     Checkout {
         /// Local branch name.
         branch: String,
@@ -372,6 +380,20 @@ enum AgentCommand {
         text: Vec<String>,
         /// Project name, or `name@host` for a remote project (default: the
         /// calling session's project).
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Send one terminal key by stable agent ID, without submitting a prompt.
+    Key {
+        id: String,
+        #[arg(value_parser = ["Up", "Down", "Left", "Right", "Enter", "Escape", "Tab"])]
+        key: String,
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Delete exactly this agent ID, never resolve a mutable session name.
+    DeleteId {
+        id: String,
         #[arg(long)]
         project: Option<String>,
     },
@@ -619,6 +641,8 @@ fn main() -> Result<()> {
                 from,
                 project,
             } => nebula_tui::run_worktree_new(name.join(" "), from, project),
+            WorktreeCommand::DeleteSafe { id, branch, path, check, project } =>
+                nebula_tui::run_worktree_delete_safe(id, branch, path, check, project),
             WorktreeCommand::Delete {
                 name,
                 force,
@@ -679,6 +703,8 @@ fn main() -> Result<()> {
             AgentCommand::Unarchive { name, project } => {
                 nebula_tui::run_agent_ctl(nebula_tui::AgentCtl::Unarchive, name, project)
             }
+            AgentCommand::Key { id, key, project } => nebula_tui::run_agent_action_id(id, Some(key), project),
+            AgentCommand::DeleteId { id, project } => nebula_tui::run_agent_action_id(id, None, project),
             AgentCommand::Delete { name, project } => {
                 nebula_tui::run_agent_ctl(nebula_tui::AgentCtl::Delete, name, project)
             }

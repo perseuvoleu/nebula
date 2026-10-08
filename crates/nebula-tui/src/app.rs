@@ -158,30 +158,22 @@ pub enum MenuAction {
         project: ProjectId,
         branch: String,
     },
-    /// A twin row (`… on findl`) whose host has no checkout of this
-    /// branch yet: check it out on the twin's primary (the `nebula
-    /// switch` shape, same as a local checkout-less branch row) and
-    /// carry on with `next` there — never on whatever branch the
-    /// primary happened to be on.
+    /// Resolve this branch on the selected host before continuing the session action.
     CheckoutThen {
         project: ProjectId,
         branch: String,
         next: AfterCheckout,
     },
-    /// Open the new-branch name prompt (chains into the base-branch
-    /// picker; the branch is created with `git branch` and checked out on
-    /// the primary, like `nebula switch`).
+    /// Open the name/base picker and create a Git branch without moving a checkout.
     NewBranch(ProjectId),
     /// A base-branch-picker row (new-branch flow): run
-    /// `git branch <name> <base>` in the project's primary checkout, then
-    /// check it out there.
+    /// `git branch <name> <base>` without moving the primary checkout.
     CreateBranchFrom {
         project: ProjectId,
         name: String,
         base: String,
     },
-    /// Check this row's branch out in the primary checkout: the daemon
-    /// removes the session-free worktree holding it and keeps the branch.
+    /// Deliberately switch primary; the daemon refuses occupied or already hosted branches.
     CheckoutPrimary {
         project: ProjectId,
         branch: String,
@@ -467,13 +459,6 @@ pub enum PendingAction {
         project: ProjectId,
         branch: String,
     },
-    /// Confirmed move of the primary checkout onto `branch` while busy
-    /// sessions sit on it; `next` runs there once the Ack lands.
-    CheckoutPrimary {
-        project: ProjectId,
-        branch: String,
-        next: AfterCheckout,
-    },
     Quit,
 }
 
@@ -499,9 +484,8 @@ pub enum PromptKind {
         id: ProjectId,
         before: bool,
     },
-    /// Name for a new local branch (checked out on the primary once
-    /// created, like `nebula switch`); submit chains into the
-    /// base-branch picker, which leads with the primary checkout's branch.
+    /// Name for a new local branch; submit opens the base picker.
+    /// Creating the branch leaves every checkout on its current branch.
     NewBranch {
         project: ProjectId,
     },
@@ -1685,6 +1669,8 @@ pub struct WorktreeRollback {
 /// What to do when an Ack (or Error) for this req_id arrives.
 #[derive(Debug, Clone)]
 pub enum PendingIntent {
+    /// Best-effort display-only read; errors stay silent even after timeout/navigation.
+    AttachPreview,
     /// Attach the created session and focus the terminal.
     AttachCreated,
     /// ⌘D: attach the created shell in the split's right pane and move the
@@ -1708,9 +1694,12 @@ pub enum PendingIntent {
     /// The `a` palette flow picked a branch with no checkout: once the
     /// worktree's Ack lands, open the new-session picker on it.
     PickAgentOnCreatedWorktree,
-    /// A new-session keypress on a checkout-less branch row: the daemon is
-    /// checking the branch out on the primary; once the Ack lands, carry on
-    /// with the session on the primary checkout.
+    /// Continue on the acknowledged checkout, retaining the requested branch for spawn validation.
+    ResolveBranchThen {
+        branch: String,
+        next: AfterCheckout,
+    },
+    /// An explicitly requested primary checkout movement.
     CheckoutPrimaryThen {
         project: ProjectId,
         next: AfterCheckout,
@@ -1718,15 +1707,14 @@ pub enum PendingIntent {
     None,
 }
 
-/// What a branch row's new-session keypress does once its branch sits on
-/// the primary checkout.
+/// What to do once the selected host acknowledges an execution checkout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AfterCheckout {
     /// Just select the primary row — the branch is where the user now is.
     Land,
-    /// Open the new-session picker (agent kind) on the primary.
+    /// Open the new-session picker on the resolved checkout.
     PickAgent,
-    /// Create and attach a shell terminal on the primary.
+    /// Create and attach a shell on the resolved checkout.
     Terminal,
     /// ⌘T row: create and attach an agent of this kind, no prompts.
     QuickAgent(AgentKind),
@@ -2180,34 +2168,15 @@ impl Tree {
         vec![id.clone()]
     }
 
-    /// The row a session lives under. Its checkout's row while the
-    /// checkout still holds the session's branch (or the session predates
-    /// branch tracking); the checkout that holds that branch now, when it
-    /// moved to one; otherwise the branch's own row, chats parked there
-    /// until something checks the branch out again.
-    pub fn session_home(&self, worktree_id: &WorktreeId, branch: Option<&str>) -> SessionHome {
-        let Some(w) = self.worktrees.iter().find(|w| &w.id == worktree_id) else {
-            return SessionHome::Worktree(worktree_id.clone());
-        };
-        let Some(branch) = branch.filter(|b| *b != w.branch) else {
-            return SessionHome::Worktree(w.id.clone());
-        };
-        match self
-            .worktrees
-            .iter()
-            .find(|x| x.project_id == w.project_id && x.branch == branch)
-        {
-            Some(x) => SessionHome::Worktree(x.id.clone()),
-            None => SessionHome::Branch(w.project_id.clone(), branch.to_owned()),
-        }
-    }
-
+    /// An agent is listed under the checkout its process actually owns.
+    /// Historical branch metadata never substitutes another working directory.
     pub fn agent_home(&self, agent: &Agent) -> SessionHome {
-        self.session_home(&agent.worktree_id, agent.branch.as_deref())
+        SessionHome::Worktree(agent.worktree_id.clone())
     }
 
+    /// A shell stays listed under its physical checkout, including after a Git switch.
     pub fn terminal_home(&self, terminal: &TerminalTab) -> SessionHome {
-        self.session_home(&terminal.worktree_id, terminal.branch.as_deref())
+        SessionHome::Worktree(terminal.worktree_id.clone())
     }
 
     /// The names of the branches in `project` (or its twins) that only
@@ -2364,6 +2333,19 @@ impl HomeIndex {
 }
 
 pub struct AttachedTerm {
+    /// Time the current attach started; cleared only by its Scrollback reply.
+    pub awaiting_snapshot: Option<std::time::Instant>,
+    /// Safe attach attempts in this recovery cycle, capped at three.
+    pub attach_attempts: u8,
+    /// Compact, display-only screen while a cold attach waits for replay.
+    pub attach_preview: Option<String>,
+    /// Correlation and deadline origin; never reused across attachments.
+    pub preview_request: Option<(u64, std::time::Instant)>,
+    /// Startup ends at the first visible text, not an empty replay/control sequence.
+    pub has_content: bool,
+    pub starting_label: String,
+    /// Host outage requires replacing the parser even if sequence numbers match.
+    pub fresh_snapshot: bool,
     pub sref: SessionRef,
     pub parser: vt100::Parser,
     pub exited: bool,
@@ -2400,6 +2382,13 @@ impl AttachedTerm {
     pub fn new(sref: SessionRef, cols: u16, rows: u16) -> Self {
         Self {
             sref,
+            awaiting_snapshot: Some(std::time::Instant::now()),
+            attach_attempts: 1,
+            attach_preview: None,
+            preview_request: None,
+            has_content: false,
+            starting_label: "session".into(),
+            fresh_snapshot: false,
             parser: vt100::Parser::new(rows, cols, 10_000),
             #[cfg(feature = "ghostty")]
             gh: crate::ghostty_pane::enabled_by_env()
@@ -2418,6 +2407,9 @@ impl AttachedTerm {
 
     /// Reset the parser (fresh replay is about to arrive).
     pub fn reset(&mut self) {
+        self.attach_preview = None;
+        self.preview_request = None;
+        self.has_content = false;
         self.parser = vt100::Parser::new(self.rows, self.cols, 10_000);
         #[cfg(feature = "ghostty")]
         if self.gh.is_some() {
@@ -2441,6 +2433,10 @@ impl AttachedTerm {
     /// Feed PTY bytes to the parser, invalidating screen-derived memos.
     pub fn feed(&mut self, data: &[u8]) {
         self.parser.process(data);
+        if !self.has_content && !self.parser.screen().contents().trim().is_empty() {
+            self.has_content = true;
+            self.attach_preview = None;
+        }
         #[cfg(feature = "ghostty")]
         if let Some(gh) = &mut self.gh {
             gh.feed(data);
@@ -2617,6 +2613,8 @@ pub struct App {
     /// the focused panel, and whether input was locked.
     pub quick_term_restore: Option<QuickTermRestore>,
     pub conn: ConnState,
+    /// Hosts with a reported relay outage; cleared by a fresh screen.
+    pub unavailable_relays: std::collections::HashSet<String>,
     pub hits: Vec<(Rect, HitTarget)>,
     /// Inner rect of the terminal pane from the last draw.
     pub term_area: Rect,
@@ -2651,6 +2649,8 @@ pub struct App {
     pub select_divider_when_seen: Option<(ProjectId, bool)>,
     /// Worktree created by us, awaiting its upsert to fix the selection.
     pub select_worktree_when_seen: Option<WorktreeId>,
+    /// Branch captured when a session picker/resolution starts, retained until spawn.
+    pub session_creation_branches: HashMap<WorktreeId, String>,
     /// Project added by `nebula open`, awaiting its upsert to land the
     /// selection on it.
     pub select_project_when_seen: Option<ProjectId>,
@@ -2866,6 +2866,7 @@ impl App {
             quick_term: false,
             quick_term_restore: None,
             conn: ConnState::Disconnected,
+            unavailable_relays: std::collections::HashSet::new(),
             hits: Vec::new(),
             term_area: Rect::default(),
             dirty: true,
@@ -2884,6 +2885,7 @@ impl App {
             select_when_seen: None,
             select_divider_when_seen: None,
             select_worktree_when_seen: None,
+            session_creation_branches: HashMap::new(),
             select_project_when_seen: None,
             open_at: None,
             select_note_when_seen: None,
@@ -2961,6 +2963,38 @@ impl App {
         }
     }
 
+    /// Remote host owning this session, resolved through the project tree.
+    pub fn attached_session_host(&self, session: &SessionRef) -> Option<&str> {
+        let worktree = self.worktree_of_sref(session)?;
+        let worktree = self.tree.worktrees.iter().find(|w| w.id == worktree)?;
+        self.tree
+            .projects
+            .iter()
+            .find(|p| p.id == worktree.project_id)?
+            .host
+            .as_deref()
+    }
+
+    /// Persistent recovery text for a remote pane awaiting a fresh screen.
+    pub fn relay_pane_notice(&self, term: &AttachedTerm) -> Option<String> {
+        let host = self.attached_session_host(&term.sref)?;
+        // A normal reconnect must not cover the cached frame/compact preview.
+        if (term.has_content || term.attach_preview.is_some())
+            && !self.unavailable_relays.contains(host)
+        {
+            return None;
+        }
+        let since = term.awaiting_snapshot?;
+        let state =
+            if term.attach_attempts >= 3 && since.elapsed() >= std::time::Duration::from_secs(10) {
+                "unavailable"
+            } else if self.unavailable_relays.contains(host) {
+                "reconnecting"
+            } else {
+                "connecting"
+            };
+        Some(format!("{host}: {state} — Ctrl+R to retry"))
+    }
     /// The worktree a session lives on, resolved through the tree.
     pub fn worktree_of_sref(&self, sref: &SessionRef) -> Option<WorktreeId> {
         match sref {
@@ -3282,10 +3316,10 @@ impl App {
     }
 
     /// Park a parser for a session we are leaving, so the next visit can
-    /// resume it from `end_seq`. Exited sessions are never parked — their
-    /// screen is final and their PTY is gone.
+    /// resume it from `end_seq`. Exited sessions and not-yet-attached preview
+    /// requests are never parked: neither has resumable live parser state.
     pub fn park_term(&mut self, term: AttachedTerm) {
-        if term.exited {
+        if term.exited || term.preview_request.is_some() {
             self.drop_cached_term(&term.sref);
             return;
         }
@@ -3567,25 +3601,9 @@ impl App {
         }
         // First match wins, like the linear `find`s these maps replace.
         let mut by_id: HashMap<&WorktreeId, &Worktree> = HashMap::new();
-        let mut by_branch: HashMap<(&ProjectId, &str), &Worktree> = HashMap::new();
         for w in &tree.worktrees {
             by_id.entry(&w.id).or_insert(w);
-            by_branch
-                .entry((&w.project_id, w.branch.as_str()))
-                .or_insert(w);
         }
-        let home_of = |worktree_id: &WorktreeId, branch: Option<&str>| {
-            let Some(w) = by_id.get(worktree_id) else {
-                return SessionHome::Worktree(worktree_id.clone());
-            };
-            let Some(branch) = branch.filter(|b| *b != w.branch) else {
-                return SessionHome::Worktree(w.id.clone());
-            };
-            match by_branch.get(&(&w.project_id, branch)) {
-                Some(x) => SessionHome::Worktree(x.id.clone()),
-                None => SessionHome::Branch(w.project_id.clone(), branch.to_owned()),
-            }
-        };
         let visible = |home: &SessionHome| {
             let project = match home {
                 SessionHome::Worktree(id) => by_id.get(id).map(|w| &w.project_id),
@@ -3598,14 +3616,14 @@ impl App {
         };
         let mut index = HomeIndex::default();
         for (i, a) in tree.agents.iter().enumerate() {
-            let home = home_of(&a.worktree_id, a.branch.as_deref());
+            let home = tree.agent_home(a);
             index.agent_homes.push(home.clone());
             if visible(&home) {
                 index.agents.entry(home).or_default().push(i);
             }
         }
         for (i, t) in tree.terminals.iter().enumerate() {
-            let home = home_of(&t.worktree_id, t.branch.as_deref());
+            let home = tree.terminal_home(t);
             index.terminal_homes.push(home.clone());
             if visible(&home) {
                 index.terminals.entry(home).or_default().push(i);
@@ -4579,7 +4597,8 @@ mod tests {
         assert_eq!(branches(&app), fixed);
     }
 
-    /// The primary stays first when switched; sessions remain on their branch.
+    /// The primary stays first when switched; sessions stay under their
+    /// physical checkout.
     #[test]
     fn checkout_on_the_primary_keeps_the_checkout_first() {
         let (mut app, primary) = link_app();
@@ -4643,10 +4662,14 @@ mod tests {
             ],
             "primary keeps its leading slot"
         );
+        assert!(
+            app.panel_row_sessions(1).is_empty(),
+            "historical branch has no sessions"
+        );
         assert_eq!(
-            names(app.panel_row_sessions(1)),
+            names(app.panel_row_sessions(0)),
             ["on-main"],
-            "sessions stay with main"
+            "sessions stay with the primary checkout"
         );
     }
 
@@ -4918,22 +4941,31 @@ mod tests {
     #[test]
     fn panel_projection_follows_every_input() {
         let (mut app, local, remote) = twin_app();
+        assert_eq!(row_names(&app), ["w1", "remote-checkout", "w-feature"]);
         assert_eq!(
-            row_names(&app),
+            session_names(&app),
             [
-                "w1",
-                "remote-checkout",
-                "w-feature",
-                "branch:gone",
-                "branch:older",
-                "branch:shells"
-            ],
+                "on-main",
+                "moved-to-feature",
+                "local-parked",
+                "other-parked",
+                "t-main"
+            ]
         );
-        assert_eq!(session_names(&app), ["on-main", "t-main"]);
 
         // Tree upsert: a new session, then a status change in place.
         app.tree.agents.push(agent_on("new", &local, None));
-        assert_eq!(session_names(&app), ["on-main", "new", "t-main"]);
+        assert_eq!(
+            session_names(&app),
+            [
+                "on-main",
+                "moved-to-feature",
+                "local-parked",
+                "other-parked",
+                "new",
+                "t-main"
+            ]
+        );
         app.tree
             .agents
             .iter_mut()
@@ -4942,15 +4974,31 @@ mod tests {
             .status = AgentStatus::Running;
         assert_eq!(
             session_names(&app),
-            ["new", "on-main", "t-main"],
+            [
+                "new",
+                "on-main",
+                "moved-to-feature",
+                "local-parked",
+                "other-parked",
+                "t-main"
+            ],
             "a working session leads"
         );
         // Tree removal.
         app.tree.agents.retain(|a| a.name != "new");
-        assert_eq!(session_names(&app), ["on-main", "t-main"]);
+        assert_eq!(
+            session_names(&app),
+            [
+                "on-main",
+                "moved-to-feature",
+                "local-parked",
+                "other-parked",
+                "t-main"
+            ]
+        );
         app.tree.agents.retain(|a| a.name != "other-parked");
         assert!(!row_names(&app).contains(&"branch:older".to_string()));
-        // A checkout taking a parked branch adopts its sessions.
+        // A checkout taking a historical branch does not adopt its sessions.
         app.tree
             .worktrees
             .iter_mut()
@@ -4961,7 +5009,7 @@ mod tests {
         app.sel_worktree = app
             .worktree_row_index(&WorktreeId("w-feature".into()))
             .unwrap();
-        assert_eq!(session_names(&app), ["local-parked"]);
+        assert!(session_names(&app).is_empty());
 
         // Selection move.
         app.sel_worktree = app.worktree_row_index(&remote).unwrap();
@@ -4969,7 +5017,10 @@ mod tests {
             app.selected_home(),
             Some(SessionHome::Worktree(remote.clone()))
         );
-        assert_eq!(session_names(&app), ["on-remote"]);
+        assert_eq!(
+            session_names(&app),
+            ["remote-parked", "on-remote", "t-parked"]
+        );
         assert_eq!(app.selected_worktree().map(|w| &w.id), Some(&remote));
         app.sel_worktree = 0;
 
@@ -4980,22 +5031,28 @@ mod tests {
             .find(|a| a.name == "on-main")
             .unwrap()
             .archived = true;
-        assert_eq!(session_names(&app), ["t-main"]);
+        assert_eq!(
+            session_names(&app),
+            ["moved-to-feature", "local-parked", "t-main"]
+        );
         app.show_archived = true;
-        assert_eq!(session_names(&app), ["t-main", "on-main"]);
+        assert_eq!(
+            session_names(&app),
+            ["moved-to-feature", "local-parked", "t-main", "on-main"]
+        );
         assert_eq!(
             app.worktree_session_rows(&local).len(),
-            1,
+            3,
             "sublists never show archived"
         );
 
         // Host filters.
         app.hide_remote = true;
-        // (`feature` is parked now that its checkout moved to `gone`.)
-        assert_eq!(row_names(&app), ["w1", "w-feature", "branch:feature"]);
+        // Historical branches do not create parked rows in protocol 29.
+        assert_eq!(row_names(&app), ["w1", "w-feature"]);
         app.hide_remote = false;
         app.hide_local = true;
-        assert_eq!(row_names(&app), ["remote-checkout", "branch:shells"]);
+        assert_eq!(row_names(&app), ["remote-checkout"]);
         app.hide_local = false;
         assert!(row_names(&app).starts_with(&["w1".into(), "remote-checkout".into()]));
 
@@ -5048,17 +5105,13 @@ mod tests {
         assert_ne!(app.tree.generation(), generation);
     }
 
-    /// A checkout switching branches leaves its chats where they were: a
-    /// session records the branch it was spawned on and is listed under
-    /// that branch's row — a plain branch row when nothing checks the
-    /// branch out any more (even one the branch cache doesn't list). A
-    /// session with no recorded branch follows the checkout.
+    /// Historical branch affinity never moves a session's physical checkout identity.
     #[test]
-    fn sessions_stay_on_their_branch_when_the_primary_switches() {
+    fn sessions_stay_on_their_checkout_when_the_primary_switches() {
         let (mut app, primary) = link_app();
         app.tree
             .agents
-            .push(agent_on("parked", &primary, Some("dada")));
+            .push(agent_on("old", &primary, Some("dada")));
         app.tree
             .agents
             .push(agent_on("current", &primary, Some("main")));
@@ -5068,77 +5121,33 @@ mod tests {
             worktree_id: primary.clone(),
             name: "shell".into(),
             sort_order: 0,
-            alive: false,
+            alive: true,
             busy: false,
             status: None,
             status_changed_at: 0,
             branch: Some("dada".into()),
         });
-
-        let names = |rows: Vec<SessionRow>| -> Vec<String> {
-            rows.iter()
-                .map(|r| match r {
-                    SessionRow::Agent(a) => a.name.clone(),
-                    SessionRow::Terminal(t) => t.name.clone(),
-                    SessionRow::Link(l) => l.label(),
-                })
-                .collect()
-        };
-        assert_eq!(
-            app.panel_entries(),
-            [
-                PanelEntry {
-                    row: PanelRow::Worktree(primary.clone()),
-                    depth: 0,
-                    base: None
-                },
-                PanelEntry {
-                    row: PanelRow::Branch("dada".into()),
-                    depth: 0,
-                    base: None
-                },
-            ],
-            "the parked branch gets a row without a cache entry"
-        );
-        assert_eq!(names(app.panel_row_sessions(0)), ["current", "legacy"]);
-        assert_eq!(names(app.panel_row_sessions(1)), ["parked", "shell"]);
-        app.sel_worktree = 1;
-        assert_eq!(app.selected_branch_row().as_deref(), Some("dada"));
-        assert_eq!(names(app.visible_session_rows()), ["parked", "shell"]);
-        assert_eq!(
-            app.row_index_for_session(&SessionRef::Agent(AgentId("parked".into()))),
-            Some(1)
-        );
-        assert_eq!(
-            app.row_index_for_session(&SessionRef::Terminal(TerminalId("t1".into()))),
-            Some(1)
-        );
-        assert_eq!(app.branch_rollup("dada"), Some(AgentStatus::Finished));
-
-        // Switching keeps primary first and moves its old sessions to main.
-        app.tree.worktrees[0].branch = "dada".into();
-        app.tree.worktrees[0].created_from = Some("main".into());
-        assert_eq!(
-            app.panel_entries(),
-            [
-                PanelEntry {
-                    row: PanelRow::Worktree(primary.clone()),
-                    depth: 0,
-                    base: Some("main".into())
-                },
-                PanelEntry {
-                    row: PanelRow::Branch("main".into()),
-                    depth: 0,
-                    base: None
-                },
-            ]
-        );
-        assert_eq!(names(app.panel_row_sessions(1)), ["current"]);
-        assert_eq!(
-            names(app.panel_row_sessions(0)),
-            ["parked", "legacy", "shell"]
-        );
-        assert_eq!(app.worktree_rollup(&primary), Some(AgentStatus::Finished));
+        // Even when a different physical checkout hosts the historical branch.
+        let mut other = app.tree.worktrees[0].clone();
+        other.id = WorktreeId("other".into());
+        other.path = "/tmp/other".into();
+        other.branch = "dada".into();
+        other.is_main = false;
+        app.tree.worktrees.push(other);
+        for actual in ["main", "dada", "another"] {
+            app.tree.worktrees[0].branch = actual.into();
+            for a in &app.tree.agents {
+                assert_eq!(
+                    app.tree.agent_home(a),
+                    SessionHome::Worktree(primary.clone())
+                );
+            }
+            assert_eq!(
+                app.tree.terminal_home(&app.tree.terminals[0]),
+                SessionHome::Worktree(primary.clone())
+            );
+            assert_eq!(app.visible_session_rows().len(), 4);
+        }
     }
 
     /// Branch rows nest by their recorded creation base like worktrees do:
