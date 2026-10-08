@@ -184,7 +184,10 @@ pub async fn calling_session() -> Option<(String, Option<String>)> {
         let stream = try_connect(&paths::socket_path()).await.ok()?;
         let mut conn = handshake(stream).await.ok()?;
         let (_, _, agents) = subscribe_snapshot(&mut conn).await.ok()?;
-        agents.into_iter().find(|a| a.id.as_str() == id).map(|a| a.name)
+        agents
+            .into_iter()
+            .find(|a| a.id.as_str() == id)
+            .map(|a| a.name)
     };
     let name = tokio::time::timeout(Duration::from_secs(2), lookup)
         .await

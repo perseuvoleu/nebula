@@ -50,12 +50,15 @@ pub struct CommitEntry {
 /// What the diff viewer compares. `WorkingTree` (the default) is the
 /// checkout's uncommitted changes against HEAD; `Upstream` is the working
 /// tree against the branch's tracking ref (everything not yet pushed,
-/// committed or not); `Commit` is one commit against its first parent.
+/// committed or not); `Branch` is the working tree against its merge base
+/// with another branch (everything a merge into that branch would bring);
+/// `Commit` is one commit against its first parent.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum DiffBase {
     #[default]
     WorkingTree,
     Upstream(String),
+    Branch(String),
     Commit(CommitEntry),
 }
 
@@ -65,12 +68,25 @@ impl DiffBase {
     }
 
     /// Short label for the diff pane title: nothing for the working tree,
-    /// `vs origin/main` for the upstream, `@ abc1234` for a commit.
+    /// `vs origin/main` for the upstream or a branch, `@ abc1234` for a
+    /// commit.
     pub fn title_suffix(&self) -> String {
         match self {
             DiffBase::WorkingTree => String::new(),
-            DiffBase::Upstream(name) => format!(" vs {name}"),
+            DiffBase::Upstream(name) | DiffBase::Branch(name) => format!(" vs {name}"),
             DiffBase::Commit(c) => format!(" @ {}", c.short),
+        }
+    }
+
+    /// The `git diff` revision arguments that compare the working tree
+    /// with this base: the upstream's tip, or `--merge-base <branch>` so a
+    /// branch that moved on does not show its own commits reversed.
+    /// `None` for the bases that are not a working-tree-vs-rev diff.
+    pub fn rev_args(&self) -> Option<Vec<&str>> {
+        match self {
+            DiffBase::Upstream(rev) => Some(vec![rev]),
+            DiffBase::Branch(branch) => Some(vec!["--merge-base", branch]),
+            DiffBase::WorkingTree | DiffBase::Commit(_) => None,
         }
     }
 }
@@ -248,10 +264,51 @@ fn rev_name(root: &Path, rev: &str) -> Option<String> {
     (output.status.success() && !name.is_empty()).then_some(name)
 }
 
-/// Working-tree files that differ from `rev` (tracked, via `git diff`)
-/// plus the untracked ones from status. `Err` is a user-facing flash.
-pub fn files_since(root: &Path, rev: &str) -> Result<Vec<DiffFile>, String> {
-    let output = run_git(root, &["diff", "-M", "--name-status", "-z", rev])?;
+/// Every other branch of the checkout for the ^g picker's branch list:
+/// local ones first, then the remote-tracking ones, each most recently
+/// committed first. `current` (the checked-out branch) is left out.
+/// `Err` is a user-facing flash message.
+pub fn branches(root: &Path, current: &str) -> Result<Vec<String>, String> {
+    let output = run_git(
+        root,
+        &[
+            "for-each-ref",
+            "--sort=-committerdate",
+            "--format=%(symref)%1f%(refname)",
+            "refs/heads",
+            "refs/remotes",
+        ],
+    )?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("git for-each-ref failed: {}", stderr.trim()));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let (mut local, mut remote) = (Vec::new(), Vec::new());
+    for line in text.lines() {
+        // A symref (`origin/HEAD`) only repeats the branch it points at.
+        let Some(("", refname)) = line.split_once('\x1f') else {
+            continue;
+        };
+        if let Some(name) = refname.strip_prefix("refs/heads/") {
+            if name != current {
+                local.push(name.to_string());
+            }
+        } else if let Some(name) = refname.strip_prefix("refs/remotes/") {
+            remote.push(name.to_string());
+        }
+    }
+    local.extend(remote);
+    Ok(local)
+}
+
+/// Working-tree files that differ from `rev` (`DiffBase::rev_args`;
+/// tracked, via `git diff`) plus the untracked ones from status. `Err` is
+/// a user-facing flash.
+pub fn files_since(root: &Path, rev: &[&str]) -> Result<Vec<DiffFile>, String> {
+    let mut args = vec!["diff", "-M", "--name-status", "-z"];
+    args.extend(rev);
+    let output = run_git(root, &args)?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("git diff failed: {}", stderr.trim()));
@@ -401,16 +458,10 @@ pub fn diff_for(root: &Path, file: &DiffFile, base: &DiffBase, head_ok: bool) ->
             args.push(orig);
         }
         run_git(root, &args)
-    } else if let (DiffBase::Upstream(rev), false) = (base, file.is_untracked()) {
-        let mut args = vec![
-            "diff",
-            rev,
-            "-M",
-            "--no-color",
-            "--no-ext-diff",
-            "--",
-            &file.path,
-        ];
+    } else if let (Some(rev), false) = (base.rev_args(), file.is_untracked()) {
+        let mut args = vec!["diff"];
+        args.extend(rev);
+        args.extend(["-M", "--no-color", "--no-ext-diff", "--", &file.path]);
         if let Some(orig) = &file.orig_path {
             args.push(orig);
         }
@@ -699,16 +750,44 @@ mod tests {
         let files = changed_files(&repo).unwrap();
         assert_eq!(files.len(), 1);
         // … but against the upstream the committed edit shows too.
-        let files = files_since(&repo, "base").unwrap();
+        let base = DiffBase::Upstream("base".into());
+        let files = files_since(&repo, &base.rev_args().unwrap()).unwrap();
         assert_eq!(files.len(), 2, "{files:?}");
         let tracked = files.iter().find(|f| f.path == "tracked.txt").unwrap();
         assert_eq!(tracked.xy, ['M', ' ']);
-        let base = DiffBase::Upstream("base".into());
         let diff = diff_for(&repo, tracked, &base, true);
         assert!(diff.contains("-old line"), "{diff}");
         assert!(diff.contains("+committed"), "{diff}");
         let fresh = files.iter().find(|f| f.path == "fresh.txt").unwrap();
         assert!(diff_for(&repo, fresh, &base, true).contains("+hello"));
+    }
+
+    #[test]
+    fn branch_base_diffs_against_the_merge_base_not_the_branch_tip() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = make_repo(&dir);
+        // `dev` moves on after `feat` is cut from it.
+        git(&repo, &["branch", "-m", "dev"]);
+        git(&repo, &["checkout", "-b", "feat"]);
+        std::fs::write(repo.join("mine.txt"), "one\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "feat 1"]);
+        std::fs::write(repo.join("mine.txt"), "one\ntwo\n").unwrap();
+        git(&repo, &["commit", "-am", "feat 2"]);
+        git(&repo, &["checkout", "dev"]);
+        std::fs::write(repo.join("theirs.txt"), "dev only\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "dev moved"]);
+        git(&repo, &["checkout", "feat"]);
+
+        assert_eq!(branches(&repo, "feat").unwrap(), ["dev"]);
+        let base = DiffBase::Branch("dev".into());
+        let files = files_since(&repo, &base.rev_args().unwrap()).unwrap();
+        // Both feat commits as one change; dev's own commit stays out.
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert_eq!(files[0].path, "mine.txt");
+        let diff = diff_for(&repo, &files[0], &base, true);
+        assert!(diff.contains("+one") && diff.contains("+two"), "{diff}");
     }
 
     #[test]

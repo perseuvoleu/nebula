@@ -294,11 +294,18 @@ impl HtmlViewer {
 
     fn step(&mut self, forward: bool) {
         let count = self.diagrams.len();
-        let Some(at) = self.current().and_then(|c| self.diagrams.iter().position(|d| d.slug == c.slug)) else {
+        let Some(at) = self
+            .current()
+            .and_then(|c| self.diagrams.iter().position(|d| d.slug == c.slug))
+        else {
             return;
         };
         if count > 1 {
-            self.show(if forward { (at + 1) % count } else { (at + count - 1) % count });
+            self.show(if forward {
+                (at + 1) % count
+            } else {
+                (at + count - 1) % count
+            });
         }
     }
 
@@ -308,7 +315,9 @@ impl HtmlViewer {
     fn flush_hover(&mut self) {
         if let Some((x, y)) = self.hover.take() {
             self.last_hover = Instant::now();
-            self.write(json!({"type":"mouse","action":"move","button":"left","x":x,"y":y,"dx":0,"dy":0}));
+            self.write(
+                json!({"type":"mouse","action":"move","button":"left","x":x,"y":y,"dx":0,"dy":0}),
+            );
         }
     }
     fn send(&mut self, value: Value) {
@@ -382,7 +391,9 @@ impl HtmlViewer {
             let throttled = self
                 .last_decision
                 .is_some_and(|at| at.elapsed() < DECISION_INTERVAL);
-            if let (Some(slug), Some(decision), false) = (slug, Decision::from_value(&value), throttled) {
+            if let (Some(slug), Some(decision), false) =
+                (slug, Decision::from_value(&value), throttled)
+            {
                 self.last_decision = Some(Instant::now());
                 self.decisions.push((slug, decision));
             }
@@ -410,18 +421,20 @@ impl HtmlViewer {
                     continue;
                 }
             };
-            let owner = self
-                .diagrams
-                .iter()
-                .find(|d| d.slug == slug)
-                .and_then(|d| diagrams::resolve_owner(d, &self.checkout, projects, worktrees, agents));
+            let owner = self.diagrams.iter().find(|d| d.slug == slug).and_then(|d| {
+                diagrams::resolve_owner(d, &self.checkout, projects, worktrees, agents)
+            });
             self.status = match owner {
                 Some(agent) => {
                     deliveries.push(Delivery {
                         agent: agent.id.clone(),
                         prompt: decision.prompt(&slug, &log),
                     });
-                    format!("\"{}\" sent to {}", decision.choice, diagrams::clean(&agent.name, 60))
+                    format!(
+                        "\"{}\" sent to {}",
+                        decision.choice,
+                        diagrams::clean(&agent.name, 60)
+                    )
                 }
                 None => format!("\"{}\" saved (no live owner session)", decision.choice),
             };
@@ -561,8 +574,7 @@ impl HtmlViewer {
         // Slide the window right until the marked entry fits.
         let room = usize::from(width).saturating_sub(4);
         let mut start = 0;
-        while start < marked
-            && items[start..=marked].iter().map(Span::width).sum::<usize>() > room
+        while start < marked && items[start..=marked].iter().map(Span::width).sum::<usize>() > room
         {
             start += 1;
         }
@@ -613,7 +625,10 @@ impl HtmlViewer {
             ]),
             None => Line::styled(self.status.clone(), Style::default().fg(theme.muted)),
         };
-        f.render_widget(Paragraph::new(head), Rect::new(area.x + 1, area.y + 1, inner_width, 1));
+        f.render_widget(
+            Paragraph::new(head),
+            Rect::new(area.x + 1, area.y + 1, inner_width, 1),
+        );
         // The strip only takes a row when there is something to switch to.
         let strip = u16::from(self.diagrams.len() > 1 || self.search.is_some());
         if strip == 1 {
@@ -721,8 +736,12 @@ impl HtmlViewer {
                     self.show(index);
                 }
             }
-            KeyCode::Left | KeyCode::Up | KeyCode::BackTab => search.sel = search.sel.saturating_sub(1),
-            KeyCode::Right | KeyCode::Down | KeyCode::Tab => search.sel = (search.sel + 1).min(last),
+            KeyCode::Left | KeyCode::Up | KeyCode::BackTab => {
+                search.sel = search.sel.saturating_sub(1)
+            }
+            KeyCode::Right | KeyCode::Down | KeyCode::Tab => {
+                search.sel = (search.sel + 1).min(last)
+            }
             KeyCode::Char('k' | 'p') if ctrl => search.sel = search.sel.saturating_sub(1),
             KeyCode::Char('j' | 'n') if ctrl => search.sel = (search.sel + 1).min(last),
             KeyCode::Backspace => {
@@ -753,9 +772,9 @@ impl HtmlViewer {
                     return false;
                 }
                 let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-                let bare = !k.modifiers.intersects(
-                    KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
-                );
+                let bare = !k
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
                 match k.code {
                     KeyCode::Esc => return true,
                     KeyCode::Char('r') if ctrl => {
@@ -833,7 +852,9 @@ impl HtmlViewer {
                 }
                 None => self.send_input(json!({"type":"text","text":text})),
             },
-            Event::Mouse(m) if self.current.is_some() && self.body.contains((m.column, m.row).into()) => {
+            Event::Mouse(m)
+                if self.current.is_some() && self.body.contains((m.column, m.row).into()) =>
+            {
                 if m.modifiers.contains(KeyModifiers::CONTROL) {
                     let zoom_key = match m.kind {
                         MouseEventKind::ScrollUp => Some("+"),
@@ -903,8 +924,12 @@ mod tests {
     #[test]
     fn only_a_frame_or_its_stand_in_error_settles_a_request() {
         assert!(answers_request(&json!({"png":"AAAA","width":1,"height":1})));
-        assert!(answers_request(&json!({"error":"screenshot timed out","reply":true})));
-        assert!(!answers_request(&json!({"error":"ReferenceError: x is not defined"})));
+        assert!(answers_request(
+            &json!({"error":"screenshot timed out","reply":true})
+        ));
+        assert!(!answers_request(
+            &json!({"error":"ReferenceError: x is not defined"})
+        ));
     }
 
     #[test]
@@ -915,7 +940,11 @@ mod tests {
         reap(child, Duration::from_millis(100));
         assert!(started.elapsed() < Duration::from_secs(5));
         // Reaped, so the pid is gone (or at least no longer our child).
-        let alive = Command::new("kill").args(["-0", &pid]).stderr(Stdio::null()).status().unwrap();
+        let alive = Command::new("kill")
+            .args(["-0", &pid])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
         assert!(!alive.success());
     }
 
@@ -929,12 +958,24 @@ mod tests {
 
     #[test]
     fn viewer_occupies_thirteen_fifteenths_and_stays_centered() {
-        assert_eq!(viewer_area(Rect::new(0, 0, 180, 60)), Rect::new(12, 4, 156, 52));
-        assert_eq!(viewer_area(Rect::new(5, 7, 100, 40)), Rect::new(12, 10, 86, 34));
+        assert_eq!(
+            viewer_area(Rect::new(0, 0, 180, 60)),
+            Rect::new(12, 4, 156, 52)
+        );
+        assert_eq!(
+            viewer_area(Rect::new(5, 7, 100, 40)),
+            Rect::new(12, 10, 86, 34)
+        );
     }
 
     /// A diagram `age_secs` old, owned by `agent` when given.
-    fn diagram(checkout: &Path, slug: &str, title: &str, agent: Option<&str>, age_secs: u64) -> PathBuf {
+    fn diagram(
+        checkout: &Path,
+        slug: &str,
+        title: &str,
+        agent: Option<&str>,
+        age_secs: u64,
+    ) -> PathBuf {
         let meta = diagrams::Meta {
             tags: vec![],
             session: None,
@@ -942,14 +983,19 @@ mod tests {
         };
         let path = diagrams::file(checkout, slug);
         std::fs::create_dir_all(diagrams::dir(checkout)).unwrap();
-        std::fs::write(&path, diagrams::render_template(diagrams::Template::Plain, slug, title, &meta)).unwrap();
+        std::fs::write(
+            &path,
+            diagrams::render_template(diagrams::Template::Plain, slug, title, &meta),
+        )
+        .unwrap();
         touch(&path, age_secs);
         path
     }
 
     fn touch(path: &Path, age_secs: u64) {
         let file = std::fs::File::options().write(true).open(path).unwrap();
-        file.set_modified(SystemTime::now() - Duration::from_secs(age_secs)).unwrap();
+        file.set_modified(SystemTime::now() - Duration::from_secs(age_secs))
+            .unwrap();
     }
 
     /// Three diagrams, newest first: flow, storage, deploy.
@@ -1048,7 +1094,11 @@ mod tests {
         key(&mut viewer, KeyCode::Char('j'), KeyModifiers::CONTROL);
         assert_eq!(viewer.current.as_deref(), Some("deploy"));
         typed(&mut viewer, "]");
-        assert_eq!(viewer.current.as_deref(), Some("flow"), "wraps past the oldest");
+        assert_eq!(
+            viewer.current.as_deref(),
+            Some("flow"),
+            "wraps past the oldest"
+        );
         typed(&mut viewer, "[");
         key(&mut viewer, KeyCode::Char('k'), KeyModifiers::CONTROL);
         assert_eq!(viewer.current.as_deref(), Some("storage"));
@@ -1056,7 +1106,13 @@ mod tests {
         // switch keys themselves never reach the page.
         assert_eq!(
             sent(&mut viewer),
-            ["goto:storage", "goto:deploy", "goto:flow", "goto:deploy", "goto:storage"]
+            [
+                "goto:storage",
+                "goto:deploy",
+                "goto:flow",
+                "goto:deploy",
+                "goto:storage"
+            ]
         );
         assert_eq!(viewer.pending, 5, "each goto is owed a frame");
     }
@@ -1068,7 +1124,10 @@ mod tests {
         typed(&mut viewer, "a");
         key(&mut viewer, KeyCode::Down, KeyModifiers::NONE);
         key(&mut viewer, KeyCode::Char('a'), KeyModifiers::CONTROL);
-        assert_eq!(sent(&mut viewer), ["key:a", "key:ArrowDown", "key:Control+a"]);
+        assert_eq!(
+            sent(&mut viewer),
+            ["key:a", "key:ArrowDown", "key:Control+a"]
+        );
         assert!(viewer.needs_frame);
         // One diagram only: the switch keys have nowhere to go.
         let tmp = tempfile::tempdir().unwrap();
@@ -1084,12 +1143,19 @@ mod tests {
         let (_tmp, mut viewer) = three();
         sent(&mut viewer);
         typed(&mut viewer, "/");
-        assert_eq!(viewer.listed(), [0, 1, 2], "an empty query lists everything");
+        assert_eq!(
+            viewer.listed(),
+            [0, 1, 2],
+            "an empty query lists everything"
+        );
         typed(&mut viewer, "stor");
         assert_eq!(viewer.listed(), [1]);
         key(&mut viewer, KeyCode::Backspace, KeyModifiers::NONE);
         typed(&mut viewer, "]");
-        assert!(viewer.listed().is_empty(), "`]` is query text here, not a switch");
+        assert!(
+            viewer.listed().is_empty(),
+            "`]` is query text here, not a switch"
+        );
         assert_eq!(viewer.current.as_deref(), Some("flow"));
         for _ in 0..2 {
             key(&mut viewer, KeyCode::Backspace, KeyModifiers::NONE);
@@ -1098,7 +1164,10 @@ mod tests {
         assert_eq!(viewer.listed(), [1], "sto + r");
         viewer.event(Event::Paste("ignored\u{1b}".into()));
         key(&mut viewer, KeyCode::Char('u'), KeyModifiers::CONTROL);
-        assert!(sent(&mut viewer).is_empty(), "nothing typed in search reaches the page");
+        assert!(
+            sent(&mut viewer).is_empty(),
+            "nothing typed in search reaches the page"
+        );
         assert!(!viewer.needs_frame, "and none of it costs a screenshot");
 
         // Enter renders the selection and leaves search.
@@ -1120,7 +1189,10 @@ mod tests {
         let second = viewer.listed()[1];
         key(&mut viewer, KeyCode::Right, KeyModifiers::NONE);
         key(&mut viewer, KeyCode::Enter, KeyModifiers::NONE);
-        assert_eq!(viewer.current.as_deref(), Some(viewer.diagrams[second].slug.as_str()));
+        assert_eq!(
+            viewer.current.as_deref(),
+            Some(viewer.diagrams[second].slug.as_str())
+        );
 
         sent(&mut viewer);
         typed(&mut viewer, "/zzz");
@@ -1134,7 +1206,11 @@ mod tests {
         typed(&mut viewer, "/sto");
         assert!(!key(&mut viewer, KeyCode::Esc, KeyModifiers::NONE));
         assert!(viewer.search.is_none());
-        assert_eq!(viewer.current.as_deref(), Some("flow"), "leaving search switches nothing");
+        assert_eq!(
+            viewer.current.as_deref(),
+            Some("flow"),
+            "leaving search switches nothing"
+        );
         assert!(key(&mut viewer, KeyCode::Esc, KeyModifiers::NONE));
         // ⌘X closes from anywhere, search included.
         typed(&mut viewer, "/");
@@ -1182,7 +1258,10 @@ mod tests {
         assert_eq!((viewer.current.clone(), viewer.png.clone()), (None, None));
         let mut out = Vec::new();
         viewer.paint(&mut out).unwrap();
-        assert_eq!(out, format!("\x1b_Ga=d,d=I,i={IMAGE_ID},q=2\x1b\\").into_bytes());
+        assert_eq!(
+            out,
+            format!("\x1b_Ga=d,d=I,i={IMAGE_ID},q=2\x1b\\").into_bytes()
+        );
     }
 
     #[test]
@@ -1252,10 +1331,17 @@ mod tests {
 
         viewer.handle_line(&decision_line(&owned, "pg"));
         assert!(viewer.has_decisions() && viewer.needs_frame);
-        let out = viewer.deliver(&[project.clone()], &[worktree.clone()], &[agent.clone()], 42);
+        let out = viewer.deliver(
+            &[project.clone()],
+            &[worktree.clone()],
+            &[agent.clone()],
+            42,
+        );
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].agent, agent.id);
-        assert!(out[0].prompt.starts_with("[nebula diagram] pick: decision \"db\" = \"pg\" (Postgres). Decisions file: "));
+        assert!(out[0].prompt.starts_with(
+            "[nebula diagram] pick: decision \"db\" = \"pg\" (Postgres). Decisions file: "
+        ));
         assert_eq!(viewer.status, "\"pg\" sent to designer");
         assert_eq!(diagrams::read_decisions(tmp.path(), "pick")[0]["ts"], 42);
 
@@ -1268,10 +1354,18 @@ mod tests {
         for (path, slug) in [(&owned, "pick"), (&orphan, "orphan")] {
             viewer.last_decision = None;
             viewer.handle_line(&decision_line(path, "sqlite"));
-            let out = viewer.deliver(&[project.clone()], &[worktree.clone()], &[agent.clone()], 43);
+            let out = viewer.deliver(
+                &[project.clone()],
+                &[worktree.clone()],
+                &[agent.clone()],
+                43,
+            );
             assert!(out.is_empty(), "{slug}");
             assert_eq!(viewer.status, "\"sqlite\" saved (no live owner session)");
-            assert_eq!(diagrams::read_decisions(tmp.path(), slug).last().unwrap()["choice"], "sqlite");
+            assert_eq!(
+                diagrams::read_decisions(tmp.path(), slug).last().unwrap()["choice"],
+                "sqlite"
+            );
         }
 
         // A page outside the folder decides nothing.
@@ -1304,11 +1398,22 @@ mod tests {
     fn the_strip_keeps_the_current_diagram_in_view() {
         let (_tmp, mut viewer) = three();
         let theme = Theme::by_name("default");
-        let text = |line: Line| line.spans.iter().map(|s| s.content.to_string()).collect::<String>();
+        let text = |line: Line| {
+            line.spans
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect::<String>()
+        };
         let wide = text(viewer.strip(120, &theme));
-        assert!(wide.contains("Login flow · 1m") && wide.contains("Release pipeline · 5m"), "{wide}");
+        assert!(
+            wide.contains("Login flow · 1m") && wide.contains("Release pipeline · 5m"),
+            "{wide}"
+        );
         typed(&mut viewer, "]]");
         let narrow = text(viewer.strip(30, &theme));
-        assert!(narrow.starts_with("‹ ") && narrow.contains("Release pipeline"), "{narrow}");
+        assert!(
+            narrow.starts_with("‹ ") && narrow.contains("Release pipeline"),
+            "{narrow}"
+        );
     }
 }

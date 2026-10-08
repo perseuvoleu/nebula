@@ -1,8 +1,8 @@
 pub mod app;
 pub mod branch_name;
 pub mod branches;
-pub mod completion;
 pub mod collect_cli;
+pub mod completion;
 pub mod config;
 pub mod diagram_cli;
 pub mod diagrams;
@@ -14,6 +14,7 @@ pub mod ghostty_pane;
 pub mod git_diff;
 pub mod grep_search;
 pub mod hosts;
+mod html_prototype;
 mod html_viewer;
 pub mod ipc;
 pub mod keymap;

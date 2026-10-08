@@ -2,6 +2,24 @@ import { expect } from "@playwright/test";
 import { test, appendEntry, assistantText, login, readAgents, shot, writeAgents } from "./helpers";
 
 test.describe("selection and structured conversation", () => {
+  test("working names sweep in sidebar, header and tabs, then stop when finished", async ({ page }) => {
+    await login(page, "/p/alpha/s/pi-2");
+    const names = page.locator(".session-working").filter({ hasText: "A doua sesiune Pi" });
+    await expect(names).toHaveCount(3);
+    for (const name of await names.all()) {
+      await expect(name).toHaveCSS("animation-name", "session-working-sweep");
+    }
+    await page.emulateMedia({ reducedMotion: "reduce" });
+    for (const name of await names.all()) {
+      await expect(name).toHaveCSS("animation-name", "none");
+      await expect(name).toHaveCSS("color", "rgb(250, 204, 21)");
+    }
+    const rows = readAgents();
+    rows.find((r) => r.id === "pi-2")!.status = "finished";
+    writeAgents(rows);
+    await expect(names).toHaveCount(0, { timeout: 15_000 });
+  });
+
   test("login → second project → existing session renders real structured reply, not loading", async ({ page }) => {
     await login(page);
     await page.getByRole("combobox", { name: "Proiect", exact: true }).selectOption("beta");

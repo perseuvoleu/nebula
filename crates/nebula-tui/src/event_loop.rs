@@ -202,7 +202,6 @@ async fn main_loop(
     app.open_at = open_at;
     app.conn = ConnState::Connected;
     let cfg = crate::config::Config::load();
-    app.recent_window_ms = cfg.recent_window_ms();
     app.theme = cfg.theme();
     app.animations = cfg.animations;
     app.focus_tint = cfg.focus_tint;
@@ -271,13 +270,7 @@ async fn main_loop(
             next_draw = tokio::time::Instant::now() + FRAME_INTERVAL;
             sync_pty_size(&mut app, &mut out);
             sync_vim_size(&mut app);
-            // What the user sees selected, for RECENT-expiry re-anchoring.
-            app.drawn_session = app.selected_session_row().and_then(|r| r.sref());
         }
-
-        // Wake when the next RECENT session ages out so the list regroups
-        // (slack so the wakeup lands past the boundary).
-        let recent_expiry = app.next_recent_expiry();
 
         let focus_before = app.focus;
         tokio::select! {
@@ -330,24 +323,6 @@ async fn main_loop(
                     app.dirty = true;
                 }
                 next_ago_refresh = tokio::time::Instant::now() + AGO_REFRESH;
-            }
-            _ = tokio::time::sleep(recent_expiry.unwrap_or_default() + Duration::from_millis(250)),
-                if recent_expiry.is_some() =>
-            {
-                // Re-read the config so window edits apply without restart.
-                app.recent_window_ms = crate::config::Config::load().recent_window_ms();
-                // The expired session dropped down the list; keep the
-                // selection on whatever row the user had selected.
-                if let Some(keep) = app.drawn_session.clone() {
-                    if let Some(i) = app
-                        .visible_session_rows()
-                        .iter()
-                        .position(|r| r.sref().as_ref() == Some(&keep))
-                    {
-                        app.sel_session = i;
-                    }
-                }
-                app.dirty = true;
             }
             // The worktree selection rested past the debounce: ask the
             // daemon to boot its dead sessions in the background so
@@ -582,9 +557,7 @@ async fn main_loop(
 /// the diagram viewer needs, since its image sat on top of the UI. Not
 /// `Terminal::clear`: that asks the terminal for the cursor position first,
 /// and a reply lost to the input stream is a 2 s stall and a fatal error.
-fn repaint_everything(
-    terminal: &mut Terminal<CrosstermBackend<BufWriter<Stdout>>>,
-) -> Result<()> {
+fn repaint_everything(terminal: &mut Terminal<CrosstermBackend<BufWriter<Stdout>>>) -> Result<()> {
     use ratatui::backend::{Backend, ClearType};
     terminal.backend_mut().clear_region(ClearType::All)?;
     // The diff base is now as blank as the screen.
@@ -745,9 +718,20 @@ fn handle_branch_event(app: &mut App, ev: BranchEvent, out: &mut Vec<ClientReque
     match ev {
         BranchEvent::List(project, branches) => {
             app.branch_inflight = false;
+            let row = app.selected_panel_row();
+            app.seen_branch_lists
+                .insert(project.clone(), branches.clone());
             let next = Some((project, branches));
             if app.branch_list != next {
                 app.branch_list = next;
+                if let Some(index) = app
+                    .panel_entries()
+                    .iter()
+                    .position(|entry| Some(&entry.row) == row.as_ref())
+                {
+                    app.sel_worktree = index;
+                }
+                clamp_selections(app);
                 app.dirty = true;
             }
         }
@@ -932,6 +916,9 @@ fn ui_state_json(app: &App) -> String {
         worktree: app.selected_worktree().map(|w| w.id.to_string()),
         session_agent: app.selected_session().map(|a| a.id.to_string()),
         show_archived: app.show_archived,
+        hide_local: app.hide_local,
+        hide_remote: app.hide_remote,
+        hide_empty: app.hide_empty,
         collapsed: app.collapsed,
         panel_widths: Some(app.desired_panel_widths.to_vec()),
         diff_files_width: Some(app.diff_files_width),
@@ -965,6 +952,9 @@ fn restore_ui_state(app: &mut App, json: &str) {
         return;
     };
     app.show_archived = state.show_archived;
+    app.hide_local = state.hide_local;
+    app.hide_remote = state.hide_remote;
+    app.hide_empty = state.hide_empty;
     if let Some(w) = state.panel_widths {
         // Coarse sanity clamp; normalize_panel_widths re-fits to the actual
         // screen on the next draw. Older blobs carry a third (sessions)
@@ -1116,9 +1106,14 @@ fn close_vim(app: &mut App) {
 fn handle_terminal_event(app: &mut App, event: Event, out: &mut Vec<ClientRequest>) {
     match event {
         Event::Key(key) if key.kind != KeyEventKind::Release => {
-            app.flash = None;
-            handle_key(app, key, out);
+            // A key repaints unless `handle_key` only forwarded it to the
+            // PTY (it lowers `dirty` there): nothing on screen moved, and
+            // the echo draws when it comes back as `Output`. A frame that
+            // was already owed, or a flash this key dismissed, still draws.
+            let owed = app.dirty || app.flash.take().is_some();
             app.dirty = true;
+            handle_key(app, key, out);
+            app.dirty |= owed;
         }
         Event::Mouse(mouse) => handle_mouse(app, mouse, out),
         Event::Paste(text) if app.vim.is_some() => {
@@ -1382,11 +1377,13 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             app.term.as_ref().is_some_and(|t| t.exited)
         };
         if !exited {
+            // Did forwarding change anything the user can see?
+            let mut changed = false;
             if !split_active {
                 // Typing changes the content under a persisted selection
                 // highlight — drop it. (The selection lives on the left
                 // pane, so typing into the split leaves it alone.)
-                app.term_selection = None;
+                changed |= app.term_selection.take().is_some();
             }
             let term = if split_active {
                 app.split_term.as_mut()
@@ -1397,6 +1394,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 // Typing exits scroll mode (tmux behavior).
                 if term.scroll > 0 {
                     term.set_scroll(0);
+                    changed = true;
                 }
                 if let Some(data) = keys::encode_key(&key, term.kitty_flags) {
                     out.push(ClientRequest::Input {
@@ -1405,6 +1403,9 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                     });
                 }
             }
+            // Forwarded and nothing else: no frame of our own (see
+            // `handle_terminal_event`).
+            app.dirty = changed;
             return;
         }
         // Exited session: there is nothing to type into, so don't swallow
@@ -2014,12 +2015,21 @@ fn open_diff_view(app: &mut App) {
     app.overlay = Some(Overlay::Diff(view));
 }
 
-/// Open the diff viewer's ^g base picker, loading the commit rows on
-/// first use. A `git log` failure flashes and leaves the picker closed.
+/// Open the diff viewer's ^g base picker, loading the commit and branch
+/// rows on first use. A git failure flashes and leaves the picker closed.
 fn open_diff_base_picker(app: &mut App) {
     let Some(Overlay::Diff(view)) = &mut app.overlay else {
         return;
     };
+    if view.branches.is_empty() && view.head_ok {
+        match crate::git_diff::branches(&view.root, &view.branch) {
+            Ok(branches) => view.branches = branches,
+            Err(msg) => {
+                app.flash = Some(msg);
+                return;
+            }
+        }
+    }
     if view.commits.is_empty() && view.head_ok {
         match crate::git_diff::recent_commits(&view.root) {
             Ok(commits) => view.commits = commits,
@@ -2044,7 +2054,9 @@ fn set_diff_base(app: &mut App, base: crate::git_diff::DiffBase) {
     };
     let files = match &base {
         DiffBase::WorkingTree => crate::git_diff::changed_files(&view.root),
-        DiffBase::Upstream(rev) => crate::git_diff::files_since(&view.root, rev),
+        DiffBase::Upstream(_) | DiffBase::Branch(_) => {
+            crate::git_diff::files_since(&view.root, &base.rev_args().unwrap_or_default())
+        }
         DiffBase::Commit(c) => crate::git_diff::commit_files(&view.root, c),
     };
     let files = match files {
@@ -2635,6 +2647,42 @@ fn open_hidden_projects_menu(app: &mut App, at: (u16, u16)) {
         parent: None,
         filter: None,
     }));
+}
+
+/// Filter navigation only; never stop or archive a session.
+fn toggle_host_filter(app: &mut App, target: HitTarget, out: &mut Vec<ClientRequest>) {
+    let row = app.selected_panel_row();
+    let session = app.selected_session_row().map(|r| r.click_key());
+    remember_context(app);
+    match target {
+        HitTarget::ToggleRemote => app.hide_remote = !app.hide_remote,
+        HitTarget::ToggleLocal => app.hide_local = !app.hide_local,
+        HitTarget::ToggleAll => app.hide_empty = !app.hide_empty,
+        _ => return,
+    }
+    app.focus = Focus::Worktrees;
+    app.select_worktree_when_seen = None;
+    app.global_sessions_scroll = 0;
+    app.sel_worktree = app
+        .panel_entries()
+        .iter()
+        .position(|entry| Some(&entry.row) == row.as_ref())
+        .unwrap_or(0);
+    let same_row = app.selected_panel_row() == row;
+    let same_session = app
+        .visible_session_rows()
+        .iter()
+        .position(|r| Some(r.click_key()) == session);
+    if let Some(index) = same_session.filter(|_| same_row) {
+        app.sel_session = index;
+    } else {
+        restore_session(app, out);
+    }
+    clamp_selections(app);
+    out.push(ClientRequest::SaveUiState {
+        json: ui_state_json(app),
+    });
+    app.dirty = true;
 }
 
 fn toggle_archived(app: &mut App, out: &mut Vec<ClientRequest>) {
@@ -3713,6 +3761,10 @@ fn open_command_palette(app: &mut App) {
         items.push(row("w · New worktree…", MenuAction::NewWorktree(p.clone())));
         items.push(row("b · New branch…", MenuAction::NewBranch(p.clone())));
         items.push(row(
+            "co · Checkout branch…",
+            MenuAction::Command(PaletteCommand::CheckoutBranch(p.clone())),
+        ));
+        items.push(row(
             "t · Quick terminal (⌘T window)",
             MenuAction::Command(PaletteCommand::QuickTerminal),
         ));
@@ -4055,6 +4107,48 @@ fn open_agent_branch_picker(app: &mut App, project: nebula_core::ProjectId) {
         }
         .filterable(),
     ));
+}
+
+/// The panel's `⎇ branch ▾` control (and `co` in the palette): fuzzy-pick
+/// a local branch and check it out on the primary checkout — the `nebula
+/// switch` shape, confirmed first when busy sessions sit on the primary.
+/// The current branch leads and starts hovered; picking it just lands on
+/// the primary. `at` anchors the dropdown under the control; None centers.
+fn open_checkout_picker(app: &mut App, project: nebula_core::ProjectId, at: Option<(u16, u16)>) {
+    let Some((branches, root_branch)) = project_local_branches(app, &project) else {
+        app.flash = Some("no local branches found".into());
+        return;
+    };
+    let items: Vec<MenuItem> = branches
+        .into_iter()
+        .map(|branch| MenuItem {
+            // The current branch reads `(primary)` (and draws dark green,
+            // see `ui::CURRENT_BRANCH`).
+            label: if Some(&branch) == root_branch.as_ref() {
+                format!("{branch} (primary)")
+            } else {
+                branch_pick_label(app, &project, &branch, root_branch.as_ref())
+            },
+            action: MenuAction::CheckoutPrimary {
+                project: project.clone(),
+                branch,
+            },
+            destructive: false,
+        })
+        .collect();
+    app.overlay = Some(Overlay::Menu(
+        ContextMenu {
+            title: Some("Checkout".into()),
+            items,
+            at,
+            hover: 0,
+            area: ratatui::layout::Rect::default(),
+            parent: None,
+            filter: None,
+        }
+        .filterable(),
+    ));
+    app.dirty = true;
 }
 
 /// The new-branch flow's second step: pick the branch the new one starts
@@ -4811,12 +4905,16 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
             let half = (view.view_height / 2).max(1) as i32;
             let page = view.view_height.max(1) as i32;
             // The ^g base picker sits above the viewer and takes every key
-            // while open: ↑/↓ move, Enter picks, Esc (or ^g again) closes.
+            // while open: ↑/↓ move, Tab flips commits/branches, Enter picks,
+            // Esc (or ^g again) closes.
             if let Some(picker) = &view.picker {
                 let hover = picker.hover as i64;
                 let rows = view.picker_rows() as i64;
                 match key.code {
                     KeyCode::Esc => view.picker = None,
+                    KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => {
+                        view.toggle_picker_mode()
+                    }
                     KeyCode::Char('g') if cmd_or_ctrl => view.picker = None,
                     KeyCode::Enter => {
                         let base = view.picker_base(picker.hover);
@@ -5755,7 +5853,6 @@ fn apply_setting_at(app: &mut App, tab: usize, index: usize, delta: i32) {
         app.flash = Some(format!("couldn't save settings: {err}"));
         return;
     }
-    app.recent_window_ms = cfg.recent_window_ms();
     app.theme = cfg.theme();
     app.animations = cfg.animations;
     app.focus_tint = cfg.focus_tint;
@@ -6322,7 +6419,20 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             out.push(ClientRequest::SetWorktreePinned { req_id, id, pinned });
         }
         MenuAction::CheckoutPrimary { project, branch } => {
-            checkout_primary_then(app, project, branch, AfterCheckout::Land, out);
+            let primary = app
+                .tree
+                .worktrees
+                .iter()
+                .find(|w| w.project_id == project && w.is_main)
+                .filter(|w| w.branch == branch)
+                .map(|w| w.id.clone());
+            match primary {
+                // Already there (the picker's leading row): just land on it.
+                Some(id) => {
+                    select_worktree_by_id(app, &id, out);
+                }
+                None => checkout_primary_then(app, project, branch, AfterCheckout::Land, out),
+            }
         }
         MenuAction::DeleteWorktree(id) => {
             if let Some(w) = app.tree.worktrees.iter().find(|w| w.id == id).cloned() {
@@ -6374,6 +6484,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             use crate::app::PaletteCommand;
             match cmd {
                 PaletteCommand::NewAgentOnBranch(project) => open_agent_branch_picker(app, project),
+                PaletteCommand::CheckoutBranch(project) => open_checkout_picker(app, project, None),
                 PaletteCommand::NewAgentInWorktree(project) => {
                     open_worktree_picker_for_agent(app, project)
                 }
@@ -6582,6 +6693,15 @@ fn remove_divider(app: &mut App, project_index: usize, before: bool, out: &mut V
 /// on, and which session row that worktree was on — so switching back
 /// restores both. Call BEFORE moving the selection away.
 fn remember_context(app: &mut App) {
+    if let Some(pid) = app.selected_project().map(|p| p.id.clone()) {
+        if let Some(sref) = app
+            .selected_session_row()
+            .filter(|r| !r.is_archived_agent())
+            .and_then(|r| r.sref())
+        {
+            app.last_session_for_project.insert(pid, sref);
+        }
+    }
     let Some(wid) = app.selected_worktree().map(|w| w.id.clone()) else {
         return;
     };
@@ -6605,10 +6725,52 @@ fn remember_context(app: &mut App) {
     }
 }
 
-/// After a project switch: land on the project's remembered worktree (its
-/// main checkout otherwise), then re-show that worktree's session.
+/// On project entry, attach the latest unread completion, then the remembered
+/// session, then the first open session. Empty projects retain worktree context.
 fn restore_context(app: &mut App, out: &mut Vec<ClientRequest>) {
     app.sel_worktree = 0;
+    let remembered = app
+        .selected_project()
+        .and_then(|p| app.last_session_for_project.get(&p.id))
+        .cloned();
+    let sessions: Vec<_> = app
+        .panel_entries()
+        .iter()
+        .enumerate()
+        .flat_map(|(row, entry)| {
+            app.sessions_for_panel_row(&entry.row)
+                .into_iter()
+                .filter(|s| !s.is_archived_agent())
+                .filter_map(move |s| s.sref().map(|sref| (row, s, sref)))
+        })
+        .collect();
+    let target = sessions
+        .iter()
+        .filter(
+            |(_, s, _)| matches!(s, SessionRow::Agent(a) if app.unseen_finished.contains(&a.id)),
+        )
+        .max_by_key(|(_, s, _)| match s {
+            SessionRow::Agent(a) => a.status_changed_at,
+            _ => 0,
+        })
+        .or_else(|| {
+            sessions
+                .iter()
+                .find(|(_, _, sref)| Some(sref) == remembered.as_ref())
+        })
+        .or_else(|| sessions.first());
+    if let Some((row, _, sref)) = target {
+        app.sel_worktree = *row;
+        app.sel_session = app
+            .visible_session_rows()
+            .iter()
+            .position(|s| s.sref().as_ref() == Some(sref))
+            .unwrap_or(0);
+        schedule_prewarm(app);
+        schedule_pr_lookup(app);
+        attach(app, sref.clone(), out);
+        return;
+    }
     if let Some(pid) = app.selected_project().map(|p| p.id.clone()) {
         if let Some(wid) = app.last_worktree_for_project.get(&pid).cloned() {
             if let Some(i) = app.worktree_row_index(&wid) {
@@ -7703,6 +7865,10 @@ fn pointer_wants_hand(app: &App, column: u16, row: u16) -> bool {
                     | HitTarget::WorktreeBranch(_)
                     | HitTarget::Session(_)
                     | HitTarget::GlobalSession(_)
+                    | HitTarget::ToggleLocal
+                    | HitTarget::ToggleRemote
+                    | HitTarget::ToggleAll
+                    | HitTarget::CheckoutBranch
                     | HitTarget::ArchivedHeader
             )
         ),
@@ -8664,6 +8830,18 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     if let Some(agent) = app.global_sessions().get(i) {
                         let id = agent.id.clone();
                         jump_to_target(app, PaletteTarget::Session(id), false, out);
+                    }
+                }
+                Some(HitTarget::ToggleLocal) => {
+                    toggle_host_filter(app, HitTarget::ToggleLocal, out)
+                }
+                Some(HitTarget::ToggleRemote) => {
+                    toggle_host_filter(app, HitTarget::ToggleRemote, out)
+                }
+                Some(HitTarget::ToggleAll) => toggle_host_filter(app, HitTarget::ToggleAll, out),
+                Some(HitTarget::CheckoutBranch) => {
+                    if let Some(project) = app.selected_project().map(|p| p.id.clone()) {
+                        open_checkout_picker(app, project, Some((mouse.column, mouse.row + 1)));
                     }
                 }
                 Some(HitTarget::ArchivedHeader) => {
@@ -10022,6 +10200,273 @@ mod tests {
         );
     }
 
+    fn host_filter_fixture() -> App {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_remote_twin(&mut app);
+        let mut remote = app.tree.agents[0].clone();
+        remote.id = AgentId("a-remote".into());
+        remote.worktree_id = WorktreeId("w-remote".into());
+        app.tree.agents.push(remote);
+        app
+    }
+
+    #[test]
+    fn all_filter_keeps_open_sessions_and_persists_after_click() {
+        let mut app = host_filter_fixture();
+        app.tree.agents[0].branch = Some("parked".into());
+        app.tree.agents[1].archived = true;
+        app.branch_list = Some((nebula_core::ProjectId("p1".into()), vec!["empty".into()]));
+        for width in [10, 30, 50] {
+            app.hide_empty = false;
+            app.desired_panel_widths = [20, width];
+            let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            let hit = app
+                .hits
+                .iter()
+                .find(|(_, target)| *target == HitTarget::ToggleAll)
+                .unwrap()
+                .0;
+            let mut out = Vec::new();
+            handle_mouse(
+                &mut app,
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: hit.x,
+                    row: hit.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &mut out,
+            );
+            assert_eq!(
+                app.panel_entries()
+                    .iter()
+                    .map(|e| e.row.clone())
+                    .collect::<Vec<_>>(),
+                vec![PanelRow::Branch("parked".into())]
+            );
+            let mut restored = host_filter_fixture();
+            restore_ui_state(&mut restored, &ui_state_json(&app));
+            assert!(restored.hide_empty);
+        }
+        app.hide_local = true;
+        assert!(app.panel_entries().is_empty());
+        app.hide_empty = false;
+        assert_eq!(
+            app.panel_entries().len(),
+            1,
+            "All restores the remote checkout"
+        );
+    }
+
+    #[test]
+    fn project_navigation_restores_parked_session_and_prefers_unread_completion() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.tree.agents[0].branch = Some("parked".into());
+        let mut second = app.tree.agents[0].clone();
+        second.id = AgentId("a2".into());
+        second.branch = Some("other".into());
+        app.tree.agents.push(second);
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: project("p2", "two", 1, false, None),
+            },
+        );
+        app.focus = Focus::Projects;
+        let mut out = Vec::new();
+        // First visit skips the empty primary and attaches a parked session.
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            &mut out,
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+            &mut out,
+        );
+        assert_eq!(
+            app.term.as_ref().map(|t| t.sref.clone()),
+            Some(SessionRef::Agent(AgentId("a1".into())))
+        );
+        // A manually chosen parked session is remembered across projects.
+        app.sel_worktree = app.branch_row_index("other").unwrap();
+        restore_session(&mut app, &mut out);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            &mut out,
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+            &mut out,
+        );
+        assert_eq!(
+            app.term.as_ref().map(|t| t.sref.clone()),
+            Some(SessionRef::Agent(AgentId("a2".into())))
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            &mut out,
+        );
+        let mut finished = app.tree.agents[0].clone();
+        finished.status = AgentStatus::Finished;
+        finished.status_changed_at = 100;
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: nebula_core::Entity::Agent(finished),
+            },
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+            &mut out,
+        );
+        assert_eq!(
+            app.term.as_ref().map(|t| t.sref.clone()),
+            Some(SessionRef::Agent(AgentId("a1".into())))
+        );
+    }
+
+    #[test]
+    fn host_filters_hide_only_view_rows_and_preserve_sessions() {
+        let mut app = host_filter_fixture();
+        let original_agents = serde_json::to_value(&app.tree.agents).unwrap();
+        let original_worktrees = serde_json::to_value(&app.tree.worktrees).unwrap();
+        let mut out = Vec::new();
+        assert_eq!(app.panel_entries().len(), 2);
+        assert_eq!(app.global_sessions().len(), 2);
+        toggle_host_filter(&mut app, HitTarget::ToggleLocal, &mut out);
+        assert_eq!(app.panel_entries().len(), 1);
+        assert_eq!(app.selected_worktree().unwrap().id.as_str(), "w-remote");
+        assert_eq!(app.global_sessions()[0].id.as_str(), "a-remote");
+        toggle_host_filter(&mut app, HitTarget::ToggleRemote, &mut out);
+        assert!(app.panel_entries().is_empty());
+        assert!(app.visible_session_rows().is_empty());
+        assert!(app.global_sessions().is_empty());
+        assert!(app.term.is_none());
+        toggle_host_filter(&mut app, HitTarget::ToggleLocal, &mut out);
+        assert_eq!(app.panel_entries().len(), 1);
+        assert_eq!(app.selected_worktree().unwrap().id.as_str(), "w1");
+        toggle_host_filter(&mut app, HitTarget::ToggleRemote, &mut out);
+        assert_eq!(app.panel_entries().len(), 2);
+        assert_eq!(app.selected_worktree().unwrap().id.as_str(), "w1");
+        assert_eq!(
+            serde_json::to_value(&app.tree.agents).unwrap(),
+            original_agents
+        );
+        assert_eq!(
+            serde_json::to_value(&app.tree.worktrees).unwrap(),
+            original_worktrees
+        );
+        // View filtering may attach/detach previews and save UI state, but
+        // must not issue a destructive or mutating lifecycle request.
+        assert!(
+            out.iter().all(|r| matches!(
+                r,
+                ClientRequest::Attach { .. }
+                    | ClientRequest::Detach { .. }
+                    | ClientRequest::Resize { .. }
+                    | ClientRequest::SaveUiState { .. }
+            )),
+            "unexpected request: {out:?}"
+        );
+    }
+
+    #[test]
+    fn host_filters_preserve_visible_parked_twin_sessions() {
+        let mut app = host_filter_fixture();
+        for agent in &mut app.tree.agents {
+            agent.branch = Some("parked".into());
+        }
+        for (hide_local, hide_remote, expected) in [(false, true, "a1"), (true, false, "a-remote")]
+        {
+            app.hide_local = hide_local;
+            app.hide_remote = hide_remote;
+            let index = app
+                .branch_row_index("parked")
+                .expect("visible parked host retains row");
+            let rows = app.panel_row_sessions(index);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].sref(),
+                Some(SessionRef::Agent(AgentId(expected.into())))
+            );
+        }
+        app.hide_local = true;
+        app.hide_remote = true;
+        assert!(app.branch_row_index("parked").is_none());
+    }
+
+    #[test]
+    fn host_filters_keep_selection_by_identity_and_restore_old_state_defaults() {
+        let mut app = host_filter_fixture();
+        app.sel_worktree = app
+            .worktree_row_index(&WorktreeId("w-remote".into()))
+            .unwrap();
+        toggle_host_filter(&mut app, HitTarget::ToggleLocal, &mut Vec::new());
+        assert_eq!(app.selected_worktree().unwrap().id.as_str(), "w-remote");
+        let json = ui_state_json(&app);
+        let mut restored = host_filter_fixture();
+        restore_ui_state(&mut restored, &json);
+        assert!(restored.hide_local);
+        assert!(!restored.hide_remote);
+        assert_eq!(
+            restored.selected_worktree().unwrap().id.as_str(),
+            "w-remote"
+        );
+        restore_ui_state(
+            &mut restored,
+            r#"{"project":null,"worktree":null,"session_agent":null,"show_archived":false,"collapsed":false}"#,
+        );
+        assert!(!restored.hide_local && !restored.hide_remote);
+        assert_eq!(restored.panel_entries().len(), 2);
+    }
+
+    #[test]
+    fn host_filters_are_clickable_even_when_both_disabled_and_narrow() {
+        for width in [10, 22, 40] {
+            let mut app = host_filter_fixture();
+            app.hide_local = true;
+            app.hide_remote = true;
+            app.desired_panel_widths = [20, width];
+            let mut terminal = Terminal::new(TestBackend::new(110, 30)).unwrap();
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            let text = buffer_text(&terminal);
+            assert!(
+                text.contains("☐ Local") && text.contains("☐ Remote"),
+                "{text}"
+            );
+            let hit = app
+                .hits
+                .iter()
+                .find(|(_, target)| *target == HitTarget::ToggleLocal)
+                .unwrap()
+                .0;
+            assert_eq!(app.hit_at(hit.x, hit.y), Some(HitTarget::ToggleLocal));
+            let mut out = Vec::new();
+            handle_mouse(
+                &mut app,
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: hit.x,
+                    row: hit.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &mut out,
+            );
+            assert!(!app.hide_local);
+            assert!(app.hide_remote);
+            assert_eq!(app.panel_entries().len(), 1);
+        }
+    }
+
     #[test]
     fn new_session_picker_offers_the_project_twin_on_the_other_host() {
         let mut app = App::new();
@@ -10269,12 +10714,23 @@ mod tests {
         app.sel_worktree = 0;
         let rows = app.visible_session_rows();
         assert!(!rows.iter().any(|r| r.name() == "remote-one"));
-        assert!(rows.iter().any(|r| matches!(r, SessionRow::Agent(a) if a.worktree_id.as_str() == "w1")));
-        app.sel_worktree = app.visible_worktrees().iter().position(|w| w.id.as_str() == "w-remote").unwrap();
+        assert!(rows
+            .iter()
+            .any(|r| matches!(r, SessionRow::Agent(a) if a.worktree_id.as_str() == "w1")));
+        app.sel_worktree = app
+            .visible_worktrees()
+            .iter()
+            .position(|w| w.id.as_str() == "w-remote")
+            .unwrap();
         let remote_rows = app.visible_session_rows();
-        let remote = remote_rows.iter().find(|r| r.name() == "remote-one").expect("remote checkout lists its own session");
+        let remote = remote_rows
+            .iter()
+            .find(|r| r.name() == "remote-one")
+            .expect("remote checkout lists its own session");
         assert_eq!(app.session_host(remote), Some("findl"));
-        assert!(!remote_rows.iter().any(|r| matches!(r, SessionRow::Agent(a) if a.worktree_id.as_str() == "w1")));
+        assert!(!remote_rows
+            .iter()
+            .any(|r| matches!(r, SessionRow::Agent(a) if a.worktree_id.as_str() == "w1")));
     }
 
     /// A session on a checkout that exists only on findl (no local
@@ -10428,7 +10884,11 @@ mod tests {
         app.desired_panel_widths = [30, 50];
         let mut terminal = Terminal::new(TestBackend::new(180, 40)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
-        assert!(buffer_text(&terminal).contains("develop (branch) @local"), "{}", buffer_text(&terminal));
+        assert!(
+            buffer_text(&terminal).contains("develop (branch) @local"),
+            "{}",
+            buffer_text(&terminal)
+        );
         let mut remote = app.tree.agents[0].clone();
         remote.id = AgentId("remote-parked".into());
         remote.worktree_id = nebula_core::WorktreeId("w-remote".into());
@@ -10463,6 +10923,48 @@ mod tests {
             }
         }
         panic!("{needle:?} is not on screen");
+    }
+
+    #[test]
+    fn redraw_does_not_rebuild_the_panel_tree_for_every_row() {
+        fn measure(rows: usize) -> usize {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            let template = app.tree.worktrees[0].clone();
+            for i in 1..rows {
+                let mut w = template.clone();
+                w.id = nebula_core::WorktreeId(format!("perf-{i}"));
+                w.branch = format!("branch-{i}");
+                w.is_main = false;
+                app.tree.worktrees.push(w);
+            }
+            let mut terminal = Terminal::new(TestBackend::new(160, 50)).unwrap();
+            crate::app::PANEL_PROJECTIONS.with(|count| count.set(0));
+            let started = std::time::Instant::now();
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            let calls = crate::app::PANEL_PROJECTIONS.with(|count| count.get());
+            eprintln!(
+                "rows={rows}, panel projections={calls}, draw={:?}",
+                started.elapsed()
+            );
+            // What `main_loop` asks around every draw and on every idle
+            // pass, then the next frame: all served from the projection
+            // the first draw built.
+            let _ = (app.git_changes_stale(), app.selected_session_row());
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            let idle = crate::app::PANEL_PROJECTIONS.with(|count| count.get()) - calls;
+            assert_eq!(
+                idle, 0,
+                "an unchanged tree was projected again ({rows} rows)"
+            );
+            calls
+        }
+        assert_eq!(measure(5), 1);
+        assert_eq!(
+            measure(100),
+            1,
+            "one projection per redraw, whatever the row count"
+        );
     }
 
     fn seed_tree(app: &mut App) {
@@ -10832,6 +11334,97 @@ mod tests {
                 app.overlay
             );
         })
+    }
+
+    /// The `⎇ branch ▾` control beside Local/Remote shows the primary's
+    /// branch; a click opens a fuzzy "Checkout" picker led by that branch,
+    /// and Enter on a match checks it out on the primary. Picking the
+    /// current branch sends nothing.
+    #[test]
+    fn checkout_control_fuzzy_picks_a_branch_onto_the_primary() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        for args in [
+            &["init", "-b", "main"][..],
+            &["config", "user.email", "t@t"],
+            &["config", "user.name", "t"],
+            &["commit", "--allow-empty", "-m", "init"],
+            &["branch", "feat-login"],
+            &["branch", "fix-typo"],
+        ] {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap();
+        }
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.tree.projects[0].repo_path = repo.to_path_buf();
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("⎇ main ▾"),
+            "a narrow panel gives it its own row: {text}"
+        );
+        // A wide panel keeps it beside the checkboxes, right-aligned.
+        app.panel_widths[1] = 45;
+        app.desired_panel_widths[1] = 45;
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        let row = text
+            .lines()
+            .find(|l| l.contains("Local"))
+            .unwrap_or_default();
+        assert!(row.contains("Remote") && row.contains("⎇ main ▾"), "{text}");
+        let rect = app
+            .hits
+            .iter()
+            .find_map(|(r, t)| (*t == HitTarget::CheckoutBranch).then_some(*r))
+            .expect("the control registers a hit rect");
+
+        let mut out = Vec::new();
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Down(MouseButton::Left), rect.x + 2, rect.y),
+            &mut out,
+        );
+        let Some(Overlay::Menu(menu)) = &app.overlay else {
+            panic!("expected the checkout picker, got {:?}", app.overlay);
+        };
+        assert_eq!(menu.title.as_deref(), Some("Checkout"));
+        assert_eq!(
+            menu.items[0].label, "main (primary)",
+            "the current branch leads"
+        );
+        assert_eq!(menu.items.len(), 3);
+        for c in "flog".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        let Some(Overlay::Menu(menu)) = &app.overlay else {
+            panic!("{:?}", app.overlay);
+        };
+        assert_eq!(menu.items[0].label, "feat-login (branch)");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(
+            out.iter().any(|r| matches!(
+                r,
+                ClientRequest::CheckoutPrimary { branch, .. } if branch == "feat-login"
+            )),
+            "{out:?}"
+        );
+
+        out.clear();
+        open_checkout_picker(&mut app, nebula_core::ProjectId("p1".into()), None);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(
+            !out.iter()
+                .any(|r| matches!(r, ClientRequest::CheckoutPrimary { .. })),
+            "the current branch is already checked out: {out:?}"
+        );
+        assert!(app.overlay.is_none());
     }
 
     /// A query matching nothing leaves an editable empty picker: Enter is
@@ -12188,7 +12781,7 @@ mod tests {
 
         let rows = app.visible_sessions();
         assert_eq!(rows[0].name, "agent-2", "pinned agent sorts first");
-        assert_eq!(app.session_group_counts(), (1, 0, 1, 0));
+        assert_eq!(app.session_group_counts(), (1, 1, 0));
 
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
@@ -12245,9 +12838,10 @@ mod tests {
 
         hse(&mut app, mk_feat(true));
         let rows = app.visible_worktrees();
-        assert_eq!(rows[0].branch, "feat", "pinned worktree sorts first");
-        assert_eq!(app.worktree_group_counts(), (1, 1));
-        assert_eq!(app.sel_worktree, 0, "selection follows the pinned row");
+        assert_eq!(rows[0].branch, "main", "primary stays first");
+        assert_eq!(rows[1].branch, "feat", "pinned worktree follows primary");
+        assert_eq!(app.worktree_group_counts(), (1, 0));
+        assert_eq!(app.sel_worktree, 1, "selection follows the pinned row");
         assert_eq!(app.focus, Focus::Worktrees, "focus stays on the panel");
 
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
@@ -12255,156 +12849,23 @@ mod tests {
         let text = buffer_text(&terminal);
         assert!(text.contains("PINNED"), "pinned header rendered:\n{text}");
         assert!(
-            text.contains("UNPINNED"),
-            "unpinned header rendered:\n{text}"
+            !text.contains("UNPINNED"),
+            "no empty unpinned group:\n{text}"
         );
     }
 
-    /// Agents whose status changed within the window sort into a RECENT
-    /// group: below PINNED (always), above the remaining unpinned rows.
-    /// Pinned agents stay in PINNED even with a fresh status change, and an
-    /// expired timestamp lands back in UNPINNED.
+    /// Sessions order by recency: pinned first, then working sessions,
+    /// then whichever finished last; never-run ones sink. A status flip
+    /// moves the row — and the selection follows its session.
     #[test]
-    fn recent_status_changes_group_below_pinned() {
+    fn sessions_order_by_recency_and_the_cursor_follows() {
         use nebula_core::{Agent, AgentStatus, Entity};
         let mut app = App::new();
-        seed_tree(&mut app);
-        let now = crate::app::now_ms();
-        let mk = |id: &str, pinned: bool, changed_at: i64, sort: i64| ServerEvent::EntityUpserted {
-            entity: Entity::Agent(Agent {
-                id: AgentId(id.into()),
-                worktree_id: WorktreeId("w1".into()),
-                name: id.into(),
-                status: AgentStatus::Finished,
-                archived: false,
-                archived_at: 0,
-                pinned,
-                kind: nebula_core::AgentKind::Claude,
-                model: None,
-                effort: None,
-                session_id: None,
-                sort_order: sort,
-                status_changed_at: changed_at,
-                alive: true,
-                branch: None,
-            }),
-        };
-        // Pinned with a fresh change: must stay in PINNED, not RECENT.
-        hse(&mut app, mk("pinned-fresh", true, now, 1));
-        // Unpinned, changed just now: RECENT.
-        hse(&mut app, mk("recent-1", false, now - 1_000, 2));
-        // Unpinned, changed outside the window: plain UNPINNED.
-        let stale = now - app.recent_window_ms - 60_000;
-        hse(&mut app, mk("stale-1", false, stale, 3));
-
-        let rows = app.visible_sessions();
-        let names: Vec<&str> = rows.iter().map(|a| a.name.as_str()).collect();
-        assert_eq!(
-            names,
-            vec!["pinned-fresh", "recent-1", "stale-1", "agent-1"],
-            "pinned, then recent, then the rest by last interaction              (stale-1 ran once; agent-1 never has)"
-        );
-        assert_eq!(app.session_group_counts(), (1, 1, 2, 0));
-        assert!(app.next_recent_expiry().is_some());
-
-        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
-        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
-        let line = buffer_text(&terminal)
-            .lines()
-            .find(|l| l.contains("pinned-fresh"))
-            .expect("the tab bar row")
-            .to_string();
-        let pos = |n: &str| {
-            line.find(n)
-                .unwrap_or_else(|| panic!("{n} missing:\n{line}"))
-        };
-        assert!(
-            pos("pinned-fresh") < pos("recent-1") && pos("recent-1") < pos("stale-1"),
-            "tabs keep the pinned → recent → rest order:\n{line}"
-        );
-    }
-
-    /// Running / needs-feedback sessions head the RECENT group and hold
-    /// their place there however long they have been working — an old
-    /// status timestamp doesn't drop them back into UNPINNED.
-    #[test]
-    fn working_sessions_head_recent_regardless_of_age() {
-        use nebula_core::{Agent, AgentStatus, Entity};
-        let mut app = App::new();
-        seed_tree(&mut app);
-        let now = crate::app::now_ms();
-        let stale = now - app.recent_window_ms - 60_000;
-        let mk = |id: &str, status: AgentStatus, changed_at: i64, sort: i64| {
-            ServerEvent::EntityUpserted {
-                entity: Entity::Agent(Agent {
-                    id: AgentId(id.into()),
-                    worktree_id: WorktreeId("w1".into()),
-                    name: id.into(),
-                    status,
-                    archived: false,
-                    archived_at: 0,
-                    pinned: false,
-                    kind: nebula_core::AgentKind::Claude,
-                    model: None,
-                    effort: None,
-                    session_id: None,
-                    sort_order: sort,
-                    status_changed_at: changed_at,
-                    alive: true,
-                    branch: None,
-                }),
-            }
-        };
-        // Finished a moment ago: RECENT on the timestamp alone.
-        hse(
-            &mut app,
-            mk("just-finished", AgentStatus::Finished, now - 1_000, 1),
-        );
-        // Working since before the window opened: still RECENT, and above it.
-        hse(&mut app, mk("long-running", AgentStatus::Running, stale, 2));
-        hse(
-            &mut app,
-            mk("long-blocked", AgentStatus::NeedsFeedback, stale, 3),
-        );
-
-        let rows = app.visible_sessions();
-        let names: Vec<&str> = rows.iter().map(|a| a.name.as_str()).collect();
-        assert_eq!(
-            names,
-            vec!["long-running", "long-blocked", "just-finished", "agent-1"],
-            "working sessions top RECENT, then the freshly-changed row, then the rest"
-        );
-        assert_eq!(app.session_group_counts(), (0, 3, 1, 0));
-
-        // Only the finished row is on the expiry clock; the working ones
-        // would otherwise report a deadline already past and respin the
-        // event loop every 250ms.
-        let expiry = app
-            .next_recent_expiry()
-            .expect("the finished row still ages out");
-        assert!(
-            expiry > Duration::from_secs(60),
-            "expiry tracks the finished row, not the stale working ones: {expiry:?}"
-        );
-
-        // "off" still collapses the group, working sessions included.
-        app.recent_window_ms = 0;
-        assert_eq!(app.session_group_counts(), (0, 0, 4, 0));
-        assert!(app.next_recent_expiry().is_none());
-    }
-
-    /// Every group is ordered by last interaction, newest first — the
-    /// session you just ran surfaces at the top of its group, and sessions
-    /// that have never run sink to the bottom in tree order.
-    #[test]
-    fn sessions_order_by_last_interaction() {
-        use nebula_core::{Agent, AgentStatus, Entity};
-        let mut app = App::new();
-        seed_tree(&mut app); // agent-1: fresh, never run (stamp 0)
+        seed_tree(&mut app); // agent-1: fresh, never run
         let now = crate::app::now_ms();
         let mins = |n: i64| now - n * 60_000;
-        let mk = |id: &str, pinned: bool, status: AgentStatus, at: i64, sort: i64| {
-            ServerEvent::EntityUpserted {
+        let mk =
+            |id: &str, pinned: bool, status: AgentStatus, at: i64| ServerEvent::EntityUpserted {
                 entity: Entity::Agent(Agent {
                     id: AgentId(id.into()),
                     worktree_id: WorktreeId("w1".into()),
@@ -12417,137 +12878,79 @@ mod tests {
                     model: None,
                     effort: None,
                     session_id: None,
-                    sort_order: sort,
+                    sort_order: 0,
                     status_changed_at: at,
                     alive: true,
                     branch: None,
                 }),
-            }
+            };
+        hse(
+            &mut app,
+            mk("cold", false, AgentStatus::Finished, mins(120)),
+        );
+        hse(
+            &mut app,
+            mk("working", false, AgentStatus::Running, mins(25)),
+        );
+        hse(&mut app, mk("pin", true, AgentStatus::Finished, mins(20)));
+        hse(
+            &mut app,
+            mk("blocked", false, AgentStatus::NeedsFeedback, mins(1)),
+        );
+        let names = |app: &App| -> Vec<String> {
+            app.visible_sessions().into_iter().map(|a| a.name).collect()
         };
-        // Two pinned rows, seeded in the *opposite* order to their stamps.
-        hse(
-            &mut app,
-            mk("pin-old", true, AgentStatus::Finished, mins(20), 1),
-        );
-        hse(
-            &mut app,
-            mk("pin-new", true, AgentStatus::Finished, mins(2), 2),
-        );
-        // RECENT: a long-running turn outranks a more recent finish, because
-        // a working session is interacting with you right now.
-        hse(
-            &mut app,
-            mk("working", false, AgentStatus::Running, mins(25), 3),
-        );
-        hse(
-            &mut app,
-            mk("done-1m", false, AgentStatus::Finished, mins(1), 4),
-        );
-        hse(
-            &mut app,
-            mk("done-10m", false, AgentStatus::Finished, mins(10), 5),
-        );
-        // Past the 30m window: plain unpinned, still newest-first, with the
-        // never-run agent-1 last.
-        hse(
-            &mut app,
-            mk("cold-2h", false, AgentStatus::Finished, mins(120), 6),
-        );
-        hse(
-            &mut app,
-            mk("cold-45m", false, AgentStatus::Finished, mins(45), 7),
-        );
-
-        let rows = app.visible_sessions();
-        let names: Vec<&str> = rows.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(
-            names,
-            vec![
-                "pin-new", "pin-old", // PINNED, newest first
-                "working", "done-1m", "done-10m", // RECENT, working on top
-                "cold-45m", "cold-2h", "agent-1", // the rest, never-run last
-            ],
+            names(&app),
+            ["pin", "working", "blocked", "cold", "agent-1"]
         );
-        assert_eq!(app.session_group_counts(), (2, 3, 3, 0));
+        assert_eq!(app.session_group_counts(), (1, 4, 0));
 
-        // A status flip is an interaction: the coldest row jumps the queue.
-        hse(
-            &mut app,
-            ServerEvent::StatusChanged {
-                agent: AgentId("cold-2h".into()),
-                status: AgentStatus::Finished,
-                changed_at: now,
-            },
-        );
-        let rows = app.visible_sessions();
-        let names: Vec<&str> = rows.iter().map(|a| a.name.as_str()).collect();
-        assert_eq!(
-            names,
-            vec![
-                "pin-new", "pin-old", //
-                "working", "cold-2h", "done-1m", "done-10m", //
-                "cold-45m", "agent-1",
-            ],
-            "the cold row joined RECENT at the top, behind only the live turn \
-             it ties with"
-        );
-    }
-
-    /// A StatusChanged delta stamps the agent's timestamp, pulls it into
-    /// RECENT, and the selection follows the session it was on.
-    #[test]
-    fn status_change_regroups_and_selection_follows() {
-        use nebula_core::{Agent, AgentStatus, Entity};
-        let mut app = App::new();
-        seed_tree(&mut app);
-        hse(
-            &mut app,
-            ServerEvent::EntityUpserted {
-                entity: Entity::Agent(Agent {
-                    id: AgentId("a2".into()),
-                    worktree_id: WorktreeId("w1".into()),
-                    name: "agent-2".into(),
-                    status: AgentStatus::Fresh,
-                    archived: false,
-                    archived_at: 0,
-                    pinned: false,
-                    kind: nebula_core::AgentKind::Claude,
-                    model: None,
-                    effort: None,
-                    session_id: None,
-                    sort_order: 1,
-                    status_changed_at: 0,
-                    alive: true,
-                    branch: None,
-                }),
-            },
-        );
         app.focus = Focus::Sessions;
-        app.sel_session = 1; // agent-2
-
-        hse(
-            &mut app,
-            ServerEvent::StatusChanged {
-                agent: AgentId("a2".into()),
-                status: AgentStatus::Finished,
-                changed_at: crate::app::now_ms(),
-            },
+        app.sel_session = 3; // cold
+        for (id, status) in [
+            ("cold", AgentStatus::Running),
+            ("working", AgentStatus::Finished),
+        ] {
+            hse(
+                &mut app,
+                ServerEvent::StatusChanged {
+                    agent: AgentId(id.into()),
+                    status,
+                    changed_at: mins(0) - 1,
+                },
+            );
+        }
+        let order = ["pin", "cold", "blocked", "working", "agent-1"];
+        assert_eq!(
+            names(&app),
+            order,
+            "running leads, the just-finished one follows"
         );
-        let rows = app.visible_sessions();
-        assert_eq!(rows[0].name, "agent-2", "recent agent bubbled to the top");
-        assert_eq!(app.session_group_counts(), (0, 1, 1, 0));
-        assert_eq!(app.sel_session, 0, "selection followed agent-2");
+        assert_eq!(app.sel_session, 1, "the cursor follows cold");
 
-        // recent_window "off" collapses the group back to a flat list —
-        // still ordered by last interaction, so agent-2 keeps the top.
-        app.recent_window_ms = 0;
-        assert_eq!(app.session_group_counts(), (0, 0, 2, 0));
-        assert_eq!(app.visible_sessions()[0].name, "agent-2");
-        assert!(app.next_recent_expiry().is_none());
+        let mut terminal = Terminal::new(TestBackend::new(200, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        let line = text
+            .lines()
+            .find(|l| l.contains("cold") && l.contains("blocked"))
+            .unwrap_or_else(|| panic!("the tab bar row:\n{text}"))
+            .to_string();
+        let pos = |n: &str| {
+            line.find(n)
+                .unwrap_or_else(|| panic!("{n} missing:\n{line}"))
+        };
+        assert!(
+            pos("pin") < pos("cold")
+                && pos("cold") < pos("blocked")
+                && pos("blocked") < pos("working"),
+            "tabs keep the same order:\n{line}"
+        );
     }
 
     #[test]
-    fn status_change_reorders_sidebar_rows_without_moving_entity_selection() {
+    fn status_change_keeps_sidebar_rows_in_place() {
         use nebula_core::{Agent, AgentStatus, Entity};
         let mut app = App::new();
         seed_tree(&mut app); // main/w1 + a1
@@ -12579,6 +12982,8 @@ mod tests {
 
         app.focus = Focus::Worktrees;
         app.sel_worktree = app.worktree_row_index(&WorktreeId("w3".into())).unwrap();
+        let before = app.panel_entries();
+        let at = app.sel_worktree;
         hse(
             &mut app,
             ServerEvent::StatusChanged {
@@ -12588,9 +12993,14 @@ mod tests {
             },
         );
         assert_eq!(
+            app.panel_entries(),
+            before,
+            "a running session moves no row"
+        );
+        assert_eq!(app.sel_worktree, at);
+        assert_eq!(
             app.selected_worktree().map(|worktree| worktree.id.as_str()),
             Some("w3"),
-            "the worktree cursor follows the row that became active"
         );
     }
 
@@ -17215,10 +17625,11 @@ mod tests {
         let mut app = App::new();
         seed_tree(&mut app); // p1/w1(main) + agent-1
         for (id, branch, base) in [
-            ("w2", "n-child", Some("main")),
+            ("w-root", "n-root", None),
+            ("w2", "n-child", Some("n-root")),
             ("w3", "n-loner", Some("ghost")),
             ("w4", "n-grand", Some("n-child")),
-            ("w5", "n-last", Some("main")),
+            ("w5", "n-last", Some("n-root")),
         ] {
             hse(
                 &mut app,
@@ -17240,13 +17651,13 @@ mod tests {
         app.focus = Focus::Worktrees;
         // Tall enough that the whole lineage plus the flat orphan's
         // from-line fits below the section's midpoint.
-        let mut terminal = Terminal::new(TestBackend::new(100, 44)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(100, 52)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
         let cell = |x: u16, y: u16| terminal.backend().buffer()[(x, y)].symbol().to_string();
         // The primary row carries the project's name; its branch sits on
         // the `on main` sub-line.
-        let (main_x, main_y) = find_cell(&terminal, "main ⌂");
+        let (main_x, main_y) = find_cell(&terminal, "n-root");
         let (child_x, child_y) = find_cell(&terminal, "n-child");
         let (grand_x, grand_y) = find_cell(&terminal, "n-grand");
         let (last_x, last_y) = find_cell(&terminal, "n-last");
@@ -17256,7 +17667,7 @@ mod tests {
         assert_eq!(grand_x, main_x + 4, "grandchild indents two levels: {text}");
         assert_eq!(loner_x, main_x, "orphan stays flat: {text}");
         assert!(
-            !text.contains("from main"),
+            !text.contains("from n-root"),
             "nested row drops the redundant from-line: {text}"
         );
         assert!(
@@ -18541,6 +18952,7 @@ mod tests {
                 crate::branches::LocalBranch {
                     name: "fx-sub".into(),
                     created_from: Some("fx".into()),
+                    created_at: None,
                 },
             ],
         ));
@@ -18563,7 +18975,7 @@ mod tests {
         seed_tree(&mut app);
         app.branch_list = Some((
             nebula_core::ProjectId("p1".into()),
-            vec!["feature-x".into()],
+            vec!["main".into(), "feature-x".into()],
         ));
         app.focus = Focus::Worktrees;
         let mut out = Vec::new();
@@ -18635,7 +19047,7 @@ mod tests {
         seed_tree(&mut app);
         app.branch_list = Some((
             nebula_core::ProjectId("p1".into()),
-            vec!["feature-x".into()],
+            vec!["main".into(), "feature-x".into()],
         ));
         app.focus = Focus::Worktrees;
         let mut out = Vec::new();
@@ -18666,7 +19078,7 @@ mod tests {
         seed_tree(&mut app);
         app.branch_list = Some((
             nebula_core::ProjectId("p1".into()),
-            vec!["feature-x".into()],
+            vec!["main".into(), "feature-x".into()],
         ));
         app.focus = Focus::Worktrees;
         app.sel_worktree = app.visible_worktrees().len();
@@ -18953,6 +19365,82 @@ mod tests {
         );
     }
 
+    /// A key that only travels to the PTY changes nothing on screen — the
+    /// echo repaints when it arrives as `Output` — so it must not cost a
+    /// frame. Anything the key visibly changes still does.
+    #[test]
+    fn a_key_only_forwarded_to_the_pty_does_not_request_a_redraw() {
+        fn locked_app() -> App {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            app.term = Some(AttachedTerm::new(
+                SessionRef::Agent(AgentId("a1".into())),
+                80,
+                24,
+            ));
+            app.focus = Focus::Terminal;
+            app.term_locked = true;
+            app.dirty = false;
+            app
+        }
+        fn type_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Vec<ClientRequest> {
+            let mut out = Vec::new();
+            handle_terminal_event(app, Event::Key(KeyEvent::new(code, mods)), &mut out);
+            out
+        }
+
+        let mut app = locked_app();
+        let out = type_key(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert!(matches!(&out[..], [ClientRequest::Input { data, .. }] if data == b"x"));
+        assert!(!app.dirty, "a forwarded key draws nothing of its own");
+
+        // A frame that was already owed is not cancelled by typing.
+        app.dirty = true;
+        type_key(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+        assert!(app.dirty);
+
+        // Dismissing a flash repaints the footer.
+        let mut app = locked_app();
+        app.flash = Some("saved".into());
+        let out = type_key(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(out.len(), 1, "still forwarded");
+        assert!(app.flash.is_none() && app.dirty);
+
+        // Typing drops the selection highlight.
+        let mut app = locked_app();
+        app.term_selection = Some(TermSelection {
+            anchor: (0, 0),
+            head: (3, 0),
+            dragging: false,
+            active: true,
+        });
+        type_key(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert!(app.term_selection.is_none() && app.dirty);
+
+        // Typing leaves scroll mode.
+        let mut app = locked_app();
+        let term = app.term.as_mut().unwrap();
+        term.feed(&b"line\r\n".repeat(100));
+        term.set_scroll(5);
+        assert!(term.scroll > 0);
+        type_key(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(app.term.as_ref().unwrap().scroll, 0);
+        assert!(app.dirty);
+
+        // The unlock hatch is not forwarded and changes focus.
+        let mut app = locked_app();
+        let out = type_key(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL);
+        assert!(out.is_empty() && !app.term_locked);
+        assert!(app.dirty);
+
+        // Panel navigation (nothing locked) still repaints.
+        let mut app = locked_app();
+        app.term_locked = false;
+        app.focus = Focus::Sessions;
+        type_key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        assert!(app.dirty);
+    }
+
     /// A clean tree still opens the viewer (empty list) so ^g can switch
     /// to a commit from there.
     #[test]
@@ -19102,6 +19590,54 @@ mod tests {
         let v = diff_view(&app);
         assert!(v.base.is_working_tree());
         assert_eq!(v.files[0].path, "z.txt");
+    }
+
+    /// Tab in the ^g picker flips to the branch list; Enter on a branch
+    /// shows everything since the merge base with it, commits included.
+    #[test]
+    fn ctrl_g_tab_picks_a_branch_to_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo(&dir);
+        run_git(&repo, &["branch", "dev"]);
+        std::fs::write(repo.join("a.txt"), "committed\n").unwrap();
+        run_git(&repo, &["commit", "-am", "second"]);
+        let mut app = App::new();
+        seed_repo_tree(&mut app, &repo);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
+        assert!(diff_view(&app).files.is_empty(), "clean tree");
+
+        press(
+            &mut app,
+            KeyCode::Char('g'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+        {
+            let v = diff_view(&app);
+            assert!(v.picker.as_ref().unwrap().branches);
+            assert_eq!(v.branches, ["dev"]);
+            assert_eq!(v.picker_rows(), 1);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        {
+            let v = diff_view(&app);
+            assert_eq!(v.base, crate::git_diff::DiffBase::Branch("dev".into()));
+            assert_eq!(v.files.len(), 1);
+            assert_eq!(v.files[0].path, "a.txt");
+            assert!(v.diff.contains("+committed"), "{}", v.diff);
+        }
+        // Reopening lands back in branch mode, on the current base.
+        press(
+            &mut app,
+            KeyCode::Char('g'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
+        let picker = diff_view(&app).picker.as_ref().unwrap();
+        assert!(picker.branches);
+        assert_eq!(picker.hover, 0);
     }
 
     /// `G` turns the checkout's remote into a page and hands it to the
@@ -20311,7 +20847,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_hl_cycles_recent_window_and_applies() {
+    fn settings_hl_cycles_a_choice_and_saves() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         crate::config::with_config_path(path, || {
@@ -20319,7 +20855,7 @@ mod tests {
             let mut out = Vec::new();
             press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &mut out);
             let (tab, row) =
-                crate::config::locate(crate::config::SettingKind::RecentWindow).unwrap();
+                crate::config::locate(crate::config::SettingKind::SessionIdleTimeout).unwrap();
             for _ in 0..tab {
                 press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
             }
@@ -20328,15 +20864,10 @@ mod tests {
             }
             press(&mut app, KeyCode::Char('l'), KeyModifiers::NONE, &mut out);
             let cfg = crate::config::Config::load();
-            assert_eq!(cfg.recent_window, "1h");
-            assert_eq!(app.recent_window_ms, 3_600_000);
+            assert_eq!(cfg.session_idle_timeout, "15m");
             press(&mut app, KeyCode::Char('h'), KeyModifiers::NONE, &mut out);
             let cfg = crate::config::Config::load();
-            assert_eq!(cfg.recent_window, "30m");
-            assert_eq!(
-                app.recent_window_ms,
-                crate::config::DEFAULT_RECENT_WINDOW_MS
-            );
+            assert_eq!(cfg.session_idle_timeout, "5m");
         });
     }
 
@@ -20356,14 +20887,14 @@ mod tests {
         // Settings live on their own tab now, so a row from another tab
         // is only on screen once you switch to it.
         assert!(
-            !text.contains("Recent window"),
+            !text.contains("Idle session timeout"),
             "another tab's rows stay off screen:\n{text}"
         );
         press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let sessions_text = buffer_text(&terminal);
         assert!(
-            sessions_text.contains("Recent window"),
+            sessions_text.contains("Idle session timeout"),
             "Tab reaches the Sessions tab:\n{sessions_text}"
         );
         for tab in crate::config::SETTINGS_TABS {

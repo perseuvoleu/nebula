@@ -170,7 +170,8 @@ pub struct Agent {
     #[serde(default)]
     pub pinned: bool,
     /// Epoch ms of the last status change; 0 = unknown (pre-upgrade rows or
-    /// never-run agents). Drives the TUI's RECENT session group.
+    /// never-run agents). Drives the TUI's "23m ago" stamps and the
+    /// all-projects SESSIONS list's recency order.
     #[serde(default)]
     pub status_changed_at: i64,
     #[serde(default)]
@@ -188,12 +189,12 @@ pub struct Agent {
     pub sort_order: i64,
     /// True when the daemon currently holds a live PTY for this agent.
     pub alive: bool,
-    /// The branch the checkout had when this session was spawned (or last
-    /// deliberately moved). The session stays listed under that branch
-    /// even after the checkout switches to another one — chats belong to
-    /// the branch they were had on, not to whatever the directory holds
-    /// now. None = unknown (rows from before this was recorded), which
-    /// follows the checkout's current branch.
+    /// The branch the session is listed under: its checkout's branch,
+    /// re-stamped when the checkout switches in place so chats stay on
+    /// the checkout's row. A stamp that differs from the checkout's (rows
+    /// from before the re-stamp, a `nebula switch` mover from another
+    /// checkout) lists the session under that branch instead. None =
+    /// unknown, which follows the checkout's current branch.
     #[serde(default)]
     pub branch: Option<String>,
 }

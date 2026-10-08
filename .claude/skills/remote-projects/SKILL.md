@@ -35,6 +35,15 @@ Completion criterion: no command or delegated worker can publish to either prote
 Include this guardrail in remote worker handoffs. A needed sync never overrides it; the
 hybrid-work skill determines whether any transfer is needed in the first place.
 
+## Application-local Nebula artifacts
+
+For preview/setup work and before staging application files, follow
+[Local Nebula artifacts — outside application Git](../hybrid-work/SKILL.md#local-nebula-artifacts--outside-application-git).
+Keep `.nebula-preview.json` and other `.nebula*` configuration ignored and local to the
+checkout; transfer needed recipes as ignored files, not commits or recipe-only merges.
+Tell delegated remote workers the same rule. The runbook covers safe untracking and
+preserving each host's copy when synchronizing a cleanup commit.
+
 ## The host is findl. Always.
 
 Remote work goes to **findl** (ssh alias in `~/.ssh/config`, key on disk, no touch needed). Do not

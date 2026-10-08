@@ -1383,6 +1383,28 @@ impl Daemon {
         // the reflog, and a branch minted right here branches from the
         // root checkout's HEAD (which `git worktree add` reads too).
         let pre_existing = git::branch_exists(&project.repo_path, branch).await;
+        // Capture display lineage before creating the task branch. A full
+        // commit pin at the primary tip inherits the primary's branch name;
+        // do not guess among other refs (siblings may share that same tip).
+        // Git still receives the original base, so its commit stays pinned.
+        let display_base = if let Some(b) = base {
+            let is_oid = matches!(b.len(), 40 | 64) && b.bytes().all(|c| c.is_ascii_hexdigit());
+            if !pre_existing && is_oid && !git::branch_exists(&project.repo_path, b).await {
+                match git::current_branch(&project.repo_path).await {
+                    Ok(primary) if !primary.starts_with("detached@") => {
+                        match git::branch_tip(&project.repo_path, &primary).await {
+                            Some(tip) if tip.eq_ignore_ascii_case(b) => Some(primary),
+                            _ => Some(b.to_owned()),
+                        }
+                    }
+                    _ => Some(b.to_owned()),
+                }
+            } else {
+                Some(b.to_owned())
+            }
+        } else {
+            None
+        };
         let path = git::add_worktree(&project.repo_path, branch, base).await?;
         // The root checkout's `.env`s come along — synchronously, they are
         // tiny, and a session started right after must find them.
@@ -1398,8 +1420,8 @@ impl Daemon {
         if let Some(primary) = seed_primary.filter(|_| project.host.is_none()) {
             git::seed_node_modules_in_background(&primary, &path);
         }
-        let created_from = match base {
-            Some(b) => Some(b.to_owned()),
+        let created_from = match display_base {
+            Some(b) => Some(b),
             None if pre_existing => git::branch_creation_base(&project.repo_path, branch).await,
             None => git::current_branch(&project.repo_path)
                 .await
@@ -1580,11 +1602,11 @@ impl Daemon {
             });
         }
         git::checkout(&project.repo_path, branch).await?;
-        // The main row's branch label follows the checkout via reconcile.
+        // The main row's branch label, and every session in the primary,
+        // follow the checkout via reconcile.
         self.reconcile_project_worktrees(&project).await?;
-        // Sessions keep the branch they were on — the panel lists them
-        // there still. Only the one that asked for the switch from inside
-        // its own shell goes along with the checkout.
+        // The session that asked for the switch goes along too, even from
+        // another checkout.
         if let Some(mover) = mover {
             self.follow_branch(mover, branch)?;
         }
@@ -1650,7 +1672,8 @@ impl Daemon {
                 // reality instead of the branch at adoption time.
                 let mut updated = (*known).clone();
                 let mut changed = false;
-                if known.branch != entry.branch {
+                let switched = known.branch != entry.branch;
+                if switched {
                     self.store
                         .update_worktree_branch(&known.id, &entry.branch)?;
                     updated.branch = entry.branch.clone();
@@ -1704,6 +1727,25 @@ impl Daemon {
                     self.broadcast(ServerEvent::EntityUpserted {
                         entity: Entity::Worktree(updated),
                     });
+                }
+                if switched {
+                    // Chats stay with their checkout: an in-place switch
+                    // takes every session in it along to the new branch
+                    // (after the row's upsert, so no client briefly parks
+                    // them under a branch the row doesn't hold yet).
+                    let sessions = agents
+                        .iter()
+                        .filter(|a| a.worktree_id == known.id)
+                        .map(|a| SessionRef::Agent(a.id.clone()))
+                        .chain(
+                            terminals
+                                .iter()
+                                .filter(|t| t.worktree_id == known.id)
+                                .map(|t| SessionRef::Terminal(t.id.clone())),
+                        );
+                    for session in sessions {
+                        self.follow_branch(&session, &entry.branch)?;
+                    }
                 }
                 continue;
             }
@@ -4326,13 +4368,13 @@ mod tests {
         assert!(err.to_string().contains("push it first"), "{err}");
     }
 
-    /// `nebula switch` on the primary: the chats stay listed on the branch
-    /// they were on, only the session that asked follows the checkout, and
+    /// `nebula switch` on the primary: every chat in the checkout goes
+    /// along to the new branch (they stay on the checkout's row), and
     /// the main row records the branch it was cut from (so the panel keeps
     /// it under its parent). Switching back onto a base-less branch clears
     /// the stale lineage.
     #[tokio::test]
-    async fn checkout_primary_leaves_sessions_on_their_branch_but_moves_the_mover() {
+    async fn checkout_primary_takes_the_checkouts_sessions_along() {
         let tmp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(tmp.path()).unwrap();
         let repo = root.join("repo");
@@ -4400,7 +4442,7 @@ mod tests {
                 .branch
         };
         assert_eq!(branch_of("mover").as_deref(), Some("feat"), "follows");
-        assert_eq!(branch_of("stays").as_deref(), Some("main"), "left behind");
+        assert_eq!(branch_of("stays").as_deref(), Some("feat"), "stays on the checkout");
         assert_eq!(
             daemon
                 .store
@@ -4409,7 +4451,7 @@ mod tests {
                 .unwrap()
                 .branch
                 .as_deref(),
-            Some("main")
+            Some("feat")
         );
         let main = daemon
             .store
@@ -4436,8 +4478,8 @@ mod tests {
         );
         assert_eq!(
             branch_of("mover").as_deref(),
-            Some("feat"),
-            "no mover this time"
+            Some("main"),
+            "back with the checkout, mover or not"
         );
     }
 
@@ -4541,6 +4583,16 @@ mod tests {
             .await
             .unwrap();
 
+        // Pinning the primary's commit must retain the same display parent,
+        // including when multiple sibling task branches already share that tip.
+        let sha = git::branch_tip(&repo, "main").await.unwrap();
+        for task in ["pinned-one", "pinned-two"] {
+            daemon.create_worktree(&project.id, task, Some(&sha)).await.unwrap();
+        }
+        daemon.create_worktree(&project.id, "explicit-dad", Some("dad")).await.unwrap();
+        git_in(&repo, &["commit", "--allow-empty", "-m", "advance"]);
+        daemon.create_worktree(&project.id, "historical", Some(&sha)).await.unwrap();
+
         let (_, worktrees, _, _) = daemon.store.load_tree().unwrap();
         let base = |branch: &str| {
             worktrees
@@ -4552,6 +4604,11 @@ mod tests {
         };
         assert_eq!(base("dad").as_deref(), Some("main"));
         assert_eq!(base("fresh").as_deref(), Some("main"));
+        assert_eq!(base("pinned-one").as_deref(), Some("main"));
+        assert_eq!(base("pinned-two").as_deref(), Some("main"));
+        assert_eq!(base("explicit-dad").as_deref(), Some("dad"));
+        assert_eq!(base("historical").as_deref(), Some(sha.as_str()));
+        assert_eq!(git::branch_tip(&repo, "pinned-one").await.as_deref(), Some(sha.as_str()));
         // Identity: checking out a pre-existing branch keeps it a branch;
         // a branch minted by the worktree flow is a worktree.
         let for_branch = |branch: &str| {

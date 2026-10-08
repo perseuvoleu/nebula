@@ -8,8 +8,8 @@ agent manager — entirely inside your terminal.
 ┌ Projects ─┬ Worktrees ─┬ Sessions ────┬ Terminal ──────────────────────┐
 │ ● nebula  │ ● main     │ PINNED       │ $ claude                       │
 │ ○ herdr   │ ● feat/x   │ ● auth-bot   │ …live claude session…          │
-│           │            │ RECENT       │                                │
 │           │            │ ● refactor   │                                │
+│           │            │ ● docs-fix   │                                │
 │           │            │ LINKS        │                                │
 │           │            │ ⇢ PR #42     │                                │
 ├───────────┴────────────┴──────────────┴────────────────────────────────┤
@@ -181,7 +181,7 @@ The panels aren't the only view. With a worktree selected, from any panel:
   fresh on each use by both the daemon and the TUI, so hand edits apply without
   a restart. `s` opens the settings overlay over the same file: color theme,
   animations, focused-panel tint, editor, default model and reasoning effort
-  per agent CLI, the RECENT window, the idle timeout, and whether new sessions
+  per agent CLI, the idle timeout, and whether new sessions
   stop to ask for a name.
 - **Every panel key is rebindable.** The overlay's Hotkeys tab lists every
   action and what it answers to, and writes overrides into the same file
@@ -204,6 +204,18 @@ The panels aren't the only view. With a worktree selected, from any panel:
 | ○ | disconnected — daemon restarted while the agent was live |
 
 Worktree and project rows roll up their children: red beats yellow beats green.
+
+The **WORKTREES & BRANCHES** panel has **☑ Local** and **☑ Remote** filters,
+checked by default. Click either to hide that host category's checkout/session
+rows (also in the all-projects session list); check it again to show them.
+Both may be unchecked. This is only a view filter: agents keep running, and
+nothing is archived or deleted. The choices are saved across TUI restarts.
+
+Beside them, **⎇ branch ▾** shows the primary checkout's branch. Click it (or
+`co` in the ⌘K palette) for a fuzzy branch picker; the pick is checked out on
+the primary. Rows keep one fixed order — branches by when they were created,
+sessions by when they were started — so a checkout, or a session starting or
+finishing, only moves the `⌂ primary` badge and the cursor, never the rows.
 
 ## Keys
 
