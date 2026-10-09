@@ -25,6 +25,9 @@ const READER_CHANNEL_BOUND: usize = 64;
 /// After the polite SIGHUP, how long the child gets to exit before its whole
 /// process group is SIGKILLed.
 const KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+/// What a tty in line mode queues before it drops input: MAX_CANON on macOS,
+/// the smallest such limit among the supported platforms.
+const LINE_MODE_INPUT_MAX: usize = 1024;
 
 /// Broadcast to attached clients (and, later, the status machine).
 #[derive(Clone, Debug)]
@@ -144,6 +147,22 @@ impl PtySession {
         w.write_all(data)?;
         w.flush()?;
         Ok(())
+    }
+
+    /// [`Self::write_input`] for a caller that reports delivery. A tty in
+    /// line mode takes the write and silently drops what overflows its input
+    /// queue, so input that long is refused instead.
+    pub fn write_input_whole(&self, data: &[u8]) -> Result<()> {
+        use nix::sys::termios::LocalFlags;
+        let line_mode = self.master.lock().unwrap().get_termios().is_some_and(|t| {
+            t.local_flags.bits() & LocalFlags::ICANON.bits() != 0
+        });
+        if line_mode && data.len() >= LINE_MODE_INPUT_MAX {
+            anyhow::bail!(
+                "the session's terminal is in line mode (its CLI is not reading keys yet) and would drop input past {LINE_MODE_INPUT_MAX} bytes; nothing was sent"
+            );
+        }
+        self.write_input(data)
     }
 
     pub fn resize(&self, cols: u16, rows: u16) -> Result<()> {

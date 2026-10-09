@@ -5419,3 +5419,106 @@ async fn protocol29_handshake_accepts_repeated_probes_and_rejects_protocol28() {
     let reply = tokio::time::timeout(Duration::from_secs(3), read_frame::<ServerEvent, _>(&mut old)).await.unwrap().unwrap();
     assert!(matches!(reply, Some(ServerEvent::Incompatible { daemon_protocol_version: 29 })), "{reply:?}");
 }
+
+/// A fake agent CLI that records every byte its PTY hands it. `raw` picks
+/// the tty mode a running CLI uses; without it the tty stays in line mode,
+/// as it is while a CLI is still booting.
+fn input_recorder(env: &TestEnv, raw: bool) -> (PathBuf, PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let capture = env.tmp.path().join("input");
+    let ready = env.tmp.path().join("ready");
+    let script = env.tmp.path().join("recorder");
+    let mode = if raw { "tty.setraw(0)\n" } else { "" };
+    std::fs::write(
+        &script,
+        format!(
+            "#!/usr/bin/python3\nimport os, tty\n{mode}open({ready:?}, 'w').close()\nwhile True:\n with open({capture:?}, 'ab', buffering=0) as f: f.write(os.read(0, 65536))\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (script, ready, capture)
+}
+
+/// 4,200 bytes on one line, every word distinct so a cut shows where it fell.
+fn long_single_line_message() -> String {
+    (0..700).map(|i| format!("w{i:04}")).collect::<Vec<_>>().join(" ")
+}
+
+/// A tty hands a raw-mode reader a long line in pieces (1,022 bytes each on
+/// macOS), and Claude Code keeps only the last piece of an unbracketed burst.
+/// A bracketed paste is what lets the receiver put the pieces back together.
+#[tokio::test]
+async fn agent_send_delivers_a_long_line_as_one_bracketed_paste() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let (script, ready, capture) = input_recorder(&env, true);
+    let mut daemon = MobileFixtureDaemon(env.spawn_daemon_with_agent_cmd(script.to_str().unwrap()));
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let main = add_project_get_main_worktree(&mut c, &repo).await;
+    create_agent_get_id(&mut c, &main.id, "fixture", 90).await;
+    for _ in 0..100 {
+        if ready.exists() { break; }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(ready.exists());
+
+    let long = long_single_line_message();
+    assert_eq!(long.len(), 4199);
+    let mut expected = Vec::new();
+    for (text, on_the_wire) in [
+        ("short line", "short line\r".to_string()),
+        ("two\nlines", "\x1b[200~two\nlines\x1b[201~\r".to_string()),
+        (long.as_str(), format!("\x1b[200~{long}\x1b[201~\r")),
+    ] {
+        let result = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+            .args(["agent", "send", "--project", "repo", "--", "fixture", text])
+            .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "{result:?}");
+        expected.extend_from_slice(on_the_wire.as_bytes());
+        for _ in 0..100 {
+            if std::fs::read(&capture).unwrap_or_default().len() >= expected.len() { break; }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            String::from_utf8_lossy(&std::fs::read(&capture).unwrap_or_default()),
+            String::from_utf8_lossy(&expected)
+        );
+    }
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon.0);
+}
+
+/// A tty still in line mode silently drops whatever does not fit its input
+/// queue, so the write "succeeds" for text the CLI will never read.
+#[tokio::test]
+async fn agent_send_refuses_a_long_message_the_tty_would_drop() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let (script, ready, capture) = input_recorder(&env, false);
+    let mut daemon = MobileFixtureDaemon(env.spawn_daemon_with_agent_cmd(script.to_str().unwrap()));
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let main = add_project_get_main_worktree(&mut c, &repo).await;
+    create_agent_get_id(&mut c, &main.id, "fixture", 90).await;
+    for _ in 0..100 {
+        if ready.exists() { break; }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(ready.exists());
+
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        .args(["agent", "send", "--project", "repo", "--", "fixture", &long_single_line_message()])
+        .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
+        .output()
+        .unwrap();
+    assert!(!result.status.success(), "{result:?}");
+    assert!(String::from_utf8_lossy(&result.stderr).contains("line mode"), "{result:?}");
+    assert_eq!(String::from_utf8_lossy(&result.stdout), "");
+    assert_eq!(std::fs::read(&capture).unwrap_or_default(), b"");
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon.0);
+}

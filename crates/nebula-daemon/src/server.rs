@@ -249,7 +249,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     let result = daemon.validate_agent_project(&id, &project).and_then(|_| {
                         daemon.session(&SessionRef::Agent(id))
                             .ok_or_else(|| anyhow::anyhow!("Session has no live PTY"))
-                            .and_then(|s| s.write_input(&data))
+                            .and_then(|s| s.write_input_whole(&data))
                     });
                     reply(&out_tx, req_id, result.map(|_| None)).await;
                 }

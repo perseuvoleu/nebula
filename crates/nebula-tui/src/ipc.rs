@@ -1297,10 +1297,25 @@ pub async fn agent_read(
     }
 }
 
+/// The longest single-line text `agent send` types raw. A tty hands a
+/// raw-mode reader at most 1,022 bytes per read on macOS, and Claude Code
+/// keeps only the last read of an unbracketed burst, so anything that could
+/// span two reads goes as a bracketed paste instead.
+const RAW_SEND_MAX: usize = 1000;
+
+fn send_payload(text: &str) -> Vec<u8> {
+    if text.contains('\n') || text.len() > RAW_SEND_MAX {
+        format!("\x1b[200~{text}\x1b[201~").into_bytes()
+    } else {
+        text.as_bytes().to_vec()
+    }
+}
+
 /// `nebula agent send <name> <text…>`: type a follow-up prompt into a
 /// running worker's CLI and submit it — the steering half of delegation
 /// (`--prompt` only covers the first task). Multi-line text goes in as a
-/// bracketed paste so embedded newlines don't submit early; Enter follows
+/// bracketed paste so embedded newlines don't submit early, and so does a
+/// long line (see [`RAW_SEND_MAX`]); Enter follows
 /// after a beat, once the CLI has ingested the text.
 pub async fn agent_send(name: String, text: String, project_flag: Option<String>) -> Result<()> {
     let sock = paths::socket_path();
@@ -1317,29 +1332,23 @@ pub async fn agent_send(name: String, text: String, project_flag: Option<String>
             a.status.as_str()
         );
     }
-    let session = nebula_core::SessionRef::Agent(a.id.clone());
-    let data = if text.contains('\n') {
-        format!("\x1b[200~{text}\x1b[201~").into_bytes()
-    } else {
-        text.clone().into_bytes()
-    };
-    write_frame(
-        &mut conn.stream,
-        &ClientRequest::Input {
-            session: session.clone(),
-            data,
-        },
-    )
-    .await?;
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    write_frame(
-        &mut conn.stream,
-        &ClientRequest::Input {
-            session,
-            data: b"\r".to_vec(),
-        },
-    )
-    .await?;
+    // Acknowledged writes: "sent" is printed only for text the PTY took.
+    for (req_id, data) in [(1, send_payload(&text)), (2, b"\r".to_vec())] {
+        if req_id == 2 {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        write_frame(
+            &mut conn.stream,
+            &ClientRequest::InputAcknowledged {
+                req_id,
+                id: a.id.clone(),
+                project: project.id.clone(),
+                data,
+            },
+        )
+        .await?;
+        await_ack(&mut conn, req_id, &mut Vec::new()).await?;
+    }
     println!(
         "{}",
         serde_json::json!({
