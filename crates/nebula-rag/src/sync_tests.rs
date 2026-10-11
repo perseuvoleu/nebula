@@ -179,3 +179,82 @@ fn a_sync_stopped_by_the_neuron_cap_resumes_without_redoing_work() {
     assert_eq!((r.indexed, r.unchanged), (1, 1), "{r:?}");
     assert_eq!(f.docs(), vec!["a.md", "b.md"]);
 }
+
+fn clone_of_new_origin(root: &Path, name: &str) -> PathBuf {
+    sh(root, &["init", "-q", "--bare", &format!("{name}.git")]);
+    sh(root, &["clone", "-q", &format!("{name}.git"), name]);
+    root.join(name)
+}
+
+fn app_names(rag: &Rag) -> Vec<String> {
+    rag.apps().unwrap().into_iter().map(|a| a.name).collect()
+}
+
+#[test]
+fn a_project_checkout_with_an_origin_becomes_an_app_once() {
+    let f = Fixture::new(&[("a.md", b"# A\nalpha")]);
+    let root = f.checkout.parent().unwrap().to_path_buf();
+    let other = clone_of_new_origin(&root, "other");
+    let projects = vec![
+        ("Other".to_string(), other.clone()),
+        ("checkout".to_string(), f.checkout.clone()),
+    ];
+
+    assert_eq!(f.rag.register_checkouts(&projects).unwrap(), vec!["other"]);
+    assert_eq!(app_names(&f.rag), vec!["demo", "other"]);
+    assert_eq!(
+        f.rag.app("other").unwrap().repo,
+        std::fs::canonicalize(&other).unwrap().to_string_lossy()
+    );
+
+    assert_eq!(
+        f.rag.register_checkouts(&projects).unwrap(),
+        Vec::<String>::new()
+    );
+    assert_eq!(app_names(&f.rag), vec!["demo", "other"]);
+}
+
+#[test]
+fn a_checkout_with_no_origin_or_a_taken_name_is_left_alone() {
+    let f = Fixture::new(&[("a.md", b"# A\nalpha")]);
+    let root = f.checkout.parent().unwrap().to_path_buf();
+    sh(&root, &["init", "-q", "plain"]);
+    let rival = clone_of_new_origin(&root, "rival");
+    let demo_repo = f.rag.app("demo").unwrap().repo;
+    let projects = vec![
+        ("plain".to_string(), root.join("plain")),
+        ("Demo".to_string(), rival),
+        ("gone".to_string(), root.join("gone")),
+    ];
+
+    assert_eq!(
+        f.rag.register_checkouts(&projects).unwrap(),
+        Vec::<String>::new()
+    );
+    assert_eq!(app_names(&f.rag), vec!["demo"]);
+    assert_eq!(f.rag.app("demo").unwrap().repo, demo_repo);
+}
+
+#[test]
+fn host_projects_are_the_daemon_projects_on_this_machine() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("nebula.db");
+    assert_eq!(crate::apps::host_projects(&path).unwrap(), vec![]);
+
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE projects (name TEXT, repo_path TEXT, host TEXT);
+         INSERT INTO projects VALUES ('logistica', '/home/a/logistica', NULL);
+         INSERT INTO projects VALUES ('vela', '~/vela', 'findl');
+         INSERT INTO projects VALUES ('daria-fit', '/home/a/daria-fit', NULL);",
+    )
+    .unwrap();
+    drop(conn);
+    assert_eq!(
+        crate::apps::host_projects(&path).unwrap(),
+        vec![
+            ("daria-fit".to_string(), PathBuf::from("/home/a/daria-fit")),
+            ("logistica".to_string(), PathBuf::from("/home/a/logistica")),
+        ]
+    );
+}

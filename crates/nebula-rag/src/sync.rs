@@ -8,7 +8,7 @@
 //! finishes, so a run stopped by the daily neuron cap resumes next time
 //! without re-embedding what it already did.
 
-use crate::apps::{git, App};
+use crate::apps::{git, host_projects, App};
 use crate::db::now;
 use crate::embed::is_cap;
 use crate::ignore::Ignore;
@@ -45,7 +45,19 @@ struct Entry {
 pub fn run(rag: &mut Rag, app: Option<&str>, full: bool) -> Result<()> {
     let apps = match app {
         Some(a) => vec![rag.app(a)?],
-        None => rag.apps()?,
+        None => {
+            match host_projects(&nebula_core::paths::db_path())
+                .and_then(|projects| rag.register_checkouts(&projects))
+            {
+                Ok(added) => {
+                    for name in added {
+                        println!("{name}: registered from the nebula project list");
+                    }
+                }
+                Err(e) => eprintln!("project registration skipped: {e:#}"),
+            }
+            rag.apps()?
+        }
     };
     let purged = rag.purge()?;
     if purged > 0 {

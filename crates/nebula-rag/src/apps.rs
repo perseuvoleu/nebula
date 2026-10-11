@@ -5,9 +5,9 @@
 use crate::db::now;
 use crate::{ws, Rag};
 use anyhow::{anyhow, bail, Context, Result};
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::Serialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Debug, Serialize, Clone)]
@@ -55,6 +55,25 @@ pub fn origin_of(dir: &Path) -> Option<String> {
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// The nebula daemon's projects whose checkout is on this machine, as
+/// `(name, repo)`. Read from the daemon's database, not asked of the daemon:
+/// the sync timer runs whether or not one is up.
+pub fn host_projects(db: &Path) -> Result<Vec<(String, PathBuf)>> {
+    if !db.exists() {
+        return Ok(Vec::new());
+    }
+    let conn = Connection::open_with_flags(db, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("open {}", db.display()))?;
+    let mut st =
+        conn.prepare("SELECT name, repo_path FROM projects WHERE host IS NULL ORDER BY name")?;
+    let rows = st
+        .query_map([], |r| {
+            Ok((r.get(0)?, PathBuf::from(r.get::<_, String>(1)?)))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
 }
 
 impl Rag {
@@ -144,6 +163,30 @@ impl Rag {
             params![name, repo.to_string_lossy(), remote, branch, now()],
         )?;
         self.app(&name)
+    }
+
+    /// Register each project checkout that has an origin and no app yet,
+    /// under the project's name, and return the names added. A checkout that
+    /// cannot be registered is reported and skipped: one bad project must
+    /// not stop a sync.
+    pub fn register_checkouts(&self, projects: &[(String, PathBuf)]) -> Result<Vec<String>> {
+        let mut added = Vec::new();
+        for (name, repo) in projects {
+            let Some(origin) = origin_of(repo) else {
+                continue;
+            };
+            // `app_add` on an existing name repoints that app, so a taken
+            // name is skipped here.
+            let taken = self.apps()?.iter().any(|a| a.name == name.to_lowercase());
+            if taken || self.app_for_remote(&origin)?.is_some() {
+                continue;
+            }
+            match self.app_add(name, repo, None, false) {
+                Ok(app) => added.push(app.name),
+                Err(e) => eprintln!("{name}: not registered: {e:#}"),
+            }
+        }
+        Ok(added)
     }
 }
 

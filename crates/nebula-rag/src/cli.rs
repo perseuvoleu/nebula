@@ -95,7 +95,8 @@ pub enum RagCommand {
         command: AppCommand,
     },
     /// Fetch and re-index apps' markdown from origin/<branch> (all apps, or
-    /// one), and purge notes deleted over 30 days ago.
+    /// one), and purge notes deleted over 30 days ago. With no app, the
+    /// host's nebula projects that have an origin and no app are registered first.
     Sync {
         app: Option<String>,
         /// Reconcile every file instead of diffing from the last commit.

@@ -245,6 +245,12 @@ Where the code settles what the design left open, or deviates from it:
   run re-diffs and skips blobs already indexed.
 - **Dedup** compares a new note with live notes in the **same workspace** only, on its
   first chunk's vector (notes are one fact). The same fact in another app is kept.
+- **Registration:** `nebula rag sync` with no app first registers every project of the
+  host's nebula daemon (`projects` in `nebula.db`, rows with no `host`) that has an
+  `origin` and no app yet, under the project's name; the 10-minute timer therefore picks
+  up a project added with `nebula add`. A checkout with no origin, a name an app already
+  has, or a remote an app already has is skipped. `app add` stays for a checkout that is
+  not a nebula project, or for another branch.
 - **Sync:** branch = `origin/HEAD` of the checkout at `app add` (else `main`; `--branch`
   overrides). Only the repo-root `.gitignore` and `.ragignore` are read (nested ignore
   files are not); `node_modules/`, `/vendor/`, `third_party/` are always skipped;
