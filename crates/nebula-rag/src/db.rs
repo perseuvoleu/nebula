@@ -4,7 +4,7 @@
 //! why everything lives in one DB (see docs/specs/rag.md).
 
 use anyhow::{bail, Context, Result};
-use rusqlite::{ffi, Connection};
+use rusqlite::{ffi, Connection, TransactionBehavior};
 use std::path::{Path, PathBuf};
 
 /// Embedding model the index is built with. Changing it means re-embedding
@@ -17,7 +17,9 @@ pub fn db_path() -> PathBuf {
 }
 
 /// Ordered migrations; `PRAGMA user_version` is the count applied.
-const MIGRATIONS: &[&str] = &[r#"
+const MIGRATIONS: &[&str] = &[SCHEMA, OBSERVATION_FIELDS, BACKFILL_LEGACY_OBSERVATIONS];
+
+const SCHEMA: &str = r#"
 CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE workspaces(
     id INTEGER PRIMARY KEY,
@@ -75,7 +77,34 @@ CREATE TABLE embed_usage(
     tokens INTEGER NOT NULL
 );
 INSERT INTO workspaces(path, created) VALUES ('shared', unixepoch());
-"#];
+"#;
+
+const OBSERVATION_FIELDS: &str = r#"
+ALTER TABLE documents ADD COLUMN category TEXT CHECK (
+    category IS NULL
+    OR (category IN ('correction', 'rework', 'search', 'skill', 'tool') AND kind = 'note')
+);
+ALTER TABLE documents ADD COLUMN status TEXT CHECK (
+    status IN ('open', 'done', 'dismissed') AND (status IS NULL) = (category IS NULL)
+);
+ALTER TABLE documents ADD COLUMN closed_at INTEGER CHECK (
+    (closed_at IS NULL) = (status IS NULL OR status = 'open')
+);
+ALTER TABLE documents ADD COLUMN resolution TEXT CHECK (
+    resolution IS NULL OR closed_at IS NOT NULL
+);
+"#;
+
+const BACKFILL_LEGACY_OBSERVATIONS: &str = r#"
+UPDATE documents SET status = 'open', category = CASE
+        WHEN substr(title, 1, instr(title, ': ') - 1)
+             IN ('correction', 'rework', 'search', 'skill', 'tool')
+        THEN substr(title, 1, instr(title, ': ') - 1)
+        ELSE 'tool' END
+    WHERE kind = 'note' AND ws_id IN (
+        SELECT id FROM workspaces WHERE path = 'observations' OR path LIKE '%/observations'
+    );
+"#;
 
 /// Register sqlite-vec on this connection only. The spike used
 /// `sqlite3_auto_extension`, which is process-wide; the nebula binary also
@@ -120,45 +149,59 @@ fn setup(mut conn: Connection) -> Result<Connection> {
         "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;
          PRAGMA busy_timeout = 10000;",
     )?;
-    migrate(&mut conn)?;
+    migrate(&mut conn, MIGRATIONS)?;
     check_model(&conn)?;
     Ok(conn)
 }
 
-fn migrate(conn: &mut Connection) -> Result<()> {
-    let applied = conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? as usize;
-    if applied > MIGRATIONS.len() {
-        bail!(
-            "rag.db schema v{applied} is newer than this nebula (v{}) — upgrade nebula",
-            MIGRATIONS.len()
-        );
+fn migrate(conn: &mut Connection, migrations: &[&str]) -> Result<()> {
+    let applied = |c: &Connection| -> Result<usize> {
+        let applied = c.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? as usize;
+        if applied > migrations.len() {
+            bail!(
+                "rag.db schema v{applied} is newer than this nebula (v{}) — upgrade nebula",
+                migrations.len()
+            );
+        }
+        Ok(applied)
+    };
+    if applied(conn)? == migrations.len() {
+        return Ok(());
     }
-    for (i, sql) in MIGRATIONS.iter().enumerate().skip(applied) {
-        let tx = conn.transaction()?;
+    // The write lock comes first and the version is read again under it:
+    // another process opening the database now may have migrated it since.
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    for (i, sql) in migrations.iter().enumerate().skip(applied(&tx)?) {
         tx.execute_batch(sql)
             .with_context(|| format!("rag migration {}", i + 1))?;
         tx.pragma_update(None, "user_version", (i + 1) as i64)?;
-        tx.commit()?;
     }
+    tx.commit()?;
     Ok(())
 }
 
 fn check_model(conn: &Connection) -> Result<()> {
-    let stored: Option<String> = conn
-        .query_row("SELECT value FROM meta WHERE key = 'model'", [], |r| {
+    let stored = || -> Option<String> {
+        conn.query_row("SELECT value FROM meta WHERE key = 'model'", [], |r| {
             r.get(0)
         })
-        .ok();
-    match stored {
+        .ok()
+    };
+    let model = match stored() {
+        Some(m) => m,
         None => {
-            conn.execute("INSERT INTO meta(key, value) VALUES ('model', ?1)", [MODEL])?;
+            // OR IGNORE, then read back: another first open may have won.
+            conn.execute(
+                "INSERT OR IGNORE INTO meta(key, value) VALUES ('model', ?1)",
+                [MODEL],
+            )?;
+            stored().context("rag.db has no model row after writing it")?
         }
-        Some(m) if m != MODEL => {
-            bail!(
-                "rag.db was embedded with {m}, this nebula uses {MODEL}: re-embedding is required"
-            )
-        }
-        Some(_) => {}
+    };
+    if model != MODEL {
+        bail!(
+            "rag.db was embedded with {model}, this nebula uses {MODEL}: re-embedding is required"
+        )
     }
     Ok(())
 }
@@ -208,5 +251,110 @@ mod tests {
         drop(conn);
         let err = open(&path).unwrap_err().to_string();
         assert!(err.contains("re-embedding"), "{err}");
+    }
+
+    #[test]
+    fn simultaneous_first_opens_after_an_upgrade_all_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rag.db");
+        let mut v1 = Connection::open(&path).unwrap();
+        register_vec(&v1).unwrap();
+        v1.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+        migrate(&mut v1, &MIGRATIONS[..1]).unwrap();
+        drop(v1);
+
+        let start = std::sync::Barrier::new(8);
+        let errors: Vec<String> = std::thread::scope(|s| {
+            let opens: Vec<_> = (0..8)
+                .map(|_| {
+                    s.spawn(|| {
+                        start.wait();
+                        open(&path).map(drop).map_err(|e| format!("{e:#}"))
+                    })
+                })
+                .collect();
+            opens
+                .into_iter()
+                .filter_map(|t| t.join().unwrap().err())
+                .collect()
+        });
+        assert_eq!(errors, Vec::<String>::new());
+        let columns: i64 = open(&path)
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('documents') WHERE name = 'category'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(columns, 1);
+    }
+
+    #[test]
+    fn notes_in_observations_workspaces_become_open_observations() {
+        use crate::obs::{Category, ObsFilter, Status};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rag.db");
+        let mut v1 = Connection::open(&path).unwrap();
+        register_vec(&v1).unwrap();
+        migrate(&mut v1, &MIGRATIONS[..1]).unwrap();
+        v1.execute_batch(
+            "INSERT INTO workspaces(id, path, created) VALUES
+                 (10, 'apps/x/observations', 0), (11, 'shared/observations', 0), (12, 'apps/x/notes', 0);
+             INSERT INTO documents(id, ws_id, kind, title, body, created, updated) VALUES
+                 (1, 10, 'note', 'rework: tests rewritten twice', 'b1', 100, 100),
+                 (2, 11, 'note', 'the hop dropped a quote', 'b2', 200, 200),
+                 (3, 12, 'note', 'rework: a plain note', 'b3', 300, 300);",
+        )
+        .unwrap();
+        drop(v1);
+
+        let rag = crate::Rag::with_conn(
+            open(&path).unwrap(),
+            Box::new(crate::embed::fake::FakeEmbedder::default()),
+        );
+        let got: Vec<_> = rag
+            .obs_list(&ObsFilter::default())
+            .unwrap()
+            .into_iter()
+            .map(|o| (o.id, o.app, o.category, o.status, o.title))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (
+                    2,
+                    "shared".to_string(),
+                    Category::Tool,
+                    Status::Open,
+                    "the hop dropped a quote".to_string()
+                ),
+                (
+                    1,
+                    "x".to_string(),
+                    Category::Rework,
+                    Status::Open,
+                    "rework: tests rewritten twice".to_string()
+                ),
+            ]
+        );
+        assert_eq!(
+            rag.obs(3).unwrap_err().to_string(),
+            "note:3 is a note, not an observation"
+        );
+        let titles: Vec<String> = rag
+            .notes(None, false)
+            .unwrap()
+            .into_iter()
+            .map(|n| n.title)
+            .collect();
+        assert_eq!(
+            titles,
+            vec![
+                "rework: a plain note",
+                "the hop dropped a quote",
+                "rework: tests rewritten twice"
+            ]
+        );
     }
 }

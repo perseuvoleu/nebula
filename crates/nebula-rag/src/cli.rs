@@ -4,6 +4,7 @@
 
 use crate::apps::origin_of;
 use crate::embed::{self, Embedded, Embedder, WorkersAi};
+use crate::obs::{since_cutoff, Category, Obs, ObsFilter, Status, Transition};
 use crate::store::{age, Hit, Kind, NewDoc, NoteAdded, Rag};
 use crate::ws;
 use anyhow::{anyhow, bail, Context, Result};
@@ -81,6 +82,12 @@ pub enum RagCommand {
     Note {
         #[command(subcommand)]
         command: NoteCommand,
+    },
+    /// Observations: things that went wrong while an agent worked, each
+    /// with a category and a status (open, done, dismissed). Never deduped.
+    Obs {
+        #[command(subcommand)]
+        command: ObsCommand,
     },
     /// Repos whose markdown on origin/main is indexed.
     App {
@@ -172,6 +179,92 @@ pub enum NoteCommand {
 }
 
 #[derive(Subcommand, Debug)]
+pub enum ObsCommand {
+    /// Record one ("<text>"). The same event saved again is a new row.
+    Add {
+        /// What went wrong (words are joined).
+        #[arg(required = true, num_args = 1..)]
+        text: Vec<String>,
+        /// correction, rework, search, skill or tool.
+        #[arg(long)]
+        category: Category,
+        /// Default: the first line of the text.
+        #[arg(long)]
+        title: Option<String>,
+        /// App it belongs to (default: this checkout's app, else `shared`).
+        #[arg(long)]
+        app: Option<String>,
+    },
+    /// Observations, newest first, across every app and shared.
+    List {
+        /// open, done, dismissed or all.
+        #[arg(long, default_value = "open")]
+        status: StatusFilter,
+        #[arg(long)]
+        category: Option<Category>,
+        /// One app, or `shared`.
+        #[arg(long)]
+        app: Option<String>,
+        /// Created in the last 7d / 24h, or since a date (2026-10-01, UTC).
+        #[arg(long, value_parser = since_arg)]
+        since: Option<i64>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// One observation in full, with its resolution once closed.
+    Show {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Close as fixed; --note says what was built.
+    Done {
+        #[arg(required = true)]
+        ids: Vec<String>,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Close as not important; --note says why.
+    Dismiss {
+        #[arg(required = true)]
+        ids: Vec<String>,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Back to open; the resolution is cleared.
+    Reopen {
+        #[arg(required = true)]
+        ids: Vec<String>,
+    },
+    /// Counts by status, category and app: where the period went.
+    Stats {
+        /// Created in the last 7d / 24h, or since a date (2026-10-01, UTC).
+        #[arg(long, value_parser = since_arg)]
+        since: Option<i64>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct StatusFilter(Option<Status>);
+
+impl std::str::FromStr for StatusFilter {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        Ok(Self(match s {
+            "all" => None,
+            s => Some(s.parse().map_err(|e| anyhow!("{e}, or all"))?),
+        }))
+    }
+}
+
+fn since_arg(s: &str) -> Result<i64> {
+    since_cutoff(s, crate::db::now())
+}
+
+#[derive(Subcommand, Debug)]
 pub enum AppCommand {
     /// Register a repo checkout on the RAG host; creates apps/<name>/{docs,notes}.
     Add {
@@ -250,6 +343,7 @@ pub fn run(args: RagArgs) -> Result<()> {
         } => add(&mut rag, &ctx, target, ws, title, no_dedup, name),
         RagCommand::Ws { command } => ws_cmd(&mut rag, command),
         RagCommand::Note { command } => note_cmd(&mut rag, &ctx, command),
+        RagCommand::Obs { command } => obs_cmd(&mut rag, &ctx, command),
         RagCommand::App { command } => app_cmd(&rag, command),
         RagCommand::Sync { app, full } => crate::sync::run(&mut rag, app.as_deref(), full),
         RagCommand::Setup { .. } => unreachable!("handled above"),
@@ -845,6 +939,148 @@ fn note_cmd(rag: &mut Rag, ctx: &Ctx, cmd: NoteCommand) -> Result<()> {
     }
 }
 
+fn obs_id(s: &str) -> Result<i64> {
+    s.strip_prefix("obs:")
+        .or_else(|| s.strip_prefix("note:"))
+        .unwrap_or(s)
+        .parse()
+        .map_err(|_| anyhow!("bad observation id {s:?} (obs:<n>, note:<n> or <n>)"))
+}
+
+fn obs_cmd(rag: &mut Rag, ctx: &Ctx, cmd: ObsCommand) -> Result<()> {
+    match cmd {
+        ObsCommand::Add {
+            text,
+            category,
+            title,
+            app,
+        } => {
+            let o = rag.obs_add(
+                app.as_deref().or(ctx.app.as_deref()),
+                category,
+                title.as_deref(),
+                &text.join(" "),
+                ctx.source.as_deref(),
+            )?;
+            println!("saved obs:{} → {}", o.id, o.ws);
+            Ok(())
+        }
+        ObsCommand::List {
+            status,
+            category,
+            app,
+            since,
+            json,
+        } => {
+            let all = rag.obs_list(&ObsFilter {
+                status: status.0,
+                category,
+                app,
+                since,
+            })?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&all)?);
+                return Ok(());
+            }
+            if all.is_empty() {
+                println!("no observations");
+            }
+            let mixed = all.iter().any(|o| o.status != all[0].status);
+            for o in &all {
+                let status = if mixed {
+                    format!("{:<10}", o.status.as_str())
+                } else {
+                    String::new()
+                };
+                println!(
+                    "obs:{:<5} {:>4}  {:<14} {:<11}{status} {}",
+                    o.id,
+                    age(o.created),
+                    o.app,
+                    o.category.as_str(),
+                    o.title
+                );
+            }
+            Ok(())
+        }
+        ObsCommand::Show { id, json } => {
+            let o = rag.obs(obs_id(&id)?)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&o)?);
+                return Ok(());
+            }
+            print_obs(&o);
+            Ok(())
+        }
+        ObsCommand::Done { ids, note } => obs_apply(rag, &ids, Transition::Done(note.as_deref())),
+        ObsCommand::Dismiss { ids, note } => {
+            obs_apply(rag, &ids, Transition::Dismiss(note.as_deref()))
+        }
+        ObsCommand::Reopen { ids } => obs_apply(rag, &ids, Transition::Reopen),
+        ObsCommand::Stats { since, json } => {
+            let stats = rag.obs_stats(since)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&stats)?);
+                return Ok(());
+            }
+            println!("{} observations", stats.total);
+            for (label, counts) in [
+                ("status", &stats.by_status),
+                ("category", &stats.by_category),
+                ("app", &stats.by_app),
+            ] {
+                let mut rows: Vec<_> = counts.iter().collect();
+                rows.sort_by(|a, b| b.1.cmp(a.1));
+                let rows: Vec<String> = rows.iter().map(|(k, n)| format!("{k} {n}")).collect();
+                println!("{label:<9} {}", rows.join(", "));
+            }
+            Ok(())
+        }
+    }
+}
+
+fn print_obs(o: &Obs) {
+    println!(
+        "obs:{}  {} · {}  {}",
+        o.id,
+        o.category.as_str(),
+        o.status.as_str(),
+        o.title
+    );
+    println!(
+        "app: {}  ws: {}  created: {}  source: {}",
+        o.app,
+        o.ws,
+        ago(o.created),
+        o.source.as_deref().unwrap_or("-")
+    );
+    if let Some(t) = o.closed_at {
+        println!(
+            "closed: {}  resolution: {}",
+            ago(t),
+            o.resolution.as_deref().unwrap_or("-")
+        );
+    }
+    println!("\n{}", o.body);
+}
+
+fn obs_apply(rag: &Rag, ids: &[String], transition: Transition) -> Result<()> {
+    let mut failed = 0;
+    for id in ids {
+        match obs_id(id).and_then(|n| rag.obs_apply(n, transition)) {
+            Ok(o) => println!("obs:{} {}", o.id, o.status.as_str()),
+            Err(e) => {
+                failed += 1;
+                eprintln!("nebula rag: {e}");
+            }
+        }
+    }
+    if failed > 0 {
+        bail!("{failed} of {} not changed", ids.len());
+    }
+    Ok(())
+}
+
 fn edit_in_editor(body: &str) -> Result<String> {
     let editor = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
@@ -961,6 +1197,38 @@ mod tests {
             .collect();
         strip_globals(&mut a);
         assert_eq!(a, vec!["add", "--source", "text"]);
+    }
+
+    #[test]
+    fn an_observation_id_reads_with_either_label_or_bare() {
+        assert_eq!(obs_id("obs:7").unwrap(), 7);
+        assert_eq!(obs_id("note:7").unwrap(), 7);
+        assert_eq!(obs_id("7").unwrap(), 7);
+        assert_eq!(
+            obs_id("seven").unwrap_err().to_string(),
+            "bad observation id \"seven\" (obs:<n>, note:<n> or <n>)"
+        );
+    }
+
+    #[test]
+    fn one_id_that_is_not_an_observation_fails_the_command_after_the_rest() {
+        let mut rag = Rag::with_conn(
+            crate::db::open_memory().unwrap(),
+            Box::new(crate::embed::fake::FakeEmbedder::default()),
+        );
+        let a = rag
+            .obs_add(None, Category::Tool, None, "first failure", None)
+            .unwrap()
+            .id;
+        let b = rag
+            .obs_add(None, Category::Tool, None, "second failure", None)
+            .unwrap()
+            .id;
+        let ids = [a.to_string(), "999".to_string(), format!("note:{b}")];
+        let err = obs_apply(&rag, &ids, Transition::Done(None)).unwrap_err();
+        assert_eq!(err.to_string(), "1 of 3 not changed");
+        assert_eq!(rag.obs(a).unwrap().status, Status::Done);
+        assert_eq!(rag.obs(b).unwrap().status, Status::Done);
     }
 
     #[test]

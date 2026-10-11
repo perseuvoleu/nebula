@@ -5,6 +5,7 @@
 use crate::chunk::{anchor_of, chunk_markdown, Chunk};
 use crate::db::{self, now, vec_bytes};
 use crate::embed::{estimate_neurons, CapReached, Embedder, BATCH};
+use crate::obs::Category;
 use crate::ws;
 use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
@@ -440,9 +441,53 @@ impl Rag {
         source: Option<&str>,
         dedup: bool,
     ) -> Result<NoteAdded> {
+        let draft = self.draft_note("note", title, text)?;
+        let similar = if dedup {
+            self.nearest_plain_note(ws_id, &draft.vectors[0])?
+                .filter(|(_, sim)| *sim >= DEDUP_SIMILARITY)
+        } else {
+            None
+        };
+        let tx = self.conn.transaction()?;
+        let result = match similar {
+            Some((id, sim)) => {
+                tx.execute(
+                    "UPDATE documents SET title = ?2, body = ?3, source = coalesce(?4, source), updated = ?5 WHERE id = ?1",
+                    params![id, draft.title, draft.text, source, now()],
+                )?;
+                replace_chunks(&tx, id, ws_id, &draft.chunks, &draft.vectors)?;
+                NoteAdded::Updated(id, sim)
+            }
+            None => NoteAdded::Created(insert_note(&tx, ws_id, &draft, source, None)?),
+        };
+        tx.commit()?;
+        Ok(result)
+    }
+
+    pub(crate) fn add_observation(
+        &mut self,
+        ws_id: i64,
+        title: Option<&str>,
+        text: &str,
+        source: Option<&str>,
+        category: Category,
+    ) -> Result<i64> {
+        let draft = self.draft_note("observation", title, text)?;
+        let tx = self.conn.transaction()?;
+        let id = insert_note(&tx, ws_id, &draft, source, Some(category))?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    fn draft_note<'a>(
+        &self,
+        what: &str,
+        title: Option<&str>,
+        text: &'a str,
+    ) -> Result<NoteDraft<'a>> {
         let text = text.trim();
         if text.is_empty() {
-            bail!("empty note");
+            bail!("empty {what}");
         }
         let title = title
             .map(str::to_string)
@@ -450,45 +495,21 @@ impl Rag {
         let chunks = Self::chunks_for(&title, text);
         let texts: Vec<String> = chunks.iter().map(Chunk::indexed).collect();
         let vectors = self.embed(&texts, true)?;
-        let similar = if dedup {
-            self.nearest_note(ws_id, &vectors[0])?
-                .filter(|(_, sim)| *sim >= DEDUP_SIMILARITY)
-        } else {
-            None
-        };
-        let tx = self.conn.transaction()?;
-        let t = now();
-        let result = match similar {
-            Some((id, sim)) => {
-                tx.execute(
-                    "UPDATE documents SET title = ?2, body = ?3, source = coalesce(?4, source), updated = ?5 WHERE id = ?1",
-                    params![id, title, text, source, t],
-                )?;
-                replace_chunks(&tx, id, ws_id, &chunks, &vectors)?;
-                NoteAdded::Updated(id, sim)
-            }
-            None => {
-                tx.execute(
-                    "INSERT INTO documents(ws_id, kind, title, body, source, created, updated)
-                     VALUES (?1, 'note', ?2, ?3, ?4, ?5, ?5)",
-                    params![ws_id, title, text, source, t],
-                )?;
-                let id = tx.last_insert_rowid();
-                replace_chunks(&tx, id, ws_id, &chunks, &vectors)?;
-                NoteAdded::Created(id)
-            }
-        };
-        tx.commit()?;
-        Ok(result)
+        Ok(NoteDraft {
+            title,
+            text,
+            chunks,
+            vectors,
+        })
     }
 
     /// The live note in `ws_id` closest to `v`, with its cosine similarity.
-    fn nearest_note(&self, ws_id: i64, v: &[f32]) -> Result<Option<(i64, f64)>> {
+    fn nearest_plain_note(&self, ws_id: i64, v: &[f32]) -> Result<Option<(i64, f64)>> {
         let mut st = self.conn.prepare(
             "SELECT d.id, v.distance FROM chunk_vec v
              JOIN chunks c ON c.id = v.rowid JOIN documents d ON d.id = c.doc_id
              WHERE v.embedding MATCH ?1 AND v.k = 10 AND v.ws_id = ?2
-               AND d.kind = 'note' AND d.deleted_at IS NULL
+               AND d.kind = 'note' AND d.deleted_at IS NULL AND d.category IS NULL
              ORDER BY v.distance LIMIT 1",
         )?;
         Ok(st
@@ -716,6 +737,37 @@ fn note_row(r: &rusqlite::Row) -> rusqlite::Result<Note> {
         updated: r.get(6)?,
         deleted_at: r.get(7)?,
     })
+}
+
+struct NoteDraft<'a> {
+    title: String,
+    text: &'a str,
+    chunks: Vec<Chunk>,
+    vectors: Vec<Vec<f32>>,
+}
+
+fn insert_note(
+    tx: &Transaction,
+    ws_id: i64,
+    draft: &NoteDraft,
+    source: Option<&str>,
+    category: Option<Category>,
+) -> Result<i64> {
+    tx.execute(
+        "INSERT INTO documents(ws_id, kind, title, body, source, created, updated, category, status)
+         VALUES (?1, 'note', ?2, ?3, ?4, ?5, ?5, ?6, CASE WHEN ?6 IS NOT NULL THEN 'open' END)",
+        params![
+            ws_id,
+            draft.title,
+            draft.text,
+            source,
+            now(),
+            category.map(Category::as_str)
+        ],
+    )?;
+    let id = tx.last_insert_rowid();
+    replace_chunks(tx, id, ws_id, &draft.chunks, &draft.vectors)?;
+    Ok(id)
 }
 
 fn replace_chunks(

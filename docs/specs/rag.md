@@ -260,6 +260,52 @@ Where the code settles what the design left open, or deviates from it:
   `<prefix>/rag.db`, default prefix `prod`) and downloads Litestream 0.5.17 to
   `<data_dir>/bin` (sha256 pinned); `--enable` is a separate, explicit step.
 
+## Observations (2026-10-11)
+
+An observation is one thing that went wrong while an agent worked. It replaces the
+convention of plain notes in a workspace named `observations`.
+
+```
+nebula rag obs add "<text>" --category <c> [--title …] [--app <app>]
+nebula rag obs list [--status open|done|dismissed|all] [--category <c>] [--app <app>] [--since <7d|24h|2026-10-01>] [--json]
+nebula rag obs show <id> [--json]
+nebula rag obs done <id>… [--note "<what was built>"]
+nebula rag obs dismiss <id>… [--note "<why>"]
+nebula rag obs reopen <id>…
+nebula rag obs stats [--since …] [--json]
+```
+
+- **Storage:** an observation is a `documents` row with `kind = 'note'` plus `category`,
+  `status`, `resolution` and `closed_at` (migration 2; CHECK constraints keep the four
+  consistent; migration 3 is the backfill below). It is chunked, embedded and searched
+  like any note, open or closed, and
+  `note list` shows it; search hits label it `note:<id>`, the same number as `obs:<id>`,
+  and `show`, `done`, `dismiss` and `reopen` take either label or the bare number.
+- **Upgrade:** pending migrations run in one `BEGIN IMMEDIATE` transaction that re-reads
+  `user_version`, so two first opens after an upgrade cannot both apply them. An older
+  binary refuses the migrated database: replace every nebula binary on the RAG host
+  before the first `rag` call.
+- **Category** is a closed set: `correction`, `rework`, `search`, `skill`, `tool`. An
+  unknown one is refused with the list.
+- **Status** is one enum: `open` → `done` (a fix was built) or `dismissed` (not
+  important); `reopen` returns either to `open` and clears the resolution and the closing
+  time. Repeating `done` or `dismiss` keeps the first closing time, and the resolution
+  unless a new `--note` is given.
+- **No dedup:** the same event saved six times is six rows, and the count is the signal.
+  `rag add` never updates an observation either, even from its workspace.
+- **App:** `apps/<app>/observations`, created when missing; `--app` defaults to the
+  caller's checkout as a note's workspace does, and outside any app (or with
+  `--app shared`) it is `shared/observations`. The name is normalized like a workspace
+  segment on `add` and on `list --app` alike (`Nebula` is `nebula`).
+- **`list`** defaults to `--status open` across every app plus shared (the weekly review
+  is cross-project), newest first. `--since` filters on the creation time; a date is its
+  UTC midnight, and anything that is not `<n>d`, `<n>h` or a real `YYYY-MM-DD` day is
+  refused. `done`, `dismiss` and `reopen` take several ids, report each, and exit
+  non-zero when any is not an observation.
+- **Migration of old notes:** a note already in a workspace whose path ends in
+  `/observations` becomes an open observation, its category taken from a
+  `<category>: ` title prefix, else `tool`.
+
 ## Open questions
 
 None blocking. Follow-ups: re-evaluate the model on the real `origin/main` corpus with
