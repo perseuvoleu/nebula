@@ -127,6 +127,10 @@ enum Command {
         #[command(subcommand)]
         command: RemoteCommand,
     },
+    /// Knowledge base for agents: notes, shared know-how and every app's
+    /// markdown docs, searched semantically. Lives on findl; elsewhere this
+    /// runs `ssh findl nebula rag …`.
+    Rag(nebula_rag::cli::RagArgs),
     /// Collect a settled remote checkout through origin, preserving both
     /// checkouts and all sessions. Prints JSON on success, dry-run, and refusal.
     Collect {
@@ -780,6 +784,7 @@ fn main() -> Result<()> {
                 RemoteCommand::Restart => nebula_tui::RemoteOp::Restart,
             },
         ),
+        Some(Command::Rag(args)) => nebula_rag::cli::run(args),
         Some(Command::Collect { selector, branch, worktree, project, host, agent, dry_run, timeout }) => {
             use nebula_tui::collect_cli::{CollectOpts, Mode};
             nebula_tui::run_collect(CollectOpts {
