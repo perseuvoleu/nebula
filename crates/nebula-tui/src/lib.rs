@@ -52,17 +52,29 @@ pub fn run_tui(open_at: Option<app::OpenAt>) -> Result<event_loop::Handoff> {
     runtime()?.block_on(event_loop::run_app(open_at))
 }
 
-/// `nebula open --session`: resolve the session, then land it in a running
-/// TUI, printing what landed as one JSON object. `Some(id)` when no TUI
+/// `nebula open --session`: resolve the session, land it in a running TUI
+/// and (unless `focus` is off) bring that TUI's window to the front,
+/// printing what landed as one JSON object. `Some(id)` when no TUI
 /// answered — the caller starts one landed on `id` when it has a terminal.
 pub fn run_open_session(
     reference: String,
     project: Option<String>,
+    focus: bool,
 ) -> Result<Option<nebula_core::AgentId>> {
     let resolved = runtime()?.block_on(session_open::resolve(&reference, project.as_deref()))?;
     let Some(pid) = session_open::hand_to_running_tui(&resolved.id)? else {
         return Ok(Some(resolved.id));
     };
+    // The attach is confirmed by now; a window that won't come forward
+    // is reported, not a failure.
+    let focused = focus
+        && match session_open::focus_tui_window(pid) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("nebula: attached, but could not focus its window: {error:#}");
+                false
+            }
+        };
     println!(
         "{}",
         serde_json::json!({
@@ -72,6 +84,7 @@ pub fn run_open_session(
             "name": resolved.name,
             "project": resolved.project,
             "host": resolved.host,
+            "focused": focused,
         })
     );
     Ok(None)

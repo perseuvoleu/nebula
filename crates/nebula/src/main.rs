@@ -32,12 +32,14 @@ enum Command {
     /// (default: the current one) — the repo is added as a project first
     /// when nebula doesn't know it yet. The `ng` launcher uses this.
     ///
-    /// With --session it lands attached to that session instead. A running
-    /// TUI takes the attach and the command prints
-    /// {"landed":"tui","tui_pid",id,name,project,host} (host null when
-    /// local); with none running it starts the TUI here when run in a
-    /// terminal, else exits 3. An unknown, archived or ambiguous session
-    /// exits 1.
+    /// With --session it lands attached to that session instead, opening
+    /// its workspace and unhiding its project when needed. A running TUI
+    /// takes the attach, its window comes to the front, and once the pane
+    /// holds the session's terminal the command prints
+    /// {"landed":"tui","tui_pid",id,name,project,host,focused} (host null
+    /// when local). With no TUI running it starts one here when run in a
+    /// terminal, else exits 3. An unknown, archived or ambiguous session,
+    /// or an attach that fails, exits 1.
     Open {
         /// Directory to land on (default: the current directory).
         #[arg(default_value = ".", conflicts_with = "session")]
@@ -50,6 +52,9 @@ enum Command {
         /// for a remote one (default: every project).
         #[arg(long, requires = "session")]
         project: Option<String>,
+        /// Leave the window where it is (the attach still happens).
+        #[arg(long, requires = "session")]
+        no_focus: bool,
     },
     /// Run the daemon process (normally auto-spawned by the TUI).
     Daemon {
@@ -610,10 +615,11 @@ fn main() -> Result<()> {
         Some(Command::Open {
             session: Some(reference),
             project,
+            no_focus,
             ..
         }) => {
             use std::io::IsTerminal;
-            let Some(id) = nebula_tui::run_open_session(reference, project)? else {
+            let Some(id) = nebula_tui::run_open_session(reference, project, !no_focus)? else {
                 return Ok(());
             };
             if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {

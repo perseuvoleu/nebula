@@ -953,7 +953,14 @@ fn open_session_attaches_it_in_the_running_tui() {
 
     let by_name = nebula_cli(
         &tui,
-        &["open", "--session", "second", "--project", "alpha-proj"],
+        &[
+            "open",
+            "--session",
+            "second",
+            "--project",
+            "alpha-proj",
+            "--no-focus",
+        ],
     );
     assert_eq!(by_name.status.code(), Some(0), "{by_name:?}");
     let landed: serde_json::Value = serde_json::from_slice(&by_name.stdout).unwrap();
@@ -966,6 +973,7 @@ fn open_session_attaches_it_in_the_running_tui() {
             "name": "second",
             "project": "alpha-proj",
             "host": null,
+            "focused": false,
         })
     );
     tui.wait_for_selected("second");
@@ -983,13 +991,13 @@ fn open_session_attaches_it_in_the_running_tui() {
     tui.wait_for_text(FOOTER_TERMINAL_LOCKED);
     tui.type_str("echo split-$((6*7))\r");
     tui.wait_for_text("split-42");
-    let reopen = nebula_cli(&tui, &["open", "--session", &ids[1]]);
+    let reopen = nebula_cli(&tui, &["open", "--session", &ids[1], "--no-focus"]);
     assert_eq!(reopen.status.code(), Some(0), "{reopen:?}");
     assert_typing_reaches(&mut tui, "t1b", &ids[1]);
 
     tui.send(&[0x11]);
     tui.wait_for_text(FOOTER_SESSIONS);
-    let by_id = nebula_cli(&tui, &["open", "--session", &ids[0]]);
+    let by_id = nebula_cli(&tui, &["open", "--session", &ids[0], "--no-focus"]);
     assert_eq!(by_id.status.code(), Some(0), "{by_id:?}");
     tui.wait_for_selected("first");
     tui.wait_for_text(FOOTER_TERMINAL_LOCKED);
@@ -1005,7 +1013,7 @@ fn open_session_attaches_it_in_the_running_tui() {
     tui.wait_for_gone("alpha-proj");
     tui.send(&[0x11]);
     tui.wait_for_text(FOOTER_PROJECTS);
-    let out_of_scope = nebula_cli(&tui, &["open", "--session", "second"]);
+    let out_of_scope = nebula_cli(&tui, &["open", "--session", "second", "--no-focus"]);
     assert_eq!(out_of_scope.status.code(), Some(0), "{out_of_scope:?}");
     tui.wait_for_text("alpha-proj");
     tui.wait_for_selected("second");
@@ -1025,7 +1033,7 @@ fn open_session_attaches_it_in_the_running_tui() {
     }
     tui.send(b"\r");
     tui.wait_for_text("PROJECTS    ▾ 1");
-    let hidden = nebula_cli(&tui, &["open", "--session", "first"]);
+    let hidden = nebula_cli(&tui, &["open", "--session", "first", "--no-focus"]);
     assert_eq!(hidden.status.code(), Some(0), "{hidden:?}");
     tui.wait_for_gone("▾ 1");
     assert_typing_reaches(&mut tui, "t2c", &ids[0]);
@@ -1100,7 +1108,7 @@ fn open_session_fails_when_the_attach_fails() {
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    let out = nebula_cli(&tui, &["open", "--session", "broken"]);
+    let out = nebula_cli(&tui, &["open", "--session", "broken", "--no-focus"]);
     assert_eq!(out.status.code(), Some(1), "{out:?}");
     assert!(out.stdout.is_empty(), "{out:?}");
     let stderr = String::from_utf8_lossy(&out.stderr);

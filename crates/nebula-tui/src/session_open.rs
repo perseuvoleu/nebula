@@ -6,7 +6,7 @@
 //! knows a TUI landed it.
 
 use crate::ipc;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use nebula_core::{paths, AgentId};
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -196,10 +196,89 @@ pub fn ack(request: &Request, error: Option<String>) {
     let _ = write_atomically(&ack_path(), &ack.to_string());
 }
 
+/// Bring the window of the app running the TUI `tui_pid` — the Ghostty
+/// instance `ng` started — to the front, un-minimized. It goes by the app
+/// through System Events, never by posting keys; the calling app needs the
+/// Automation permission for System Events (macOS asks once). Restoring a
+/// minimized window also needs Accessibility, and is skipped without it.
+pub fn focus_tui_window(tui_pid: u32) -> Result<()> {
+    let app = app_ancestor(tui_pid, parent_of)
+        .with_context(|| format!("no app owns the nebula TUI (pid {tui_pid})"))?;
+    // Every statement filters by unix id again: a stored process reference
+    // resolves by name, which is the first instance of the same app.
+    let script = format!(
+        r#"tell application "System Events"
+    try
+        set value of attribute "AXMinimized" of every window of (first process whose unix id is {app}) to false
+    end try
+    set frontmost of (first process whose unix id is {app}) to true
+end tell"#
+    );
+    let out = std::process::Command::new("osascript")
+        .args(["-e", &script])
+        .output()
+        .context("run osascript")?;
+    if !out.status.success() {
+        bail!("osascript: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(())
+}
+
+/// `pid`'s parent and executable path, from `ps`.
+fn parent_of(pid: u32) -> Option<(u32, String)> {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "ppid=,comm=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (ppid, exe) = text.trim().split_once(char::is_whitespace)?;
+    Some((ppid.parse().ok()?, exe.trim().to_owned()))
+}
+
+/// The nearest ancestor of `pid` that runs from an app bundle.
+fn app_ancestor(pid: u32, parent_of: impl Fn(u32) -> Option<(u32, String)>) -> Option<u32> {
+    let mut current = pid;
+    for _ in 0..32 {
+        let (parent, _) = parent_of(current)?;
+        if parent <= 1 {
+            return None;
+        }
+        let (_, exe) = parent_of(parent)?;
+        if exe.contains(".app/Contents/MacOS/") {
+            return Some(parent);
+        }
+        current = parent;
+    }
+    None
+}
+
 /// Write-then-rename: the reader never sees half a file.
 fn write_atomically(path: &Path, text: &str) -> Result<()> {
     let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
     std::fs::write(&tmp, text)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_window_to_focus_is_the_tuis_nearest_app_ancestor() {
+        let tree = |pid: u32| match pid {
+            29810 => Some((29808, "nebula".to_owned())),
+            29808 => Some((29805, "/usr/bin/login".to_owned())),
+            29805 => Some((
+                1,
+                "/Applications/Ghostty.app/Contents/MacOS/ghostty".to_owned(),
+            )),
+            1 => Some((0, "/sbin/launchd".to_owned())),
+            _ => None,
+        };
+        assert_eq!(app_ancestor(29810, tree), Some(29805));
+        assert_eq!(app_ancestor(29808, tree), Some(29805));
+        assert_eq!(app_ancestor(1, tree), None);
+        assert_eq!(app_ancestor(4242, tree), None);
+    }
 }
