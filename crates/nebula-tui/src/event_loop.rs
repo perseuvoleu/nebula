@@ -3,7 +3,7 @@
 use crate::app::{
     AfterCheckout, App, AttachedTerm, ConfirmDialog, ConnState, ContextMenu, DiffView, FileFinder,
     Focus, GrepView, HitTarget, LinkRow, MenuAction, MenuItem, MetricsView, NoteInput, NoteView,
-    Overlay, Palette, PaletteTarget, PanelEntry, PanelRow, PendingAction, PendingIntent,
+    OpenStage, Overlay, Palette, PaletteTarget, PanelEntry, PanelRow, PendingAction, PendingIntent,
     PointerShape, ProjectRow, PromptDialog, PromptKind, SessionRow, SettingsView, SplitterDrag,
     SubmenuKind, TermSelection, TodoInput, TodoInputTarget, TodoView, WorktreeRollback,
 };
@@ -6825,11 +6825,53 @@ fn start_open_session(
         finish_open_session(app, Err("replaced by a newer nebula open --session".into()));
     }
     app.open_session = Some(crate::app::OpenSession {
-        agent: id.clone(),
+        agent: id,
         request,
-        attaching: false,
+        stage: OpenStage::Showing,
         deadline: std::time::Instant::now() + crate::session_open::ATTACH_TIMEOUT,
     });
+    land_open_session(app, out);
+}
+
+/// One step of the landing in flight: open the session's workspace when
+/// another one is open (resumed by ActiveWorkspaceChanged), unhide its
+/// project, then jump to it and attach.
+fn land_open_session(app: &mut App, out: &mut Vec<ClientRequest>) {
+    let Some(id) = app.open_session.as_ref().map(|o| o.agent.clone()) else {
+        return;
+    };
+    let project = app
+        .tree
+        .agents
+        .iter()
+        .find(|a| a.id == id)
+        .and_then(|a| app.tree.worktrees.iter().find(|w| w.id == a.worktree_id))
+        .and_then(|w| app.tree.projects.iter().find(|p| p.id == w.project_id))
+        .cloned();
+    let Some(project) = project else {
+        let error = format!(
+            "session \"{}\" is gone from the daemon",
+            agent_label(app, &id)
+        );
+        finish_open_session(app, Err(error));
+        return;
+    };
+    if project.workspace_id != app.tree.active_workspace {
+        let req_id = app.alloc_req_id(PendingIntent::None);
+        out.push(ClientRequest::OpenWorkspace {
+            req_id,
+            id: project.workspace_id.clone(),
+        });
+        if let Some(open) = app.open_session.as_mut() {
+            open.stage = OpenStage::AwaitingWorkspace;
+        }
+        return;
+    }
+    for member in app.tree.project_family(&project.id) {
+        if app.tree.hidden_projects.contains(&member) {
+            set_project_hidden(app, member, false, out);
+        }
+    }
     let sref = SessionRef::Agent(id.clone());
     jump_to_target(app, PaletteTarget::Session(id.clone()), true, out);
     // Re-attaching the pane it already holds keeps a ⌘D split's focus;
@@ -6847,13 +6889,13 @@ fn start_open_session(
         || app.split_term.as_ref().is_some_and(|t| t.sref == sref);
     if attach_sent {
         if let Some(open) = app.open_session.as_mut() {
-            open.attaching = true;
+            open.stage = OpenStage::Attaching;
         }
     } else if shown {
         finish_open_session(app, Ok(()));
     } else {
         let error = format!(
-            "the running nebula TUI could not show \"{}\" — its project is outside the open workspace or hidden",
+            "the running nebula TUI could not show \"{}\"",
             agent_label(app, &id)
         );
         finish_open_session(app, Err(error));
@@ -9282,11 +9324,9 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             base_seq,
             data,
         } => {
-            if app
-                .open_session
-                .as_ref()
-                .is_some_and(|o| o.attaching && session == SessionRef::Agent(o.agent.clone()))
-            {
+            if app.open_session.as_ref().is_some_and(|o| {
+                o.stage == OpenStage::Attaching && session == SessionRef::Agent(o.agent.clone())
+            }) {
                 finish_open_session(app, Ok(()));
             }
             if let Some(term) = app.term.as_mut().filter(|t| t.sref == session) {
@@ -9566,6 +9606,13 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                 // An open switcher keeps its ✓ on the now-open workspace.
                 refresh_workspace_picker(app);
             }
+            if app
+                .open_session
+                .as_ref()
+                .is_some_and(|o| o.stage == OpenStage::AwaitingWorkspace)
+            {
+                land_open_session(app, out);
+            }
             app.dirty = true;
         }
         ServerEvent::Metrics { req_id, snapshot } => {
@@ -9581,7 +9628,11 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
         ServerEvent::Error { req_id, message } => {
             // The daemon answers a failed Attach with an unnumbered error.
             if req_id.is_none() && message.starts_with("attach:") {
-                if let Some(open) = app.open_session.as_ref().filter(|o| o.attaching) {
+                if let Some(open) = app
+                    .open_session
+                    .as_ref()
+                    .filter(|o| o.stage == OpenStage::Attaching)
+                {
                     let error = format!(
                         "nebula could not attach \"{}\": {message}",
                         agent_label(app, &open.agent)

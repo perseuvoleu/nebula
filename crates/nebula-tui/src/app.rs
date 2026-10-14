@@ -982,17 +982,27 @@ pub enum OpenAt {
     Session(AgentId),
 }
 
-/// A `nebula open --session` landing: the session is shown, then attached;
-/// it ends once the daemon sends the session's screen, or with an error.
+/// A `nebula open --session` landing: the session's project is revealed,
+/// the session shown, then attached; it ends once the daemon sends the
+/// session's screen, or with an error by `deadline`.
 pub struct OpenSession {
     pub agent: AgentId,
     /// The running-TUI request to answer; None when the command started
     /// this TUI (an error is then only flashed).
     pub request: Option<crate::session_open::Request>,
-    /// Set once the Attach is on its way; the landing then waits for the
-    /// session's Scrollback until `deadline`.
-    pub attaching: bool,
+    pub stage: OpenStage,
     pub deadline: std::time::Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenStage {
+    /// Revealing and showing the session; no reply awaited yet.
+    Showing,
+    /// The session's workspace was asked open; ActiveWorkspaceChanged
+    /// resumes the landing.
+    AwaitingWorkspace,
+    /// The Attach is on its way; the session's Scrollback ends the landing.
+    Attaching,
 }
 
 /// What a `/` palette row jumps to.

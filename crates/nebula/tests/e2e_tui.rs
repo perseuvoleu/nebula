@@ -1003,13 +1003,33 @@ fn open_session_attaches_it_in_the_running_tui() {
         assert!(out.status.success(), "{args:?}: {out:?}");
     }
     tui.wait_for_gone("alpha-proj");
+    tui.send(&[0x11]);
+    tui.wait_for_text(FOOTER_PROJECTS);
     let out_of_scope = nebula_cli(&tui, &["open", "--session", "second"]);
-    assert_eq!(out_of_scope.status.code(), Some(1), "{out_of_scope:?}");
-    assert_eq!(
-        String::from_utf8_lossy(&out_of_scope.stderr).trim(),
-        "Error: the running nebula TUI could not show \"second\" — its project is outside the open workspace or hidden"
-    );
-    let out = nebula_cli(&tui, &["workspace", "open", "default"]);
+    assert_eq!(out_of_scope.status.code(), Some(0), "{out_of_scope:?}");
+    tui.wait_for_text("alpha-proj");
+    tui.wait_for_selected("second");
+    assert_typing_reaches(&mut tui, "t2b", &ids[1]);
+
+    tui.send(&[0x11]);
+    tui.wait_for_text(FOOTER_SESSIONS);
+    tui.send(b"\x1b[D\x1b[D");
+    tui.wait_for_text(FOOTER_PROJECTS);
+    tui.send(b"m");
+    tui.wait_for_text("Remove from list");
+    let deadline = Instant::now() + WAIT;
+    while !row_is_selected(&tui.parser.lock().unwrap().screen().clone(), "Hide") {
+        assert!(Instant::now() < deadline, "menu never reached Hide");
+        tui.send(b"\x1b[B");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    tui.send(b"\r");
+    tui.wait_for_text("PROJECTS    ▾ 1");
+    let hidden = nebula_cli(&tui, &["open", "--session", "first"]);
+    assert_eq!(hidden.status.code(), Some(0), "{hidden:?}");
+    tui.wait_for_gone("▾ 1");
+    assert_typing_reaches(&mut tui, "t2c", &ids[0]);
+    let out = nebula_cli(&tui, &["workspace", "open", "other"]);
     assert!(out.status.success(), "{out:?}");
 
     tui.child.kill().unwrap();
