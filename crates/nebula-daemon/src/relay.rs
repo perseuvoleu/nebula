@@ -41,7 +41,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncRead, AsyncWrite, BufReader, BufWriter};
 use tokio::sync::mpsc;
 
 /// What this daemon shows of one host.
@@ -58,15 +58,52 @@ pub struct Mirror {
     pub ids: HashSet<String>,
 }
 
+/// A local connection receiving remote replies and ordered terminal frames.
+/// Overflow closes the entire connection; reconnecting clients get a snapshot.
+#[derive(Clone)]
+pub struct RelayClient {
+    tx: mpsc::Sender<ServerEvent>,
+    closed: tokio_util::sync::CancellationToken,
+}
+
+impl RelayClient {
+    /// Bind delivery to the server connection's cancellation signal.
+    pub fn new(tx: mpsc::Sender<ServerEvent>, closed: tokio_util::sync::CancellationToken) -> Self {
+        Self { tx, closed }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.is_cancelled() || self.tx.is_closed()
+    }
+
+    fn same_channel(&self, other: &Self) -> bool {
+        self.tx.same_channel(&other.tx)
+    }
+
+    fn deliver(&self, event: ServerEvent) {
+        if !self.is_closed() && self.tx.try_send(event).is_err() {
+            // Never skip VT bytes and then continue the same stream.
+            self.closed.cancel();
+        }
+    }
+}
+
+struct QueuedRequest {
+    request: ClientRequest,
+    enqueued: tokio::time::Instant,
+}
+
 pub struct Relay {
     pub host: String,
     /// Frames bound for the host daemon; the run loop writes them.
-    out: mpsc::Sender<ClientRequest>,
+    out: mpsc::Sender<QueuedRequest>,
+    /// Serializes request admission with connection teardown and queue draining.
+    admission: Mutex<()>,
     pub mirror: Mutex<Mirror>,
     /// Clients watching a mirrored session's PTY, by session.
-    attached: Mutex<HashMap<SessionRef, Vec<(mpsc::Sender<ServerEvent>, (u16, u16))>>>,
-    /// Relay req_id → (asking client, its own req_id).
-    pending: Mutex<HashMap<u64, (mpsc::Sender<ServerEvent>, u64)>>,
+    attached: Mutex<HashMap<SessionRef, Vec<(RelayClient, (u16, u16))>>>,
+    /// Relay req_id → (asking client, its own req_id, admission time).
+    pending: Mutex<HashMap<u64, (RelayClient, u64, tokio::time::Instant)>>,
     next_req: AtomicU64,
     pub connected: AtomicBool,
     /// AddProject requests this relay sent for wanted paths the host lacked,
@@ -92,6 +129,7 @@ impl Relay {
         let relay = Arc::new(Relay {
             host,
             out,
+            admission: Mutex::new(()),
             mirror: Mutex::new(Mirror::default()),
             attached: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
@@ -112,8 +150,14 @@ impl Relay {
     /// anchor covers any more.
     pub fn refresh_anchors(&self, daemon: &Daemon) {
         rescope(self, daemon, false);
+        let _admission = self.admission.lock().unwrap();
+        if !self.connected.load(Ordering::Relaxed) { return; }
         for req in missing_adds(self, daemon) {
-            let _ = self.out.try_send(req);
+            if let Err(error) = self.out.try_send(QueuedRequest { request: req, enqueued: tokio::time::Instant::now() }) {
+                if let Some(id) = request_req_id(&error.into_inner().request) {
+                    self.pending_adds.lock().unwrap().remove(&id);
+                }
+            }
         }
     }
 
@@ -147,7 +191,8 @@ impl Relay {
 
     /// Hand a client's request to the host daemon. `client` is the
     /// connection's writer: replies and PTY frames come back through it.
-    pub async fn forward(&self, req: ClientRequest, client: &mpsc::Sender<ServerEvent>) {
+    pub async fn forward(&self, req: ClientRequest, client: &RelayClient) {
+        let _admission = self.admission.lock().unwrap();
         let req = match req {
             ClientRequest::Attach {
                 session,
@@ -180,11 +225,21 @@ impl Relay {
             }
             other => match request_req_id(&other) {
                 Some(local) => {
+                    if self.pending.lock().unwrap().len() >= 256 {
+                        client.deliver(ServerEvent::Error {
+                            req_id: Some(local),
+                            message: format!(
+                                "{}: too many pending requests; request was not sent",
+                                self.host
+                            ),
+                        });
+                        return;
+                    }
                     let remote = self.next_req.fetch_add(1, Ordering::Relaxed);
                     self.pending
                         .lock()
                         .unwrap()
-                        .insert(remote, (client.clone(), local));
+                        .insert(remote, (client.clone(), local, tokio::time::Instant::now()));
                     match with_req_id(&other, remote) {
                         Some(r) => r,
                         None => other,
@@ -196,22 +251,65 @@ impl Relay {
         if !self.connected.load(Ordering::Relaxed) {
             let waiting = request_req_id(&req)
                 .and_then(|remote| self.pending.lock().unwrap().remove(&remote));
-            if let Some((client, local)) = waiting {
-                let _ = client
-                    .send(ServerEvent::Error {
-                        req_id: Some(local),
-                        message: format!("{} is unreachable right now", self.host),
-                    })
-                    .await;
+            if matches!(req, ClientRequest::Attach { .. }) {
+                client.deliver(ServerEvent::Error {
+                    req_id: None,
+                    message: nebula_core::relay_status::RelayStatus {
+                        host: self.host.clone(),
+                        connected: false,
+                    }
+                    .message(),
+                });
+            }
+            if let Some((client, local, _)) = waiting {
+                client.deliver(ServerEvent::Error {
+                    req_id: Some(local),
+                    message: format!("{} is unreachable right now", self.host),
+                });
             }
             return;
         }
-        let _ = self.out.send(req).await;
+        if let Err(error) = self.out.try_send(QueuedRequest {
+            request: req,
+            enqueued: tokio::time::Instant::now(),
+        }) {
+            let req = error.into_inner().request;
+            let req_id = request_req_id(&req).and_then(|remote| {
+                self.pending
+                    .lock()
+                    .unwrap()
+                    .remove(&remote)
+                    .map(|(_, local, _)| local)
+            });
+            client.deliver(ServerEvent::Error {
+                req_id,
+                message: format!("{}: relay queue full; request was not sent", self.host),
+            });
+        }
     }
 
+    fn notify_status(&self, connected: bool) {
+        let event = ServerEvent::Error {
+            req_id: None,
+            message: nebula_core::relay_status::RelayStatus {
+                host: self.host.clone(),
+                connected,
+            }
+            .message(),
+        };
+        let mut clients: Vec<RelayClient> = Vec::new();
+        for (client, _) in self.attached.lock().unwrap().values().flatten() {
+            if !clients.iter().any(|known| known.same_channel(client)) {
+                clients.push(client.clone());
+            }
+        }
+        for client in clients {
+            client.deliver(event.clone());
+        }
+    }
     /// Deliver a PTY-plane frame to the clients watching that session.
     async fn fan_out(&self, session: &SessionRef, ev: ServerEvent) {
-        let watchers: Vec<mpsc::Sender<ServerEvent>> = {
+        let watchers: Vec<RelayClient> = {
             let mut attached = self.attached.lock().unwrap();
             let Some(list) = attached.get_mut(session) else {
                 return;
@@ -220,14 +318,14 @@ impl Relay {
             list.iter().map(|(tx, _)| tx.clone()).collect()
         };
         for tx in watchers {
-            let _ = tx.send(ev.clone()).await;
+            tx.deliver(ev.clone());
         }
     }
 
     /// Route a reply to the client whose request it answers, under that
     /// client's own req_id.
     async fn answer(&self, remote_req: u64, ev: ServerEvent) {
-        let Some((client, local)) = self.pending.lock().unwrap().remove(&remote_req) else {
+        let Some((client, local, _)) = self.pending.lock().unwrap().remove(&remote_req) else {
             return;
         };
         let ev = match ev {
@@ -253,7 +351,7 @@ impl Relay {
             },
             other => other,
         };
-        let _ = client.send(ev).await;
+        client.deliver(ev);
     }
 }
 
@@ -284,28 +382,22 @@ fn relay_command(host: &str) -> tokio::process::Command {
     cmd
 }
 
-async fn run(relay: Arc<Relay>, daemon: Arc<Daemon>, mut out_rx: mpsc::Receiver<ClientRequest>) {
+async fn run(relay: Arc<Relay>, daemon: Arc<Daemon>, mut out_rx: mpsc::Receiver<QueuedRequest>) {
     let mut backoff = RECONNECT_MIN;
     loop {
         if daemon.shutdown.is_cancelled() {
             return;
         }
+        let connected_at = tokio::time::Instant::now();
         match connect_and_pump(&relay, &daemon, &mut out_rx).await {
-            Ok(()) => backoff = RECONNECT_MIN,
+            Ok(()) => {}
             Err(e) => {
                 tracing::warn!(host = %relay.host, error = %e, "relay link down");
             }
         }
         relay.connected.store(false, Ordering::Relaxed);
-        // Pending RPCs can't be answered by a link that died under them.
-        let pending: Vec<_> = relay.pending.lock().unwrap().drain().collect();
-        for (_, (client, local)) in pending {
-            let _ = client
-                .send(ServerEvent::Error {
-                    req_id: Some(local),
-                    message: format!("{}: connection lost", relay.host),
-                })
-                .await;
+        if connected_at.elapsed() >= RECONNECT_MAX {
+            backoff = RECONNECT_MIN;
         }
         tokio::select! {
             _ = daemon.shutdown.cancelled() => return,
@@ -320,7 +412,7 @@ async fn run(relay: Arc<Relay>, daemon: Arc<Daemon>, mut out_rx: mpsc::Receiver<
 async fn connect_and_pump(
     relay: &Arc<Relay>,
     daemon: &Arc<Daemon>,
-    out_rx: &mut mpsc::Receiver<ClientRequest>,
+    out_rx: &mut mpsc::Receiver<QueuedRequest>,
 ) -> Result<()> {
     let mut child = relay_command(&relay.host)
         .stdin(std::process::Stdio::piped())
@@ -329,9 +421,64 @@ async fn connect_and_pump(
         .kill_on_drop(true)
         .spawn()
         .context("spawn relay transport")?;
-    let mut writer = BufWriter::new(child.stdin.take().context("relay stdin")?);
-    let mut reader = BufReader::new(child.stdout.take().context("relay stdout")?);
+    let writer = BufWriter::new(child.stdin.take().context("relay stdin")?);
+    let reader = BufReader::new(child.stdout.take().context("relay stdout")?);
+    pump_transport(
+        relay,
+        daemon,
+        out_rx,
+        reader,
+        writer,
+        Duration::from_secs(10),
+    )
+    .await
+}
 
+/// Speak the relay protocol over one transport; all frame state belongs to
+/// this connection and is discarded when the transport disconnects.
+async fn pump_transport<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    relay: &Arc<Relay>,
+    daemon: &Arc<Daemon>,
+    out_rx: &mut mpsc::Receiver<QueuedRequest>,
+    reader: R,
+    writer: W,
+    progress_timeout: Duration,
+) -> Result<()> {
+    let result = pump_connection(relay, daemon, out_rx, reader, writer, progress_timeout).await;
+    let _admission = relay.admission.lock().unwrap();
+    relay.connected.store(false, Ordering::Relaxed);
+    // Admission never awaits: once this lock is held no old request can
+    // arrive after the drain. The new handshake reopens admission.
+    while out_rx.try_recv().is_ok() {}
+    let pending = std::mem::take(&mut *relay.pending.lock().unwrap());
+    for (_, (client, local, _)) in pending {
+        client.deliver(ServerEvent::Error {
+            req_id: Some(local),
+            message: format!(
+                "{}: connection lost; request outcome unknown; not replayed",
+                relay.host
+            ),
+        });
+    }
+    relay.notify_status(false);
+    // Reconcile adoption against the next full snapshot before asking again.
+    relay.pending_adds.lock().unwrap().clear();
+    relay.attached.lock().unwrap().retain(|_, clients| {
+        clients.retain(|(client, _)| !client.is_closed());
+        !clients.is_empty()
+    });
+    result
+}
+
+async fn pump_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
+    relay: &Arc<Relay>,
+    daemon: &Arc<Daemon>,
+    out_rx: &mut mpsc::Receiver<QueuedRequest>,
+    mut reader: R,
+    mut writer: W,
+    progress_timeout: Duration,
+) -> Result<()> {
+    tokio::time::timeout(progress_timeout, async {
     write_frame(
         &mut writer,
         &ClientRequest::Hello {
@@ -340,7 +487,7 @@ async fn connect_and_pump(
     )
     .await?;
     match read_frame::<ServerEvent, _>(&mut reader).await? {
-        Some(ServerEvent::HelloOk { .. }) => {}
+        Some(ServerEvent::HelloOk { protocol_version, .. }) if protocol_version == PROTOCOL_VERSION => {}
         Some(ServerEvent::Incompatible {
             daemon_protocol_version,
         }) => bail!(
@@ -350,34 +497,91 @@ async fn connect_and_pump(
         other => bail!("unexpected handshake reply: {other:?}"),
     }
     write_frame(&mut writer, &ClientRequest::Subscribe).await?;
-    relay.connected.store(true, Ordering::Relaxed);
+        Ok::<_, anyhow::Error>(())
+    }).await.context("relay handshake timed out")??;
+    {
+        let _admission = relay.admission.lock().unwrap();
+        relay.connected.store(true, Ordering::Relaxed);
+    }
     tracing::info!(host = %relay.host, "relay link up");
 
+    let mut probe_due = tokio::time::Instant::now() + progress_timeout;
+    let mut awaiting_probe = false;
+    let snapshot_due = tokio::time::Instant::now() + progress_timeout * 3;
+    let mut snapshot_received = false;
     loop {
-        tokio::select! {
-            frame = read_frame::<ServerEvent, _>(&mut reader) => {
-                match frame? {
-                    None => return Ok(()),
-                    Some(ev) => {
-                        if let Some(reqs) = handle_event(relay, daemon, ev).await {
-                            for r in reqs {
-                                write_frame(&mut writer, &r).await?;
-                            }
+        // read_frame owns partial header/payload bytes. Keep that future alive
+        // across outgoing requests: cancelling and recreating it loses framing.
+        let frame = {
+            let read = read_frame::<ServerEvent, _>(&mut reader);
+            tokio::pin!(read);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = daemon.shutdown.cancelled() => return Ok(()),
+                    _ = tokio::time::sleep_until(snapshot_due), if !snapshot_received => {
+                        bail!("relay initial snapshot timed out");
+                    }
+                    _ = tokio::time::sleep_until(probe_due) => {
+                        if relay.pending.lock().unwrap().values().any(|(_, _, started)|
+                            started.elapsed() >= progress_timeout * 3) {
+                            bail!("relay request deadline exceeded; outcome unknown");
                         }
+                        if awaiting_probe {
+                            bail!("relay application probe timed out");
+                        }
+                        // Hello is an existing read-only request serviced on the
+                        // subscribed connection. Only one probe is outstanding.
+                        tokio::time::timeout(progress_timeout, write_frame(&mut writer,
+                            &ClientRequest::Hello { protocol_version: PROTOCOL_VERSION }))
+                            .await.context("relay probe write timed out")??;
+                        awaiting_probe = true;
+                        probe_due = tokio::time::Instant::now() + progress_timeout;
+                    }
+                    event = async {
+                        // Fairly choose between frames and requests under load;
+                        // the outer select still gives deadlines priority.
+                        tokio::select! {
+                            frame = &mut read => Ok(frame),
+                            request = out_rx.recv() => Err(request),
+                        }
+                    } => match event {
+                        Ok(frame) => break frame?,
+                        Err(Some(queued)) => {
+                            if queued.enqueued.elapsed() >= progress_timeout {
+                                bail!("relay request queue expired; queued actions discarded");
+                            }
+                            tokio::time::timeout(progress_timeout, write_frame(&mut writer, &queued.request))
+                                .await.context("relay write timed out")??;
+                        }
+                        Err(None) => return Ok(()),
                     }
                 }
             }
-            req = out_rx.recv() => {
-                match req {
-                    Some(r) => write_frame(&mut writer, &r).await?,
-                    None => return Ok(()),
+        };
+        let Some(ev) = frame else {
+            return Ok(());
+        };
+        if matches!(ev, ServerEvent::HelloOk { protocol_version, .. } if protocol_version == PROTOCOL_VERSION)
+        {
+            if awaiting_probe {
+                awaiting_probe = false;
+                probe_due = tokio::time::Instant::now() + progress_timeout;
+            }
+            continue;
+        }
+        if matches!(ev, ServerEvent::Snapshot { .. }) { snapshot_received = true; }
+        // Abandon the whole connection on timeout: never resume a partial write.
+        tokio::time::timeout(progress_timeout, async {
+            if let Some(reqs) = handle_event(relay, daemon, ev).await {
+                for r in reqs {
+                    write_frame(&mut writer, &r).await?;
                 }
             }
-            _ = daemon.shutdown.cancelled() => {
-                let _ = writer.shutdown().await;
-                return Ok(());
-            }
-        }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("relay event delivery timed out")??;
     }
 }
 
@@ -609,6 +813,7 @@ async fn handle_event(
             *relay.host_tree.lock().unwrap() = tree;
             rescope(relay, daemon, true);
 
+            relay.notify_status(true);
             let mut follow_ups = missing_adds(relay, daemon);
             // Re-attach what clients still watch: the host replays each
             // ring and the panes repaint.
@@ -977,7 +1182,794 @@ fn with_req_id(req: &ClientRequest, req_id: u64) -> Option<ClientRequest> {
 mod tests {
     use super::*;
     use nebula_core::{AgentId, WorktreeId};
+    use tokio::io::AsyncWriteExt;
 
+    /// A byte transport that acknowledges when a supplied fragment has been
+    /// consumed and the relay is waiting for more bytes. No timing sleeps.
+    struct ObservedReader {
+        inner: tokio::io::ReadHalf<tokio::io::DuplexStream>,
+        waiting: mpsc::UnboundedSender<()>,
+    }
+
+    impl AsyncRead for ObservedReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let result = std::pin::Pin::new(&mut self.inner).poll_read(cx, buf);
+            if result.is_pending() {
+                let _ = self.waiting.send(());
+            }
+            result
+        }
+    }
+
+    fn test_relay() -> (Arc<Daemon>, Arc<Relay>, mpsc::Receiver<QueuedRequest>) {
+        let daemon = Daemon::new(
+            Arc::new(crate::store::Store::open_in_memory().unwrap()),
+            crate::hooks::HookEnv {
+                port: 0,
+                token: String::new(),
+            },
+        );
+        let (out, out_rx) = mpsc::channel(256);
+        let relay = Arc::new(Relay {
+            host: "test-host".into(),
+            out,
+            admission: Mutex::new(()),
+            mirror: Mutex::new(Mirror::default()),
+            attached: Mutex::new(HashMap::new()),
+            pending: Mutex::new(HashMap::new()),
+            next_req: AtomicU64::new(1),
+            connected: AtomicBool::new(false),
+            pending_adds: Mutex::new(HashMap::new()),
+            adopted: Mutex::new(HashSet::new()),
+            host_tree: Mutex::new(Mirror::default()),
+            task: Mutex::new(None),
+        });
+        (daemon, relay, out_rx)
+    }
+
+    #[tokio::test]
+    async fn answering_probes_without_initial_snapshot_is_not_ready() {
+        let (daemon, relay, mut requests) = test_relay();
+        let (transport, mut host) = tokio::io::duplex(4096);
+        let (read, write) = tokio::io::split(transport);
+        let scenario = async {
+            while let Some(request) = read_frame::<ClientRequest, _>(&mut host).await.unwrap() {
+                if matches!(request, ClientRequest::Hello { .. }) {
+                    write_frame(&mut host, &ServerEvent::HelloOk { protocol_version: PROTOCOL_VERSION, daemon_pid: 7 }).await.unwrap();
+                }
+            }
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(pump_transport(&relay, &daemon, &mut requests, read, write, Duration::from_millis(20)), scenario)
+        }).await.expect("host never supplied the subscribed snapshot");
+        assert!(result.unwrap_err().to_string().contains("snapshot"));
+    }
+
+    /// A host whose output is always readable, even between scheduler polls.
+    struct BusyHostReader {
+        hello: Vec<u8>,
+        output: Vec<u8>,
+        offset: usize,
+        greeted: bool,
+    }
+
+    impl AsyncRead for BusyHostReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let bytes = if self.greeted {
+                &self.output
+            } else {
+                &self.hello
+            };
+            let end = (self.offset + buf.remaining()).min(bytes.len());
+            buf.put_slice(&bytes[self.offset..end]);
+            let complete = end == bytes.len();
+            self.offset = if complete { 0 } else { end };
+            if complete {
+                self.greeted = true;
+            }
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn continuous_host_output_does_not_starve_input() {
+        let (daemon, relay, mut requests) = test_relay();
+        let session = SessionRef::Agent(AgentId("busy-session".into()));
+        let mut hello = Vec::new();
+        write_frame(
+            &mut hello,
+            &ServerEvent::HelloOk {
+                protocol_version: PROTOCOL_VERSION,
+                daemon_pid: 7,
+            },
+        )
+        .await
+        .unwrap();
+        let mut output = Vec::new();
+        write_frame(
+            &mut output,
+            &ServerEvent::Output {
+                session: session.clone(),
+                seq: 0,
+                data: b"busy".to_vec(),
+            },
+        )
+        .await
+        .unwrap();
+        let reader = BusyHostReader {
+            hello,
+            output,
+            offset: 0,
+            greeted: false,
+        };
+        let (writer, mut host) = tokio::io::duplex(4096);
+        let host_relay = relay.clone();
+        let host_daemon = daemon.clone();
+        let scenario = tokio::spawn(async move {
+            read_frame::<ClientRequest, _>(&mut host)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                read_frame::<ClientRequest, _>(&mut host).await.unwrap(),
+                Some(ClientRequest::Subscribe)
+            ));
+            let (client, _replies) = mpsc::channel(4);
+            let client = RelayClient::new(client, tokio_util::sync::CancellationToken::new());
+            host_relay
+                .forward(
+                    ClientRequest::Input {
+                        session,
+                        data: b"typed".to_vec(),
+                    },
+                    &client,
+                )
+                .await;
+            let request = read_frame::<ClientRequest, _>(&mut host).await.unwrap();
+            host_daemon.shutdown.cancel();
+            assert!(
+                matches!(request, Some(ClientRequest::Input { data, .. }) if data == b"typed"),
+                "readable output starved input until the probe deadline"
+            );
+        });
+        let result = pump_transport(
+            &relay,
+            &daemon,
+            &mut requests,
+            reader,
+            writer,
+            Duration::from_millis(100),
+        )
+        .await;
+        scenario.await.unwrap();
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconnect_resubscribes_idle_session_and_replays_full_screen() {
+        let (daemon, relay, mut requests) = test_relay();
+        let (client, mut replies) = mpsc::channel(32);
+        let client = RelayClient::new(client, tokio_util::sync::CancellationToken::new());
+        let session = SessionRef::Agent(AgentId("same-live-session".into()));
+        relay
+            .forward(
+                ClientRequest::Attach {
+                    session: session.clone(),
+                    from_seq: None,
+                    cols: 80,
+                    rows: 24,
+                },
+                &client,
+            )
+            .await;
+        for generation in 0..3 {
+            let (transport, mut host) = tokio::io::duplex(4096);
+            let (read, write) = tokio::io::split(transport);
+            let scenario = async {
+                assert!(matches!(
+                    read_frame::<ClientRequest, _>(&mut host).await.unwrap(),
+                    Some(ClientRequest::Hello { .. })
+                ));
+                write_frame(
+                    &mut host,
+                    &ServerEvent::HelloOk {
+                        protocol_version: PROTOCOL_VERSION,
+                        daemon_pid: 7,
+                    },
+                )
+                .await
+                .unwrap();
+                assert!(matches!(
+                    read_frame::<ClientRequest, _>(&mut host).await.unwrap(),
+                    Some(ClientRequest::Subscribe)
+                ));
+                write_frame(&mut host, &daemon.snapshot().unwrap())
+                    .await
+                    .unwrap();
+                assert!(
+                    matches!(read_frame::<ClientRequest, _>(&mut host).await.unwrap(),
+                    Some(ClientRequest::Attach { session: actual, from_seq: None, .. }) if actual == session)
+                );
+                let data = format!("screen {generation}").into_bytes();
+                write_frame(
+                    &mut host,
+                    &ServerEvent::Scrollback {
+                        session: session.clone(),
+                        base_seq: 0,
+                        data: data.clone(),
+                    },
+                )
+                .await
+                .unwrap();
+                loop {
+                    let reply = replies.recv().await.unwrap();
+                    if let ServerEvent::Scrollback { data: actual, .. } = reply {
+                        assert_eq!(actual, data);
+                        break;
+                    }
+                }
+                // No terminal output for several probe periods is healthy.
+                for _ in 0..4 {
+                    assert!(matches!(
+                        read_frame::<ClientRequest, _>(&mut host).await.unwrap(),
+                        Some(ClientRequest::Hello { .. })
+                    ));
+                    write_frame(
+                        &mut host,
+                        &ServerEvent::HelloOk {
+                            protocol_version: PROTOCOL_VERSION,
+                            daemon_pid: 7,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                }
+                host.shutdown().await.unwrap();
+            };
+            let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+                tokio::join!(
+                    pump_transport(
+                        &relay,
+                        &daemon,
+                        &mut requests,
+                        read,
+                        write,
+                        Duration::from_millis(20)
+                    ),
+                    scenario
+                )
+            })
+            .await
+            .expect("idle session did not recover");
+            result.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn blocked_writer_abandons_the_transport() {
+        let (daemon, relay, mut requests) = test_relay();
+        let (client, _replies) = mpsc::channel(4);
+        let client = RelayClient::new(client, tokio_util::sync::CancellationToken::new());
+        let (transport, mut host) = tokio::io::duplex(256);
+        let (read, write) = tokio::io::split(transport);
+        let (finished, wait) = tokio::sync::oneshot::channel();
+        let scenario = async {
+            read_frame::<ClientRequest, _>(&mut host)
+                .await
+                .unwrap()
+                .unwrap();
+            write_frame(
+                &mut host,
+                &ServerEvent::HelloOk {
+                    protocol_version: PROTOCOL_VERSION,
+                    daemon_pid: 0,
+                },
+            )
+            .await
+            .unwrap();
+            read_frame::<ClientRequest, _>(&mut host)
+                .await
+                .unwrap()
+                .unwrap();
+            relay
+                .forward(
+                    ClientRequest::Input {
+                        session: SessionRef::Agent(AgentId("session".into())),
+                        data: vec![b'x'; 8192],
+                    },
+                    &client,
+                )
+                .await;
+            // Keep SSH alive but stop draining its stdin entirely.
+            wait.await.unwrap();
+            drop(host);
+        };
+        let pump = async {
+            let result = pump_transport(
+                &relay,
+                &daemon,
+                &mut requests,
+                read,
+                write,
+                Duration::from_millis(20),
+            )
+            .await;
+            let _ = finished.send(());
+            result
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(pump, scenario)
+        })
+        .await
+        .expect("blocked writer held the connection forever");
+        assert!(result.unwrap_err().to_string().contains("write timed out"));
+    }
+
+    #[tokio::test]
+    async fn responsive_probes_do_not_hide_a_stuck_request() {
+        let (daemon, relay, mut requests) = test_relay();
+        let (client, mut replies) = mpsc::channel(16);
+        let client = RelayClient::new(client, tokio_util::sync::CancellationToken::new());
+        let (transport, mut host) = tokio::io::duplex(4096);
+        let (read, write) = tokio::io::split(transport);
+        let scenario = async {
+            while let Some(request) = read_frame::<ClientRequest, _>(&mut host).await.unwrap() {
+                match request {
+                    ClientRequest::Hello { .. } => write_frame(
+                        &mut host,
+                        &ServerEvent::HelloOk {
+                            protocol_version: PROTOCOL_VERSION,
+                            daemon_pid: 0,
+                        },
+                    )
+                    .await
+                    .unwrap(),
+                    ClientRequest::Subscribe => {
+                        write_frame(&mut host, &daemon.snapshot().unwrap()).await.unwrap();
+                        relay
+                            .forward(
+                                ClientRequest::CreateTerminal {
+                                    expected_branch: Some("feature".into()),
+                                    req_id: 42,
+                                    worktree: WorktreeId("worktree".into()),
+                                    name: None,
+                                },
+                                &client,
+                            )
+                            .await
+                    }
+                    _ => {} // Accept the mutation but never acknowledge it.
+                }
+            }
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(
+                pump_transport(
+                    &relay,
+                    &daemon,
+                    &mut requests,
+                    read,
+                    write,
+                    Duration::from_millis(20)
+                ),
+                scenario
+            )
+        })
+        .await
+        .expect("probe success must not leave a mutation pending forever");
+        assert!(result.is_err());
+        assert!(matches!(
+            replies.recv().await,
+            Some(ServerEvent::Error {
+                req_id: Some(42),
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn connection_loss_fails_uncertain_mutation_and_discards_queued_input() {
+        let (daemon, relay, mut requests) = test_relay();
+        let (client, mut replies) = mpsc::channel(16);
+        let client = RelayClient::new(client, tokio_util::sync::CancellationToken::new());
+        for _ in 0..3 {
+            let (transport, mut host) = tokio::io::duplex(4096);
+            let (read, write) = tokio::io::split(transport);
+            let scenario = async {
+                assert!(matches!(
+                    read_frame::<ClientRequest, _>(&mut host).await.unwrap(),
+                    Some(ClientRequest::Hello { .. })
+                ));
+                write_frame(
+                    &mut host,
+                    &ServerEvent::HelloOk {
+                        protocol_version: PROTOCOL_VERSION,
+                        daemon_pid: 0,
+                    },
+                )
+                .await
+                .unwrap();
+                assert!(matches!(
+                    read_frame::<ClientRequest, _>(&mut host).await.unwrap(),
+                    Some(ClientRequest::Subscribe)
+                ));
+                assert!(
+                    matches!(
+                        read_frame::<ClientRequest, _>(&mut host).await.unwrap(),
+                        Some(ClientRequest::Hello { .. })
+                    ),
+                    "a previous connection's action was replayed"
+                );
+                write_frame(
+                    &mut host,
+                    &ServerEvent::HelloOk {
+                        protocol_version: PROTOCOL_VERSION,
+                        daemon_pid: 0,
+                    },
+                )
+                .await
+                .unwrap();
+                // Give the relay a queued mutation and input, then EOF before it
+                // gets to send either. Neither may survive into the next pipe.
+                relay
+                    .forward(
+                        ClientRequest::CreateTerminal {
+                            expected_branch: Some("feature".into()),
+                            req_id: 42,
+                            worktree: WorktreeId("worktree".into()),
+                            name: None,
+                        },
+                        &client,
+                    )
+                    .await;
+                relay
+                    .forward(
+                        ClientRequest::Input {
+                            session: SessionRef::Agent(AgentId("session".into())),
+                            data: b"do not replay".to_vec(),
+                        },
+                        &client,
+                    )
+                    .await;
+                drop(host);
+            };
+            let _ = tokio::join!(
+                pump_transport(
+                    &relay,
+                    &daemon,
+                    &mut requests,
+                    read,
+                    write,
+                    Duration::from_millis(20)
+                ),
+                scenario
+            );
+            let reply = tokio::time::timeout(Duration::from_millis(100), replies.recv())
+                .await
+                .expect("uncertain mutation was left pending");
+            assert!(matches!(
+                reply,
+                Some(ServerEvent::Error {
+                    req_id: Some(42),
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn full_request_queue_rejects_mutations_without_waiting() {
+        let (_, relay, _requests) = test_relay();
+        relay.connected.store(true, Ordering::Relaxed);
+        let (client, mut replies) = mpsc::channel(4);
+        let client = RelayClient::new(client, tokio_util::sync::CancellationToken::new());
+        for _ in 0..256 {
+            relay
+                .forward(
+                    ClientRequest::Input {
+                        session: SessionRef::Agent(AgentId("session".into())),
+                        data: b"x".to_vec(),
+                    },
+                    &client,
+                )
+                .await;
+        }
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            relay.forward(
+                ClientRequest::CreateTerminal {
+                    expected_branch: Some("feature".into()),
+                    req_id: 42,
+                    worktree: WorktreeId("worktree".into()),
+                    name: None,
+                },
+                &client,
+            ),
+        )
+        .await
+        .expect("full transport queue blocked a caller");
+        assert!(matches!(
+            replies.recv().await,
+            Some(ServerEvent::Error {
+                req_id: Some(42),
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn slow_subscriber_does_not_block_healthy_session_output() {
+        let (daemon, relay, mut requests) = test_relay();
+        let (slow, _slow_rx) = mpsc::channel(1);
+        let (healthy, mut healthy_rx) = mpsc::channel(4);
+        let slow_closed = tokio_util::sync::CancellationToken::new();
+        let slow = RelayClient::new(slow, slow_closed.clone());
+        let healthy = RelayClient::new(healthy, tokio_util::sync::CancellationToken::new());
+        let session = SessionRef::Agent(AgentId("session".into()));
+        let (transport, mut host) = tokio::io::duplex(4096);
+        let (read, write) = tokio::io::split(transport);
+        let scenario = async {
+            read_frame::<ClientRequest, _>(&mut host)
+                .await
+                .unwrap()
+                .unwrap();
+            write_frame(
+                &mut host,
+                &ServerEvent::HelloOk {
+                    protocol_version: PROTOCOL_VERSION,
+                    daemon_pid: 0,
+                },
+            )
+            .await
+            .unwrap();
+            read_frame::<ClientRequest, _>(&mut host)
+                .await
+                .unwrap()
+                .unwrap();
+            for client in [&slow, &healthy] {
+                relay
+                    .forward(
+                        ClientRequest::Attach {
+                            session: session.clone(),
+                            from_seq: None,
+                            cols: 80,
+                            rows: 24,
+                        },
+                        client,
+                    )
+                    .await;
+                assert!(matches!(
+                    read_frame::<ClientRequest, _>(&mut host).await.unwrap(),
+                    Some(ClientRequest::Attach { .. })
+                ));
+            }
+            for seq in 0..2 {
+                write_frame(
+                    &mut host,
+                    &ServerEvent::Output {
+                        session: session.clone(),
+                        seq,
+                        data: b"x".to_vec(),
+                    },
+                )
+                .await
+                .unwrap();
+                let reply = tokio::time::timeout(Duration::from_millis(100), healthy_rx.recv())
+                    .await
+                    .expect("one full subscriber blocked the host");
+                assert!(
+                    matches!(reply, Some(ServerEvent::Output { seq: actual, .. }) if actual == seq)
+                );
+            }
+            // This signal is the server connection's socket-close boundary.
+            tokio::time::timeout(Duration::from_millis(100), slow_closed.cancelled())
+                .await
+                .expect("lagging socket was not told to disconnect");
+            drop(host);
+        };
+        let (result, ()) = tokio::join!(
+            pump_transport(
+                &relay,
+                &daemon,
+                &mut requests,
+                read,
+                write,
+                Duration::from_secs(1)
+            ),
+            scenario
+        );
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_transport_without_application_replies_is_rejected() {
+        let (daemon, relay, mut requests) = test_relay();
+        let (transport, mut host) = tokio::io::duplex(4096);
+        let (read, write) = tokio::io::split(transport);
+        let scenario = async {
+            read_frame::<ClientRequest, _>(&mut host)
+                .await
+                .unwrap()
+                .unwrap();
+            write_frame(
+                &mut host,
+                &ServerEvent::HelloOk {
+                    protocol_version: PROTOCOL_VERSION,
+                    daemon_pid: 0,
+                },
+            )
+            .await
+            .unwrap();
+            // SSH keeps accepting bytes, but its application never answers again.
+            while read_frame::<ClientRequest, _>(&mut host)
+                .await
+                .unwrap()
+                .is_some()
+            {}
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(
+                pump_transport(
+                    &relay,
+                    &daemon,
+                    &mut requests,
+                    read,
+                    write,
+                    Duration::from_millis(20)
+                ),
+                scenario
+            )
+        })
+        .await
+        .expect("alive transport hid an unresponsive application");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn silent_transport_handshake_is_bounded() {
+        let (daemon, relay, mut requests) = test_relay();
+        let (transport, _silent_host) = tokio::io::duplex(4096);
+        let (read, write) = tokio::io::split(transport);
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            pump_transport(
+                &relay,
+                &daemon,
+                &mut requests,
+                read,
+                write,
+                Duration::from_millis(20),
+            ),
+        )
+        .await
+        .expect("silent SSH transport must not hang the relay handshake");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn session_reads_survive_bidirectional_fragmented_traffic() {
+        let (daemon, relay, mut out_rx) = test_relay();
+        let (transport, mut host) = tokio::io::duplex(4096);
+        let (reader, writer) = tokio::io::split(transport);
+        let (waiting, mut waits) = mpsc::unbounded_channel();
+        let reader = ObservedReader {
+            inner: reader,
+            waiting,
+        };
+        let (client, mut replies) = mpsc::channel(16);
+        let client = RelayClient::new(client, tokio_util::sync::CancellationToken::new());
+        let session = SessionRef::Agent(AgentId("test-session".into()));
+        let pump = pump_transport(
+            &relay,
+            &daemon,
+            &mut out_rx,
+            BufReader::new(reader),
+            BufWriter::new(writer),
+            Duration::from_secs(10),
+        );
+        let scenario = async {
+            assert!(matches!(
+                read_frame::<ClientRequest, _>(&mut host).await.unwrap(),
+                Some(ClientRequest::Hello { .. })
+            ));
+            write_frame(
+                &mut host,
+                &ServerEvent::HelloOk {
+                    protocol_version: PROTOCOL_VERSION,
+                    daemon_pid: 0,
+                },
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                read_frame::<ClientRequest, _>(&mut host).await.unwrap(),
+                Some(ClientRequest::Subscribe)
+            ));
+
+            // First split makes a lost payload prefix look like a valid 64 KiB
+            // frame length: the broken relay stays connected but never replies.
+            // Then exercise every header boundary and another payload boundary.
+            for (index, split) in [None, Some(1), Some(2), Some(3), Some(4), Some(5)]
+                .into_iter()
+                .enumerate()
+            {
+                let local_id = 100 + index as u64;
+                relay
+                    .forward(
+                        ClientRequest::ReadSession {
+                            req_id: local_id,
+                            session: session.clone(),
+                            lines: Some(2),
+                        },
+                        &client,
+                    )
+                    .await;
+                let Some(ClientRequest::ReadSession { req_id, .. }) =
+                    read_frame::<ClientRequest, _>(&mut host).await.unwrap()
+                else {
+                    panic!("host did not receive session read");
+                };
+                let text = "\0\0\u{1}\0pane";
+                let mut frame = Vec::new();
+                write_frame(
+                    &mut frame,
+                    &ServerEvent::SessionText {
+                        req_id,
+                        cols: 80,
+                        rows: 24,
+                        text: text.into(),
+                    },
+                )
+                .await
+                .unwrap();
+                let split = split.unwrap_or(frame.len() - 8);
+                while waits.try_recv().is_ok() {}
+                host.write_all(&frame[..split]).await.unwrap();
+                waits.recv().await.unwrap();
+                // The reader is now suspended inside this frame. Three outgoing
+                // requests must progress without losing its header or payload.
+                for _ in 0..3 {
+                    relay
+                        .forward(
+                            ClientRequest::Input {
+                                session: session.clone(),
+                                data: b"x".to_vec(),
+                            },
+                            &client,
+                        )
+                        .await;
+                    assert!(
+                        matches!(read_frame::<ClientRequest, _>(&mut host).await.unwrap(),
+                        Some(ClientRequest::Input { data, .. }) if data == b"x")
+                    );
+                }
+                host.write_all(&frame[split..]).await.unwrap();
+                let reply = tokio::time::timeout(Duration::from_secs(1), replies.recv())
+                    .await
+                    .expect("session read timed out on a healthy relay after interleaved input")
+                    .expect("client disconnected");
+                assert!(
+                    matches!(reply, ServerEvent::SessionText { req_id, text: actual, .. }
+                    if req_id == local_id && actual == text)
+                );
+            }
+            host.shutdown().await.unwrap();
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(pump, scenario)
+        })
+        .await
+        .expect("relay stopped making bidirectional progress");
+        result.unwrap();
+    }
     #[test]
     fn request_ids_cover_every_addressing_shape() {
         let wt = WorktreeId("w1".into());
@@ -993,6 +1985,7 @@ mod tests {
         );
         assert_eq!(
             request_ids(&ClientRequest::CreateTerminal {
+                expected_branch: None,
                 req_id: 7,
                 worktree: wt.clone(),
                 name: None
@@ -1014,6 +2007,7 @@ mod tests {
     #[test]
     fn req_id_round_trips_through_rewrite() {
         let req = ClientRequest::CreateTerminal {
+            expected_branch: None,
             req_id: 7,
             worktree: WorktreeId("w1".into()),
             name: Some("t".into()),

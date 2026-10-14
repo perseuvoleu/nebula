@@ -19,8 +19,8 @@ export function SessionTabs({ sessions, selected, onSelect }: {
           onSelect(sessions[next]);
           requestAnimationFrame(() => document.querySelector<HTMLButtonElement>('[role="tab"][aria-selected="true"]')?.focus());
         }}
-        className={`max-w-52 shrink-0 truncate rounded-md border px-3 py-2 text-sm ${row.id === selected ? "border-foreground bg-secondary font-medium" : "border-transparent hover:bg-muted"} ${row.status === "running" ? "text-working" : "text-foreground"}`}>
-        {row.name}
+        className={`max-w-52 shrink-0 truncate rounded-md border px-3 py-2 text-sm ${row.id === selected ? "border-foreground bg-secondary font-medium" : "border-transparent hover:bg-muted"} text-foreground`}>
+        <span className={row.status === "running" ? "session-working" : undefined}>{row.name}</span>
       </button>)}
     </div>
   );

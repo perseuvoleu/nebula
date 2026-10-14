@@ -136,7 +136,7 @@ export function ConversationView({ project, row, state, controller, onBack, show
           </Button>
         )}
         <div className="min-w-0 flex-1">
-          <h1 className="truncate text-[15px] font-semibold leading-tight">{title}</h1>
+          <h1 className={`truncate text-[15px] font-semibold leading-tight ${session?.status === "running" ? "session-working" : ""}`}>{title}</h1>
           {session && (
             <p className="truncate text-xs text-muted-foreground">
               {kindLabel(session.kind)} · <span className="font-mono">{session.worktree}</span> · {statusLabel(session.status)}

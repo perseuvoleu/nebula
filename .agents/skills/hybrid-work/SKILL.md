@@ -15,8 +15,9 @@ requests synchronization. Merely having sessions on both machines is not enough:
 tasks may stay independent. An explicit local-only / remote-only / no-sync instruction takes
 precedence; report a missing input rather than silently crossing that boundary.
 
-Before any transfer that can push commits, apply [Protected branches](../remote-projects/SKILL.md#protected-branches-never-push-main-or-master): `main` / `master` are never push destinations,
-including implicit pushes performed by sync/collect. Pass this guardrail to delegated workers.
+Before any transfer that can push commits, apply [Protected branches](../remote-projects/SKILL.md#protected-branches-explicit-approval-required): writes to `main` / `master`,
+including implicit sync/collect pushes, require Andrei's explicit approval for that operation.
+Pass the resolved destination and approval scope (or its absence) to delegated workers.
 
 `nebula sync --help` and `nebula collect --help` are the source of truth for flags.
 This tracked file is the canonical runbook; from any local project read
@@ -59,6 +60,42 @@ Completion criterion: each worker has an execution side, an existing checkout th
 inputs and a safe owner. Equal heads and two checkouts are required only for a transfer that
 actually needs them.
 
+## Findl resource budget — before builds/tests
+
+Findl is shared by agents, previews and production services. A runaway test suite can take
+those services down: on 2026-09-15, parallel Jest workers exhausted its ~16 GB RAM with no
+swap and the kernel OOM-killed Nebula Web. A 6 GiB `/swapfile` was subsequently enabled and
+persisted in `/etc/fstab`. Recheck live capacity; remote does not mean unlimited. Swap is an
+emergency buffer, not extra capacity for admitting parallel jobs.
+
+Before each heavy run on findl:
+
+1. Inspect **all agents on findl**, across projects: run `nebula agent list` on the host
+   without a project filter. Match heavy processes to their owning agent via PID/PPID ancestry
+   and working directory; agent status alone does not reveal builds/tests. Check `free -h`,
+   `uptime`, `/proc/pressure/memory` and the largest RSS processes
+   (`ps -eo pid,ppid,comm,rss --sort=-rss | head -20`). Budget against total host consumption,
+   including other agents, Docker and production. Defer if memory is under pressure or another
+   heavy verification is running; coordinate with its owning agent before launch. Recheck
+   immediately before starting, since another agent may have started work during preparation.
+2. Run focused packages/tests, one heavy command at a time across workers. Default to one
+   test worker; use at most two only with measured headroom. Serialize build orchestration
+   and cap compiler jobs too. Keep at least 2 GiB available as an operational floor, not
+   a guarantee that the next job fits. Never size worker pools from CPU count alone.
+3. For Jest, pass `--runInBand` directly to Jest (or `--maxWorkers=2`, not both). Inspect
+   package scripts/wrappers first: a literal `--` reaching Jest before `--runInBand` can
+   turn it into a positional argument instead of a concurrency limit. Verify the actual
+   child process tree after launch; the command's text alone is not proof of serial execution.
+4. Monitor available RAM during the run. If it falls below the floor, memory pressure
+   rises persistently or unexpected workers spawn, terminate only your own test/build tree
+   and retry a smaller scope after recovery. Ask before stopping another agent's job;
+   preserve agent sessions, databases and production services. Adding swap or changing
+   host/service limits requires explicit approval.
+
+Include this budget in every remote worker/handoff prompt. Completion criterion: concurrency
+is verified in the live process tree, memory headroom remains throughout, and verification
+reports its scope and any deferred checks rather than launching an unrestricted retry.
+
 ## 2. Ownership rule
 
 **One writer per branch across both machines.** A branch with a running session on findl is the
@@ -74,6 +111,32 @@ its writer's side unless §1 identifies a concrete transfer need.
 
 Completion criterion: no branch has a planned writer on both sides; read-only inspection needs
 neither a mirror nor a sync.
+
+## Local Nebula artifacts — outside application Git
+
+In an application checkout, `.nebula*` files/directories (including `.nebula-preview.json`)
+are machine-local orchestration/preview configuration, not product source. Add `.nebula*`
+to the project's `.gitignore` before creating them. Put generated plans, logs and handoffs
+in the ignored `.scratch/` directory. Never commit or merge a preview-recipe-only branch
+into an application branch just to transfer these files. This does not exclude Nebula's own
+implementation, documentation or intentional test fixtures from its source repository.
+
+Before committing or syncing an application branch:
+- Check `git ls-files -- '.nebula*'` and `git check-ignore <artifact>`; an ignore rule alone
+  does not untrack an existing file.
+- For a requested cleanup, preserve the on-disk file and use `git rm --cached -- <explicit paths>`.
+  Commit only the index removal and ignore rule. Existing published commits stay in history;
+  rewriting shared history needs separate explicit approval and coordination.
+- Before the removal commit reaches another checkout, preserve that checkout's own recipe
+  in its ignored `.scratch/`, then restore it as an ignored file after the fast-forward.
+  Keep machine-specific values; do not replace them with another host's recipe.
+- If the other host actually needs an ignored recipe, copy that file separately into an
+  ignored path, preserving existing destination files unless replacement was requested.
+  A missing ignored file is not a reason to force-add it to Git.
+
+Pass this rule to workers, including preview/setup workers. Completion criterion: no local
+Nebula artifacts appear in the application's tracked diff, required on-disk copies remain
+available and any separate file transfer is reported explicitly.
 
 ## 3. Handoff out (laptop → findl)
 

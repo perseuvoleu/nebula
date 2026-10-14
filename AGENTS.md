@@ -1,8 +1,9 @@
 # Nebula
 
-Rust workspace: `nebula` (CLI + e2e tests), `nebula-tui`, `nebula-daemon`, `nebula-core`, vendored
-`vt100`. `make install` builds and installs the release binary; the daemon side of a change needs
-`nebula kill` (stops ALL sessions) before it takes effect — TUI-only changes just need a new `ng`.
+Rust workspace: `nebula` (CLI + e2e tests), `nebula-tui`, `nebula-daemon`, `nebula-core`,
+`nebula-rag` (`nebula rag`, see docs/specs/rag.md), vendored `vt100`. `make install` builds and
+installs the release binary; the daemon side of a change needs `nebula kill` (stops ALL sessions)
+before it takes effect — TUI-only changes just need a new `ng`.
 
 ## Ghostty pane engine
 
@@ -22,20 +23,20 @@ mouse modes and pane sizing read `vt100::Screen`. Porting those (plus
 
 ## Skills
 
-Shared by every agent kind (claude, codex, cursor, pi). Open one only when its trigger matches:
+They live in `.agents/skills/`, the project directory Codex and Pi read; `.claude/skills/` holds a relative link to each, because Claude reads only that directory. A new skill follows the same shape. Open one only when its trigger matches:
 
-- `.claude/skills/release/SKILL.md` — trigger: "release", "ship it", a new version, or questions
+- `.agents/skills/release/SKILL.md` — trigger: "release", "ship it", a new version, or questions
   about the release process.
-- `.claude/skills/remote-projects/SKILL.md` — trigger: "remote", "pe server", findl / `@host`,
+- `.agents/skills/remote-projects/SKILL.md` — trigger: "remote", "pe server", findl / `@host`,
   `nebula remote`, sessions or checkouts on another machine, remote rows missing. The remote host
   is always findl; never set up another server for this without being told to.
-- `.claude/skills/sync-skills/SKILL.md` — trigger: "sync skills", updating skills on the server /
+- `.agents/skills/sync-skills/SKILL.md` — trigger: "sync skills", updating skills on the server /
   findl, `nss`, or a remote agent missing a skill.
-- `.claude/skills/hybrid-work/SKILL.md` — trigger: "remote worker", "findl worker", "handoff",
+- `.agents/skills/hybrid-work/SKILL.md` — trigger: "remote worker", "findl worker", "handoff",
   "continuă pe server", "adu ce a făcut agentul de pe findl", sync between machines, the
   `[nebula] This project has a twin on <host>` prompt line, or a `nebula sync` refusal.
-- `.claude/skills/recall/SKILL.md` — Mission Control sessions only (MC_* env vars present):
+- `.agents/skills/recall/SKILL.md` — Mission Control sessions only (MC_* env vars present):
   saving a durable project fact, or code questions via the graph_* MCP tools.
-- `.claude/skills/diagram/SKILL.md` — trigger: any diagram request, or a choice the user should
+- `.agents/skills/diagram/SKILL.md` — trigger: any diagram request, or a choice the user should
   make by clicking an option. `nebula diagram new` → edit the HTML in `.scratch/diagrams/` →
   `nebula diagram open` (⌘X viewer); Mission Control sessions (MC_* env vars) use Mermaid instead.

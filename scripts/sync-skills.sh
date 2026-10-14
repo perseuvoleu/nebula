@@ -1,9 +1,11 @@
 #!/bin/sh
 # nebula-sync-skills [host]  — push the agent skills/config to a remote box.
-# Canonical copy: nebula repo scripts/sync-skills.sh (see .claude/skills/sync-skills/SKILL.md).
+# Canonical copy: nebula repo scripts/sync-skills.sh (see .agents/skills/sync-skills/SKILL.md).
 #
 # Mirrors (delete-on-remote, so removals propagate too):
+#   ~/Desktop/perseu-stack   the perseu-stack repo; ~/.agents/skills links into its skills/ (relative)
 #   ~/.agents/skills          the shared skill source (claude/codex symlink into it)
+#   ~/.agents/pstack-models.md  models per role (a relative link into perseu-stack/config)
 #   ~/.claude/{skills,commands,agents,rules,shared,CLAUDE.md}
 #   ~/.codex/{skills,agents,AGENTS.md}
 #   ~/.pi/agent/skills
@@ -11,7 +13,8 @@
 # few that point at /Users/<me>/… are rewritten to the remote $HOME.
 set -eu
 host="${1:-findl}"
-excl="--exclude node_modules --exclude .git --exclude .DS_Store"
+# .system is Codex's own bundled skills: each machine's Codex rewrites it at startup.
+excl="--exclude node_modules --exclude .git --exclude .DS_Store --exclude .system"
 
 sync() { # sync <local path> <remote path>
   if [ -d "$1" ]; then
@@ -23,7 +26,9 @@ sync() { # sync <local path> <remote path>
   fi
 }
 
+sync ~/Desktop/perseu-stack  Desktop/perseu-stack
 sync ~/.agents/skills        .agents/skills
+sync ~/.agents/pstack-models.md .agents/pstack-models.md
 sync ~/.claude/skills        .claude/skills
 sync ~/.claude/commands      .claude/commands
 sync ~/.claude/agents        .claude/agents

@@ -26,6 +26,10 @@ where
 }
 
 /// Returns Ok(None) on clean EOF at a frame boundary.
+///
+/// Not cancellation safe: dropping this future loses any header or payload
+/// bytes already consumed. When selecting against other work, retain and poll
+/// the same future until completion, or discard the connection on cancellation.
 pub async fn read_frame<T, R>(r: &mut R) -> io::Result<Option<T>>
 where
     T: DeserializeOwned,

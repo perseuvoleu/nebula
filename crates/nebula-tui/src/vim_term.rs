@@ -54,9 +54,14 @@ impl VimTerm {
         tx: UnboundedSender<VimEvent>,
     ) -> Result<Self, String> {
         let title = format!("{file}:{line}");
+        let path = if file.starts_with('-') {
+            format!("./{file}")
+        } else {
+            file.to_string()
+        };
         Self::spawn_cmd(
             editor,
-            &[format!("+{line}"), file.to_string()],
+            &[format!("+{line}"), path],
             root,
             title,
             cols,

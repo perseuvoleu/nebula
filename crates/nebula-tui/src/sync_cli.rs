@@ -520,34 +520,51 @@ fn describe(step: Step, t: &SyncTarget) -> String {
 pub(crate) fn push_remote(t: &SyncTarget, host: &dyn HostRunner) -> Result<String> {
     let rp = ssh_quote(&t.remote_path.to_string_lossy());
     let branch = ssh_quote(&format!("refs/heads/{}:refs/heads/{}", t.branch, t.branch));
-    host.run(&format!("git -C {rp} push -q origin {branch} 2>&1 && git -C {rp} rev-parse HEAD"))
+    host.run(&format!(
+        "git -C {rp} push -q origin {branch} 2>&1 && git -C {rp} rev-parse HEAD"
+    ))
 }
 
 /// Collect only committed history using the sync planner and transport.
 /// Context transfer and rebasing are deliberately unavailable here.
 pub(crate) fn sync_commits(t: &SyncTarget, host: &dyn HostRunner) -> Result<()> {
     let state = gather(t, host)?;
-    if state.local.branch != t.branch { bail!("local branch changed during collect; retry after inspecting ownership"); }
+    if state.local.branch != t.branch {
+        bail!("local branch changed during collect; retry after inspecting ownership");
+    }
     let steps = match plan(&state, Direction::From, false, false) {
         SyncPlan::Refusal { reason, hint } => bail!("{reason}; {hint}"),
         SyncPlan::Steps(steps) => steps,
     };
     for step in steps {
         match step {
-            Step::PushRemote => { push_remote(t, host)?; },
+            Step::PushRemote => {
+                push_remote(t, host)?;
+            }
             Step::PullLocal => {
                 let expected = &state.remote.as_ref().context("remote disappeared")?.head;
                 git_local(&t.local_path, &["fetch", "-q", "origin"])?;
-                if git_local(&t.local_path, &["rev-parse", &format!("refs/remotes/origin/{}", t.branch)])? != *expected {
+                if git_local(
+                    &t.local_path,
+                    &["rev-parse", &format!("refs/remotes/origin/{}", t.branch)],
+                )? != *expected
+                {
                     bail!("origin changed during collect; inspect it before retrying");
                 }
                 if git_local(&t.local_path, &["symbolic-ref", "--short", "HEAD"])? != t.branch
-                    || !git_local(&t.local_path, &["status", "--porcelain", "--untracked-files=all"])?.is_empty() {
-                    bail!("local checkout changed during collect; retry after inspecting ownership");
+                    || !git_local(
+                        &t.local_path,
+                        &["status", "--porcelain", "--untracked-files=all"],
+                    )?
+                    .is_empty()
+                {
+                    bail!(
+                        "local checkout changed during collect; retry after inspecting ownership"
+                    );
                 }
                 git_local(&t.local_path, &["merge", "-q", "--ff-only", expected])?;
-            },
-            Step::CarryScratch => {},
+            }
+            Step::CarryScratch => {}
             _ => bail!("unexpected outbound step in collect: {step:?}"),
         }
     }

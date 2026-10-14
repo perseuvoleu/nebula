@@ -1162,6 +1162,7 @@ dependencies = [
  "clap",
  "nebula-core",
  "nebula-daemon",
+ "nebula-rag",
  "nebula-tui",
  "portable-pty",
  "serde_json",
@@ -1181,6 +1182,7 @@ dependencies = [
  "rmp-serde",
  "serde",
  "serde_bytes",
+ "serde_json",
  "tokio",
  "ulid",
 ]
@@ -1209,6 +1211,21 @@ dependencies = [
  "tracing-subscriber",
  "ulid",
  "vt100",
+]
+
+[[package]]
+name = "nebula-rag"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "nebula-core",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sqlite-vec",
+ "tempfile",
 ]
 
 [[package]]
@@ -2052,6 +2069,15 @@ checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
  "windows-sys",
+]
+
+[[package]]
+name = "sqlite-vec"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0ba424237a9a5db2f6071f193319e2b6a32f7f3961debb2fbbfe67067abce3f"
+dependencies = [
+ "cc",
 ]
 
 [[package]]

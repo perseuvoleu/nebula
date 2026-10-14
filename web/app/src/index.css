@@ -125,6 +125,27 @@
   }
 }
 
+/* Yellow sweep across working session names, matching the terminal UI. */
+.session-working {
+  color: #facc15;
+}
+@media (prefers-reduced-motion: no-preference) {
+  @supports (background-clip: text) {
+    .session-working {
+      background-image: linear-gradient(110deg, #facc15 35%, #ffffaf 50%, #facc15 65%);
+      background-size: 250% 100%;
+      background-clip: text;
+      -webkit-background-clip: text;
+      color: transparent;
+      animation: session-working-sweep 2s linear infinite;
+    }
+  }
+}
+@keyframes session-working-sweep {
+  from { background-position: 100% 0; }
+  to { background-position: -100% 0; }
+}
+
 /* Prose inside messages: readable measure, no color, monochrome code. */
 .prose-mono {
   max-width: 72ch;

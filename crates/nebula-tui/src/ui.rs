@@ -15,12 +15,35 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-/// Draw the attached pane with the Ghostty VT engine when it is built in
-/// (`--features ghostty`) and enabled for this pane. Returns false when the
-/// caller should draw the vt100 + tui-term pane instead — which is always
-/// the case in a default build.
-#[cfg(feature = "ghostty")]
+/// Display-only attach state, shared by both pane renderers.
+fn draw_startup_preview(f: &mut Frame, term: &mut crate::app::AttachedTerm, area: Rect) -> bool {
+    // Size synchronization runs after drawing; invalidate before this frame.
+    if (term.cols, term.rows) != (area.width, area.height) {
+        term.attach_preview = None;
+    }
+    if !term.has_content && !term.parser.screen().contents().trim().is_empty() {
+        term.has_content = true;
+    }
+    if !term.has_content && !term.exited {
+        let text = match &term.attach_preview {
+            Some(text) => format!("Resuming {}…\n{text}", term.starting_label),
+            None => format!("Starting {}…", term.starting_label),
+        };
+        f.render_widget(
+            Paragraph::new(text).style(Style::default().add_modifier(Modifier::DIM)),
+            area,
+        );
+        return true;
+    }
+    false
+}
+
+/// Paint startup state or Ghostty; false falls back to vt100.
 fn draw_pane_ghostty(f: &mut Frame, term: &mut crate::app::AttachedTerm, area: Rect) -> bool {
+    if draw_startup_preview(f, term, area) {
+        return true;
+    }
+    #[cfg(feature = "ghostty")]
     match &mut term.gh {
         Some(gh) => {
             gh.render(area, f.buffer_mut(), true);
@@ -28,11 +51,10 @@ fn draw_pane_ghostty(f: &mut Frame, term: &mut crate::app::AttachedTerm, area: R
         }
         None => false,
     }
-}
-
-#[cfg(not(feature = "ghostty"))]
-fn draw_pane_ghostty(_f: &mut Frame, _term: &mut crate::app::AttachedTerm, _area: Rect) -> bool {
-    false
+    #[cfg(not(feature = "ghostty"))]
+    {
+        false
+    }
 }
 
 /// Outer size of the editor modal, as (width, height) percent of the frame.
@@ -281,8 +303,18 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 let Some(row) = row_rect(inner, i - offset) else {
                     break;
                 };
+                let current_branch = match &item.action {
+                    crate::app::MenuAction::CheckoutPrimary { project, branch } => app
+                        .tree
+                        .worktrees
+                        .iter()
+                        .any(|w| &w.project_id == project && w.is_main && &w.branch == branch),
+                    _ => false,
+                };
                 let mut style = if item.destructive {
                     Style::default().fg(th.err)
+                } else if current_branch {
+                    Style::default().fg(CURRENT_BRANCH)
                 } else {
                     Style::default()
                 };
@@ -306,7 +338,19 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
         Overlay::Confirm(confirm) => {
             // Bulk deletes itemize their casualties across several message
             // lines — size the dialog to fit them.
-            let msg_lines: Vec<&str> = confirm.message.lines().collect();
+            let mut msg_lines: Vec<String> = confirm.message.lines().map(str::to_owned).collect();
+            if let crate::app::PendingAction::StopBusyAndCheckout { sessions, .. } = &confirm.action
+            {
+                let room = (f.area().height as usize).saturating_sub(4 + msg_lines.len());
+                let shown = match sessions.len() > room {
+                    true => room.saturating_sub(1),
+                    false => sessions.len(),
+                };
+                msg_lines.extend(sessions[..shown].iter().map(|s| format!("  {s}")));
+                if shown < sessions.len() {
+                    msg_lines.push(format!("… and {} more", sessions.len() - shown));
+                }
+            }
             let longest = msg_lines.iter().map(|l| l.chars().count()).max();
             let width = (longest.unwrap_or(0) as u16 + 4).max(52);
             let height = msg_lines.len() as u16 + 4;
@@ -322,10 +366,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 ));
             let inner = block.inner(area);
             f.render_widget(block, area);
-            let mut lines: Vec<Line> = msg_lines
-                .into_iter()
-                .map(|l| Line::from(l.to_string()))
-                .collect();
+            let mut lines: Vec<Line> = msg_lines.into_iter().map(Line::from).collect();
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
                 Span::styled("[Enter/y] confirm", Style::default().fg(th.err)),
@@ -501,7 +542,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         (Act(&[Todos]), "todos for the worktree"),
                         (
                             Act(&[GitDiff]),
-                            "git diff (^g/⌘G: compare with a commit, ^r: mark reviewed ✓)",
+                            "git diff (^g/⌘G: compare with a commit or branch, ^r: mark reviewed ✓)",
                         ),
                         (Act(&[OpenRepo]), "open the repo on GitHub"),
                         (Act(&[Pin]), "pin / unpin"),
@@ -1066,6 +1107,15 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
         Overlay::Diff(view) => {
             let area = centered_rect_pct(f.area(), 92, 90);
             f.render_widget(Clear, area);
+            let area = match review_status_line(&view, area.width, th) {
+                Some(line) => {
+                    let [status, rest] =
+                        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+                    f.render_widget(Paragraph::new(line), status);
+                    rest
+                }
+                None => area,
+            };
             // Cap first, floor second: on a tiny screen the file list keeps
             // its minimum and Min(20) squeezes the diff pane instead.
             let files_w = view
@@ -1099,7 +1149,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             if base_area.height > 0 {
                 let label = match &view.base {
                     DiffBase::WorkingTree => "Working tree".to_string(),
-                    DiffBase::Upstream(name) => format!("vs {name}"),
+                    DiffBase::Upstream(name) | DiffBase::Branch(name) => format!("vs {name}"),
                     DiffBase::Commit(c) => format!("{} {}", c.short, c.subject),
                 };
                 let budget = (base_area.width as usize).saturating_sub(3);
@@ -1114,9 +1164,75 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     base_area,
                 );
             }
-            let list_inner = Rect {
+            // Under it: a pinned "Current" row (the uncommitted changes,
+            // when the source has a working tree) and the recent commits,
+            // a short scrollable strip (⇥/⇧⇥ step through both); the file
+            // list keeps at least one row.
+            let strip_h =
+                view.commits
+                    .len()
+                    .min(crate::app::DIFF_COMMIT_ROWS)
+                    .min(files_inner.height.saturating_sub(4) as usize) as u16;
+            let current_area = Rect {
                 y: files_inner.y + 2,
-                height: files_inner.height.saturating_sub(2),
+                height: strip_h.min(u16::from(view.source.has_working_tree())),
+                ..files_inner
+            };
+            if current_area.height > 0 {
+                let on = view.base.is_working_tree();
+                let style = if on {
+                    Style::default().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(th.dim)
+                };
+                f.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::styled(if on { "● " } else { "  " }, Style::default().fg(th.ok)),
+                        Span::styled("Current", style),
+                        Span::styled("  uncommitted", Style::default().fg(th.dim)),
+                    ])),
+                    current_area,
+                );
+            }
+            let commits_area = Rect {
+                y: current_area.y + current_area.height,
+                height: strip_h,
+                ..files_inner
+            };
+            let commit_start = view.commit_window_start(strip_h as usize);
+            for (row, c) in view.commits.iter().skip(commit_start).enumerate() {
+                let Some(row_area) = row_rect(commits_area, row) else {
+                    break;
+                };
+                let current = matches!(&view.base, DiffBase::Commit(b) if b == c);
+                let subject_style = if current {
+                    Style::default().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(th.dim)
+                };
+                let age = format!(" {}", c.age());
+                let budget = (row_area.width as usize)
+                    .saturating_sub(3 + c.short.chars().count() + age.chars().count());
+                let subject = truncate(&c.subject, budget);
+                let pad = budget.saturating_sub(subject.chars().count());
+                f.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::styled(
+                            if current { "● " } else { "  " },
+                            Style::default().fg(th.ok),
+                        ),
+                        Span::styled(format!("{} ", c.short), Style::default().fg(th.accent)),
+                        Span::styled(subject, subject_style),
+                        Span::styled(format!("{:pad$}{age}", ""), Style::default().fg(th.dim)),
+                    ])),
+                    row_area,
+                );
+            }
+            let list_inner = Rect {
+                y: commits_area.y + strip_h,
+                height: files_inner
+                    .height
+                    .saturating_sub(2 + current_area.height + strip_h),
                 ..files_inner
             };
             let start = view.window_start(list_inner.height as usize);
@@ -1180,10 +1296,10 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 ),
                 (diff_a.width as usize).saturating_sub(4),
             );
-            let hint = if view.base.is_working_tree() {
-                " ^g/⌘G: compare with…  ^r: toggle reviewed "
+            let hint = if view.mark_scope().is_some() {
+                " ⇥/⇧⇥: commits  ^g/⌘G: compare with…  ^r: toggle reviewed "
             } else {
-                " ^g/⌘G: compare with… "
+                " ⇥/⇧⇥: commits  ^g/⌘G: compare with… "
             };
             let mut block = panel_block(&title, true, th)
                 .title_bottom(Line::from(Span::styled(hint, Style::default().fg(th.dim))));
@@ -1217,12 +1333,14 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             if view.files.is_empty() {
                 let what = match &view.base {
                     DiffBase::WorkingTree => "working tree clean".to_string(),
-                    DiffBase::Upstream(name) => format!("nothing differs from {name}"),
+                    DiffBase::Upstream(name) | DiffBase::Branch(name) => {
+                        format!("nothing differs from {name}")
+                    }
                     DiffBase::Commit(c) => format!("{} touches no files", c.short),
                 };
                 f.render_widget(
                     Paragraph::new(Span::styled(
-                        format!("{what} — ^g compares with the upstream or a commit"),
+                        format!("{what} — ^g compares with a branch or a commit"),
                         Style::default().fg(th.dim),
                     )),
                     diff_inner,
@@ -1232,27 +1350,49 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             }
 
             // The ^g base picker: a centered popup over the modal listing
-            // the working tree, the upstream and the recent commits.
+            // the working tree, the upstream and the recent commits — or,
+            // in branch mode, the other branches.
             let picker_rects = view.picker.as_ref().map(|picker| {
                 let rows = view.picker_rows();
                 let width = (area.width.saturating_sub(8)).clamp(24, 96);
-                let height = (rows as u16 + 2).min(area.height.saturating_sub(4).max(3));
+                let height = (rows.max(1) as u16 + 2).min(area.height.saturating_sub(4).max(3));
+                let tab = |label: &'static str, on: bool| {
+                    let style = if on {
+                        Style::default().fg(th.accent).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(th.dim)
+                    };
+                    Span::styled(label, style)
+                };
                 let popup = centered_rect(area, width, height);
                 f.render_widget(Clear, popup);
                 let block = Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(th.accent))
-                    .title(Span::styled(
-                        " Compare with ",
-                        Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-                    ))
+                    .title(Line::from(vec![
+                        Span::styled(" Compare with: ", Style::default().fg(th.accent)),
+                        tab("Commits", !picker.branches),
+                        Span::styled(" │ ", Style::default().fg(th.dim)),
+                        tab("Branches ", picker.branches),
+                    ]))
                     .title_bottom(Line::from(Span::styled(
-                        " ↑↓ move  ⏎ pick  esc ",
+                        " ↑↓ move  ⇥ commits/branches  ⏎ pick  esc ",
                         Style::default().fg(th.dim),
                     )));
                 let inner = block.inner(popup);
                 f.render_widget(block, popup);
+                if rows == 0 {
+                    if let Some(row_area) = row_rect(inner, 0) {
+                        f.render_widget(
+                            Paragraph::new(Span::styled(
+                                "  no other branches",
+                                Style::default().fg(th.dim),
+                            )),
+                            row_area,
+                        );
+                    }
+                }
                 let offset = picker.scroll_offset(inner.height as usize);
                 let budget = (inner.width as usize).saturating_sub(2);
                 for row in offset..rows {
@@ -1278,6 +1418,10 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                                 Style::default().fg(th.dim),
                             ),
                         ],
+                        Some(DiffBase::Branch(name)) => vec![
+                            Span::styled(marker, Style::default().fg(th.ok)),
+                            Span::raw(truncate(name.label(), budget.saturating_sub(2))),
+                        ],
                         Some(DiffBase::Commit(c)) => {
                             let head = format!("{} ", c.short);
                             let tail = format!("  {}", c.when);
@@ -1298,14 +1442,92 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 (popup, inner)
             });
 
+            let queue_rects = view.queue_picker.as_ref().map(|picker| {
+                let entries = &view.queue_snapshot.entries;
+                let width = (area.width.saturating_sub(8)).clamp(24, 96);
+                let height = (entries.len() as u16 + 2).min(area.height.saturating_sub(4).max(3));
+                let popup = centered_rect(area, width, height);
+                f.render_widget(Clear, popup);
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(th.accent))
+                    .title(Span::styled(" To review ", Style::default().fg(th.accent)))
+                    .title_bottom(Line::from(Span::styled(
+                        " ↑↓ move  ⏎ open  esc ",
+                        Style::default().fg(th.dim),
+                    )));
+                let inner = block.inner(popup);
+                f.render_widget(block, popup);
+                let name_w = entries
+                    .iter()
+                    .map(|e| e.branch.chars().count())
+                    .max()
+                    .unwrap_or(0)
+                    .min((inner.width as usize).saturating_sub(44));
+                let offset = picker.scroll_offset(inner.height as usize);
+                for (row, entry) in entries.iter().enumerate().skip(offset) {
+                    let Some(row_area) = row_rect(inner, row - offset) else {
+                        break;
+                    };
+                    let marker = if entry.fully_reviewed() {
+                        "✓ "
+                    } else if Some(&entry.worktree) == view.worktree.as_ref() {
+                        "● "
+                    } else {
+                        "  "
+                    };
+                    let mut spans = vec![
+                        Span::styled(marker, Style::default().fg(th.ok)),
+                        Span::raw(format!("{:name_w$}", truncate(&entry.branch, name_w))),
+                    ];
+                    match &entry.changes {
+                        Ok(_) if entry.fully_reviewed() => {
+                            spans.push(Span::styled("   reviewed", Style::default().fg(th.dim)))
+                        }
+                        Ok(changes) => spans.extend([
+                            Span::styled(
+                                format!("   {:<14}", entry.agents.label()),
+                                Style::default().fg(th.dim),
+                            ),
+                            Span::raw(format!("  {:>9}", changes.files_label())),
+                            Span::styled(
+                                format!("  {:>5}", format!("+{}", changes.added)),
+                                Style::default().fg(th.ok),
+                            ),
+                            Span::styled(
+                                format!(" −{}", changes.removed),
+                                Style::default().fg(th.err),
+                            ),
+                        ]),
+                        Err(error) => spans.push(Span::styled(
+                            truncate(
+                                &format!("   {error}"),
+                                (inner.width as usize).saturating_sub(name_w + 2),
+                            ),
+                            Style::default().fg(th.err),
+                        )),
+                    }
+                    render_row(f, row_area, spans, row == picker.hover, true, th);
+                }
+                (popup, inner)
+            });
+
             // Write-back (draw works on a clone): page size for key paging,
             // scroll re-clamped so resizes never strand the view.
             if let Some(Overlay::Diff(v)) = &mut app.overlay {
+                if let (Some(p), Some((popup, inner))) = (&mut v.queue_picker, queue_rects) {
+                    p.area = popup;
+                    p.list_area = inner;
+                }
                 v.view_height = diff_inner.height;
                 v.scroll = scroll;
                 v.list_area = list_inner;
                 v.list_scroll = start;
                 v.base_area = base_area;
+                v.commits_area = commits_area;
+                v.current_area = current_area;
+                v.commit_scroll = commit_start;
                 v.area = area;
                 v.files_width = files_w;
                 if let (Some(p), Some((popup, inner))) = (&mut v.picker, picker_rects) {
@@ -1315,7 +1537,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             }
         }
         Overlay::Palette(palette) => {
-            let area = centered_rect(f.area(), 64, 18);
+            let area = command_palette_area(f.area());
             f.render_widget(Clear, area);
             let name = if palette.sessions_only {
                 "Sessions"
@@ -2391,6 +2613,52 @@ fn settings_keys_hint(view: &crate::app::SettingsView) -> &'static str {
     "↑/↓: move  Enter/Space: toggle  ←/→: cycle  Tab: next tab  ↑ at top: tabs"
 }
 
+pub(crate) fn command_palette_area(frame: Rect) -> Rect {
+    centered_rect(frame, 64, 18)
+}
+
+fn review_status_line(view: &crate::app::DiffView, width: u16, th: Theme) -> Option<Line<'static>> {
+    let entries = &view.queue_snapshot.entries;
+    let on_show = view.worktree.as_ref();
+    if entries.iter().all(|entry| Some(&entry.worktree) == on_show) {
+        return None;
+    }
+    let position = view.queue_snapshot.position(on_show);
+    let place = position.map_or("–".to_string(), |index| (index + 1).to_string());
+    let dim = Style::default().fg(th.dim);
+    let keys = "^n next  ^p prev  ^l list ";
+    let mut spans = vec![
+        Span::styled(format!(" review {place}/{}   ‹ ", entries.len()), dim),
+        Span::styled(
+            view.branch.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" ›", dim),
+    ];
+    match position.map(|index| &entries[index].changes) {
+        Some(Ok(changes)) => spans.extend([
+            Span::styled(format!("   {}   ", changes.comparison()), dim),
+            Span::raw(changes.files_label()),
+            Span::styled(format!("  +{}", changes.added), Style::default().fg(th.ok)),
+            Span::styled(
+                format!(" −{}", changes.removed),
+                Style::default().fg(th.err),
+            ),
+        ]),
+        Some(Err(error)) => spans.push(Span::styled(
+            format!("   {error}"),
+            Style::default().fg(th.err),
+        )),
+        None => {}
+    }
+    let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    let gap = (width as usize)
+        .saturating_sub(used + keys.chars().count())
+        .max(4);
+    spans.push(Span::styled(format!("{:gap$}{keys}", ""), dim));
+    Some(Line::from(spans))
+}
+
 fn centered_rect(frame: Rect, width: u16, height: u16) -> Rect {
     let width = width.min(frame.width);
     let height = height.min(frame.height);
@@ -2503,7 +2771,9 @@ fn remote_badge(host: Option<&str>, th: Theme) -> Option<Span<'static>> {
     host.map(|h| {
         Span::styled(
             format!(" @{h}"),
-            Style::default().fg(if h == "local" { th.info } else { th.remote }).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(if h == "local" { th.info } else { th.remote })
+                .add_modifier(Modifier::BOLD),
         )
     })
 }
@@ -2978,14 +3248,17 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
                 let family = app.tree.project_family(&app.tree.projects[*i].id);
                 let mut hosts = Vec::new();
                 for (remote, color) in [(false, th.info), (true, th.remote)] {
-                    if app.tree.projects.iter().any(|p| {
-                        family.contains(&p.id) && p.host.is_some() == remote
-                    }) {
+                    if app
+                        .tree
+                        .projects
+                        .iter()
+                        .any(|p| family.contains(&p.id) && p.host.is_some() == remote)
+                    {
                         hosts.push(Span::styled(" ●", Style::default().fg(color)));
                     }
                 }
-                let badge_len = note_badge.as_ref().map_or(0, |(s, _)| s.chars().count())
-                    + hosts.len() * 2;
+                let badge_len =
+                    note_badge.as_ref().map_or(0, |(s, _)| s.chars().count()) + hosts.len() * 2;
                 // Bold name: the top of the tree reads "biggest".
                 let mut spans = vec![status_dot(*roll, th)];
                 spans.extend(status_name_spans(
@@ -3227,6 +3500,103 @@ fn nest_level_continues(depths: &[usize], i: usize, level: usize) -> bool {
         .is_some_and(|&d| d == level)
 }
 
+/// Keep the controls outside the scrolling rows, including when both hosts
+/// are hidden. Stack on narrow columns so neither checkbox becomes unreachable.
+/// Dark green for the branch the primary checkout is on: the `⎇` control
+/// and its row in the checkout picker.
+const CURRENT_BRANCH: Color = Color::Rgb(0, 135, 0);
+
+fn draw_host_filters(f: &mut Frame, app: &mut App, area: Rect) -> Rect {
+    let controls = [
+        ("Local", !app.hide_local, HitTarget::ToggleLocal),
+        ("Remote", !app.hide_remote, HitTarget::ToggleRemote),
+        ("All", !app.hide_empty, HitTarget::ToggleAll),
+    ];
+    // Move off the left splitter hit lane, using the column's reserved
+    // right-padding cell instead (the border itself remains untouched).
+    let controls_area = Rect {
+        x: area.x + 1,
+        ..area
+    };
+    let stacked = controls_area.width < 25;
+    for (i, (label, checked, target)) in controls.into_iter().enumerate() {
+        let x = controls_area.x + if stacked { 0 } else { [0, 9, 19][i] };
+        let y = area.y + if stacked { i as u16 } else { 0 };
+        if y >= controls_area.bottom() || x >= controls_area.right() {
+            continue;
+        }
+        let text = format!("{} {label}", if checked { "☑" } else { "☐" });
+        let rect = Rect::new(
+            x,
+            y,
+            (text.chars().count() as u16).min(controls_area.right() - x),
+            1,
+        );
+        f.render_widget(
+            Paragraph::new(text).style(Style::default().fg(if checked {
+                app.theme.text
+            } else {
+                app.theme.dim
+            })),
+            rect,
+        );
+        app.hits.push((rect, target));
+    }
+    let mut used = if stacked { 4 } else { 2 };
+    // The primary checkout's branch, as a dropdown: right-aligned beside the
+    // checkboxes when it fits there, otherwise on a row of its own.
+    let primary_branch = app
+        .selected_project()
+        .and_then(|p| {
+            app.tree
+                .worktrees
+                .iter()
+                .find(|w| w.project_id == p.id && w.is_main)
+        })
+        .map(|w| w.branch.clone());
+    if let Some(branch) = primary_branch {
+        const CHROME: usize = 4; // "⎇ " + " ▾"
+        const CHECKBOXES_W: u16 = 26; // Three checkboxes plus a gap
+        let inline = !stacked && controls_area.width >= CHECKBOXES_W + 8;
+        let (x, y, room) = if inline {
+            (
+                controls_area.x + CHECKBOXES_W,
+                area.y,
+                controls_area.width - CHECKBOXES_W,
+            )
+        } else {
+            used += 1;
+            (controls_area.x, area.y + used - 2, controls_area.width)
+        };
+        let name = truncate(&branch, (room as usize).saturating_sub(CHROME + 1));
+        let width = (name.chars().count() + CHROME) as u16;
+        let x = if inline {
+            controls_area.right().saturating_sub(width + 1).max(x)
+        } else {
+            x
+        };
+        if y < area.bottom() && width > CHROME as u16 {
+            let rect = Rect::new(x, y, width.min(controls_area.right() - x), 1);
+            let th = app.theme;
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("⎇ ", Style::default().fg(th.warn)),
+                    Span::styled(name, Style::default().fg(CURRENT_BRANCH)),
+                    Span::styled(" ▾", Style::default().fg(th.dim)),
+                ])),
+                rect,
+            );
+            app.hits.push((rect, HitTarget::CheckoutBranch));
+        }
+    }
+    let used = used.min(area.height);
+    Rect {
+        y: area.y + used,
+        height: area.height - used,
+        ..area
+    }
+}
+
 fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     let th = app.theme;
     let worktrees_focused = app.focus == Focus::Worktrees;
@@ -3243,6 +3613,8 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         worktrees_focused,
         th,
     );
+
+    let inner = draw_host_filters(f, app, inner);
 
     let push_section_backgrounds = move |app: &mut App| {
         app.hits
@@ -3261,9 +3633,8 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     enum RowKind {
         /// The primary checkout: `branch ⌂ primary`.
         Primary,
-        /// A linked worktree — `(wt)`, or `(branch)` when it exists only
-        /// to host sessions on a branch the user created as a branch.
-        Worktree { for_branch: bool },
+        /// A physical linked checkout always reads `(wt)`.
+        Worktree,
         /// A local branch no checkout holds — dim `○ branch (branch)`,
         /// with the chats parked on it (if any) listed underneath.
         Branch,
@@ -3284,21 +3655,15 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     }
     let rows: Vec<Row> = entries
         .iter()
-        .enumerate()
-        .map(|(i, entry)| {
+        .map(|entry| {
             let sub = entry.base.clone().filter(|_| entry.depth == 0);
             match &entry.row {
                 PanelRow::Worktree(id) => {
                     let w = app.tree.worktrees.iter().find(|w| &w.id == id);
                     let (label, kind) = match w {
                         Some(w) if w.is_main => (w.branch.clone(), RowKind::Primary),
-                        Some(w) => (
-                            w.branch.clone(),
-                            RowKind::Worktree {
-                                for_branch: w.for_branch,
-                            },
-                        ),
-                        None => (String::new(), RowKind::Worktree { for_branch: false }),
+                        Some(w) => (w.branch.clone(), RowKind::Worktree),
+                        None => (String::new(), RowKind::Worktree),
                     };
                     Row {
                         kind,
@@ -3306,7 +3671,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                         sub,
                         roll: app.worktree_rollup(id),
                         notes: app.note_stats(&nebula_core::NoteOwner::Worktree(id.clone())),
-                        sessions: app.panel_row_sessions(i),
+                        sessions: app.sessions_for_panel_row(&entry.row),
                         depth: entry.depth,
                         host: app.worktree_host(id).map(str::to_owned).or_else(|| {
                             w.filter(|w| app.tree.project_family(&w.project_id).len() > 1)
@@ -3321,12 +3686,12 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                     sub,
                     roll: app.branch_rollup(name),
                     notes: (0, 0),
-                    sessions: app.panel_row_sessions(i),
+                    sessions: app.sessions_for_panel_row(&entry.row),
                     depth: entry.depth,
                     host: app.selected_project().and_then(|project| {
                         // Parked branch rows can still aggregate sessions from twins.
                         // Do not label a mixed or remote-only session row as local.
-                        let foreign_session = app.panel_row_sessions(i).iter().any(|session| {
+                        let foreign_session = app.sessions_for_panel_row(&entry.row).iter().any(|session| {
                             let home = match session {
                                 SessionRow::Agent(agent) => app.tree.agent_home(agent),
                                 SessionRow::Terminal(terminal) => app.tree.terminal_home(terminal),
@@ -3347,14 +3712,23 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             }
         })
         .collect();
+    if rows.is_empty() && (app.hide_local || app.hide_remote || app.hide_empty) {
+        f.render_widget(
+            Paragraph::new("No matching rows\nEnable Local / Remote / All")
+                .style(Style::default().fg(th.dim)),
+            inner,
+        );
+        push_section_backgrounds(app);
+        return;
+    }
     if rows.is_empty() && !app.tree.has_visible_projects() {
         push_section_backgrounds(app);
         return;
     }
 
     // The primary checkout (the original clone, whatever branch it has
-    // checked out) renders as `branch ⌂ primary` — the dim badge alone
-    // marks it; it nests under the branch it was cut from like any row.
+    // checked out) renders as `branch ⌂ primary` — the badge turns green
+    // on the current row; it nests under its parent branch like any row.
     const ROOT_BADGE: &str = " ⌂ primary";
     // Row-kind tags: worktree checkouts vs plain local branches, each in
     // its own color so the two kinds read apart at a glance. The primary
@@ -3366,6 +3740,10 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     // holds checkouts only, so its length is the pinned checkout count.
     let (pinned_count, _) = app.worktree_group_counts();
     let grouped = pinned_count > 0;
+    let primary_count = rows
+        .iter()
+        .take_while(|row| row.kind == RowKind::Primary)
+        .count();
     let dim = Style::default().fg(th.dim);
     // Tree guide lines pick up the theme's warn orange so the lineage
     // structure reads at a glance; only the glyph color differs from the
@@ -3399,7 +3777,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         .enumerate()
         .map(|(i, row)| {
             let mut h = PILL_H as usize + usize::from(row.sub.is_some()) + row.sessions.len();
-            if grouped && (i == 0 || i == pinned_count) {
+            if grouped && (i == primary_count || i == primary_count + pinned_count) {
                 h += 1;
             }
             h
@@ -3427,10 +3805,10 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         let depth = row.depth;
         // 2 cells per lineage level, already depth-capped by the app side.
         let nest = 2 * depth;
-        if grouped && i == 0 {
+        if grouped && i == primary_count {
             header(f, "PINNED".into(), &mut screen_row);
         }
-        if grouped && i == pinned_count {
+        if grouped && i == primary_count + pinned_count {
             header(f, "UNPINNED".into(), &mut screen_row);
         }
         let row_height = PILL_H as usize + usize::from(row.sub.is_some());
@@ -3474,7 +3852,9 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                 // Host identity must survive a narrow column. Compact the
                 // primary tag before sacrificing @local / @findl or the name.
                 let root_badge = if row.host.is_some()
-                    && (inner.width as usize) < RAIL_AND_DOT + nest + ROOT_BADGE.chars().count() + badge_len + 4 {
+                    && (inner.width as usize)
+                        < RAIL_AND_DOT + nest + ROOT_BADGE.chars().count() + badge_len + 4
+                {
                     " ⌂"
                 } else {
                     ROOT_BADGE
@@ -3487,17 +3867,14 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                     ramp,
                     app.sweep_phase(),
                 ));
-                spans.push(Span::styled(root_badge, Style::default().fg(th.dim)));
+                spans.push(Span::styled(
+                    root_badge,
+                    Style::default().fg(if i == app.sel_worktree { th.ok } else { th.dim }),
+                ));
             }
-            RowKind::Worktree { for_branch } => {
+            RowKind::Worktree => {
                 spans.push(status_dot(row.roll, th));
-                // A checkout that exists only to host sessions on a branch
-                // the user created as a branch keeps its (branch) identity.
-                let (tag, tag_color) = if for_branch {
-                    (BRANCH_TAG, th.special)
-                } else {
-                    (WT_TAG, th.info)
-                };
+                let (tag, tag_color) = (WT_TAG, th.info);
                 spans.extend(status_name_spans(
                     truncate(
                         &row.label,
@@ -3521,8 +3898,9 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                 spans.push(Span::styled(
                     truncate(
                         &row.label,
-                        (inner.width as usize)
-                            .saturating_sub(RAIL_AND_DOT + badge_len + nest + BRANCH_TAG.chars().count()),
+                        (inner.width as usize).saturating_sub(
+                            RAIL_AND_DOT + badge_len + nest + BRANCH_TAG.chars().count(),
+                        ),
                     ),
                     dim,
                 ));
@@ -3659,6 +4037,10 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             }
             let detail = detail.map(|label| format!("{label} "));
             let remote = remote_badge(app.session_host(session), th);
+            let name = match branch_mismatch(app, session) {
+                Some(branch) => format!("⚠ expects {branch}: {name}"),
+                None => name,
+            };
             let name = truncate(
                 &name,
                 (inner.width as usize).saturating_sub(
@@ -3906,7 +4288,7 @@ fn draw_session_tabs(f: &mut Frame, app: &mut App, area: Rect, right: Option<Spa
     let sub_r = row_rect(area, 2);
     let dim = Style::default().fg(th.dim);
     let rows = app.visible_session_rows();
-    let (_, _, _, archived_count) = app.session_group_counts();
+    let (_, _, archived_count) = app.session_group_counts();
 
     // Right-aligned cluster: the archived chip, then the state tag.
     let mut cluster: Vec<Span> = Vec::new();
@@ -4089,6 +4471,22 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
         app.term_file_links = Vec::new();
         return;
     }
+    if let Some(branch) = app.parked_placeholder_branch() {
+        let inner = terminal_frame(f, area, Vec::new(), None, focused, th);
+        app.term_area = inner;
+        let msg = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("parked on {branch} — Enter switches primary and resumes it"),
+                Style::default().fg(th.muted).add_modifier(Modifier::BOLD),
+            )),
+        ])
+        .centered();
+        f.render_widget(msg, inner);
+        app.term_links = Vec::new();
+        app.term_file_links = Vec::new();
+        return;
+    }
     let right = match &app.term {
         Some(t) if t.exited => Some(Span::styled(
             "exited".to_string(),
@@ -4154,11 +4552,13 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
     if let Some((_, right)) = split_inner {
         app.split_term_area = right;
         app.hits.push((right, HitTarget::SplitTerminalPane));
-        if let Some(split) = &app.split_term {
-            f.render_widget(
-                tui_term::widget::PseudoTerminal::new(split.parser.screen()),
-                right,
-            );
+        if let Some(split) = &mut app.split_term {
+            if !draw_startup_preview(f, split, right) {
+                f.render_widget(
+                    tui_term::widget::PseudoTerminal::new(split.parser.screen()),
+                    right,
+                );
+            }
         }
     }
 
@@ -4254,6 +4654,20 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
     }
     app.term_links = links;
     app.term_file_links = file_links;
+    for (term, rect) in [
+        (app.term.as_ref(), inner),
+        (app.split_term.as_ref(), app.split_term_area),
+    ] {
+        if let Some(notice) = term.and_then(|t| app.relay_pane_notice(t)) {
+            f.render_widget(Clear, rect);
+            f.render_widget(
+                Paragraph::new(format!("\n{notice}"))
+                    .style(Style::default().fg(th.warn))
+                    .centered(),
+                rect,
+            );
+        }
+    }
 }
 
 /// The ⌘T quick terminal: a centered floating window (noticeably larger
@@ -4358,6 +4772,35 @@ fn draw_quick_terminal(f: &mut Frame, app: &mut App) {
     }
     app.term_area = inner;
     app.hits.insert(0, (inner, HitTarget::TerminalPane));
+    if let Some(notice) = app.term.as_ref().and_then(|t| app.relay_pane_notice(t)) {
+        f.render_widget(Clear, inner);
+        f.render_widget(
+            Paragraph::new(format!("\n{notice}"))
+                .style(Style::default().fg(th.warn))
+                .centered(),
+            inner,
+        );
+        app.term_links.clear();
+        app.term_file_links.clear();
+    }
+}
+
+fn branch_mismatch<'a>(app: &App, session: &'a SessionRow) -> Option<&'a str> {
+    let (id, recorded, home) = match session {
+        SessionRow::Agent(a) => (&a.worktree_id, a.branch.as_deref(), app.tree.agent_home(a)),
+        SessionRow::Terminal(t) => (
+            &t.worktree_id,
+            t.branch.as_deref(),
+            app.tree.terminal_home(t),
+        ),
+        SessionRow::Link(_) => return None,
+    };
+    let listed_where_it_runs = home == crate::app::SessionHome::Worktree(id.clone());
+    if !listed_where_it_runs {
+        return None;
+    }
+    let current = app.tree.worktrees.iter().find(|w| &w.id == id)?;
+    recorded.filter(|b| *b != current.branch)
 }
 
 /// `project ▸ branch ▸ session` breadcrumb of the current selection; the
@@ -4418,6 +4861,12 @@ fn breadcrumb(app: &App) -> Vec<Span<'static>> {
                 &name,
                 matches!(app.focus, Focus::Sessions | Focus::Terminal),
             ));
+            if let Some(branch) = branch_mismatch(app, &session) {
+                spans.push(Span::styled(
+                    format!(" ⚠ expects {branch} — recovery required"),
+                    Style::default().fg(th.special),
+                ));
+            }
         }
     }
     spans
@@ -4985,10 +5434,11 @@ mod tests {
         let mut app = App::new();
         app.animations = false;
         for (i, host) in hosts.iter().enumerate() {
+            let workspace_id = app.tree.active_workspace.clone();
             app.tree.projects.push(nebula_core::Project {
                 id: nebula_core::ProjectId(format!("host-project-{i}")),
                 name: "sample-project".into(),
-                workspace_id: app.tree.active_workspace.clone(),
+                workspace_id,
                 repo_path: "/sample-project".into(),
                 sort_order: i as i64,
                 divider_after: false,
@@ -5002,15 +5452,18 @@ mod tests {
     }
 
     fn rendered_project_hosts(app: &mut App, width: u16) -> Vec<Color> {
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 30))
-            .unwrap();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 30)).unwrap();
         terminal.draw(|f| draw_projects(f, app, f.area())).unwrap();
         let buffer = terminal.backend().buffer();
         // The existing hollow activity dot remains independent of host presence.
         assert!(buffer.content().iter().any(|cell| cell.symbol() == "○"));
-        buffer.content().iter()
-            .filter(|cell| cell.symbol() == "●"
-                && (cell.fg == app.theme.info || cell.fg == app.theme.remote))
+        buffer
+            .content()
+            .iter()
+            .filter(|cell| {
+                cell.symbol() == "●" && (cell.fg == app.theme.info || cell.fg == app.theme.remote)
+            })
             .map(|cell| cell.fg)
             .collect()
     }
@@ -5025,8 +5478,15 @@ mod tests {
         ];
         for (hosts, remote_flags) in cases {
             let mut app = host_project_app(&hosts);
-            let expected: Vec<_> = remote_flags.iter()
-                .map(|remote| if *remote { app.theme.remote } else { app.theme.info })
+            let expected: Vec<_> = remote_flags
+                .iter()
+                .map(|remote| {
+                    if *remote {
+                        app.theme.remote
+                    } else {
+                        app.theme.info
+                    }
+                })
                 .collect();
             for focus in [Focus::Projects, Focus::Worktrees] {
                 app.focus = focus;
@@ -5051,6 +5511,55 @@ mod tests {
         }
         let expected = vec![app.theme.info, app.theme.remote];
         assert_eq!(rendered_project_hosts(&mut app, 22), expected);
+    }
+
+    #[test]
+    fn primary_badge_is_green_only_on_the_current_checkout() {
+        let mut app = host_project_app(&[Some("findl")]);
+        let project_id = app.tree.projects[0].id.clone();
+        for (id, branch, is_main) in [("primary", "main", true), ("linked", "feature", false)] {
+            app.tree.worktrees.push(nebula_core::Worktree {
+                id: nebula_core::WorktreeId(id.into()),
+                project_id: project_id.clone(),
+                path: format!("/sample-project/{id}").into(),
+                branch: branch.into(),
+                is_main,
+                created_from: None,
+                pinned: false,
+                for_branch: false,
+                sort_order: 0,
+            });
+        }
+        for (width, badge) in [(50, "⌂ primary"), (22, "⌂")] {
+            for focus in [Focus::Worktrees, Focus::Sessions, Focus::Terminal] {
+                app.focus = focus;
+                for (id, expected) in [("primary", app.theme.ok), ("linked", app.theme.dim)] {
+                    app.sel_worktree = app
+                        .worktree_row_index(&nebula_core::WorktreeId(id.into()))
+                        .unwrap();
+                    let mut terminal =
+                        ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 30))
+                            .unwrap();
+                    terminal
+                        .draw(|f| draw_worktrees(f, &mut app, f.area()))
+                        .unwrap();
+                    let buffer = terminal.backend().buffer();
+                    let (x, y) = (0..30)
+                        .flat_map(|y| (0..width).map(move |x| (x, y)))
+                        .find(|&(x, y)| buffer[(x, y)].symbol() == "⌂")
+                        .expect("primary badge is visible");
+                    for (offset, ch) in badge.chars().enumerate() {
+                        let cell = &buffer[(x + offset as u16, y)];
+                        assert_eq!(cell.symbol(), ch.to_string());
+                        assert_eq!(cell.fg, expected, "{id}, {focus:?}, width={width}");
+                    }
+                    if badge == "⌂" {
+                        let text: String = (0..width).map(|x| buffer[(x, y)].symbol()).collect();
+                        assert!(!text.contains("primary"), "compact badge: {text}");
+                    }
+                }
+            }
+        }
     }
 
     const RAMP: [Color; 3] = [Color::Yellow, Color::Indexed(220), Color::Indexed(230)];

@@ -32,6 +32,7 @@ use std::time::Duration;
 /// Redraw cap (~60fps). Output bursts coalesce into one frame; input events
 /// are still handled immediately between frames.
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+const ATTACH_PREVIEW_TIMEOUT: Duration = Duration::from_millis(150);
 
 /// How often the worktree panel's changed-file badge re-reads `git status`
 /// for the selected checkout, so agent edits surface without a keypress.
@@ -202,7 +203,6 @@ async fn main_loop(
     app.open_at = open_at;
     app.conn = ConnState::Connected;
     let cfg = crate::config::Config::load();
-    app.recent_window_ms = cfg.recent_window_ms();
     app.theme = cfg.theme();
     app.animations = cfg.animations;
     app.focus_tint = cfg.focus_tint;
@@ -240,6 +240,7 @@ async fn main_loop(
     // re-dials (respawning the daemon if it's gone) instead of sitting on
     // a dead footer until the user restarts the TUI.
     let mut next_reconnect = tokio::time::Instant::now();
+    let mut relay_tick = tokio::time::interval(Duration::from_secs(1));
     // The ⌘X diagram viewer: a local surface over the whole UI. Input never
     // reaches the attached agent while it is open; the daemon carries on.
     let mut html_viewer: Option<crate::html_viewer::HtmlViewer> = None;
@@ -273,16 +274,33 @@ async fn main_loop(
             next_draw = tokio::time::Instant::now() + FRAME_INTERVAL;
             sync_pty_size(&mut app, &mut out);
             sync_vim_size(&mut app);
-            // What the user sees selected, for RECENT-expiry re-anchoring.
-            app.drawn_session = app.selected_session_row().and_then(|r| r.sref());
         }
 
-        // Wake when the next RECENT session ages out so the list regroups
-        // (slack so the wakeup lands past the boundary).
-        let recent_expiry = app.next_recent_expiry();
-
         let focus_before = app.focus;
+        let preview_deadline = [app.term.as_ref(), app.split_term.as_ref()]
+            .into_iter()
+            .flatten()
+            .filter_map(|t| t.preview_request)
+            .map(|(_, since)| tokio::time::Instant::from_std(since + ATTACH_PREVIEW_TIMEOUT))
+            .min();
         tokio::select! {
+            _ = tokio::time::sleep_until(preview_deadline.unwrap_or_else(tokio::time::Instant::now)), if preview_deadline.is_some() => {
+                for term in [app.term.as_mut(), app.split_term.as_mut()].into_iter().flatten() {
+                    if term.preview_request.is_some_and(|(_, since)| since.elapsed() >= ATTACH_PREVIEW_TIMEOUT) {
+                        finish_attach_preview(term, &mut out);
+                    }
+                }
+            }
+            _ = relay_tick.tick() => {
+                let primary = app.term.as_ref().is_some_and(|t| app.attached_session_host(&t.sref).is_some());
+                let split = app.split_term.as_ref().is_some_and(|t| app.attached_session_host(&t.sref).is_some());
+                for term in [app.term.as_mut().filter(|_| primary), app.split_term.as_mut().filter(|_| split)].into_iter().flatten() {
+                    if term.awaiting_snapshot.is_some_and(|since| since.elapsed() >= Duration::from_secs(10)) {
+                        if term.attach_attempts < 3 { retry_remote_term(term, &mut out); }
+                        app.dirty = true;
+                    }
+                }
+            }
             // Pending redraw: wake at the frame boundary even if no new
             // events arrive.
             _ = tokio::time::sleep_until(next_draw), if app.dirty => {}
@@ -332,24 +350,6 @@ async fn main_loop(
                     app.dirty = true;
                 }
                 next_ago_refresh = tokio::time::Instant::now() + AGO_REFRESH;
-            }
-            _ = tokio::time::sleep(recent_expiry.unwrap_or_default() + Duration::from_millis(250)),
-                if recent_expiry.is_some() =>
-            {
-                // Re-read the config so window edits apply without restart.
-                app.recent_window_ms = crate::config::Config::load().recent_window_ms();
-                // The expired session dropped down the list; keep the
-                // selection on whatever row the user had selected.
-                if let Some(keep) = app.drawn_session.clone() {
-                    if let Some(i) = app
-                        .visible_session_rows()
-                        .iter()
-                        .position(|r| r.sref().as_ref() == Some(&keep))
-                    {
-                        app.sel_session = i;
-                    }
-                }
-                app.dirty = true;
             }
             // The worktree selection rested past the debounce: ask the
             // daemon to boot its dead sessions in the background so
@@ -608,9 +608,7 @@ async fn main_loop(
 /// the diagram viewer needs, since its image sat on top of the UI. Not
 /// `Terminal::clear`: that asks the terminal for the cursor position first,
 /// and a reply lost to the input stream is a 2 s stall and a fatal error.
-fn repaint_everything(
-    terminal: &mut Terminal<CrosstermBackend<BufWriter<Stdout>>>,
-) -> Result<()> {
+fn repaint_everything(terminal: &mut Terminal<CrosstermBackend<BufWriter<Stdout>>>) -> Result<()> {
     use ratatui::backend::{Backend, ClearType};
     terminal.backend_mut().clear_region(ClearType::All)?;
     // The diff base is now as blank as the screen.
@@ -723,14 +721,8 @@ pub enum BranchEvent {
     /// `git for-each-ref` answer for this project's repo, each branch
     /// carrying the creation base its reflog names.
     List(nebula_core::ProjectId, Vec<crate::branches::LocalBranch>),
-    /// A `git branch` op finished; `message` is the flash to show. A
-    /// successful create carries the branch to check out on the primary
-    /// next — the `nebula switch` shape, create then land there.
-    Op {
-        message: String,
-        error: bool,
-        checkout: Option<(nebula_core::ProjectId, String)>,
-    },
+    /// A `git branch` mutation finished; creation never moves a checkout.
+    Op { message: String },
 }
 
 /// Kick a local-branch listing for the panel's checkout-less branch rows,
@@ -767,30 +759,31 @@ fn spawn_branch_list(app: &mut App) {
 /// Land a branch-channel answer: refresh the cache, or flash an op's
 /// outcome and re-list so the new/removed branch row shows right away. A
 /// create's follow-up checkout goes out from here.
-fn handle_branch_event(app: &mut App, ev: BranchEvent, out: &mut Vec<ClientRequest>) {
+fn handle_branch_event(app: &mut App, ev: BranchEvent, _out: &mut Vec<ClientRequest>) {
     match ev {
         BranchEvent::List(project, branches) => {
             app.branch_inflight = false;
+            let row = app.selected_panel_row();
+            app.seen_branch_lists
+                .insert(project.clone(), branches.clone());
             let next = Some((project, branches));
             if app.branch_list != next {
                 app.branch_list = next;
+                if let Some(index) = app
+                    .panel_entries()
+                    .iter()
+                    .position(|entry| Some(&entry.row) == row.as_ref())
+                {
+                    app.sel_worktree = index;
+                }
+                clamp_selections(app);
                 app.dirty = true;
             }
         }
-        BranchEvent::Op {
-            message,
-            error,
-            checkout,
-        } => {
+        BranchEvent::Op { message, .. } => {
             app.dirty = true;
             spawn_branch_list(app);
-            match (error, checkout) {
-                (false, Some((project, branch))) => {
-                    checkout_primary_then(app, project, branch, AfterCheckout::Land, out);
-                    app.flash = Some(format!("{message} · checking out on the primary…"));
-                }
-                _ => app.flash = Some(message),
-            }
+            app.flash = Some(message);
         }
     }
 }
@@ -800,7 +793,7 @@ fn handle_branch_event(app: &mut App, ev: BranchEvent, out: &mut Vec<ClientReque
 /// commits.
 enum BranchCmd {
     /// `git branch <name> <base>`; on success the branch is checked out
-    /// on the primary, like `nebula switch`.
+    /// without moving any checkout.
     Create {
         name: String,
         base: String,
@@ -835,26 +828,13 @@ fn spawn_branch_op(
         app.flash = Some("project has no primary checkout".into());
         return;
     };
-    let project = project.clone();
     let run = move || {
-        let (result, checkout) = match &cmd {
-            BranchCmd::Create { name, base } => (
-                crate::branches::branch_op(&repo, &[name, base]),
-                Some((project, name.clone())),
-            ),
-            BranchCmd::Delete(branch) => (crate::branches::delete_branch(&repo, branch), None),
+        let result = match &cmd {
+            BranchCmd::Create { name, base } => crate::branches::branch_op(&repo, &[name, base]),
+            BranchCmd::Delete(branch) => crate::branches::delete_branch(&repo, branch),
         };
-        match result {
-            Ok(()) => BranchEvent::Op {
-                message: done,
-                error: false,
-                checkout,
-            },
-            Err(e) => BranchEvent::Op {
-                message: e,
-                error: true,
-                checkout: None,
-            },
+        BranchEvent::Op {
+            message: result.map(|()| done).unwrap_or_else(|e| e),
         }
     };
     match app.branch_tx.clone() {
@@ -958,6 +938,9 @@ fn ui_state_json(app: &App) -> String {
         worktree: app.selected_worktree().map(|w| w.id.to_string()),
         session_agent: app.selected_session().map(|a| a.id.to_string()),
         show_archived: app.show_archived,
+        hide_local: app.hide_local,
+        hide_remote: app.hide_remote,
+        hide_empty: app.hide_empty,
         collapsed: app.collapsed,
         panel_widths: Some(app.desired_panel_widths.to_vec()),
         diff_files_width: Some(app.diff_files_width),
@@ -991,6 +974,9 @@ fn restore_ui_state(app: &mut App, json: &str) {
         return;
     };
     app.show_archived = state.show_archived;
+    app.hide_local = state.hide_local;
+    app.hide_remote = state.hide_remote;
+    app.hide_empty = state.hide_empty;
     if let Some(w) = state.panel_widths {
         // Coarse sanity clamp; normalize_panel_widths re-fits to the actual
         // screen on the next draw. Older blobs carry a third (sessions)
@@ -1083,6 +1069,8 @@ fn sync_pty_size(app: &mut App, out: &mut Vec<ClientRequest>) {
 fn resize_term(term: &mut AttachedTerm, area: ratatui::layout::Rect, out: &mut Vec<ClientRequest>) {
     term.cols = area.width;
     term.rows = area.height;
+    term.attach_preview = None;
+    finish_attach_preview(term, out);
     term.parser.screen_mut().set_size(area.height, area.width);
     #[cfg(feature = "ghostty")]
     if let Some(gh) = &mut term.gh {
@@ -1140,11 +1128,19 @@ fn close_vim(app: &mut App) {
 }
 
 fn handle_terminal_event(app: &mut App, event: Event, out: &mut Vec<ClientRequest>) {
+    if app.parked_placeholder_branch().is_some() {
+        show_parked_placeholder(app, out);
+    }
     match event {
         Event::Key(key) if key.kind != KeyEventKind::Release => {
-            app.flash = None;
-            handle_key(app, key, out);
+            // A key repaints unless `handle_key` only forwarded it to the
+            // PTY (it lowers `dirty` there): nothing on screen moved, and
+            // the echo draws when it comes back as `Output`. A frame that
+            // was already owed, or a flash this key dismissed, still draws.
+            let owed = app.dirty || app.flash.take().is_some();
             app.dirty = true;
+            handle_key(app, key, out);
+            app.dirty |= owed;
         }
         Event::Mouse(mouse) => handle_mouse(app, mouse, out),
         Event::Paste(text) if app.vim.is_some() => {
@@ -1258,6 +1254,25 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
     if app.overlay.is_some() {
         handle_overlay_key(app, key, out);
         return;
+    }
+
+    if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        let term = if app.split_focused {
+            app.split_term.as_ref()
+        } else {
+            app.term.as_ref()
+        };
+        if term.is_some_and(|t| app.relay_pane_notice(t).is_some()) {
+            let term = if app.split_focused {
+                app.split_term.as_mut()
+            } else {
+                app.term.as_mut()
+            }
+            .unwrap();
+            term.attach_attempts = 0;
+            retry_remote_term(term, out);
+            return;
+        }
     }
 
     // Terminal input-locked with a live session: forward everything except
@@ -1408,11 +1423,13 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             app.term.as_ref().is_some_and(|t| t.exited)
         };
         if !exited {
+            // Did forwarding change anything the user can see?
+            let mut changed = false;
             if !split_active {
                 // Typing changes the content under a persisted selection
                 // highlight — drop it. (The selection lives on the left
                 // pane, so typing into the split leaves it alone.)
-                app.term_selection = None;
+                changed |= app.term_selection.take().is_some();
             }
             let term = if split_active {
                 app.split_term.as_mut()
@@ -1423,6 +1440,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 // Typing exits scroll mode (tmux behavior).
                 if term.scroll > 0 {
                     term.set_scroll(0);
+                    changed = true;
                 }
                 if let Some(data) = keys::encode_key(&key, term.kitty_flags) {
                     out.push(ClientRequest::Input {
@@ -1431,6 +1449,9 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                     });
                 }
             }
+            // Forwarded and nothing else: no frame of our own (see
+            // `handle_terminal_event`).
+            app.dirty = changed;
             return;
         }
         // Exited session: there is nothing to type into, so don't swallow
@@ -1566,21 +1587,16 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 }
                 _ => app.focus = Focus::Worktrees,
             },
-            Focus::Worktrees => {
-                // A checkout-less branch row with nothing parked on it has
-                // no sessions to enter — Enter opens its action menu
-                // instead. One holding chats left behind by a checkout
-                // switch enters them like any checkout row.
-                match app.selected_branch_row() {
-                    Some(branch) if app.visible_session_rows().is_empty() => {
-                        if let Some(project) = app.selected_project().map(|p| p.id.clone()) {
-                            open_menu(app, branch_row_menu(project, branch), (30, 4));
-                        }
-                    }
-                    _ => app.focus = Focus::Sessions,
+            Focus::Worktrees => match app.selected_branch_target() {
+                Some((project, branch)) => {
+                    checkout_primary_then(app, project, branch, AfterCheckout::Land, out)
                 }
-            }
+                None => app.focus = Focus::Sessions,
+            },
             Focus::Sessions => attach_selected(app, out),
+            Focus::Terminal if app.parked_placeholder_branch().is_some() => {
+                attach_selected(app, out)
+            }
             Focus::Terminal => {
                 // Lock input into an already-focused live pane.
                 if app.term.as_ref().is_some_and(|t| !t.exited) {
@@ -1831,7 +1847,10 @@ fn open_new_worktree_or_branch_picker(app: &mut App, project: nebula_core::Proje
                 "Worktree (own directory)",
                 MenuAction::NewWorktree(project.clone()),
             ),
-            row("Branch (on the primary)", MenuAction::NewBranch(project)),
+            row(
+                "Branch (checkout when needed)",
+                MenuAction::NewBranch(project),
+            ),
         ],
         at: None,
         hover: 0,
@@ -1903,7 +1922,7 @@ fn open_prompt(app: &mut App, kind: PromptKind) {
         ),
         PromptKind::NewBranch { .. } => (
             "New branch".to_string(),
-            "branch name (checked out on the primary, like nebula switch)".to_string(),
+            "branch name (files stay on the current branch)".to_string(),
             String::new(),
         ),
         PromptKind::NewAgent {
@@ -2008,46 +2027,148 @@ fn open_repo_in_browser(app: &mut App) {
 }
 
 fn open_diff_view(app: &mut App) {
-    // Clone before touching app.overlay — selected_worktree borrows app.
-    let Some((path, branch)) = app
-        .selected_worktree()
-        .map(|w| (w.path.clone(), w.branch.clone()))
-    else {
-        app.flash = Some("no worktree selected".into());
+    match app
+        .selected_view_source()
+        .and_then(|row| load_diff_view(app, row))
+    {
+        Ok(view) => app.overlay = Some(Overlay::Diff(Box::new(view))),
+        Err(msg) => app.flash = Some(msg),
+    }
+}
+
+/// The diff viewer for `row`, loaded and, for a checkout, with the review
+/// queue around it; nothing in `app` changes. `Err` is a user-facing flash
+/// message.
+fn load_diff_view(app: &App, row: crate::app::ViewSource) -> Result<DiffView, String> {
+    if let Some(msg) = checkout_unreachable(row.source.dir()) {
+        return Err(msg);
+    }
+    let (base, files) = crate::git_diff::opening_diff(
+        &row.source,
+        &row.branch,
+        row.base.as_deref(),
+        row.primary.as_deref(),
+    )?;
+    let head = crate::git_diff::head_oid(row.source.dir());
+    let head_ok = head.is_some();
+    let mut view = DiffView::new(row.source, row.branch, files, head_ok);
+    view.base = base;
+    view.head_key = head.unwrap_or_default();
+    view.files_width = app.diff_files_width;
+    view.upstream = crate::git_diff::upstream_name(&view.source);
+    // The commit strip shows them at once; a failure leaves it empty and
+    // the ^g picker retries.
+    view.commits = crate::git_diff::recent_commits(&view.source).unwrap_or_default();
+    reload_reviewed_marks(&mut view);
+    crate::git_diff::load_selected_diff(&mut view);
+    let Some(id) = row.worktree else {
+        view.queue_snapshot = review_queue(app, None);
+        return Ok(view);
+    };
+    let changes = crate::review_queue::Changes::measure(
+        view.source.dir(),
+        view.base.clone(),
+        &view.files,
+        view.head_ok,
+        view.reviewed.len(),
+    );
+    view.queue_snapshot = review_queue(app, Some((&id, &changes)));
+    view.worktree = Some(id);
+    Ok(view)
+}
+
+fn review_queue(
+    app: &App,
+    loaded: Option<(&nebula_core::WorktreeId, &crate::review_queue::Changes)>,
+) -> crate::review_queue::ReviewQueue {
+    use crate::review_queue::{AgentsState, ReviewQueue};
+    let checkouts = app.visible_worktrees().into_iter().map(|worktree| {
+        let statuses = app
+            .tree
+            .agents
+            .iter()
+            .filter(|a| a.worktree_id == worktree.id && !a.archived)
+            .map(|a| a.status);
+        (worktree, AgentsState::of(statuses))
+    });
+    ReviewQueue::build(checkouts, loaded)
+}
+
+fn step_review(app: &mut App, forward: bool, out: &mut Vec<ClientRequest>) {
+    let Some(Overlay::Diff(view)) = &app.overlay else {
         return;
     };
-    if let Some(msg) = checkout_unreachable(&path) {
-        app.flash = Some(msg);
-        return;
+    let target = view
+        .queue_snapshot
+        .step(view.worktree.as_ref(), forward)
+        .map(|entry| entry.worktree.clone());
+    match target {
+        Ok(id) => open_diff_then_select_checkout(app, &id, out),
+        Err(msg) => app.flash = Some(msg.into()),
     }
-    let files = match crate::git_diff::changed_files(&path) {
-        Ok(files) => files,
+}
+
+fn open_diff_then_select_checkout(
+    app: &mut App,
+    id: &nebula_core::WorktreeId,
+    out: &mut Vec<ClientRequest>,
+) {
+    let row = app
+        .worktree_view_source(id)
+        .ok_or_else(|| "that checkout is no longer in the panel".to_string());
+    let view = match row.and_then(|row| load_diff_view(app, row)) {
+        Ok(view) => view,
         Err(msg) => {
             app.flash = Some(msg);
             return;
         }
     };
-    // A clean tree still opens: the ^g picker can switch to the upstream
-    // or a past commit from there.
-    let head = crate::git_diff::head_oid(&path);
-    let head_ok = head.is_some();
-    let mut view = DiffView::new(path, branch, files, head_ok);
-    view.head_key = head.unwrap_or_default();
-    view.files_width = app.diff_files_width;
-    view.upstream = crate::git_diff::upstream_name(&view.root);
-    restore_reviewed_marks(&mut view);
-    crate::git_diff::load_selected_diff(&mut view);
-    app.overlay = Some(Overlay::Diff(view));
+    if let Some(index) = app.worktree_row_index(id) {
+        if app.sel_worktree != index {
+            remember_context(app);
+            app.sel_worktree = index;
+            restore_session(app, out);
+        }
+    }
+    app.overlay = Some(Overlay::Diff(Box::new(view)));
 }
 
-/// Open the diff viewer's ^g base picker, loading the commit rows on
-/// first use. A `git log` failure flashes and leaves the picker closed.
+fn open_review_list(app: &mut App) {
+    let queue = review_queue(app, None);
+    let Some(Overlay::Diff(view)) = &mut app.overlay else {
+        return;
+    };
+    view.queue_snapshot = queue;
+    if view.queue_snapshot.entries.is_empty() {
+        app.flash = Some("no checkout waits for review".into());
+        return;
+    }
+    view.queue_picker = Some(crate::app::QueuePicker {
+        hover: view
+            .queue_snapshot
+            .position(view.worktree.as_ref())
+            .unwrap_or(0),
+        ..Default::default()
+    });
+}
+
+/// Open the diff viewer's ^g base picker, loading the commit and branch
+/// rows on first use. A git failure flashes and leaves the picker closed.
 fn open_diff_base_picker(app: &mut App) {
     let Some(Overlay::Diff(view)) = &mut app.overlay else {
         return;
     };
+    if view.branches.is_empty() && view.head_ok {
+        match crate::git_diff::branches(view.source.dir(), &view.branch) {
+            Ok(branches) => view.branches = branches,
+            Err(msg) => {
+                app.flash = Some(msg);
+                return;
+            }
+        }
+    }
     if view.commits.is_empty() && view.head_ok {
-        match crate::git_diff::recent_commits(&view.root) {
+        match crate::git_diff::recent_commits(&view.source) {
             Ok(commits) => view.commits = commits,
             Err(msg) => {
                 app.flash = Some(msg);
@@ -2058,20 +2179,17 @@ fn open_diff_base_picker(app: &mut App) {
     view.open_picker();
 }
 
-/// Switch what the diff viewer compares: reload the file list for `base`,
-/// keep the filter, and re-select the top row. Reviewed ✓ marks only
-/// apply to the working-tree view (they are keyed to HEAD's uncommitted
-/// diff), so they clear for any other base and come back when it returns.
-/// A git failure flashes and leaves the current base in place.
 fn set_diff_base(app: &mut App, base: crate::git_diff::DiffBase) {
     use crate::git_diff::DiffBase;
     let Some(Overlay::Diff(view)) = &mut app.overlay else {
         return;
     };
     let files = match &base {
-        DiffBase::WorkingTree => crate::git_diff::changed_files(&view.root),
-        DiffBase::Upstream(rev) => crate::git_diff::files_since(&view.root, rev),
-        DiffBase::Commit(c) => crate::git_diff::commit_files(&view.root, c),
+        DiffBase::WorkingTree => crate::git_diff::changed_files(view.source.dir()),
+        DiffBase::Upstream(_) | DiffBase::Branch(_) => {
+            crate::git_diff::files_since(&view.source, &base)
+        }
+        DiffBase::Commit(c) => crate::git_diff::commit_files(view.source.dir(), c),
     };
     let files = match files {
         Ok(files) => files,
@@ -2081,42 +2199,28 @@ fn set_diff_base(app: &mut App, base: crate::git_diff::DiffBase) {
         }
     };
     view.base = base;
+    view.follow_commit();
     view.files = files;
-    view.reviewed.clear();
-    if view.base.is_working_tree() {
-        restore_reviewed_marks(view);
-    }
+    reload_reviewed_marks(view);
     view.apply_filter();
     crate::git_diff::load_selected_diff(view);
 }
 
-/// Restore the worktree's reviewed ✓ marks into `view.reviewed`, dropping
-/// any that no longer apply: `load_marks` already returns nothing when HEAD
-/// moved (a commit resets the whole worktree), and a mark whose file left
-/// the change list or whose diff text changed since it was approved is
-/// pruned here — then the pruned set is written back. Restored marks sink
-/// to the bottom, so the modal opens on the first unreviewed file.
-fn restore_reviewed_marks(view: &mut DiffView) {
-    let stored = crate::review::load_marks(&view.root, &view.head_key);
-    if stored.is_empty() {
-        return;
-    }
-    view.reviewed = view
-        .files
-        .iter()
-        .filter_map(|file| {
-            let mark = *stored.get(&file.path)?;
-            let diff = crate::git_diff::diff_for(
-                &view.root,
-                file,
-                &crate::git_diff::DiffBase::WorkingTree,
-                view.head_ok,
-            );
-            (crate::review::fingerprint(&diff) == mark).then(|| (file.path.clone(), mark))
-        })
-        .collect();
-    if view.reviewed.len() != stored.len() {
-        crate::review::store_marks(&view.root, &view.head_key, &view.reviewed);
+fn reload_reviewed_marks(view: &mut DiffView) {
+    view.reviewed.clear();
+    if let Some(scope) = view.mark_scope() {
+        let stored = crate::review::load_marks(view.source.dir(), scope);
+        let unchanged = crate::review_queue::marks_on_unchanged_diffs(
+            view.source.dir(),
+            &view.files,
+            &view.base,
+            view.head_ok,
+            &stored,
+        );
+        if unchanged.len() != stored.len() {
+            crate::review::store_marks(view.source.dir(), scope, &unchanged);
+        }
+        view.reviewed = unchanged;
     }
     view.recompute_matches();
 }
@@ -2233,19 +2337,14 @@ fn open_hosts_picker(app: &mut App) {
 }
 
 fn open_file_finder(app: &mut App) {
-    // Clone before touching app.overlay — selected_worktree borrows app.
-    let Some((path, branch)) = app
-        .selected_worktree()
-        .map(|w| (w.path.clone(), w.branch.clone()))
-    else {
-        app.flash = Some("no worktree selected".into());
-        return;
+    let crate::app::ViewSource { source, branch, .. } = match app.selected_view_source() {
+        Ok(row) => row,
+        Err(msg) => {
+            app.flash = Some(msg);
+            return;
+        }
     };
-    if let Some(msg) = checkout_unreachable(&path) {
-        app.flash = Some(msg);
-        return;
-    }
-    let files = match crate::git_diff::list_files(&path) {
+    let files = match crate::git_diff::list_files(&source) {
         Ok(files) => files,
         Err(msg) => {
             app.flash = Some(msg);
@@ -2257,7 +2356,9 @@ fn open_file_finder(app: &mut App) {
         return;
     }
     let editor = crate::config::Config::load().editor_command();
-    app.overlay = Some(Overlay::Files(FileFinder::new(path, branch, editor, files)));
+    app.overlay = Some(Overlay::Files(FileFinder::new(
+        source, branch, editor, files,
+    )));
 }
 
 /// Path viewer (⌘I): a path box over the file's contents, read straight
@@ -2285,19 +2386,14 @@ fn open_file_view(app: &mut App) {
 /// flash instead of opening when there's no worktree, the path is gone, or
 /// git fails.
 fn open_tree_browser(app: &mut App) {
-    // Clone before touching app.overlay — selected_worktree borrows app.
-    let Some((path, branch)) = app
-        .selected_worktree()
-        .map(|w| (w.path.clone(), w.branch.clone()))
-    else {
-        app.flash = Some("no worktree selected".into());
-        return;
+    let crate::app::ViewSource { source, branch, .. } = match app.selected_view_source() {
+        Ok(row) => row,
+        Err(msg) => {
+            app.flash = Some(msg);
+            return;
+        }
     };
-    if let Some(msg) = checkout_unreachable(&path) {
-        app.flash = Some(msg);
-        return;
-    }
-    let files = match crate::git_diff::list_files(&path) {
+    let files = match crate::git_diff::list_files(&source) {
         Ok(files) => files,
         Err(msg) => {
             app.flash = Some(msg);
@@ -2309,26 +2405,23 @@ fn open_tree_browser(app: &mut App) {
         return;
     }
     let editor = crate::config::Config::load().editor_command();
-    app.overlay = Some(Overlay::Tree(TreeBrowser::new(path, branch, editor, files)));
+    app.overlay = Some(Overlay::Tree(TreeBrowser::new(
+        source, branch, editor, files,
+    )));
 }
 
 /// Find-in-files (`F`): live `git grep` over the selected worktree; Enter
 /// on a hit opens it in the editor modal. Same shell as `open_diff_view`.
 fn open_grep_view(app: &mut App) {
-    // Clone before touching app.overlay — selected_worktree borrows app.
-    let Some((path, branch)) = app
-        .selected_worktree()
-        .map(|w| (w.path.clone(), w.branch.clone()))
-    else {
-        app.flash = Some("no worktree selected".into());
-        return;
+    let crate::app::ViewSource { source, branch, .. } = match app.selected_view_source() {
+        Ok(row) => row,
+        Err(msg) => {
+            app.flash = Some(msg);
+            return;
+        }
     };
-    if let Some(msg) = checkout_unreachable(&path) {
-        app.flash = Some(msg);
-        return;
-    }
     let editor = crate::config::Config::load().editor_command();
-    app.overlay = Some(Overlay::Grep(GrepView::new(path, branch, editor)));
+    app.overlay = Some(Overlay::Grep(GrepView::new(source, branch, editor)));
 }
 
 /// Enter on a grep hit: spawn the editor at `path:line` inside the modal
@@ -2341,8 +2434,15 @@ fn open_selected_hit_in_editor(app: &mut App) {
     let Some(hit) = view.selected_hit() else {
         return;
     };
-    let (root, editor) = (view.root.clone(), view.editor.clone());
-    let (path, line) = (hit.path.clone(), hit.line);
+    let line = hit.line;
+    let editor = view.editor.clone();
+    let (root, path) = match view.source.editor_target(&hit.path) {
+        Ok(target) => target,
+        Err(msg) => {
+            app.flash = Some(msg);
+            return;
+        }
+    };
     let Some(tx) = app.vim_tx.clone() else {
         return; // main loop not running (unit tests without a channel)
     };
@@ -2371,10 +2471,17 @@ fn open_selected_file_in_editor(app: &mut App) {
     let Some(Overlay::Files(finder)) = &app.overlay else {
         return;
     };
-    let Some(path) = finder.selected_path().map(str::to_string) else {
+    let Some(path) = finder.selected_path() else {
         return;
     };
-    let (root, editor) = (finder.root.clone(), finder.editor.clone());
+    let editor = finder.editor.clone();
+    let (root, path) = match finder.source.editor_target(path) {
+        Ok(target) => target,
+        Err(msg) => {
+            app.flash = Some(msg);
+            return;
+        }
+    };
     let Some(tx) = app.vim_tx.clone() else {
         return; // main loop not running (unit tests without a channel)
     };
@@ -2401,7 +2508,14 @@ fn open_selected_tree_file_in_editor(app: &mut App) {
     else {
         return;
     };
-    let (root, editor) = (view.root.clone(), view.editor.clone());
+    let editor = view.editor.clone();
+    let (root, path) = match view.source.editor_target(&path) {
+        Ok(target) => target,
+        Err(msg) => {
+            app.flash = Some(msg);
+            return;
+        }
+    };
     // Size from the last-drawn preview pane; the post-draw sync corrects it.
     let preview = view.preview_area;
     let Some(tx) = app.vim_tx.clone() else {
@@ -2480,7 +2594,7 @@ fn open_file_link(app: &mut App, path: &str, line: Option<u64>) {
 /// another machine (the editor, file finder and tree browser are local
 /// tools — git-backed views still work over ssh), or its directory is
 /// gone. None = fine to open.
-fn checkout_unreachable(path: &std::path::Path) -> Option<String> {
+pub(crate) fn checkout_unreachable(path: &std::path::Path) -> Option<String> {
     if let Some(host) = nebula_core::remote::host_for(path) {
         return Some(format!(
             "checkout lives on {host} — open files from a shell tab there"
@@ -2663,6 +2777,42 @@ fn open_hidden_projects_menu(app: &mut App, at: (u16, u16)) {
     }));
 }
 
+/// Filter navigation only; never stop or archive a session.
+fn toggle_host_filter(app: &mut App, target: HitTarget, out: &mut Vec<ClientRequest>) {
+    let row = app.selected_panel_row();
+    let session = app.selected_session_row().map(|r| r.click_key());
+    remember_context(app);
+    match target {
+        HitTarget::ToggleRemote => app.hide_remote = !app.hide_remote,
+        HitTarget::ToggleLocal => app.hide_local = !app.hide_local,
+        HitTarget::ToggleAll => app.hide_empty = !app.hide_empty,
+        _ => return,
+    }
+    app.focus = Focus::Worktrees;
+    app.select_worktree_when_seen = None;
+    app.global_sessions_scroll = 0;
+    app.sel_worktree = app
+        .panel_entries()
+        .iter()
+        .position(|entry| Some(&entry.row) == row.as_ref())
+        .unwrap_or(0);
+    let same_row = app.selected_panel_row() == row;
+    let same_session = app
+        .visible_session_rows()
+        .iter()
+        .position(|r| Some(r.click_key()) == session);
+    if let Some(index) = same_session.filter(|_| same_row) {
+        app.sel_session = index;
+    } else {
+        restore_session(app, out);
+    }
+    clamp_selections(app);
+    out.push(ClientRequest::SaveUiState {
+        json: ui_state_json(app),
+    });
+    app.dirty = true;
+}
+
 fn toggle_archived(app: &mut App, out: &mut Vec<ClientRequest>) {
     let before = selection_snapshot(app);
     app.show_archived = !app.show_archived;
@@ -2702,35 +2852,152 @@ fn open_session_picker_for_context(app: &mut App, out: &mut Vec<ClientRequest>) 
     open_new_agent_picker(app, worktree);
 }
 
-/// The session picker on a branch: an existing checkout (the primary
-/// included) goes straight to the picker; a checkout-less branch is
-/// checked out on the primary — a branch is a branch, not a reason for a
-/// separate checkout — and the picker follows the Ack there. An explicit
-/// worktree is the menu's other item.
+/// Branch intent always resolves this host's guarded primary checkout.
+/// Explicit physical checkout actions use their selected checkout instead.
 fn pick_agent_on_branch(
     app: &mut App,
     project: nebula_core::ProjectId,
     branch: String,
     out: &mut Vec<ClientRequest>,
 ) {
-    if let Some(worktree) = app
-        .tree
-        .worktrees
-        .iter()
-        .find(|w| w.project_id == project && w.branch == branch)
-        .map(|w| w.id.clone())
-    {
-        open_new_agent_picker(app, worktree);
-    } else {
-        checkout_primary_then(app, project, branch, AfterCheckout::PickAgent, out);
+    resolve_branch_then(app, project, branch, AfterCheckout::PickAgent, out);
+}
+
+/// Resolve primary on the selected host, refusing an unsafe switch.
+fn resolve_branch_then(
+    app: &mut App,
+    project: nebula_core::ProjectId,
+    branch: String,
+    next: AfterCheckout,
+    out: &mut Vec<ClientRequest>,
+) {
+    let req_id = app.alloc_req_id(PendingIntent::ResolveBranchThen {
+        project: project.clone(),
+        branch: branch.clone(),
+        next,
+    });
+    app.flash = Some(format!("resolving {branch} checkout…"));
+    app.dirty = true;
+    out.push(ClientRequest::ResolveBranchCheckout {
+        req_id,
+        project,
+        branch,
+    });
+}
+
+fn remember_session_branch(app: &mut App, id: &WorktreeId) {
+    if let Some(w) = app.tree.worktrees.iter().find(|w| &w.id == id) {
+        app.session_creation_branches
+            .insert(id.clone(), w.branch.clone());
     }
 }
 
-/// Check `branch` out on the project's primary checkout, then carry on with
-/// `next` there — the `nebula switch` shape. Sessions already working on
-/// the primary would have the branch change under them, so the move is
-/// confirmed first whenever one of them is busy; an idle primary moves
-/// straight away.
+fn expected_session_branch(app: &mut App, id: &WorktreeId) -> Option<String> {
+    app.session_creation_branches.remove(id).or_else(|| {
+        app.tree
+            .worktrees
+            .iter()
+            .find(|w| &w.id == id)
+            .map(|w| w.branch.clone())
+    })
+}
+
+/// Continue a session action only with the checkout id acknowledged by its host.
+fn after_checkout(
+    app: &mut App,
+    id: WorktreeId,
+    branch: String,
+    next: AfterCheckout,
+    out: &mut Vec<ClientRequest>,
+) {
+    if let AfterCheckout::Attach(sref) = next {
+        resume_after_switch(app, sref, out);
+        return;
+    }
+    if !select_worktree_by_id(app, &id, out) {
+        app.select_worktree_when_seen = Some(id.clone());
+    }
+    app.session_creation_branches
+        .insert(id.clone(), branch.clone());
+    match next {
+        AfterCheckout::Land | AfterCheckout::Attach(_) => {}
+        AfterCheckout::PickAgent => {
+            open_new_agent_picker(app, id.clone());
+            app.session_creation_branches.insert(id, branch);
+        }
+        AfterCheckout::Terminal | AfterCheckout::SplitShell => {
+            let intent = if next == AfterCheckout::SplitShell {
+                PendingIntent::AttachCreatedSplit
+            } else {
+                PendingIntent::AttachCreated
+            };
+            let req_id = app.alloc_req_id(intent);
+            out.push(ClientRequest::CreateTerminal {
+                expected_branch: expected_session_branch(app, &id),
+                req_id,
+                worktree: id,
+                name: None,
+            });
+        }
+        AfterCheckout::QuickAgent(kind) | AfterCheckout::SplitAgent(kind) => {
+            let intent = if matches!(next, AfterCheckout::SplitAgent(_)) {
+                PendingIntent::AttachCreatedSplit
+            } else {
+                PendingIntent::AttachCreated
+            };
+            create_default_agent(app, id, kind, intent, out);
+        }
+    }
+}
+
+/// A checkout-less branch offers session kinds before provisioning a checkout.
+fn branch_session_menu(app: &mut App, split: bool) -> bool {
+    let Some((project, branch)) = app
+        .selected_project()
+        .map(|p| p.id.clone())
+        .zip(app.selected_branch_row())
+    else {
+        return false;
+    };
+    let target = TwinTarget::Checkout { project, branch };
+    let mut items: Vec<MenuItem> = [
+        AgentKind::Claude,
+        AgentKind::Codex,
+        AgentKind::Cursor,
+        AgentKind::Pi,
+    ]
+    .into_iter()
+    .map(|kind| MenuItem {
+        label: kind.as_str().to_owned(),
+        action: target.clone().then(if split {
+            AfterCheckout::SplitAgent(kind)
+        } else {
+            AfterCheckout::QuickAgent(kind)
+        }),
+        destructive: false,
+    })
+    .collect();
+    items.push(MenuItem {
+        label: "Terminal (shell)".into(),
+        action: target.then(if split {
+            AfterCheckout::SplitShell
+        } else {
+            AfterCheckout::Terminal
+        }),
+        destructive: false,
+    });
+    app.overlay = Some(Overlay::Menu(ContextMenu {
+        title: Some(if split { "Split pane" } else { "New session" }.into()),
+        items,
+        at: None,
+        hover: if split { 0 } else { 4 },
+        area: Default::default(),
+        parent: None,
+        filter: None,
+    }));
+    true
+}
+
 fn checkout_primary_then(
     app: &mut App,
     project: nebula_core::ProjectId,
@@ -2738,46 +3005,7 @@ fn checkout_primary_then(
     next: AfterCheckout,
     out: &mut Vec<ClientRequest>,
 ) {
-    let primary = app
-        .tree
-        .worktrees
-        .iter()
-        .find(|w| w.project_id == project && w.is_main);
-    let busy: Vec<&str> = primary
-        .map(|p| {
-            app.tree
-                .agents
-                .iter()
-                .filter(|a| a.worktree_id == p.id && !a.archived)
-                .filter(|a| {
-                    matches!(
-                        a.status,
-                        nebula_core::AgentStatus::Running | nebula_core::AgentStatus::NeedsFeedback
-                    )
-                })
-                .map(|a| a.name.as_str())
-                .collect()
-        })
-        .unwrap_or_default();
-    if busy.is_empty() {
-        request_checkout_primary(app, project, branch, next, out);
-        return;
-    }
-    let current = primary.map(|p| p.branch.as_str()).unwrap_or("?");
-    app.overlay = Some(Overlay::Confirm(ConfirmDialog {
-        title: "Move primary checkout".into(),
-        message: format!(
-            "The primary is on {current} with {} busy session(s): {}.\nCheck out {branch} under them?",
-            busy.len(),
-            busy.join(", ")
-        ),
-        action: PendingAction::CheckoutPrimary {
-            project,
-            branch,
-            next,
-        },
-    }));
-    app.dirty = true;
+    request_checkout_primary(app, project, branch, next, false, out);
 }
 
 /// The `CheckoutPrimary` request itself; the Ack lands on the primary and
@@ -2787,10 +3015,12 @@ fn request_checkout_primary(
     project: nebula_core::ProjectId,
     branch: String,
     next: AfterCheckout,
+    stop_busy: bool,
     out: &mut Vec<ClientRequest>,
 ) {
     let req_id = app.alloc_req_id(PendingIntent::CheckoutPrimaryThen {
         project: project.clone(),
+        branch: branch.clone(),
         next,
     });
     app.flash = Some(format!("checking out {branch} on the primary checkout…"));
@@ -2800,6 +3030,7 @@ fn request_checkout_primary(
         project,
         branch,
         mover: None,
+        stop_busy,
     });
 }
 
@@ -2823,14 +3054,13 @@ fn context_worktree(app: &App) -> Option<nebula_core::WorktreeId> {
 /// Projects panel has focus. The daemon names it (`term-N`) and the Ack
 /// attaches it, so one keypress lands in a ready shell.
 fn create_terminal_for_context(app: &mut App, out: &mut Vec<ClientRequest>) {
-    // A checkout-less branch row: the shell wants that branch, on the
-    // primary — check it out there first, the Ack creates the terminal.
+    // A checkout-less branch needs resolution before the shell can be spawned.
     if app.focus == Focus::Worktrees {
         if let (Some(branch), Some(project)) = (
             app.selected_branch_row(),
             app.selected_project().map(|p| p.id.clone()),
         ) {
-            checkout_primary_then(app, project, branch, AfterCheckout::Terminal, out);
+            resolve_branch_then(app, project, branch, AfterCheckout::Terminal, out);
             return;
         }
     }
@@ -2838,8 +3068,10 @@ fn create_terminal_for_context(app: &mut App, out: &mut Vec<ClientRequest>) {
         app.flash = Some("select a project or worktree first".into());
         return;
     };
+    remember_session_branch(app, &worktree);
     let req_id = app.alloc_req_id(PendingIntent::AttachCreated);
     out.push(ClientRequest::CreateTerminal {
+        expected_branch: expected_session_branch(app, &worktree),
         req_id,
         worktree,
         name: None,
@@ -2907,10 +3139,14 @@ fn quick_terminal_shortcut(app: &mut App, out: &mut Vec<ClientRequest>) {
         return;
     }
     let Some(worktree) = context_worktree(app) else {
+        if branch_session_menu(app, false) {
+            return;
+        }
         app.flash = Some("select a project or worktree first".into());
         return;
     };
     app.collapsed = false;
+    remember_session_branch(app, &worktree);
     let kind_row = |label: &str, kind: AgentKind| MenuItem {
         label: label.into(),
         action: MenuAction::QuickAgentOfKind {
@@ -2993,6 +3229,7 @@ fn toggle_quick_terminal(app: &mut App, out: &mut Vec<ClientRequest>) {
         None => {
             let req_id = app.alloc_req_id(PendingIntent::AttachCreated);
             out.push(ClientRequest::CreateTerminal {
+                expected_branch: expected_session_branch(app, &worktree),
                 req_id,
                 worktree,
                 name: Some(QUICK_TERMINAL_NAME.into()),
@@ -3018,9 +3255,13 @@ fn toggle_split_terminal(app: &mut App, out: &mut Vec<ClientRequest>) {
         return;
     }
     let Some(worktree) = quick_terminal_worktree(app) else {
+        if branch_session_menu(app, true) {
+            return;
+        }
         app.flash = Some("select a project or worktree first".into());
         return;
     };
+    remember_session_branch(app, &worktree);
     let kind_row = |label: &str, kind: AgentKind| MenuItem {
         label: label.into(),
         action: MenuAction::SplitAgentOfKind {
@@ -3149,14 +3390,9 @@ fn mount_split(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>, ta
         app.split_pairs.insert(owner, sref.clone());
     }
     let (cols, rows) = split_pane_size(app);
-    let (term, from_seq) = resume_or_fresh(app, &sref, cols, rows);
+    let (mut term, from_seq) = resume_or_fresh(app, &sref, cols, rows);
+    request_attach(app, &mut term, from_seq, out);
     app.split_term = Some(term);
-    out.push(ClientRequest::Attach {
-        session: sref,
-        from_seq,
-        cols,
-        rows,
-    });
     if take_focus {
         app.split_focused = true;
         app.focus = Focus::Terminal;
@@ -3739,8 +3975,12 @@ fn open_command_palette(app: &mut App) {
         items.push(row("w · New worktree…", MenuAction::NewWorktree(p.clone())));
         items.push(row("b · New branch…", MenuAction::NewBranch(p.clone())));
         items.push(row(
+            "co · Checkout branch…",
+            MenuAction::Command(PaletteCommand::CheckoutBranch(p.clone())),
+        ));
+        items.push(row(
             "t · Quick terminal (⌘T window)",
-            MenuAction::Command(PaletteCommand::QuickTerminal),
+            MenuAction::Command(crate::app::PaletteCommand::QuickTerminal),
         ));
         items.push(row(
             "tn · New terminal tab",
@@ -3833,6 +4073,7 @@ fn open_new_agent_picker(app: &mut App, worktree: WorktreeId) {
 }
 
 fn open_agent_picker(app: &mut App, worktree: WorktreeId) {
+    remember_session_branch(app, &worktree);
     let kind_row = |label: &str, kind: AgentKind| MenuItem {
         label: label.into(),
         action: MenuAction::NewAgentOfKind {
@@ -3881,9 +4122,7 @@ fn open_agent_picker(app: &mut App, worktree: WorktreeId) {
     }));
 }
 
-/// Where a twin row sends a new session: the twin's checkout of the same
-/// branch when it has one, otherwise a checkout of that branch on the
-/// twin's primary first (`nebula switch` there, then the session).
+/// Host selection targets the twin's primary, never an implicit linked checkout.
 #[derive(Debug, Clone, PartialEq)]
 enum TwinTarget {
     Worktree(WorktreeId),
@@ -3898,7 +4137,7 @@ impl TwinTarget {
     fn then(self, next: AfterCheckout) -> MenuAction {
         match self {
             TwinTarget::Worktree(w) => match next {
-                AfterCheckout::Land => MenuAction::NewAgent(w),
+                AfterCheckout::Land | AfterCheckout::Attach(_) => MenuAction::NewAgent(w),
                 AfterCheckout::PickAgent => MenuAction::NewAgent(w),
                 AfterCheckout::Terminal => MenuAction::NewTerminal(w),
                 AfterCheckout::QuickAgent(kind) => {
@@ -3923,8 +4162,8 @@ impl TwinTarget {
 /// findl:/path` counterpart, say) — as (where, target) pairs for the
 /// session pickers; `where` is the host name, or "locally" for the
 /// checkout on this machine. The target follows the worktree's *branch*,
-/// exactly like a local pick would: the twin's checkout of that branch,
-/// or a checkout of it on the twin's primary when there is none — a
+/// exactly like a local branch pick: the twin's primary if already on that
+/// branch, or a guarded primary switch otherwise — a
 /// session started "on findl" from a feature worktree never lands on
 /// whatever findl's primary happens to be on.
 fn project_twins(app: &App, worktree: &WorktreeId) -> Vec<(String, TwinTarget)> {
@@ -3953,9 +4192,7 @@ fn project_twins(app: &App, worktree: &WorktreeId) -> Vec<(String, TwinTarget)> 
                 .tree
                 .worktrees
                 .iter()
-                .filter(|x| x.project_id == p.id && x.branch == w.branch)
-                // The primary wins over a parked worktree on the same branch.
-                .max_by_key(|x| x.is_main)
+                .find(|x| x.project_id == p.id && x.is_main && x.branch == w.branch)
                 .map(|x| x.id.clone());
             let target = match same_branch {
                 Some(id) => TwinTarget::Worktree(id),
@@ -4040,9 +4277,7 @@ fn branch_pick_label(
         .tree
         .worktrees
         .iter()
-        // A for_branch checkout hosts sessions on a branch the user made
-        // as a branch — the picker keeps calling it one.
-        .any(|w| &w.project_id == project && w.branch == branch && !w.for_branch)
+        .any(|w| &w.project_id == project && w.branch == branch && !w.is_main)
     {
         format!("{branch} (wt)")
     } else {
@@ -4083,6 +4318,62 @@ fn open_agent_branch_picker(app: &mut App, project: nebula_core::ProjectId) {
     ));
 }
 
+fn split_stopped_sessions(refusal: &str) -> (String, Vec<String>) {
+    let Some((head, list)) = refusal.split_once(" stops ") else {
+        return (refusal.to_owned(), Vec::new());
+    };
+    let sessions = list
+        .split("), ")
+        .map(|s| match s.ends_with(')') {
+            true => s.to_owned(),
+            false => format!("{s})"),
+        })
+        .collect();
+    (format!("{} stops:", head.replace("; ", ";\n")), sessions)
+}
+
+/// The panel's `⎇ branch ▾` control (and `co` in the palette): fuzzy-pick
+/// a local branch and check it out on the primary checkout — the `nebula
+/// switch` shape.
+/// The current branch leads and starts hovered; picking it just lands on
+/// the primary. `at` anchors the dropdown under the control; None centers.
+fn open_checkout_picker(app: &mut App, project: nebula_core::ProjectId, at: Option<(u16, u16)>) {
+    let Some((branches, root_branch)) = project_local_branches(app, &project) else {
+        app.flash = Some("no local branches found".into());
+        return;
+    };
+    let items: Vec<MenuItem> = branches
+        .into_iter()
+        .map(|branch| MenuItem {
+            // The current branch reads `(primary)` (and draws dark green,
+            // see `ui::CURRENT_BRANCH`).
+            label: if Some(&branch) == root_branch.as_ref() {
+                format!("{branch} (primary)")
+            } else {
+                branch_pick_label(app, &project, &branch, root_branch.as_ref())
+            },
+            action: MenuAction::CheckoutPrimary {
+                project: project.clone(),
+                branch,
+            },
+            destructive: false,
+        })
+        .collect();
+    app.overlay = Some(Overlay::Menu(
+        ContextMenu {
+            title: Some("Checkout".into()),
+            items,
+            at,
+            hover: 0,
+            area: ratatui::layout::Rect::default(),
+            parent: None,
+            filter: None,
+        }
+        .filterable(),
+    ));
+    app.dirty = true;
+}
+
 /// The new-branch flow's second step: pick the branch the new one starts
 /// FROM. Same rule as the `ab` picker — the primary
 /// checkout's branch leads the list and starts hovered, the rest stay
@@ -4120,11 +4411,20 @@ fn open_new_branch_base_picker(app: &mut App, project: nebula_core::ProjectId, n
     ));
 }
 
-/// The menu on a checkout-less branch row (Enter, right-click, or the
-/// context-menu key): spawn work on the branch through the existing
-/// `AgentOnBranch` machinery, give it a checkout, or delete it.
-fn branch_row_menu(project: nebula_core::ProjectId, branch: String) -> Vec<MenuItem> {
+fn branch_row_menu(
+    project: nebula_core::ProjectId,
+    owner: nebula_core::ProjectId,
+    branch: String,
+) -> Vec<MenuItem> {
     vec![
+        MenuItem {
+            label: "Switch primary to this branch".into(),
+            action: MenuAction::CheckoutPrimary {
+                project: owner,
+                branch: branch.clone(),
+            },
+            destructive: false,
+        },
         MenuItem {
             label: "New agent here (checks out on primary)".into(),
             action: MenuAction::AgentOnBranch {
@@ -4498,9 +4798,9 @@ fn open_context_menu_for_selection(app: &mut App) {
         Focus::Worktrees => {
             // The cursor can sit on a checkout-less branch row below the
             // worktree rows — its menu acts on the branch, not a checkout.
-            if let Some(branch) = app.selected_branch_row() {
+            if let Some((owner, branch)) = app.selected_branch_target() {
                 if let Some(p) = app.selected_project().map(|p| p.id.clone()) {
-                    open_menu(app, branch_row_menu(p, branch), at);
+                    open_menu(app, branch_row_menu(p, owner, branch), at);
                 }
                 return;
             }
@@ -4837,12 +5137,16 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
             let half = (view.view_height / 2).max(1) as i32;
             let page = view.view_height.max(1) as i32;
             // The ^g base picker sits above the viewer and takes every key
-            // while open: ↑/↓ move, Enter picks, Esc (or ^g again) closes.
+            // while open: ↑/↓ move, Tab flips commits/branches, Enter picks,
+            // Esc (or ^g again) closes.
             if let Some(picker) = &view.picker {
                 let hover = picker.hover as i64;
                 let rows = view.picker_rows() as i64;
                 match key.code {
                     KeyCode::Esc => view.picker = None,
+                    KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => {
+                        view.toggle_picker_mode()
+                    }
                     KeyCode::Char('g') if cmd_or_ctrl => view.picker = None,
                     KeyCode::Enter => {
                         let base = view.picker_base(picker.hover);
@@ -4864,10 +5168,50 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 app.dirty = true;
                 return;
             }
+            if let Some(picker) = &mut view.queue_picker {
+                let last = view.queue_snapshot.entries.len().saturating_sub(1);
+                let down = key.code == KeyCode::Down || (ctrl && key.code == KeyCode::Char('n'));
+                let up = key.code == KeyCode::Up || (ctrl && key.code == KeyCode::Char('p'));
+                match key.code {
+                    _ if down => picker.hover = (picker.hover + 1).min(last),
+                    _ if up => picker.hover = picker.hover.saturating_sub(1),
+                    KeyCode::Enter => {
+                        let id = view
+                            .queue_snapshot
+                            .entries
+                            .get(picker.hover)
+                            .map(|e| e.worktree.clone());
+                        view.queue_picker = None;
+                        if let Some(id) = id {
+                            open_diff_then_select_checkout(app, &id, out);
+                        }
+                    }
+                    KeyCode::Esc => view.queue_picker = None,
+                    KeyCode::Char('l') if ctrl => view.queue_picker = None,
+                    _ => {}
+                }
+                app.dirty = true;
+                return;
+            }
             match key.code {
+                KeyCode::Char('n') if ctrl => step_review(app, true, out),
+                KeyCode::Char('p') if ctrl => step_review(app, false, out),
+                KeyCode::Char('l') if ctrl => open_review_list(app),
                 // ^g: pick what the diff compares (working tree, upstream,
                 // a commit).
                 KeyCode::Char('g') if cmd_or_ctrl => open_diff_base_picker(app),
+                // ⇥/⇧⇥ step the base along the commit strip: working tree,
+                // then the commits newest first.
+                KeyCode::Tab | KeyCode::BackTab => {
+                    let delta = if key.code == KeyCode::BackTab || shift {
+                        -1
+                    } else {
+                        1
+                    };
+                    if let Some(base) = view.step_base(delta) {
+                        set_diff_base(app, base);
+                    }
+                }
                 // Two-stage escape: an active filter is cleared before the
                 // second Esc closes the modal.
                 KeyCode::Esc if !view.filter.is_empty() => {
@@ -4881,15 +5225,11 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 // Ctrl+u is the line editor's kill-to-start while something
                 // is typed; only with an empty filter does it scroll.
                 KeyCode::Char('u') if ctrl && view.filter.is_empty() => view.scroll_by(-half),
-                // Ctrl+r toggles the reviewed ✓ on the selected file —
-                // nebula-side bookkeeping only, no git state is touched.
-                // Reviewed files sink to the bottom; marking advances to the
-                // next file and unmarking to the next still-marked file, so
-                // held Ctrl+r sweeps either way (see
-                // `DiffView::toggle_reviewed`).
-                KeyCode::Char('r') if ctrl && view.base.is_working_tree() => {
+                KeyCode::Char('r') if ctrl && view.mark_scope().is_some() => {
                     if let Some(changed) = view.toggle_reviewed() {
-                        crate::review::store_marks(&view.root, &view.head_key, &view.reviewed);
+                        if let Some(scope) = view.mark_scope() {
+                            crate::review::store_marks(view.source.dir(), scope, &view.reviewed);
+                        }
                         if changed {
                             crate::git_diff::load_selected_diff(view);
                         }
@@ -5781,7 +6121,6 @@ fn apply_setting_at(app: &mut App, tab: usize, index: usize, delta: i32) {
         app.flash = Some(format!("couldn't save settings: {err}"));
         return;
     }
-    app.recent_window_ms = cfg.recent_window_ms();
     app.theme = cfg.theme();
     app.animations = cfg.animations;
     app.focus_tint = cfg.focus_tint;
@@ -6063,11 +6402,13 @@ fn run_pending_action(app: &mut App, action: PendingAction, out: &mut Vec<Client
             let done = format!("branch {branch} deleted");
             spawn_branch_op(app, &project, BranchCmd::Delete(branch), done, out);
         }
-        PendingAction::CheckoutPrimary {
+        PendingAction::StopBusyAndCheckout {
             project,
             branch,
             next,
-        } => request_checkout_primary(app, project, branch, next, out),
+            ..
+        } => request_checkout_primary(app, project, branch, next, true, out),
+
         PendingAction::Quit => app.should_quit = true,
     }
 }
@@ -6159,11 +6500,7 @@ fn dirty_count(app: &App, w: &nebula_core::Worktree) -> usize {
 
 fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientRequest>) {
     match action {
-        MenuAction::Attach(sref) => {
-            attach(app, sref, out);
-            app.focus = Focus::Terminal;
-            app.term_locked = true;
-        }
+        MenuAction::Attach(sref) => attach_on_its_branch(app, sref, out),
         MenuAction::RestartAgent(id) => {
             let req_id = app.alloc_req_id(PendingIntent::None);
             out.push(ClientRequest::RestartAgent { req_id, id });
@@ -6208,6 +6545,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
         MenuAction::NewTerminal(worktree) => {
             let req_id = app.alloc_req_id(PendingIntent::AttachCreated);
             out.push(ClientRequest::CreateTerminal {
+                expected_branch: expected_session_branch(app, &worktree),
                 req_id,
                 worktree,
                 name: None,
@@ -6227,6 +6565,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
         MenuAction::SplitShell(worktree) => {
             let req_id = app.alloc_req_id(PendingIntent::AttachCreatedSplit);
             out.push(ClientRequest::CreateTerminal {
+                expected_branch: expected_session_branch(app, &worktree),
                 req_id,
                 worktree,
                 name: None,
@@ -6236,7 +6575,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             project,
             branch,
             next,
-        } => checkout_primary_then(app, project, branch, next, out),
+        } => resolve_branch_then(app, project, branch, next, out),
         MenuAction::RenameTerminal(id) => open_prompt(app, PromptKind::RenameTerminal { id }),
         MenuAction::CloseTerminal(id) => {
             if let Some(t) = app.tree.terminals.iter().find(|t| t.id == id).cloned() {
@@ -6348,7 +6687,20 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             out.push(ClientRequest::SetWorktreePinned { req_id, id, pinned });
         }
         MenuAction::CheckoutPrimary { project, branch } => {
-            checkout_primary_then(app, project, branch, AfterCheckout::Land, out);
+            let primary = app
+                .tree
+                .worktrees
+                .iter()
+                .find(|w| w.project_id == project && w.is_main)
+                .filter(|w| w.branch == branch)
+                .map(|w| w.id.clone());
+            match primary {
+                // Already there (the picker's leading row): just land on it.
+                Some(id) => {
+                    select_worktree_by_id(app, &id, out);
+                }
+                None => checkout_primary_then(app, project, branch, AfterCheckout::Land, out),
+            }
         }
         MenuAction::DeleteWorktree(id) => {
             if let Some(w) = app.tree.worktrees.iter().find(|w| w.id == id).cloned() {
@@ -6400,6 +6752,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             use crate::app::PaletteCommand;
             match cmd {
                 PaletteCommand::NewAgentOnBranch(project) => open_agent_branch_picker(app, project),
+                PaletteCommand::CheckoutBranch(project) => open_checkout_picker(app, project, None),
                 PaletteCommand::NewAgentInWorktree(project) => {
                     open_worktree_picker_for_agent(app, project)
                 }
@@ -6608,6 +6961,15 @@ fn remove_divider(app: &mut App, project_index: usize, before: bool, out: &mut V
 /// on, and which session row that worktree was on — so switching back
 /// restores both. Call BEFORE moving the selection away.
 fn remember_context(app: &mut App) {
+    if let Some(pid) = app.selected_project().map(|p| p.id.clone()) {
+        if let Some(sref) = app
+            .selected_session_row()
+            .filter(|r| !r.is_archived_agent())
+            .and_then(|r| r.sref())
+        {
+            app.last_session_for_project.insert(pid, sref);
+        }
+    }
     let Some(wid) = app.selected_worktree().map(|w| w.id.clone()) else {
         return;
     };
@@ -6631,10 +6993,52 @@ fn remember_context(app: &mut App) {
     }
 }
 
-/// After a project switch: land on the project's remembered worktree (its
-/// main checkout otherwise), then re-show that worktree's session.
+/// On project entry, attach the latest unread completion, then the remembered
+/// session, then the first open session. Empty projects retain worktree context.
 fn restore_context(app: &mut App, out: &mut Vec<ClientRequest>) {
     app.sel_worktree = 0;
+    let remembered = app
+        .selected_project()
+        .and_then(|p| app.last_session_for_project.get(&p.id))
+        .cloned();
+    let sessions: Vec<_> = app
+        .panel_entries()
+        .iter()
+        .enumerate()
+        .flat_map(|(row, entry)| {
+            app.sessions_for_panel_row(&entry.row)
+                .into_iter()
+                .filter(|s| !s.is_archived_agent())
+                .filter_map(move |s| s.sref().map(|sref| (row, s, sref)))
+        })
+        .collect();
+    let target = sessions
+        .iter()
+        .filter(
+            |(_, s, _)| matches!(s, SessionRow::Agent(a) if app.unseen_finished.contains(&a.id)),
+        )
+        .max_by_key(|(_, s, _)| match s {
+            SessionRow::Agent(a) => a.status_changed_at,
+            _ => 0,
+        })
+        .or_else(|| {
+            sessions
+                .iter()
+                .find(|(_, _, sref)| Some(sref) == remembered.as_ref())
+        })
+        .or_else(|| sessions.first());
+    if let Some((row, _, sref)) = target {
+        app.sel_worktree = *row;
+        app.sel_session = app
+            .visible_session_rows()
+            .iter()
+            .position(|s| s.sref().as_ref() == Some(sref))
+            .unwrap_or(0);
+        schedule_prewarm(app);
+        schedule_pr_lookup(app);
+        attach(app, sref.clone(), out);
+        return;
+    }
     if let Some(pid) = app.selected_project().map(|p| p.id.clone()) {
         if let Some(wid) = app.last_worktree_for_project.get(&pid).cloned() {
             if let Some(i) = app.worktree_row_index(&wid) {
@@ -7081,7 +7485,36 @@ fn jump_to_target(
 /// modal's Enter. The same walk as the palette's session jump, generalized
 /// to terminal tabs.
 fn open_session(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
-    let worktree = match &sref {
+    match land_on_session(app, &sref) {
+        Landing::Session => attach_selected(app, out),
+        Landing::Row => {
+            restore_session(app, out);
+            app.focus = Focus::Sessions;
+            app.flash = Some("session no longer exists".into());
+        }
+        Landing::Nowhere => app.flash = Some("session no longer exists".into()),
+    }
+}
+
+fn resume_after_switch(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
+    if land_on_session(app, &sref) != Landing::Session {
+        app.flash = Some("session no longer exists".into());
+        return;
+    }
+    mount_session(app, sref, out);
+    app.focus = Focus::Terminal;
+    app.term_locked = true;
+}
+
+#[derive(PartialEq)]
+enum Landing {
+    Session,
+    Row,
+    Nowhere,
+}
+
+fn land_on_session(app: &mut App, sref: &SessionRef) -> Landing {
+    let worktree = match sref {
         SessionRef::Agent(id) => app
             .tree
             .agents
@@ -7100,24 +7533,20 @@ fn open_session(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
         app.listed_project_for(wid)
             .is_some_and(|pid| select_project_row_by_id(app, &pid))
     });
-    let wt_index = found.then(|| app.row_index_for_session(&sref)).flatten();
+    let wt_index = found.then(|| app.row_index_for_session(sref)).flatten();
     let Some(wt_index) = wt_index else {
-        app.flash = Some("session no longer exists".into());
-        return;
+        return Landing::Nowhere;
     };
     app.sel_worktree = wt_index;
     let Some(index) = app
         .visible_session_rows()
         .iter()
-        .position(|r| r.sref().as_ref() == Some(&sref))
+        .position(|r| r.sref().as_ref() == Some(sref))
     else {
-        restore_session(app, out);
-        app.focus = Focus::Sessions;
-        app.flash = Some("session no longer exists".into());
-        return;
+        return Landing::Row;
     };
     app.sel_session = index;
-    attach_selected(app, out);
+    Landing::Session
 }
 
 /// A no-prompt agent create — configured defaults, generated name,
@@ -7133,6 +7562,7 @@ fn create_default_agent(
     let cfg = crate::config::Config::load();
     let req_id = app.alloc_req_id(intent);
     out.push(ClientRequest::CreateAgent {
+        expected_branch: expected_session_branch(app, &worktree),
         req_id,
         worktree: worktree.clone(),
         name: app.default_session_name("agent"),
@@ -7239,6 +7669,14 @@ fn attach_selected(app: &mut App, out: &mut Vec<ClientRequest>) {
         }
         return;
     };
+    attach_on_its_branch(app, sref, out);
+}
+
+fn attach_on_its_branch(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
+    if let Some((project, branch)) = app.parked_branch(&sref) {
+        checkout_primary_then(app, project, branch, AfterCheckout::Attach(sref), out);
+        return;
+    }
     attach(app, sref, out);
     app.focus = Focus::Terminal;
     app.term_locked = true;
@@ -7284,6 +7722,31 @@ fn mark_pr_seen(app: &mut App, url: &str, out: &mut Vec<ClientRequest>) {
 }
 
 fn attach(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
+    if app.parked_branch(&sref).is_some() {
+        show_parked_placeholder(app, out);
+        return;
+    }
+    mount_session(app, sref, out);
+}
+
+fn show_parked_placeholder(app: &mut App, out: &mut Vec<ClientRequest>) {
+    park_mounted_term(app, out);
+    if app.split_term.is_some() {
+        hide_split_pane(app, out);
+    }
+    app.term_locked = false;
+}
+
+fn park_mounted_term(app: &mut App, out: &mut Vec<ClientRequest>) {
+    if let Some(existing) = app.term.take() {
+        out.push(ClientRequest::Detach {
+            session: existing.sref.clone(),
+        });
+        app.park_term(existing);
+    }
+}
+
+fn mount_session(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
     // Entering ANY session of a worktree marks all of its unseen-finished
     // sessions seen at once — before the dedupe early-returns below, so
     // re-entering the already-attached session still counts as a visit.
@@ -7299,30 +7762,22 @@ fn attach(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
         app.dirty = true;
         return;
     }
-    if let Some(existing) = &app.term {
-        if existing.sref == sref && !existing.exited {
-            return; // already attached
-        }
-        out.push(ClientRequest::Detach {
-            session: existing.sref.clone(),
-        });
+    if app
+        .term
+        .as_ref()
+        .is_some_and(|t| t.sref == sref && !t.exited)
+    {
+        return; // already attached
     }
     // Park the parser we are leaving: walking back into it later resumes
     // from its `end_seq` instead of re-parsing the session's whole ring.
-    if let Some(existing) = app.term.take() {
-        app.park_term(existing);
-    }
+    park_mounted_term(app, out);
     let (cols, rows) = pane_size(app);
     // Fresh screen, so any persisted selection would point at stale cells.
     app.term_selection = None;
-    let (term, from_seq) = resume_or_fresh(app, &sref, cols, rows);
+    let (mut term, from_seq) = resume_or_fresh(app, &sref, cols, rows);
+    request_attach(app, &mut term, from_seq, out);
     app.term = Some(term);
-    out.push(ClientRequest::Attach {
-        session: sref.clone(),
-        from_seq,
-        cols,
-        rows,
-    });
     // Deliberately mounting a split session as a main tab pulls it out of
     // its pair (the visible-split case was rerouted above instead).
     app.split_pairs.retain(|_, v| v != &sref);
@@ -7344,9 +7799,70 @@ fn attach(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
     }
 }
 
-/// Mount a session's parser: the parked one when this pane already holds
-/// its state at this exact size (then the Attach asks for a delta from
-/// `end_seq`), else a fresh parser and a full replay.
+/// Warm/local attaches stream directly. A cold remote pane first asks for
+/// compact text, then replays full VT state; the preview never enters a parser.
+fn request_attach(
+    app: &mut App,
+    term: &mut AttachedTerm,
+    from_seq: Option<u64>,
+    out: &mut Vec<ClientRequest>,
+) {
+    term.starting_label = match &term.sref {
+        SessionRef::Agent(id) => app
+            .tree
+            .agents
+            .iter()
+            .find(|a| &a.id == id)
+            .map(|a| a.kind.as_str().to_owned())
+            .unwrap_or_else(|| "agent".into()),
+        SessionRef::Terminal(_) => "shell".into(),
+    };
+    if from_seq.is_none() && app.attached_session_host(&term.sref).is_some() {
+        // Sending Attach in the same batch would put the large ring replay
+        // ahead of the asynchronous ReadSession result on the relay.
+        let req_id = app.alloc_req_id(PendingIntent::AttachPreview);
+        term.preview_request = Some((req_id, std::time::Instant::now()));
+        out.push(ClientRequest::ReadSession {
+            req_id,
+            session: term.sref.clone(),
+            lines: Some(term.rows.saturating_sub(1) as usize),
+        });
+    } else {
+        out.push(ClientRequest::Attach {
+            session: term.sref.clone(),
+            from_seq,
+            cols: term.cols,
+            rows: term.rows,
+        });
+    }
+}
+
+fn finish_attach_preview(term: &mut AttachedTerm, out: &mut Vec<ClientRequest>) {
+    if term.preview_request.take().is_some() {
+        out.push(ClientRequest::Attach {
+            session: term.sref.clone(),
+            from_seq: None,
+            cols: term.cols,
+            rows: term.rows,
+        });
+    }
+}
+
+fn retry_remote_term(term: &mut AttachedTerm, out: &mut Vec<ClientRequest>) {
+    term.preview_request = None;
+    term.attach_preview = None;
+    term.awaiting_snapshot = Some(std::time::Instant::now());
+    term.attach_attempts += 1;
+    term.fresh_snapshot = true;
+    out.push(ClientRequest::Attach {
+        session: term.sref.clone(),
+        from_seq: None,
+        cols: term.cols,
+        rows: term.rows,
+    });
+}
+
+/// Mount the same-size parked parser (delta from `end_seq`), or a fresh one.
 fn resume_or_fresh(
     app: &mut App,
     sref: &SessionRef,
@@ -7357,6 +7873,8 @@ fn resume_or_fresh(
         Some(mut term) => {
             // Re-attaching always lands on the live tail, like a fresh one.
             term.set_scroll(0);
+            term.awaiting_snapshot = Some(std::time::Instant::now());
+            term.attach_attempts = 1;
             let from_seq = Some(term.end_seq);
             (term, from_seq)
         }
@@ -7426,6 +7944,7 @@ fn create_agent(
     };
     let req_id = app.alloc_req_id(PendingIntent::AttachCreated);
     out.push(ClientRequest::CreateAgent {
+        expected_branch: expected_session_branch(app, &worktree),
         req_id,
         worktree: worktree.clone(),
         name,
@@ -7768,11 +8287,17 @@ fn pointer_wants_hand(app: &App, column: u16, row: u16) -> bool {
             g.window_start(g.list_area.height as usize),
             g.hits.len(),
         ),
-        Some(Overlay::Diff(v)) => list_row(
-            v.list_area,
-            v.window_start(v.list_area.height as usize),
-            v.matches.len(),
-        ),
+        Some(Overlay::Diff(v)) => {
+            list_row(
+                v.list_area,
+                v.window_start(v.list_area.height as usize),
+                v.matches.len(),
+            ) || list_row(
+                v.commits_area,
+                v.commit_window_start(v.commits_area.height as usize),
+                v.commits.len(),
+            ) || inside(v.current_area)
+        }
         Some(Overlay::Tree(t)) => list_row(
             t.list_area,
             t.window_start(t.list_area.height as usize),
@@ -7841,6 +8366,10 @@ fn pointer_wants_hand(app: &App, column: u16, row: u16) -> bool {
                     | HitTarget::WorktreeBranch(_)
                     | HitTarget::Session(_)
                     | HitTarget::GlobalSession(_)
+                    | HitTarget::ToggleLocal
+                    | HitTarget::ToggleRemote
+                    | HitTarget::ToggleAll
+                    | HitTarget::CheckoutBranch
                     | HitTarget::ArchivedHeader
             )
         ),
@@ -7996,6 +8525,39 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
     // selects that file, a drag on the files/diff border resizes the file
     // list; everything else is swallowed.
     if let Some(Overlay::Diff(view)) = &mut app.overlay {
+        if let Some(picker) = &mut view.queue_picker {
+            let last = view.queue_snapshot.entries.len().saturating_sub(1);
+            let inside = |r: ratatui::layout::Rect| {
+                mouse.column >= r.x
+                    && mouse.column < r.x + r.width
+                    && mouse.row >= r.y
+                    && mouse.row < r.y + r.height
+            };
+            match mouse.kind {
+                MouseEventKind::ScrollUp => picker.hover = picker.hover.saturating_sub(1),
+                MouseEventKind::ScrollDown => picker.hover = (picker.hover + 1).min(last),
+                MouseEventKind::Down(MouseButton::Left) if inside(picker.list_area) => {
+                    let list = picker.list_area;
+                    let row =
+                        picker.scroll_offset(list.height as usize) + (mouse.row - list.y) as usize;
+                    if let Some(id) = view
+                        .queue_snapshot
+                        .entries
+                        .get(row)
+                        .map(|e| e.worktree.clone())
+                    {
+                        view.queue_picker = None;
+                        open_diff_then_select_checkout(app, &id, out);
+                    }
+                }
+                MouseEventKind::Down(MouseButton::Left) if !inside(picker.area) => {
+                    view.queue_picker = None
+                }
+                _ => return,
+            }
+            app.dirty = true;
+            return;
+        }
         // The ^g base picker on top: the wheel moves the hover, a click on
         // a row picks it, a click outside closes; everything else is
         // swallowed.
@@ -8037,7 +8599,40 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
             && mouse.column < view.splitter_x()
             && mouse.row >= view.area.y
             && mouse.row < view.area.y + view.area.height;
+        // The commit strip under the ▾ base row: the wheel scrolls it, a
+        // click on a row compares with that commit.
+        let strip = view.commits_area;
+        let over_commits = strip.width > 0
+            && mouse.column >= strip.x
+            && mouse.column < strip.x + strip.width
+            && mouse.row >= strip.y
+            && mouse.row < strip.y + strip.height;
+        let cur = view.current_area;
+        let over_current = cur.height > 0
+            && mouse.row == cur.y
+            && mouse.column >= cur.x
+            && mouse.column < cur.x + cur.width;
         match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) if over_current => {
+                set_diff_base(app, crate::git_diff::DiffBase::WorkingTree);
+                app.dirty = true;
+            }
+            MouseEventKind::ScrollUp if over_commits => {
+                view.scroll_commits_by(-1);
+                app.dirty = true;
+            }
+            MouseEventKind::ScrollDown if over_commits => {
+                view.scroll_commits_by(1);
+                app.dirty = true;
+            }
+            MouseEventKind::Down(MouseButton::Left) if over_commits => {
+                let index = view.commit_window_start(strip.height as usize)
+                    + (mouse.row - strip.y) as usize;
+                if let Some(c) = view.commits.get(index).cloned() {
+                    set_diff_base(app, crate::git_diff::DiffBase::Commit(c));
+                    app.dirty = true;
+                }
+            }
             MouseEventKind::ScrollUp if over_files => {
                 view.scroll_list_by(-3);
                 app.dirty = true;
@@ -8804,6 +9399,18 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                         jump_to_target(app, PaletteTarget::Session(id), false, out);
                     }
                 }
+                Some(HitTarget::ToggleLocal) => {
+                    toggle_host_filter(app, HitTarget::ToggleLocal, out)
+                }
+                Some(HitTarget::ToggleRemote) => {
+                    toggle_host_filter(app, HitTarget::ToggleRemote, out)
+                }
+                Some(HitTarget::ToggleAll) => toggle_host_filter(app, HitTarget::ToggleAll, out),
+                Some(HitTarget::CheckoutBranch) => {
+                    if let Some(project) = app.selected_project().map(|p| p.id.clone()) {
+                        open_checkout_picker(app, project, Some((mouse.column, mouse.row + 1)));
+                    }
+                }
                 Some(HitTarget::ArchivedHeader) => {
                     app.focus = Focus::Sessions;
                     toggle_archived(app, out);
@@ -9068,12 +9675,11 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                 Some(HitTarget::WorktreeBranch(i)) => {
                     app.focus = Focus::Worktrees;
                     app.sel_worktree = i;
-                    if let Some((project, branch)) = app
-                        .selected_project()
-                        .map(|p| p.id.clone())
-                        .zip(app.selected_branch_row())
+                    if let Some(((owner, branch), project)) = app
+                        .selected_branch_target()
+                        .zip(app.selected_project().map(|p| p.id.clone()))
                     {
-                        open_menu_at(app, branch_row_menu(project, branch), at);
+                        open_menu_at(app, branch_row_menu(project, owner, branch), at);
                     }
                 }
                 Some(HitTarget::Session(i)) => {
@@ -9319,6 +9925,35 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             }
             app.dirty = true;
         }
+        ServerEvent::SessionText { req_id, text, .. } => {
+            app.pending.remove(&req_id);
+            if let Some(term) = [app.term.as_mut(), app.split_term.as_mut()]
+                .into_iter()
+                .flatten()
+                .find(|t| t.preview_request.is_some_and(|(id, _)| id == req_id))
+            {
+                // Plain text is clipped to this pane, never interpreted as VT
+                // state at a different grid. A resize cancels this request.
+                if !text.trim().is_empty() && !term.has_content {
+                    term.attach_preview = Some(text);
+                    app.dirty = true;
+                }
+                finish_attach_preview(term, out);
+            }
+        }
+        ServerEvent::Error {
+            req_id: Some(req_id),
+            ..
+        } if matches!(app.pending.get(&req_id), Some(PendingIntent::AttachPreview)) => {
+            app.pending.remove(&req_id);
+            if let Some(term) = [app.term.as_mut(), app.split_term.as_mut()]
+                .into_iter()
+                .flatten()
+                .find(|t| t.preview_request.is_some_and(|(id, _)| id == req_id))
+            {
+                finish_attach_preview(term, out);
+            }
+        }
         ServerEvent::Scrollback {
             session,
             base_seq,
@@ -9329,35 +9964,60 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             }) {
                 finish_open_session(app, Ok(()));
             }
-            if let Some(term) = app.term.as_mut().filter(|t| t.sref == session) {
+            if let Some(host) = app.attached_session_host(&session).map(str::to_string) {
+                app.unavailable_relays.remove(&host);
+            }
+            if let Some(term) = app
+                .term
+                .as_mut()
+                .filter(|t| t.sref == session && t.preview_request.is_none())
+            {
+                term.attach_preview = None;
                 // A replay whose base is exactly where the parser stopped is
                 // a delta on top of state we already hold — the whole point
                 // of a resumed attach, and usually empty. Any other base
                 // means the bytes in between fell off the ring (or this is a
                 // fresh parser): rebuild the screen from scratch.
-                if base_seq != term.end_seq {
+                if term.fresh_snapshot || base_seq != term.end_seq {
                     term.reset();
                 }
+                term.awaiting_snapshot = None;
+                term.fresh_snapshot = false;
                 term.feed(&data);
                 term.end_seq = base_seq + data.len() as u64;
                 // Either way the cells under a stored selection moved.
                 app.term_selection = None;
                 app.dirty = true;
-            } else if let Some(term) = app.split_term.as_mut().filter(|t| t.sref == session) {
-                if base_seq != term.end_seq {
+            } else if let Some(term) = app
+                .split_term
+                .as_mut()
+                .filter(|t| t.sref == session && t.preview_request.is_none())
+            {
+                term.attach_preview = None;
+                if term.fresh_snapshot || base_seq != term.end_seq {
                     term.reset();
                 }
+                term.awaiting_snapshot = None;
+                term.fresh_snapshot = false;
                 term.feed(&data);
                 term.end_seq = base_seq + data.len() as u64;
                 app.dirty = true;
             }
         }
         ServerEvent::Output { session, seq, data } => {
-            if let Some(term) = app.term.as_mut().filter(|t| t.sref == session) {
+            if let Some(term) = app
+                .term
+                .as_mut()
+                .filter(|t| t.sref == session && t.preview_request.is_none())
+            {
                 term.feed(&data);
                 term.end_seq = seq + data.len() as u64;
                 app.dirty = true;
-            } else if let Some(term) = app.split_term.as_mut().filter(|t| t.sref == session) {
+            } else if let Some(term) = app
+                .split_term
+                .as_mut()
+                .filter(|t| t.sref == session && t.preview_request.is_none())
+            {
                 term.feed(&data);
                 term.end_seq = seq + data.len() as u64;
                 app.dirty = true;
@@ -9444,7 +10104,20 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                     }
                     open_new_agent_picker(app, id);
                 }
-                (Some(PendingIntent::CheckoutPrimaryThen { project, next }), _) => {
+                (
+                    Some(PendingIntent::ResolveBranchThen { branch, next, .. }),
+                    Some(EntityId::Worktree(id)),
+                ) => {
+                    after_checkout(app, id, branch, next, out);
+                }
+                (
+                    Some(PendingIntent::CheckoutPrimaryThen {
+                        project,
+                        branch,
+                        next,
+                    }),
+                    _,
+                ) => {
                     // The branch now sits on the primary checkout (its row's
                     // branch label follows via the reconcile upsert). Land
                     // there and carry on; the old primary branch becomes a
@@ -9460,41 +10133,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                     else {
                         return;
                     };
-                    select_worktree_by_id(app, &primary, out);
-                    match next {
-                        AfterCheckout::Land => {}
-                        AfterCheckout::PickAgent => open_new_agent_picker(app, primary),
-                        AfterCheckout::Terminal => {
-                            let req_id = app.alloc_req_id(PendingIntent::AttachCreated);
-                            out.push(ClientRequest::CreateTerminal {
-                                req_id,
-                                worktree: primary,
-                                name: None,
-                            });
-                        }
-                        AfterCheckout::QuickAgent(kind) => create_default_agent(
-                            app,
-                            primary,
-                            kind,
-                            PendingIntent::AttachCreated,
-                            out,
-                        ),
-                        AfterCheckout::SplitAgent(kind) => create_default_agent(
-                            app,
-                            primary,
-                            kind,
-                            PendingIntent::AttachCreatedSplit,
-                            out,
-                        ),
-                        AfterCheckout::SplitShell => {
-                            let req_id = app.alloc_req_id(PendingIntent::AttachCreatedSplit);
-                            out.push(ClientRequest::CreateTerminal {
-                                req_id,
-                                worktree: primary,
-                                name: None,
-                            });
-                        }
-                    }
+                    after_checkout(app, primary, branch, next, out);
                 }
                 (Some(PendingIntent::SelectCreatedWorktree), Some(EntityId::Worktree(id))) => {
                     // Its upsert usually lands just before this Ack; if not,
@@ -9626,6 +10265,38 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             app.dirty = true;
         }
         ServerEvent::Error { req_id, message } => {
+            if req_id.is_none() {
+                if let Some(status) = nebula_core::relay_status::RelayStatus::parse(&message) {
+                    let was_unavailable = app.unavailable_relays.contains(&status.host);
+                    if status.connected {
+                        app.unavailable_relays.remove(&status.host);
+                    } else {
+                        app.unavailable_relays.insert(status.host.clone());
+                    }
+                    let primary = app.term.as_ref().is_some_and(|t| {
+                        app.attached_session_host(&t.sref) == Some(status.host.as_str())
+                    });
+                    let split = app.split_term.as_ref().is_some_and(|t| {
+                        app.attached_session_host(&t.sref) == Some(status.host.as_str())
+                    });
+                    for term in [
+                        app.term.as_mut().filter(|_| primary),
+                        app.split_term.as_mut().filter(|_| split),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        if status.connected || !was_unavailable {
+                            term.awaiting_snapshot = Some(std::time::Instant::now());
+                            term.attach_attempts = 1;
+                        }
+                        term.fresh_snapshot = true;
+                    }
+                    app.term_cache.clear();
+                    app.dirty = true;
+                    return;
+                }
+            }
             // The daemon answers a failed Attach with an unnumbered error.
             if req_id.is_none() && message.starts_with("attach:") {
                 if let Some(open) = app
@@ -9642,10 +10313,38 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             }
             // A failed request's intent never gets an Ack; clear it — and if
             // it was an optimistic worktree delete, put the rows back.
-            if let Some(PendingIntent::DeleteWorktree(rollback)) =
-                req_id.and_then(|id| app.pending.remove(&id))
-            {
-                restore_worktree_rows(app, rollback);
+            match req_id.and_then(|id| app.pending.remove(&id)) {
+                Some(PendingIntent::DeleteWorktree(rollback)) => {
+                    restore_worktree_rows(app, rollback);
+                }
+                Some(
+                    PendingIntent::CheckoutPrimaryThen {
+                        project,
+                        branch,
+                        next,
+                    }
+                    | PendingIntent::ResolveBranchThen {
+                        project,
+                        branch,
+                        next,
+                    },
+                ) if message.starts_with(nebula_core::BUSY_SESSIONS_REFUSAL) => {
+                    app.flash = None;
+                    let (message, sessions) = split_stopped_sessions(&message);
+                    app.overlay = Some(Overlay::Confirm(ConfirmDialog {
+                        title: "Stop sessions and switch?".into(),
+                        message,
+                        action: PendingAction::StopBusyAndCheckout {
+                            project,
+                            branch,
+                            next,
+                            sessions,
+                        },
+                    }));
+                    app.dirty = true;
+                    return;
+                }
+                _ => {}
             }
             app.flash = Some(message);
             app.dirty = true;
@@ -9718,6 +10417,16 @@ fn apply_upsert(app: &mut App, entity: nebula_core::Entity) {
             app.sync_remote_hosts();
         }
         Entity::Agent(a) => {
+            // Create Ack and entity broadcast race; attach may mount before
+            // the row supplying its kind arrives.
+            for term in [app.term.as_mut(), app.split_term.as_mut()]
+                .into_iter()
+                .flatten()
+            {
+                if term.sref == SessionRef::Agent(a.id.clone()) {
+                    term.starting_label = a.kind.as_str().to_owned();
+                }
+            }
             let id = a.id.clone();
             let prev = app
                 .tree
@@ -10188,6 +10897,284 @@ mod tests {
         );
     }
 
+    fn host_filter_fixture() -> App {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_remote_twin(&mut app);
+        let mut remote = app.tree.agents[0].clone();
+        remote.id = AgentId("a-remote".into());
+        remote.worktree_id = WorktreeId("w-remote".into());
+        app.tree.agents.push(remote);
+        app
+    }
+
+    #[test]
+    fn all_filter_keeps_open_sessions_and_persists_after_click() {
+        let mut app = host_filter_fixture();
+        app.tree.agents[0].branch = Some("parked".into());
+        app.tree.agents[1].archived = true;
+        app.branch_list = Some((nebula_core::ProjectId("p1".into()), vec!["empty".into()]));
+        for width in [10, 30, 50] {
+            app.hide_empty = false;
+            app.desired_panel_widths = [20, width];
+            let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            let hit = app
+                .hits
+                .iter()
+                .find(|(_, target)| *target == HitTarget::ToggleAll)
+                .unwrap()
+                .0;
+            let mut out = Vec::new();
+            handle_mouse(
+                &mut app,
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: hit.x,
+                    row: hit.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &mut out,
+            );
+            assert_eq!(
+                app.panel_entries()
+                    .iter()
+                    .map(|e| e.row.clone())
+                    .collect::<Vec<_>>(),
+                vec![PanelRow::Worktree(WorktreeId("w1".into()))]
+            );
+            let mut restored = host_filter_fixture();
+            restore_ui_state(&mut restored, &ui_state_json(&app));
+            assert!(restored.hide_empty);
+        }
+        app.hide_local = true;
+        assert!(app.panel_entries().is_empty());
+        app.hide_empty = false;
+        assert_eq!(
+            app.panel_entries().len(),
+            1,
+            "All restores the remote checkout"
+        );
+    }
+
+    #[test]
+    fn project_navigation_restores_linked_checkout_session_and_prefers_unread_completion() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        // Sessions list under their physical checkout, so the two live in
+        // linked checkouts beside the empty primary.
+        for (id, branch) in [("w-parked", "parked"), ("w-other", "other")] {
+            let mut linked = app.tree.worktrees[0].clone();
+            linked.id = WorktreeId(id.into());
+            linked.path = format!("/tmp/demo-{branch}").into();
+            linked.branch = branch.into();
+            linked.is_main = false;
+            app.tree.worktrees.push(linked);
+        }
+        app.tree.agents[0].worktree_id = WorktreeId("w-parked".into());
+        let mut second = app.tree.agents[0].clone();
+        second.id = AgentId("a2".into());
+        second.worktree_id = WorktreeId("w-other".into());
+        app.tree.agents.push(second);
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: project("p2", "two", 1, false, None),
+            },
+        );
+        app.focus = Focus::Projects;
+        let mut out = Vec::new();
+        // First visit skips the empty primary and attaches a linked checkout's session.
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            &mut out,
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+            &mut out,
+        );
+        assert_eq!(
+            app.term.as_ref().map(|t| t.sref.clone()),
+            Some(SessionRef::Agent(AgentId("a1".into())))
+        );
+        // A manually chosen session is remembered across projects.
+        app.sel_worktree = app
+            .worktree_row_index(&WorktreeId("w-other".into()))
+            .unwrap();
+        restore_session(&mut app, &mut out);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            &mut out,
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+            &mut out,
+        );
+        assert_eq!(
+            app.term.as_ref().map(|t| t.sref.clone()),
+            Some(SessionRef::Agent(AgentId("a2".into())))
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+            &mut out,
+        );
+        let mut finished = app.tree.agents[0].clone();
+        finished.status = AgentStatus::Finished;
+        finished.status_changed_at = 100;
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: nebula_core::Entity::Agent(finished),
+            },
+        );
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+            &mut out,
+        );
+        assert_eq!(
+            app.term.as_ref().map(|t| t.sref.clone()),
+            Some(SessionRef::Agent(AgentId("a1".into())))
+        );
+    }
+
+    #[test]
+    fn host_filters_hide_only_view_rows_and_preserve_sessions() {
+        let mut app = host_filter_fixture();
+        let original_agents = serde_json::to_value(&app.tree.agents).unwrap();
+        let original_worktrees = serde_json::to_value(&app.tree.worktrees).unwrap();
+        let mut out = Vec::new();
+        assert_eq!(app.panel_entries().len(), 2);
+        assert_eq!(app.global_sessions().len(), 2);
+        toggle_host_filter(&mut app, HitTarget::ToggleLocal, &mut out);
+        assert_eq!(app.panel_entries().len(), 1);
+        assert_eq!(app.selected_worktree().unwrap().id.as_str(), "w-remote");
+        assert_eq!(app.global_sessions()[0].id.as_str(), "a-remote");
+        toggle_host_filter(&mut app, HitTarget::ToggleRemote, &mut out);
+        assert!(app.panel_entries().is_empty());
+        assert!(app.visible_session_rows().is_empty());
+        assert!(app.global_sessions().is_empty());
+        assert!(app.term.is_none());
+        toggle_host_filter(&mut app, HitTarget::ToggleLocal, &mut out);
+        assert_eq!(app.panel_entries().len(), 1);
+        assert_eq!(app.selected_worktree().unwrap().id.as_str(), "w1");
+        toggle_host_filter(&mut app, HitTarget::ToggleRemote, &mut out);
+        assert_eq!(app.panel_entries().len(), 2);
+        assert_eq!(app.selected_worktree().unwrap().id.as_str(), "w1");
+        assert_eq!(
+            serde_json::to_value(&app.tree.agents).unwrap(),
+            original_agents
+        );
+        assert_eq!(
+            serde_json::to_value(&app.tree.worktrees).unwrap(),
+            original_worktrees
+        );
+        // View filtering may attach/detach previews and save UI state, but
+        // must not issue a destructive or mutating lifecycle request.
+        assert!(
+            out.iter().all(|r| matches!(
+                r,
+                ClientRequest::Attach { .. }
+                    | ClientRequest::Detach { .. }
+                    | ClientRequest::Resize { .. }
+                    | ClientRequest::SaveUiState { .. }
+                    | ClientRequest::ReadSession { .. }
+            )),
+            "unexpected request: {out:?}"
+        );
+    }
+
+    #[test]
+    fn host_filters_preserve_visible_twin_sessions_with_historical_branches() {
+        let mut app = host_filter_fixture();
+        for agent in &mut app.tree.agents {
+            agent.branch = Some("parked".into());
+        }
+        for (hide_local, hide_remote, expected) in [(false, true, "a1"), (true, false, "a-remote")]
+        {
+            app.hide_local = hide_local;
+            app.hide_remote = hide_remote;
+            assert!(app.branch_row_index("parked").is_none());
+            let rows = app.panel_row_sessions(0);
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].sref(),
+                Some(SessionRef::Agent(AgentId(expected.into())))
+            );
+        }
+        app.hide_local = true;
+        app.hide_remote = true;
+        assert!(app.branch_row_index("parked").is_none());
+    }
+
+    #[test]
+    fn host_filters_keep_selection_by_identity_and_restore_old_state_defaults() {
+        let mut app = host_filter_fixture();
+        app.sel_worktree = app
+            .worktree_row_index(&WorktreeId("w-remote".into()))
+            .unwrap();
+        toggle_host_filter(&mut app, HitTarget::ToggleLocal, &mut Vec::new());
+        assert_eq!(app.selected_worktree().unwrap().id.as_str(), "w-remote");
+        let json = ui_state_json(&app);
+        let mut restored = host_filter_fixture();
+        restore_ui_state(&mut restored, &json);
+        assert!(restored.hide_local);
+        assert!(!restored.hide_remote);
+        assert_eq!(
+            restored.selected_worktree().unwrap().id.as_str(),
+            "w-remote"
+        );
+        restore_ui_state(
+            &mut restored,
+            r#"{"project":null,"worktree":null,"session_agent":null,"show_archived":false,"collapsed":false}"#,
+        );
+        assert!(!restored.hide_local && !restored.hide_remote);
+        assert_eq!(restored.panel_entries().len(), 2);
+    }
+
+    #[test]
+    fn host_filters_are_clickable_even_when_both_disabled_and_narrow() {
+        for width in [10, 22, 40] {
+            let mut app = host_filter_fixture();
+            app.hide_local = true;
+            app.hide_remote = true;
+            app.desired_panel_widths = [20, width];
+            let mut terminal = Terminal::new(TestBackend::new(110, 30)).unwrap();
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            let text = buffer_text(&terminal);
+            assert!(
+                text.contains("☐ Local") && text.contains("☐ Remote"),
+                "{text}"
+            );
+            let hit = app
+                .hits
+                .iter()
+                .find(|(_, target)| *target == HitTarget::ToggleLocal)
+                .unwrap()
+                .0;
+            assert_eq!(app.hit_at(hit.x, hit.y), Some(HitTarget::ToggleLocal));
+            let mut out = Vec::new();
+            handle_mouse(
+                &mut app,
+                MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: hit.x,
+                    row: hit.y,
+                    modifiers: KeyModifiers::NONE,
+                },
+                &mut out,
+            );
+            assert!(!app.hide_local);
+            assert!(app.hide_remote);
+            assert_eq!(app.panel_entries().len(), 1);
+        }
+    }
+
     #[test]
     fn new_session_picker_offers_the_project_twin_on_the_other_host() {
         let mut app = App::new();
@@ -10317,8 +11304,8 @@ mod tests {
                 entity: Entity::Worktree(feature("w-feat", "p1", 1)),
             },
         );
-        // findl has no checkout of feature-x: "Run on findl" checks the
-        // branch out on findl's primary first, then picks the agent there
+        // findl has no checkout of feature-x: "Run on findl" resolves
+        // guarded primary resolution there, then picks the agent there
         // — never a session on whatever findl's primary was on.
         open_agent_picker(&mut app, WorktreeId("w-feat".into()));
         let Some(Overlay::Menu(menu)) = &app.overlay else {
@@ -10344,7 +11331,7 @@ mod tests {
         assert!(
             matches!(
                 out.last(),
-                Some(ClientRequest::CheckoutPrimary { project, branch, .. })
+                Some(ClientRequest::ResolveBranchCheckout { project, branch, .. })
                     if project.as_str() == "p-remote" && branch == "feature-x"
             ),
             "{out:?}"
@@ -10375,8 +11362,8 @@ mod tests {
                     branch: "feature-x".into(),
                     next: AfterCheckout::Terminal,
                 }));
-        // Once findl has the branch checked out, the rows aim straight at
-        // that checkout.
+        // A host selection is not permission to enter a parked linked checkout.
+        // Even when it exists, ask primary and let its host refuse safely.
         app.overlay = None;
         hse(
             &mut app,
@@ -10393,7 +11380,14 @@ mod tests {
             .iter()
             .find(|i| i.label == "Run on findl ▸")
             .unwrap();
-        assert!(matches!(&twin.action, MenuAction::NewAgent(w) if w.as_str() == "w-remote-feat"));
+        assert_eq!(
+            twin.action,
+            MenuAction::CheckoutThen {
+                project: ProjectId("p-remote".into()),
+                branch: "feature-x".into(),
+                next: AfterCheckout::PickAgent,
+            }
+        );
     }
 
     #[test]
@@ -10435,12 +11429,23 @@ mod tests {
         app.sel_worktree = 0;
         let rows = app.visible_session_rows();
         assert!(!rows.iter().any(|r| r.name() == "remote-one"));
-        assert!(rows.iter().any(|r| matches!(r, SessionRow::Agent(a) if a.worktree_id.as_str() == "w1")));
-        app.sel_worktree = app.visible_worktrees().iter().position(|w| w.id.as_str() == "w-remote").unwrap();
+        assert!(rows
+            .iter()
+            .any(|r| matches!(r, SessionRow::Agent(a) if a.worktree_id.as_str() == "w1")));
+        app.sel_worktree = app
+            .visible_worktrees()
+            .iter()
+            .position(|w| w.id.as_str() == "w-remote")
+            .unwrap();
         let remote_rows = app.visible_session_rows();
-        let remote = remote_rows.iter().find(|r| r.name() == "remote-one").expect("remote checkout lists its own session");
+        let remote = remote_rows
+            .iter()
+            .find(|r| r.name() == "remote-one")
+            .expect("remote checkout lists its own session");
         assert_eq!(app.session_host(remote), Some("findl"));
-        assert!(!remote_rows.iter().any(|r| matches!(r, SessionRow::Agent(a) if a.worktree_id.as_str() == "w1")));
+        assert!(!remote_rows
+            .iter()
+            .any(|r| matches!(r, SessionRow::Agent(a) if a.worktree_id.as_str() == "w1")));
     }
 
     /// A session on a checkout that exists only on findl (no local
@@ -10586,7 +11591,7 @@ mod tests {
     }
 
     #[test]
-    fn branch_badge_does_not_label_remote_parked_sessions_as_local() {
+    fn historical_remote_branch_does_not_change_local_branch_ownership() {
         let mut app = App::new();
         seed_tree(&mut app);
         seed_remote_twin(&mut app);
@@ -10594,7 +11599,11 @@ mod tests {
         app.desired_panel_widths = [30, 50];
         let mut terminal = Terminal::new(TestBackend::new(180, 40)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
-        assert!(buffer_text(&terminal).contains("develop (branch) @local"), "{}", buffer_text(&terminal));
+        assert!(
+            buffer_text(&terminal).contains("develop (branch) @local"),
+            "{}",
+            buffer_text(&terminal)
+        );
         let mut remote = app.tree.agents[0].clone();
         remote.id = AgentId("remote-parked".into());
         remote.worktree_id = nebula_core::WorktreeId("w-remote".into());
@@ -10602,7 +11611,17 @@ mod tests {
         app.tree.agents.push(remote);
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
-        assert!(!text.contains("develop (branch) @local"), "{text}");
+        assert!(text.contains("develop (branch) @local"), "{text}");
+        let remote = app
+            .tree
+            .agents
+            .iter()
+            .find(|a| a.id.as_str() == "remote-parked")
+            .unwrap();
+        assert_eq!(
+            app.tree.agent_home(remote),
+            crate::app::SessionHome::Worktree(WorktreeId("w-remote".into()))
+        );
     }
 
     fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
@@ -10629,6 +11648,48 @@ mod tests {
             }
         }
         panic!("{needle:?} is not on screen");
+    }
+
+    #[test]
+    fn redraw_does_not_rebuild_the_panel_tree_for_every_row() {
+        fn measure(rows: usize) -> usize {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            let template = app.tree.worktrees[0].clone();
+            for i in 1..rows {
+                let mut w = template.clone();
+                w.id = nebula_core::WorktreeId(format!("perf-{i}"));
+                w.branch = format!("branch-{i}");
+                w.is_main = false;
+                app.tree.worktrees.push(w);
+            }
+            let mut terminal = Terminal::new(TestBackend::new(160, 50)).unwrap();
+            crate::app::PANEL_PROJECTIONS.with(|count| count.set(0));
+            let started = std::time::Instant::now();
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            let calls = crate::app::PANEL_PROJECTIONS.with(|count| count.get());
+            eprintln!(
+                "rows={rows}, panel projections={calls}, draw={:?}",
+                started.elapsed()
+            );
+            // What `main_loop` asks around every draw and on every idle
+            // pass, then the next frame: all served from the projection
+            // the first draw built.
+            let _ = (app.git_changes_stale(), app.selected_session_row());
+            terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+            let idle = crate::app::PANEL_PROJECTIONS.with(|count| count.get()) - calls;
+            assert_eq!(
+                idle, 0,
+                "an unchanged tree was projected again ({rows} rows)"
+            );
+            calls
+        }
+        assert_eq!(measure(5), 1);
+        assert_eq!(
+            measure(100),
+            1,
+            "one projection per redraw, whatever the row count"
+        );
     }
 
     fn seed_tree(app: &mut App) {
@@ -10990,14 +12051,323 @@ mod tests {
             );
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
             assert!(
-                matches!(
-                    &app.overlay,
-                    Some(Overlay::Menu(m)) if m.title.as_deref() == Some("New session")
-                ),
-                "enter opens the session picker on the filtered branch's checkout: {:?}",
-                app.overlay
+                matches!(out.last(), Some(ClientRequest::ResolveBranchCheckout { branch, .. }) if branch == "feature"),
+                "branch intent must ask primary even when a linked checkout exists: {out:?}"
             );
+            assert!(app.overlay.is_none());
         })
+    }
+
+    /// The `⎇ branch ▾` control beside Local/Remote shows the primary's
+    /// branch; a click opens a fuzzy "Checkout" picker led by that branch,
+    /// and Enter on a match checks it out on the primary. Picking the
+    /// current branch sends nothing.
+    #[test]
+    fn checkout_control_fuzzy_picks_a_branch_onto_the_primary() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        for args in [
+            &["init", "-b", "main"][..],
+            &["config", "user.email", "t@t"],
+            &["config", "user.name", "t"],
+            &["commit", "--allow-empty", "-m", "init"],
+            &["branch", "feat-login"],
+            &["branch", "fix-typo"],
+        ] {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap();
+        }
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.tree.projects[0].repo_path = repo.to_path_buf();
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("⎇ main ▾"),
+            "a narrow panel gives it its own row: {text}"
+        );
+        // A wide panel keeps it beside the checkboxes, right-aligned.
+        app.panel_widths[1] = 45;
+        app.desired_panel_widths[1] = 45;
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        let row = text
+            .lines()
+            .find(|l| l.contains("Local"))
+            .unwrap_or_default();
+        assert!(row.contains("Remote") && row.contains("⎇ main ▾"), "{text}");
+        let rect = app
+            .hits
+            .iter()
+            .find_map(|(r, t)| (*t == HitTarget::CheckoutBranch).then_some(*r))
+            .expect("the control registers a hit rect");
+
+        let mut out = Vec::new();
+        handle_mouse(
+            &mut app,
+            mev(MouseEventKind::Down(MouseButton::Left), rect.x + 2, rect.y),
+            &mut out,
+        );
+        let Some(Overlay::Menu(menu)) = &app.overlay else {
+            panic!("expected the checkout picker, got {:?}", app.overlay);
+        };
+        assert_eq!(menu.title.as_deref(), Some("Checkout"));
+        assert_eq!(
+            menu.items[0].label, "main (primary)",
+            "the current branch leads"
+        );
+        assert_eq!(menu.items.len(), 3);
+        for c in "flog".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        let Some(Overlay::Menu(menu)) = &app.overlay else {
+            panic!("{:?}", app.overlay);
+        };
+        assert_eq!(menu.items[0].label, "feat-login (branch)");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(
+            out.iter().any(|r| matches!(
+                r,
+                ClientRequest::CheckoutPrimary { branch, .. } if branch == "feat-login"
+            )),
+            "{out:?}"
+        );
+
+        out.clear();
+        open_checkout_picker(&mut app, nebula_core::ProjectId("p1".into()), None);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(
+            !out.iter()
+                .any(|r| matches!(r, ClientRequest::CheckoutPrimary { .. })),
+            "the current branch is already checked out: {out:?}"
+        );
+        assert!(app.overlay.is_none());
+    }
+
+    #[test]
+    fn a_confirmed_switch_creates_the_follow_up_session_on_the_requested_branch() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        resolve_branch_then(
+            &mut app,
+            nebula_core::ProjectId("p1".into()),
+            "feat-x".into(),
+            AfterCheckout::Terminal,
+            &mut out,
+        );
+        let Some(ClientRequest::ResolveBranchCheckout { req_id, .. }) = out.pop() else {
+            panic!("{out:?}");
+        };
+        handle_server_event(
+            &mut app,
+            ServerEvent::Error {
+                req_id: Some(req_id),
+                message: "primary has sessions on \"main\"; switching to \"feat-x\" stops runner (agent, running)".into(),
+            },
+            &mut out,
+        );
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        let Some(ClientRequest::CheckoutPrimary { req_id, .. }) = out.pop() else {
+            panic!("{out:?}");
+        };
+
+        handle_server_event(
+            &mut app,
+            ServerEvent::Ack {
+                req_id,
+                created: None,
+            },
+            &mut out,
+        );
+
+        assert!(
+            matches!(
+                out.last(),
+                Some(ClientRequest::CreateTerminal { expected_branch: Some(b), .. }) if b == "feat-x"
+            ),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn a_sessions_refusal_asks_before_stopping_them_and_switching() {
+        let project = nebula_core::ProjectId("p1".into());
+        let starts: [fn(&mut App, nebula_core::ProjectId, &mut Vec<ClientRequest>); 2] = [
+            |app, project, out| {
+                run_menu_action(
+                    app,
+                    MenuAction::CheckoutPrimary {
+                        project,
+                        branch: "feat-x".into(),
+                    },
+                    out,
+                )
+            },
+            |app, project, out| {
+                resolve_branch_then(app, project, "feat-x".into(), AfterCheckout::Land, out)
+            },
+        ];
+        for start in starts {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            let mut out = Vec::new();
+            start(&mut app, project.clone(), &mut out);
+            let req_id = match out.pop() {
+                Some(ClientRequest::CheckoutPrimary { req_id, .. })
+                | Some(ClientRequest::ResolveBranchCheckout { req_id, .. }) => req_id,
+                other => panic!("{other:?}"),
+            };
+            handle_server_event(
+                &mut app,
+                ServerEvent::Error {
+                    req_id: Some(req_id),
+                    message: "primary has sessions on \"main\"; switching to \"feat-x\" stops runner (agent, running), shell (terminal)".into(),
+                },
+                &mut out,
+            );
+            let Some(Overlay::Confirm(confirm)) = &app.overlay else {
+                panic!("expected the stop confirm, got {:?}", app.overlay);
+            };
+            assert!(
+                matches!(
+                    &confirm.action,
+                    PendingAction::StopBusyAndCheckout { sessions, .. }
+                        if sessions == &["runner (agent, running)", "shell (terminal)"]
+                ),
+                "{:?}",
+                confirm.action
+            );
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(
+                matches!(
+                    out.last(),
+                    Some(ClientRequest::CheckoutPrimary { project: p, branch, stop_busy: true, mover: None, .. })
+                        if p == &project && branch == "feat-x"
+                ),
+                "{out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_stop_confirm_shows_every_session_in_a_narrow_terminal() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        run_menu_action(
+            &mut app,
+            MenuAction::CheckoutPrimary {
+                project: nebula_core::ProjectId("p1".into()),
+                branch: "feat-x".into(),
+            },
+            &mut out,
+        );
+        let Some(ClientRequest::CheckoutPrimary { req_id, .. }) = out.pop() else {
+            panic!("{out:?}")
+        };
+        let sessions = [
+            "claude-fix (agent, running)",
+            "review (agent, finished)",
+            "dev-server (terminal)",
+            "notes (agent, needs feedback)",
+        ];
+        handle_server_event(
+            &mut app,
+            ServerEvent::Error {
+                req_id: Some(req_id),
+                message: format!(
+                    "primary has sessions on \"main\"; switching to \"feat-x\" stops {}",
+                    sessions.join(", ")
+                ),
+            },
+            &mut out,
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        for line in [
+            "primary has sessions on \"main\";",
+            "switching to \"feat-x\" stops:",
+        ]
+        .into_iter()
+        .chain(sessions)
+        {
+            assert!(text.contains(line), "{line} is cut off:\n{text}");
+        }
+        assert!(text.contains("[Enter/y] confirm"), "{text}");
+    }
+
+    #[test]
+    fn a_stop_confirm_taller_than_the_terminal_counts_the_sessions_it_cannot_show() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        run_menu_action(
+            &mut app,
+            MenuAction::CheckoutPrimary {
+                project: nebula_core::ProjectId("p1".into()),
+                branch: "feat-x".into(),
+            },
+            &mut out,
+        );
+        let Some(ClientRequest::CheckoutPrimary { req_id, .. }) = out.pop() else {
+            panic!("{out:?}")
+        };
+        let sessions: Vec<String> = (1..=10).map(|i| format!("shell-{i} (terminal)")).collect();
+        handle_server_event(
+            &mut app,
+            ServerEvent::Error {
+                req_id: Some(req_id),
+                message: format!(
+                    "primary has sessions on \"main\"; switching to \"feat-x\" stops {}",
+                    sessions.join(", ")
+                ),
+            },
+            &mut out,
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        for shown in &sessions[..5] {
+            assert!(text.contains(shown.as_str()), "{shown}:\n{text}");
+        }
+        assert!(!text.contains("shell-6 (terminal)"), "{text}");
+        assert!(text.contains("… and 5 more"), "{text}");
+        assert!(text.contains("[Enter/y] confirm"), "{text}");
+    }
+
+    #[test]
+    fn a_bulk_delete_confirm_in_a_short_terminal_keeps_its_own_summary() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let template = app.tree.agents[0].clone();
+        for i in 2..=20 {
+            let mut agent = template.clone();
+            agent.id = AgentId(format!("a{i}"));
+            agent.name = format!("session-{i:02}");
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: nebula_core::Entity::Agent(agent),
+                },
+            );
+        }
+        app.focus = Focus::Sessions;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('D'), KeyModifiers::SHIFT, &mut out);
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("… and 12 more"), "{text}");
     }
 
     /// A query matching nothing leaves an editable empty picker: Enter is
@@ -12354,7 +13724,7 @@ mod tests {
 
         let rows = app.visible_sessions();
         assert_eq!(rows[0].name, "agent-2", "pinned agent sorts first");
-        assert_eq!(app.session_group_counts(), (1, 0, 1, 0));
+        assert_eq!(app.session_group_counts(), (1, 1, 0));
 
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
@@ -12411,9 +13781,10 @@ mod tests {
 
         hse(&mut app, mk_feat(true));
         let rows = app.visible_worktrees();
-        assert_eq!(rows[0].branch, "feat", "pinned worktree sorts first");
-        assert_eq!(app.worktree_group_counts(), (1, 1));
-        assert_eq!(app.sel_worktree, 0, "selection follows the pinned row");
+        assert_eq!(rows[0].branch, "main", "primary stays first");
+        assert_eq!(rows[1].branch, "feat", "pinned worktree follows primary");
+        assert_eq!(app.worktree_group_counts(), (1, 0));
+        assert_eq!(app.sel_worktree, 1, "selection follows the pinned row");
         assert_eq!(app.focus, Focus::Worktrees, "focus stays on the panel");
 
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
@@ -12421,156 +13792,23 @@ mod tests {
         let text = buffer_text(&terminal);
         assert!(text.contains("PINNED"), "pinned header rendered:\n{text}");
         assert!(
-            text.contains("UNPINNED"),
-            "unpinned header rendered:\n{text}"
+            !text.contains("UNPINNED"),
+            "no empty unpinned group:\n{text}"
         );
     }
 
-    /// Agents whose status changed within the window sort into a RECENT
-    /// group: below PINNED (always), above the remaining unpinned rows.
-    /// Pinned agents stay in PINNED even with a fresh status change, and an
-    /// expired timestamp lands back in UNPINNED.
+    /// Sessions order by recency: pinned first, then working sessions,
+    /// then whichever finished last; never-run ones sink. A status flip
+    /// moves the row — and the selection follows its session.
     #[test]
-    fn recent_status_changes_group_below_pinned() {
+    fn sessions_order_by_recency_and_the_cursor_follows() {
         use nebula_core::{Agent, AgentStatus, Entity};
         let mut app = App::new();
-        seed_tree(&mut app);
-        let now = crate::app::now_ms();
-        let mk = |id: &str, pinned: bool, changed_at: i64, sort: i64| ServerEvent::EntityUpserted {
-            entity: Entity::Agent(Agent {
-                id: AgentId(id.into()),
-                worktree_id: WorktreeId("w1".into()),
-                name: id.into(),
-                status: AgentStatus::Finished,
-                archived: false,
-                archived_at: 0,
-                pinned,
-                kind: nebula_core::AgentKind::Claude,
-                model: None,
-                effort: None,
-                session_id: None,
-                sort_order: sort,
-                status_changed_at: changed_at,
-                alive: true,
-                branch: None,
-            }),
-        };
-        // Pinned with a fresh change: must stay in PINNED, not RECENT.
-        hse(&mut app, mk("pinned-fresh", true, now, 1));
-        // Unpinned, changed just now: RECENT.
-        hse(&mut app, mk("recent-1", false, now - 1_000, 2));
-        // Unpinned, changed outside the window: plain UNPINNED.
-        let stale = now - app.recent_window_ms - 60_000;
-        hse(&mut app, mk("stale-1", false, stale, 3));
-
-        let rows = app.visible_sessions();
-        let names: Vec<&str> = rows.iter().map(|a| a.name.as_str()).collect();
-        assert_eq!(
-            names,
-            vec!["pinned-fresh", "recent-1", "stale-1", "agent-1"],
-            "pinned, then recent, then the rest by last interaction              (stale-1 ran once; agent-1 never has)"
-        );
-        assert_eq!(app.session_group_counts(), (1, 1, 2, 0));
-        assert!(app.next_recent_expiry().is_some());
-
-        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
-        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
-        let line = buffer_text(&terminal)
-            .lines()
-            .find(|l| l.contains("pinned-fresh"))
-            .expect("the tab bar row")
-            .to_string();
-        let pos = |n: &str| {
-            line.find(n)
-                .unwrap_or_else(|| panic!("{n} missing:\n{line}"))
-        };
-        assert!(
-            pos("pinned-fresh") < pos("recent-1") && pos("recent-1") < pos("stale-1"),
-            "tabs keep the pinned → recent → rest order:\n{line}"
-        );
-    }
-
-    /// Running / needs-feedback sessions head the RECENT group and hold
-    /// their place there however long they have been working — an old
-    /// status timestamp doesn't drop them back into UNPINNED.
-    #[test]
-    fn working_sessions_head_recent_regardless_of_age() {
-        use nebula_core::{Agent, AgentStatus, Entity};
-        let mut app = App::new();
-        seed_tree(&mut app);
-        let now = crate::app::now_ms();
-        let stale = now - app.recent_window_ms - 60_000;
-        let mk = |id: &str, status: AgentStatus, changed_at: i64, sort: i64| {
-            ServerEvent::EntityUpserted {
-                entity: Entity::Agent(Agent {
-                    id: AgentId(id.into()),
-                    worktree_id: WorktreeId("w1".into()),
-                    name: id.into(),
-                    status,
-                    archived: false,
-                    archived_at: 0,
-                    pinned: false,
-                    kind: nebula_core::AgentKind::Claude,
-                    model: None,
-                    effort: None,
-                    session_id: None,
-                    sort_order: sort,
-                    status_changed_at: changed_at,
-                    alive: true,
-                    branch: None,
-                }),
-            }
-        };
-        // Finished a moment ago: RECENT on the timestamp alone.
-        hse(
-            &mut app,
-            mk("just-finished", AgentStatus::Finished, now - 1_000, 1),
-        );
-        // Working since before the window opened: still RECENT, and above it.
-        hse(&mut app, mk("long-running", AgentStatus::Running, stale, 2));
-        hse(
-            &mut app,
-            mk("long-blocked", AgentStatus::NeedsFeedback, stale, 3),
-        );
-
-        let rows = app.visible_sessions();
-        let names: Vec<&str> = rows.iter().map(|a| a.name.as_str()).collect();
-        assert_eq!(
-            names,
-            vec!["long-running", "long-blocked", "just-finished", "agent-1"],
-            "working sessions top RECENT, then the freshly-changed row, then the rest"
-        );
-        assert_eq!(app.session_group_counts(), (0, 3, 1, 0));
-
-        // Only the finished row is on the expiry clock; the working ones
-        // would otherwise report a deadline already past and respin the
-        // event loop every 250ms.
-        let expiry = app
-            .next_recent_expiry()
-            .expect("the finished row still ages out");
-        assert!(
-            expiry > Duration::from_secs(60),
-            "expiry tracks the finished row, not the stale working ones: {expiry:?}"
-        );
-
-        // "off" still collapses the group, working sessions included.
-        app.recent_window_ms = 0;
-        assert_eq!(app.session_group_counts(), (0, 0, 4, 0));
-        assert!(app.next_recent_expiry().is_none());
-    }
-
-    /// Every group is ordered by last interaction, newest first — the
-    /// session you just ran surfaces at the top of its group, and sessions
-    /// that have never run sink to the bottom in tree order.
-    #[test]
-    fn sessions_order_by_last_interaction() {
-        use nebula_core::{Agent, AgentStatus, Entity};
-        let mut app = App::new();
-        seed_tree(&mut app); // agent-1: fresh, never run (stamp 0)
+        seed_tree(&mut app); // agent-1: fresh, never run
         let now = crate::app::now_ms();
         let mins = |n: i64| now - n * 60_000;
-        let mk = |id: &str, pinned: bool, status: AgentStatus, at: i64, sort: i64| {
-            ServerEvent::EntityUpserted {
+        let mk =
+            |id: &str, pinned: bool, status: AgentStatus, at: i64| ServerEvent::EntityUpserted {
                 entity: Entity::Agent(Agent {
                     id: AgentId(id.into()),
                     worktree_id: WorktreeId("w1".into()),
@@ -12583,137 +13821,79 @@ mod tests {
                     model: None,
                     effort: None,
                     session_id: None,
-                    sort_order: sort,
+                    sort_order: 0,
                     status_changed_at: at,
                     alive: true,
                     branch: None,
                 }),
-            }
+            };
+        hse(
+            &mut app,
+            mk("cold", false, AgentStatus::Finished, mins(120)),
+        );
+        hse(
+            &mut app,
+            mk("working", false, AgentStatus::Running, mins(25)),
+        );
+        hse(&mut app, mk("pin", true, AgentStatus::Finished, mins(20)));
+        hse(
+            &mut app,
+            mk("blocked", false, AgentStatus::NeedsFeedback, mins(1)),
+        );
+        let names = |app: &App| -> Vec<String> {
+            app.visible_sessions().into_iter().map(|a| a.name).collect()
         };
-        // Two pinned rows, seeded in the *opposite* order to their stamps.
-        hse(
-            &mut app,
-            mk("pin-old", true, AgentStatus::Finished, mins(20), 1),
-        );
-        hse(
-            &mut app,
-            mk("pin-new", true, AgentStatus::Finished, mins(2), 2),
-        );
-        // RECENT: a long-running turn outranks a more recent finish, because
-        // a working session is interacting with you right now.
-        hse(
-            &mut app,
-            mk("working", false, AgentStatus::Running, mins(25), 3),
-        );
-        hse(
-            &mut app,
-            mk("done-1m", false, AgentStatus::Finished, mins(1), 4),
-        );
-        hse(
-            &mut app,
-            mk("done-10m", false, AgentStatus::Finished, mins(10), 5),
-        );
-        // Past the 30m window: plain unpinned, still newest-first, with the
-        // never-run agent-1 last.
-        hse(
-            &mut app,
-            mk("cold-2h", false, AgentStatus::Finished, mins(120), 6),
-        );
-        hse(
-            &mut app,
-            mk("cold-45m", false, AgentStatus::Finished, mins(45), 7),
-        );
-
-        let rows = app.visible_sessions();
-        let names: Vec<&str> = rows.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(
-            names,
-            vec![
-                "pin-new", "pin-old", // PINNED, newest first
-                "working", "done-1m", "done-10m", // RECENT, working on top
-                "cold-45m", "cold-2h", "agent-1", // the rest, never-run last
-            ],
+            names(&app),
+            ["pin", "working", "blocked", "cold", "agent-1"]
         );
-        assert_eq!(app.session_group_counts(), (2, 3, 3, 0));
+        assert_eq!(app.session_group_counts(), (1, 4, 0));
 
-        // A status flip is an interaction: the coldest row jumps the queue.
-        hse(
-            &mut app,
-            ServerEvent::StatusChanged {
-                agent: AgentId("cold-2h".into()),
-                status: AgentStatus::Finished,
-                changed_at: now,
-            },
-        );
-        let rows = app.visible_sessions();
-        let names: Vec<&str> = rows.iter().map(|a| a.name.as_str()).collect();
-        assert_eq!(
-            names,
-            vec![
-                "pin-new", "pin-old", //
-                "working", "cold-2h", "done-1m", "done-10m", //
-                "cold-45m", "agent-1",
-            ],
-            "the cold row joined RECENT at the top, behind only the live turn \
-             it ties with"
-        );
-    }
-
-    /// A StatusChanged delta stamps the agent's timestamp, pulls it into
-    /// RECENT, and the selection follows the session it was on.
-    #[test]
-    fn status_change_regroups_and_selection_follows() {
-        use nebula_core::{Agent, AgentStatus, Entity};
-        let mut app = App::new();
-        seed_tree(&mut app);
-        hse(
-            &mut app,
-            ServerEvent::EntityUpserted {
-                entity: Entity::Agent(Agent {
-                    id: AgentId("a2".into()),
-                    worktree_id: WorktreeId("w1".into()),
-                    name: "agent-2".into(),
-                    status: AgentStatus::Fresh,
-                    archived: false,
-                    archived_at: 0,
-                    pinned: false,
-                    kind: nebula_core::AgentKind::Claude,
-                    model: None,
-                    effort: None,
-                    session_id: None,
-                    sort_order: 1,
-                    status_changed_at: 0,
-                    alive: true,
-                    branch: None,
-                }),
-            },
-        );
         app.focus = Focus::Sessions;
-        app.sel_session = 1; // agent-2
-
-        hse(
-            &mut app,
-            ServerEvent::StatusChanged {
-                agent: AgentId("a2".into()),
-                status: AgentStatus::Finished,
-                changed_at: crate::app::now_ms(),
-            },
+        app.sel_session = 3; // cold
+        for (id, status) in [
+            ("cold", AgentStatus::Running),
+            ("working", AgentStatus::Finished),
+        ] {
+            hse(
+                &mut app,
+                ServerEvent::StatusChanged {
+                    agent: AgentId(id.into()),
+                    status,
+                    changed_at: mins(0) - 1,
+                },
+            );
+        }
+        let order = ["pin", "cold", "blocked", "working", "agent-1"];
+        assert_eq!(
+            names(&app),
+            order,
+            "running leads, the just-finished one follows"
         );
-        let rows = app.visible_sessions();
-        assert_eq!(rows[0].name, "agent-2", "recent agent bubbled to the top");
-        assert_eq!(app.session_group_counts(), (0, 1, 1, 0));
-        assert_eq!(app.sel_session, 0, "selection followed agent-2");
+        assert_eq!(app.sel_session, 1, "the cursor follows cold");
 
-        // recent_window "off" collapses the group back to a flat list —
-        // still ordered by last interaction, so agent-2 keeps the top.
-        app.recent_window_ms = 0;
-        assert_eq!(app.session_group_counts(), (0, 0, 2, 0));
-        assert_eq!(app.visible_sessions()[0].name, "agent-2");
-        assert!(app.next_recent_expiry().is_none());
+        let mut terminal = Terminal::new(TestBackend::new(200, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        let line = text
+            .lines()
+            .find(|l| l.contains("cold") && l.contains("blocked"))
+            .unwrap_or_else(|| panic!("the tab bar row:\n{text}"))
+            .to_string();
+        let pos = |n: &str| {
+            line.find(n)
+                .unwrap_or_else(|| panic!("{n} missing:\n{line}"))
+        };
+        assert!(
+            pos("pin") < pos("cold")
+                && pos("cold") < pos("blocked")
+                && pos("blocked") < pos("working"),
+            "tabs keep the same order:\n{line}"
+        );
     }
 
     #[test]
-    fn status_change_reorders_sidebar_rows_without_moving_entity_selection() {
+    fn status_change_keeps_sidebar_rows_in_place() {
         use nebula_core::{Agent, AgentStatus, Entity};
         let mut app = App::new();
         seed_tree(&mut app); // main/w1 + a1
@@ -12745,6 +13925,8 @@ mod tests {
 
         app.focus = Focus::Worktrees;
         app.sel_worktree = app.worktree_row_index(&WorktreeId("w3".into())).unwrap();
+        let before = app.panel_entries();
+        let at = app.sel_worktree;
         hse(
             &mut app,
             ServerEvent::StatusChanged {
@@ -12754,9 +13936,14 @@ mod tests {
             },
         );
         assert_eq!(
+            app.panel_entries(),
+            before,
+            "a running session moves no row"
+        );
+        assert_eq!(app.sel_worktree, at);
+        assert_eq!(
             app.selected_worktree().map(|worktree| worktree.id.as_str()),
             Some("w3"),
-            "the worktree cursor follows the row that became active"
         );
     }
 
@@ -17381,10 +18568,11 @@ mod tests {
         let mut app = App::new();
         seed_tree(&mut app); // p1/w1(main) + agent-1
         for (id, branch, base) in [
-            ("w2", "n-child", Some("main")),
+            ("w-root", "n-root", None),
+            ("w2", "n-child", Some("n-root")),
             ("w3", "n-loner", Some("ghost")),
             ("w4", "n-grand", Some("n-child")),
-            ("w5", "n-last", Some("main")),
+            ("w5", "n-last", Some("n-root")),
         ] {
             hse(
                 &mut app,
@@ -17406,13 +18594,13 @@ mod tests {
         app.focus = Focus::Worktrees;
         // Tall enough that the whole lineage plus the flat orphan's
         // from-line fits below the section's midpoint.
-        let mut terminal = Terminal::new(TestBackend::new(100, 44)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(100, 52)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
         let cell = |x: u16, y: u16| terminal.backend().buffer()[(x, y)].symbol().to_string();
         // The primary row carries the project's name; its branch sits on
         // the `on main` sub-line.
-        let (main_x, main_y) = find_cell(&terminal, "main ⌂");
+        let (main_x, main_y) = find_cell(&terminal, "n-root");
         let (child_x, child_y) = find_cell(&terminal, "n-child");
         let (grand_x, grand_y) = find_cell(&terminal, "n-grand");
         let (last_x, last_y) = find_cell(&terminal, "n-last");
@@ -17422,7 +18610,7 @@ mod tests {
         assert_eq!(grand_x, main_x + 4, "grandchild indents two levels: {text}");
         assert_eq!(loner_x, main_x, "orphan stays flat: {text}");
         assert!(
-            !text.contains("from main"),
+            !text.contains("from n-root"),
             "nested row drops the redundant from-line: {text}"
         );
         assert!(
@@ -18147,7 +19335,7 @@ mod tests {
     fn fake_diff_view(lines: usize) -> crate::app::DiffView {
         use crate::git_diff::DiffFile;
         let mut view = DiffView::new(
-            "/nonexistent-nebula-diff-test".into(),
+            crate::git_diff::Source::Checkout("/nonexistent-nebula-diff-test".into()),
             "main".into(),
             vec![
                 DiffFile {
@@ -18558,6 +19746,19 @@ mod tests {
             assert_eq!(menu.items[0].label, "main ⌂ primary");
         }
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        let Some(ClientRequest::ResolveBranchCheckout { req_id, branch, .. }) = out.pop() else {
+            panic!("expected guarded primary resolution");
+        };
+        assert_eq!(branch, "main");
+        hse(
+            &mut app,
+            ServerEvent::Ack {
+                req_id,
+                created: Some(nebula_core::EntityId::Worktree(nebula_core::WorktreeId(
+                    "w1".into(),
+                ))),
+            },
+        );
         let Some(Overlay::Menu(menu)) = &app.overlay else {
             panic!("expected the session picker, got {:?}", app.overlay);
         };
@@ -18595,11 +19796,9 @@ mod tests {
         assert!(out.is_empty(), "nothing goes to the daemon: {out:?}");
     }
 
-    /// The `a` flow on a branch with no checkout: the branch is checked
-    /// out on the primary (no worktree minted), and the Ack opens the
-    /// session picker on the primary checkout.
+    /// The branch action resolves a physical checkout before opening its session picker.
     #[test]
-    fn agent_on_branch_without_checkout_checks_it_out_on_primary_then_opens_picker() {
+    fn agent_on_branch_without_checkout_resolves_then_opens_picker() {
         let mut app = App::new();
         seed_tree(&mut app);
         let mut out = Vec::new();
@@ -18611,29 +19810,18 @@ mod tests {
             },
             &mut out,
         );
-        let Some(ClientRequest::CheckoutPrimary { req_id, branch, .. }) = out.first() else {
-            panic!("expected CheckoutPrimary, got {out:?}");
+        let Some(ClientRequest::ResolveBranchCheckout { req_id, branch, .. }) = out.first() else {
+            panic!("expected ResolveBranchCheckout, got {out:?}");
         };
         assert_eq!(branch, "feature");
-        assert!(
-            !out.iter()
-                .any(|r| matches!(r, ClientRequest::CreateWorktree { .. })),
-            "a branch gets no worktree of its own"
-        );
         let req_id = *req_id;
-        let primary = app
-            .tree
-            .worktrees
-            .iter()
-            .find(|w| w.is_main)
-            .map(|w| w.id.clone())
-            .expect("seed has a primary");
+        let resolved = WorktreeId("resolved-feature".into());
         let mut out = Vec::new();
         handle_server_event(
             &mut app,
             ServerEvent::Ack {
                 req_id,
-                created: None,
+                created: Some(EntityId::Worktree(resolved.clone())),
             },
             &mut out,
         );
@@ -18644,11 +19832,113 @@ mod tests {
         assert!(
             matches!(
                 &menu.items[0].action,
-                MenuAction::NewAgentOfKind { worktree, .. } if worktree == &primary
+                MenuAction::NewAgentOfKind { worktree, .. } if worktree == &resolved
             ),
             "{:?}",
             menu.items[0].action
         );
+    }
+
+    #[test]
+    fn split_on_unmaterialized_branch_retains_branch_through_late_checkout_updates() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.branch_list = Some((ProjectId("p1".into()), vec!["feature".into()]));
+        app.focus = Focus::Worktrees;
+        app.sel_worktree = app.branch_row_index("feature").unwrap();
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('d'), KeyModifiers::SUPER, &mut out);
+        assert!(out.is_empty(), "opening the picker does not mutate Git");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        let Some(ClientRequest::ResolveBranchCheckout { req_id, branch, .. }) = out.last() else {
+            panic!("{out:?}")
+        };
+        assert_eq!(branch, "feature");
+        let req_id = *req_id;
+        let id = WorktreeId("resolved".into());
+        let mut checkout = app.tree.worktrees[0].clone();
+        checkout.id = id.clone();
+        checkout.branch = "changed-after-resolution".into();
+        checkout.is_main = false;
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: nebula_core::Entity::Worktree(checkout),
+            },
+        );
+        out.clear();
+        handle_server_event(
+            &mut app,
+            ServerEvent::Ack {
+                req_id,
+                created: Some(EntityId::Worktree(id.clone())),
+            },
+            &mut out,
+        );
+        assert!(out.iter().any(|r| matches!(r, ClientRequest::CreateAgent { worktree, expected_branch: Some(branch), .. } if worktree == &id && branch == "feature")), "{out:?}");
+    }
+
+    #[test]
+    fn historical_branch_mismatch_is_visible_in_the_breadcrumb() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.tree.agents[0].branch = Some("feature".into());
+        app.focus = Focus::Sessions;
+        let mut terminal = Terminal::new(TestBackend::new(160, 35)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("expects feature"), "{text}");
+        assert_eq!(app.selected_worktree().unwrap().branch, "main");
+    }
+
+    #[test]
+    fn a_session_stopped_by_a_primary_switch_stays_under_the_branch_it_left() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut stopped = app.tree.agents[0].clone();
+        stopped.alive = false;
+        stopped.branch = Some("main".into());
+        stopped.status = nebula_core::AgentStatus::Disconnected;
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: nebula_core::Entity::Agent(stopped),
+            },
+        );
+        let mut primary = app.tree.worktrees[0].clone();
+        primary.branch = "feat".into();
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: nebula_core::Entity::Worktree(primary),
+            },
+        );
+
+        let names = |row: PanelRow| -> Vec<String> {
+            app.sessions_for_panel_row(&row)
+                .iter()
+                .map(|s| s.name().to_string())
+                .collect()
+        };
+        assert_eq!(names(PanelRow::Branch("main".into())), ["agent-1"]);
+        assert!(names(PanelRow::Worktree(WorktreeId("w1".into()))).is_empty());
+    }
+
+    #[test]
+    fn a_stopped_session_under_its_branch_row_carries_no_mismatch_warning() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.tree.agents[0].branch = Some("feature".into());
+        app.tree.agents[0].alive = false;
+        app.sel_worktree = app.branch_row_index("feature").unwrap();
+        app.focus = Focus::Sessions;
+        assert_eq!(app.visible_session_rows().len(), 1);
+        let mut terminal = Terminal::new(TestBackend::new(160, 35)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("● feature (branch)"), "{text}");
+        assert!(text.contains("● claude"), "{text}");
+        assert!(!text.contains("⚠"), "{text}");
     }
 
     /// The panel is WORKTREES & BRANCHES now: checkout-less local branches
@@ -18707,6 +19997,7 @@ mod tests {
                 crate::branches::LocalBranch {
                     name: "fx-sub".into(),
                     created_from: Some("fx".into()),
+                    created_at: None,
                 },
             ],
         ));
@@ -18720,22 +20011,89 @@ mod tests {
         );
     }
 
-    /// j walks off the last worktree onto the branch rows, and Enter there
-    /// opens the branch menu (agent / worktree / delete) instead of moving
-    /// focus into the empty sessions of a checkout that doesn't exist.
+    fn park_agent_on(app: &mut App, branch: &str) {
+        let mut parked = app.tree.agents[0].clone();
+        parked.alive = false;
+        parked.branch = Some(branch.into());
+        parked.status = nebula_core::AgentStatus::Disconnected;
+        hse(
+            app,
+            ServerEvent::EntityUpserted {
+                entity: nebula_core::Entity::Agent(parked),
+            },
+        );
+    }
+
+    fn primary_lands_on(app: &mut App, branch: &str, req_id: u64, out: &mut Vec<ClientRequest>) {
+        let mut primary = app.tree.worktrees[0].clone();
+        primary.branch = branch.into();
+        hse(
+            app,
+            ServerEvent::EntityUpserted {
+                entity: nebula_core::Entity::Worktree(primary),
+            },
+        );
+        handle_server_event(
+            app,
+            ServerEvent::Ack {
+                req_id,
+                created: None,
+            },
+            out,
+        );
+    }
+
     #[test]
-    fn enter_on_a_branch_row_opens_its_menu() {
+    fn enter_on_a_branch_row_switches_primary_and_lands_on_its_sessions() {
         let mut app = App::new();
         seed_tree(&mut app);
+        park_agent_on(&mut app, "feature-x");
         app.branch_list = Some((
             nebula_core::ProjectId("p1".into()),
-            vec!["feature-x".into()],
+            vec!["main".into(), "feature-x".into()],
         ));
         app.focus = Focus::Worktrees;
         let mut out = Vec::new();
         press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
         assert_eq!(app.selected_branch_row().as_deref(), Some("feature-x"));
+
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none(), "{:?}", app.overlay);
+        let Some(ClientRequest::CheckoutPrimary {
+            req_id,
+            branch,
+            stop_busy: false,
+            mover: None,
+            ..
+        }) = out.pop()
+        else {
+            panic!("expected the primary switch, got {out:?}");
+        };
+        assert_eq!(branch, "feature-x");
+
+        primary_lands_on(&mut app, "feature-x", req_id, &mut out);
+        assert_eq!(app.selected_worktree().map(|w| w.id.0.as_str()), Some("w1"));
+        assert_eq!(app.focus, Focus::Sessions);
+        let names: Vec<String> = app
+            .visible_session_rows()
+            .iter()
+            .map(|s| s.name().to_string())
+            .collect();
+        assert_eq!(names, ["agent-1"]);
+    }
+
+    #[test]
+    fn the_branch_row_menu_leads_with_switching_primary() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.branch_list = Some((
+            nebula_core::ProjectId("p1".into()),
+            vec!["main".into(), "feature-x".into()],
+        ));
+        app.focus = Focus::Worktrees;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Char('m'), KeyModifiers::NONE, &mut out);
         let Some(Overlay::Menu(menu)) = &app.overlay else {
             panic!("expected the branch menu, got {:?}", app.overlay);
         };
@@ -18743,28 +20101,541 @@ mod tests {
         assert_eq!(
             labels,
             [
+                "Switch primary to this branch",
                 "New agent here (checks out on primary)",
                 "New worktree from this branch",
                 "Delete branch"
             ]
         );
-        assert!(menu.items[2].destructive);
         assert!(
             matches!(
                 &menu.items[0].action,
-                MenuAction::AgentOnBranch { branch, .. } if branch == "feature-x"
+                MenuAction::CheckoutPrimary { branch, .. } if branch == "feature-x"
             ),
             "{:?}",
             menu.items[0].action
         );
+        assert!(menu.items[3].destructive);
         assert!(out.is_empty(), "opening the menu sends nothing");
     }
 
-    /// A worktree whose checkout was created for a pre-existing branch
-    /// (`for_branch`) keeps the (branch) tag — spawning a session on a
-    /// branch must not re-label it as a worktree.
     #[test]
-    fn for_branch_worktree_rows_keep_the_branch_tag() {
+    fn attaching_a_session_parked_on_a_branch_row_switches_primary_first() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        park_agent_on(&mut app, "feature-x");
+        app.branch_list = Some((
+            nebula_core::ProjectId("p1".into()),
+            vec!["main".into(), "feature-x".into()],
+        ));
+        app.sel_worktree = app.branch_row_index("feature-x").unwrap();
+        app.focus = Focus::Sessions;
+        app.sel_session = 0;
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(
+            !out.iter()
+                .any(|r| matches!(r, ClientRequest::Attach { .. })),
+            "no resume before primary holds the branch: {out:?}"
+        );
+        let Some(ClientRequest::CheckoutPrimary { req_id, branch, .. }) = out.pop() else {
+            panic!("expected the primary switch, got {out:?}");
+        };
+        assert_eq!(branch, "feature-x");
+        handle_server_event(
+            &mut app,
+            ServerEvent::Error {
+                req_id: Some(req_id),
+                message: "primary has sessions on \"main\"; switching to \"feature-x\" stops shell (terminal)".into(),
+            },
+            &mut out,
+        );
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        let Some(ClientRequest::CheckoutPrimary {
+            req_id,
+            stop_busy: true,
+            ..
+        }) = out.pop()
+        else {
+            panic!("expected the confirmed switch, got {out:?}");
+        };
+
+        primary_lands_on(&mut app, "feature-x", req_id, &mut out);
+        assert!(
+            matches!(
+                out.last(),
+                Some(ClientRequest::Attach { session: SessionRef::Agent(id), .. }) if id.0 == "a1"
+            ),
+            "{out:?}"
+        );
+        assert_eq!(app.focus, Focus::Terminal);
+    }
+
+    fn attaches_of(out: &[ClientRequest]) -> Vec<String> {
+        out.iter()
+            .filter_map(|r| match r {
+                ClientRequest::Attach {
+                    session: SessionRef::Agent(id),
+                    ..
+                } => Some(id.0.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn walk_onto_the_parked_branch_row(app: &mut App, out: &mut Vec<ClientRequest>) {
+        seed_tree(app);
+        park_agent_on(app, "feature-x");
+        app.branch_list = Some((
+            nebula_core::ProjectId("p1".into()),
+            vec!["main".into(), "feature-x".into()],
+        ));
+        app.focus = Focus::Worktrees;
+        press(app, KeyCode::Char('j'), KeyModifiers::NONE, out);
+        if !attaches_of(out).is_empty() {
+            hse(
+                app,
+                ServerEvent::Error {
+                    req_id: None,
+                    message:
+                        "attach: session expects branch \"feature-x\" but /tmp/demo is on \"main\""
+                            .into(),
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn a_parked_session_previews_as_a_placeholder_and_resumes_after_the_switch() {
+        let mut app = App::new();
+        let mut out = Vec::new();
+        walk_onto_the_parked_branch_row(&mut app, &mut out);
+        assert!(attaches_of(&out).is_empty(), "no preview Attach: {out:?}");
+        let mut terminal = Terminal::new(TestBackend::new(160, 35)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("parked on feature-x — Enter switches primary and resumes it"),
+            "{text}"
+        );
+
+        press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        let Some(ClientRequest::CheckoutPrimary { req_id, .. }) = out.pop() else {
+            panic!("expected the primary switch, got {out:?}");
+        };
+        let mut out = Vec::new();
+        primary_lands_on(&mut app, "feature-x", req_id, &mut out);
+        assert_eq!(attaches_of(&out), ["a1"], "{out:?}");
+        assert_eq!(app.focus, Focus::Terminal);
+    }
+
+    #[test]
+    fn selecting_a_parked_session_parks_the_mounted_one_and_enter_switches() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut parked = app.tree.agents[0].clone();
+        parked.id = AgentId("a2".into());
+        parked.name = "agent-2".into();
+        parked.alive = false;
+        parked.branch = Some("feature-x".into());
+        parked.status = nebula_core::AgentStatus::Disconnected;
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: nebula_core::Entity::Agent(parked),
+            },
+        );
+        app.branch_list = Some((
+            nebula_core::ProjectId("p1".into()),
+            vec!["main".into(), "feature-x".into()],
+        ));
+        let mut out = Vec::new();
+        attach(&mut app, SessionRef::Agent(AgentId("a1".into())), &mut out);
+        assert_eq!(attaches_of(&out), ["a1"]);
+
+        app.focus = Focus::Worktrees;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+        assert_eq!(
+            app.parked_placeholder_branch().as_deref(),
+            Some("feature-x")
+        );
+
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+        assert_eq!(app.focus, Focus::Terminal);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE, &mut out);
+        assert!(
+            !out.iter().any(|r| matches!(r, ClientRequest::Input { session: SessionRef::Agent(id), .. } if id.0 == "a1")),
+            "input reached the hidden session: {out:?}"
+        );
+        assert!(
+            out.iter().any(|r| matches!(r, ClientRequest::CheckoutPrimary { branch, .. } if branch == "feature-x")),
+            "Enter on the placeholder switches primary: {out:?}"
+        );
+        assert!(
+            app.term.is_none(),
+            "the live pane stays mounted behind the placeholder"
+        );
+        assert!(
+            out.iter().any(|r| matches!(r, ClientRequest::Detach { session: SessionRef::Agent(id) } if id.0 == "a1")),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn right_clicking_a_parked_branch_row_leaves_no_input_target_behind_the_placeholder() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut parked = app.tree.agents[0].clone();
+        parked.id = AgentId("a2".into());
+        parked.name = "agent-2".into();
+        parked.alive = false;
+        parked.branch = Some("feature-x".into());
+        parked.status = nebula_core::AgentStatus::Disconnected;
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: nebula_core::Entity::Agent(parked),
+            },
+        );
+        app.branch_list = Some((
+            nebula_core::ProjectId("p1".into()),
+            vec!["main".into(), "feature-x".into()],
+        ));
+        let mut out = Vec::new();
+        attach(&mut app, SessionRef::Agent(AgentId("a1".into())), &mut out);
+        app.focus = Focus::Terminal;
+        app.term_locked = true;
+        let mut terminal = Terminal::new(TestBackend::new(160, 35)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let row = app
+            .hits
+            .iter()
+            .find(|(_, target)| matches!(target, HitTarget::WorktreeBranch(_)))
+            .expect("the branch row is drawn")
+            .0;
+
+        let mut out = Vec::new();
+        handle_terminal_event(
+            &mut app,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right),
+                column: row.x + 1,
+                row: row.y,
+                modifiers: KeyModifiers::NONE,
+            }),
+            &mut out,
+        );
+        assert!(
+            matches!(app.overlay, Some(Overlay::Menu(_))),
+            "{:?}",
+            app.overlay
+        );
+        for code in [KeyCode::Esc, KeyCode::Tab, KeyCode::Tab, KeyCode::Enter] {
+            handle_terminal_event(
+                &mut app,
+                Event::Key(KeyEvent::new(code, KeyModifiers::NONE)),
+                &mut out,
+            );
+        }
+        handle_terminal_event(&mut app, Event::Paste("rm -rf build".into()), &mut out);
+
+        assert!(
+            !out.iter().any(|r| matches!(r, ClientRequest::Input { session: SessionRef::Agent(id), .. } if id.0 == "a1")),
+            "input reached the hidden session: {out:?}"
+        );
+        assert!(
+            out.iter().any(|r| matches!(r, ClientRequest::CheckoutPrimary { branch, .. } if branch == "feature-x")),
+            "Enter on the placeholder switches primary: {out:?}"
+        );
+        assert!(!app.term_locked);
+    }
+
+    #[test]
+    fn the_quick_terminal_keeps_its_input_over_a_parked_selection() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut parked = app.tree.agents[0].clone();
+        parked.id = AgentId("a2".into());
+        parked.alive = false;
+        parked.branch = Some("feature-x".into());
+        parked.status = nebula_core::AgentStatus::Disconnected;
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: nebula_core::Entity::Agent(parked),
+            },
+        );
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: nebula_core::Entity::Terminal(nebula_core::TerminalTab {
+                    id: nebula_core::TerminalId("t-quick".into()),
+                    worktree_id: nebula_core::WorktreeId("w1".into()),
+                    name: "quick".into(),
+                    sort_order: 0,
+                    alive: true,
+                    branch: None,
+                    busy: false,
+                    status: None,
+                    status_changed_at: 0,
+                }),
+            },
+        );
+        app.branch_list = Some((
+            nebula_core::ProjectId("p1".into()),
+            vec!["main".into(), "feature-x".into()],
+        ));
+        app.focus = Focus::Worktrees;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+        assert_eq!(
+            app.parked_placeholder_branch().as_deref(),
+            Some("feature-x")
+        );
+        press(&mut app, KeyCode::Left, KeyModifiers::NONE, &mut out);
+        assert_eq!(app.focus, Focus::Projects);
+        run_menu_action(
+            &mut app,
+            MenuAction::Command(crate::app::PaletteCommand::QuickTerminal),
+            &mut out,
+        );
+        assert!(app.quick_term);
+
+        let mut out = Vec::new();
+        handle_terminal_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE)),
+            &mut out,
+        );
+        handle_terminal_event(&mut app, Event::Paste("ls".into()), &mut out);
+        let quick: Vec<&[u8]> = out
+            .iter()
+            .filter_map(|r| match r {
+                ClientRequest::Input {
+                    session: SessionRef::Terminal(id),
+                    data,
+                } if id.0 == "t-quick" => Some(data.as_slice()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(quick, [&b"l"[..], &b"\x1b[200~ls\x1b[201~"[..]], "{out:?}");
+        assert!(app.term.is_some() && app.term_locked);
+    }
+
+    #[test]
+    fn the_resume_does_not_wait_for_the_primary_upsert() {
+        let mut app = App::new();
+        let mut out = Vec::new();
+        walk_onto_the_parked_branch_row(&mut app, &mut out);
+        press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        let Some(ClientRequest::CheckoutPrimary { req_id, .. }) = out.pop() else {
+            panic!("expected the primary switch, got {out:?}");
+        };
+
+        let mut out = Vec::new();
+        handle_server_event(
+            &mut app,
+            ServerEvent::Ack {
+                req_id,
+                created: None,
+            },
+            &mut out,
+        );
+        assert_eq!(attaches_of(&out), ["a1"], "{out:?}");
+        handle_terminal_event(&mut app, Event::Paste("y".into()), &mut out);
+        assert!(
+            matches!(out.last(), Some(ClientRequest::Input { session: SessionRef::Agent(id), .. }) if id.0 == "a1"),
+            "the resumed session keeps its pane before the upsert: {out:?}"
+        );
+    }
+
+    #[test]
+    fn branch_enter_then_session_enter_resumes_a_previewed_parked_session() {
+        let mut app = App::new();
+        let mut out = Vec::new();
+        walk_onto_the_parked_branch_row(&mut app, &mut out);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        let Some(ClientRequest::CheckoutPrimary { req_id, .. }) = out.pop() else {
+            panic!("expected the primary switch, got {out:?}");
+        };
+
+        let mut out = Vec::new();
+        primary_lands_on(&mut app, "feature-x", req_id, &mut out);
+        assert_eq!(app.focus, Focus::Sessions);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert_eq!(attaches_of(&out), ["a1"], "{out:?}");
+        assert_eq!(app.focus, Focus::Terminal);
+    }
+
+    #[test]
+    fn the_resume_after_the_switch_lands_on_the_requested_session_and_project() {
+        use nebula_core::{Entity, Project, ProjectId, Worktree, WorktreeId};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        park_agent_on(&mut app, "feature-x");
+        let mut second = app.tree.agents[0].clone();
+        second.id = AgentId("a2".into());
+        second.name = "agent-2".into();
+        second.sort_order = 1;
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(second),
+            },
+        );
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Project(Project {
+                    workspace_id: Default::default(),
+                    id: ProjectId("p2".into()),
+                    name: "other".into(),
+                    repo_path: "/tmp/other".into(),
+                    sort_order: 1,
+                    divider_after: false,
+                    divider_label: None,
+                    divider_before: false,
+                    divider_before_label: None,
+                    host: None,
+                }),
+            },
+        );
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(Worktree {
+                    id: WorktreeId("w2".into()),
+                    project_id: ProjectId("p2".into()),
+                    path: "/tmp/other".into(),
+                    branch: "main".into(),
+                    is_main: true,
+                    created_from: None,
+                    pinned: false,
+                    for_branch: false,
+                    sort_order: 0,
+                }),
+            },
+        );
+        app.branch_list = Some((
+            ProjectId("p1".into()),
+            vec!["main".into(), "feature-x".into()],
+        ));
+        app.focus = Focus::Worktrees;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+        assert_eq!(
+            app.selected_session_row()
+                .map(|r| r.name().to_string())
+                .as_deref(),
+            Some("agent-2")
+        );
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        let Some(ClientRequest::CheckoutPrimary { req_id, .. }) = out.pop() else {
+            panic!("expected the primary switch, got {out:?}");
+        };
+        assert!(select_project_row_by_id(&mut app, &ProjectId("p2".into())));
+
+        let mut out = Vec::new();
+        primary_lands_on(&mut app, "feature-x", req_id, &mut out);
+        assert_eq!(attaches_of(&out), ["a2"], "{out:?}");
+        assert_eq!(app.selected_project().map(|p| p.id.0.as_str()), Some("p1"));
+        assert_eq!(app.selected_worktree().map(|w| w.id.0.as_str()), Some("w1"));
+        assert_eq!(
+            app.selected_session_row()
+                .map(|r| r.name().to_string())
+                .as_deref(),
+            Some("agent-2")
+        );
+        assert_eq!(app.focus, Focus::Terminal);
+    }
+
+    #[test]
+    fn a_parked_remote_session_switches_the_primary_on_its_own_host() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_remote_twin(&mut app);
+        let mut remote = app.tree.agents[0].clone();
+        remote.id = AgentId("a-remote".into());
+        remote.worktree_id = WorktreeId("w-remote".into());
+        remote.alive = false;
+        remote.branch = Some("feature".into());
+        remote.status = nebula_core::AgentStatus::Disconnected;
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: nebula_core::Entity::Agent(remote),
+            },
+        );
+        app.branch_list = Some((nebula_core::ProjectId("p1".into()), vec!["main".into()]));
+        app.sel_worktree = app
+            .branch_row_index("feature")
+            .expect("the parked branch row");
+        let to_twin = |out: &[ClientRequest]| {
+            matches!(
+                out.last(),
+                Some(ClientRequest::CheckoutPrimary { project, branch, .. })
+                    if project.0 == "p-remote" && branch == "feature"
+            )
+        };
+
+        app.focus = Focus::Sessions;
+        app.sel_session = 0;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(to_twin(&out), "attach: {out:?}");
+
+        app.focus = Focus::Worktrees;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(to_twin(&out), "branch row Enter: {out:?}");
+
+        press(&mut app, KeyCode::Char('m'), KeyModifiers::NONE, &mut out);
+        let Some(Overlay::Menu(menu)) = &app.overlay else {
+            panic!("expected the branch menu, got {:?}", app.overlay);
+        };
+        assert!(
+            matches!(
+                &menu.items[0].action,
+                MenuAction::CheckoutPrimary { project, .. } if project.0 == "p-remote"
+            ),
+            "{:?}",
+            menu.items[0].action
+        );
+    }
+
+    #[test]
+    fn the_session_menus_attach_switches_primary_for_a_parked_session() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        park_agent_on(&mut app, "feature-x");
+        let mut out = Vec::new();
+        run_menu_action(
+            &mut app,
+            MenuAction::Attach(SessionRef::Agent(AgentId("a1".into()))),
+            &mut out,
+        );
+        assert!(attaches_of(&out).is_empty(), "{out:?}");
+        assert!(
+            matches!(
+                out.last(),
+                Some(ClientRequest::CheckoutPrimary { project, branch, .. })
+                    if project.0 == "p1" && branch == "feature-x"
+            ),
+            "{out:?}"
+        );
+    }
+
+    /// Physical linked directories stay worktrees regardless of historical flags.
+    #[test]
+    fn for_branch_worktree_rows_show_the_worktree_tag() {
         use nebula_core::{Entity, Worktree, WorktreeId};
         let mut app = App::new();
         seed_tree(&mut app);
@@ -18787,21 +20658,32 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
-        assert!(text.contains("feat (branch)"), "{text}");
-        assert!(!text.contains("feat (wt)"), "{text}");
+        assert!(text.contains("feat (wt)"), "{text}");
+        assert!(!text.contains("feat (branch)"), "{text}");
+        assert_eq!(
+            branch_pick_label(&app, &nebula_core::ProjectId("p1".into()), "feat", None),
+            "feat (wt)"
+        );
+        let mut out = Vec::new();
+        pick_agent_on_branch(
+            &mut app,
+            nebula_core::ProjectId("p1".into()),
+            "feat".into(),
+            &mut out,
+        );
+        assert!(
+            matches!(out.last(), Some(ClientRequest::ResolveBranchCheckout { branch, .. }) if branch == "feat")
+        );
     }
 
-    /// `t` on a checkout-less branch row skips the "select a worktree"
-    /// flash: it checks the branch out on the primary (the session picker
-    /// follows the Ack, same as the row menu's "New agent here") — no
-    /// worktree is minted for a branch.
+    /// The session key on a checkout-less branch requests host-owned resolution.
     #[test]
-    fn t_on_a_branch_row_checks_it_out_on_primary_for_the_picker() {
+    fn t_on_a_branch_row_resolves_for_the_picker() {
         let mut app = App::new();
         seed_tree(&mut app);
         app.branch_list = Some((
             nebula_core::ProjectId("p1".into()),
-            vec!["feature-x".into()],
+            vec!["main".into(), "feature-x".into()],
         ));
         app.focus = Focus::Worktrees;
         let mut out = Vec::new();
@@ -18811,59 +20693,52 @@ mod tests {
         assert!(
             app.flash
                 .as_deref()
-                .is_some_and(|f| f.contains("checking out feature-x")),
+                .is_some_and(|f| f.contains("resolving feature-x")),
             "progress flash, not the select-a-worktree one: {:?}",
             app.flash
         );
         assert!(
             matches!(
                 out.last(),
-                Some(ClientRequest::CheckoutPrimary { branch, .. }) if branch == "feature-x"
+                Some(ClientRequest::ResolveBranchCheckout { branch, .. }) if branch == "feature-x"
             ),
             "{out:?}"
         );
     }
 
-    /// ⌘T on a checkout-less branch row: the same checkout-on-primary,
-    /// and the Ack creates the shell on the primary checkout.
+    /// The terminal action uses the checkout acknowledged for the requested branch.
     #[test]
-    fn new_terminal_on_a_branch_row_lands_on_the_primary() {
+    fn new_terminal_on_a_branch_row_uses_resolved_checkout() {
         let mut app = App::new();
         seed_tree(&mut app);
         app.branch_list = Some((
             nebula_core::ProjectId("p1".into()),
-            vec!["feature-x".into()],
+            vec!["main".into(), "feature-x".into()],
         ));
         app.focus = Focus::Worktrees;
         app.sel_worktree = app.visible_worktrees().len();
         assert_eq!(app.selected_branch_row().as_deref(), Some("feature-x"));
         let mut out = Vec::new();
         create_terminal_for_context(&mut app, &mut out);
-        let Some(ClientRequest::CheckoutPrimary { req_id, .. }) = out.last() else {
-            panic!("expected CheckoutPrimary, got {out:?}");
+        let Some(ClientRequest::ResolveBranchCheckout { req_id, .. }) = out.last() else {
+            panic!("expected ResolveBranchCheckout, got {out:?}");
         };
         let req_id = *req_id;
-        let primary = app
-            .tree
-            .worktrees
-            .iter()
-            .find(|w| w.is_main)
-            .map(|w| w.id.clone())
-            .unwrap();
+        let resolved = WorktreeId("resolved-feature".into());
         let mut out = Vec::new();
         handle_server_event(
             &mut app,
             ServerEvent::Ack {
                 req_id,
-                created: None,
+                created: Some(EntityId::Worktree(resolved.clone())),
             },
             &mut out,
         );
         assert!(
             matches!(
                 out.last(),
-                Some(ClientRequest::CreateTerminal { worktree, name: None, .. })
-                    if worktree == &primary
+                Some(ClientRequest::CreateTerminal { worktree, expected_branch: Some(branch), name: None, .. })
+                    if worktree == &resolved && branch == "feature-x"
             ),
             "{out:?}"
         );
@@ -18919,32 +20794,22 @@ mod tests {
             crate::branches::local_branches(&repo).contains(&"topic".to_string()),
             "git branch ran in the primary checkout"
         );
-        assert_eq!(
-            app.flash.as_deref(),
-            Some("branch topic created from main · checking out on the primary…")
-        );
+        assert_eq!(app.flash.as_deref(), Some("branch topic created from main"));
         assert!(
             app.branch_rows().contains(&"topic".to_string()),
             "{:?}",
             app.branch_list
         );
-        // Then the `nebula switch` step: the fresh branch is checked out
-        // on the primary, so the user lands on it instead of on a dim row
-        // that moves the primary at some later keypress.
         assert!(
-            matches!(
-                out.last(),
-                Some(ClientRequest::CheckoutPrimary { branch, .. }) if branch == "topic"
-            ),
+            !out.iter()
+                .any(|r| matches!(r, ClientRequest::CheckoutPrimary { .. })),
             "{out:?}"
         );
     }
 
-    /// Moving the primary under a busy session is not silent: the checkout
-    /// (from a branch row's `a`, or a fresh create) asks first, and `y`
-    /// sends it. An idle primary needs no question.
+    /// Creating on another branch leaves a running primary unchanged without confirmation.
     #[test]
-    fn moving_the_primary_under_a_running_session_asks_first() {
+    fn new_branch_session_preserves_a_running_primary_without_confirmation() {
         let mut app = App::new();
         seed_tree(&mut app);
         let primary = app.tree.worktrees[0].id.clone();
@@ -18979,17 +20844,14 @@ mod tests {
             },
             &mut out,
         );
-        assert!(out.is_empty(), "nothing moves before the answer: {out:?}");
-        let Some(Overlay::Confirm(c)) = &app.overlay else {
-            panic!("expected a confirm, got {:?}", app.overlay);
-        };
-        assert!(c.message.contains("worker"), "{}", c.message);
-        assert!(c.message.contains("feature"), "{}", c.message);
-        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE, &mut out);
+        assert!(
+            app.overlay.is_none(),
+            "no permission to move primary is needed"
+        );
         assert!(
             matches!(
                 out.last(),
-                Some(ClientRequest::CheckoutPrimary { branch, .. }) if branch == "feature"
+                Some(ClientRequest::ResolveBranchCheckout { branch, .. }) if branch == "feature"
             ),
             "{out:?}"
         );
@@ -19030,7 +20892,13 @@ mod tests {
         let Some(Overlay::Menu(menu)) = &app.overlay else {
             panic!("expected the branch menu, got {:?}", app.overlay);
         };
-        let delete = menu.items[2].action.clone();
+        let delete = menu
+            .items
+            .iter()
+            .find(|i| i.label == "Delete branch")
+            .unwrap()
+            .action
+            .clone();
         app.overlay = None;
         let mut out = Vec::new();
         run_menu_action(&mut app, delete, &mut out);
@@ -19119,6 +20987,82 @@ mod tests {
         );
     }
 
+    /// A key that only travels to the PTY changes nothing on screen — the
+    /// echo repaints when it arrives as `Output` — so it must not cost a
+    /// frame. Anything the key visibly changes still does.
+    #[test]
+    fn a_key_only_forwarded_to_the_pty_does_not_request_a_redraw() {
+        fn locked_app() -> App {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            app.term = Some(AttachedTerm::new(
+                SessionRef::Agent(AgentId("a1".into())),
+                80,
+                24,
+            ));
+            app.focus = Focus::Terminal;
+            app.term_locked = true;
+            app.dirty = false;
+            app
+        }
+        fn type_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Vec<ClientRequest> {
+            let mut out = Vec::new();
+            handle_terminal_event(app, Event::Key(KeyEvent::new(code, mods)), &mut out);
+            out
+        }
+
+        let mut app = locked_app();
+        let out = type_key(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert!(matches!(&out[..], [ClientRequest::Input { data, .. }] if data == b"x"));
+        assert!(!app.dirty, "a forwarded key draws nothing of its own");
+
+        // A frame that was already owed is not cancelled by typing.
+        app.dirty = true;
+        type_key(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+        assert!(app.dirty);
+
+        // Dismissing a flash repaints the footer.
+        let mut app = locked_app();
+        app.flash = Some("saved".into());
+        let out = type_key(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(out.len(), 1, "still forwarded");
+        assert!(app.flash.is_none() && app.dirty);
+
+        // Typing drops the selection highlight.
+        let mut app = locked_app();
+        app.term_selection = Some(TermSelection {
+            anchor: (0, 0),
+            head: (3, 0),
+            dragging: false,
+            active: true,
+        });
+        type_key(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert!(app.term_selection.is_none() && app.dirty);
+
+        // Typing leaves scroll mode.
+        let mut app = locked_app();
+        let term = app.term.as_mut().unwrap();
+        term.feed(&b"line\r\n".repeat(100));
+        term.set_scroll(5);
+        assert!(term.scroll > 0);
+        type_key(&mut app, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(app.term.as_ref().unwrap().scroll, 0);
+        assert!(app.dirty);
+
+        // The unlock hatch is not forwarded and changes focus.
+        let mut app = locked_app();
+        let out = type_key(&mut app, KeyCode::Char('q'), KeyModifiers::CONTROL);
+        assert!(out.is_empty() && !app.term_locked);
+        assert!(app.dirty);
+
+        // Panel navigation (nothing locked) still repaints.
+        let mut app = locked_app();
+        app.term_locked = false;
+        app.focus = Focus::Sessions;
+        type_key(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        assert!(app.dirty);
+    }
+
     /// A clean tree still opens the viewer (empty list) so ^g can switch
     /// to a commit from there.
     #[test]
@@ -19152,7 +21096,7 @@ mod tests {
             })
             .collect();
         let mut view = DiffView::new(
-            "/nonexistent-nebula-diff-test".into(),
+            crate::git_diff::Source::Checkout("/nonexistent-nebula-diff-test".into()),
             "main".into(),
             files,
             true,
@@ -19161,7 +21105,7 @@ mod tests {
         view.files_width = 30;
         view.list_area = ratatui::layout::Rect::new(1, 3, 28, 10);
         let mut app = App::new();
-        app.overlay = Some(Overlay::Diff(view));
+        app.overlay = Some(Overlay::Diff(Box::new(view)));
         let wheel = |app: &mut App, col: u16, kind: MouseEventKind| {
             handle_mouse(
                 app,
@@ -19268,6 +21212,154 @@ mod tests {
         let v = diff_view(&app);
         assert!(v.base.is_working_tree());
         assert_eq!(v.files[0].path, "z.txt");
+    }
+
+    /// The commit strip under the ▾ base row lists the recent commits as
+    /// soon as the viewer opens: ⇥ steps down it, ⇧⇥ back up to the
+    /// working tree, and a click on a row picks that commit.
+    #[test]
+    fn tab_steps_through_the_commit_strip() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo(&dir);
+        std::fs::write(repo.join("a.txt"), "committed\n").unwrap();
+        run_git(&repo, &["commit", "-am", "second"]);
+        std::fs::write(repo.join("z.txt"), "fresh\n").unwrap();
+        let mut app = App::new();
+        seed_repo_tree(&mut app, &repo);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
+        assert_eq!(diff_view(&app).commits.len(), 2, "loaded on open");
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("second"), "strip row:\n{text}");
+        let strip = diff_view(&app).commits_area;
+        assert_eq!(strip.height, 2);
+        assert_eq!(diff_view(&app).list_area.y, strip.y + 2, "files below");
+
+        let subject = |app: &App| match &diff_view(app).base {
+            crate::git_diff::DiffBase::Commit(c) => c.subject.clone(),
+            other => format!("{other:?}"),
+        };
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+        assert_eq!(subject(&app), "second");
+        assert_eq!(diff_view(&app).files[0].path, "a.txt");
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+        let oldest = diff_view(&app).commits[1].subject.clone();
+        assert_eq!(subject(&app), oldest);
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+        assert_eq!(subject(&app), oldest, "the last commit is the end");
+        press(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT, &mut out);
+        press(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT, &mut out);
+        assert!(diff_view(&app).base.is_working_tree());
+        assert_eq!(diff_view(&app).files[0].path, "z.txt");
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: strip.x + 3,
+                row: strip.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut out,
+        );
+        assert_eq!(subject(&app), "second", "a click picks the row");
+
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Current  uncommitted"), "pinned row:\n{text}");
+        let current = diff_view(&app).current_area;
+        assert_eq!(current.y + 1, strip.y, "pinned above the commits");
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: current.x + 3,
+                row: current.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut out,
+        );
+        assert!(
+            diff_view(&app).base.is_working_tree(),
+            "back to uncommitted"
+        );
+    }
+
+    /// The strip shows five rows; stepping past them scrolls it along.
+    #[test]
+    fn commit_strip_follows_the_picked_commit() {
+        let mut view = fake_diff_view(4);
+        view.commits = (0..12)
+            .map(|i| crate::git_diff::CommitEntry {
+                oid: format!("oid{i}"),
+                short: format!("s{i}"),
+                parent: None,
+                when: String::new(),
+                subject: format!("commit {i}"),
+            })
+            .collect();
+        for expected in [0, 0, 0, 0, 0, 1, 2] {
+            view.base = view.step_base(1).expect("more commits");
+            view.follow_commit();
+            assert_eq!(view.commit_scroll, expected);
+        }
+        view.base = crate::git_diff::DiffBase::Commit(view.commits[1].clone());
+        view.follow_commit();
+        assert_eq!(view.commit_scroll, 1);
+    }
+
+    /// Tab in the ^g picker flips to the branch list; Enter on a branch
+    /// shows everything since the merge base with it, commits included.
+    #[test]
+    fn ctrl_g_tab_picks_a_branch_to_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo(&dir);
+        run_git(&repo, &["branch", "dev"]);
+        std::fs::write(repo.join("a.txt"), "committed\n").unwrap();
+        run_git(&repo, &["commit", "-am", "second"]);
+        let mut app = App::new();
+        seed_repo_tree(&mut app, &repo);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
+        assert!(diff_view(&app).files.is_empty(), "clean tree");
+
+        press(
+            &mut app,
+            KeyCode::Char('g'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+        {
+            let v = diff_view(&app);
+            assert!(v.picker.as_ref().unwrap().branches);
+            assert_eq!(v.branches, [crate::git_diff::GitRef::local("dev")]);
+            assert_eq!(v.picker_rows(), 1);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        {
+            let v = diff_view(&app);
+            assert_eq!(
+                v.base,
+                crate::git_diff::DiffBase::Branch(crate::git_diff::GitRef::local("dev"))
+            );
+            assert_eq!(v.files.len(), 1);
+            assert_eq!(v.files[0].path, "a.txt");
+            assert!(v.diff.contains("+committed"), "{}", v.diff);
+        }
+        // Reopening lands back in branch mode, on the current base.
+        press(
+            &mut app,
+            KeyCode::Char('g'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
+        let picker = diff_view(&app).picker.as_ref().unwrap();
+        assert!(picker.branches);
+        assert_eq!(picker.hover, 0);
     }
 
     /// `G` turns the checkout's remote into a page and hands it to the
@@ -19403,7 +21495,7 @@ mod tests {
     fn diff_modal_keys_switch_files_and_scroll() {
         let mut app = App::new();
         seed_tree(&mut app);
-        app.overlay = Some(Overlay::Diff(fake_diff_view(100)));
+        app.overlay = Some(Overlay::Diff(Box::new(fake_diff_view(100))));
         let mut out = Vec::new();
         let scroll = |app: &App| match &app.overlay {
             Some(Overlay::Diff(v)) => (v.selected, v.scroll),
@@ -19449,7 +21541,7 @@ mod tests {
     fn diff_modal_type_to_filter() {
         let mut app = App::new();
         seed_tree(&mut app);
-        app.overlay = Some(Overlay::Diff(fake_diff_view(10)));
+        app.overlay = Some(Overlay::Diff(Box::new(fake_diff_view(10))));
         let mut out = Vec::new();
         let view = |app: &App| match &app.overlay {
             Some(Overlay::Diff(v)) => v.clone(),
@@ -19635,10 +21727,335 @@ mod tests {
     }
 
     #[test]
+    fn a_branch_base_mark_survives_commits_to_other_files_only() {
+        use nebula_core::{Entity, ProjectId, Worktree, WorktreeId};
+        let dir = tempfile::tempdir().unwrap();
+        crate::review::with_store_path(dir.path().join("reviewed.json"), || {
+            let repo = test_repo(&dir);
+            run_git(&repo, &["checkout", "-b", "feat"]);
+            std::fs::write(repo.join("a.txt"), "feat\n").unwrap();
+            std::fs::write(repo.join("b.txt"), "new\n").unwrap();
+            run_git(&repo, &["add", "."]);
+            run_git(&repo, &["commit", "-m", "feat work"]);
+
+            let mut app = App::new();
+            seed_repo_tree(&mut app, &repo);
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Worktree(Worktree {
+                        id: WorktreeId("w1".into()),
+                        project_id: ProjectId("p1".into()),
+                        path: repo.clone(),
+                        branch: "feat".into(),
+                        is_main: true,
+                        created_from: Some("main".into()),
+                        pinned: false,
+                        for_branch: false,
+                        sort_order: 0,
+                    }),
+                },
+            );
+            let mut out = Vec::new();
+            let reviewed = |app: &App| {
+                let mut paths: Vec<String> = diff_view(app).reviewed.keys().cloned().collect();
+                paths.sort();
+                paths
+            };
+            let on_main = crate::git_diff::DiffBase::Branch(crate::git_diff::GitRef::local("main"));
+
+            press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
+            assert_eq!(diff_view(&app).base, on_main, "clean tree: review base");
+            assert_eq!(diff_order(&app), ["a.txt", "b.txt"]);
+            press(
+                &mut app,
+                KeyCode::Char('r'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
+            assert_eq!(reviewed(&app), ["a.txt"]);
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+
+            std::fs::write(repo.join("c.txt"), "more\n").unwrap();
+            run_git(&repo, &["add", "."]);
+            run_git(&repo, &["commit", "-m", "another file"]);
+            press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
+            assert_eq!(diff_view(&app).base, on_main);
+            assert_eq!(reviewed(&app), ["a.txt"], "a.txt was not touched");
+            assert_eq!(diff_order(&app), ["b.txt", "c.txt", "a.txt"]);
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+
+            std::fs::write(repo.join("a.txt"), "feat again\n").unwrap();
+            run_git(&repo, &["commit", "-am", "a.txt again"]);
+            press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
+            assert_eq!(diff_view(&app).base, on_main);
+            assert_eq!(reviewed(&app), [] as [&str; 0], "a.txt changed again");
+        });
+    }
+
+    /// Two checkouts of `repo` cut from `main`, each one commit ahead:
+    /// "a" on `feat-a` adds `x.txt`, "b" on `feat-b` adds `y.txt`.
+    fn seed_feature_checkouts(app: &mut App, dir: &tempfile::TempDir, repo: &std::path::Path) {
+        use nebula_core::{Entity, ProjectId, Worktree, WorktreeId};
+        for (id, branch, file, order) in [("a", "feat-a", "x.txt", 1), ("b", "feat-b", "y.txt", 2)]
+        {
+            let path = dir.path().join(branch);
+            run_git(
+                repo,
+                &["worktree", "add", "-b", branch, path.to_str().unwrap()],
+            );
+            std::fs::write(path.join(file), "new\n").unwrap();
+            run_git(&path, &["add", "."]);
+            run_git(&path, &["commit", "-m", branch]);
+            hse(
+                app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Worktree(Worktree {
+                        id: WorktreeId(id.into()),
+                        project_id: ProjectId("p1".into()),
+                        path,
+                        branch: branch.into(),
+                        is_main: false,
+                        created_from: Some("main".into()),
+                        pinned: false,
+                        for_branch: false,
+                        sort_order: order,
+                    }),
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn a_review_step_clears_the_filter_and_loads_the_next_checkout() {
+        use nebula_core::WorktreeId;
+        let dir = tempfile::tempdir().unwrap();
+        crate::review::with_store_path(dir.path().join("reviewed.json"), || {
+            let repo = test_repo(&dir);
+            let mut app = App::new();
+            seed_repo_tree(&mut app, &repo);
+            seed_feature_checkouts(&mut app, &dir, &repo);
+            let mut out = Vec::new();
+            let ctrl = |app: &mut App, c: char, out: &mut Vec<ClientRequest>| {
+                press(app, KeyCode::Char(c), KeyModifiers::CONTROL, out)
+            };
+            let shown = |app: &App| {
+                let v = diff_view(app);
+                let reviewed: Vec<String> = v.reviewed.keys().cloned().collect();
+                (
+                    v.branch.clone(),
+                    v.filter.as_str().to_string(),
+                    diff_order(app),
+                    reviewed,
+                )
+            };
+            let none: Vec<String> = Vec::new();
+
+            app.sel_worktree = app.worktree_row_index(&WorktreeId("b".into())).unwrap();
+            press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
+            ctrl(&mut app, 'r', &mut out);
+            ctrl(&mut app, 'p', &mut out);
+            assert_eq!(
+                shown(&app),
+                (
+                    "feat-a".into(),
+                    String::new(),
+                    vec!["x.txt".to_string()],
+                    none.clone()
+                )
+            );
+
+            press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE, &mut out);
+            assert_eq!(diff_view(&app).filter.as_str(), "x");
+            ctrl(&mut app, 'n', &mut out);
+            assert_eq!(
+                shown(&app),
+                (
+                    "feat-b".into(),
+                    String::new(),
+                    vec!["y.txt".to_string()],
+                    vec!["y.txt".to_string()]
+                )
+            );
+            assert_eq!(app.selected_worktree().unwrap().branch, "feat-b");
+
+            ctrl(&mut app, 'n', &mut out);
+            assert_eq!(app.flash.as_deref(), Some("no next checkout to review"));
+            assert_eq!(diff_view(&app).branch, "feat-b");
+        });
+    }
+
+    #[test]
+    fn a_review_step_that_cannot_open_its_target_stays_on_the_checkout_shown() {
+        use nebula_core::WorktreeId;
+        let dir = tempfile::tempdir().unwrap();
+        crate::review::with_store_path(dir.path().join("reviewed.json"), || {
+            let repo = test_repo(&dir);
+            let mut app = App::new();
+            seed_repo_tree(&mut app, &repo);
+            seed_feature_checkouts(&mut app, &dir, &repo);
+            let mut out = Vec::new();
+            app.sel_worktree = app.worktree_row_index(&WorktreeId("a".into())).unwrap();
+            press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
+
+            let gone = dir.path().join("feat-b");
+            std::fs::remove_dir_all(&gone).unwrap();
+            press(
+                &mut app,
+                KeyCode::Char('n'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
+            assert_eq!(
+                app.flash,
+                Some(format!("worktree path missing on disk: {}", gone.display()))
+            );
+            assert_eq!(diff_view(&app).branch, "feat-a");
+            assert_eq!(app.selected_worktree().unwrap().branch, "feat-a");
+        });
+    }
+
+    fn review_entry(
+        id: &str,
+        branch: &str,
+        changes: Result<crate::review_queue::Changes, String>,
+    ) -> crate::review_queue::ReviewEntry {
+        crate::review_queue::ReviewEntry {
+            worktree: nebula_core::WorktreeId(id.into()),
+            branch: branch.into(),
+            agents: crate::review_queue::AgentsState::Finished,
+            changes,
+        }
+    }
+
+    /// The row above the diff viewer, cut to the viewer's own columns.
+    fn review_status_row(app: &mut App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, app)).unwrap();
+        let viewer = diff_view(app).area;
+        buffer_text(&terminal)
+            .lines()
+            .nth(viewer.y as usize - 1)
+            .expect("a row above the viewer")
+            .chars()
+            .skip(viewer.x as usize)
+            .take(viewer.width as usize)
+            .collect::<String>()
+            .trim()
+            .to_string()
+    }
+
+    #[test]
+    fn the_review_status_line_shows_while_the_queue_leads_elsewhere() {
+        use crate::git_diff::DiffBase;
+        use crate::review_queue::{Changes, ReviewQueue};
+        use nebula_core::WorktreeId;
+        let changes = |base, files, added, removed| {
+            Ok(Changes {
+                base,
+                files,
+                added,
+                removed,
+                reviewed: 0,
+            })
+        };
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut view = fake_diff_view(4);
+        view.branch = "fix-login".into();
+        view.worktree = Some(WorktreeId("b".into()));
+        view.queue_snapshot = ReviewQueue {
+            entries: vec![
+                review_entry(
+                    "a",
+                    "feat-a",
+                    changes(
+                        DiffBase::Branch(crate::git_diff::GitRef::local("main")),
+                        1,
+                        2,
+                        0,
+                    ),
+                ),
+                review_entry("b", "fix-login", changes(DiffBase::WorkingTree, 3, 48, 12)),
+            ],
+        };
+        app.overlay = Some(Overlay::Diff(Box::new(view)));
+        let keys = "^n next  ^p prev  ^l list";
+        let split = |row: String| {
+            let (left, right) = row.split_once("    ").expect("keys on the right");
+            (left.to_string(), right.trim().to_string())
+        };
+        let view_mut = |app: &mut App, edit: &dyn Fn(&mut DiffView)| match &mut app.overlay {
+            Some(Overlay::Diff(view)) => edit(view),
+            other => panic!("expected diff overlay, got {other:?}"),
+        };
+
+        assert_eq!(
+            split(review_status_row(&mut app)),
+            (
+                "review 2/2   ‹ fix-login ›   uncommitted   3 files  +48 −12".to_string(),
+                keys.to_string()
+            )
+        );
+
+        view_mut(&mut app, &|view| {
+            view.branch = "feat-a".into();
+            view.worktree = Some(WorktreeId("a".into()));
+        });
+        assert_eq!(
+            split(review_status_row(&mut app)),
+            (
+                "review 1/2   ‹ feat-a ›   vs main   1 file  +2 −0".to_string(),
+                keys.to_string()
+            )
+        );
+
+        view_mut(&mut app, &|view| {
+            view.queue_snapshot.entries.remove(1);
+        });
+        let alone = review_status_row(&mut app);
+        assert!(!alone.contains("review"), "the only entry: {alone}");
+        assert!(!alone.contains("^n next"), "the only entry: {alone}");
+
+        view_mut(&mut app, &|view| {
+            view.branch = "main".into();
+            view.worktree = Some(WorktreeId("clean".into()));
+        });
+        assert_eq!(
+            split(review_status_row(&mut app)),
+            ("review –/1   ‹ main ›".to_string(), keys.to_string())
+        );
+    }
+
+    #[test]
+    fn the_review_list_shows_the_error_of_a_checkout_git_cannot_inspect() {
+        use crate::review_queue::ReviewQueue;
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut view = fake_diff_view(4);
+        view.queue_snapshot = ReviewQueue {
+            entries: vec![review_entry(
+                "x",
+                "broken",
+                Err("git status failed: boom".into()),
+            )],
+        };
+        view.queue_picker = Some(Default::default());
+        app.overlay = Some(Overlay::Diff(Box::new(view)));
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("broken   git status failed: boom"),
+            "list row:\n{text}"
+        );
+    }
+
+    #[test]
     fn diff_modal_ctrl_u_clears_filter_before_scrolling() {
         let mut app = App::new();
         seed_tree(&mut app);
-        app.overlay = Some(Overlay::Diff(fake_diff_view(100)));
+        app.overlay = Some(Overlay::Diff(Box::new(fake_diff_view(100))));
         let mut out = Vec::new();
         let view = |app: &App| match &app.overlay {
             Some(Overlay::Diff(v)) => v.clone(),
@@ -19689,7 +22106,7 @@ mod tests {
             xy: ['M', ' '],
         };
         let mut view = DiffView::new(
-            "/nonexistent-nebula-diff-test".into(),
+            crate::git_diff::Source::Checkout("/nonexistent-nebula-diff-test".into()),
             "main".into(),
             vec![file("build.rs"), file("src/ui.rs")],
             true,
@@ -19709,7 +22126,7 @@ mod tests {
         let mut view = fake_diff_view(4);
         view.diff = "diff --git a/a.rs b/a.rs\n@@ -1,2 +1,2 @@\n-old line\n+new line".into();
         view.diff_line_count = 4;
-        app.overlay = Some(Overlay::Diff(view));
+        app.overlay = Some(Overlay::Diff(Box::new(view)));
 
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
@@ -19732,7 +22149,7 @@ mod tests {
         let mut app = App::new();
         seed_tree(&mut app);
         app.focus = Focus::Projects;
-        app.overlay = Some(Overlay::Diff(fake_diff_view(100)));
+        app.overlay = Some(Overlay::Diff(Box::new(fake_diff_view(100))));
         let mut out = Vec::new();
 
         let wheel = MouseEvent {
@@ -19768,7 +22185,7 @@ mod tests {
     fn diff_modal_click_selects_file_row() {
         let mut app = App::new();
         seed_tree(&mut app);
-        app.overlay = Some(Overlay::Diff(fake_diff_view(4)));
+        app.overlay = Some(Overlay::Diff(Box::new(fake_diff_view(4))));
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let area = match &app.overlay {
@@ -19822,7 +22239,7 @@ mod tests {
     fn diff_modal_border_drag_resizes_file_list() {
         let mut app = App::new();
         seed_tree(&mut app);
-        app.overlay = Some(Overlay::Diff(fake_diff_view(4)));
+        app.overlay = Some(Overlay::Diff(Box::new(fake_diff_view(4))));
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let (area, width_before) = match &app.overlay {
@@ -20477,7 +22894,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_hl_cycles_recent_window_and_applies() {
+    fn settings_hl_cycles_a_choice_and_saves() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         crate::config::with_config_path(path, || {
@@ -20485,7 +22902,7 @@ mod tests {
             let mut out = Vec::new();
             press(&mut app, KeyCode::Char('s'), KeyModifiers::NONE, &mut out);
             let (tab, row) =
-                crate::config::locate(crate::config::SettingKind::RecentWindow).unwrap();
+                crate::config::locate(crate::config::SettingKind::SessionIdleTimeout).unwrap();
             for _ in 0..tab {
                 press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
             }
@@ -20494,15 +22911,10 @@ mod tests {
             }
             press(&mut app, KeyCode::Char('l'), KeyModifiers::NONE, &mut out);
             let cfg = crate::config::Config::load();
-            assert_eq!(cfg.recent_window, "1h");
-            assert_eq!(app.recent_window_ms, 3_600_000);
+            assert_eq!(cfg.session_idle_timeout, "15m");
             press(&mut app, KeyCode::Char('h'), KeyModifiers::NONE, &mut out);
             let cfg = crate::config::Config::load();
-            assert_eq!(cfg.recent_window, "30m");
-            assert_eq!(
-                app.recent_window_ms,
-                crate::config::DEFAULT_RECENT_WINDOW_MS
-            );
+            assert_eq!(cfg.session_idle_timeout, "5m");
         });
     }
 
@@ -20522,14 +22934,14 @@ mod tests {
         // Settings live on their own tab now, so a row from another tab
         // is only on screen once you switch to it.
         assert!(
-            !text.contains("Recent window"),
+            !text.contains("Idle session timeout"),
             "another tab's rows stay off screen:\n{text}"
         );
         press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let sessions_text = buffer_text(&terminal);
         assert!(
-            sessions_text.contains("Recent window"),
+            sessions_text.contains("Idle session timeout"),
             "Tab reaches the Sessions tab:\n{sessions_text}"
         );
         for tab in crate::config::SETTINGS_TABS {
@@ -21245,7 +23657,7 @@ mod tests {
     fn file_finder_escape_clears_query_then_closes() {
         let mut app = App::new();
         app.overlay = Some(Overlay::Files(FileFinder::new(
-            "/nonexistent-nebula-finder-test".into(),
+            crate::git_diff::Source::Checkout("/nonexistent-nebula-finder-test".into()),
             "main".into(),
             "vim".into(),
             vec!["src/alpha.rs".into(), "src/beta.rs".into()],
@@ -21303,7 +23715,7 @@ mod tests {
     fn file_finder_renders_query_row_and_matches() {
         let mut app = App::new();
         app.overlay = Some(Overlay::Files(FileFinder::new(
-            "/nonexistent-nebula-finder-test".into(),
+            crate::git_diff::Source::Checkout("/nonexistent-nebula-finder-test".into()),
             "main".into(),
             "vim".into(),
             vec!["src/alpha.rs".into(), "src/beta.rs".into()],
@@ -21628,7 +24040,7 @@ mod tests {
 
     fn fake_grep_view(hits: Vec<crate::grep_search::GrepHit>) -> GrepView {
         let mut view = GrepView::new(
-            "/nonexistent-nebula-grep-test".into(),
+            crate::git_diff::Source::Checkout("/nonexistent-nebula-grep-test".into()),
             "main".into(),
             "vim".into(),
         );
@@ -22900,6 +25312,323 @@ mod tests {
         });
     }
 
+    #[test]
+    fn repeated_offline_notices_preserve_exhausted_retry_budget() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.tree.projects[0].host = Some("findl".into());
+        attach(
+            &mut app,
+            SessionRef::Agent(AgentId("a1".into())),
+            &mut Vec::new(),
+        );
+        let notice = ServerEvent::Error {
+            req_id: None,
+            message: "nebula relay: {\"host\":\"findl\",\"connected\":false}".into(),
+        };
+        hse(&mut app, notice.clone());
+        // Advance the time boundary to an exhausted three-attempt cycle.
+        let term = app.term.as_mut().unwrap();
+        term.attach_attempts = 3;
+        term.awaiting_snapshot = Some(std::time::Instant::now() - Duration::from_secs(11));
+        hse(&mut app, notice);
+        app.quick_term = true;
+        let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(buffer_text(&terminal).contains("findl: unavailable"));
+    }
+
+    #[test]
+    fn remote_pane_shows_recovery_until_snapshot_and_retry_never_sends_keys() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.tree.projects[0].host = Some("findl".into());
+        let session = SessionRef::Agent(AgentId("a1".into()));
+        let mut out = Vec::new();
+        attach(&mut app, session.clone(), &mut out);
+        let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(buffer_text(&terminal).contains("findl: connecting"));
+        hse(
+            &mut app,
+            ServerEvent::Error {
+                req_id: None,
+                message: "nebula relay: {\"host\":\"findl\",\"connected\":false}".into(),
+            },
+        );
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(buffer_text(&terminal).contains("findl: reconnecting"));
+        app.focus = Focus::Terminal;
+        app.term_locked = true;
+        out.clear();
+        press(
+            &mut app,
+            KeyCode::Char('r'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
+        assert!(matches!(
+            out.as_slice(),
+            [ClientRequest::Attach { from_seq: None, .. }]
+        ));
+        hse(
+            &mut app,
+            ServerEvent::Scrollback {
+                session,
+                base_seq: 0,
+                data: b"recovered screen".to_vec(),
+            },
+        );
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let screen = buffer_text(&terminal);
+        assert!(screen.contains("recovered screen"));
+        assert!(!screen.contains("findl: reconnecting"));
+    }
+    #[test]
+    fn empty_replay_keeps_starting_hint_until_the_child_paints() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let session = SessionRef::Agent(AgentId("a1".into()));
+        attach(&mut app, session.clone(), &mut Vec::new());
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(buffer_text(&terminal).contains("Starting claude…"));
+        hse(
+            &mut app,
+            ServerEvent::Scrollback {
+                session: session.clone(),
+                base_seq: 0,
+                data: vec![],
+            },
+        );
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(
+            buffer_text(&terminal).contains("Starting claude…"),
+            "empty replay is not app readiness"
+        );
+        hse(
+            &mut app,
+            ServerEvent::Output {
+                session,
+                seq: 0,
+                data: b"ready for input".to_vec(),
+            },
+        );
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("ready for input"));
+        assert!(!text.contains("Starting claude…"));
+    }
+
+    #[test]
+    fn cold_remote_attach_paints_preview_then_authoritative_replay() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.tree.projects[0].host = Some("findl".into());
+        let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let session = SessionRef::Agent(AgentId("a1".into()));
+        let mut out = Vec::new();
+        attach(&mut app, session.clone(), &mut out);
+        let req_id = match out.as_slice() {
+            [ClientRequest::ReadSession { req_id, .. }] => *req_id,
+            _ => panic!("cold remote attach must request compact preview first: {out:?}"),
+        };
+        out.clear();
+        // A previous attach to this session can still have events in flight.
+        // They must not cancel the deferred Attach or become its first frame.
+        hse(
+            &mut app,
+            ServerEvent::Scrollback {
+                session: session.clone(),
+                base_seq: 900,
+                data: b"old attachment".to_vec(),
+            },
+        );
+        hse(
+            &mut app,
+            ServerEvent::Output {
+                session: session.clone(),
+                seq: 914,
+                data: b"old output".to_vec(),
+            },
+        );
+        let (cols, rows) = pane_size(&app);
+        handle_server_event(
+            &mut app,
+            ServerEvent::SessionText {
+                req_id,
+                text: "idle agent ready".into(),
+                cols,
+                rows,
+            },
+            &mut out,
+        );
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(
+            buffer_text(&terminal).contains("idle agent ready"),
+            "first reply paints useful content without a child redraw"
+        );
+        assert!(matches!(
+            out.as_slice(),
+            [ClientRequest::Attach { from_seq: None, .. }]
+        ));
+        hse(
+            &mut app,
+            ServerEvent::Scrollback {
+                session: session.clone(),
+                base_seq: 0,
+                data: b"\x1b[2J".to_vec(),
+            },
+        );
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(
+            !buffer_text(&terminal).contains("idle agent ready"),
+            "even a blank authoritative replay replaces the preview"
+        );
+        hse(
+            &mut app,
+            ServerEvent::Output {
+                session: session.clone(),
+                seq: 4,
+                data: b"authoritative screen".to_vec(),
+            },
+        );
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("authoritative screen"));
+        assert!(!text.contains("idle agent ready"));
+        attach(&mut app, other_session(), &mut Vec::new());
+        out.clear();
+        attach(&mut app, session, &mut out);
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(
+            buffer_text(&terminal).contains("authoritative screen"),
+            "warm first frame is cached, no network response needed"
+        );
+        assert!(out
+            .iter()
+            .all(|r| !matches!(r, ClientRequest::ReadSession { .. })));
+    }
+
+    #[test]
+    fn resize_discards_preview_and_rejects_its_late_reply() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.tree.projects[0].host = Some("findl".into());
+        let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let mut out = Vec::new();
+        attach(&mut app, SessionRef::Agent(AgentId("a1".into())), &mut out);
+        let req_id = match out[0] {
+            ClientRequest::ReadSession { req_id, .. } => req_id,
+            _ => panic!(),
+        };
+        let (cols, rows) = pane_size(&app);
+        hse(
+            &mut app,
+            ServerEvent::SessionText {
+                req_id,
+                text: "old size preview".into(),
+                cols,
+                rows,
+            },
+        );
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(buffer_text(&terminal).contains("old size preview"));
+        terminal.backend_mut().resize(100, 30);
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(
+            !buffer_text(&terminal).contains("old size preview"),
+            "even the first resized frame must discard the preview"
+        );
+        sync_pty_size(&mut app, &mut out);
+        hse(
+            &mut app,
+            ServerEvent::SessionText {
+                req_id,
+                text: "late stale preview".into(),
+                cols,
+                rows,
+            },
+        );
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(!text.contains("old size preview"));
+        assert!(!text.contains("late stale preview"));
+    }
+
+    #[test]
+    fn remote_split_paints_the_compact_preview() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.tree.projects[0].host = Some("findl".into());
+        app.term = Some(AttachedTerm::new(other_session(), 80, 24));
+        app.split_term = Some(AttachedTerm::new(other_session(), 40, 24));
+        let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let mut out = Vec::new();
+        attach_split(&mut app, SessionRef::Agent(AgentId("a1".into())), &mut out);
+        let req_id = out
+            .iter()
+            .find_map(|r| match r {
+                ClientRequest::ReadSession { req_id, .. } => Some(*req_id),
+                _ => None,
+            })
+            .expect("split uses compact preview too");
+        hse(
+            &mut app,
+            ServerEvent::SessionText {
+                req_id,
+                text: "split ready".into(),
+                cols: 40,
+                rows: 24,
+            },
+        );
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("split ready"));
+        assert!(text.contains("Resuming claude…"));
+    }
+
+    #[test]
+    fn preview_error_falls_back_to_attach_without_a_flash() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.tree.projects[0].host = Some("findl".into());
+        let mut out = Vec::new();
+        attach(&mut app, SessionRef::Agent(AgentId("a1".into())), &mut out);
+        let req_id = match out[0] {
+            ClientRequest::ReadSession { req_id, .. } => req_id,
+            _ => panic!(),
+        };
+        out.clear();
+        handle_server_event(
+            &mut app,
+            ServerEvent::Error {
+                req_id: Some(req_id),
+                message: "no live PTY".into(),
+            },
+            &mut out,
+        );
+        assert!(app.flash.is_none(), "preview is best effort");
+        assert!(matches!(
+            out.as_slice(),
+            [ClientRequest::Attach { from_seq: None, .. }]
+        ));
+        hse(
+            &mut app,
+            ServerEvent::SessionText {
+                req_id,
+                text: "late reply".into(),
+                cols: 80,
+                rows: 24,
+            },
+        );
+        assert!(app.term.as_ref().unwrap().attach_preview.is_none());
+    }
+
     // ---- fast session re-attach: parked parsers + scrollback deltas ----
 
     fn term_screen(term: &crate::app::AttachedTerm) -> String {
@@ -23089,5 +25818,610 @@ mod tests {
             },
         );
         assert!(app.take_cached_term(&a1, 40, 10).is_none());
+    }
+
+    fn app_on_unchecked_out_branch(dir: &tempfile::TempDir) -> (App, std::path::PathBuf) {
+        let repo = test_repo(dir);
+        run_git(&repo, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(repo.join("only-on-feature.txt"), "feature line\n").unwrap();
+        run_git(&repo, &["add", "."]);
+        run_git(&repo, &["commit", "-q", "-m", "feature work"]);
+        run_git(&repo, &["checkout", "-q", "main"]);
+        let mut app = App::new();
+        seed_repo_tree(&mut app, &repo);
+        app.branch_list = Some((
+            ProjectId("p1".into()),
+            vec![crate::branches::LocalBranch {
+                name: "feature".into(),
+                created_from: Some("main".into()),
+                created_at: None,
+            }],
+        ));
+        app.focus = Focus::Worktrees;
+        app.sel_worktree = app.branch_row_index("feature").unwrap();
+        (app, repo)
+    }
+
+    fn checkout_state(repo: &std::path::Path) -> String {
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let mut files: Vec<String> = std::fs::read_dir(repo)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        files.sort();
+        format!(
+            "{}{}{}{files:?}",
+            git(&["symbolic-ref", "HEAD"]),
+            git(&["rev-parse", "HEAD"]),
+            git(&["status", "--porcelain", "--ignored"]),
+        )
+    }
+
+    #[test]
+    fn g_on_a_branch_row_diffs_the_branch_against_the_base_its_row_shows() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, repo) = app_on_unchecked_out_branch(&dir);
+        let before = checkout_state(&repo);
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
+
+        assert_eq!(app.flash, None);
+        let view = diff_view(&app);
+        assert_eq!(
+            view.base,
+            crate::git_diff::DiffBase::Branch(crate::git_diff::GitRef::local("main"))
+        );
+        let paths: Vec<&str> = view.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["only-on-feature.txt"]);
+        assert!(view.diff.contains("+feature line"), "{}", view.diff);
+        assert_eq!(view.commits[0].subject, "feature work");
+        assert!(
+            (0..view.picker_rows())
+                .all(|row| view.picker_base(row) != Some(crate::git_diff::DiffBase::WorkingTree)),
+            "no working-tree choice without a checkout"
+        );
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("feature work"), "{text}");
+        assert!(!text.contains("uncommitted"), "{text}");
+        assert_eq!(checkout_state(&repo), before);
+    }
+
+    #[test]
+    fn f_on_a_branch_row_finds_the_files_of_the_branch_tip() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, repo) = app_on_unchecked_out_branch(&dir);
+        let before = checkout_state(&repo);
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Char('f'), KeyModifiers::NONE, &mut out);
+
+        assert_eq!(app.flash, None);
+        assert_eq!(finder(&app).files, ["a.txt", "only-on-feature.txt"]);
+        assert_eq!(checkout_state(&repo), before);
+    }
+
+    #[test]
+    fn b_on_a_branch_row_browses_and_previews_the_branch_tip() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, repo) = app_on_unchecked_out_branch(&dir);
+        let before = checkout_state(&repo);
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Char('b'), KeyModifiers::NONE, &mut out);
+        for c in "only".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+
+        assert_eq!(app.flash, None);
+        assert_eq!(tree_rows(&app), ["only-on-feature.txt"]);
+        assert_eq!(tree_view(&app).preview, "feature line");
+        assert_eq!(checkout_state(&repo), before);
+    }
+
+    #[test]
+    fn shift_f_on_a_branch_row_greps_the_branch_tip() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, repo) = app_on_unchecked_out_branch(&dir);
+        let before = checkout_state(&repo);
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Char('F'), KeyModifiers::SHIFT, &mut out);
+        for c in "feature".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+
+        assert_eq!(app.flash, None);
+        let view = grep_view(&app);
+        assert_eq!(view.error, None);
+        let hits: Vec<(&str, u64)> = view
+            .hits
+            .iter()
+            .map(|h| (h.path.as_str(), h.line))
+            .collect();
+        assert_eq!(hits, [("only-on-feature.txt", 1)]);
+        assert_eq!(checkout_state(&repo), before);
+    }
+
+    fn capturing_editor(dir: &std::path::Path) -> (String, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let log = dir.join("editor.log");
+        let script = dir.join("editor.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\npwd -P > '{0}.part'\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> '{0}.part'; done\nmv '{0}.part' '{0}'\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (script.to_string_lossy().into_owned(), log)
+    }
+
+    fn editor_input(log: &std::path::Path) -> (std::path::PathBuf, Vec<String>) {
+        for _ in 0..100 {
+            if let Ok(text) = std::fs::read_to_string(log) {
+                let mut lines = text.lines().map(str::to_string);
+                let cwd = lines.next().unwrap().into();
+                return (cwd, lines.collect());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        panic!("the editor never ran");
+    }
+
+    fn set_editor(app: &mut App, editor: &str) {
+        match &mut app.overlay {
+            Some(Overlay::Grep(v)) => v.editor = editor.into(),
+            Some(Overlay::Files(v)) => v.editor = editor.into(),
+            Some(Overlay::Tree(v)) => v.editor = editor.into(),
+            other => panic!("no file overlay: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enter_on_a_branch_row_hit_opens_a_private_read_only_copy_of_the_branch_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, repo) = app_on_unchecked_out_branch(&dir);
+        let before = checkout_state(&repo);
+        let (editor, log) = capturing_editor(dir.path());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.vim_tx = Some(tx);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('F'), KeyModifiers::SHIFT, &mut out);
+        for c in "feature".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        set_editor(&mut app, &editor);
+
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+
+        assert_eq!(app.flash, None);
+        let (cwd, args) = editor_input(&log);
+        assert_eq!(args[0], "+1");
+        let copy = cwd.join(&args[1]);
+        assert!(
+            !copy.starts_with(repo.canonicalize().unwrap()),
+            "{copy:?} is inside the repository"
+        );
+        assert_eq!(std::fs::read_to_string(&copy).unwrap(), "feature line\n");
+        assert!(std::fs::metadata(&copy).unwrap().permissions().readonly());
+        let mode = std::fs::metadata(&cwd).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "the copy's directory is private");
+        assert_eq!(checkout_state(&repo), before);
+    }
+
+    #[test]
+    fn enter_opens_the_revision_the_view_listed_after_the_branch_moves_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, repo) = app_on_unchecked_out_branch(&dir);
+        let (editor, log) = capturing_editor(dir.path());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.vim_tx = Some(tx);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('f'), KeyModifiers::NONE, &mut out);
+        for c in "only".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        set_editor(&mut app, &editor);
+        run_git(&repo, &["checkout", "-q", "feature"]);
+        std::fs::write(repo.join("only-on-feature.txt"), "newer\n").unwrap();
+        run_git(&repo, &["commit", "-q", "-am", "feature moves on"]);
+        run_git(&repo, &["checkout", "-q", "main"]);
+
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+
+        assert_eq!(app.flash, None);
+        let (cwd, args) = editor_input(&log);
+        assert_eq!(args[1], "only-on-feature.txt");
+        assert_eq!(
+            std::fs::read_to_string(cwd.join(&args[1])).unwrap(),
+            "feature line\n"
+        );
+    }
+
+    #[test]
+    fn enter_on_a_file_named_like_an_option_hands_the_editor_a_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, repo) = app_on_unchecked_out_branch(&dir);
+        run_git(&repo, &["checkout", "-q", "feature"]);
+        std::fs::write(repo.join("-dash.txt"), "dash\n").unwrap();
+        run_git(&repo, &["add", "--", "-dash.txt"]);
+        run_git(&repo, &["commit", "-q", "-m", "dash"]);
+        run_git(&repo, &["checkout", "-q", "main"]);
+        let (editor, log) = capturing_editor(dir.path());
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.vim_tx = Some(tx);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('f'), KeyModifiers::NONE, &mut out);
+        for c in "-dash".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        assert_eq!(finder(&app).selected_path(), Some("-dash.txt"));
+        set_editor(&mut app, &editor);
+
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+
+        let (cwd, args) = editor_input(&log);
+        assert_eq!(args, ["+1", "./-dash.txt"]);
+        assert_eq!(
+            std::fs::read_to_string(cwd.join(&args[1])).unwrap(),
+            "dash\n"
+        );
+    }
+
+    #[test]
+    fn read_views_on_a_branch_named_like_an_option_read_that_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, repo) = app_on_unchecked_out_branch(&dir);
+        run_git(
+            &repo,
+            &["update-ref", "refs/heads/-x", "refs/heads/feature"],
+        );
+        app.branch_list = Some((
+            ProjectId("p1".into()),
+            vec![crate::branches::LocalBranch {
+                name: "-x".into(),
+                created_from: Some("main".into()),
+                created_at: None,
+            }],
+        ));
+        app.sel_worktree = app.branch_row_index("-x").unwrap();
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Char('f'), KeyModifiers::NONE, &mut out);
+        assert_eq!(app.flash, None);
+        assert_eq!(finder(&app).files, ["a.txt", "only-on-feature.txt"]);
+        app.overlay = None;
+        press(&mut app, KeyCode::Char('F'), KeyModifiers::SHIFT, &mut out);
+        for c in "feature".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        let hits: Vec<&str> = grep_view(&app)
+            .hits
+            .iter()
+            .map(|h| h.path.as_str())
+            .collect();
+        assert_eq!(hits, ["only-on-feature.txt"]);
+    }
+
+    #[test]
+    fn g_on_a_branch_row_with_no_shown_base_or_upstream_compares_with_the_primarys_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, repo) = app_on_unchecked_out_branch(&dir);
+        run_git(
+            &repo,
+            &[
+                "update-ref",
+                "refs/remotes/origin/other",
+                "refs/heads/feature",
+            ],
+        );
+        run_git(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/other",
+            ],
+        );
+        app.branch_list.as_mut().unwrap().1[0].created_from = None;
+        app.sel_worktree = app.branch_row_index("feature").unwrap();
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
+
+        assert_eq!(app.flash, None);
+        let view = diff_view(&app);
+        assert_eq!(
+            view.base,
+            crate::git_diff::DiffBase::Branch(crate::git_diff::GitRef::local("main"))
+        );
+        let paths: Vec<&str> = view.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["only-on-feature.txt"]);
+    }
+
+    #[test]
+    fn ctrl_n_from_a_branch_diff_steps_to_a_checkout_awaiting_review() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::review::with_store_path(dir.path().join("reviewed.json"), || {
+            let (mut app, repo) = app_on_unchecked_out_branch(&dir);
+            seed_feature_checkouts(&mut app, &dir, &repo);
+            app.sel_worktree = app.branch_row_index("feature").unwrap();
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
+
+            press(
+                &mut app,
+                KeyCode::Char('n'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
+
+            assert_eq!(app.flash, None);
+            assert_eq!(diff_view(&app).branch, "feat-a");
+        });
+    }
+
+    #[test]
+    fn a_remote_twins_parked_branch_row_refuses_the_read_views() {
+        let mut app = host_filter_fixture();
+        app.tree.agents[1].branch = Some("twin-only".into());
+        app.tree.agents[1].alive = false;
+        app.focus = Focus::Worktrees;
+        app.sel_worktree = app.branch_row_index("twin-only").unwrap();
+        let mut out = Vec::new();
+        for (code, mods) in [
+            (KeyCode::Char('g'), KeyModifiers::NONE),
+            (KeyCode::Char('f'), KeyModifiers::NONE),
+            (KeyCode::Char('F'), KeyModifiers::SHIFT),
+            (KeyCode::Char('b'), KeyModifiers::NONE),
+        ] {
+            app.flash = None;
+            press(&mut app, code, mods, &mut out);
+            assert!(app.overlay.is_none(), "{code:?} opened {:?}", app.overlay);
+            assert_eq!(
+                app.flash.as_deref(),
+                Some("twin-only is a branch on findl — open it there"),
+                "{code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_comparison_branch_named_like_an_option_is_compared_not_obeyed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, repo) = app_on_unchecked_out_branch(&dir);
+        let option = "--output=review-output.txt";
+        run_git(
+            &repo,
+            &[
+                "update-ref",
+                &format!("refs/heads/{option}"),
+                "refs/heads/main",
+            ],
+        );
+        app.branch_list.as_mut().unwrap().1[0].created_from = Some(option.into());
+        app.sel_worktree = app.branch_row_index("feature").unwrap();
+        let before = checkout_state(&repo);
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
+        assert_eq!(app.flash, None);
+        assert_eq!(
+            diff_view(&app).base,
+            crate::git_diff::DiffBase::Branch(crate::git_diff::GitRef::local(option))
+        );
+        press(
+            &mut app,
+            KeyCode::Char('g'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+
+        assert_eq!(app.flash, None);
+        let view = diff_view(&app);
+        assert_eq!(
+            view.base,
+            crate::git_diff::DiffBase::Branch(crate::git_diff::GitRef::local(option))
+        );
+        let paths: Vec<&str> = view.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["only-on-feature.txt"]);
+        assert!(view.diff.contains("+feature line"), "{}", view.diff);
+        assert_eq!(checkout_state(&repo), before);
+    }
+
+    #[test]
+    fn a_twin_branch_row_over_a_hidden_local_namesake_refuses_the_read_views() {
+        let mut app = host_filter_fixture();
+        app.tree.agents[1].branch = Some("twin-only".into());
+        app.tree.agents[1].alive = false;
+        app.branch_list = Some((ProjectId("p1".into()), vec!["twin-only".into()]));
+        app.hide_local = true;
+        app.focus = Focus::Worktrees;
+        app.sel_worktree = app.branch_row_index("twin-only").unwrap();
+        let mut out = Vec::new();
+        for (code, mods) in [
+            (KeyCode::Char('g'), KeyModifiers::NONE),
+            (KeyCode::Char('f'), KeyModifiers::NONE),
+            (KeyCode::Char('F'), KeyModifiers::SHIFT),
+            (KeyCode::Char('b'), KeyModifiers::NONE),
+        ] {
+            app.flash = None;
+            press(&mut app, code, mods, &mut out);
+            assert!(app.overlay.is_none(), "{code:?} opened {:?}", app.overlay);
+            assert_eq!(
+                app.flash.as_deref(),
+                Some("twin-only is a branch on findl — open it there"),
+                "{code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_listed_branch_with_a_tag_namesake_opens_its_read_views() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, repo) = app_on_unchecked_out_branch(&dir);
+        run_git(&repo, &["tag", "feature", "main"]);
+        app.branch_list = Some((
+            ProjectId("p1".into()),
+            crate::branches::local_branches_with_bases(&repo),
+        ));
+        app.sel_worktree = app.branch_row_index("feature").expect("a feature row");
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Char('f'), KeyModifiers::NONE, &mut out);
+
+        assert_eq!(app.flash, None);
+        assert_eq!(finder(&app).files, ["a.txt", "only-on-feature.txt"]);
+    }
+
+    #[test]
+    fn g_compares_with_a_configured_upstream_that_has_a_tag_namesake() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, repo) = app_on_unchecked_out_branch(&dir);
+        run_git(&repo, &["branch", "--set-upstream-to=main", "feature"]);
+        run_git(&repo, &["tag", "main", "main"]);
+        app.branch_list.as_mut().unwrap().1[0].created_from = None;
+        app.sel_worktree = app.branch_row_index("feature").unwrap();
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
+
+        assert_eq!(app.flash, None);
+        let view = diff_view(&app);
+        assert_eq!(view.base.title_suffix(), " vs main");
+        let paths: Vec<&str> = view.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["only-on-feature.txt"]);
+    }
+
+    #[test]
+    fn ctrl_g_on_a_remote_branch_compares_with_the_remote_not_its_local_namesake() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, repo) = app_on_unchecked_out_branch(&dir);
+        run_git(&repo, &["branch", "origin/main", "main"]);
+        run_git(
+            &repo,
+            &[
+                "update-ref",
+                "refs/remotes/origin/main",
+                "refs/heads/feature",
+            ],
+        );
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
+
+        press(
+            &mut app,
+            KeyCode::Char('g'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
+        press(&mut app, KeyCode::End, KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+
+        assert_eq!(app.flash, None);
+        let view = diff_view(&app);
+        assert_eq!(view.base.title_suffix(), " vs origin/main");
+        assert!(view.files.is_empty(), "{:?}", view.files);
+    }
+
+    #[test]
+    fn g_on_a_checkout_cut_from_a_remote_tracking_branch_compares_with_it() {
+        use nebula_core::{Entity, ProjectId, Worktree, WorktreeId};
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo(&dir);
+        run_git(
+            &repo,
+            &[
+                "update-ref",
+                "refs/remotes/origin/develop",
+                "refs/heads/main",
+            ],
+        );
+        let path = dir.path().join("topic");
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "topic",
+                path.to_str().unwrap(),
+            ],
+        );
+        std::fs::write(path.join("topic.txt"), "topic\n").unwrap();
+        run_git(&path, &["add", "."]);
+        run_git(&path, &["commit", "-q", "-m", "topic"]);
+        let mut app = App::new();
+        seed_repo_tree(&mut app, &repo);
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Worktree(Worktree {
+                    id: WorktreeId("topic".into()),
+                    project_id: ProjectId("p1".into()),
+                    path,
+                    branch: "topic".into(),
+                    is_main: false,
+                    created_from: Some("origin/develop".into()),
+                    pinned: false,
+                    for_branch: false,
+                    sort_order: 1,
+                }),
+            },
+        );
+        app.sel_worktree = app.worktree_row_index(&WorktreeId("topic".into())).unwrap();
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
+
+        assert_eq!(app.flash, None);
+        let view = diff_view(&app);
+        assert_eq!(
+            view.base,
+            crate::git_diff::DiffBase::Branch(
+                crate::git_diff::GitRef::full("refs/remotes/origin/develop").unwrap()
+            )
+        );
+        let paths: Vec<&str> = view.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["topic.txt"]);
+    }
+
+    #[test]
+    fn g_on_a_branch_row_whose_shown_base_is_a_tag_compares_with_the_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, repo) = app_on_unchecked_out_branch(&dir);
+        run_git(&repo, &["tag", "v1", "main"]);
+        app.branch_list.as_mut().unwrap().1[0].created_from = Some("v1".into());
+        app.sel_worktree = app.branch_row_index("feature").unwrap();
+        let mut out = Vec::new();
+
+        press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
+
+        assert_eq!(app.flash, None);
+        let view = diff_view(&app);
+        assert_eq!(
+            view.base,
+            crate::git_diff::DiffBase::Branch(
+                crate::git_diff::GitRef::full("refs/tags/v1").unwrap()
+            )
+        );
+        let paths: Vec<&str> = view.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["only-on-feature.txt"]);
     }
 }

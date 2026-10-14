@@ -25,6 +25,7 @@ a higher number means the source dir for that symlink wasn't mirrored — add it
 
 | Local | Remote | Why |
 |---|---|---|
+| `~/Desktop/perseu-stack` | `~/Desktop/perseu-stack` | the perseu-stack repo (skills, core rules, config); entries in `~/.agents/skills` are relative symlinks into its `skills/`, so it syncs first |
 | `~/.agents/skills` | `~/.agents/skills` | the shared skill source; claude/codex entries symlink into it |
 | `~/.claude/{skills,commands,agents,rules,shared,CLAUDE.md}` | same | Claude Code's global config; `CLAUDE.md` `@include`s `shared/` and `commands/shared/` |
 | `~/.codex/{skills,agents,AGENTS.md}` | same | Codex's global skills, subagent definitions, instructions |

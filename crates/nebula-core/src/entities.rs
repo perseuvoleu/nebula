@@ -147,9 +147,8 @@ pub struct Worktree {
     /// Pinned worktrees sort into their own PINNED group in the worktrees list.
     #[serde(default)]
     pub pinned: bool,
-    /// The checkout was created for a branch that already existed (a
-    /// session spawned on a branch row) — the panel keeps presenting the
-    /// row as a branch, not a worktree the user asked for by name.
+    /// Legacy/explicit branch presentation and deletion semantics. Automatic
+    /// session checkouts leave this false so normal removal retains the branch.
     #[serde(default)]
     pub for_branch: bool,
     pub sort_order: i64,
@@ -170,7 +169,8 @@ pub struct Agent {
     #[serde(default)]
     pub pinned: bool,
     /// Epoch ms of the last status change; 0 = unknown (pre-upgrade rows or
-    /// never-run agents). Drives the TUI's RECENT session group.
+    /// never-run agents). Drives the TUI's "23m ago" stamps and the
+    /// all-projects SESSIONS list's recency order.
     #[serde(default)]
     pub status_changed_at: i64,
     #[serde(default)]
@@ -188,12 +188,13 @@ pub struct Agent {
     pub sort_order: i64,
     /// True when the daemon currently holds a live PTY for this agent.
     pub alive: bool,
-    /// The branch the checkout had when this session was spawned (or last
-    /// deliberately moved). The session stays listed under that branch
-    /// even after the checkout switches to another one — chats belong to
-    /// the branch they were had on, not to whatever the directory holds
-    /// now. None = unknown (rows from before this was recorded), which
-    /// follows the checkout's current branch.
+    /// Branch expected at spawn/resume, or last deliberately moved to.
+    /// Execution identity is `worktree_id` on its owning host. A mismatch
+    /// blocks spawning and never moves a live process. A live agent stays
+    /// listed under `worktree_id`, with a recovery warning on a mismatch;
+    /// a stopped one is listed under this branch's checkout, else its
+    /// branch row. None denotes legacy rows with unknown affinity,
+    /// validated against their checkout row.
     #[serde(default)]
     pub branch: Option<String>,
 }

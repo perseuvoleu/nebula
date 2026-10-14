@@ -107,6 +107,10 @@ enum Command {
         /// Project name (default: the project owning this shell or cwd).
         #[arg(long)]
         project: Option<String>,
+        /// Stop the agents and shells on the primary checkout instead of
+        /// refusing; warm agent PTYs are always stopped.
+        #[arg(long)]
+        stop_busy: bool,
     },
     /// Spawn and inspect agent sessions from the command line — how a
     /// session delegates work to and manages its workers.
@@ -149,6 +153,10 @@ enum Command {
         #[command(subcommand)]
         command: RemoteCommand,
     },
+    /// Knowledge base for agents: notes, shared know-how and every app's
+    /// markdown docs, searched semantically. Lives on findl; elsewhere this
+    /// runs `ssh findl nebula rag …`.
+    Rag(nebula_rag::cli::RagArgs),
     /// Collect a settled remote checkout through origin, preserving both
     /// checkouts and all sessions. Prints JSON on success, dry-run, and refusal.
     Collect {
@@ -290,10 +298,20 @@ enum WorktreeCommand {
         #[arg(long)]
         project: Option<String>,
     },
-    /// Check a branch out in the primary checkout. A nebula worktree
-    /// holding that branch is removed first (the branch is kept); refused
-    /// while sessions still run on it. Never detach a worktree by hand to
-    /// free a branch — this is the supported route.
+    /// Remove only a clean, merged, session-free worktree by ID. Keeps its branch.
+    DeleteSafe {
+        id: String,
+        branch: String,
+        path: std::path::PathBuf,
+        #[arg(long)]
+        check: bool,
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Deliberately switch primary. Refused while other sessions run there
+    /// (unless `--stop-busy`), primary has uncommitted changes, an untracked
+    /// file the branch would overwrite, or the branch already has a checkout;
+    /// use that checkout instead.
     Checkout {
         /// Local branch name.
         branch: String,
@@ -301,6 +319,10 @@ enum WorktreeCommand {
         /// calling session's project).
         #[arg(long)]
         project: Option<String>,
+        /// Stop the agents and shells on the primary checkout instead of
+        /// refusing; warm agent PTYs are always stopped.
+        #[arg(long)]
+        stop_busy: bool,
     },
 }
 
@@ -394,6 +416,20 @@ enum AgentCommand {
         text: Vec<String>,
         /// Project name, or `name@host` for a remote project (default: the
         /// calling session's project).
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Send one terminal key by stable agent ID, without submitting a prompt.
+    Key {
+        id: String,
+        #[arg(value_parser = ["Up", "Down", "Left", "Right", "Enter", "Escape", "Tab"])]
+        key: String,
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Delete exactly this agent ID, never resolve a mutable session name.
+    DeleteId {
+        id: String,
         #[arg(long)]
         project: Option<String>,
     },
@@ -659,21 +695,26 @@ fn main() -> Result<()> {
                 from,
                 project,
             } => nebula_tui::run_worktree_new(name.join(" "), from, project),
+            WorktreeCommand::DeleteSafe { id, branch, path, check, project } =>
+                nebula_tui::run_worktree_delete_safe(id, branch, path, check, project),
             WorktreeCommand::Delete {
                 name,
                 force,
                 project,
             } => nebula_tui::run_worktree_delete(name, force, project),
-            WorktreeCommand::Checkout { branch, project } => {
-                nebula_tui::run_worktree_checkout(branch, project)
-            }
+            WorktreeCommand::Checkout {
+                branch,
+                project,
+                stop_busy,
+            } => nebula_tui::run_worktree_checkout(branch, project, stop_busy),
         },
         Some(Command::Switch {
             branch,
             from,
             worktree,
             project,
-        }) => nebula_tui::run_switch(branch, from, worktree, project),
+            stop_busy,
+        }) => nebula_tui::run_switch(branch, from, worktree, project, stop_busy),
         Some(Command::Agent { command }) => match command {
             AgentCommand::New {
                 worktree,
@@ -719,6 +760,8 @@ fn main() -> Result<()> {
             AgentCommand::Unarchive { name, project } => {
                 nebula_tui::run_agent_ctl(nebula_tui::AgentCtl::Unarchive, name, project)
             }
+            AgentCommand::Key { id, key, project } => nebula_tui::run_agent_action_id(id, Some(key), project),
+            AgentCommand::DeleteId { id, project } => nebula_tui::run_agent_action_id(id, None, project),
             AgentCommand::Delete { name, project } => {
                 nebula_tui::run_agent_ctl(nebula_tui::AgentCtl::Delete, name, project)
             }
@@ -794,6 +837,7 @@ fn main() -> Result<()> {
                 RemoteCommand::Restart => nebula_tui::RemoteOp::Restart,
             },
         ),
+        Some(Command::Rag(args)) => nebula_rag::cli::run(args),
         Some(Command::Collect { selector, branch, worktree, project, host, agent, dry_run, timeout }) => {
             use nebula_tui::collect_cli::{CollectOpts, Mode};
             nebula_tui::run_collect(CollectOpts {

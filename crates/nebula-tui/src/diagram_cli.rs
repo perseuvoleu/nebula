@@ -78,7 +78,10 @@ fn existing(checkout: &Path, slug: &str) -> Result<PathBuf> {
     check_slug(slug)?;
     let path = diagrams::file(checkout, slug);
     if !path.is_file() {
-        bail!("no diagram \"{slug}\" in {} — see `nebula diagram list`", diagrams::dir(checkout).display());
+        bail!(
+            "no diagram \"{slug}\" in {} — see `nebula diagram list`",
+            diagrams::dir(checkout).display()
+        );
     }
     Ok(path)
 }
@@ -98,7 +101,13 @@ pub fn run_in(checkout: &Path, op: DiagramOp, owner: Meta) -> Result<()> {
     let folder = diagrams::dir(checkout);
     match op {
         DiagramOp::Path => println!("{}", folder.display()),
-        DiagramOp::New { slug, title, tags, decision, force } => {
+        DiagramOp::New {
+            slug,
+            title,
+            tags,
+            decision,
+            force,
+        } => {
             check_slug(&slug)?;
             let path = diagrams::file(checkout, &slug);
             if path.exists() && !force {
@@ -107,7 +116,11 @@ pub fn run_in(checkout: &Path, op: DiagramOp, owner: Meta) -> Result<()> {
                     path.display()
                 );
             }
-            let kind = if decision { Template::Decision } else { Template::Plain };
+            let kind = if decision {
+                Template::Decision
+            } else {
+                Template::Plain
+            };
             let meta = Meta { tags, ..owner };
             let title = title.unwrap_or_else(|| slug.clone());
             std::fs::create_dir_all(&folder)
@@ -188,7 +201,10 @@ pub fn run_in(checkout: &Path, op: DiagramOp, owner: Meta) -> Result<()> {
             if let Some(slug) = &slug {
                 existing(checkout, slug)?;
             } else if diagrams::scan(checkout).is_empty() {
-                bail!("no diagrams in {} — create one with `nebula diagram new <slug>`", folder.display());
+                bail!(
+                    "no diagrams in {} — create one with `nebula diagram new <slug>`",
+                    folder.display()
+                );
             }
             let request = json!({
                 "checkout": checkout.display().to_string(),
@@ -277,9 +293,15 @@ mod tests {
         std::fs::write(&path, "edited by the agent").unwrap();
         let refused = run_in(tmp.path(), new("flow", false), Meta::default()).unwrap_err();
         assert!(refused.to_string().contains("--force"), "{refused}");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "edited by the agent");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "edited by the agent"
+        );
         run_in(tmp.path(), new("flow", true), Meta::default()).unwrap();
-        assert_ne!(std::fs::read_to_string(&path).unwrap(), "edited by the agent");
+        assert_ne!(
+            std::fs::read_to_string(&path).unwrap(),
+            "edited by the agent"
+        );
 
         assert!(run_in(tmp.path(), new("Bad Slug", false), Meta::default()).is_err());
         assert!(run_in(tmp.path(), new("../escape", false), Meta::default()).is_err());
@@ -297,7 +319,10 @@ mod tests {
         };
         run_in(tmp.path(), add(&source, None), Meta::default()).unwrap();
         assert!(diagrams::file(tmp.path(), "auth-flow").is_file());
-        assert!(run_in(tmp.path(), add(&source, None), Meta::default()).is_err(), "no overwrite");
+        assert!(
+            run_in(tmp.path(), add(&source, None), Meta::default()).is_err(),
+            "no overwrite"
+        );
         run_in(tmp.path(), add(&source, Some("second")), Meta::default()).unwrap();
 
         let untitled = tmp.path().join("untitled.html");
@@ -311,10 +336,24 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         run_in(tmp.path(), new("pick", false), Meta::default()).unwrap();
         std::fs::write(diagrams::decisions_file(tmp.path(), "pick"), "{}\n").unwrap();
-        run_in(tmp.path(), DiagramOp::Rm { slug: "pick".into() }, Meta::default()).unwrap();
+        run_in(
+            tmp.path(),
+            DiagramOp::Rm {
+                slug: "pick".into(),
+            },
+            Meta::default(),
+        )
+        .unwrap();
         assert!(!diagrams::file(tmp.path(), "pick").exists());
         assert!(!diagrams::decisions_file(tmp.path(), "pick").exists());
-        assert!(run_in(tmp.path(), DiagramOp::Rm { slug: "pick".into() }, Meta::default()).is_err());
+        assert!(run_in(
+            tmp.path(),
+            DiagramOp::Rm {
+                slug: "pick".into()
+            },
+            Meta::default()
+        )
+        .is_err());
     }
 
     #[test]
@@ -322,7 +361,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let request = tmp.path().join("diagram-open.json");
         let write = |slug: serde_json::Value, ts: i64| {
-            let body = json!({"checkout": tmp.path().display().to_string(), "slug": slug, "ts": ts});
+            let body =
+                json!({"checkout": tmp.path().display().to_string(), "slug": slug, "ts": ts});
             std::fs::write(&request, body.to_string()).unwrap();
         };
         write(json!("flow"), 1_000);
@@ -333,15 +373,25 @@ mod tests {
         assert_eq!(take_open_request(&request, 1_500), None, "consumed");
 
         write(json!(null), 1_000);
-        assert_eq!(take_open_request(&request, 2_000), Some((tmp.path().to_path_buf(), None)));
+        assert_eq!(
+            take_open_request(&request, 2_000),
+            Some((tmp.path().to_path_buf(), None))
+        );
 
         write(json!("flow"), 1_000);
-        assert_eq!(take_open_request(&request, 1_000 + OPEN_REQUEST_TTL_MS + 1), None, "stale");
+        assert_eq!(
+            take_open_request(&request, 1_000 + OPEN_REQUEST_TTL_MS + 1),
+            None,
+            "stale"
+        );
         assert!(!request.exists(), "a stale request is still cleaned up");
 
         // A slug that could never be a diagram falls back to the newest.
         write(json!("../../etc/passwd"), 1_000);
-        assert_eq!(take_open_request(&request, 1_000), Some((tmp.path().to_path_buf(), None)));
+        assert_eq!(
+            take_open_request(&request, 1_000),
+            Some((tmp.path().to_path_buf(), None))
+        );
 
         std::fs::write(&request, "not json").unwrap();
         assert_eq!(take_open_request(&request, 1_000), None);

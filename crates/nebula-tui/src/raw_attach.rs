@@ -50,47 +50,52 @@ async fn passthrough(
     let mut size_tick = tokio::time::interval(std::time::Duration::from_millis(500));
 
     loop {
-        tokio::select! {
-            frame = read_frame::<ServerEvent, _>(reader) => {
-                match frame? {
-                    Some(ServerEvent::Scrollback { data, .. }) | Some(ServerEvent::Output { data, .. }) => {
-                        stdout.write_all(&data)?;
-                        stdout.flush()?;
+        let read = read_frame::<ServerEvent, _>(&mut *reader);
+        tokio::pin!(read);
+        loop {
+            tokio::select! {
+                frame = &mut read => {
+                    match frame? {
+                        Some(ServerEvent::Scrollback { data, .. }) | Some(ServerEvent::Output { data, .. }) => {
+                            stdout.write_all(&data)?;
+                            stdout.flush()?;
+                        }
+                        Some(ServerEvent::SessionExited { exit_code, .. }) => {
+                            eprintln!("\r\n[nebula] session exited ({exit_code:?})\r");
+                            return Ok(());
+                        }
+                        Some(_) => {}
+                        None => {
+                            eprintln!("\r\n[nebula] daemon closed the connection\r");
+                            return Ok(());
+                        }
                     }
-                    Some(ServerEvent::SessionExited { exit_code, .. }) => {
-                        eprintln!("\r\n[nebula] session exited ({exit_code:?})\r");
+                    break;
+                }
+                n = stdin.read(&mut stdin_buf) => {
+                    let n = n?;
+                    if n == 0 {
                         return Ok(());
                     }
-                    Some(_) => {}
-                    None => {
-                        eprintln!("\r\n[nebula] daemon closed the connection\r");
+                    if stdin_buf[..n].contains(&DETACH_BYTE) {
+                        eprintln!("\r\n[nebula] detached\r");
+                        write_frame(writer, &ClientRequest::Detach { session: sref.clone() }).await?;
                         return Ok(());
                     }
+                    write_frame(writer, &ClientRequest::Input {
+                        session: sref.clone(),
+                        data: stdin_buf[..n].to_vec(),
+                    }).await?;
                 }
-            }
-            n = stdin.read(&mut stdin_buf) => {
-                let n = n?;
-                if n == 0 {
-                    return Ok(());
-                }
-                if stdin_buf[..n].contains(&DETACH_BYTE) {
-                    eprintln!("\r\n[nebula] detached\r");
-                    write_frame(writer, &ClientRequest::Detach { session: sref.clone() }).await?;
-                    return Ok(());
-                }
-                write_frame(writer, &ClientRequest::Input {
-                    session: sref.clone(),
-                    data: stdin_buf[..n].to_vec(),
-                }).await?;
-            }
-            _ = size_tick.tick() => {
-                if let Ok((c, r)) = crossterm::terminal::size() {
-                    if (c, r) != (cols, rows) {
-                        cols = c;
-                        rows = r;
-                        write_frame(writer, &ClientRequest::Resize {
-                            session: sref.clone(), cols, rows,
-                        }).await?;
+                _ = size_tick.tick() => {
+                    if let Ok((c, r)) = crossterm::terminal::size() {
+                        if (c, r) != (cols, rows) {
+                            cols = c;
+                            rows = r;
+                            write_frame(writer, &ClientRequest::Resize {
+                                session: sref.clone(), cols, rows,
+                            }).await?;
+                        }
                     }
                 }
             }

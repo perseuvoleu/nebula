@@ -8,10 +8,15 @@ use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 28;
+pub const PROTOCOL_VERSION: u32 = 29;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
+
+/// Starts the `Error` a `CheckoutPrimary` or `ResolveBranchCheckout` gets
+/// when live sessions sit on primary; clients answer it with a confirmation
+/// that resends `CheckoutPrimary` with `stop_busy`.
+pub const BUSY_SESSIONS_REFUSAL: &str = "primary has sessions on";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SessionRef {
@@ -40,6 +45,14 @@ pub enum ClientRequest {
     },
     Input {
         session: SessionRef,
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+    },
+    /// One explicit key/input write, acknowledged only after the PTY accepted it.
+    InputAcknowledged {
+        req_id: u64,
+        id: AgentId,
+        project: ProjectId,
         #[serde(with = "serde_bytes")]
         data: Vec<u8>,
     },
@@ -122,25 +135,42 @@ pub enum ClientRequest {
         branch: String,
         base: Option<String>,
     },
+    /// Resolve a usable checkout of an existing branch on the project's host.
+    /// Moves primary under `CheckoutPrimary`'s rules, live sessions refused;
+    /// never creates a branch or a linked checkout.
+    ResolveBranchCheckout {
+        req_id: u64,
+        project: ProjectId,
+        branch: String,
+    },
+    /// Conservative web removal: no sessions, clean and merged, branch preserved.
+    CheckWorktreeRemoval {
+        req_id: u64,
+        id: WorktreeId,
+        branch: String,
+        path: PathBuf,
+        delete: bool,
+    },
     DeleteWorktree {
         req_id: u64,
         id: WorktreeId,
         force: bool,
     },
-    /// Check `branch` out in the project's primary checkout. When the
-    /// branch lives in a nebula worktree, that checkout is removed first
-    /// (the branch itself is kept) — refused while sessions still run on
-    /// it, so nobody is left on a detached HEAD.
+    /// Explicitly move primary. Refuses uncommitted changes, a blocking
+    /// untracked file, branches already hosted by a linked checkout, and live
+    /// sessions on primary unless `stop_busy`; then stops them, and they keep
+    /// their rows and branch.
     CheckoutPrimary {
         req_id: u64,
         project: ProjectId,
         branch: String,
-        /// The session that asked for the switch from inside its own
-        /// shell (`nebula switch`): it follows the branch, so its row
-        /// moves with the checkout while every other session on the old
-        /// branch stays listed there.
+        /// Sole caller moving its own physical checkout; it keeps running.
         #[serde(default)]
         mover: Option<SessionRef>,
+        /// The user confirmed stopping the sessions on primary. Skipped
+        /// when false so unconfirmed requests stay readable by older daemons.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        stop_busy: bool,
     },
     /// Pin/unpin the worktree in the worktrees list (pure metadata).
     SetWorktreePinned {
@@ -151,6 +181,9 @@ pub enum ClientRequest {
     CreateAgent {
         req_id: u64,
         worktree: WorktreeId,
+        /// Requested branch for a branch/session action; None explicitly selects
+        /// the physical checkout regardless of branch (e.g. --worktree primary).
+        expected_branch: Option<String>,
         name: String,
         kind: AgentKind,
         /// Model the CLI launches with; None = the CLI's own default.
@@ -230,6 +263,12 @@ pub enum ClientRequest {
         id: AgentId,
         pinned: bool,
     },
+    /// Delete only a non-archived agent in the explicitly selected project.
+    DeleteAgentScoped {
+        req_id: u64,
+        id: AgentId,
+        project: ProjectId,
+    },
     DeleteAgent {
         req_id: u64,
         id: AgentId,
@@ -243,6 +282,9 @@ pub enum ClientRequest {
     CreateTerminal {
         req_id: u64,
         worktree: WorktreeId,
+        /// Requested branch for a branch/session action; None explicitly selects
+        /// the physical checkout regardless of branch (e.g. --worktree primary).
+        expected_branch: Option<String>,
         name: Option<String>,
     },
     CreateNote {

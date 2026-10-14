@@ -142,7 +142,10 @@ pub fn parse_meta(head: &str) -> Meta {
         let tag_start = lower[..name].rfind('<')?;
         let tag = &head[tag_start..name + head[name..].find('>')?];
         let content = find_ci(tag, "content=")? + "content=".len();
-        let quote = tag[content..].chars().next().filter(|c| matches!(c, '"' | '\''))?;
+        let quote = tag[content..]
+            .chars()
+            .next()
+            .filter(|c| matches!(c, '"' | '\''))?;
         let body = &tag[content + 1..];
         let body = &body[..body.find(quote)?];
         serde_json::from_str::<Value>(&unescape(body)).ok()
@@ -196,7 +199,11 @@ pub fn scan_reusing(checkout: &Path, previous: &[Diagram]) -> Vec<Diagram> {
         .flatten()
         .filter_map(|entry| {
             let path = entry.path();
-            let slug = path.file_name()?.to_str()?.strip_suffix(".html")?.to_owned();
+            let slug = path
+                .file_name()?
+                .to_str()?
+                .strip_suffix(".html")?
+                .to_owned();
             if !valid_slug(&slug) {
                 return None;
             }
@@ -440,7 +447,9 @@ pub fn auto_focus(current: &Diagram, before: &[Diagram], after: &[Diagram]) -> O
         d.slug != current.slug
             && d.owner_key() == Some(owner)
             && d.mtime > shown
-            && !before.iter().any(|old| old.slug == d.slug && old.mtime == d.mtime)
+            && !before
+                .iter()
+                .any(|old| old.slug == d.slug && old.mtime == d.mtime)
     })
 }
 
@@ -504,12 +513,17 @@ mod tests {
     fn missing_or_invalid_meta_is_empty_not_an_error() {
         assert_eq!(parse_meta("<html><title>t</title>"), Meta::default());
         assert_eq!(parse_meta(&page("t", "{not json")), Meta::default());
-        assert_eq!(parse_meta(&page("t", r#"{"tags":"nope","session":7}"#)), Meta::default());
+        assert_eq!(
+            parse_meta(&page("t", r#"{"tags":"nope","session":7}"#)),
+            Meta::default()
+        );
         assert_eq!(parse_title("<html><title>  </title>"), None);
         assert_eq!(parse_title("<html>"), None);
         // Control characters never survive into the listing.
         assert_eq!(
-            parse_meta(&page("t", r#"{"session":"a\u001b[31mb"}"#)).session.as_deref(),
+            parse_meta(&page("t", r#"{"session":"a\u001b[31mb"}"#))
+                .session
+                .as_deref(),
             Some("a[31mb")
         );
     }
@@ -551,11 +565,19 @@ mod tests {
     fn search_is_fuzzy_over_slug_title_and_tags() {
         let tmp = tempfile::tempdir().unwrap();
         write(tmp.path(), "auth-flow", &page("Login sequence", "{}"), 10);
-        write(tmp.path(), "db", &page("Storage layout", r#"{"tags":["postgres"]}"#), 20);
+        write(
+            tmp.path(),
+            "db",
+            &page("Storage layout", r#"{"tags":["postgres"]}"#),
+            20,
+        );
         write(tmp.path(), "deploy", &page("Release pipeline", "{}"), 30);
         let all = scan(tmp.path());
         let slugs = |q: &str| -> Vec<&str> {
-            search(q, &all).into_iter().map(|i| all[i].slug.as_str()).collect()
+            search(q, &all)
+                .into_iter()
+                .map(|i| all[i].slug.as_str())
+                .collect()
         };
         assert_eq!(slugs(""), ["auth-flow", "db", "deploy"]);
         assert_eq!(slugs("auth"), ["auth-flow"]);
@@ -610,7 +632,10 @@ mod tests {
         assert_eq!(d.note.as_ref().unwrap().len(), 2000);
         // Wrong types and empty essentials are dropped, not coerced.
         assert_eq!(Decision::from_value(&json!({"id": 1, "choice": "a"})), None);
-        assert_eq!(Decision::from_value(&json!({"id": "x", "choice": "\n"})), None);
+        assert_eq!(
+            Decision::from_value(&json!({"id": "x", "choice": "\n"})),
+            None
+        );
         assert_eq!(Decision::from_value(&json!("text")), None);
     }
 
@@ -642,10 +667,16 @@ mod tests {
         assert_eq!(path, decisions_file(tmp.path(), "pick"));
         let rows = read_decisions(tmp.path(), "pick");
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0], json!({"ts":1,"slug":"pick","id":"q","choice":"a","label":"L","note":null}));
+        assert_eq!(
+            rows[0],
+            json!({"ts":1,"slug":"pick","id":"q","choice":"a","label":"L","note":null})
+        );
         assert_eq!(rows[1]["choice"], "b");
         assert!(read_decisions(tmp.path(), "other").is_empty());
-        assert!(scan(tmp.path()).is_empty(), "a decisions log is not a diagram");
+        assert!(
+            scan(tmp.path()).is_empty(),
+            "a decisions log is not a diagram"
+        );
     }
 
     fn project(id: &str, host: Option<&str>) -> Project {
@@ -734,14 +765,23 @@ mod tests {
             agent("a-dup2", "dup", "w-here", true),
         ];
         let owner = |session: Option<&str>, id: Option<&str>| {
-            resolve_owner(&owned("d", session, id, 0), here.path(), &projects, &worktrees, &agents)
-                .map(|a| a.id.as_str().to_owned())
+            resolve_owner(
+                &owned("d", session, id, 0),
+                here.path(),
+                &projects,
+                &worktrees,
+                &agents,
+            )
+            .map(|a| a.id.as_str().to_owned())
         };
         assert_eq!(owner(Some("owner"), None).as_deref(), Some("a-live"));
         assert_eq!(owner(None, Some("a-live")).as_deref(), Some("a-live"));
         // The id decides: a stale name next to a live id still resolves, and
         // a live name never rescues an id that is not deliverable.
-        assert_eq!(owner(Some("renamed since"), Some("a-live")).as_deref(), Some("a-live"));
+        assert_eq!(
+            owner(Some("renamed since"), Some("a-live")).as_deref(),
+            Some("a-live")
+        );
         assert_eq!(owner(Some("owner"), Some("a-dead")), None);
         assert_eq!(owner(None, None), None, "no owner recorded");
         assert_eq!(owner(Some("ghost"), None), None, "unknown session");
@@ -759,11 +799,19 @@ mod tests {
         let before = vec![shown.clone(), owned("other", None, Some("s2"), 200)];
 
         // Same session, new and newer: focus moves.
-        let after = vec![owned("answer", None, Some("s1"), 10), before[0].clone(), before[1].clone()];
+        let after = vec![
+            owned("answer", None, Some("s1"), 10),
+            before[0].clone(),
+            before[1].clone(),
+        ];
         assert_eq!(auto_focus(&shown, &before, &after), Some(0));
 
         // Another session's new page, or an unowned one: stay put.
-        let after = vec![owned("noise", None, Some("s2"), 10), owned("anon", None, None, 5), shown.clone()];
+        let after = vec![
+            owned("noise", None, Some("s2"), 10),
+            owned("anon", None, None, 5),
+            shown.clone(),
+        ];
         assert_eq!(auto_focus(&shown, &before, &after), None);
 
         // Nothing changed since the last scan: stay put (the user may have
@@ -773,7 +821,10 @@ mod tests {
 
         // The shown page itself was rewritten more recently: it reloads
         // instead, the older sibling does not steal the focus.
-        let after = vec![owned("ask", None, Some("s1"), 1), owned("answer", None, Some("s1"), 10)];
+        let after = vec![
+            owned("ask", None, Some("s1"), 1),
+            owned("answer", None, Some("s1"), 10),
+        ];
         assert_eq!(auto_focus(&shown, &before, &after), None);
 
         // An unowned page never auto-focuses anything.

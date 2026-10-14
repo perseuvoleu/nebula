@@ -10,7 +10,12 @@ use nebula_core::{
 };
 use ratatui::layout::Rect;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+
+#[cfg(test)]
+thread_local! {
+    // Deterministic complexity regression check; no production instrumentation.
+    pub(crate) static PANEL_PROJECTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// Frame duration of the status-sweep text animation: the event loop's
 /// repaint cadence while [`App::status_anim_active`] holds, and the step
@@ -48,6 +53,14 @@ pub enum HitTarget {
     /// A checkout-less local branch row — an index into
     /// `App::panel_entries()`, same as `Worktree`.
     WorktreeBranch(usize),
+    /// Client-side host visibility checkboxes; never change session lifecycle.
+    ToggleLocal,
+    ToggleRemote,
+    /// Toggle rows without open sessions.
+    ToggleAll,
+    /// The `⎇ branch ▾` control beside them: a click opens the fuzzy
+    /// branch picker that checks the pick out on the primary checkout.
+    CheckoutBranch,
     Session(usize),
     /// Row in the Projects panel's all-projects SESSIONS section — an
     /// index into `App::global_sessions()`; a click jumps to the session.
@@ -144,30 +157,22 @@ pub enum MenuAction {
         project: ProjectId,
         branch: String,
     },
-    /// A twin row (`… on findl`) whose host has no checkout of this
-    /// branch yet: check it out on the twin's primary (the `nebula
-    /// switch` shape, same as a local checkout-less branch row) and
-    /// carry on with `next` there — never on whatever branch the
-    /// primary happened to be on.
+    /// Resolve this branch on the selected host before continuing the session action.
     CheckoutThen {
         project: ProjectId,
         branch: String,
         next: AfterCheckout,
     },
-    /// Open the new-branch name prompt (chains into the base-branch
-    /// picker; the branch is created with `git branch` and checked out on
-    /// the primary, like `nebula switch`).
+    /// Open the name/base picker and create a Git branch without moving a checkout.
     NewBranch(ProjectId),
     /// A base-branch-picker row (new-branch flow): run
-    /// `git branch <name> <base>` in the project's primary checkout, then
-    /// check it out there.
+    /// `git branch <name> <base>` without moving the primary checkout.
     CreateBranchFrom {
         project: ProjectId,
         name: String,
         base: String,
     },
-    /// Check this row's branch out in the primary checkout: the daemon
-    /// removes the session-free worktree holding it and keeps the branch.
+    /// Deliberately switch primary; the daemon refuses occupied or already hosted branches.
     CheckoutPrimary {
         project: ProjectId,
         branch: String,
@@ -236,6 +241,9 @@ pub enum PaletteCommand {
     /// Filterable picker over the project's worktrees, then the normal
     /// new-session picker (kind → model/effort → name) on the pick.
     NewAgentInWorktree(ProjectId),
+    /// Filterable picker over the project's LOCAL BRANCHES; the pick is
+    /// checked out on the primary checkout (the panel's `⎇` control).
+    CheckoutBranch(ProjectId),
     /// Shell terminal TAB in the current context's checkout (the `t`
     /// hotkey's rule).
     NewTerminal,
@@ -450,12 +458,11 @@ pub enum PendingAction {
         project: ProjectId,
         branch: String,
     },
-    /// Confirmed move of the primary checkout onto `branch` while busy
-    /// sessions sit on it; `next` runs there once the Ack lands.
-    CheckoutPrimary {
+    StopBusyAndCheckout {
         project: ProjectId,
         branch: String,
         next: AfterCheckout,
+        sessions: Vec<String>,
     },
     Quit,
 }
@@ -482,9 +489,8 @@ pub enum PromptKind {
         id: ProjectId,
         before: bool,
     },
-    /// Name for a new local branch (checked out on the primary once
-    /// created, like `nebula switch`); submit chains into the
-    /// base-branch picker, which leads with the primary checkout's branch.
+    /// Name for a new local branch; submit opens the base picker.
+    /// Creating the branch leaves every checkout on its current branch.
     NewBranch {
         project: ProjectId,
     },
@@ -675,8 +681,8 @@ pub struct DiffMatch {
 /// Full-screen git-diff viewer: file list left, scrollable diff right.
 #[derive(Debug, Clone)]
 pub struct DiffView {
-    /// Checkout dir the diffs are read from.
-    pub root: PathBuf,
+    /// What the diffs are read from.
+    pub source: crate::git_diff::Source,
     /// Branch name for the pane title.
     pub branch: String,
     pub files: Vec<DiffFile>,
@@ -714,16 +720,19 @@ pub struct DiffView {
     /// Nebula-side bookkeeping only (persisted via `review::store_marks`);
     /// never stages or otherwise touches git state.
     pub reviewed: HashMap<String, u64>,
-    /// HEAD OID the marks are scoped to (empty on an unborn HEAD). A moved
-    /// HEAD — commit, checkout — resets the worktree's marks on next open.
+    /// HEAD OID the working-tree marks are scoped to (empty on an unborn
+    /// HEAD). A moved HEAD — commit, checkout — resets them on next open.
     pub head_key: String,
     /// What `files` and `diff` compare (see `DiffBase`); the ^g picker
     /// switches it. Default: the working tree against HEAD.
     pub base: DiffBase,
     /// The branch's tracking ref, if any — the picker's "vs upstream" row.
-    pub upstream: Option<String>,
+    pub upstream: Option<crate::git_diff::GitRef>,
     /// Picker rows below the working-tree ones; loaded on the first ^g.
     pub commits: Vec<CommitEntry>,
+    /// The picker's branch-mode rows (every other branch); loaded on the
+    /// first ^g.
+    pub branches: Vec<crate::git_diff::GitRef>,
     /// The ^g base picker while it is open.
     pub picker: Option<BasePicker>,
     /// Screen rect of the "compare with" row under the filter (the ▾ base
@@ -733,14 +742,56 @@ pub struct DiffView {
     /// change pulls it back so the selected row stays on screen
     /// (`follow_selection`).
     pub list_scroll: usize,
+    /// First visible row of the commit strip under the ▾ base row. The
+    /// wheel moves it freely; a base change pulls it back to the picked
+    /// commit (`follow_commit`).
+    pub commit_scroll: usize,
+    /// Screen rect of the commit strip, written back during draw so
+    /// clicks and the wheel can hit-test it.
+    pub commits_area: Rect,
+    /// Screen rect of the pinned "Current" row above the strip (the way
+    /// back to the uncommitted changes), written back during draw.
+    pub current_area: Rect,
+    /// The checkout on show; `None` for a view not opened from the panel.
+    pub worktree: Option<WorktreeId>,
+    /// The project's review queue as last built: when the viewer opened,
+    /// a ^n/^p step landed, or the ^l list opened.
+    pub queue_snapshot: crate::review_queue::ReviewQueue,
+    /// The ^l review list while it is open.
+    pub queue_picker: Option<QueuePicker>,
 }
 
-/// The ^g popup over the diff viewer: pick what the diff compares.
-/// Row 0 is the working tree vs HEAD, row 1 the upstream (when there is
-/// one), then the commits newest first.
+/// The ^l popup over the diff viewer: one row per review queue entry.
+#[derive(Debug, Clone, Default)]
+pub struct QueuePicker {
+    /// Index of the hovered entry.
+    pub hover: usize,
+    /// Screen rect of the rows (border excluded), written back during
+    /// draw for click hit-testing.
+    pub list_area: Rect,
+    /// Full popup rect, written back during draw; a click outside closes.
+    pub area: Rect,
+}
+
+impl QueuePicker {
+    /// First visible row for a window `visible` rows tall.
+    pub fn scroll_offset(&self, visible: usize) -> usize {
+        (self.hover + 1).saturating_sub(visible.max(1))
+    }
+}
+
+/// Rows of the commit strip under the diff viewer's ▾ base row.
+pub const DIFF_COMMIT_ROWS: usize = 5;
+
+/// The ^g popup over the diff viewer: pick what the diff compares. Two
+/// modes, flipped with Tab. Commits: row 0 is the working tree vs HEAD,
+/// row 1 the upstream (when there is one), then the commits newest first.
+/// Branches: every other branch, to see all the work since the merge base.
 #[derive(Debug, Clone, Default)]
 pub struct BasePicker {
     pub hover: usize,
+    /// Branch mode (the rows are `DiffView::branches`) instead of commits.
+    pub branches: bool,
     /// Screen rect of the rows (border excluded), written back during
     /// draw for click hit-testing.
     pub list_area: Rect,
@@ -760,17 +811,34 @@ impl BasePicker {
 }
 
 impl DiffView {
-    /// Number of ^g picker rows: working tree, optional upstream, commits.
+    /// Whether the ^g picker is showing branches rather than commits.
+    fn picker_branch_mode(&self) -> bool {
+        self.picker.as_ref().is_some_and(|p| p.branches)
+    }
+
+    /// Number of ^g picker rows: working tree, optional upstream, commits
+    /// — or the branches in branch mode.
     pub fn picker_rows(&self) -> usize {
-        1 + usize::from(self.upstream.is_some()) + self.commits.len()
+        if self.picker_branch_mode() {
+            return self.branches.len();
+        }
+        usize::from(self.source.has_working_tree())
+            + usize::from(self.upstream.is_some())
+            + self.commits.len()
     }
 
     /// The base a picker row stands for.
     pub fn picker_base(&self, row: usize) -> Option<DiffBase> {
-        if row == 0 {
-            return Some(DiffBase::WorkingTree);
+        if self.picker_branch_mode() {
+            return self.branches.get(row).cloned().map(DiffBase::Branch);
         }
-        let mut row = row - 1;
+        let mut row = row;
+        if self.source.has_working_tree() {
+            if row == 0 {
+                return Some(DiffBase::WorkingTree);
+            }
+            row -= 1;
+        }
         if let Some(up) = &self.upstream {
             if row == 0 {
                 return Some(DiffBase::Upstream(up.clone()));
@@ -787,12 +855,22 @@ impl DiffView {
             .unwrap_or(0)
     }
 
-    /// Open the ^g picker hovering the current base.
+    /// Open the ^g picker hovering the current base, in the mode that
+    /// base belongs to.
     pub fn open_picker(&mut self) {
         self.picker = Some(BasePicker {
-            hover: self.picker_row_of_base(),
+            branches: matches!(self.base, DiffBase::Branch(_)),
             ..BasePicker::default()
         });
+        self.picker_hover(self.picker_row_of_base() as i64);
+    }
+
+    /// Flip the ^g picker between commits and branches.
+    pub fn toggle_picker_mode(&mut self) {
+        if let Some(p) = &mut self.picker {
+            p.branches = !p.branches;
+        }
+        self.picker_hover(self.picker_row_of_base() as i64);
     }
 
     /// Clamped move of the picker hover.
@@ -803,9 +881,77 @@ impl DiffView {
         }
     }
 
-    pub fn new(root: PathBuf, branch: String, files: Vec<DiffFile>, head_ok: bool) -> Self {
+    /// The base `delta` steps along the strip's order — the working tree,
+    /// then the commits newest first — or `None` at either end. An
+    /// upstream or branch base counts as the working tree's position.
+    pub fn step_base(&self, delta: i64) -> Option<DiffBase> {
+        let pos = match &self.base {
+            DiffBase::Commit(c) => self
+                .commits
+                .iter()
+                .position(|e| e == c)
+                .map_or(0, |i| i + 1),
+            _ => 0,
+        };
+        let next = (pos as i64 + delta).clamp(0, self.commits.len() as i64) as usize;
+        let base = match next.checked_sub(1) {
+            Some(i) => DiffBase::Commit(self.commits[i].clone()),
+            None if self.source.has_working_tree() => DiffBase::WorkingTree,
+            None => return None,
+        };
+        (base != self.base).then_some(base)
+    }
+
+    /// First visible strip row for a strip `height` rows tall:
+    /// `commit_scroll`, re-clamped so the last page stays full.
+    pub fn commit_window_start(&self, height: usize) -> usize {
+        self.commit_scroll
+            .min(self.commits.len().saturating_sub(height.max(1)))
+    }
+
+    /// Pull `commit_scroll` so the base's commit is inside the strip.
+    pub fn follow_commit(&mut self) {
+        let DiffBase::Commit(c) = &self.base else {
+            return;
+        };
+        let Some(i) = self.commits.iter().position(|e| e == c) else {
+            return;
+        };
+        let height = match self.commits_area.height as usize {
+            0 => DIFF_COMMIT_ROWS,
+            h => h,
+        };
+        if i < self.commit_scroll {
+            self.commit_scroll = i;
+        } else if i >= self.commit_scroll + height {
+            self.commit_scroll = i + 1 - height;
+        }
+    }
+
+    /// Wheel over the commit strip: move its window, leave the base alone.
+    pub fn scroll_commits_by(&mut self, delta: i32) {
+        let height = (self.commits_area.height as usize).max(1);
+        let max = self.commits.len().saturating_sub(height) as i32;
+        self.commit_scroll = (self.commit_scroll as i32 + delta).clamp(0, max) as usize;
+    }
+
+    /// Where the current base's ✓ marks are stored; `None` for the bases
+    /// that have none (the upstream, a commit).
+    pub fn mark_scope(&self) -> Option<crate::review::MarkScope<'_>> {
+        let crate::git_diff::Source::Checkout(_) = &self.source else {
+            return None;
+        };
+        self.base.mark_scope(&self.head_key)
+    }
+
+    pub fn new(
+        source: crate::git_diff::Source,
+        branch: String,
+        files: Vec<DiffFile>,
+        head_ok: bool,
+    ) -> Self {
         let mut view = Self {
-            root,
+            source,
             branch,
             files,
             filter: TextInput::new(),
@@ -825,9 +971,16 @@ impl DiffView {
             base: DiffBase::WorkingTree,
             upstream: None,
             commits: Vec::new(),
+            branches: Vec::new(),
             picker: None,
             base_area: Rect::default(),
             list_scroll: 0,
+            commit_scroll: 0,
+            commits_area: Rect::default(),
+            current_area: Rect::default(),
+            worktree: None,
+            queue_snapshot: Default::default(),
+            queue_picker: None,
         };
         view.apply_filter();
         view
@@ -1199,8 +1352,8 @@ pub struct FinderMatch {
 /// Fuzzy file finder over every file of the selected worktree (`f`).
 #[derive(Debug, Clone)]
 pub struct FileFinder {
-    /// Checkout dir the listing was read from.
-    pub root: PathBuf,
+    /// What the listing was read from.
+    pub source: crate::git_diff::Source,
     /// Branch name for the modal title.
     pub branch: String,
     /// Editor command Enter launches (NEBULA_EDITOR, then the `editor`
@@ -1223,9 +1376,14 @@ pub struct FileFinder {
 }
 
 impl FileFinder {
-    pub fn new(root: PathBuf, branch: String, editor: String, files: Vec<String>) -> Self {
+    pub fn new(
+        source: crate::git_diff::Source,
+        branch: String,
+        editor: String,
+        files: Vec<String>,
+    ) -> Self {
         let mut finder = Self {
-            root,
+            source,
             branch,
             editor,
             files,
@@ -1272,8 +1430,8 @@ impl FileFinder {
 /// Find-in-files overlay (`F`): live `git grep` over the selected worktree.
 #[derive(Debug, Clone)]
 pub struct GrepView {
-    /// Checkout dir the search runs in.
-    pub root: PathBuf,
+    /// What the search runs over.
+    pub source: crate::git_diff::Source,
     /// Branch name for the modal title.
     pub branch: String,
     /// Editor command Enter launches (NEBULA_EDITOR, then the `editor`
@@ -1297,9 +1455,9 @@ pub struct GrepView {
 }
 
 impl GrepView {
-    pub fn new(root: PathBuf, branch: String, editor: String) -> Self {
+    pub fn new(source: crate::git_diff::Source, branch: String, editor: String) -> Self {
         Self {
-            root,
+            source,
             branch,
             editor,
             query: TextInput::new(),
@@ -1322,7 +1480,7 @@ impl GrepView {
             self.truncated = false;
             return;
         }
-        match crate::grep_search::search(&self.root, &self.query) {
+        match crate::grep_search::search(&self.source, &self.query) {
             Ok((hits, truncated)) => {
                 self.hits = hits;
                 self.truncated = truncated;
@@ -1636,7 +1794,7 @@ pub enum Overlay {
     Prompt(PromptDialog),
     Help,
     Settings(SettingsView),
-    Diff(DiffView),
+    Diff(Box<DiffView>),
     Palette(Palette),
     Files(FileFinder),
     Grep(GrepView),
@@ -1672,6 +1830,8 @@ pub struct WorktreeRollback {
 /// What to do when an Ack (or Error) for this req_id arrives.
 #[derive(Debug, Clone)]
 pub enum PendingIntent {
+    /// Best-effort display-only read; errors stay silent even after timeout/navigation.
+    AttachPreview,
     /// Attach the created session and focus the terminal.
     AttachCreated,
     /// ⌘D: attach the created shell in the split's right pane and move the
@@ -1695,25 +1855,30 @@ pub enum PendingIntent {
     /// The `a` palette flow picked a branch with no checkout: once the
     /// worktree's Ack lands, open the new-session picker on it.
     PickAgentOnCreatedWorktree,
-    /// A new-session keypress on a checkout-less branch row: the daemon is
-    /// checking the branch out on the primary; once the Ack lands, carry on
-    /// with the session on the primary checkout.
+    /// Continue on the acknowledged checkout, retaining the requested branch for spawn validation.
+    ResolveBranchThen {
+        project: ProjectId,
+        branch: String,
+        next: AfterCheckout,
+    },
+    /// An explicitly requested primary checkout movement.
     CheckoutPrimaryThen {
         project: ProjectId,
+        branch: String,
         next: AfterCheckout,
     },
     None,
 }
 
-/// What a branch row's new-session keypress does once its branch sits on
-/// the primary checkout.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What to do once the selected host acknowledges an execution checkout.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AfterCheckout {
     /// Just select the primary row — the branch is where the user now is.
     Land,
-    /// Open the new-session picker (agent kind) on the primary.
+    Attach(SessionRef),
+    /// Open the new-session picker on the resolved checkout.
     PickAgent,
-    /// Create and attach a shell terminal on the primary.
+    /// Create and attach a shell on the resolved checkout.
     Terminal,
     /// ⌘T row: create and attach an agent of this kind, no prompts.
     QuickAgent(AgentKind),
@@ -1884,22 +2049,6 @@ pub fn worktree_rollup(tree: &Tree, worktree_id: &WorktreeId) -> Option<AgentSta
     )
 }
 
-/// The same aggregate for a checkout-less branch row: the sessions parked
-/// on `branch` in `project` (and its twins) whose checkout has since moved
-/// to another branch.
-pub fn branch_rollup(tree: &Tree, project_id: &ProjectId, branch: &str) -> Option<AgentStatus> {
-    let projects = tree.project_family(project_id);
-    rollup(
-        tree.agents
-            .iter()
-            .filter(|a| !a.archived)
-            .filter(|a| {
-                matches!(tree.agent_home(a), SessionHome::Branch(p, b) if b == branch && projects.contains(&p))
-            })
-            .map(|a| a.status),
-    )
-}
-
 /// The same aggregate over every worktree of a project — and of its
 /// twins, whose sessions the row lists too.
 pub fn project_rollup(tree: &Tree, project_id: &ProjectId) -> Option<AgentStatus> {
@@ -1938,9 +2087,7 @@ impl ProjectRow {
     }
 }
 
-/// A session that is mid-turn or blocked on the user. These head the
-/// RECENT group and never age out of it — the whole point of the group is
-/// to keep what needs attention in view.
+/// A session that is mid-turn or blocked on the user.
 pub fn is_active_status(s: AgentStatus) -> bool {
     matches!(s, AgentStatus::Running | AgentStatus::NeedsFeedback)
 }
@@ -1972,11 +2119,29 @@ pub struct PanelEntry {
     pub base: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct ViewSource {
+    /// What git reads; a branch row's commit is pinned when the view opens.
+    pub source: crate::git_diff::Source,
+    /// The name the base and upstream lookups start from; files are read
+    /// from `source`.
+    pub branch: String,
+    /// The base the row shows (`from <base>`), the first thing a branch
+    /// row's diff compares with.
+    pub base: Option<String>,
+    /// The primary checkout's branch, a branch row's last comparison
+    /// fallback; `None` for a checkout row.
+    pub primary: Option<String>,
+    /// `None` for a branch row, which has no review marks or queue entry.
+    pub worktree: Option<WorktreeId>,
+}
+
 /// Where a session is listed: under a checkout row, or under the branch
 /// row of a branch no checkout holds any more. A session belongs to the
 /// branch it was spawned on (`Agent::branch`); a checkout switching to
-/// another branch leaves it behind on the old one.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// another branch leaves it behind on the old one once its process has
+/// stopped (see `Tree::session_home`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SessionHome {
     Worktree(WorktreeId),
     Branch(ProjectId, String),
@@ -2169,34 +2334,47 @@ impl Tree {
         vec![id.clone()]
     }
 
-    /// The row a session lives under. Its checkout's row while the
-    /// checkout still holds the session's branch (or the session predates
-    /// branch tracking); the checkout that holds that branch now, when it
-    /// moved to one; otherwise the branch's own row, chats parked there
-    /// until something checks the branch out again.
-    pub fn session_home(&self, worktree_id: &WorktreeId, branch: Option<&str>) -> SessionHome {
-        let Some(w) = self.worktrees.iter().find(|w| &w.id == worktree_id) else {
-            return SessionHome::Worktree(worktree_id.clone());
+    fn session_home(
+        &self,
+        worktree_id: &WorktreeId,
+        branch: Option<&str>,
+        alive: bool,
+    ) -> SessionHome {
+        let where_it_runs = SessionHome::Worktree(worktree_id.clone());
+        if alive {
+            return where_it_runs;
+        }
+        let Some(own) = self.worktrees.iter().find(|w| &w.id == worktree_id) else {
+            return where_it_runs;
         };
-        let Some(branch) = branch.filter(|b| *b != w.branch) else {
-            return SessionHome::Worktree(w.id.clone());
+        let Some(left_behind) = branch.filter(|b| *b != own.branch) else {
+            return where_it_runs;
         };
-        match self
+        let holder = self
             .worktrees
             .iter()
-            .find(|x| x.project_id == w.project_id && x.branch == branch)
-        {
-            Some(x) => SessionHome::Worktree(x.id.clone()),
-            None => SessionHome::Branch(w.project_id.clone(), branch.to_owned()),
+            .find(|w| w.project_id == own.project_id && w.branch == left_behind);
+        match holder {
+            Some(holder) => SessionHome::Worktree(holder.id.clone()),
+            None => SessionHome::Branch(own.project_id.clone(), left_behind.to_owned()),
         }
     }
 
+    /// The row that lists `agent`, which is not always where it executes:
+    /// a stopped agent can be listed under another checkout or a branch
+    /// row while `agent.worktree_id` still names the checkout it resumes in.
     pub fn agent_home(&self, agent: &Agent) -> SessionHome {
-        self.session_home(&agent.worktree_id, agent.branch.as_deref())
+        self.session_home(&agent.worktree_id, agent.branch.as_deref(), agent.alive)
     }
 
+    /// The row that lists `terminal`; like [`Tree::agent_home`] it can
+    /// differ from `terminal.worktree_id` once the shell has stopped.
     pub fn terminal_home(&self, terminal: &TerminalTab) -> SessionHome {
-        self.session_home(&terminal.worktree_id, terminal.branch.as_deref())
+        self.session_home(
+            &terminal.worktree_id,
+            terminal.branch.as_deref(),
+            terminal.alive,
+        )
     }
 
     /// The names of the branches in `project` (or its twins) that only
@@ -2250,7 +2428,122 @@ impl Tree {
     }
 }
 
+/// The entity tree plus a generation stamp that changes on EVERY mutable
+/// access. The memoized panel projection keys on it, so a tree write cannot
+/// forget to invalidate: `app.tree.agents.push(..)` goes through `DerefMut`
+/// like any other write. Reads (`Deref`) leave the stamp alone. Stamps are
+/// process-unique, so replacing the whole value never reuses one.
+#[derive(Debug)]
+pub struct TrackedTree {
+    tree: Tree,
+    generation: u64,
+}
+
+fn next_generation() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+impl TrackedTree {
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+impl Default for TrackedTree {
+    fn default() -> Self {
+        Tree::default().into()
+    }
+}
+
+impl From<Tree> for TrackedTree {
+    fn from(tree: Tree) -> Self {
+        Self {
+            tree,
+            generation: next_generation(),
+        }
+    }
+}
+
+impl std::ops::Deref for TrackedTree {
+    type Target = Tree;
+    fn deref(&self) -> &Tree {
+        &self.tree
+    }
+}
+
+impl std::ops::DerefMut for TrackedTree {
+    fn deref_mut(&mut self) -> &mut Tree {
+        self.generation = next_generation();
+        &mut self.tree
+    }
+}
+
+/// Everything the WORKTREES & BRANCHES projection reads besides the tree
+/// itself. Compared by value on every lookup, so none of these can go
+/// stale either. Nothing here (or in the projection) depends on the clock.
+#[derive(PartialEq)]
+struct PanelKey {
+    tree: u64,
+    sel_project: usize,
+    hide_local: bool,
+    hide_remote: bool,
+    hide_empty: bool,
+    branch_list: Option<(ProjectId, Vec<crate::branches::LocalBranch>)>,
+}
+
+/// The memoized projection: the panel rows plus the session→row index the
+/// per-row session lists are served from.
+struct PanelProjection {
+    key: PanelKey,
+    entries: Vec<PanelEntry>,
+    homes: HomeIndex,
+}
+
+/// Agents and terminals grouped by the row they are listed under, as
+/// indexes into `tree.agents` / `tree.terminals` in tree order. Sessions
+/// whose home is on a hidden host are left out, so a lookup is exactly
+/// `lists_home`.
+#[derive(Default)]
+struct HomeIndex {
+    agents: HashMap<SessionHome, Vec<usize>>,
+    terminals: HashMap<SessionHome, Vec<usize>>,
+    /// Every session's home, hidden hosts included, index-aligned with
+    /// `tree.agents` / `tree.terminals`.
+    agent_homes: Vec<SessionHome>,
+    terminal_homes: Vec<SessionHome>,
+}
+
+impl HomeIndex {
+    /// `Tree::parked_branches` off the precomputed homes: the branches in
+    /// `projects` that only sessions remember, in first-seen order.
+    fn parked_branches(&self, projects: &[ProjectId]) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        for home in self.agent_homes.iter().chain(&self.terminal_homes) {
+            if let SessionHome::Branch(p, b) = home {
+                if projects.contains(p) && !names.contains(b) {
+                    names.push(b.clone());
+                }
+            }
+        }
+        names
+    }
+}
+
 pub struct AttachedTerm {
+    /// Time the current attach started; cleared only by its Scrollback reply.
+    pub awaiting_snapshot: Option<std::time::Instant>,
+    /// Safe attach attempts in this recovery cycle, capped at three.
+    pub attach_attempts: u8,
+    /// Compact, display-only screen while a cold attach waits for replay.
+    pub attach_preview: Option<String>,
+    /// Correlation and deadline origin; never reused across attachments.
+    pub preview_request: Option<(u64, std::time::Instant)>,
+    /// Startup ends at the first visible text, not an empty replay/control sequence.
+    pub has_content: bool,
+    pub starting_label: String,
+    /// Host outage requires replacing the parser even if sequence numbers match.
+    pub fresh_snapshot: bool,
     pub sref: SessionRef,
     pub parser: vt100::Parser,
     pub exited: bool,
@@ -2287,6 +2580,13 @@ impl AttachedTerm {
     pub fn new(sref: SessionRef, cols: u16, rows: u16) -> Self {
         Self {
             sref,
+            awaiting_snapshot: Some(std::time::Instant::now()),
+            attach_attempts: 1,
+            attach_preview: None,
+            preview_request: None,
+            has_content: false,
+            starting_label: "session".into(),
+            fresh_snapshot: false,
             parser: vt100::Parser::new(rows, cols, 10_000),
             #[cfg(feature = "ghostty")]
             gh: crate::ghostty_pane::enabled_by_env()
@@ -2305,6 +2605,9 @@ impl AttachedTerm {
 
     /// Reset the parser (fresh replay is about to arrive).
     pub fn reset(&mut self) {
+        self.attach_preview = None;
+        self.preview_request = None;
+        self.has_content = false;
         self.parser = vt100::Parser::new(self.rows, self.cols, 10_000);
         #[cfg(feature = "ghostty")]
         if self.gh.is_some() {
@@ -2328,6 +2631,10 @@ impl AttachedTerm {
     /// Feed PTY bytes to the parser, invalidating screen-derived memos.
     pub fn feed(&mut self, data: &[u8]) {
         self.parser.process(data);
+        if !self.has_content && !self.parser.screen().contents().trim().is_empty() {
+            self.has_content = true;
+            self.attach_preview = None;
+        }
         #[cfg(feature = "ghostty")]
         if let Some(gh) = &mut self.gh {
             gh.feed(data);
@@ -2365,6 +2672,13 @@ pub struct UiState {
     pub worktree: Option<String>,
     pub session_agent: Option<String>,
     pub show_archived: bool,
+    #[serde(default)]
+    pub hide_local: bool,
+    #[serde(default)]
+    pub hide_remote: bool,
+    /// Hide branch and worktree rows without non-archived agents or terminals.
+    #[serde(default)]
+    pub hide_empty: bool,
     pub collapsed: bool,
     /// Panel widths (projects, worktrees); absent in older blobs. Kept as a
     /// Vec so blobs written when Sessions was still a third column (3 wide)
@@ -2456,7 +2770,7 @@ impl PointerShape {
 }
 
 pub struct App {
-    pub tree: Tree,
+    pub tree: TrackedTree,
     pub focus: Focus,
     /// Selected row in the Projects panel — indexes `project_rows()`, which
     /// interleaves projects and their dividers.
@@ -2497,6 +2811,8 @@ pub struct App {
     /// the focused panel, and whether input was locked.
     pub quick_term_restore: Option<QuickTermRestore>,
     pub conn: ConnState,
+    /// Hosts with a reported relay outage; cleared by a fresh screen.
+    pub unavailable_relays: std::collections::HashSet<String>,
     pub hits: Vec<(Rect, HitTarget)>,
     /// Inner rect of the terminal pane from the last draw.
     pub term_area: Rect,
@@ -2514,6 +2830,11 @@ pub struct App {
     pub flash: Option<String>,
     pub overlay: Option<Overlay>,
     pub show_archived: bool,
+    /// View-only filters, shared across projects. False keeps old saved states visible.
+    pub hide_local: bool,
+    pub hide_remote: bool,
+    /// Show only rows with non-archived agents or terminals when true.
+    pub hide_empty: bool,
     /// Sidebars collapsed (z) — terminal takes the full width.
     pub collapsed: bool,
     pub next_req_id: u64,
@@ -2526,6 +2847,8 @@ pub struct App {
     pub select_divider_when_seen: Option<(ProjectId, bool)>,
     /// Worktree created by us, awaiting its upsert to fix the selection.
     pub select_worktree_when_seen: Option<WorktreeId>,
+    /// Branch captured when a session picker/resolution starts, retained until spawn.
+    pub session_creation_branches: HashMap<WorktreeId, String>,
     /// Project added by `nebula open`, awaiting its upsert to land the
     /// selection on it.
     pub select_project_when_seen: Option<ProjectId>,
@@ -2544,6 +2867,8 @@ pub struct App {
     /// Last selected worktree per project — switching back to a project
     /// returns to the worktree the user left it on.
     pub last_worktree_for_project: HashMap<ProjectId, WorktreeId>,
+    /// Last selected session per project, including sessions parked on branches.
+    pub last_session_for_project: HashMap<ProjectId, SessionRef>,
     /// Last selected session per worktree — switching back to a worktree
     /// re-shows the session the user left it on.
     pub last_session_for_worktree: HashMap<WorktreeId, SessionRef>,
@@ -2609,13 +2934,6 @@ pub struct App {
     /// Running inside an ssh session (SSH_CONNECTION/SSH_TTY) — the footer
     /// colors the hostname as a remote warning.
     pub is_remote: bool,
-    /// Unpinned sessions whose status changed within this window sort into
-    /// a RECENT group (below PINNED). 0 disables the group. From config
-    /// (`recent_window`); the event loop refreshes it.
-    pub recent_window_ms: i64,
-    /// Session under the cursor as of the last draw, so the RECENT-expiry
-    /// tick can re-anchor `sel_session` after rows regroup underneath it.
-    pub drawn_session: Option<SessionRef>,
     /// Active color theme. From config (`theme`); the event loop refreshes
     /// it when the setting changes.
     pub theme: crate::theme::Theme,
@@ -2640,6 +2958,10 @@ pub struct App {
     /// the git poll (and after branch ops) — the draw path only filters
     /// this cache, it never runs git.
     pub branch_list: Option<(ProjectId, Vec<crate::branches::LocalBranch>)>,
+    /// The last branch listing of every project visited this session, so
+    /// the panel's rows keep their slots across a project switch while the
+    /// fresh listing is still a poll away.
+    pub seen_branch_lists: HashMap<ProjectId, Vec<crate::branches::LocalBranch>>,
     /// A branch listing is running off-loop; don't stack another.
     pub branch_inflight: bool,
     /// Where off-loop branch listings and `git branch` ops send their
@@ -2715,6 +3037,8 @@ pub struct App {
     /// reconnect snapshots re-run `restore_ui_state`, and the stale quit-time
     /// blob must not resurrect marks the user already cleared by visiting.
     pub unseen_restored: bool,
+    /// The memoized panel projection — see [`App::projection`].
+    panel_cache: std::cell::RefCell<Option<std::rc::Rc<PanelProjection>>>,
 }
 
 impl Default for App {
@@ -2726,7 +3050,7 @@ impl Default for App {
 impl App {
     pub fn new() -> Self {
         Self {
-            tree: Tree::default(),
+            tree: TrackedTree::default(),
             focus: Focus::Projects,
             sel_project: 0,
             sel_worktree: 0,
@@ -2741,6 +3065,7 @@ impl App {
             quick_term: false,
             quick_term_restore: None,
             conn: ConnState::Disconnected,
+            unavailable_relays: std::collections::HashSet::new(),
             hits: Vec::new(),
             term_area: Rect::default(),
             dirty: true,
@@ -2750,12 +3075,16 @@ impl App {
             flash: None,
             overlay: None,
             show_archived: false,
+            hide_local: false,
+            hide_remote: false,
+            hide_empty: false,
             collapsed: false,
             next_req_id: 1,
             pending: HashMap::new(),
             select_when_seen: None,
             select_divider_when_seen: None,
             select_worktree_when_seen: None,
+            session_creation_branches: HashMap::new(),
             select_project_when_seen: None,
             open_at: None,
             open_session: None,
@@ -2763,6 +3092,7 @@ impl App {
             select_todo_when_seen: None,
             select_link_when_seen: None,
             last_worktree_for_project: HashMap::new(),
+            last_session_for_project: HashMap::new(),
             last_session_for_worktree: HashMap::new(),
             global_sessions_scroll: 0,
             pending_prewarm: None,
@@ -2784,8 +3114,6 @@ impl App {
             body_area: Rect::default(),
             hostname: nebula_core::host::hostname(),
             is_remote: nebula_core::host::is_remote_session(),
-            recent_window_ms: crate::config::DEFAULT_RECENT_WINDOW_MS,
-            drawn_session: None,
             theme: crate::theme::Theme::default(),
             vim: None,
             vim_tx: None,
@@ -2793,6 +3121,7 @@ impl App {
             git_changes: None,
             git_inflight: false,
             branch_list: None,
+            seen_branch_lists: HashMap::new(),
             branch_inflight: false,
             branch_tx: None,
             pull_requests: HashMap::new(),
@@ -2811,6 +3140,7 @@ impl App {
             notify_queue: Vec::new(),
             unseen_finished: HashSet::new(),
             unseen_restored: false,
+            panel_cache: Default::default(),
         }
     }
 
@@ -2833,6 +3163,38 @@ impl App {
         }
     }
 
+    /// Remote host owning this session, resolved through the project tree.
+    pub fn attached_session_host(&self, session: &SessionRef) -> Option<&str> {
+        let worktree = self.worktree_of_sref(session)?;
+        let worktree = self.tree.worktrees.iter().find(|w| w.id == worktree)?;
+        self.tree
+            .projects
+            .iter()
+            .find(|p| p.id == worktree.project_id)?
+            .host
+            .as_deref()
+    }
+
+    /// Persistent recovery text for a remote pane awaiting a fresh screen.
+    pub fn relay_pane_notice(&self, term: &AttachedTerm) -> Option<String> {
+        let host = self.attached_session_host(&term.sref)?;
+        // A normal reconnect must not cover the cached frame/compact preview.
+        if (term.has_content || term.attach_preview.is_some())
+            && !self.unavailable_relays.contains(host)
+        {
+            return None;
+        }
+        let since = term.awaiting_snapshot?;
+        let state =
+            if term.attach_attempts >= 3 && since.elapsed() >= std::time::Duration::from_secs(10) {
+                "unavailable"
+            } else if self.unavailable_relays.contains(host) {
+                "reconnecting"
+            } else {
+                "connecting"
+            };
+        Some(format!("{host}: {state} — Ctrl+R to retry"))
+    }
     /// The worktree a session lives on, resolved through the tree.
     pub fn worktree_of_sref(&self, sref: &SessionRef) -> Option<WorktreeId> {
         match sref {
@@ -3085,7 +3447,8 @@ impl App {
 
     /// Panel index of worktree `id`'s row.
     pub fn worktree_row_index(&self, id: &WorktreeId) -> Option<usize> {
-        self.panel_entries()
+        self.projection()
+            .entries
             .iter()
             .position(|entry| matches!(&entry.row, PanelRow::Worktree(w) if w == id))
     }
@@ -3095,6 +3458,158 @@ impl App {
             PanelRow::Worktree(id) => self.worktree_by_id(&id),
             PanelRow::Branch(_) => None,
         }
+    }
+
+    /// The cursor's row as a view source, resolving a branch row's tip with
+    /// git. `Err` is the flash: nothing selected, a twin's branch on another
+    /// host, an unreachable repository, or a branch that no longer exists.
+    pub fn selected_view_source(&self) -> Result<ViewSource, String> {
+        let no_selection = || "no worktree selected".to_string();
+        let entry = self
+            .projection()
+            .entries
+            .get(self.sel_worktree)
+            .cloned()
+            .ok_or_else(no_selection)?;
+        let row = match entry.row {
+            PanelRow::Worktree(id) => self.worktree_view_source(&id).ok_or_else(no_selection)?,
+            PanelRow::Branch(name) => {
+                let project = self.selected_project().ok_or_else(no_selection)?;
+                if let Some(host) = self.remote_twin_host(project, &name) {
+                    return Err(format!("{name} is a branch on {host} — open it there"));
+                }
+                if let Some(msg) = crate::event_loop::checkout_unreachable(&project.repo_path) {
+                    return Err(msg);
+                }
+                ViewSource {
+                    source: crate::git_diff::Source::branch_tip(&project.repo_path, &name)?,
+                    branch: name,
+                    base: entry.base,
+                    primary: self
+                        .tree
+                        .worktrees
+                        .iter()
+                        .find(|w| w.project_id == project.id && w.is_main)
+                        .map(|w| w.branch.clone()),
+                    worktree: None,
+                }
+            }
+        };
+        if let Some(msg) = crate::event_loop::checkout_unreachable(row.source.dir()) {
+            return Err(msg);
+        }
+        Ok(row)
+    }
+
+    fn remote_twin_host(&self, project: &Project, name: &str) -> Option<String> {
+        let owner = self.branch_owner(project, name);
+        if owner == project.id {
+            return None;
+        }
+        self.tree
+            .projects
+            .iter()
+            .find(|p| p.id == owner)
+            .and_then(|p| p.host.clone())
+    }
+
+    fn branch_owner(&self, project: &Project, name: &str) -> ProjectId {
+        if self.lists_own_branch(project, name) {
+            return project.id.clone();
+        }
+        self.twin_parked_on(project, name)
+            .unwrap_or_else(|| project.id.clone())
+    }
+
+    fn lists_own_branch(&self, project: &Project, name: &str) -> bool {
+        self.project_host_visible(&project.id)
+            && self
+                .branch_listing(&project.id)
+                .is_some_and(|list| list.iter().any(|b| b.name == name))
+    }
+
+    fn twin_parked_on(&self, project: &Project, name: &str) -> Option<ProjectId> {
+        let owners: Vec<ProjectId> = self
+            .sessions_for_panel_row(&PanelRow::Branch(name.to_string()))
+            .iter()
+            .filter_map(|session| match session {
+                SessionRow::Agent(agent) => Some(self.tree.agent_home(agent)),
+                SessionRow::Terminal(terminal) => Some(self.tree.terminal_home(terminal)),
+                SessionRow::Link(_) => None,
+            })
+            .filter_map(|home| match home {
+                SessionHome::Branch(owner, _) => Some(owner),
+                SessionHome::Worktree(_) => None,
+            })
+            .collect();
+        if owners.contains(&project.id) {
+            return None;
+        }
+        self.tree
+            .projects
+            .iter()
+            .find(|p| owners.contains(&p.id))
+            .map(|p| p.id.clone())
+    }
+
+    pub fn selected_branch_target(&self) -> Option<(ProjectId, String)> {
+        let project = self.selected_project()?;
+        let name = self.selected_branch_row()?;
+        Some((self.branch_owner(project, &name), name))
+    }
+
+    pub fn parked_branch(&self, sref: &SessionRef) -> Option<(ProjectId, String)> {
+        match self.session_home_of(sref)? {
+            SessionHome::Branch(project, branch) => Some((project, branch)),
+            SessionHome::Worktree(_) => None,
+        }
+    }
+
+    pub fn parked_placeholder_branch(&self) -> Option<String> {
+        if self.quick_term {
+            return None;
+        }
+        let sref = self.selected_session_row()?.sref()?;
+        if self.term.as_ref().is_some_and(|t| t.sref == sref) {
+            return None;
+        }
+        self.parked_branch(&sref).map(|(_, branch)| branch)
+    }
+
+    fn session_home_of(&self, sref: &SessionRef) -> Option<SessionHome> {
+        match sref {
+            SessionRef::Agent(id) => self
+                .tree
+                .agents
+                .iter()
+                .find(|a| &a.id == id)
+                .map(|a| self.tree.agent_home(a)),
+            SessionRef::Terminal(id) => self
+                .tree
+                .terminals
+                .iter()
+                .find(|t| &t.id == id)
+                .map(|t| self.tree.terminal_home(t)),
+        }
+    }
+
+    fn branch_listing(&self, project: &ProjectId) -> Option<&Vec<crate::branches::LocalBranch>> {
+        match &self.branch_list {
+            Some((id, list)) if id == project => Some(list),
+            _ => self.seen_branch_lists.get(project),
+        }
+    }
+
+    /// `None` once checkout `id` has left the tree.
+    pub fn worktree_view_source(&self, id: &WorktreeId) -> Option<ViewSource> {
+        let worktree = self.worktree_by_id(id)?;
+        Some(ViewSource {
+            source: crate::git_diff::Source::Checkout(worktree.path.clone()),
+            branch: worktree.branch.clone(),
+            base: worktree.created_from.clone(),
+            primary: None,
+            worktree: Some(id.clone()),
+        })
     }
 
     /// The cached changed-file count when it belongs to the selected
@@ -3131,8 +3646,8 @@ impl App {
 
     fn session_rows_for_home(&self, home: &SessionHome, show_archived: bool) -> Vec<SessionRow> {
         let agents = self.sessions_for_home(home, show_archived);
-        let (pinned, recent, unpinned, _) = self.session_group_counts_for_home(home);
-        let active = (pinned + recent + unpinned).min(agents.len());
+        let (pinned, unpinned, _) = self.session_group_counts_for_home(home);
+        let active = (pinned + unpinned).min(agents.len());
         let mut rows: Vec<SessionRow> = agents[..active]
             .iter()
             .cloned()
@@ -3145,12 +3660,6 @@ impl App {
         );
         rows.extend(self.links_for_home(home).into_iter().map(SessionRow::Link));
         rows.extend(agents[active..].iter().cloned().map(SessionRow::Agent));
-        // Tabs and worktree sublists share this composite row funnel. Hoist
-        // active agents over every other row, then retain the existing
-        // pinned/recent/terminal/link/archived order for everything else.
-        rows.sort_by_key(
-            |row| !matches!(row, SessionRow::Agent(agent) if is_active_status(agent.status)),
-        );
         // The ⌘D split's session is a normal row/tab like any other — it's
         // an independent session that happens to render in the right pane.
         // `attach` guards the one hazard: selecting its row focuses the
@@ -3159,10 +3668,10 @@ impl App {
     }
 
     /// Park a parser for a session we are leaving, so the next visit can
-    /// resume it from `end_seq`. Exited sessions are never parked — their
-    /// screen is final and their PTY is gone.
+    /// resume it from `end_seq`. Exited sessions and not-yet-attached preview
+    /// requests are never parked: neither has resumable live parser state.
     pub fn park_term(&mut self, term: AttachedTerm) {
-        if term.exited {
+        if term.exited || term.preview_request.is_some() {
             self.drop_cached_term(&term.sref);
             return;
         }
@@ -3289,10 +3798,8 @@ impl App {
     }
 
     fn terminals_for_home(&self, home: &SessionHome) -> Vec<TerminalTab> {
-        self.tree
-            .terminals
-            .iter()
-            .filter(|t| self.lists_home(home, &self.tree.terminal_home(t)))
+        self.terminals_listed(&self.projection().homes, home)
+            .into_iter()
             .cloned()
             .collect()
     }
@@ -3300,7 +3807,14 @@ impl App {
     /// Does the row for `home` list a session whose own home is
     /// `session_home`? A checkout row lists only its own host's sessions;
     /// a checkout-less branch row lists parked sessions across twins.
+    ///
+    /// The per-agent reference definition. The panels answer it through
+    /// the projection's `HomeIndex`; tests hold the two to the same answer.
+    #[cfg(test)]
     fn lists_home(&self, home: &SessionHome, session_home: &SessionHome) -> bool {
+        if !self.home_host_visible(session_home) {
+            return false;
+        }
         match (home, session_home) {
             (SessionHome::Worktree(row), SessionHome::Worktree(w)) => {
                 self.worktree_family(row).contains(w)
@@ -3309,6 +3823,29 @@ impl App {
                 name == b && self.tree.project_family(project).contains(p)
             }
             _ => false,
+        }
+    }
+
+    pub fn project_host_visible(&self, id: &ProjectId) -> bool {
+        self.tree
+            .projects
+            .iter()
+            .find(|p| &p.id == id)
+            .is_some_and(|p| {
+                if p.host.is_some() {
+                    !self.hide_remote
+                } else {
+                    !self.hide_local
+                }
+            })
+    }
+
+    pub fn home_host_visible(&self, home: &SessionHome) -> bool {
+        match home {
+            SessionHome::Worktree(id) => self
+                .worktree_by_id(id)
+                .is_some_and(|w| self.project_host_visible(&w.project_id)),
+            SessionHome::Branch(id, _) => self.project_host_visible(id),
         }
     }
 
@@ -3329,22 +3866,179 @@ impl App {
         }
     }
 
-    /// Every row of the WORKTREES & BRANCHES panel, in draw order —
-    /// `sel_worktree` indexes this list. The pinned checkouts come first
-    /// (nested among themselves), then the unpinned checkouts and the
-    /// checkout-less branch rows as ONE lineage tree: a row whose recorded
-    /// base is another row in the group moves directly after that parent
-    /// (after the parent's earlier children — chains and multiple children
-    /// both nest). The primary checkout nests too — the branch it holds
-    /// stays under the branch it was cut from, so a `nebula switch` on the
-    /// primary keeps the tree intact. A parent in the OTHER pin group is
-    /// never torn out of it: the child stays a top-level row of its own
-    /// group. Siblings keep the running-first stable order for checkouts
-    /// and the cached listing's order (newest commit first) for branches.
-    /// Branch rows also cover branches only sessions remember — chats
-    /// parked on a branch whose checkout moved on. Depth is capped at
-    /// `WORKTREE_NEST_MAX_DEPTH` so the indent stays sane on narrow panels.
+    /// Every panel row in draw order: primary checkouts, pinned worktrees,
+    /// then unpinned worktrees and branches nested by lineage. Primary rows
+    /// stay outside lineage so switching their branch never moves the checkout.
+    /// `sel_worktree` indexes this list; empty rows can be hidden with `hide_empty`.
     pub fn panel_entries(&self) -> Vec<PanelEntry> {
+        self.projection().entries.clone()
+    }
+
+    /// The memoized panel projection. Every helper that needs the panel
+    /// rows or a row's sessions reads this, so one redraw (and one idle
+    /// loop pass) costs at most one rebuild — and none at all while the
+    /// inputs in [`PanelKey`] hold still.
+    fn projection(&self) -> std::rc::Rc<PanelProjection> {
+        let listing = self.selected_project().and_then(|p| {
+            self.branch_list
+                .as_ref()
+                .filter(|(id, _)| id == &p.id)
+                .map(|(_, list)| (&p.id, list))
+                .or_else(|| self.seen_branch_lists.get(&p.id).map(|list| (&p.id, list)))
+        });
+        if let Some(cached) = self.panel_cache.borrow().as_ref() {
+            let key = &cached.key;
+            if key.tree == self.tree.generation()
+                && key.sel_project == self.sel_project
+                && key.hide_local == self.hide_local
+                && key.hide_remote == self.hide_remote
+                && key.hide_empty == self.hide_empty
+                && key.branch_list.as_ref().map(|(id, list)| (id, list)) == listing
+            {
+                return cached.clone();
+            }
+        }
+        let key = PanelKey {
+            tree: self.tree.generation(),
+            sel_project: self.sel_project,
+            hide_local: self.hide_local,
+            hide_remote: self.hide_remote,
+            hide_empty: self.hide_empty,
+            branch_list: listing.map(|(id, list)| (id.clone(), list.clone())),
+        };
+        let homes = self.build_home_index();
+        let mut entries = self.build_panel_entries(&homes);
+        if self.hide_empty {
+            let project = self.selected_project().map(|p| p.id.clone());
+            let mut retained_depths = Vec::new();
+            entries.retain_mut(|entry| {
+                retained_depths.truncate(entry.depth);
+                let home = match &entry.row {
+                    PanelRow::Worktree(id) => SessionHome::Worktree(id.clone()),
+                    PanelRow::Branch(name) => {
+                        SessionHome::Branch(project.clone().unwrap(), name.clone())
+                    }
+                };
+                let keep = self
+                    .agents_listed(&homes, &home)
+                    .iter()
+                    .any(|a| !a.archived)
+                    || !self.terminals_listed(&homes, &home).is_empty();
+                let depth = retained_depths.iter().filter(|&&kept| kept).count();
+                retained_depths.push(keep);
+                entry.depth = depth;
+                keep
+            });
+        }
+        let projection = std::rc::Rc::new(PanelProjection {
+            key,
+            entries,
+            homes,
+        });
+        *self.panel_cache.borrow_mut() = Some(projection.clone());
+        projection
+    }
+
+    /// One pass over the tree resolving every session's home — what
+    /// `Tree::session_home` + `lists_home` answer per agent, per row.
+    fn build_home_index(&self) -> HomeIndex {
+        let tree = &*self.tree;
+        let mut host_visible: HashMap<&ProjectId, bool> = HashMap::new();
+        for p in &tree.projects {
+            host_visible.entry(&p.id).or_insert(if p.host.is_some() {
+                !self.hide_remote
+            } else {
+                !self.hide_local
+            });
+        }
+        // First match wins, like the linear `find`s these maps replace.
+        let mut by_id: HashMap<&WorktreeId, &Worktree> = HashMap::new();
+        for w in &tree.worktrees {
+            by_id.entry(&w.id).or_insert(w);
+        }
+        let visible = |home: &SessionHome| {
+            let project = match home {
+                SessionHome::Worktree(id) => by_id.get(id).map(|w| &w.project_id),
+                SessionHome::Branch(id, _) => Some(id),
+            };
+            project
+                .and_then(|id| host_visible.get(id))
+                .copied()
+                .unwrap_or(false)
+        };
+        let mut index = HomeIndex::default();
+        for (i, a) in tree.agents.iter().enumerate() {
+            let home = tree.agent_home(a);
+            index.agent_homes.push(home.clone());
+            if visible(&home) {
+                index.agents.entry(home).or_default().push(i);
+            }
+        }
+        for (i, t) in tree.terminals.iter().enumerate() {
+            let home = tree.terminal_home(t);
+            index.terminal_homes.push(home.clone());
+            if visible(&home) {
+                index.terminals.entry(home).or_default().push(i);
+            }
+        }
+        index
+    }
+
+    /// The homes a row lists: a checkout row its own, a checkout-less
+    /// branch row that branch across the project's twins (`lists_home`).
+    fn listed_homes(&self, home: &SessionHome) -> Vec<SessionHome> {
+        match home {
+            SessionHome::Worktree(id) => self
+                .worktree_family(id)
+                .into_iter()
+                .map(SessionHome::Worktree)
+                .collect(),
+            SessionHome::Branch(project, name) => self
+                .tree
+                .project_family(project)
+                .into_iter()
+                .map(|p| SessionHome::Branch(p, name.clone()))
+                .collect(),
+        }
+    }
+
+    /// The agents row `home` lists, in tree order.
+    fn agents_listed(&self, homes: &HomeIndex, home: &SessionHome) -> Vec<&Agent> {
+        let mut indexes: Vec<usize> = self
+            .listed_homes(home)
+            .iter()
+            .filter_map(|h| homes.agents.get(h))
+            .flatten()
+            .copied()
+            .collect();
+        indexes.sort_unstable();
+        indexes.dedup();
+        indexes
+            .into_iter()
+            .filter_map(|i| self.tree.agents.get(i))
+            .collect()
+    }
+
+    /// The terminals row `home` lists, in tree order.
+    fn terminals_listed(&self, homes: &HomeIndex, home: &SessionHome) -> Vec<&TerminalTab> {
+        let mut indexes: Vec<usize> = self
+            .listed_homes(home)
+            .iter()
+            .filter_map(|h| homes.terminals.get(h))
+            .flatten()
+            .copied()
+            .collect();
+        indexes.sort_unstable();
+        indexes.dedup();
+        indexes
+            .into_iter()
+            .filter_map(|i| self.tree.terminals.get(i))
+            .collect()
+    }
+
+    fn build_panel_entries(&self, homes: &HomeIndex) -> Vec<PanelEntry> {
+        #[cfg(test)]
+        PANEL_PROJECTIONS.with(|count| count.set(count.get() + 1));
         let Some(project) = self.selected_project() else {
             return vec![];
         };
@@ -3352,33 +4046,41 @@ impl App {
             .tree
             .worktrees
             .iter()
-            .filter(|w| w.project_id == project.id && w.pinned)
+            .filter(|w| {
+                w.project_id == project.id
+                    && w.pinned
+                    && !w.is_main
+                    && self.project_host_visible(&w.project_id)
+            })
             .collect();
-        let mut unpinned: Vec<&Worktree> = self
+        let unpinned: Vec<&Worktree> = self
             .tree
             .worktrees
             .iter()
-            .filter(|w| w.project_id == project.id && !w.pinned)
+            .filter(|w| {
+                w.project_id == project.id
+                    && !w.pinned
+                    && !w.is_main
+                    && self.project_host_visible(&w.project_id)
+            })
             .collect();
-        let running_first = |rows: &mut [&Worktree]| {
-            let is_running = |worktree: &&Worktree| {
-                self.sessions_for_home(&SessionHome::Worktree(worktree.id.clone()), false)
-                    .iter()
-                    .any(|agent| is_active_status(agent.status))
-            };
-            let primary = rows.iter().position(|worktree| worktree.is_main);
-            let (before, after) = match primary {
-                Some(index) => {
-                    let (before, primary_and_after) = rows.split_at_mut(index);
-                    (before, &mut primary_and_after[1..])
-                }
-                None => (rows, &mut [][..]),
-            };
-            before.sort_by_key(|worktree| !is_running(worktree));
-            after.sort_by_key(|worktree| !is_running(worktree));
-        };
-        running_first(&mut pinned);
-        running_first(&mut unpinned);
+        // Keep the last known branch list while another project's poll is
+        // in flight. Primary checkouts have fixed leading slots; other rows
+        // keep branch creation order regardless of session activity.
+        let listing = self.branch_listing(&project.id);
+        let births: HashMap<&str, (u8, i64)> = listing
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .map(|(i, b)| {
+                (
+                    b.name.as_str(),
+                    b.created_at.map_or((1, i as i64), |at| (0, at)),
+                )
+            })
+            .collect();
+        let slot = |name: &str| births.get(name).copied().unwrap_or((2, 0));
+        pinned.sort_by_key(|w| slot(&w.branch));
         let mut out: Vec<PanelEntry> = nest_by_lineage(pinned)
             .into_iter()
             .map(|(w, depth)| PanelEntry {
@@ -3387,6 +4089,26 @@ impl App {
                 base: w.created_from.clone(),
             })
             .collect();
+
+        let primary: Vec<PanelEntry> = self
+            .tree
+            .worktrees
+            .iter()
+            .filter(|w| {
+                w.is_main
+                    && self
+                        .tree
+                        .project_family(&project.id)
+                        .contains(&w.project_id)
+                    && self.project_host_visible(&w.project_id)
+            })
+            .map(|w| PanelEntry {
+                row: PanelRow::Worktree(w.id.clone()),
+                depth: 0,
+                base: w.created_from.clone(),
+            })
+            .collect();
+        out.splice(0..0, primary);
 
         // Every twin checkout retains its host-owned row, even on the same
         // branch as a local checkout. Branch names are not checkout identities.
@@ -3413,7 +4135,9 @@ impl App {
             .map(|w| w.branch.as_str())
             .collect();
         for twin in self.tree.projects.iter().filter(|q| {
-            q.id != project.id && self.tree.absorbed_by_twin(q) && q.name == project.name
+            q.id != project.id
+                && self.tree.absorbed_by_twin(q)
+                && q.name == project.name
                 && q.workspace_id == project.workspace_id
         }) {
             let twin_only: Vec<&Worktree> = self
@@ -3422,6 +4146,8 @@ impl App {
                 .iter()
                 .filter(|w| {
                     w.project_id == twin.id
+                        && !w.is_main
+                        && self.project_host_visible(&w.project_id)
                 })
                 .collect();
             for w in twin_only {
@@ -3438,8 +4164,8 @@ impl App {
         // remember, which the listing may lack (deleted, or the cache is
         // a poll behind).
         let mut branches: Vec<(&str, Option<String>)> = Vec::new();
-        if let Some((cached_for, list)) = &self.branch_list {
-            if cached_for == &project.id {
+        if let Some(list) = listing {
+            if self.project_host_visible(&project.id) {
                 branches.extend(
                     list.iter()
                         .filter(|b| !checked_out.contains(&b.name.as_str()))
@@ -3447,9 +4173,14 @@ impl App {
                 );
             }
         }
-        let parked = self.tree.parked_branches(&project.id);
+        let parked = homes.parked_branches(&self.tree.project_family(&project.id));
         for name in &parked {
-            if !checked_out.contains(&name.as_str()) && !branches.iter().any(|(n, _)| n == name) {
+            let home = SessionHome::Branch(project.id.clone(), name.clone());
+            // Parked rows can aggregate both hosts: retain the row if any
+            // visible host still has a session, not just its project's host.
+            let has_visible_sessions = !self.agents_listed(homes, &home).is_empty()
+                || !self.terminals_listed(homes, &home).is_empty();
+            if has_visible_sessions && !branches.iter().any(|(n, _)| n == name) {
                 branches.push((name.as_str(), None));
             }
         }
@@ -3459,6 +4190,7 @@ impl App {
             name,
             base,
         }));
+        nodes.sort_by_key(|n| slot(n.name));
         let parent: Vec<Option<usize>> = nodes
             .iter()
             .enumerate()
@@ -3532,15 +4264,15 @@ impl App {
 
     /// Every row `sel_worktree` can land on.
     pub fn worktree_panel_len(&self) -> usize {
-        self.panel_entries().len()
+        self.projection().entries.len()
     }
 
     /// The panel row under the cursor.
     pub fn selected_panel_row(&self) -> Option<PanelRow> {
-        self.panel_entries()
-            .into_iter()
-            .nth(self.sel_worktree)
-            .map(|entry| entry.row)
+        self.projection()
+            .entries
+            .get(self.sel_worktree)
+            .map(|entry| entry.row.clone())
     }
 
     /// The branch row under the cursor, when `sel_worktree` sits on one
@@ -3554,7 +4286,8 @@ impl App {
 
     /// Panel index of the branch row named `branch`.
     pub fn branch_row_index(&self, branch: &str) -> Option<usize> {
-        self.panel_entries()
+        self.projection()
+            .entries
             .iter()
             .position(|entry| matches!(&entry.row, PanelRow::Branch(name) if name == branch))
     }
@@ -3571,20 +4304,7 @@ impl App {
     /// The home of a session as the panel lists it, and the panel index
     /// of that row (None when the selected project doesn't list it).
     pub fn row_index_for_session(&self, sref: &SessionRef) -> Option<usize> {
-        let home = match sref {
-            SessionRef::Agent(id) => self
-                .tree
-                .agents
-                .iter()
-                .find(|a| &a.id == id)
-                .map(|a| self.tree.agent_home(a))?,
-            SessionRef::Terminal(id) => self
-                .tree
-                .terminals
-                .iter()
-                .find(|t| &t.id == id)
-                .map(|t| self.tree.terminal_home(t))?,
-        };
+        let home = self.session_home_of(sref)?;
         match home {
             // A remote session's own checkout may be hidden behind its
             // local twin; land on the row that actually lists it.
@@ -3597,61 +4317,36 @@ impl App {
 
     /// The compact session sub-list of panel row `index`.
     pub fn panel_row_sessions(&self, index: usize) -> Vec<SessionRow> {
+        self.projection()
+            .entries
+            .get(index)
+            .map(|entry| self.sessions_for_panel_row(&entry.row))
+            .unwrap_or_default()
+    }
+
+    /// Rendering already holds the projected rows; don't rebuild the entire
+    /// tree just to recover the identity of each row again.
+    pub fn sessions_for_panel_row(&self, row: &PanelRow) -> Vec<SessionRow> {
         let Some(project) = self.selected_project() else {
             return vec![];
         };
-        match self.panel_entries().into_iter().nth(index).map(|e| e.row) {
-            Some(PanelRow::Worktree(id)) => self.worktree_session_rows(&id),
-            Some(PanelRow::Branch(name)) => {
-                self.session_rows_for_home(&SessionHome::Branch(project.id.clone(), name), false)
-            }
-            None => vec![],
+        match row {
+            PanelRow::Worktree(id) => self.worktree_session_rows(id),
+            PanelRow::Branch(name) => self.session_rows_for_home(
+                &SessionHome::Branch(project.id.clone(), name.clone()),
+                false,
+            ),
         }
     }
 
     /// (pinned, unpinned) worktree counts for the selected project.
     pub fn worktree_group_counts(&self) -> (usize, usize) {
-        let Some(project) = self.selected_project() else {
-            return (0, 0);
-        };
-        let pinned = self
-            .tree
-            .worktrees
-            .iter()
-            .filter(|w| w.project_id == project.id && w.pinned)
-            .count();
-        let unpinned = self
-            .tree
-            .worktrees
-            .iter()
-            .filter(|w| w.project_id == project.id && !w.pinned)
-            .count();
+        let visible = self.visible_worktrees();
+        let pinned = visible.iter().filter(|w| w.pinned && !w.is_main).count();
+        let unpinned = visible.iter().filter(|w| !w.pinned && !w.is_main).count();
         (pinned, unpinned)
     }
 
-    /// An unpinned, unarchived agent sorts into the RECENT group when it is
-    /// still working (running / needs-feedback, however long that has taken)
-    /// or when its status changed within the configured window. Pinned
-    /// agents never join it — PINNED always stays on top, and `off` still
-    /// collapses the group entirely.
-    pub fn is_recent(&self, a: &Agent) -> bool {
-        !a.pinned
-            && !a.archived
-            && self.recent_window_ms > 0
-            && (is_active_status(a.status)
-                || (a.status_changed_at > 0
-                    && now_ms().saturating_sub(a.status_changed_at) < self.recent_window_ms))
-    }
-
-    /// Session rows for the selected worktree: pinned agents, then RECENT
-    /// (whatever is working or changed status within the window), then the
-    /// remaining unpinned, then (when shown) archived agents.
-    ///
-    /// Every group is ordered by last interaction, newest first, so the
-    /// session you just ran surfaces at the top of its group and the list
-    /// reads as a history of what you have been doing. Working sessions
-    /// count as interacting now, which keeps them heading RECENT however
-    /// long the turn has taken.
     /// Every live (non-archived) session across every project of the open
     /// workspace, most recent activity first — working sessions lead.
     /// Feeds the Projects panel's all-projects SESSIONS section.
@@ -3661,9 +4356,9 @@ impl App {
         let mut rest: Vec<Agent> = Vec::new();
         for a in self.tree.agents.iter().filter(|a| {
             !a.archived
-                && self
-                    .project_of_agent(a)
-                    .is_some_and(|p| self.tree.in_active_workspace(p))
+                && self.project_of_agent(a).is_some_and(|p| {
+                    self.tree.in_active_workspace(p) && self.project_host_visible(&p.id)
+                })
         }) {
             if matches!(a.status, AgentStatus::Running | AgentStatus::NeedsFeedback) {
                 working.push(a.clone());
@@ -3691,33 +4386,28 @@ impl App {
         self.sessions_for_home(&home, self.show_archived)
     }
 
+    /// A row's sessions: pinned agents, then the rest, then (when shown)
+    /// archived agents. Most recent activity first within each live group:
+    /// working sessions lead, then whichever finished last. Never-run
+    /// sessions keep tree order at the bottom (stable sort).
     fn sessions_for_home(&self, home: &SessionHome, show_archived: bool) -> Vec<Agent> {
-        let now = now_ms();
-        let listed = |a: &Agent| self.lists_home(home, &self.tree.agent_home(a));
-        // Stable throughout, so ties — never-run rows especially, which all
-        // stamp 0 — keep tree order instead of shuffling between frames.
-        let collect = |keep: &dyn Fn(&Agent) -> bool| {
-            let mut group: Vec<Agent> = self
-                .tree
-                .agents
+        let projection = self.projection();
+        let listed = self.agents_listed(&projection.homes, home);
+        let collect = |keep: &dyn Fn(&Agent) -> bool| -> Vec<Agent> {
+            listed
                 .iter()
-                .filter(|a| listed(a) && keep(a))
-                .cloned()
-                .collect();
-            group.sort_by_key(|a| recency_key(a, now));
-            group
+                .filter(|a| keep(a))
+                .map(|a| (*a).clone())
+                .collect()
         };
+        let now = now_ms();
         let mut rows = collect(&|a| !a.archived && a.pinned);
-        rows.extend(collect(&|a| self.is_recent(a)));
-        rows.extend(collect(&|a| !a.archived && !a.pinned && !self.is_recent(a)));
+        rows.sort_by_key(|a| recency_key(a, now));
+        let mut unpinned = collect(&|a| !a.archived && !a.pinned);
+        unpinned.sort_by_key(|a| recency_key(a, now));
+        rows.extend(unpinned);
         if show_archived {
-            let mut archived: Vec<Agent> = self
-                .tree
-                .agents
-                .iter()
-                .filter(|a| listed(a) && a.archived)
-                .cloned()
-                .collect();
+            let mut archived = collect(&|a| a.archived);
             // Most recently archived first; pre-`archived_at` rows (stamp 0)
             // keep tree order at the bottom (stable sort).
             archived.sort_by_key(|a| std::cmp::Reverse(a.archived_at));
@@ -3726,62 +4416,21 @@ impl App {
         rows
     }
 
-    /// (pinned, recent, unpinned, archived-total) for the selected row.
-    pub fn session_group_counts(&self) -> (usize, usize, usize, usize) {
+    /// (pinned, unpinned, archived-total) for the selected row.
+    pub fn session_group_counts(&self) -> (usize, usize, usize) {
         let Some(home) = self.selected_home() else {
-            return (0, 0, 0, 0);
+            return (0, 0, 0);
         };
         self.session_group_counts_for_home(&home)
     }
 
-    fn session_group_counts_for_home(&self, home: &SessionHome) -> (usize, usize, usize, usize) {
-        let listed = |a: &Agent| self.lists_home(home, &self.tree.agent_home(a));
-        let pinned = self
-            .tree
-            .agents
-            .iter()
-            .filter(|a| listed(a) && !a.archived && a.pinned)
-            .count();
-        let recent = self
-            .tree
-            .agents
-            .iter()
-            .filter(|a| listed(a) && self.is_recent(a))
-            .count();
-        let unpinned = self
-            .tree
-            .agents
-            .iter()
-            .filter(|a| listed(a) && !a.archived && !a.pinned && !self.is_recent(a))
-            .count();
-        let archived = self
-            .tree
-            .agents
-            .iter()
-            .filter(|a| listed(a) && a.archived)
-            .count();
-        (pinned, recent, unpinned, archived)
-    }
-
-    /// Delay until the next visible RECENT session ages out of the window,
-    /// so the event loop can wake up and regroup. None when nothing is
-    /// pending expiry. Working sessions are excluded — they hold their place
-    /// in RECENT past the window, so their deadline is already behind us and
-    /// would otherwise wake the loop on every pass.
-    pub fn next_recent_expiry(&self) -> Option<std::time::Duration> {
-        let home = self.selected_home()?;
-        let now = now_ms();
-        self.tree
-            .agents
-            .iter()
-            .filter(|a| {
-                self.lists_home(&home, &self.tree.agent_home(a))
-                    && self.is_recent(a)
-                    && !is_active_status(a.status)
-            })
-            .map(|a| (a.status_changed_at + self.recent_window_ms - now).max(0) as u64)
-            .min()
-            .map(std::time::Duration::from_millis)
+    fn session_group_counts_for_home(&self, home: &SessionHome) -> (usize, usize, usize) {
+        let projection = self.projection();
+        let listed = self.agents_listed(&projection.homes, home);
+        let pinned = listed.iter().filter(|a| !a.archived && a.pinned).count();
+        let unpinned = listed.iter().filter(|a| !a.archived && !a.pinned).count();
+        let archived = listed.iter().filter(|a| a.archived).count();
+        (pinned, unpinned, archived)
     }
 
     /// Delay until the pending worktree-sessions prewarm is due, so the
@@ -3852,7 +4501,13 @@ impl App {
     /// project: the chats parked on that branch.
     pub fn branch_rollup(&self, branch: &str) -> Option<AgentStatus> {
         let project = self.selected_project()?;
-        branch_rollup(&self.tree, &project.id, branch)
+        let home = SessionHome::Branch(project.id.clone(), branch.to_owned());
+        rollup(
+            self.agents_listed(&self.projection().homes, &home)
+                .into_iter()
+                .filter(|a| !a.archived)
+                .map(|a| a.status),
+        )
     }
 
     pub fn project_rollup(&self, project_id: &ProjectId) -> Option<AgentStatus> {
@@ -3891,15 +4546,31 @@ mod tests {
         assert!(rows.contains(&PanelRow::Worktree(local.clone())));
         assert!(rows.contains(&PanelRow::Worktree(remote_id.clone())));
         assert_eq!(app.listed_worktree_for(&remote_id), Some(remote_id.clone()));
-        app.tree.agents.push(agent_on("local-agent", &local, Some("main")));
-        app.tree.agents.push(agent_on("remote-agent", &remote_id, Some("main")));
+        app.tree
+            .agents
+            .push(agent_on("local-agent", &local, Some("main")));
+        app.tree
+            .agents
+            .push(agent_on("remote-agent", &remote_id, Some("main")));
         let entries = app.panel_entries();
-        let local_row = entries.iter().position(|e| e.row == PanelRow::Worktree(local.clone())).unwrap();
-        let remote_row = entries.iter().position(|e| e.row == PanelRow::Worktree(remote_id.clone())).unwrap();
+        let local_row = entries
+            .iter()
+            .position(|e| e.row == PanelRow::Worktree(local.clone()))
+            .unwrap();
+        let remote_row = entries
+            .iter()
+            .position(|e| e.row == PanelRow::Worktree(remote_id.clone()))
+            .unwrap();
         assert_eq!(app.panel_row_sessions(local_row).len(), 1);
         assert_eq!(app.panel_row_sessions(remote_row).len(), 1);
-        assert_eq!(app.row_index_for_session(&SessionRef::Agent(AgentId("remote-agent".into()))), Some(remote_row));
-        assert_eq!(app.row_index_for_session(&SessionRef::Agent(AgentId("local-agent".into()))), Some(local_row));
+        assert_eq!(
+            app.row_index_for_session(&SessionRef::Agent(AgentId("remote-agent".into()))),
+            Some(remote_row)
+        );
+        assert_eq!(
+            app.row_index_for_session(&SessionRef::Agent(AgentId("local-agent".into()))),
+            Some(local_row)
+        );
     }
 
     #[test]
@@ -3921,12 +4592,19 @@ mod tests {
         app.tree.projects.push(project);
         app.tree.worktrees.push(remote);
         app.branch_list = Some((project_id, vec!["develop".into(), "feature/landing".into()]));
-        let rows: Vec<_> = app.panel_entries().into_iter().map(|entry| (entry.row, entry.depth)).collect();
-        assert_eq!(rows, vec![
-            (PanelRow::Worktree(WorktreeId("remote-checkout".into())), 0),
-            (PanelRow::Branch("develop".into()), 0),
-            (PanelRow::Worktree(local), 1),
-        ]);
+        let rows: Vec<_> = app
+            .panel_entries()
+            .into_iter()
+            .map(|entry| (entry.row, entry.depth))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (PanelRow::Worktree(local), 0),
+                (PanelRow::Worktree(WorktreeId("remote-checkout".into())), 0),
+                (PanelRow::Branch("develop".into()), 0),
+            ]
+        );
     }
 
     // ---- worktree links ----
@@ -3959,6 +4637,15 @@ mod tests {
             sort_order: 0,
         });
         (app, worktree_id)
+    }
+
+    /// A listed branch with a known creation time and no recorded base.
+    fn born(name: &str, at: i64) -> crate::branches::LocalBranch {
+        crate::branches::LocalBranch {
+            name: name.into(),
+            created_from: None,
+            created_at: Some(at),
+        }
     }
 
     fn link(id: &str, worktree: &WorktreeId, url: &str, sort_order: i64) -> Link {
@@ -4057,11 +4744,12 @@ mod tests {
             alive: true,
             branch: None,
         });
+        let template = app.tree.agents[0].clone();
         app.tree.agents.push(Agent {
             id: AgentId("a2".into()),
             name: "old".into(),
             archived: true,
-            ..app.tree.agents[0].clone()
+            ..template
         });
         app.tree.terminals.push(TerminalTab {
             id: TerminalId("t1".into()),
@@ -4085,12 +4773,13 @@ mod tests {
     }
 
     #[test]
-    fn session_tabs_and_worktree_sublists_put_running_rows_first_stably() {
+    fn session_tabs_and_worktree_sublists_order_by_recency() {
         let (mut app, worktree) = link_app();
         for (id, status, pinned) in [
+            ("blocked", AgentStatus::NeedsFeedback, false),
+            ("idle", AgentStatus::Fresh, false),
             ("pinned-idle", AgentStatus::Fresh, true),
             ("running", AgentStatus::Running, false),
-            ("blocked", AgentStatus::NeedsFeedback, false),
         ] {
             app.tree.agents.push(Agent {
                 id: AgentId(id.into()),
@@ -4136,9 +4825,10 @@ mod tests {
             .map(|row| row.name().to_string())
             .collect();
         let expected = [
-            "running",
-            "blocked",
             "pinned-idle",
+            "blocked",
+            "running",
+            "idle",
             "shell",
             "https://a.dev/spec",
         ];
@@ -4171,10 +4861,11 @@ mod tests {
     }
 
     #[test]
-    fn visible_worktrees_put_running_work_first_within_existing_groups() {
+    fn visible_worktrees_hold_their_branch_slot_whatever_runs() {
         let (mut app, _main) = link_app();
         let project = app.tree.projects[0].id.clone();
         let mut add_worktree = |id: &str, branch: &str, pinned: bool| {
+            let sort_order = app.tree.worktrees.len() as i64;
             app.tree.worktrees.push(Worktree {
                 id: WorktreeId(id.into()),
                 project_id: project.clone(),
@@ -4184,20 +4875,45 @@ mod tests {
                 created_from: None,
                 pinned,
                 for_branch: false,
-                sort_order: app.tree.worktrees.len() as i64,
+                sort_order,
             });
         };
-        add_worktree("p-idle", "pinned-idle", true);
-        add_worktree("p-run", "pinned-running", true);
-        add_worktree("idle", "idle", false);
-        add_worktree("run", "running", false);
+        add_worktree("p-old", "pinned-old", true);
+        add_worktree("p-new", "pinned-new", true);
+        add_worktree("old", "old", false);
+        add_worktree("new", "new", false);
+        let branches = |app: &App| -> Vec<String> {
+            app.visible_worktrees()
+                .iter()
+                .map(|w| w.branch.clone())
+                .collect()
+        };
+        // No listing yet: tree order, pinned group first.
+        assert_eq!(
+            branches(&app),
+            ["main", "pinned-old", "pinned-new", "old", "new"]
+        );
 
-        let add_agent = |app: &mut App, id: &str, worktree: &str, status: AgentStatus| {
+        // Creation times decide, not the tree: "new" was born before "old".
+        app.branch_list = Some((
+            project.clone(),
+            vec![
+                born("main", 1),
+                born("new", 2),
+                born("old", 3),
+                born("pinned-new", 4),
+                born("pinned-old", 5),
+            ],
+        ));
+        let fixed = ["main", "pinned-new", "pinned-old", "new", "old"];
+        assert_eq!(branches(&app), fixed);
+
+        for worktree in ["p-old", "old"] {
             app.tree.agents.push(Agent {
-                id: AgentId(id.into()),
+                id: AgentId(format!("{worktree}-agent")),
                 worktree_id: WorktreeId(worktree.into()),
-                name: id.into(),
-                status,
+                name: worktree.into(),
+                status: AgentStatus::Running,
                 archived: false,
                 archived_at: 0,
                 pinned: false,
@@ -4210,28 +4926,134 @@ mod tests {
                 alive: true,
                 branch: None,
             });
-        };
-        add_agent(&mut app, "p-idle-agent", "p-idle", AgentStatus::Fresh);
-        add_agent(&mut app, "p-run-agent", "p-run", AgentStatus::Running);
-        add_agent(&mut app, "idle-agent", "idle", AgentStatus::Fresh);
-        add_agent(&mut app, "run-agent", "run", AgentStatus::Running);
+        }
+        assert_eq!(branches(&app), fixed, "running sessions move no row");
 
-        let branches: Vec<&str> = app
-            .visible_worktrees()
-            .iter()
-            .map(|worktree| worktree.branch.as_str())
-            .collect();
+        // A switch away and back before the next poll lands: the listing
+        // seen last time keeps the slots.
+        let list = app.branch_list.take().unwrap().1;
+        app.seen_branch_lists.insert(project, list);
+        assert_eq!(branches(&app), fixed);
+    }
+
+    #[test]
+    fn checkout_on_the_primary_keeps_the_checkout_first() {
+        let (mut app, primary) = link_app();
+        let project = app.tree.projects[0].id.clone();
+        lineage_worktree(&mut app, "wt", "feat-wt", Some("main"), false);
+        let based = |name: &str, base: &str, at: i64| crate::branches::LocalBranch {
+            created_from: Some(base.into()),
+            ..born(name, at)
+        };
+        app.branch_list = Some((
+            project,
+            vec![
+                born("main", 100),
+                based("feat-x", "main", 200),
+                based("feat-wt", "main", 300),
+                born("zeta", 400),
+            ],
+        ));
+        app.tree
+            .agents
+            .push(agent_on("on-main", &primary, Some("main")));
+        let rows = |app: &App| -> Vec<(String, usize)> {
+            app.panel_entries()
+                .iter()
+                .map(|e| match &e.row {
+                    PanelRow::Worktree(id) => (id.0.clone(), e.depth),
+                    PanelRow::Branch(name) => (format!("branch:{name}"), e.depth),
+                })
+                .collect()
+        };
+        let names = |rows: Vec<SessionRow>| -> Vec<String> {
+            rows.iter().map(|r| r.name().to_string()).collect()
+        };
         assert_eq!(
-            branches,
-            ["pinned-running", "pinned-idle", "main", "running", "idle"],
-            "running-first stays inside pinned/primary placement constraints"
+            rows(&app),
+            [
+                ("w1".into(), 0),
+                ("branch:feat-x".into(), 0),
+                ("wt".into(), 0),
+                ("branch:zeta".into(), 0)
+            ]
         );
+        assert_eq!(names(app.panel_row_sessions(0)), ["on-main"]);
+
+        // The daemon's view after `CheckoutPrimary feat-x`.
+        let w1 = app
+            .tree
+            .worktrees
+            .iter_mut()
+            .find(|w| w.id == primary)
+            .unwrap();
+        w1.branch = "feat-x".into();
+        w1.created_from = Some("main".into());
+        assert_eq!(
+            rows(&app),
+            [
+                ("w1".into(), 0),
+                ("branch:main".into(), 0),
+                ("wt".into(), 1),
+                ("branch:zeta".into(), 0)
+            ],
+            "primary keeps its leading slot"
+        );
+        assert_eq!(
+            names(app.panel_row_sessions(1)),
+            ["on-main"],
+            "a stopped session stays with its branch"
+        );
+        assert!(app.panel_row_sessions(0).is_empty());
     }
 
     /// The panel's branch rows come straight from the cache, minus every
     /// branch that already has a checkout, and only for the project the
     /// cache was read for — a selection change can't show another repo's
     /// branches.
+    #[test]
+    fn cached_project_branches_stay_visible_while_another_project_is_polled() {
+        let (mut app, _) = link_app();
+        let project = app.tree.projects[0].id.clone();
+        let list = vec![born("main", 1), born("empty", 2)];
+        app.branch_list = Some((project.clone(), list.clone()));
+        app.seen_branch_lists.insert(project.clone(), list);
+        let before = app.panel_entries();
+        app.branch_list = Some((ProjectId("another".into()), vec!["foreign".into()]));
+        assert_eq!(app.panel_entries(), before);
+        app.seen_branch_lists
+            .get_mut(&project)
+            .unwrap()
+            .push(born("new", 3));
+        assert_eq!(app.branch_rows(), ["empty", "new"]);
+    }
+
+    #[test]
+    fn session_filter_keeps_terminal_only_rows_and_flattens_hidden_parents() {
+        let (mut app, main) = link_app();
+        lineage_worktree(&mut app, "empty-parent", "base", None, true);
+        lineage_worktree(&mut app, "shell-child", "shells", Some("base"), true);
+        app.tree.terminals.push(TerminalTab {
+            id: TerminalId("shell".into()),
+            worktree_id: WorktreeId("shell-child".into()),
+            name: "shell".into(),
+            sort_order: 0,
+            alive: true,
+            busy: false,
+            status: None,
+            status_changed_at: 0,
+            branch: None,
+        });
+        let mut archived = agent_on("archived", &main, None);
+        archived.archived = true;
+        app.tree.agents.push(archived);
+        app.hide_empty = true;
+        assert_eq!(branches_with_depth(&app), [("shells".into(), 0)]);
+        assert_eq!(app.worktree_group_counts(), (1, 0));
+        app.tree.terminals.clear();
+        assert!(app.panel_entries().is_empty());
+    }
+
     #[test]
     fn branch_rows_list_only_checkoutless_branches_of_the_selected_project() {
         let (mut app, _main) = link_app();
@@ -4256,7 +5078,7 @@ mod tests {
     fn selected_branch_row_indexes_past_the_worktree_rows() {
         let (mut app, _main) = link_app();
         let project = app.tree.projects[0].id.clone();
-        app.branch_list = Some((project, vec!["feature".into()]));
+        app.branch_list = Some((project, vec![born("main", 1), born("feature", 2)]));
         assert_eq!(app.worktree_panel_len(), 2);
         app.sel_worktree = 0;
         assert!(app.selected_branch_row().is_none());
@@ -4289,99 +5111,413 @@ mod tests {
         }
     }
 
-    /// A checkout switching branches leaves its chats where they were: a
-    /// session records the branch it was spawned on and is listed under
-    /// that branch's row — a plain branch row when nothing checks the
-    /// branch out any more (even one the branch cache doesn't list). A
-    /// session with no recorded branch follows the checkout.
+    fn projections() -> usize {
+        PANEL_PROJECTIONS.with(|count| count.get())
+    }
+
+    /// Local + findl twin, a second checkout, sessions on their checkout,
+    /// on a branch another checkout now holds, and parked on branches
+    /// nothing holds (one on each host), plus terminals.
+    fn twin_app() -> (App, WorktreeId, WorktreeId) {
+        let (mut app, local) = link_app();
+        let mut project = app.tree.projects[0].clone();
+        project.id = ProjectId("remote-project".into());
+        project.host = Some("findl".into());
+        let mut remote = app.tree.worktrees[0].clone();
+        remote.id = WorktreeId("remote-checkout".into());
+        remote.project_id = project.id.clone();
+        let remote_id = remote.id.clone();
+        let mut feature = app.tree.worktrees[0].clone();
+        feature.id = WorktreeId("w-feature".into());
+        feature.branch = "feature".into();
+        feature.is_main = false;
+        app.tree.projects.push(project);
+        app.tree.worktrees.push(remote);
+        app.tree.worktrees.push(feature);
+        for (id, worktree, branch) in [
+            ("on-main", &local, None),
+            ("remote-parked", &remote_id, Some("gone")),
+            ("moved-to-feature", &local, Some("feature")),
+            ("local-parked", &local, Some("gone")),
+            ("other-parked", &local, Some("older")),
+            ("on-remote", &remote_id, Some("main")),
+            ("orphan", &WorktreeId("deleted".into()), None),
+        ] {
+            app.tree.agents.push(agent_on(id, worktree, branch));
+        }
+        for (id, worktree, branch) in [
+            ("t-main", &local, None),
+            ("t-parked", &remote_id, Some("shells")),
+        ] {
+            app.tree.terminals.push(TerminalTab {
+                id: TerminalId(id.into()),
+                worktree_id: worktree.clone(),
+                name: id.into(),
+                sort_order: 0,
+                alive: true,
+                branch: branch.map(str::to_owned),
+                busy: false,
+                status: None,
+                status_changed_at: 0,
+            });
+        }
+        (app, local, remote_id)
+    }
+
+    /// The index the panels read is an optimisation of `lists_home` +
+    /// `Tree::session_home`, never a second opinion: every row lists the
+    /// same sessions, in tree order, under every host filter.
     #[test]
-    fn sessions_stay_on_their_branch_when_the_primary_switches() {
-        let (mut app, primary) = link_app();
+    fn home_index_lists_exactly_what_the_per_session_rule_lists() {
+        let (mut app, _, _) = twin_app();
+        let mut homes: Vec<SessionHome> = app
+            .tree
+            .worktrees
+            .iter()
+            .map(|w| SessionHome::Worktree(w.id.clone()))
+            .collect();
+        for project in &app.tree.projects {
+            for branch in ["gone", "older", "shells", "main", "nope"] {
+                homes.push(SessionHome::Branch(project.id.clone(), branch.into()));
+            }
+        }
+        for (hide_local, hide_remote) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            app.hide_local = hide_local;
+            app.hide_remote = hide_remote;
+            let projection = app.projection();
+            for home in &homes {
+                let expected: Vec<&AgentId> = app
+                    .tree
+                    .agents
+                    .iter()
+                    .filter(|a| app.lists_home(home, &app.tree.agent_home(a)))
+                    .map(|a| &a.id)
+                    .collect();
+                let got: Vec<&AgentId> = app
+                    .agents_listed(&projection.homes, home)
+                    .iter()
+                    .map(|a| &a.id)
+                    .collect();
+                assert_eq!(
+                    got, expected,
+                    "agents of {home:?} ({hide_local}/{hide_remote})"
+                );
+                let expected: Vec<&TerminalId> = app
+                    .tree
+                    .terminals
+                    .iter()
+                    .filter(|t| app.lists_home(home, &app.tree.terminal_home(t)))
+                    .map(|t| &t.id)
+                    .collect();
+                let got: Vec<&TerminalId> = app
+                    .terminals_listed(&projection.homes, home)
+                    .iter()
+                    .map(|t| &t.id)
+                    .collect();
+                assert_eq!(
+                    got, expected,
+                    "terminals of {home:?} ({hide_local}/{hide_remote})"
+                );
+            }
+            for project in &app.tree.projects {
+                assert_eq!(
+                    projection
+                        .homes
+                        .parked_branches(&app.tree.project_family(&project.id)),
+                    app.tree.parked_branches(&project.id),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn panel_projection_is_built_once_and_shared_by_every_helper() {
+        let (app, _, _) = twin_app();
+        let before = projections();
+        for _ in 0..3 {
+            app.panel_entries();
+            app.selected_home();
+            app.selected_worktree();
+            app.visible_session_rows();
+            app.selected_session_row();
+            app.session_group_counts();
+            app.visible_terminals();
+            app.git_changes_stale();
+            app.worktree_row_index(&WorktreeId("w-feature".into()));
+            for entry in app.panel_entries() {
+                app.sessions_for_panel_row(&entry.row);
+            }
+        }
+        assert_eq!(projections() - before, 1);
+    }
+
+    fn row_names(app: &App) -> Vec<String> {
+        app.panel_entries()
+            .iter()
+            .map(|e| match &e.row {
+                PanelRow::Worktree(id) => id.0.clone(),
+                PanelRow::Branch(name) => format!("branch:{name}"),
+            })
+            .collect()
+    }
+
+    fn session_names(app: &App) -> Vec<String> {
+        app.visible_session_rows()
+            .iter()
+            .map(|row| row.name().to_string())
+            .collect()
+    }
+
+    /// Each input of the projection, changed on its own with the panel
+    /// already drawn once, shows up in the very next read.
+    #[test]
+    fn panel_projection_follows_every_input() {
+        let (mut app, local, remote) = twin_app();
+        assert_eq!(
+            row_names(&app),
+            [
+                "w1",
+                "remote-checkout",
+                "w-feature",
+                "branch:gone",
+                "branch:older"
+            ]
+        );
+        assert_eq!(session_names(&app), ["on-main", "t-main"]);
+        assert_eq!(sessions_under(&app, "w-feature"), ["moved-to-feature"]);
+        assert_eq!(
+            sessions_under(&app, "branch:gone"),
+            ["remote-parked", "local-parked"]
+        );
+
+        // Tree upsert: a new session, then a status change in place.
+        app.tree.agents.push(agent_on("new", &local, None));
+        assert_eq!(session_names(&app), ["on-main", "new", "t-main"]);
         app.tree
             .agents
-            .push(agent_on("parked", &primary, Some("dada")));
+            .iter_mut()
+            .find(|a| a.name == "new")
+            .unwrap()
+            .status = AgentStatus::Running;
+        assert_eq!(
+            session_names(&app),
+            ["new", "on-main", "t-main"],
+            "a working session leads"
+        );
+        // Tree removal.
+        app.tree.agents.retain(|a| a.name != "new");
+        assert_eq!(session_names(&app), ["on-main", "t-main"]);
+        app.tree.agents.retain(|a| a.name != "other-parked");
+        assert!(!row_names(&app).contains(&"branch:older".to_string()));
+        app.tree
+            .worktrees
+            .iter_mut()
+            .find(|w| w.id.0 == "w-feature")
+            .unwrap()
+            .branch = "gone".into();
+        assert_eq!(
+            row_names(&app),
+            [
+                "w1",
+                "remote-checkout",
+                "w-feature",
+                "branch:gone",
+                "branch:feature"
+            ]
+        );
+        assert_eq!(sessions_under(&app, "w-feature"), ["local-parked"]);
+        assert_eq!(sessions_under(&app, "branch:gone"), ["remote-parked"]);
+        assert_eq!(sessions_under(&app, "branch:feature"), ["moved-to-feature"]);
+
+        // Selection move.
+        app.sel_worktree = app.worktree_row_index(&remote).unwrap();
+        assert_eq!(
+            app.selected_home(),
+            Some(SessionHome::Worktree(remote.clone()))
+        );
+        assert_eq!(session_names(&app), ["on-remote", "t-parked"]);
+        assert_eq!(app.selected_worktree().map(|w| &w.id), Some(&remote));
+        app.sel_worktree = 0;
+
+        // show_archived.
         app.tree
             .agents
-            .push(agent_on("current", &primary, Some("main")));
-        app.tree.agents.push(agent_on("legacy", &primary, None));
-        app.tree.terminals.push(TerminalTab {
-            id: TerminalId("t1".into()),
-            worktree_id: primary.clone(),
-            name: "shell".into(),
+            .iter_mut()
+            .find(|a| a.name == "on-main")
+            .unwrap()
+            .archived = true;
+        assert_eq!(session_names(&app), ["t-main"]);
+        app.show_archived = true;
+        assert_eq!(session_names(&app), ["t-main", "on-main"]);
+        assert_eq!(
+            app.worktree_session_rows(&local).len(),
+            1,
+            "sublists never show archived"
+        );
+
+        app.hide_remote = true;
+        assert_eq!(row_names(&app), ["w1", "w-feature", "branch:feature"]);
+        app.hide_remote = false;
+        app.hide_local = true;
+        assert_eq!(row_names(&app), ["remote-checkout", "branch:gone"]);
+        app.hide_local = false;
+        assert!(row_names(&app).starts_with(&["w1".into(), "remote-checkout".into()]));
+
+        // The cached branch listing, set and then edited in place.
+        app.branch_list = Some((
+            ProjectId("p1".into()),
+            vec![crate::branches::LocalBranch {
+                name: "topic".into(),
+                created_from: None,
+                created_at: None,
+            }],
+        ));
+        assert!(row_names(&app).contains(&"branch:topic".to_string()));
+        app.branch_list.as_mut().unwrap().1[0].name = "renamed".into();
+        assert!(row_names(&app).contains(&"branch:renamed".to_string()));
+
+        // Hidden projects and the project selection.
+        let mut other = app.tree.projects[0].clone();
+        other.id = ProjectId("p2".into());
+        other.name = "other".into();
+        let mut checkout = app.tree.worktrees[0].clone();
+        checkout.id = WorktreeId("w-other".into());
+        checkout.project_id = other.id.clone();
+        app.tree.projects.push(other);
+        app.tree.worktrees.push(checkout);
+        assert!(row_names(&app).contains(&"w1".to_string()));
+        app.sel_project = 1;
+        assert_eq!(row_names(&app), ["w-other"]);
+        app.sel_project = 0;
+        assert!(row_names(&app).contains(&"w1".to_string()));
+        app.tree.hidden_projects.insert(ProjectId("p1".into()));
+        assert_eq!(row_names(&app), ["w-other"], "p2 is now row 0");
+        app.tree.hidden_projects.clear();
+        assert!(row_names(&app).contains(&"w1".to_string()));
+    }
+
+    /// Reads never invalidate: only a mutable access to the tree moves the
+    /// generation, and every mutable access does.
+    #[test]
+    fn tree_generation_moves_on_writes_only() {
+        let (mut app, _, _) = twin_app();
+        let generation = app.tree.generation();
+        let _ = (
+            app.tree.agents.len(),
+            app.tree.parked_branches(&ProjectId("p1".into())),
+        );
+        let _ = Palette::new(&app.tree, false, false);
+        assert_eq!(app.tree.generation(), generation);
+        app.tree.agents[0].pinned = true;
+        assert_ne!(app.tree.generation(), generation);
+    }
+
+    fn terminal_on(id: &str, worktree: &WorktreeId, branch: Option<&str>) -> TerminalTab {
+        TerminalTab {
+            id: TerminalId(id.into()),
+            worktree_id: worktree.clone(),
+            name: id.into(),
             sort_order: 0,
             alive: false,
             busy: false,
             status: None,
             status_changed_at: 0,
-            branch: Some("dada".into()),
-        });
+            branch: branch.map(str::to_owned),
+        }
+    }
 
-        let names = |rows: Vec<SessionRow>| -> Vec<String> {
-            rows.iter()
-                .map(|r| match r {
-                    SessionRow::Agent(a) => a.name.clone(),
-                    SessionRow::Terminal(t) => t.name.clone(),
-                    SessionRow::Link(l) => l.label(),
-                })
-                .collect()
-        };
-        assert_eq!(
-            app.panel_entries(),
-            [
-                PanelEntry {
-                    row: PanelRow::Worktree(primary.clone()),
-                    depth: 0,
-                    base: None
-                },
-                PanelEntry {
-                    row: PanelRow::Branch("dada".into()),
-                    depth: 0,
-                    base: None
-                },
-            ],
-            "the parked branch gets a row without a cache entry"
-        );
-        assert_eq!(names(app.panel_row_sessions(0)), ["current", "legacy"]);
-        assert_eq!(names(app.panel_row_sessions(1)), ["parked", "shell"]);
-        app.sel_worktree = 1;
-        assert_eq!(app.selected_branch_row().as_deref(), Some("dada"));
-        assert_eq!(names(app.visible_session_rows()), ["parked", "shell"]);
-        assert_eq!(
-            app.row_index_for_session(&SessionRef::Agent(AgentId("parked".into()))),
-            Some(1)
-        );
-        assert_eq!(
-            app.row_index_for_session(&SessionRef::Terminal(TerminalId("t1".into()))),
-            Some(1)
-        );
-        assert_eq!(app.branch_rollup("dada"), Some(AgentStatus::Finished));
+    fn sessions_under(app: &App, row: &str) -> Vec<String> {
+        app.panel_entries()
+            .iter()
+            .filter(|e| match &e.row {
+                PanelRow::Worktree(id) => id.0 == row,
+                PanelRow::Branch(name) => format!("branch:{name}") == row,
+            })
+            .flat_map(|e| app.sessions_for_panel_row(&e.row))
+            .map(|s| s.name().to_string())
+            .collect()
+    }
 
-        // The primary switches onto `dada` (cut from main): the parked
-        // chats come back under it, the ones on main park on main's row,
-        // and the primary nests under main — the tree survives the switch.
-        app.tree.worktrees[0].branch = "dada".into();
-        app.tree.worktrees[0].created_from = Some("main".into());
-        assert_eq!(
-            app.panel_entries(),
-            [
-                PanelEntry {
-                    row: PanelRow::Branch("main".into()),
-                    depth: 0,
-                    base: None
-                },
-                PanelEntry {
-                    row: PanelRow::Worktree(primary.clone()),
-                    depth: 1,
-                    base: Some("main".into())
-                },
-            ]
-        );
-        assert_eq!(names(app.panel_row_sessions(0)), ["current"]);
-        assert_eq!(
-            names(app.panel_row_sessions(1)),
-            ["parked", "legacy", "shell"]
-        );
-        assert_eq!(app.worktree_rollup(&primary), Some(AgentStatus::Finished));
+    fn linked_checkout(app: &mut App, id: &str, branch: &str) {
+        let mut linked = app.tree.worktrees[0].clone();
+        linked.id = WorktreeId(id.into());
+        linked.path = format!("/tmp/{id}").into();
+        linked.branch = branch.into();
+        linked.is_main = false;
+        app.tree.worktrees.push(linked);
+    }
+
+    #[test]
+    fn a_stopped_session_is_listed_under_its_branch_row_once_primary_moves_on() {
+        let (mut app, primary) = link_app();
+        app.tree
+            .agents
+            .push(agent_on("agent", &primary, Some("feature")));
+        app.tree
+            .terminals
+            .push(terminal_on("shell", &primary, Some("feature")));
+        assert_eq!(row_names(&app), ["w1", "branch:feature"]);
+        assert_eq!(sessions_under(&app, "branch:feature"), ["agent", "shell"]);
+        assert_eq!(sessions_under(&app, "w1"), [] as [&str; 0]);
+
+        app.tree.worktrees[0].branch = "feature".into();
+        assert_eq!(row_names(&app), ["w1"]);
+        assert_eq!(sessions_under(&app, "w1"), ["agent", "shell"]);
+    }
+
+    #[test]
+    fn a_branch_row_rolls_up_only_the_sessions_it_lists() {
+        let (mut app, _, _) = twin_app();
+        app.tree
+            .agents
+            .iter_mut()
+            .find(|a| a.name == "remote-parked")
+            .unwrap()
+            .status = AgentStatus::NeedsFeedback;
+        assert_eq!(app.branch_rollup("gone"), Some(AgentStatus::NeedsFeedback));
+
+        app.hide_remote = true;
+        assert_eq!(sessions_under(&app, "branch:gone"), ["local-parked"]);
+        assert_eq!(app.branch_rollup("gone"), Some(AgentStatus::Finished));
+
+        app.tree.agents.retain(|a| a.name != "local-parked");
+        assert_eq!(app.branch_rollup("gone"), None);
+    }
+
+    #[test]
+    fn a_live_session_stays_under_the_checkout_its_process_runs_in() {
+        let (mut app, primary) = link_app();
+        linked_checkout(&mut app, "w-feature", "feature");
+        let mut agent = agent_on("agent", &primary, Some("feature"));
+        agent.alive = true;
+        app.tree.agents.push(agent);
+        let mut shell = terminal_on("shell", &primary, Some("feature"));
+        shell.alive = true;
+        app.tree.terminals.push(shell);
+        assert_eq!(sessions_under(&app, "w1"), ["agent", "shell"]);
+        assert_eq!(sessions_under(&app, "w-feature"), [] as [&str; 0]);
+
+        app.tree.worktrees.pop();
+        assert_eq!(row_names(&app), ["w1"]);
+        assert_eq!(sessions_under(&app, "w1"), ["agent", "shell"]);
+    }
+
+    #[test]
+    fn a_stopped_session_is_listed_under_the_linked_checkout_holding_its_branch() {
+        let (mut app, primary) = link_app();
+        linked_checkout(&mut app, "w-feature", "feature");
+        app.tree
+            .agents
+            .push(agent_on("agent", &primary, Some("feature")));
+        app.tree
+            .terminals
+            .push(terminal_on("shell", &primary, Some("feature")));
+        app.tree.agents.push(agent_on("legacy", &primary, None));
+        assert_eq!(row_names(&app), ["w1", "w-feature"]);
+        assert_eq!(sessions_under(&app, "w-feature"), ["agent", "shell"]);
+        assert_eq!(sessions_under(&app, "w1"), ["legacy"]);
     }
 
     /// Branch rows nest by their recorded creation base like worktrees do:
@@ -4395,10 +5531,12 @@ mod tests {
         let branch = |name: &str, base: Option<&str>| crate::branches::LocalBranch {
             name: name.into(),
             created_from: base.map(str::to_owned),
+            created_at: None,
         };
         app.branch_list = Some((
             project,
             vec![
+                born("main", 1),
                 branch("feat-a", Some("main")),
                 branch("feat-b", None),
                 branch("feat-b-sub", Some("feat-b")),
@@ -4410,9 +5548,8 @@ mod tests {
         assert_eq!(
             app.branch_rows_with_depth(),
             [
-                // base is checked out on the primary: nests under that
-                // row (one tree across checkouts and branches)
-                ("feat-a".into(), 1, Some("main".into())),
+                // Primary is outside lineage; its children stay flat.
+                ("feat-a".into(), 0, Some("main".into())),
                 ("feat-b".into(), 0, None),
                 ("feat-b-sub".into(), 1, Some("feat-b".into())),
                 ("feat-b-sub-sub".into(), 2, Some("feat-b-sub".into())),
@@ -4437,6 +5574,7 @@ mod tests {
         pinned: bool,
     ) {
         let project = app.tree.projects[0].id.clone();
+        let sort_order = app.tree.worktrees.len() as i64;
         app.tree.worktrees.push(Worktree {
             id: WorktreeId(id.into()),
             project_id: project,
@@ -4446,7 +5584,7 @@ mod tests {
             created_from: created_from.map(str::to_owned),
             pinned,
             for_branch: false,
-            sort_order: app.tree.worktrees.len() as i64,
+            sort_order,
         });
     }
 
@@ -4458,8 +5596,8 @@ mod tests {
     }
 
     /// Lineage nesting: children follow their parent (chains included),
-    /// siblings keep the running-first order, and a worktree whose base
-    /// branch has no visible checkout stays a flat row.
+    /// siblings keep their order even when one of them runs, and a worktree
+    /// whose base branch has no visible checkout stays a flat row.
     #[test]
     fn worktrees_nest_under_the_branch_they_were_created_from() {
         let (mut app, _main) = link_app();
@@ -4489,12 +5627,12 @@ mod tests {
             branches_with_depth(&app),
             [
                 ("main".into(), 0),
-                ("feat-c".into(), 1),
-                ("feat-a".into(), 1),
-                ("feat-b".into(), 2),
+                ("feat-a".into(), 0),
+                ("feat-b".into(), 1),
+                ("feat-c".into(), 0),
                 ("orphan".into(), 0),
             ],
-            "children trail their parent, running sibling first, orphan flat"
+            "children trail their parent, the running one keeps its place, orphan flat"
         );
     }
 
@@ -4508,7 +5646,7 @@ mod tests {
 
         assert_eq!(
             branches_with_depth(&app),
-            [("base".into(), 0), ("main".into(), 0), ("leaf".into(), 0)],
+            [("main".into(), 0), ("base".into(), 0), ("leaf".into(), 0)],
             "pinned parent keeps its group, unpinned child stays flat"
         );
     }
@@ -4614,7 +5752,12 @@ mod tests {
                 xy: ['M', ' '],
             })
             .to_vec();
-        let mut v = DiffView::new("/nonexistent-review".into(), "main".into(), files, true);
+        let mut v = DiffView::new(
+            crate::git_diff::Source::Checkout("/nonexistent-review".into()),
+            "main".into(),
+            files,
+            true,
+        );
         let order = |v: &DiffView| -> Vec<String> {
             v.matches
                 .iter()
