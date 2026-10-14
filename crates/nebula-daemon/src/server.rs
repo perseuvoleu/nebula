@@ -468,6 +468,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     project,
                     branch,
                     mover,
+                    stop_busy,
                 } => {
                     let daemon = daemon.clone();
                     let out_tx = out_tx.clone();
@@ -476,7 +477,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                             &out_tx,
                             req_id,
                             daemon
-                                .checkout_primary(&project, &branch, mover.as_ref())
+                                .checkout_primary(&project, &branch, mover.as_ref(), stop_busy)
                                 .await
                                 .map(|_| None),
                         )

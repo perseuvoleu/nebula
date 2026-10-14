@@ -549,6 +549,18 @@ pub(crate) async fn subscribe_snapshot(
     Vec<nebula_core::Worktree>,
     Vec<nebula_core::Agent>,
 )> {
+    let (projects, worktrees, agents, _) = subscribe_snapshot_with_terminals(conn).await?;
+    Ok((projects, worktrees, agents))
+}
+
+async fn subscribe_snapshot_with_terminals(
+    conn: &mut Connection,
+) -> Result<(
+    Vec<nebula_core::Project>,
+    Vec<nebula_core::Worktree>,
+    Vec<nebula_core::Agent>,
+    Vec<nebula_core::TerminalTab>,
+)> {
     write_frame(&mut conn.stream, &ClientRequest::Subscribe).await?;
     loop {
         match read_frame::<ServerEvent, _>(&mut conn.stream).await? {
@@ -556,8 +568,9 @@ pub(crate) async fn subscribe_snapshot(
                 projects,
                 worktrees,
                 agents,
+                terminals,
                 ..
-            }) => return Ok((projects, worktrees, agents)),
+            }) => return Ok((projects, worktrees, agents, terminals)),
             Some(_) => continue,
             None => bail!("daemon closed the connection before the snapshot"),
         }
@@ -745,6 +758,7 @@ pub async fn switch(
     from: Option<String>,
     worktree: bool,
     project_flag: Option<String>,
+    stop_busy: bool,
 ) -> Result<()> {
     let branch = branch.trim().to_string();
     if branch.is_empty() {
@@ -774,23 +788,10 @@ pub async fn switch(
     // Host paths must never be interpreted as paths on this CLI's machine.
     // CheckoutPrimary resolves/fetches remote branches on their owning daemon.
     let pre_existing = local && git_branch_exists(&project.repo_path, &branch);
-    // The shell running this command: a terminal tab (`term:<id>`) or an
-    // agent session. It may move itself only when no other live session
-    // depends on primary; stopped sessions retain their resume expectations.
-    let own_env = std::env::var("NEBULA_AGENT_ID").ok().filter(|_| local);
-    let terminal = own_env
-        .as_deref()
-        .and_then(|v| v.strip_prefix("term:").map(str::to_owned))
-        .filter(|id| !id.is_empty());
-    let mover = match (&terminal, &own_env) {
-        (Some(id), _) => Some(nebula_core::SessionRef::Terminal(nebula_core::TerminalId(
-            id.clone(),
-        ))),
-        (None, Some(id)) => agents
-            .iter()
-            .find(|a| a.id.as_str() == id)
-            .map(|a| nebula_core::SessionRef::Agent(a.id.clone())),
-        (None, None) => None,
+    let mover = calling_session_ref(&agents).filter(|_| local);
+    let terminal = match &mover {
+        Some(nebula_core::SessionRef::Terminal(id)) => Some(id.0.clone()),
+        _ => None,
     };
     let (path, created, checked_out) = match existing.filter(|_| worktree) {
         Some(w) => (Some(w.path.display().to_string()), false, false),
@@ -817,11 +818,14 @@ pub async fn switch(
                     project: project.id.clone(),
                     branch: branch.clone(),
                     mover: mover.clone(),
+                    stop_busy,
                 },
             )
             .await?;
             let mut upserts = Vec::new();
-            await_ack(&mut conn, req_id, &mut upserts).await?;
+            await_ack(&mut conn, req_id, &mut upserts)
+                .await
+                .map_err(|e| with_busy_hint(e, RERUN_WITH_STOP_BUSY))?;
             (
                 Some(primary.path.display().to_string()),
                 local && !pre_existing,
@@ -1064,15 +1068,58 @@ pub(crate) fn resolve_worktree<'a>(
     }
 }
 
+fn calling_session_ref(agents: &[nebula_core::Agent]) -> Option<nebula_core::SessionRef> {
+    let own = std::env::var("NEBULA_AGENT_ID").ok()?;
+    match own.strip_prefix("term:") {
+        Some(id) if !id.is_empty() => Some(nebula_core::SessionRef::Terminal(
+            nebula_core::TerminalId(id.to_owned()),
+        )),
+        Some(_) => None,
+        None => agents
+            .iter()
+            .find(|a| a.id.as_str() == own)
+            .map(|a| nebula_core::SessionRef::Agent(a.id.clone())),
+    }
+}
+
+fn switch_first_hint(project: &nebula_core::Project, branch: &str) -> String {
+    let selector = match &project.host {
+        Some(host) => format!("{}@{host}", project.name),
+        None => project.name.clone(),
+    };
+    format!(
+        "run `nebula switch {} --project {} --stop-busy` first, then retry",
+        nebula_core::remote::ssh_quote(branch),
+        nebula_core::remote::ssh_quote(&selector)
+    )
+}
+
+const RERUN_WITH_STOP_BUSY: &str = "rerun with --stop-busy to stop them and switch";
+
+fn with_busy_hint(err: anyhow::Error, hint: &str) -> anyhow::Error {
+    match err.to_string() {
+        m if m.starts_with(nebula_core::BUSY_SESSIONS_REFUSAL) => anyhow::anyhow!("{m}; {hint}"),
+        _ => err,
+    }
+}
+
 /// `nebula worktree checkout <branch>` explicitly switches primary. Refused
-/// while another live session depends on it or the branch has another checkout.
-pub async fn worktree_checkout(branch: String, project_flag: Option<String>) -> Result<()> {
+/// while other live sessions run on primary unless `stop_busy` confirms
+/// stopping them, while primary has uncommitted changes or an untracked file
+/// the branch would overwrite, or while the branch has another checkout. A
+/// local caller whose session sits on primary moves along with it.
+pub async fn worktree_checkout(
+    branch: String,
+    project_flag: Option<String>,
+    stop_busy: bool,
+) -> Result<()> {
     let sock = paths::socket_path();
     let Ok(stream) = try_connect(&sock).await else {
         bail!("no nebula daemon is running");
     };
     let mut conn = handshake(stream).await?;
-    let (projects, worktrees, agents) = subscribe_snapshot(&mut conn).await?;
+    let (projects, worktrees, agents, terminals) =
+        subscribe_snapshot_with_terminals(&mut conn).await?;
     let project = resolve_project(&projects, &worktrees, &agents, project_flag.as_deref())?;
     // The caller's own checkout is the one about to be removed: refuse
     // rather than saw off the branch this session sits on.
@@ -1091,12 +1138,29 @@ pub async fn worktree_checkout(branch: String, project_flag: Option<String>) -> 
             req_id,
             project: project.id.clone(),
             branch: branch.clone(),
-            mover: None,
+            mover: calling_session_ref(&agents).filter(|caller| {
+                let home = match caller {
+                    nebula_core::SessionRef::Agent(id) => {
+                        agents.iter().find(|a| &a.id == id).map(|a| &a.worktree_id)
+                    }
+                    nebula_core::SessionRef::Terminal(id) => terminals
+                        .iter()
+                        .find(|t| &t.id == id)
+                        .map(|t| &t.worktree_id),
+                };
+                worktrees
+                    .iter()
+                    .any(|w| Some(&w.id) == home && w.is_main && w.project_id == project.id)
+                    && project.host.is_none()
+            }),
+            stop_busy,
         },
     )
     .await?;
     let mut upserts = Vec::new();
-    await_ack(&mut conn, req_id, &mut upserts).await?;
+    await_ack(&mut conn, req_id, &mut upserts)
+        .await
+        .map_err(|e| with_busy_hint(e, RERUN_WITH_STOP_BUSY))?;
     let primary = worktrees
         .iter()
         .find(|w| w.project_id == project.id && w.is_main)
@@ -1539,7 +1603,9 @@ pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
                 )
                 .await?;
                 let mut upserts = Vec::new();
-                let created = await_ack(&mut conn, 2, &mut upserts).await?;
+                let created = await_ack(&mut conn, 2, &mut upserts)
+                    .await
+                    .map_err(|e| with_busy_hint(e, &switch_first_hint(&project, sel)))?;
                 let Some(nebula_core::EntityId::Worktree(id)) = created else {
                     bail!("host did not resolve a branch checkout");
                 };
@@ -2212,6 +2278,30 @@ pub async fn run_todo(op: TodoOp) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_switch_first_hint_names_the_resolved_project_and_host() {
+        let project = |name: &str, host: Option<&str>| nebula_core::Project {
+            workspace_id: Default::default(),
+            id: nebula_core::ProjectId("p".into()),
+            name: name.into(),
+            repo_path: "/srv/app".into(),
+            sort_order: 0,
+            divider_after: false,
+            divider_before: false,
+            divider_label: None,
+            divider_before_label: None,
+            host: host.map(str::to_owned),
+        };
+        assert_eq!(
+            switch_first_hint(&project("nebula", Some("findl")), "feature"),
+            "run `nebula switch 'feature' --project 'nebula@findl' --stop-busy` first, then retry"
+        );
+        assert_eq!(
+            switch_first_hint(&project("my app", None), "it's"),
+            "run `nebula switch 'it'\\''s' --project 'my app' --stop-busy` first, then retry"
+        );
+    }
 
     /// Delegating with `--prompt` and no `--name` gets a session named
     /// after the task, not `agent-N` — the name is what the user searches

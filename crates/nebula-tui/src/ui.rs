@@ -338,7 +338,19 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
         Overlay::Confirm(confirm) => {
             // Bulk deletes itemize their casualties across several message
             // lines — size the dialog to fit them.
-            let msg_lines: Vec<&str> = confirm.message.lines().collect();
+            let mut msg_lines: Vec<String> = confirm.message.lines().map(str::to_owned).collect();
+            if let crate::app::PendingAction::StopBusyAndCheckout { sessions, .. } = &confirm.action
+            {
+                let room = (f.area().height as usize).saturating_sub(4 + msg_lines.len());
+                let shown = match sessions.len() > room {
+                    true => room.saturating_sub(1),
+                    false => sessions.len(),
+                };
+                msg_lines.extend(sessions[..shown].iter().map(|s| format!("  {s}")));
+                if shown < sessions.len() {
+                    msg_lines.push(format!("… and {} more", sessions.len() - shown));
+                }
+            }
             let longest = msg_lines.iter().map(|l| l.chars().count()).max();
             let width = (longest.unwrap_or(0) as u16 + 4).max(52);
             let height = msg_lines.len() as u16 + 4;
@@ -354,10 +366,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 ));
             let inner = block.inner(area);
             f.render_widget(block, area);
-            let mut lines: Vec<Line> = msg_lines
-                .into_iter()
-                .map(|l| Line::from(l.to_string()))
-                .collect();
+            let mut lines: Vec<Line> = msg_lines.into_iter().map(Line::from).collect();
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
                 Span::styled("[Enter/y] confirm", Style::default().fg(th.err)),
@@ -1155,9 +1164,10 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     base_area,
                 );
             }
-            // Under it: a pinned "Current" row (the uncommitted changes)
-            // and the recent commits, a short scrollable strip (⇥/⇧⇥ step
-            // through both); the file list keeps at least one row.
+            // Under it: a pinned "Current" row (the uncommitted changes,
+            // when the source has a working tree) and the recent commits,
+            // a short scrollable strip (⇥/⇧⇥ step through both); the file
+            // list keeps at least one row.
             let strip_h =
                 view.commits
                     .len()
@@ -1165,7 +1175,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     .min(files_inner.height.saturating_sub(4) as usize) as u16;
             let current_area = Rect {
                 y: files_inner.y + 2,
-                height: strip_h.min(1),
+                height: strip_h.min(u16::from(view.source.has_working_tree())),
                 ..files_inner
             };
             if current_area.height > 0 {
@@ -1410,7 +1420,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         ],
                         Some(DiffBase::Branch(name)) => vec![
                             Span::styled(marker, Style::default().fg(th.ok)),
-                            Span::raw(truncate(&name, budget.saturating_sub(2))),
+                            Span::raw(truncate(name.label(), budget.saturating_sub(2))),
                         ],
                         Some(DiffBase::Commit(c)) => {
                             let head = format!("{} ", c.short);
@@ -4461,6 +4471,22 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
         app.term_file_links = Vec::new();
         return;
     }
+    if let Some(branch) = app.parked_placeholder_branch() {
+        let inner = terminal_frame(f, area, Vec::new(), None, focused, th);
+        app.term_area = inner;
+        let msg = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("parked on {branch} — Enter switches primary and resumes it"),
+                Style::default().fg(th.muted).add_modifier(Modifier::BOLD),
+            )),
+        ])
+        .centered();
+        f.render_widget(msg, inner);
+        app.term_links = Vec::new();
+        app.term_file_links = Vec::new();
+        return;
+    }
     let right = match &app.term {
         Some(t) if t.exited => Some(Span::styled(
             "exited".to_string(),
@@ -4759,13 +4785,20 @@ fn draw_quick_terminal(f: &mut Frame, app: &mut App) {
     }
 }
 
-/// Historical affinity is a warning, never a different execution destination.
 fn branch_mismatch<'a>(app: &App, session: &'a SessionRow) -> Option<&'a str> {
-    let (id, recorded) = match session {
-        SessionRow::Agent(a) => (&a.worktree_id, a.branch.as_deref()),
-        SessionRow::Terminal(t) => (&t.worktree_id, t.branch.as_deref()),
+    let (id, recorded, home) = match session {
+        SessionRow::Agent(a) => (&a.worktree_id, a.branch.as_deref(), app.tree.agent_home(a)),
+        SessionRow::Terminal(t) => (
+            &t.worktree_id,
+            t.branch.as_deref(),
+            app.tree.terminal_home(t),
+        ),
         SessionRow::Link(_) => return None,
     };
+    let listed_where_it_runs = home == crate::app::SessionHome::Worktree(id.clone());
+    if !listed_where_it_runs {
+        return None;
+    }
     let current = app.tree.worktrees.iter().find(|w| &w.id == id)?;
     recorded.filter(|b| *b != current.branch)
 }

@@ -106,8 +106,12 @@ pub fn run_worktree_delete(name: String, force: bool, project: Option<String>) -
 }
 
 /// `nebula worktree checkout` — a branch onto the primary checkout.
-pub fn run_worktree_checkout(branch: String, project: Option<String>) -> Result<()> {
-    runtime()?.block_on(ipc::worktree_checkout(branch, project))
+pub fn run_worktree_checkout(
+    branch: String,
+    project: Option<String>,
+    stop_busy: bool,
+) -> Result<()> {
+    runtime()?.block_on(ipc::worktree_checkout(branch, project, stop_busy))
 }
 
 /// `nebula switch` — a branch's checkout (made if missing), and the calling
@@ -117,8 +121,9 @@ pub fn run_switch(
     from: Option<String>,
     worktree: bool,
     project: Option<String>,
+    stop_busy: bool,
 ) -> Result<()> {
-    runtime()?.block_on(ipc::switch(branch, from, worktree, project))
+    runtime()?.block_on(ipc::switch(branch, from, worktree, project, stop_busy))
 }
 
 /// `nebula agent new` — spawn a session.

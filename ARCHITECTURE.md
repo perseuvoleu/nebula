@@ -19,11 +19,13 @@ Everything is nested:
 
 **Workspace** (a named project group) → **Project** (a git repo) → **Worktree** (main checkout or `git worktree add`) → **Session** (an agent *or* a plain terminal tab).
 
+A session also records a **branch** (`Agent::branch`, `TerminalTab::branch`): the one it was started on, updated when the session itself moves — its process enters another checkout, or it switches the main checkout with `nebula switch`. While its process runs, the session is listed under the worktree it runs in. Once stopped, it is listed under its branch: the checkout holding that branch, else a `(branch)` row. Switching the main checkout to another branch stops the other sessions on it, which are then listed under the branch they record — the one the main checkout left, unless a session already recorded another; the session that asked for the switch keeps running and moves to the new branch (`docs/specs/branch-primary-intent.md`).
+
 Exactly one workspace is *open* at a time — daemon-global state, switched with `nebula workspace open <name>` or the TUI's `w` picker and broadcast to every client. The TUI scopes its Projects panel and `/` search to the open workspace; other workspaces' sessions keep running (and keep receiving status updates) in the background. Every install starts with the built-in `default` workspace, and `nebula add` files new projects under whichever workspace is open.
 
 Worktrees are real git worktrees, created under `<repo>/../<repo-name>-worktrees/<branch>`. The daemon also polls git metadata so worktrees created outside Nebula still show up.
 
-An agent is a PTY running `claude`, `codex`, or `cursor-agent` in that worktree. Restart uses `--resume <session-id>` when one is stored.
+An agent is a PTY running `claude`, `codex`, `cursor-agent`, or `pi` in that worktree. Restart resumes the stored CLI session id when there is one: `claude --resume <id>`, `codex resume <id>`, `cursor-agent --resume <id>`, `pi --session <id>`.
 
 Persistence is SQLite at `~/.local/share/nebula/nebula.db`: workspaces (one flagged open), projects, worktrees, agents (kind + CLI session id), notes, links, last UI selection.
 

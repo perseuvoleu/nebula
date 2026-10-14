@@ -192,6 +192,32 @@ pub async fn checkout(worktree: &Path, branch: &str) -> Result<()> {
     Ok(())
 }
 
+/// Untracked files are left out: a checkout carries them along unless the
+/// target tracks the path.
+pub async fn uncommitted_count(worktree: &Path) -> Result<usize> {
+    Ok(
+        git(worktree, &["status", "--porcelain", "--untracked-files=no"])
+            .await?
+            .lines()
+            .count(),
+    )
+}
+
+/// The untracked path in `worktree` that blocks `git checkout <branch>`,
+/// including a file where the target has a directory or the reverse. None
+/// when the checkout would proceed; other git failures are errors.
+pub async fn untracked_blocking_checkout(worktree: &Path, branch: &str) -> Result<Option<String>> {
+    let err = match git(worktree, &["read-tree", "-m", "-u", "-n", "HEAD", branch]).await {
+        Ok(_) => return Ok(None),
+        Err(err) => err,
+    };
+    let message = err.to_string();
+    match message.split('\'').nth(1) {
+        Some(path) if message.to_lowercase().contains("untracked") => Ok(Some(path.to_owned())),
+        _ => Err(err),
+    }
+}
+
 /// `git checkout -f <branch>`: the user force-confirmed the revert, so
 /// uncommitted changes that would block the plain checkout are discarded.
 pub async fn checkout_forced(worktree: &Path, branch: &str) -> Result<()> {

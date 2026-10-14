@@ -128,8 +128,14 @@ The panels aren't the only view. With a worktree selected, from any panel:
   the Sessions panel's LINKS group. nebula also finds the pull request already
   open on the branch with `gh` and lists it there on its own, with a count of
   the comments that landed while you were away.
-- **`p` — pin.** Pinned worktrees and agents sort to the top of their panel and
-  are spared by the idle reaper.
+- **`p` — pin.** Pinned worktrees and agents sort to the top of their panel; a
+  pinned agent is also spared by the idle reaper.
+
+On a `(branch)` row — a branch no checkout holds — `g`, `f`, `F` and `b` read
+the branch tip from git without checking it out. The diff compares the tip with
+its base, with no working-tree side and no review marks; `Enter` in `f`, `F` or
+`b` opens a read-only copy of the file. A `(branch)` row that belongs to a
+remote twin refuses all four (`<branch> is a branch on <host> — open it there`).
 
 ## How it works
 
@@ -209,7 +215,7 @@ The panels aren't the only view. With a worktree selected, from any panel:
 | ● green | finished — turn complete |
 | ● red | needs feedback — permission prompt or question waiting on you |
 | ● magenta | terminated — process died mid-run |
-| ○ | disconnected — daemon restarted while the agent was live |
+| ○ | disconnected — stopped while live: the daemon restarted, or primary switched branch |
 
 Worktree and project rows roll up their children: red beats yellow beats green.
 
@@ -221,9 +227,29 @@ nothing is archived or deleted. The choices are saved across TUI restarts.
 
 Beside them, **⎇ branch ▾** shows the primary checkout's branch. Click it (or
 `co` in the ⌘K palette) for a fuzzy branch picker; the pick is checked out on
-the primary. Rows keep one fixed order — branches by when they were created,
-sessions by when they were started — so a checkout, or a session starting or
-finishing, only moves the `⌂ primary` badge and the cursor, never the rows.
+the primary. Switching is refused while primary has uncommitted changes to
+tracked files, or an untracked file the branch would overwrite; other untracked
+files stay where they are. It asks before stopping the sessions on it
+(`--stop-busy` on the CLI). A session on primary that runs `nebula switch`
+itself is not stopped: it moves along to the new branch.
+
+A session remembers a branch: the one it was started on, updated when the
+session itself moves (its process `cd`s into another checkout, or it switches
+primary with `nebula switch`). While its process runs it is listed under the
+checkout it runs in, with `⚠ expects <branch>` when that checkout has moved to
+another branch. Once stopped it is listed under its branch: the checkout
+holding it, else a `(branch)` row. So sessions stopped by a switch are listed
+under the branch primary left, or under the branch they already recorded when
+that differs (those showed `⚠ expects <branch>`), and attaching one from its
+`(branch)` row moves primary there and resumes it.
+
+The primary checkout always keeps the first row. After it come pinned
+checkouts, then the other checkouts and `(branch)` rows by when their branch
+was created, each nested under the branch it was cut from. A primary switch
+changes that list: the branch primary left becomes a `(branch)` row, the one it
+took stops being one, and rows cut from either branch re-nest to match.
+Sessions sort differently: pinned agents first, then agents by last activity (a
+working one stays on top), then shell tabs in the order they were opened.
 
 ## Keys
 
@@ -233,7 +259,7 @@ Defaults — every one of them is rebindable in Settings → Hotkeys (`s`).
 |---|---|---|
 | Panels | `Tab`/`Shift+Tab`, `←/→`, `j/k` | move focus / selection |
 | Panels | `Ctrl+→` | cross into the terminal pane without attaching (plain `→` stops at Sessions) |
-| Panels | `Enter` | drill in; on a session: attach |
+| Panels | `Enter` | drill in; on a `(branch)` row: switch primary to that branch; on a session: attach (a session under a `(branch)` row switches primary first, then resumes) |
 | Any panel | `/` | fuzzy jump across every project, worktree and session (`Ctrl+n/p` move, `Ctrl+o` opens the hit, `Ctrl+f` just lands the selection on it) |
 | Projects | `n` / `d` | add project / remove from list |
 | Any panel | `o` | add ("open") a project — same prompt as `n`, from any focus |
@@ -245,13 +271,13 @@ Defaults — every one of them is rebindable in Settings → Hotkeys (`s`).
 | Worktrees | `n` / `d` | new worktree / delete (typed confirm — deletes files) |
 | New worktree | type a sentence, or `Enter` on the empty prompt | the branch name is slugified (`fix login redirect` → `fix-login-redirect`); empty takes a random `<adj>-<noun>-<verb>` |
 | Projects / Worktrees | `e` | notes for the selected project / worktree |
-| Worktrees / Sessions | `p` | pin / unpin — pinned rows sort to the top and skip the idle reaper |
+| Worktrees / Sessions | `p` | pin / unpin — pinned rows sort to the top; pinned agents also skip the idle reaper |
 | Sessions | `n` | new session (agent or shell terminal) |
 | Sessions | `r`, `a`, `u`, `d`, `A` | rename, archive, unarchive, delete, toggle archived |
 | Any panel | `Shift+D` | delete every row of the focused panel (confirm lists the casualties) |
-| Any panel | `g` | git diff for the selected worktree (the uncommitted changes, or everything since the branch it was cut from when the tree is clean): filter, `↑↓` files, `Shift+↑↓`/`PgUp/PgDn`/`Ctrl+d/u` scroll, `Ctrl+g` picks what to compare (working tree, upstream, a commit), `Tab`/`Shift+Tab` step through the recent commits listed under the filter, `Ctrl+r` marks a file reviewed ✓ (on the working tree or against a branch), `Ctrl+n`/`Ctrl+p` step to the next/previous checkout that waits for review, `Ctrl+l` lists them |
+| Any panel | `g` | git diff for the selected worktree (the uncommitted changes, or everything since the branch it was cut from when the tree is clean) or `(branch)` row (its tip against its base; no working-tree side and no review marks): filter, `↑↓` files, `Shift+↑↓`/`PgUp/PgDn`/`Ctrl+d/u` scroll, `Ctrl+g` picks what to compare (working tree, upstream, a commit), `Tab`/`Shift+Tab` step through the recent commits listed under the filter, `Ctrl+r` marks a file reviewed ✓ (on the working tree or against a branch), `Ctrl+n`/`Ctrl+p` step to the next/previous checkout that waits for review, `Ctrl+l` lists them |
 | Any panel | `Shift+G` | open the selected repo's page on its git host — the `origin` remote (`git@github.com:o/r.git`, `ssh://`, `https://`) turned into a browsable URL, credentials stripped |
-| Any panel | `f` / `F` / `b` | find file / find in files (`git grep`) / file tree browser, all scoped to the selected worktree — `Enter` opens the file in an editor modal (at the matched line, for `F`); in `f` and `b`, `Ctrl+y` copies the path |
+| Any panel | `f` / `F` / `b` | find file / find in files (`git grep`) / file tree browser, all scoped to the selected worktree or `(branch)` row (a remote twin's branch row refuses them) — `Enter` opens the file in an editor modal (at the matched line, for `F`; a read-only copy on a branch row); in `f` and `b`, `Ctrl+y` copies the path |
 | Any panel | `l` | attach a link (pull request, doc, ticket) to the selected worktree — it lands in the Sessions panel's LINKS group, above any open pull request nebula finds with `gh` |
 | Sessions | `Enter` / `r` / `d` on a link | open it in the browser / edit its URL / delete it (the detected pull request opens but can't be edited or deleted) |
 | Any panel | `t` | new shell terminal in the selected worktree's directory (Projects panel: the repo root) |

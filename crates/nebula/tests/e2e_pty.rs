@@ -2185,6 +2185,7 @@ async fn prewarmed_session_is_adopted_by_create_agent() {
         &script,
         concat!(
             "#!/bin/sh\n",
+            "echo $$ >> \"$(dirname \"$0\")/warm-pids\"\n",
             "curl -sS -m 3 -X POST -H \"Authorization: Bearer $NEBULA_API_TOKEN\" \\\n",
             "  -H 'Content-Type: application/json' -d '{\"session_id\":\"warm-sid-99\"}' \\\n",
             "  \"$NEBULA_API_URL/api/hooks/claude?agentId=$NEBULA_AGENT_ID&hookEvent=SessionStart\" \\\n",
@@ -2206,18 +2207,14 @@ async fn prewarmed_session_is_adopted_by_create_agent() {
     handshake(&mut c).await;
     let worktree = add_project_get_main_worktree(&mut c, &repo).await;
 
+    let prewarm = ClientRequest::PrewarmAgent {
+        worktree: worktree.id.clone(),
+        kind: AgentKind::Claude,
+        model: None,
+        effort: None,
+    };
     // Kind picked — warm the CLI. No reply expected.
-    write_frame(
-        &mut c,
-        &ClientRequest::PrewarmAgent {
-            worktree: worktree.id.clone(),
-            kind: AgentKind::Claude,
-            model: None,
-            effort: None,
-        },
-    )
-    .await
-    .unwrap();
+    write_frame(&mut c, &prewarm).await.unwrap();
     // "User types the name": long enough for the warm boot to finish.
     tokio::time::sleep(Duration::from_millis(4500)).await;
     let branch = std::process::Command::new("git")
@@ -2237,17 +2234,33 @@ async fn prewarmed_session_is_adopted_by_create_agent() {
     )
     .await
     .unwrap();
-    let blocked = read_events_until(&mut c, Duration::from_secs(5), |e| {
+    let switched = read_events_until(&mut c, Duration::from_secs(10), |e| {
         find_ack(e, 901).is_some()
     })
     .await;
     assert!(
-        matches!(find_ack(&blocked, 901), Some(ServerEvent::Error { message, .. }) if message.contains("live session")),
-        "{blocked:?}"
+        matches!(find_ack(&switched, 901), Some(ServerEvent::Ack { .. })),
+        "{switched:?}"
     );
     assert!(!repo.with_file_name("repo-worktrees").exists());
-    // A refused switch preserves the warm PTY for adoption; idle warm entries
-    // otherwise expire through the normal reaper, never an implicit restart.
+    let head = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["branch", "--show-current"])
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), "warm-blocked");
+    let pids = std::fs::read_to_string(env.tmp.path().join("warm-pids")).unwrap();
+    let stopped = pids.lines().next().unwrap();
+    let alive = std::process::Command::new("kill")
+        .args(["-0", stopped])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(!alive.success(), "the switch stopped the warm PTY");
+
+    write_frame(&mut c, &prewarm).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(4500)).await;
 
     write_frame(
         &mut c,
@@ -4674,8 +4687,12 @@ async fn branch_sessions_keep_independent_execution_directories() {
             find_ack(e, 810 + i).is_some()
         })
         .await;
+        let refusal = format!(
+            "primary has sessions on \"feature\"; switching to \"other\" stops feature-worker (agent, {})",
+            status.as_str().replace('_', " ")
+        );
         assert!(
-            matches!(find_ack(&evs, 810 + i), Some(ServerEvent::Error { message, .. }) if message.contains("live session")),
+            matches!(find_ack(&evs, 810 + i), Some(ServerEvent::Error { message, .. }) if *message == refusal),
             "must protect {status:?}: {evs:?}"
         );
         assert_eq!(git(&["branch", "--show-current"]), "feature");
@@ -4808,7 +4825,15 @@ async fn branch_primary_cli_switch_and_agent_destinations() {
     };
     // Conflicting tracked edits: no directory, row, HEAD change or cd.
     std::fs::write(repo.join("README.md"), "dirty primary\n").unwrap();
-    refusal(cli(&["switch", "feature"]));
+    let dirty = cli(&["switch", "feature"]);
+    assert!(
+        String::from_utf8_lossy(&dirty.stderr).contains(
+            "primary has 1 uncommitted file on \"main\"; commit them before switching to \"feature\""
+        ),
+        "{}",
+        String::from_utf8_lossy(&dirty.stderr)
+    );
+    refusal(dirty);
     refusal(cli(&[
         "agent",
         "new",
@@ -4848,6 +4873,81 @@ async fn branch_primary_cli_switch_and_agent_destinations() {
         success(cli(&["switch", "feature", "--worktree"]))["path"],
         linked_path
     );
+    write_frame(&mut c, &ClientRequest::Subscribe)
+        .await
+        .unwrap();
+    let evs = read_events_until(&mut c, Duration::from_secs(5), |e| {
+        e.iter().any(|e| matches!(e, ServerEvent::Snapshot { .. }))
+    })
+    .await;
+    let linked_id = evs
+        .iter()
+        .find_map(|e| match e {
+            ServerEvent::Snapshot { worktrees, .. } => worktrees
+                .iter()
+                .find(|w| !w.is_main && w.branch == "feature")
+                .map(|w| w.id.clone()),
+            _ => None,
+        })
+        .unwrap();
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateTerminal {
+            req_id: 903,
+            worktree: linked_id,
+            expected_branch: None,
+            name: None,
+        },
+    )
+    .await
+    .unwrap();
+    let created = read_events_until(&mut c, Duration::from_secs(5), |e| {
+        find_ack(e, 903).is_some()
+    })
+    .await;
+    let Some(ServerEvent::Ack {
+        created: Some(EntityId::Terminal(linked_tab)),
+        ..
+    }) = find_ack(&created, 903)
+    else {
+        panic!("{created:?}")
+    };
+    let linked_tab = linked_tab.clone();
+    for target in ["busy-target", "main"] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+            .args([
+                "worktree",
+                "checkout",
+                target,
+                "--project",
+                "primary-policy",
+            ])
+            .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
+            .env("NEBULA_DATA_DIR", env.tmp.path().join("data"))
+            .env("NEBULA_AGENT_ID", format!("term:{linked_tab}"))
+            .current_dir(linked_path)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "a caller in a linked checkout: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(git(&["branch", "--show-current"]), target);
+    }
+    write_frame(
+        &mut c,
+        &ClientRequest::CloseTerminal {
+            req_id: 904,
+            id: linked_tab,
+        },
+    )
+    .await
+    .unwrap();
+    read_events_until(&mut c, Duration::from_secs(5), |e| {
+        find_ack(e, 904).is_some()
+    })
+    .await;
     // Missing --worktree selector means branch intent, not permission to create a WT.
     let agent = success(cli(&[
         "agent",
@@ -4900,16 +5000,41 @@ async fn branch_primary_cli_switch_and_agent_destinations() {
         std::fs::read_to_string(repo.join("actual-files")).unwrap(),
         "feature files\n"
     );
-    refusal(cli(&["switch", "busy-target"]));
-    refusal(cli(&[
-        "agent",
-        "new",
-        "--worktree",
-        "busy-target",
-        "--name",
-        "blocked",
-    ]));
+    let SessionRef::Agent(agent_id) = &session else {
+        unreachable!()
+    };
+    let refusal_text = "primary has sessions on \"agent-branch\"; switching to \"busy-target\" stops primary-agent (agent, fresh)";
+    for (args, hint) in [
+        (
+            &["switch", "busy-target"][..],
+            "rerun with --stop-busy to stop them and switch",
+        ),
+        (
+            &["worktree", "checkout", "busy-target"][..],
+            "rerun with --stop-busy to stop them and switch",
+        ),
+        (
+            &[
+                "agent",
+                "new",
+                "--worktree",
+                "busy-target",
+                "--name",
+                "blocked",
+            ][..],
+            "run `nebula switch 'busy-target' --project 'primary-policy' --stop-busy` first, then retry",
+        ),
+    ] {
+        let busy = cli(args);
+        assert_eq!(
+            String::from_utf8_lossy(&busy.stderr).trim(),
+            format!("Error: {refusal_text}; {hint}")
+        );
+        refusal(busy);
+    }
     assert_eq!(git(&["branch", "--show-current"]), "agent-branch");
+    success(cli(&["switch", "busy-target", "--stop-busy"]));
+    assert_eq!(git(&["branch", "--show-current"]), "busy-target");
     assert_eq!(
         git(&["worktree", "list", "--porcelain"])
             .matches("worktree ")
@@ -4926,6 +5051,69 @@ async fn branch_primary_cli_switch_and_agent_destinations() {
     assert!(evs
         .iter()
         .any(|e| matches!(e, ServerEvent::Snapshot { worktrees, .. } if worktrees.len() == 2)));
+    let stopped = evs
+        .iter()
+        .find_map(|e| match e {
+            ServerEvent::Snapshot { agents, .. } => agents
+                .iter()
+                .find(|a| SessionRef::Agent(a.id.clone()) == session),
+            _ => None,
+        })
+        .expect("the stopped agent keeps its row");
+    assert!(
+        !stopped.alive,
+        "the confirmed switch stopped the busy agent"
+    );
+    assert_eq!(stopped.branch.as_deref(), Some("agent-branch"));
+    success(cli(&["switch", "agent-branch"]));
+    let upserted = |evs: &[ServerEvent]| {
+        evs.iter().rev().find_map(|e| match e {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(a),
+            } if a.id == *agent_id => Some((a.status, a.alive)),
+            _ => None,
+        })
+    };
+    write_frame(
+        &mut c,
+        &ClientRequest::RestartAgent {
+            req_id: 905,
+            id: agent_id.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    let restarted = read_events_until(&mut c, Duration::from_secs(5), |e| {
+        upserted(e).is_some_and(|(_, alive)| alive)
+    })
+    .await;
+    assert_eq!(
+        upserted(&restarted),
+        Some((nebula_core::AgentStatus::Fresh, true)),
+        "restart"
+    );
+    success(cli(&["switch", "busy-target", "--stop-busy"]));
+    success(cli(&["switch", "agent-branch"]));
+    write_frame(
+        &mut c,
+        &ClientRequest::Attach {
+            session: session.clone(),
+            from_seq: None,
+            cols: 100,
+            rows: 24,
+        },
+    )
+    .await
+    .unwrap();
+    let resumed = read_events_until(&mut c, Duration::from_secs(5), |e| {
+        upserted(e).is_some_and(|(_, alive)| alive)
+    })
+    .await;
+    assert_eq!(
+        upserted(&resumed),
+        Some((nebula_core::AgentStatus::Fresh, true)),
+        "resume on attach"
+    );
     // A real terminal must remain in primary: failed branch switches queue no cd.
     let primary = evs
         .iter()
@@ -5000,6 +5188,49 @@ async fn branch_primary_cli_switch_and_agent_destinations() {
             .trim(),
         repo.to_str().unwrap()
     );
+    for target in ["busy-target", "agent-branch"] {
+        let moved = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+            .args([
+                "worktree",
+                "checkout",
+                target,
+                "--project",
+                "primary-policy",
+                "--stop-busy",
+            ])
+            .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
+            .env("NEBULA_DATA_DIR", env.tmp.path().join("data"))
+            .env("NEBULA_AGENT_ID", format!("term:{terminal}"))
+            .current_dir(&repo)
+            .output()
+            .unwrap();
+        assert!(
+            moved.status.success(),
+            "{}",
+            String::from_utf8_lossy(&moved.stderr)
+        );
+        assert_eq!(git(&["branch", "--show-current"]), target);
+        write_frame(&mut c, &ClientRequest::Subscribe)
+            .await
+            .unwrap();
+        let evs = read_events_until(&mut c, Duration::from_secs(5), |e| {
+            e.iter().any(|e| matches!(e, ServerEvent::Snapshot { .. }))
+        })
+        .await;
+        let caller = evs
+            .iter()
+            .find_map(|e| match e {
+                ServerEvent::Snapshot { terminals, .. } => {
+                    terminals.iter().find(|t| &t.id == terminal)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            caller.alive,
+            "worktree checkout stopped the shell that ran it"
+        );
+    }
     // Retained session history must not make a vanished checkout a cd target.
     let parked_agent = success(cli(&[
         "agent",
@@ -5024,6 +5255,200 @@ async fn branch_primary_cli_switch_and_agent_destinations() {
     std::fs::rename(linked_path, repo.with_file_name("preserved-checkout")).unwrap();
     refusal(cli(&["switch", "feature", "--worktree"]));
     refusal(cli(&["switch", "feature"]));
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_parked_agent_resumes_its_conversation_once_primary_is_back_on_its_branch() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = TestEnv::new();
+    let repo = env.make_repo().canonicalize().unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    git(&["branch", "other"]);
+    let bin = env.tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let spawns = env.tmp.path().join("claude-spawns");
+    let stub = bin.join("claude");
+    std::fs::write(
+        &stub,
+        format!(
+            concat!(
+                "#!/bin/sh\n",
+                "echo \"$*\" >> '{}'\n",
+                "curl -sS -m 3 -X POST -H \"Authorization: Bearer $NEBULA_API_TOKEN\" \\\n",
+                "  -H 'Content-Type: application/json' -d '{{\"session_id\":\"sid-parked\"}}' \\\n",
+                "  \"$NEBULA_API_URL/api/hooks/claude?agentId=$NEBULA_AGENT_ID&hookEvent=SessionStart\" \\\n",
+                "  >/dev/null 2>&1\n",
+                "exec sleep 60\n",
+            ),
+            spawns.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let shell = env.tmp.path().join("seeing-shell.sh");
+    std::fs::write(
+        &shell,
+        format!(
+            "#!/bin/sh\nPATH={}:/usr/bin:/bin\nexport PATH\nexec /bin/sh -c \"$4\"\n",
+            bin.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _daemon = MobileFixtureDaemon(env.spawn_daemon_with_shell(&shell));
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let primary = add_project_get_main_worktree(&mut c, &repo).await;
+
+    write_frame(
+        &mut c,
+        &ClientRequest::CreateAgent {
+            expected_branch: Some("main".into()),
+            req_id: 2,
+            worktree: primary.id.clone(),
+            name: "parked".into(),
+            kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            auto_title: false,
+            prompt: None,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(10), |evs| {
+        find_ack(evs, 2).is_some()
+    })
+    .await;
+    let Some(ServerEvent::Ack {
+        created: Some(EntityId::Agent(agent_id)),
+        ..
+    }) = find_ack(&events, 2)
+    else {
+        panic!("CreateAgent failed: {events:#?}");
+    };
+    let agent_id = agent_id.clone();
+    let agent_row = |evs: &[ServerEvent]| {
+        evs.iter().rev().find_map(|e| match e {
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(a),
+            } if a.id == agent_id => Some(a.clone()),
+            _ => None,
+        })
+    };
+    let mut stored = None;
+    for _ in 0..50 {
+        let mut snap = connect(&env.sock()).await;
+        handshake(&mut snap).await;
+        write_frame(&mut snap, &ClientRequest::Subscribe)
+            .await
+            .unwrap();
+        let evs = read_events_until(&mut snap, Duration::from_secs(5), |evs| {
+            evs.iter()
+                .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
+        })
+        .await;
+        stored = evs.iter().find_map(|e| match e {
+            ServerEvent::Snapshot { agents, .. } => agents
+                .iter()
+                .find(|a| a.id == agent_id)
+                .and_then(|a| a.session_id.clone()),
+            _ => None,
+        });
+        if stored.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(stored.as_deref(), Some("sid-parked"));
+
+    let mut req_id = 10;
+    let mut checkout = async |c: &mut UnixStream, branch: &str, stop_busy: bool| {
+        req_id += 1;
+        write_frame(
+            c,
+            &ClientRequest::CheckoutPrimary {
+                req_id,
+                project: primary.project_id.clone(),
+                branch: branch.into(),
+                mover: None,
+                stop_busy,
+            },
+        )
+        .await
+        .unwrap();
+        let evs = read_events_until(c, Duration::from_secs(10), |e| {
+            find_ack(e, req_id).is_some()
+        })
+        .await;
+        assert!(
+            matches!(find_ack(&evs, req_id), Some(ServerEvent::Ack { .. })),
+            "switch to {branch}: {evs:?}"
+        );
+        evs
+    };
+    let parked = checkout(&mut c, "other", true).await;
+    let row = agent_row(&parked).expect("the parked agent row");
+    assert!(!row.alive);
+    assert_eq!(row.branch.as_deref(), Some("main"));
+
+    let session = SessionRef::Agent(agent_id.clone());
+    let attach = ClientRequest::Attach {
+        session: session.clone(),
+        from_seq: None,
+        cols: 100,
+        rows: 24,
+    };
+    write_frame(&mut c, &attach).await.unwrap();
+    let refused = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        evs.iter().any(|e| matches!(e, ServerEvent::Error { .. }))
+    })
+    .await;
+    assert!(
+        refused
+            .iter()
+            .any(|e| matches!(e, ServerEvent::Error { message, .. }
+            if message.starts_with("attach: session expects branch \"main\""))),
+        "{refused:?}"
+    );
+
+    checkout(&mut c, "main", false).await;
+    assert_eq!(git(&["branch", "--show-current"]), "main");
+    write_frame(&mut c, &attach).await.unwrap();
+    let resumed = read_events_until(&mut c, Duration::from_secs(10), |evs| {
+        agent_row(evs).is_some_and(|a| a.alive)
+    })
+    .await;
+    assert_eq!(agent_row(&resumed).unwrap().worktree_id, primary.id);
+    let mut spawned = String::new();
+    for _ in 0..50 {
+        spawned = std::fs::read_to_string(&spawns).unwrap();
+        if spawned.lines().count() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        spawned.lines().collect::<Vec<_>>(),
+        [
+            "--dangerously-skip-permissions",
+            "--resume sid-parked --dangerously-skip-permissions"
+        ]
+    );
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
 }
 
@@ -5204,6 +5629,7 @@ async fn branch_session_cli_rejects_a_checkout_switched_after_resolution() {
                             project: project.clone(),
                             branch: branch.into(),
                             mover: None,
+                            stop_busy: false,
                         },
                     )
                     .await

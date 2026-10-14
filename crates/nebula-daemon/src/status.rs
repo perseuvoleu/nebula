@@ -67,6 +67,10 @@ pub enum HookEvent {
     Progress {
         busy: bool,
     },
+    /// Synthetic: nebula stopped the PTY on purpose to free its checkout.
+    Parked,
+    /// Synthetic: a new PTY was spawned for the agent.
+    PtySpawned,
 }
 
 impl HookEvent {
@@ -189,6 +193,9 @@ impl AgentStatusMachine {
         now: Instant,
     ) -> Vec<Effect> {
         let mut effects = Vec::new();
+        if self.status == AgentStatus::Disconnected && event != HookEvent::PtySpawned {
+            return effects;
+        }
 
         // ---- session reconciliation ----
         if event.captures_session() {
@@ -341,6 +348,18 @@ impl AgentStatusMachine {
                         AgentStatus::Terminated
                     };
                     self.set_status(status, &mut effects);
+                }
+            }
+            HookEvent::Parked => {
+                self.subagents.clear();
+                self.stop_held = false;
+                self.drain_idle_since = None;
+                self.finished_at = None;
+                self.set_status(AgentStatus::Disconnected, &mut effects);
+            }
+            HookEvent::PtySpawned => {
+                if self.status == AgentStatus::Disconnected {
+                    self.set_status(AgentStatus::Fresh, &mut effects);
                 }
             }
         }

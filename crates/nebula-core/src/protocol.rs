@@ -13,6 +13,11 @@ pub const PROTOCOL_VERSION: u32 = 29;
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
 
+/// Starts the `Error` a `CheckoutPrimary` or `ResolveBranchCheckout` gets
+/// when live sessions sit on primary; clients answer it with a confirmation
+/// that resends `CheckoutPrimary` with `stop_busy`.
+pub const BUSY_SESSIONS_REFUSAL: &str = "primary has sessions on";
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SessionRef {
     Agent(AgentId),
@@ -131,7 +136,8 @@ pub enum ClientRequest {
         base: Option<String>,
     },
     /// Resolve a usable checkout of an existing branch on the project's host.
-    /// Reuses primary or a linked checkout; never switches or creates a branch.
+    /// Moves primary under `CheckoutPrimary`'s rules, live sessions refused;
+    /// never creates a branch or a linked checkout.
     ResolveBranchCheckout {
         req_id: u64,
         project: ProjectId,
@@ -150,15 +156,21 @@ pub enum ClientRequest {
         id: WorktreeId,
         force: bool,
     },
-    /// Explicitly move primary, refusing other live PTYs and already hosted branches.
+    /// Explicitly move primary. Refuses uncommitted changes, a blocking
+    /// untracked file, branches already hosted by a linked checkout, and live
+    /// sessions on primary unless `stop_busy`; then stops them, and they keep
+    /// their rows and branch.
     CheckoutPrimary {
         req_id: u64,
         project: ProjectId,
         branch: String,
-        /// Sole caller moving its own physical checkout. Other live sessions block
-        /// the operation, including finished agents and shell tabs.
+        /// Sole caller moving its own physical checkout; it keeps running.
         #[serde(default)]
         mover: Option<SessionRef>,
+        /// The user confirmed stopping the sessions on primary. Skipped
+        /// when false so unconfirmed requests stay readable by older daemons.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        stop_busy: bool,
     },
     /// Pin/unpin the worktree in the worktrees list (pure metadata).
     SetWorktreePinned {

@@ -11,7 +11,7 @@ use nebula_core::ClientRequest;
 use nebula_core::{
     Agent, AgentId, AgentKind, AgentStatus, Entity, EntityId, Link, LinkId, Note, NoteId,
     NoteOwner, Project, ProjectId, ServerEvent, SessionRef, TerminalId, TerminalTab, Todo, TodoId,
-    TodoOwner, Workspace, WorkspaceId, Worktree, WorktreeId,
+    TodoOwner, Workspace, WorkspaceId, Worktree, WorktreeId, BUSY_SESSIONS_REFUSAL,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -87,6 +87,8 @@ pub struct Daemon {
     worktree_ops: tokio::sync::Mutex<()>,
     /// Orders physical checkout changes against session creation/resume.
     checkout_execution: tokio::sync::RwLock<()>,
+    stop_deadline: Duration,
+    agent_cmd_override: Option<String>,
     /// Warm agent CLIs awaiting adoption, at most one per (worktree, kind).
     prewarmed: Mutex<HashMap<(WorktreeId, AgentKind), PrewarmEntry>>,
     /// Cached `command -v` results per CLI so a missing binary doesn't get
@@ -113,6 +115,22 @@ pub struct Daemon {
 
 impl Daemon {
     pub fn new(store: Arc<Store>, hook_env: HookEnv) -> Arc<Self> {
+        Self::with_overrides(
+            store,
+            hook_env,
+            DaemonOverrides {
+                agent_cmd: std::env::var("NEBULA_AGENT_CMD").ok(),
+                ..DaemonOverrides::default()
+            },
+        )
+    }
+
+    /// A daemon built with `overrides` in place of `Daemon::new`'s defaults.
+    pub fn with_overrides(
+        store: Arc<Store>,
+        hook_env: HookEnv,
+        overrides: DaemonOverrides,
+    ) -> Arc<Self> {
         let (events, _) = broadcast::channel(1024);
         Arc::new(Self {
             collect_owners: Mutex::new(HashSet::new()),
@@ -127,6 +145,8 @@ impl Daemon {
             shutdown: tokio_util::sync::CancellationToken::new(),
             worktree_ops: tokio::sync::Mutex::new(()),
             checkout_execution: tokio::sync::RwLock::new(()),
+            stop_deadline: overrides.stop_deadline,
+            agent_cmd_override: overrides.agent_cmd,
             prewarmed: Mutex::new(HashMap::new()),
             cli_probes: Mutex::new(HashMap::new()),
             attach_counts: Mutex::new(HashMap::new()),
@@ -1364,7 +1384,7 @@ impl Daemon {
         if branch.trim().is_empty() || !git::branch_exists(&project.repo_path, branch).await {
             bail!("branch \"{branch}\" does not exist on this host; create or fetch it explicitly first");
         }
-        self.checkout_primary_locked(project_id, branch, None)
+        self.checkout_primary_locked(project_id, branch, None, false)
             .await?;
         let (_, worktrees, _, _) = self.store.load_tree()?;
         let primary = worktrees
@@ -1609,17 +1629,25 @@ impl Daemon {
         Ok(())
     }
 
-    /// Deliberately switch primary, refusing other live sessions and branches
-    /// already hosted by a linked checkout. Existing directories and conversation
-    /// rows remain intact; only a sole caller may update its own branch affinity.
+    /// Move primary to `branch`. Refused, before any session is stopped, when
+    /// `branch` exists neither here nor on origin, primary has uncommitted
+    /// tracked changes, an untracked file would block the checkout, `branch`
+    /// already has a linked checkout, or a live session other than `mover`
+    /// sits on primary and `stop_busy` is false (the error then starts with
+    /// `BUSY_SESSIONS_REFUSAL` and lists every one of them).
+    /// Otherwise every other session on primary, warm PTYs included, has its
+    /// PTY stopped and its child waited for before the checkout; stopped rows
+    /// keep their conversation and the branch they were on. Only `mover`
+    /// keeps running and follows `branch`.
     pub async fn checkout_primary(
         self: &Arc<Self>,
         project_id: &ProjectId,
         branch: &str,
         mover: Option<&SessionRef>,
+        stop_busy: bool,
     ) -> Result<()> {
         let _ops = self.worktree_ops.lock().await;
-        self.checkout_primary_locked(project_id, branch, mover)
+        self.checkout_primary_locked(project_id, branch, mover, stop_busy)
             .await
     }
 
@@ -1629,6 +1657,7 @@ impl Daemon {
         project_id: &ProjectId,
         branch: &str,
         mover: Option<&SessionRef>,
+        stop_busy: bool,
     ) -> Result<()> {
         let branch = branch.trim();
         if branch.is_empty() {
@@ -1648,7 +1677,8 @@ impl Daemon {
             .iter()
             .find(|w| w.project_id == *project_id && w.is_main)
             .context("primary checkout not found")?;
-        if git::current_branch(&primary.path).await? == branch {
+        let current = git::current_branch(&primary.path).await?;
+        if current == branch {
             return Ok(());
         }
         if let Some(session) = mover {
@@ -1660,7 +1690,6 @@ impl Daemon {
                 bail!("only a session in the primary checkout may move itself with that checkout");
             }
         }
-        self.require_checkout_unoccupied(&primary.id, mover)?;
         if !git::branch_exists(&project.repo_path, branch).await {
             // Not here yet — a branch pushed from another machine can be
             // fetched into place; one that was never pushed cannot.
@@ -1680,6 +1709,51 @@ impl Daemon {
                 w.path.display()
             );
         }
+        let dirty = git::uncommitted_count(&primary.path).await?;
+        if dirty > 0 {
+            let files = if dirty == 1 { "file" } else { "files" };
+            bail!("primary has {dirty} uncommitted {files} on \"{current}\"; commit them before switching to \"{branch}\"");
+        }
+        if let Some(path) = git::untracked_blocking_checkout(&primary.path, branch).await? {
+            bail!("untracked \"{path}\" in primary would be overwritten by \"{branch}\"; move or commit it before switching");
+        }
+        let occupants = self.primary_occupants(&primary.id, mover)?;
+        if !occupants.is_empty() && !stop_busy {
+            let stopping: Vec<String> = occupants.iter().map(Occupant::describe).collect();
+            bail!(
+                "{BUSY_SESSIONS_REFUSAL} \"{current}\"; switching to \"{branch}\" stops {}",
+                stopping.join(", ")
+            );
+        }
+        let mut stops: Vec<Stop> = self
+            .prewarmed_in(&primary.id)
+            .into_iter()
+            .map(|(sref, session)| Stop {
+                sref,
+                label: "a warm agent PTY".to_owned(),
+                session,
+                kind: StopKind::Warm,
+            })
+            .collect();
+        for occupant in &occupants {
+            if let Some(session) = self.session(&occupant.sref) {
+                stops.push(Stop {
+                    sref: occupant.sref.clone(),
+                    label: occupant.describe(),
+                    session,
+                    kind: StopKind::Park,
+                });
+            }
+        }
+        for stop in &stops {
+            if let StopKind::Park = stop.kind {
+                self.stamp_branch(&stop.sref, &current)?;
+            }
+        }
+        for stop in &stops {
+            stop.session.kill();
+        }
+        self.finish_stops(stops, &current).await?;
         git::checkout(&project.repo_path, branch).await?;
         // The main row's branch label follows the checkout via reconcile.
         self.reconcile_project_worktrees(&project).await?;
@@ -1689,6 +1763,138 @@ impl Daemon {
             self.follow_branch(mover, branch)?;
         }
         Ok(())
+    }
+
+    async fn finish_stops(&self, mut stops: Vec<Stop>, branch: &str) -> Result<()> {
+        let started = Instant::now();
+        loop {
+            stops.retain(|stop| {
+                let running = child_running(&stop.session);
+                if !running {
+                    self.finalize_stop(stop);
+                }
+                running
+            });
+            if stops.is_empty() {
+                return Ok(());
+            }
+            if started.elapsed() >= self.stop_deadline {
+                let labels: Vec<&str> = stops.iter().map(|s| s.label.as_str()).collect();
+                bail!(
+                    "{} still running; primary stays on \"{branch}\"",
+                    labels.join(", ")
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    fn finalize_stop(&self, stop: &Stop) {
+        self.unregister_if_current(&stop.sref, &stop.session);
+        match stop.kind {
+            StopKind::Park => self.publish_session_end(&stop.sref, SessionEnd::Parked),
+            StopKind::Warm => self
+                .prewarmed
+                .lock()
+                .unwrap()
+                .retain(|_, e| SessionRef::Agent(e.agent_id.clone()) != stop.sref),
+        }
+    }
+
+    fn unregister_if_current(&self, sref: &SessionRef, session: &Arc<PtySession>) -> bool {
+        let removed = {
+            let mut sessions = self.sessions.lock().unwrap();
+            let current = sessions.get(sref).is_some_and(|s| Arc::ptr_eq(s, session));
+            if current {
+                sessions.remove(sref);
+            }
+            current
+        };
+        if removed {
+            self.session_interest.lock().unwrap().remove(sref);
+        }
+        removed
+    }
+
+    async fn wait_for_checkout_switch(&self) {
+        drop(self.checkout_execution.read().await);
+    }
+
+    fn primary_occupants(
+        &self,
+        primary: &WorktreeId,
+        mover: Option<&SessionRef>,
+    ) -> Result<Vec<Occupant>> {
+        let (_, _, agents, terminals) = self.store.load_tree()?;
+        let agents = agents
+            .iter()
+            .filter(|a| &a.worktree_id == primary)
+            .filter_map(|a| {
+                let sref = SessionRef::Agent(a.id.clone());
+                self.is_alive(&sref).then(|| Occupant {
+                    sref,
+                    name: a.name.clone(),
+                    status: Some(a.status),
+                })
+            });
+        let terminals = terminals
+            .iter()
+            .filter(|t| &t.worktree_id == primary)
+            .filter_map(|t| {
+                let sref = SessionRef::Terminal(t.id.clone());
+                self.is_alive(&sref).then(|| Occupant {
+                    sref,
+                    name: t.name.clone(),
+                    status: None,
+                })
+            });
+        Ok(agents
+            .chain(terminals)
+            .filter(|o| Some(&o.sref) != mover)
+            .collect())
+    }
+
+    fn stamp_branch(&self, sref: &SessionRef, branch: &str) -> Result<()> {
+        match sref {
+            SessionRef::Agent(id) => {
+                if self
+                    .store
+                    .get_agent(id)?
+                    .is_some_and(|a| a.branch.is_none())
+                {
+                    self.store.set_agent_branch(id, Some(branch))?;
+                }
+            }
+            SessionRef::Terminal(id) => {
+                if self
+                    .store
+                    .get_terminal(id)?
+                    .is_some_and(|t| t.branch.is_none())
+                {
+                    self.store.set_terminal_branch(id, Some(branch))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn publish_session_end(&self, sref: &SessionRef, end: SessionEnd) {
+        match (sref, end) {
+            (SessionRef::Agent(id), SessionEnd::Exited(exit_code)) => {
+                self.apply_hook_event(id, HookEvent::SessionEnded { exit_code }, None);
+            }
+            (SessionRef::Agent(id), SessionEnd::Parked) => {
+                self.apply_hook_event(id, HookEvent::Parked, None);
+            }
+            (SessionRef::Terminal(id), _) => self.clear_terminal_status(id),
+        }
+        let upsert = match sref {
+            SessionRef::Agent(id) => self.agent_entity(id).map(Entity::Agent),
+            SessionRef::Terminal(id) => self.terminal_entity(id).map(Entity::Terminal),
+        };
+        if let Ok(entity) = upsert {
+            self.broadcast(ServerEvent::EntityUpserted { entity });
+        }
     }
 
     /// Refuse to invalidate any live PTY, including finished agents and warm sessions.
@@ -2077,11 +2283,15 @@ impl Daemon {
         model: &Option<String>,
         effort: &Option<String>,
     ) -> Option<PrewarmEntry> {
-        let entry = self
-            .prewarmed
-            .lock()
-            .unwrap()
-            .remove(&(worktree_id.clone(), kind))?;
+        let key = (worktree_id.clone(), kind);
+        let entry = {
+            let mut pool = self.prewarmed.lock().unwrap();
+            let sref = SessionRef::Agent(pool.get(&key)?.agent_id.clone());
+            if self.session(&sref).is_some_and(|s| s.was_killed()) {
+                return None;
+            }
+            pool.remove(&key)?
+        };
         if !self.is_alive(&SessionRef::Agent(entry.agent_id.clone())) {
             return None;
         }
@@ -2137,12 +2347,24 @@ impl Daemon {
         }
     }
 
+    fn prewarmed_in(&self, worktree: &WorktreeId) -> Vec<(SessionRef, Arc<PtySession>)> {
+        let pool = self.prewarmed.lock().unwrap();
+        pool.iter()
+            .filter(|((w, _), _)| w == worktree)
+            .filter_map(|(_, e)| {
+                let sref = SessionRef::Agent(e.agent_id.clone());
+                let session = self.session(&sref)?;
+                Some((sref, session))
+            })
+            .collect()
+    }
+
     /// Is the kind's CLI on the user's PATH (as their login shell sees it)?
     /// Cached: hits for an hour, misses for a minute so a just-installed CLI
     /// gets picked up quickly. Probe trouble (timeout, spawn error) fails
     /// open — a doomed warm spawn is still graceful.
     async fn cli_available(&self, kind: AgentKind) -> bool {
-        if std::env::var("NEBULA_AGENT_CMD").is_ok() {
+        if self.agent_cmd_override.is_some() {
             return true; // test override is spawned verbatim
         }
         const OK_TTL: Duration = Duration::from_secs(3600);
@@ -2578,10 +2800,8 @@ impl Daemon {
         self.validate_execution_branch(&worktree, agent.branch.as_deref())?;
         self.kill_session(&SessionRef::Agent(id.clone()));
         self.spawn_agent_session(&agent, &worktree, 80, 24)?;
-        let mut broadcast_agent = agent.clone();
-        broadcast_agent.alive = true;
         self.broadcast(ServerEvent::EntityUpserted {
-            entity: Entity::Agent(broadcast_agent),
+            entity: Entity::Agent(self.agent_entity(id)?),
         });
         Ok(())
     }
@@ -2839,10 +3059,8 @@ impl Daemon {
                     .get_worktree(&agent.worktree_id)?
                     .context("worktree not found")?;
                 let session = self.spawn_agent_session(&agent, &worktree, cols, rows)?;
-                let mut broadcast_agent = agent;
-                broadcast_agent.alive = true;
                 self.broadcast(ServerEvent::EntityUpserted {
-                    entity: Entity::Agent(broadcast_agent),
+                    entity: Entity::Agent(self.agent_entity(id)?),
                 });
                 Ok(session)
             }
@@ -2928,14 +3146,13 @@ impl Daemon {
             tracing::warn!(error = %e, cwd = %worktree.path.display(), "hook install failed");
         }
 
-        // NEBULA_AGENT_CMD overrides for tests; default is the kind's CLI.
-        let cmd_override = std::env::var("NEBULA_AGENT_CMD").ok();
+        let cmd_override = self.agent_cmd_override.as_deref();
         let (program, args, resumed) = agent_spawn_command(
             agent.kind,
             agent.session_id.as_deref(),
             agent.model.as_deref(),
             agent.effort.as_deref(),
-            cmd_override.as_deref(),
+            cmd_override,
             initial_prompt,
         );
         let hook_env = self.hook_env_pairs(&agent.id.to_string());
@@ -2993,12 +3210,9 @@ impl Daemon {
                 }
             })
             .await;
-            if early_exit != Ok(true) {
+            if early_exit != Ok(true) || session.was_killed() {
                 return;
             }
-            // A deliberate kill looks identical to a failed resume from here:
-            // the agent may have been archived or deleted inside the window —
-            // never resurrect those.
             match daemon.store.get_agent(&agent.id) {
                 Ok(Some(current)) if !current.archived => {}
                 _ => return,
@@ -3016,12 +3230,15 @@ impl Daemon {
             let _ = daemon.store.set_agent_session_id(&agent.id, None);
             let mut fresh = agent.clone();
             fresh.session_id = None;
-            if let Ok(_session) = daemon.spawn_agent_session(&fresh, &worktree, cols, rows) {
-                let mut broadcast_agent = fresh;
-                broadcast_agent.alive = true;
-                daemon.broadcast(ServerEvent::EntityUpserted {
-                    entity: Entity::Agent(broadcast_agent),
-                });
+            if daemon
+                .spawn_agent_session(&fresh, &worktree, cols, rows)
+                .is_ok()
+            {
+                if let Ok(agent) = daemon.agent_entity(&fresh.id) {
+                    daemon.broadcast(ServerEvent::EntityUpserted {
+                        entity: Entity::Agent(agent),
+                    });
+                }
             }
         });
     }
@@ -3070,6 +3287,11 @@ impl Daemon {
     }
 
     fn install_session(self: &Arc<Self>, session: Arc<PtySession>) {
+        if let SessionRef::Agent(id) = &session.sref {
+            if matches!(self.store.get_agent(id), Ok(Some(_))) {
+                self.apply_hook_event(id, HookEvent::PtySpawned, None);
+            }
+        }
         self.touch_session(&session.sref);
         self.sessions
             .lock()
@@ -3088,46 +3310,14 @@ impl Daemon {
             loop {
                 match rx.recv().await {
                     Ok(PtyEvent::Exited { exit_code }) => {
-                        // Deliberate kills (archive/restart/delete) remove the
-                        // entry first — only a *natural* death of the still-
-                        // registered session drives status, so a restart never
-                        // flags the fresh PTY's agent as terminated.
-                        let was_registered = {
-                            let mut sessions = daemon.sessions.lock().unwrap();
-                            match sessions.get(&sref) {
-                                Some(current) if Arc::ptr_eq(current, &session) => {
-                                    sessions.remove(&sref);
-                                    true
-                                }
-                                _ => false,
-                            }
-                        };
-                        if was_registered {
-                            daemon.session_interest.lock().unwrap().remove(&sref);
+                        if session.was_killed() {
+                            daemon.wait_for_checkout_switch().await;
                         }
-                        if !was_registered {
+                        if !daemon.unregister_if_current(&sref, &session) {
                             break;
                         }
                         tracing::info!(session = ?sref, exit_code, "session exited");
-                        if let SessionRef::Agent(id) = &sref {
-                            daemon.apply_hook_event(
-                                id,
-                                HookEvent::SessionEnded { exit_code },
-                                None,
-                            );
-                        }
-                        if let SessionRef::Terminal(id) = &sref {
-                            daemon.clear_terminal_status(id);
-                        }
-                        let upsert = match &sref {
-                            SessionRef::Agent(id) => daemon.agent_entity(id).map(Entity::Agent),
-                            SessionRef::Terminal(id) => {
-                                daemon.terminal_entity(id).map(Entity::Terminal)
-                            }
-                        };
-                        if let Ok(entity) = upsert {
-                            daemon.broadcast(ServerEvent::EntityUpserted { entity });
-                        }
+                        daemon.publish_session_end(&sref, SessionEnd::Exited(exit_code));
                         break;
                     }
                     // The CLI's own busy/idle bit, read off its output. It is
@@ -3315,6 +3505,66 @@ pub fn process_cwd(pid: u32) -> Option<std::path::PathBuf> {
 
 fn canonical_or_raw(path: &Path) -> std::path::PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// What `Daemon::with_overrides` changes from `Daemon::new`.
+pub struct DaemonOverrides {
+    /// How long a primary switch waits, in total, for the PTY children it stopped to exit.
+    pub stop_deadline: Duration,
+    /// Spawned, split on whitespace, in place of every agent CLI.
+    pub agent_cmd: Option<String>,
+}
+
+impl Default for DaemonOverrides {
+    fn default() -> Self {
+        Self {
+            stop_deadline: crate::pty::STOP_DEADLINE,
+            agent_cmd: None,
+        }
+    }
+}
+
+struct Stop {
+    sref: SessionRef,
+    label: String,
+    session: Arc<PtySession>,
+    kind: StopKind,
+}
+
+enum StopKind {
+    Park,
+    Warm,
+}
+
+fn child_running(session: &PtySession) -> bool {
+    session.child_pid.is_some_and(|pid| {
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid as i32), None)
+            != Err(nix::errno::Errno::ESRCH)
+    })
+}
+
+enum SessionEnd {
+    Exited(Option<i32>),
+    Parked,
+}
+
+struct Occupant {
+    sref: SessionRef,
+    name: String,
+    status: Option<AgentStatus>,
+}
+
+impl Occupant {
+    fn describe(&self) -> String {
+        match self.status {
+            Some(status) => format!(
+                "{} (agent, {})",
+                self.name,
+                status.as_str().replace('_', " ")
+            ),
+            None => format!("{} (terminal)", self.name),
+        }
+    }
 }
 
 /// Does this terminal's shell have any child processes (a command or job
@@ -3688,13 +3938,24 @@ mod tests {
     }
 
     fn test_daemon() -> Arc<Daemon> {
-        let store = Arc::new(Store::open_in_memory().unwrap());
-        Daemon::new(
-            store,
+        test_daemon_with(DaemonOverrides::default())
+    }
+
+    fn test_daemon_stopping(stop_deadline: Duration) -> Arc<Daemon> {
+        test_daemon_with(DaemonOverrides {
+            stop_deadline,
+            ..DaemonOverrides::default()
+        })
+    }
+
+    fn test_daemon_with(overrides: DaemonOverrides) -> Arc<Daemon> {
+        Daemon::with_overrides(
+            Arc::new(Store::open_in_memory().unwrap()),
             HookEnv {
                 port: 0,
                 token: String::new(),
             },
+            overrides,
         )
     }
 
@@ -4507,13 +4768,18 @@ mod tests {
         assert!(git::checkout(&repo, "feat").await.is_err());
 
         seed_agent(&daemon, "stopped", parked.id.as_str(), Some("conversation"));
+        seed_terminal(&daemon, "idle", "root");
+        let idle = SessionRef::Terminal(TerminalId("idle".into()));
+        spawn_live(&daemon, idle.clone(), &repo, "exec sleep 60");
         let err = daemon
-            .checkout_primary(&pid, "feat", None)
+            .checkout_primary(&pid, "feat", None, false)
             .await
             .unwrap_err();
         assert!(err
             .to_string()
             .contains("Explicitly select it with --worktree"));
+        assert!(daemon.is_alive(&idle), "the parked refusal stops nothing");
+        daemon.kill_session(&idle);
         let ServerEvent::Snapshot {
             worktrees, agents, ..
         } = daemon.snapshot().unwrap()
@@ -4531,7 +4797,10 @@ mod tests {
         assert_eq!(git::current_branch(&repo).await.unwrap(), "main");
 
         // Unknown branch: refused, nothing touched.
-        assert!(daemon.checkout_primary(&pid, "nope", None).await.is_err());
+        assert!(daemon
+            .checkout_primary(&pid, "nope", None, false)
+            .await
+            .is_err());
 
         // A branch that only origin has (pushed from another machine) is
         // fetched into place and checked out — the "run on findl from a
@@ -4553,11 +4822,14 @@ mod tests {
         );
         git_in(&origin, &["branch", "pushed", "main"]);
         assert!(!git::branch_exists(&repo, "pushed").await);
-        daemon.checkout_primary(&pid, "pushed", None).await.unwrap();
+        daemon
+            .checkout_primary(&pid, "pushed", None, false)
+            .await
+            .unwrap();
         assert_eq!(git::current_branch(&repo).await.unwrap(), "pushed");
         // Still unknown everywhere: the error says what to do.
         let err = daemon
-            .checkout_primary(&pid, "nope", None)
+            .checkout_primary(&pid, "nope", None, false)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("push it first"), "{err}");
@@ -4624,7 +4896,7 @@ mod tests {
 
         let mover = SessionRef::Agent(AgentId("mover".into()));
         daemon
-            .checkout_primary(&pid, "feat", Some(&mover))
+            .checkout_primary(&pid, "feat", Some(&mover), false)
             .await
             .unwrap();
 
@@ -4660,7 +4932,10 @@ mod tests {
             "the primary records the branch it was cut from"
         );
 
-        daemon.checkout_primary(&pid, "main", None).await.unwrap();
+        daemon
+            .checkout_primary(&pid, "main", None, false)
+            .await
+            .unwrap();
         let main = daemon
             .store
             .get_worktree(&WorktreeId("root".into()))
@@ -4676,6 +4951,727 @@ mod tests {
             Some("feat"),
             "no mover this time"
         );
+    }
+
+    async fn primary_with_feat() -> (tempfile::TempDir, PathBuf, Arc<Daemon>, ProjectId, Worktree) {
+        primary_with_feat_on(test_daemon()).await
+    }
+
+    async fn primary_with_feat_on(
+        daemon: Arc<Daemon>,
+    ) -> (tempfile::TempDir, PathBuf, Arc<Daemon>, ProjectId, Worktree) {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = std::fs::canonicalize(tmp.path()).unwrap().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-b", "main"]);
+        std::fs::write(repo.join("README.md"), "main\n").unwrap();
+        std::fs::write(repo.join("lib.rs"), "main\n").unwrap();
+        git_in(&repo, &["add", "."]);
+        git_in(&repo, &["commit", "-m", "init"]);
+        git_in(&repo, &["checkout", "-b", "feat"]);
+        std::fs::write(repo.join("notes.txt"), "feat\n").unwrap();
+        git_in(&repo, &["add", "notes.txt"]);
+        git_in(&repo, &["commit", "-m", "notes"]);
+        git_in(&repo, &["checkout", "main"]);
+        let EntityId::Project(pid) = daemon.add_project(&repo, None, false, None).await.unwrap()
+        else {
+            panic!()
+        };
+        let (_, worktrees, _, _) = daemon.store.load_tree().unwrap();
+        let primary = worktrees.into_iter().find(|w| w.is_main).unwrap();
+        (tmp, repo, daemon, pid, primary)
+    }
+
+    fn spawn_live(daemon: &Arc<Daemon>, sref: SessionRef, cwd: &Path, script: &str) -> u32 {
+        let session = PtySession::spawn(
+            sref,
+            SpawnSpec {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), script.into()],
+                cwd: cwd.to_path_buf(),
+                env: Vec::new(),
+                scrub_env: Vec::new(),
+                cols: 80,
+                rows: 24,
+            },
+        )
+        .unwrap();
+        let pid = session.child_pid.unwrap();
+        daemon.install_session(session);
+        pid
+    }
+
+    async fn process_exits(pid: u32) -> bool {
+        for _ in 0..50 {
+            let alive = std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success();
+            if !alive {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn a_dirty_primary_refuses_the_switch_before_stopping_anything() {
+        let (_tmp, repo, daemon, pid, primary) = primary_with_feat().await;
+        seed_terminal(&daemon, "shell", primary.id.as_str());
+        let shell = SessionRef::Terminal(TerminalId("shell".into()));
+        spawn_live(&daemon, shell.clone(), &repo, "exec sleep 60");
+        std::fs::write(repo.join("README.md"), "edited\n").unwrap();
+        std::fs::write(repo.join("lib.rs"), "staged\n").unwrap();
+        git_in(&repo, &["add", "lib.rs"]);
+        std::fs::write(repo.join("scratch.txt"), "untracked\n").unwrap();
+
+        let err = daemon
+            .checkout_primary(&pid, "feat", None, true)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "primary has 2 uncommitted files on \"main\"; commit them before switching to \"feat\""
+        );
+        assert_eq!(git::current_branch(&repo).await.unwrap(), "main");
+        assert!(daemon.is_alive(&shell));
+        daemon.kill_session(&shell);
+    }
+
+    #[tokio::test]
+    async fn an_untracked_file_the_target_tracks_refuses_the_switch_before_stopping_anything() {
+        let (_tmp, repo, daemon, pid, primary) = primary_with_feat().await;
+        seed_terminal(&daemon, "shell", primary.id.as_str());
+        let shell = SessionRef::Terminal(TerminalId("shell".into()));
+        spawn_live(&daemon, shell.clone(), &repo, "exec sleep 60");
+        std::fs::write(repo.join("notes.txt"), "mine\n").unwrap();
+
+        let err = daemon
+            .checkout_primary(&pid, "feat", None, true)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "untracked \"notes.txt\" in primary would be overwritten by \"feat\"; move or commit it before switching"
+        );
+        assert_eq!(git::current_branch(&repo).await.unwrap(), "main");
+        assert_eq!(
+            std::fs::read_to_string(repo.join("notes.txt")).unwrap(),
+            "mine\n"
+        );
+        assert!(daemon.is_alive(&shell));
+        daemon.kill_session(&shell);
+    }
+
+    #[tokio::test]
+    async fn an_untracked_path_colliding_with_a_target_directory_or_file_refuses_before_stopping_anything(
+    ) {
+        for (target, tracked, untracked) in [
+            ("dir-target", "assets/icon.png", "assets"),
+            ("file-target", "assets", "assets/local.txt"),
+        ] {
+            let (_tmp, repo, daemon, pid, primary) = primary_with_feat().await;
+            git_in(&repo, &["checkout", "-b", target]);
+            let tracked_path = repo.join(tracked);
+            std::fs::create_dir_all(tracked_path.parent().unwrap()).unwrap();
+            std::fs::write(&tracked_path, "tracked\n").unwrap();
+            git_in(&repo, &["add", tracked]);
+            git_in(&repo, &["commit", "-m", target]);
+            git_in(&repo, &["checkout", "main"]);
+            let untracked_path = repo.join(untracked);
+            std::fs::create_dir_all(untracked_path.parent().unwrap()).unwrap();
+            std::fs::write(&untracked_path, "mine\n").unwrap();
+            seed_terminal(&daemon, "shell", primary.id.as_str());
+            let shell = SessionRef::Terminal(TerminalId("shell".into()));
+            spawn_live(&daemon, shell.clone(), &repo, "exec sleep 60");
+
+            let err = daemon
+                .checkout_primary(&pid, target, None, true)
+                .await
+                .unwrap_err();
+
+            assert_eq!(
+                err.to_string(),
+                format!("untracked \"assets\" in primary would be overwritten by \"{target}\"; move or commit it before switching")
+            );
+            assert_eq!(git::current_branch(&repo).await.unwrap(), "main");
+            assert_eq!(std::fs::read_to_string(&untracked_path).unwrap(), "mine\n");
+            assert!(
+                daemon.is_alive(&shell),
+                "{target}: the shell survives the refusal"
+            );
+            daemon.kill_session(&shell);
+        }
+    }
+
+    async fn until_running_sleep(pid: u32) {
+        for _ in 0..50 {
+            let out = std::process::Command::new("ps")
+                .args(["-o", "comm=", "-p", &pid.to_string()])
+                .output()
+                .unwrap();
+            if String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .ends_with("sleep")
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("{pid} never reached its sleep");
+    }
+
+    fn process_alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    #[tokio::test]
+    async fn the_checkout_waits_until_a_session_ignoring_hangup_is_gone() {
+        let (_tmp, repo, daemon, pid, primary) = primary_with_feat().await;
+        seed_terminal(&daemon, "stubborn", primary.id.as_str());
+        let shell = SessionRef::Terminal(TerminalId("stubborn".into()));
+        let shell_pid = spawn_live(&daemon, shell, &repo, "trap '' HUP; exec sleep 60");
+
+        daemon
+            .checkout_primary(&pid, "feat", None, true)
+            .await
+            .unwrap();
+
+        assert!(
+            !process_alive(shell_pid),
+            "checked out while the session still ran"
+        );
+        assert_eq!(git::current_branch(&repo).await.unwrap(), "feat");
+    }
+
+    #[tokio::test]
+    async fn parking_a_just_resumed_agent_keeps_its_conversation() {
+        let (_tmp, repo, daemon, _pid, primary) = primary_with_feat().await;
+        seed_agent(
+            &daemon,
+            "resumed",
+            primary.id.as_str(),
+            Some("conversation"),
+        );
+        let id = AgentId("resumed".into());
+        daemon.store.set_agent_branch(&id, Some("main")).unwrap();
+        let agent = SessionRef::Agent(id.clone());
+        spawn_live(&daemon, agent.clone(), &repo, "exec sleep 60");
+        let row = daemon.store.get_agent(&id).unwrap().unwrap();
+        daemon.arm_resume_fallback(row, primary, daemon.session(&agent).unwrap(), 80, 24);
+
+        daemon.kill_session(&agent);
+        daemon.publish_session_end(&agent, SessionEnd::Parked);
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+
+        let ServerEvent::Snapshot { agents, .. } = daemon.snapshot().unwrap() else {
+            panic!()
+        };
+        daemon.kill_all();
+        let resumed = agents.iter().find(|a| a.id == id).unwrap();
+        assert_eq!(resumed.session_id.as_deref(), Some("conversation"));
+    }
+
+    fn agent_status(daemon: &Daemon, id: &str) -> AgentStatus {
+        let ServerEvent::Snapshot { agents, .. } = daemon.snapshot().unwrap() else {
+            panic!()
+        };
+        agents.iter().find(|a| a.id.as_str() == id).unwrap().status
+    }
+
+    #[tokio::test]
+    async fn a_parked_busy_agent_reads_stopped_and_counts_as_busy_again_once_resumed() {
+        let (_tmp, repo, daemon, pid, primary) = primary_with_feat().await;
+        seed_agent(&daemon, "runner", primary.id.as_str(), Some("conversation"));
+        let agent = SessionRef::Agent(AgentId("runner".into()));
+        spawn_live(&daemon, agent.clone(), &repo, "exec sleep 60");
+
+        daemon
+            .checkout_primary(&pid, "feat", None, true)
+            .await
+            .unwrap();
+        assert_eq!(agent_status(&daemon, "runner"), AgentStatus::Disconnected);
+
+        daemon
+            .checkout_primary(&pid, "main", None, false)
+            .await
+            .unwrap();
+        spawn_live(&daemon, agent.clone(), &repo, "exec sleep 60");
+        daemon.apply_hook_event(
+            &AgentId("runner".into()),
+            HookEvent::Progress { busy: true },
+            None,
+        );
+        assert_eq!(agent_status(&daemon, "runner"), AgentStatus::Running);
+        daemon.kill_all();
+    }
+
+    #[tokio::test]
+    async fn a_survivor_that_exits_after_the_timeout_ends_as_a_natural_exit_and_is_resumable() {
+        let (_tmp, repo, daemon, pid, primary) =
+            primary_with_feat_on(test_daemon_stopping(Duration::from_millis(500))).await;
+        seed_agent(&daemon, "runner", primary.id.as_str(), Some("conversation"));
+        seed_terminal(&daemon, "shell", primary.id.as_str());
+        let agent = SessionRef::Agent(AgentId("runner".into()));
+        let shell = SessionRef::Terminal(TerminalId("shell".into()));
+        spawn_live(&daemon, agent.clone(), &repo, "trap '' HUP; exec sleep 1.5");
+        spawn_live(&daemon, shell.clone(), &repo, "trap '' HUP; exec sleep 1.5");
+        let dead = daemon.session(&shell).unwrap();
+
+        let err = daemon
+            .checkout_primary(&pid, "feat", None, true)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .ends_with("still running; primary stays on \"main\""),
+            "{err}"
+        );
+
+        for _ in 0..50 {
+            if !daemon.is_alive(&agent) && !daemon.is_alive(&shell) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let ServerEvent::Snapshot {
+            agents, terminals, ..
+        } = daemon.snapshot().unwrap()
+        else {
+            panic!()
+        };
+        let runner = agents.iter().find(|a| a.id.as_str() == "runner").unwrap();
+        assert!(!runner.alive, "the exited survivor no longer reads alive");
+        assert_eq!(runner.status, AgentStatus::Finished);
+        assert_eq!(runner.branch.as_deref(), Some("main"));
+        assert_eq!(runner.session_id.as_deref(), Some("conversation"));
+        let tab = terminals.iter().find(|t| t.id.as_str() == "shell").unwrap();
+        assert!(!tab.alive);
+        assert_eq!(tab.branch.as_deref(), Some("main"));
+        let resumed = daemon.ensure_session(&shell, 80, 24).unwrap();
+        assert!(!Arc::ptr_eq(&dead, &resumed), "resume spawns a new PTY");
+        assert!(daemon.is_alive(&shell));
+        daemon.kill_all();
+    }
+
+    fn stand_in_agent(stubborn_spawns: &[usize]) -> (tempfile::TempDir, Option<String>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.sh");
+        let stubborn: Vec<String> = stubborn_spawns.iter().map(|n| n.to_string()).collect();
+        let script = format!(
+            r#"d=$(dirname "$0"); i=1
+while ! mkdir "$d/spawn-$i" 2>/dev/null; do i=$((i+1)); done
+case " {} " in *" $i "*) trap '' HUP; exec sleep 2;; esac
+exec sleep 60
+"#,
+            stubborn.join(" ")
+        );
+        std::fs::write(&path, script).unwrap();
+        let cmd = format!("/bin/sh {}", path.display());
+        (dir, Some(cmd))
+    }
+
+    fn pid_of(daemon: &Daemon, sref: &SessionRef) -> Option<u32> {
+        daemon
+            .session_pids()
+            .into_iter()
+            .find_map(|(s, pid)| (&s == sref).then_some(pid))
+    }
+
+    async fn warm_pid(daemon: &Arc<Daemon>, primary: &WorktreeId) -> u32 {
+        daemon
+            .prewarm_agent(primary, AgentKind::Claude, None, None)
+            .await
+            .unwrap();
+        let pids = daemon.session_pids();
+        assert_eq!(pids.len(), 1, "one warm PTY: {pids:?}");
+        until_running_sleep(pids[0].1).await;
+        pids[0].1
+    }
+
+    async fn create_on(daemon: &Arc<Daemon>, primary: &WorktreeId, name: &str) -> SessionRef {
+        let EntityId::Agent(id) = daemon
+            .create_agent(
+                primary,
+                None,
+                name,
+                AgentKind::Claude,
+                None,
+                None,
+                false,
+                None,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        SessionRef::Agent(id)
+    }
+
+    #[tokio::test]
+    async fn a_healthy_warm_pty_is_adopted_and_a_timed_out_one_is_waited_for_by_the_retry() {
+        let (_script, agent) = stand_in_agent(&[2]);
+        let (_tmp, repo, daemon, pid, primary) =
+            primary_with_feat_on(test_daemon_with(DaemonOverrides {
+                stop_deadline: Duration::from_millis(1500),
+                agent_cmd: agent,
+                ..DaemonOverrides::default()
+            }))
+            .await;
+
+        let healthy = warm_pid(&daemon, &primary.id).await;
+        let adopted = create_on(&daemon, &primary.id, "adopted").await;
+        assert_eq!(
+            pid_of(&daemon, &adopted),
+            Some(healthy),
+            "the warm PTY was adopted"
+        );
+        daemon.kill_session(&adopted);
+
+        let stopping = warm_pid(&daemon, &primary.id).await;
+        let err = daemon
+            .checkout_primary(&pid, "feat", None, false)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "a warm agent PTY still running; primary stays on \"main\""
+        );
+        let cold = create_on(&daemon, &primary.id, "cold").await;
+        assert_ne!(
+            pid_of(&daemon, &cold),
+            Some(stopping),
+            "adopted a PTY being stopped"
+        );
+        daemon.kill_session(&cold);
+
+        daemon
+            .checkout_primary(&pid, "feat", None, false)
+            .await
+            .unwrap();
+        assert!(
+            !process_alive(stopping),
+            "the retry waited for the warm PTY"
+        );
+        assert_eq!(git::current_branch(&repo).await.unwrap(), "feat");
+    }
+
+    #[tokio::test]
+    async fn a_resume_that_falls_back_publishes_the_respawned_agent() {
+        let (_script, agent) = stand_in_agent(&[]);
+        let (_tmp, repo, daemon, _pid, primary) =
+            primary_with_feat_on(test_daemon_with(DaemonOverrides {
+                agent_cmd: agent,
+                ..DaemonOverrides::default()
+            }))
+            .await;
+        seed_agent(&daemon, "stale", primary.id.as_str(), Some("gone"));
+        let id = AgentId("stale".into());
+        daemon
+            .store
+            .set_agent_status(&id, AgentStatus::Disconnected)
+            .unwrap();
+        let row = daemon.store.get_agent(&id).unwrap().unwrap();
+        let agent = SessionRef::Agent(id.clone());
+        spawn_live(&daemon, agent.clone(), &repo, "sleep 0.3; exit 1");
+        let mut events = daemon.events.subscribe();
+        daemon.arm_resume_fallback(row, primary, daemon.session(&agent).unwrap(), 80, 24);
+
+        let upsert = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(ServerEvent::EntityUpserted {
+                    entity: Entity::Agent(a),
+                }) = events.recv().await
+                {
+                    if a.id == id && a.alive {
+                        return (a.status, a.alive);
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the fallback respawned the agent");
+        daemon.kill_all();
+        assert_eq!(upsert, (AgentStatus::Fresh, true));
+    }
+
+    #[tokio::test]
+    async fn a_stopped_session_reaches_subscribers_as_parked_and_not_alive() {
+        let (_tmp, repo, daemon, pid, primary) = primary_with_feat().await;
+        seed_agent(&daemon, "runner", primary.id.as_str(), Some("conversation"));
+        seed_terminal(&daemon, "shell", primary.id.as_str());
+        spawn_live(
+            &daemon,
+            SessionRef::Agent(AgentId("runner".into())),
+            &repo,
+            "exec sleep 60",
+        );
+        spawn_live(
+            &daemon,
+            SessionRef::Terminal(TerminalId("shell".into())),
+            &repo,
+            "exec sleep 60",
+        );
+        let mut events = daemon.events.subscribe();
+
+        daemon
+            .checkout_primary(&pid, "feat", None, true)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let (mut agent, mut tab, mut statuses) = (None, None, Vec::new());
+        while let Ok(event) = events.try_recv() {
+            match event {
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Agent(a),
+                } if a.id.as_str() == "runner" => agent = Some((a.alive, a.status)),
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Terminal(t),
+                } if t.id.as_str() == "shell" => tab = Some(t.alive),
+                ServerEvent::StatusChanged { agent, status, .. } if agent.as_str() == "runner" => {
+                    statuses.push(status)
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(agent, Some((false, AgentStatus::Disconnected)));
+        assert_eq!(tab, Some(false));
+        assert_eq!(statuses, [AgentStatus::Disconnected]);
+    }
+
+    #[tokio::test]
+    async fn a_session_outlasting_the_deadline_refuses_the_switch_and_the_others_are_still_parked()
+    {
+        let (_tmp, repo, daemon, pid, primary) =
+            primary_with_feat_on(test_daemon_stopping(Duration::from_secs(1))).await;
+        seed_agent(&daemon, "done", primary.id.as_str(), Some("conversation"));
+        daemon
+            .store
+            .set_agent_status(&AgentId("done".into()), AgentStatus::Finished)
+            .unwrap();
+        seed_terminal(&daemon, "stubborn", primary.id.as_str());
+        let done = SessionRef::Agent(AgentId("done".into()));
+        let stubborn = SessionRef::Terminal(TerminalId("stubborn".into()));
+        spawn_live(&daemon, done.clone(), &repo, "exec sleep 60");
+        let stubborn_pid = spawn_live(
+            &daemon,
+            stubborn.clone(),
+            &repo,
+            "trap '' HUP; exec sleep 1.5",
+        );
+
+        let err = daemon
+            .checkout_primary(&pid, "feat", None, true)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "stubborn (terminal) still running; primary stays on \"main\""
+        );
+        assert_eq!(git::current_branch(&repo).await.unwrap(), "main");
+        let ServerEvent::Snapshot {
+            agents, terminals, ..
+        } = daemon.snapshot().unwrap()
+        else {
+            panic!()
+        };
+        let parked = agents.iter().find(|a| a.id.as_str() == "done").unwrap();
+        assert!(!parked.alive);
+        assert_eq!(parked.branch.as_deref(), Some("main"));
+        let survivor = terminals
+            .iter()
+            .find(|t| t.id.as_str() == "stubborn")
+            .unwrap();
+        assert!(survivor.alive, "a survivor stays visible as alive");
+
+        daemon
+            .checkout_primary(&pid, "feat", None, true)
+            .await
+            .unwrap();
+        assert!(
+            !process_alive(stubborn_pid),
+            "the retry waited for the survivor"
+        );
+        assert_eq!(git::current_branch(&repo).await.unwrap(), "feat");
+    }
+
+    #[tokio::test]
+    async fn every_parked_agent_reads_stopped_and_ignores_late_hooks_until_respawned() {
+        let (_tmp, repo, daemon, pid, primary) = primary_with_feat().await;
+        for (id, status) in [
+            ("fresh", AgentStatus::Fresh),
+            ("done", AgentStatus::Finished),
+        ] {
+            seed_agent(&daemon, id, primary.id.as_str(), Some(id));
+            daemon
+                .store
+                .set_agent_status(&AgentId(id.into()), status)
+                .unwrap();
+            spawn_live(
+                &daemon,
+                SessionRef::Agent(AgentId(id.into())),
+                &repo,
+                "exec sleep 60",
+            );
+        }
+
+        daemon
+            .checkout_primary(&pid, "feat", None, true)
+            .await
+            .unwrap();
+
+        for id in ["fresh", "done"] {
+            assert_eq!(agent_status(&daemon, id), AgentStatus::Disconnected, "{id}");
+            for late in [
+                HookEvent::UserPromptSubmit,
+                HookEvent::PermissionRequest,
+                HookEvent::Stop,
+            ] {
+                daemon.apply_hook_event(&AgentId(id.into()), late.clone(), Some(id.into()));
+                assert_eq!(
+                    agent_status(&daemon, id),
+                    AgentStatus::Disconnected,
+                    "{id} after a late {late:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_finished_agent_and_an_idle_shell_need_confirmation_and_stay_on_their_branch() {
+        let (_tmp, repo, daemon, pid, primary) = primary_with_feat().await;
+        seed_agent(&daemon, "done", primary.id.as_str(), Some("conversation"));
+        daemon
+            .store
+            .set_agent_status(&AgentId("done".into()), AgentStatus::Finished)
+            .unwrap();
+        seed_terminal(&daemon, "shell", primary.id.as_str());
+        let agent = SessionRef::Agent(AgentId("done".into()));
+        let shell = SessionRef::Terminal(TerminalId("shell".into()));
+        let agent_pid = spawn_live(&daemon, agent.clone(), &repo, "exec sleep 60");
+        let shell_pid = spawn_live(&daemon, shell.clone(), &repo, "exec sleep 60");
+
+        let err = daemon
+            .checkout_primary(&pid, "feat", None, false)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "primary has sessions on \"main\"; switching to \"feat\" stops done (agent, finished), shell (terminal)"
+        );
+        assert!(daemon.is_alive(&agent) && daemon.is_alive(&shell));
+        daemon
+            .checkout_primary(&pid, "feat", None, true)
+            .await
+            .unwrap();
+
+        assert_eq!(git::current_branch(&repo).await.unwrap(), "feat");
+        assert!(!daemon.is_alive(&agent) && !daemon.is_alive(&shell));
+        assert!(
+            process_exits(agent_pid).await,
+            "agent process still running"
+        );
+        assert!(
+            process_exits(shell_pid).await,
+            "shell process still running"
+        );
+        let ServerEvent::Snapshot {
+            agents, terminals, ..
+        } = daemon.snapshot().unwrap()
+        else {
+            panic!()
+        };
+        let done = agents.iter().find(|a| a.id.as_str() == "done").unwrap();
+        assert_eq!(done.branch.as_deref(), Some("main"));
+        assert_eq!(done.session_id.as_deref(), Some("conversation"));
+        assert!(!done.archived && !done.alive);
+        let tab = terminals.iter().find(|t| t.id.as_str() == "shell").unwrap();
+        assert_eq!(tab.branch.as_deref(), Some("main"));
+        assert!(!tab.alive);
+    }
+
+    #[tokio::test]
+    async fn a_shell_running_a_command_needs_confirmation_before_the_switch() {
+        let (_tmp, repo, daemon, pid, primary) = primary_with_feat().await;
+        seed_terminal(&daemon, "build", primary.id.as_str());
+        let shell = SessionRef::Terminal(TerminalId("build".into()));
+        let shell_pid = spawn_live(&daemon, shell.clone(), &repo, "sleep 60; true");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let err = daemon
+            .checkout_primary(&pid, "feat", None, false)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "primary has sessions on \"main\"; switching to \"feat\" stops build (terminal)"
+        );
+        assert!(daemon.is_alive(&shell));
+
+        daemon
+            .checkout_primary(&pid, "feat", None, true)
+            .await
+            .unwrap();
+        assert!(!process_alive(shell_pid));
+        assert_eq!(git::current_branch(&repo).await.unwrap(), "feat");
+    }
+
+    #[tokio::test]
+    async fn a_running_agent_needs_confirmation_before_the_switch() {
+        let (_tmp, repo, daemon, pid, primary) = primary_with_feat().await;
+        seed_agent(&daemon, "runner", primary.id.as_str(), Some("conversation"));
+        let agent = SessionRef::Agent(AgentId("runner".into()));
+        let agent_pid = spawn_live(&daemon, agent.clone(), &repo, "exec sleep 60");
+        seed_terminal(&daemon, "shell", primary.id.as_str());
+        let shell = SessionRef::Terminal(TerminalId("shell".into()));
+        spawn_live(&daemon, shell.clone(), &repo, "exec sleep 60");
+
+        let err = daemon
+            .checkout_primary(&pid, "feat", None, false)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "primary has sessions on \"main\"; switching to \"feat\" stops runner (agent, running), shell (terminal)"
+        );
+        assert!(daemon.is_alive(&agent) && daemon.is_alive(&shell));
+        assert_eq!(git::current_branch(&repo).await.unwrap(), "main");
+        let err = daemon
+            .resolve_branch_checkout(&pid, "feat")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().starts_with(BUSY_SESSIONS_REFUSAL), "{err}");
+        assert!(daemon.is_alive(&agent));
+
+        daemon
+            .checkout_primary(&pid, "feat", None, true)
+            .await
+            .unwrap();
+        assert_eq!(git::current_branch(&repo).await.unwrap(), "feat");
+        assert!(
+            process_exits(agent_pid).await,
+            "agent process still running"
+        );
+        let ServerEvent::Snapshot { agents, .. } = daemon.snapshot().unwrap() else {
+            panic!()
+        };
+        let runner = agents.iter().find(|a| a.id.as_str() == "runner").unwrap();
+        assert_eq!(runner.session_id.as_deref(), Some("conversation"));
+        assert_eq!(runner.branch.as_deref(), Some("main"));
+        assert!(!runner.archived);
     }
 
     #[tokio::test]
@@ -5109,7 +6105,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_resume_requires_recovery_and_live_shell_blocks_primary_switch() {
+    async fn legacy_resume_requires_recovery_and_a_moving_shell_keeps_its_pty() {
         let tmp = tempfile::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         std::fs::create_dir(&repo).unwrap();
@@ -5139,7 +6135,7 @@ mod tests {
         // Deterministic inter-request race: resolution selected main, an explicit
         // switch ran before creation. Branch-bound creation must reject the new HEAD.
         daemon
-            .checkout_primary(&project, "feature", None)
+            .checkout_primary(&project, "feature", None, false)
             .await
             .unwrap();
         let err = daemon
@@ -5167,7 +6163,7 @@ mod tests {
         };
         daemon.close_terminal(&physical).unwrap();
         daemon
-            .checkout_primary(&project, "main", None)
+            .checkout_primary(&project, "main", None, false)
             .await
             .unwrap();
         seed_agent(
@@ -5214,28 +6210,49 @@ mod tests {
         assert_eq!(agents[0].session_id.as_deref(), Some("saved-conversation"));
         // Explicitly restoring the files makes a stopped shell resumable again.
         git_in(&repo, &["checkout", "main"]);
-        let shell = SessionRef::Terminal(TerminalId("legacy-shell".into()));
-        let live = daemon.ensure_session(&shell, 80, 24).unwrap();
-        let err = daemon
-            .checkout_primary(&project, "feature", None)
+        let id = TerminalId("idle".into());
+        seed_terminal(&daemon, id.as_str(), primary.as_str());
+        let idle = SessionRef::Terminal(id.clone());
+        spawn_live(&daemon, idle.clone(), &repo, "exec sleep 60");
+        let refusals = [
+            daemon
+                .checkout_primary(&project, "feature", None, false)
+                .await
+                .unwrap_err(),
+            daemon
+                .resolve_branch_checkout(&project, "feature")
+                .await
+                .unwrap_err(),
+        ];
+        for err in refusals {
+            assert_eq!(
+                err.to_string(),
+                "primary has sessions on \"main\"; switching to \"feature\" stops idle (terminal)"
+            );
+        }
+        assert!(daemon.is_alive(&idle));
+        assert_eq!(git::current_branch(&repo).await.unwrap(), "main");
+        daemon
+            .checkout_primary(&project, "feature", None, true)
             .await
-            .unwrap_err();
-        assert!(err.to_string().contains("live session"));
-        let err = daemon
-            .resolve_branch_checkout(&project, "feature")
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("live session"));
+            .unwrap();
+        assert!(
+            !daemon.is_alive(&idle),
+            "the confirmed switch stopped the idle shell"
+        );
+        assert_eq!(git::current_branch(&repo).await.unwrap(), "feature");
         assert_eq!(git::list_worktrees(&repo).await.unwrap().len(), 1);
         assert!(!git::worktree_dir(&repo, "feature").exists());
-        assert!(Arc::ptr_eq(
-            &live,
-            &daemon.ensure_session(&shell, 80, 24).unwrap()
-        ));
-        assert_eq!(git::current_branch(&repo).await.unwrap(), "main");
+        daemon.close_terminal(&id).unwrap();
+        daemon
+            .checkout_primary(&project, "main", None, false)
+            .await
+            .unwrap();
+        let shell = SessionRef::Terminal(TerminalId("legacy-shell".into()));
+        let live = daemon.ensure_session(&shell, 80, 24).unwrap();
         // A sole calling shell may deliberately move itself and keep its PTY.
         daemon
-            .checkout_primary(&project, "feature", Some(&shell))
+            .checkout_primary(&project, "feature", Some(&shell), false)
             .await
             .unwrap();
         assert!(Arc::ptr_eq(

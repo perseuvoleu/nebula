@@ -7,7 +7,6 @@ use crate::syntax::{Highlighter, TokenKind};
 use crate::text_input::TextInput;
 use ratatui::layout::Rect;
 use std::collections::HashMap;
-use std::path::PathBuf;
 
 /// Keep pathological files from bloating the preview state.
 const MAX_PREVIEW_LINES: usize = 10_000;
@@ -39,8 +38,8 @@ pub struct TreeRow {
 /// Full-screen tree browser: file tree left, scrollable preview right.
 #[derive(Debug, Clone)]
 pub struct TreeBrowser {
-    /// Checkout dir the listing was read from.
-    pub root: PathBuf,
+    /// What the listing and the previews are read from.
+    pub source: crate::git_diff::Source,
     /// Branch name for the pane title.
     pub branch: String,
     /// Editor command Enter launches (NEBULA_EDITOR, then the `editor`
@@ -99,11 +98,16 @@ pub struct TreeBrowser {
 }
 
 impl TreeBrowser {
-    pub fn new(root: PathBuf, branch: String, editor: String, files: Vec<String>) -> Self {
+    pub fn new(
+        source: crate::git_diff::Source,
+        branch: String,
+        editor: String,
+        files: Vec<String>,
+    ) -> Self {
         let (nodes, top, file_count) = build_nodes(&files);
         let expanded = vec![false; nodes.len()];
         let mut browser = Self {
-            root,
+            source,
             branch,
             editor,
             nodes,
@@ -370,7 +374,11 @@ impl TreeBrowser {
                     .join("\n");
                 (listing, None)
             }
-            Some(n) => match read_preview(&self.root.join(&n.path)) {
+            Some(n) => match self
+                .source
+                .read(&n.path, MAX_PREVIEW_BYTES + 1)
+                .and_then(|bytes| preview_text(&bytes))
+            {
                 Ok(text) => (text, Some(n.path.clone())),
                 Err(message) => (message, None),
             },
@@ -402,6 +410,10 @@ pub(crate) fn read_preview(path: &std::path::Path) -> Result<String, String> {
     {
         return Err(format!("couldn't read file: {e}"));
     }
+    preview_text(&bytes)
+}
+
+fn preview_text(bytes: &[u8]) -> Result<String, String> {
     if bytes.iter().take(8192).any(|b| *b == 0) {
         return Err("(binary file)".to_string());
     }
@@ -500,7 +512,7 @@ mod tests {
 
     fn browser(files: &[&str]) -> TreeBrowser {
         TreeBrowser::new(
-            "/nonexistent-nebula-tree-test".into(),
+            crate::git_diff::Source::Checkout("/nonexistent-nebula-tree-test".into()),
             "main".into(),
             "vim".into(),
             files.iter().map(|f| f.to_string()).collect(),
@@ -603,7 +615,7 @@ mod tests {
         std::fs::create_dir(dir.path().join("src")).unwrap();
         std::fs::write(dir.path().join("src/lib.rs"), "hello\nworld\n").unwrap();
         let mut b = TreeBrowser::new(
-            dir.path().to_path_buf(),
+            crate::git_diff::Source::Checkout(dir.path().to_path_buf()),
             "main".into(),
             "vim".into(),
             vec!["src/lib.rs".into(), "gone.txt".into()],
@@ -626,7 +638,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("main.rs"), "let x = 1; // hi\n").unwrap();
         let mut b = TreeBrowser::new(
-            dir.path().to_path_buf(),
+            crate::git_diff::Source::Checkout(dir.path().to_path_buf()),
             "main".into(),
             "vim".into(),
             vec!["main.rs".into()],
@@ -659,7 +671,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("blob.bin"), b"\x00\x01\x02").unwrap();
         let b = TreeBrowser::new(
-            dir.path().to_path_buf(),
+            crate::git_diff::Source::Checkout(dir.path().to_path_buf()),
             "main".into(),
             "vim".into(),
             vec!["blob.bin".into()],

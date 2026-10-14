@@ -5,8 +5,194 @@
 //! switching files — and per-file diffs are fast.
 
 use crate::app::DiffView;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Source {
+    Checkout(PathBuf),
+    Revision {
+        repo: PathBuf,
+        branch: String,
+        commit: String,
+    },
+}
+
+impl Source {
+    /// Pins local branch `branch` to its current tip: every read through
+    /// the result sees that commit, even after the branch moves or is
+    /// deleted.
+    pub fn branch_tip(repo: &Path, branch: &str) -> Result<Source, String> {
+        let commit = rev_oid(repo, &format!("refs/heads/{branch}"))
+            .ok_or_else(|| format!("branch {branch} no longer exists"))?;
+        Ok(Source::Revision {
+            repo: repo.to_path_buf(),
+            branch: branch.to_string(),
+            commit,
+        })
+    }
+
+    /// Where git runs: the checkout, or for a revision the repository it is
+    /// read from, whose working tree belongs to another checkout and is
+    /// never read.
+    pub fn dir(&self) -> &Path {
+        match self {
+            Source::Checkout(path) => path,
+            Source::Revision { repo, .. } => repo,
+        }
+    }
+
+    /// The pinned commit id a revision reads.
+    pub fn rev(&self) -> Option<&str> {
+        match self {
+            Source::Checkout(_) => None,
+            Source::Revision { commit, .. } => Some(commit),
+        }
+    }
+
+    /// When false, no reader may look at or compare with the working tree
+    /// under `dir`.
+    pub fn has_working_tree(&self) -> bool {
+        self.rev().is_none()
+    }
+
+    /// At most `max` bytes of `path`; a revision's blob is never buffered
+    /// past `max`. `Err` is a user-facing message.
+    pub fn read(&self, path: &str, max: usize) -> Result<Vec<u8>, String> {
+        use std::io::Read;
+        let mut bytes = match self {
+            Source::Checkout(root) => {
+                let mut bytes = Vec::new();
+                std::fs::File::open(root.join(path))
+                    .and_then(|file| file.take(max as u64).read_to_end(&mut bytes))
+                    .map_err(|e| format!("couldn't read file: {e}"))?;
+                bytes
+            }
+            Source::Revision { repo, commit, .. } => {
+                read_blob(repo, &format!("{commit}:{path}"), max)?
+            }
+        };
+        bytes.truncate(max);
+        Ok(bytes)
+    }
+
+    /// `(cwd, file)` for the editor. A checkout hands back its own
+    /// directory, so the real file is edited. A revision streams the pinned
+    /// blob into a fresh 0700 directory under `$TMPDIR/nebula-rev` that
+    /// this call alone owns, and returns only once the copy is complete and
+    /// read-only. Copies are never reused or cleaned up here.
+    pub fn editor_target(&self, path: &str) -> Result<(PathBuf, String), String> {
+        let Source::Revision { repo, commit, .. } = self else {
+            return Ok((self.dir().to_path_buf(), path.to_string()));
+        };
+        let relative = Path::new(path);
+        if !relative
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+        {
+            return Err(format!("{path} is not a path inside the repository"));
+        }
+        let failed = |e: String| format!("couldn't copy {path} out of {commit}: {e}");
+        let dir = private_copy_dir(commit).map_err(|e| failed(e.to_string()))?;
+        let copy = || -> Result<(), String> {
+            let file = dir.join(relative);
+            if let Some(parent) = file.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            let mut out = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&file)
+                .map_err(|e| e.to_string())?;
+            let mut child = cat_blob(repo, &format!("{commit}:{path}"))?;
+            let copied = child
+                .stdout
+                .take()
+                .map(|mut stdout| std::io::copy(&mut stdout, &mut out));
+            if let Some(Err(e)) = copied {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e.to_string());
+            }
+            let output = child.wait_with_output().map_err(|e| e.to_string())?;
+            if !output.status.success() {
+                return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+            }
+            let mut perms = out.metadata().map_err(|e| e.to_string())?.permissions();
+            perms.set_readonly(true);
+            std::fs::set_permissions(&file, perms).map_err(|e| e.to_string())
+        };
+        if let Err(e) = copy() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(failed(e));
+        }
+        Ok((dir, path.to_string()))
+    }
+}
+
+fn private_copy_dir(commit: &str) -> std::io::Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let root = std::env::temp_dir().join("nebula-rev");
+    std::fs::create_dir_all(&root)?;
+    let short = &commit[..commit.len().min(12)];
+    loop {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = root.join(format!("{short}-{}-{n}", std::process::id()));
+        match std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            result => return result.map(|()| dir),
+        }
+    }
+}
+
+fn cat_blob(root: &Path, object: &str) -> Result<std::process::Child, String> {
+    use std::process::Stdio;
+    let (program, argv) = nebula_core::remote::git_command(root, &["cat-file", "blob", object]);
+    Command::new(program)
+        .args(argv)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to run git: {e}"))
+}
+
+fn read_blob(root: &Path, object: &str, max: usize) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut child = cat_blob(root, object)?;
+    let mut bytes = Vec::new();
+    if let Some(stdout) = child.stdout.take() {
+        if let Err(e) = stdout.take(max as u64).read_to_end(&mut bytes) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!("couldn't read file: {e}"));
+        }
+    }
+    if bytes.len() >= max {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Ok(bytes);
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("failed to run git: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("couldn't read file: {}", stderr.trim()));
+    }
+    Ok(bytes)
+}
+
+fn rev_oid(root: &Path, rev: &str) -> Option<String> {
+    let rev = format!("{rev}^{{commit}}");
+    let output = run_git(root, &["rev-parse", "--verify", "--quiet", &rev]).ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
 
 /// Keep pathological diffs from bloating the overlay state.
 const MAX_DIFF_LINES: usize = 20_000;
@@ -82,9 +268,78 @@ impl CommitEntry {
 pub enum DiffBase {
     #[default]
     WorkingTree,
-    Upstream(String),
-    Branch(String),
+    Upstream(GitRef),
+    Branch(GitRef),
     Commit(CommitEntry),
+}
+
+/// A comparison ref as git names it in full (`refs/heads/main`,
+/// `refs/remotes/origin/main`) or a bare commit id: the identity git is
+/// asked about, never an abbreviation it would have to disambiguate.
+/// Displays as its label (`main`, `origin/main`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitRef(String);
+
+impl GitRef {
+    /// Local branch `branch`, taken literally: no lookup, so it names
+    /// `refs/heads/<branch>` whether or not that ref exists.
+    pub fn local(branch: &str) -> Self {
+        GitRef(format!("refs/heads/{branch}"))
+    }
+
+    /// `refname` as written when it is a full refname (`refs/…`); `None`
+    /// for anything git would have to disambiguate.
+    pub fn full(refname: &str) -> Option<Self> {
+        refname
+            .starts_with("refs/")
+            .then(|| GitRef(refname.to_string()))
+    }
+
+    /// A recorded base (`created_from`, a reflog's `Created from`),
+    /// resolved by exact lookups in this order: a full refname as written,
+    /// then `refs/heads/<name>`, `refs/remotes/<name>`, `refs/tags/<name>`
+    /// when that ref exists, then `name` as a commit id when it is 7–64 hex
+    /// characters, else `refs/heads/<name>`.
+    pub fn recorded(root: &Path, name: &str) -> Self {
+        if let Some(full) = GitRef::full(name) {
+            return full;
+        }
+        let local = GitRef::local(name);
+        if local.oid(root).is_some() {
+            return local;
+        }
+        for namespace in ["refs/remotes/", "refs/tags/"] {
+            let candidate = GitRef(format!("{namespace}{name}"));
+            if candidate.oid(root).is_some() {
+                return candidate;
+            }
+        }
+        let commit_id =
+            (7..=64).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_hexdigit());
+        match commit_id {
+            true => GitRef(name.to_string()),
+            false => local,
+        }
+    }
+
+    /// For display only: two refs can share a label
+    /// (`refs/heads/origin/main` and `refs/remotes/origin/main`).
+    pub fn label(&self) -> &str {
+        ["refs/heads/", "refs/remotes/", "refs/tags/"]
+            .iter()
+            .find_map(|prefix| self.0.strip_prefix(prefix))
+            .unwrap_or(&self.0)
+    }
+
+    fn oid(&self, root: &Path) -> Option<String> {
+        rev_oid(root, &self.0)
+    }
+}
+
+impl std::fmt::Display for GitRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
 }
 
 impl DiffBase {
@@ -109,21 +364,29 @@ impl DiffBase {
         use crate::review::MarkScope;
         match self {
             DiffBase::WorkingTree => Some(MarkScope::WorkingTree { head }),
-            DiffBase::Branch(base) => Some(MarkScope::Branch { base }),
+            DiffBase::Branch(base) => Some(MarkScope::Branch { base: base.label() }),
             DiffBase::Upstream(_) | DiffBase::Commit(_) => None,
         }
     }
 
     /// The `git diff` revision arguments that compare the working tree
     /// with this base: the upstream's tip, or `--merge-base <branch>` so a
-    /// branch that moved on does not show its own commits reversed.
-    /// `None` for the bases that are not a working-tree-vs-rev diff.
-    pub fn rev_args(&self) -> Option<Vec<&str>> {
-        match self {
-            DiffBase::Upstream(rev) => Some(vec![rev]),
-            DiffBase::Branch(branch) => Some(vec!["--merge-base", branch]),
-            DiffBase::WorkingTree | DiffBase::Commit(_) => None,
-        }
+    /// branch that moved on does not show its own commits reversed, the
+    /// name resolved to its commit id. `Ok(None)` for the bases that are
+    /// not a working-tree-vs-rev diff.
+    pub fn rev_args(&self, root: &Path) -> Result<Option<Vec<String>>, String> {
+        let (git_ref, merge_base) = match self {
+            DiffBase::Upstream(git_ref) => (git_ref, false),
+            DiffBase::Branch(git_ref) => (git_ref, true),
+            DiffBase::WorkingTree | DiffBase::Commit(_) => return Ok(None),
+        };
+        let oid = git_ref
+            .oid(root)
+            .ok_or_else(|| format!("{git_ref} no longer resolves"))?;
+        Ok(Some(match merge_base {
+            true => vec!["--merge-base".to_string(), oid],
+            false => vec![oid],
+        }))
     }
 }
 
@@ -221,21 +484,23 @@ pub fn parse_status_z(bytes: &[u8]) -> Vec<DiffFile> {
     files
 }
 
-/// The last `MAX_COMMITS` commits reachable from HEAD, newest first. An
-/// unborn HEAD yields an empty list; `Err` is a user-facing flash message.
-pub fn recent_commits(root: &Path) -> Result<Vec<CommitEntry>, String> {
-    if !has_head(root) {
+/// The last `MAX_COMMITS` commits reachable from the source's tip, newest
+/// first. An unborn HEAD yields an empty list; `Err` is a user-facing
+/// flash message.
+pub fn recent_commits(source: &Source) -> Result<Vec<CommitEntry>, String> {
+    let root = source.dir();
+    if source.has_working_tree() && !has_head(root) {
         return Ok(Vec::new());
     }
-    let output = run_git(
-        root,
-        &[
-            "log",
-            "-n",
-            MAX_COMMITS,
-            "--format=%H%x1f%h%x1f%P%x1f%ar%x1f%s",
-        ],
-    )?;
+    let mut args = vec![
+        "log",
+        "-n",
+        MAX_COMMITS,
+        "--format=%H%x1f%h%x1f%P%x1f%ar%x1f%s",
+    ];
+    args.extend(source.rev());
+    args.push("--");
+    let output = run_git(root, &args)?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("git log failed: {}", stderr.trim()));
@@ -244,21 +509,60 @@ pub fn recent_commits(root: &Path) -> Result<Vec<CommitEntry>, String> {
 }
 
 /// The branch's tracking ref (`origin/main`), if it has one.
-pub fn upstream_name(root: &Path) -> Option<String> {
+pub fn upstream_name(source: &Source) -> Option<GitRef> {
     // A branch that has never been pushed (a fresh feature branch) tracks
     // nothing; the remote's copy of the branch, then the remote's default
     // branch (`origin/HEAD` → `origin/develop`), stand in so "vs origin"
     // is still on offer.
-    let branch = rev_name(root, "HEAD").filter(|b| b != "HEAD");
-    rev_name(root, "@{u}")
-        .or_else(|| rev_name(root, &format!("origin/{}", branch.as_deref()?)))
+    let root = source.dir();
+    let (branch, tracking) = match source {
+        Source::Revision { branch, .. } => {
+            (Some(branch.clone()), configured_upstream(root, branch))
+        }
+        Source::Checkout(_) => (
+            rev_name(root, "HEAD").filter(|b| b != "HEAD"),
+            full_ref(root, "@{u}"),
+        ),
+    };
+    tracking
+        .or_else(|| full_ref(root, &format!("refs/remotes/origin/{}", branch.as_deref()?)))
         .or_else(|| {
             // The branch it was cut from (`git checkout -b feat develop`),
             // as that branch's own remote copy when it has one.
-            let base = creation_base(root, branch.as_deref()?)?;
-            rev_name(root, &format!("{base}@{{u}}")).or_else(|| rev_name(root, &base))
+            let base = GitRef::recorded(root, &creation_base(root, branch.as_deref()?)?);
+            let upstream = base
+                .0
+                .strip_prefix("refs/heads/")
+                .and_then(|local| configured_upstream(root, local));
+            upstream.or_else(|| base.oid(root).map(|_| base))
         })
-        .or_else(|| rev_name(root, "origin/HEAD"))
+        .or_else(|| full_ref(root, "refs/remotes/origin/HEAD"))
+}
+
+fn full_ref(root: &Path, rev: &str) -> Option<GitRef> {
+    let output = run_git(root, &["rev-parse", "--symbolic-full-name", rev]).ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    GitRef::full(String::from_utf8_lossy(&output.stdout).trim())
+}
+
+fn configured_upstream(root: &Path, branch: &str) -> Option<GitRef> {
+    let refname = format!("refs/heads/{branch}");
+    let output = run_git(
+        root,
+        &[
+            "for-each-ref",
+            "--format=%(refname)%1f%(upstream)",
+            &refname,
+        ],
+    )
+    .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines()
+        .filter_map(|line| line.split_once('\x1f'))
+        .find(|(name, _)| *name == refname)
+        .and_then(|(_, upstream)| GitRef::full(upstream))
 }
 
 /// The branch `branch` was created from, per its reflog's oldest entry
@@ -291,26 +595,39 @@ fn creation_base(root: &Path, branch: &str) -> Option<String> {
 /// The branch a checkout is reviewed against: the one the TUI recorded it
 /// was cut from (`created_from`), else the reflog's. `None` when neither
 /// is known, it names `branch` itself, or it no longer resolves to a commit.
-pub fn review_base(root: &Path, branch: &str, created_from: Option<&str>) -> Option<String> {
+pub fn review_base(root: &Path, branch: &str, created_from: Option<&str>) -> Option<GitRef> {
     created_from
         .map(str::to_owned)
         .or_else(|| creation_base(root, branch))
-        .filter(|base| base != branch && is_commit(root, base))
+        .and_then(|base| recorded_base(root, branch, &base))
 }
 
-fn is_commit(root: &Path, rev: &str) -> bool {
-    let rev = format!("{rev}^{{commit}}");
-    run_git(root, &["rev-parse", "--verify", "--quiet", &rev]).is_ok_and(|o| o.status.success())
+fn recorded_base(root: &Path, branch: &str, base: &str) -> Option<GitRef> {
+    let base = GitRef::recorded(root, base);
+    (base != GitRef::local(branch) && base.oid(root).is_some()).then_some(base)
 }
 
-/// What the viewer opens on: the uncommitted changes whenever there are
-/// any, else everything since the review base when that shows something,
-/// else the empty working tree. `Err` is a user-facing flash message.
+/// What the viewer opens on. A checkout: the uncommitted changes whenever
+/// there are any, else everything since the review base when that shows
+/// something, else the empty working tree. `Err` is a user-facing flash
+/// message.
 pub fn opening_diff(
-    root: &Path,
+    source: &Source,
     branch: &str,
     created_from: Option<&str>,
+    primary: Option<&str>,
 ) -> Result<(DiffBase, Vec<DiffFile>), String> {
+    let root = source.dir();
+    if !source.has_working_tree() {
+        let base = created_from
+            .and_then(|base| recorded_base(root, branch, base))
+            .map(DiffBase::Branch)
+            .or_else(|| configured_upstream(root, branch).map(DiffBase::Upstream))
+            .or_else(|| primary.map(|p| DiffBase::Branch(GitRef::local(p))))
+            .ok_or_else(|| format!("no base to compare {branch} with"))?;
+        let files = files_since(source, &base)?;
+        return Ok((base, files));
+    }
     let files = changed_files(root)?;
     if !files.is_empty() {
         return Ok((DiffBase::WorkingTree, files));
@@ -318,11 +635,12 @@ pub fn opening_diff(
     let Some(base) = review_base(root, branch, created_from) else {
         return Ok((DiffBase::WorkingTree, files));
     };
-    let since = files_since(root, &["--merge-base", &base])?;
+    let base = DiffBase::Branch(base);
+    let since = files_since(source, &base)?;
     if since.is_empty() {
         return Ok((DiffBase::WorkingTree, files));
     }
-    Ok((DiffBase::Branch(base), since))
+    Ok((base, since))
 }
 
 /// `rev` resolved to its short symbolic name (`origin/main`), or `None`
@@ -341,7 +659,7 @@ fn rev_name(root: &Path, rev: &str) -> Option<String> {
 /// local ones first, then the remote-tracking ones, each most recently
 /// committed first. `current` (the checked-out branch) is left out.
 /// `Err` is a user-facing flash message.
-pub fn branches(root: &Path, current: &str) -> Result<Vec<String>, String> {
+pub fn branches(root: &Path, current: &str) -> Result<Vec<GitRef>, String> {
     let output = run_git(
         root,
         &[
@@ -363,30 +681,40 @@ pub fn branches(root: &Path, current: &str) -> Result<Vec<String>, String> {
         let Some(("", refname)) = line.split_once('\x1f') else {
             continue;
         };
-        if let Some(name) = refname.strip_prefix("refs/heads/") {
-            if name != current {
-                local.push(name.to_string());
+        let Some(git_ref) = GitRef::full(refname) else {
+            continue;
+        };
+        if refname.starts_with("refs/heads/") {
+            if git_ref != GitRef::local(current) {
+                local.push(git_ref);
             }
-        } else if let Some(name) = refname.strip_prefix("refs/remotes/") {
-            remote.push(name.to_string());
+        } else if refname.starts_with("refs/remotes/") {
+            remote.push(git_ref);
         }
     }
     local.extend(remote);
     Ok(local)
 }
 
-/// Working-tree files that differ from `rev` (`DiffBase::rev_args`;
-/// tracked, via `git diff`) plus the untracked ones from status. `Err` is
-/// a user-facing flash.
-pub fn files_since(root: &Path, rev: &[&str]) -> Result<Vec<DiffFile>, String> {
+/// Files of the source that differ from `base` (`DiffBase::rev_args`;
+/// tracked, via `git diff`) plus, for a checkout, the untracked ones from
+/// status. `Err` is a user-facing flash.
+pub fn files_since(source: &Source, base: &DiffBase) -> Result<Vec<DiffFile>, String> {
+    let root = source.dir();
+    let rev = base.rev_args(root)?.unwrap_or_default();
     let mut args = vec!["diff", "-M", "--name-status", "-z"];
-    args.extend(rev);
+    args.extend(rev.iter().map(String::as_str));
+    args.extend(source.rev());
+    args.push("--");
     let output = run_git(root, &args)?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("git diff failed: {}", stderr.trim()));
     }
     let mut files = parse_name_status_z(&output.stdout);
+    if !source.has_working_tree() {
+        return Ok(files);
+    }
     files.extend(
         changed_files(root)?
             .into_iter()
@@ -399,21 +727,29 @@ pub fn files_since(root: &Path, rev: &[&str]) -> Result<Vec<DiffFile>, String> {
 /// tracked ones from `git diff --numstat`, untracked ones as all added.
 /// A git failure or a binary file counts as zero.
 pub fn line_counts(
-    root: &Path,
+    source: &Source,
     base: &DiffBase,
     files: &[DiffFile],
     head_ok: bool,
 ) -> (usize, usize) {
+    let root = source.dir();
     let mut args = vec!["diff", "--numstat", "-M"];
     let empty_tree;
-    match base.rev_args() {
-        Some(rev) => args.extend(rev),
+    let Ok(rev) = base.rev_args(root) else {
+        return (0, 0);
+    };
+    match &rev {
+        Some(rev) => {
+            args.extend(rev.iter().map(String::as_str));
+            args.extend(source.rev());
+        }
         None if head_ok => args.push("HEAD"),
         None => {
             empty_tree = empty_tree_oid(root);
             args.push(&empty_tree);
         }
     }
+    args.push("--");
     let tracked = run_git(root, &args).map(|o| o.stdout).unwrap_or_default();
     let (mut added, mut removed) = (0, 0);
     for line in String::from_utf8_lossy(&tracked).lines() {
@@ -523,20 +859,25 @@ pub fn parse_name_status_z(bytes: &[u8]) -> Vec<DiffFile> {
     files
 }
 
-/// Every file in the checkout (tracked + untracked, gitignore respected) in
-/// git listing order, for the fuzzy file finder. `Err` is a user-facing
-/// flash message.
-pub fn list_files(root: &Path) -> Result<Vec<String>, String> {
-    let output = run_git(
-        root,
-        &[
-            "ls-files",
-            "-z",
-            "--cached",
-            "--others",
-            "--exclude-standard",
-        ],
-    )?;
+/// Every file of the source in git listing order, for the fuzzy file
+/// finder: a checkout's tracked + untracked files (gitignore respected), a
+/// revision's tree. `Err` is a user-facing flash message.
+pub fn list_files(source: &Source) -> Result<Vec<String>, String> {
+    let output = match source {
+        Source::Checkout(root) => run_git(
+            root,
+            &[
+                "ls-files",
+                "-z",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+            ],
+        )?,
+        Source::Revision { repo, commit, .. } => {
+            run_git(repo, &["ls-tree", "-r", "-z", "--name-only", commit])?
+        }
+    };
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("git ls-files failed: {}", stderr.trim()));
@@ -566,7 +907,12 @@ pub fn head_oid(root: &Path) -> Option<String> {
 
 /// Diff text for one file. Never fails: errors become the displayed text so
 /// the modal survives a repo vanishing out from under it.
-pub fn diff_for(root: &Path, file: &DiffFile, base: &DiffBase, head_ok: bool) -> String {
+pub fn diff_for(source: &Source, file: &DiffFile, base: &DiffBase, head_ok: bool) -> String {
+    let root = source.dir();
+    let rev = match base.rev_args(root) {
+        Ok(rev) => rev,
+        Err(msg) => return msg,
+    };
     let output = if let DiffBase::Commit(c) = base {
         let mut args = Vec::new();
         commit_range(c, &mut args);
@@ -575,9 +921,10 @@ pub fn diff_for(root: &Path, file: &DiffFile, base: &DiffBase, head_ok: bool) ->
             args.push(orig);
         }
         run_git(root, &args)
-    } else if let (Some(rev), false) = (base.rev_args(), file.is_untracked()) {
+    } else if let (Some(rev), false) = (&rev, file.is_untracked()) {
         let mut args = vec!["diff"];
-        args.extend(rev);
+        args.extend(rev.iter().map(String::as_str));
+        args.extend(source.rev());
         args.extend(["-M", "--no-color", "--no-ext-diff", "--", &file.path]);
         if let Some(orig) = &file.orig_path {
             args.push(orig);
@@ -639,7 +986,7 @@ pub fn diff_for(root: &Path, file: &DiffFile, base: &DiffBase, head_ok: bool) ->
 /// Reload `view.diff` for the currently selected file and reset the scroll.
 pub fn load_selected_diff(view: &mut DiffView) {
     let diff = match view.selected_file() {
-        Some(file) => diff_for(&view.root, file, &view.base, view.head_ok),
+        Some(file) => diff_for(&view.source, file, &view.base, view.head_ok),
         None => String::new(),
     };
     view.diff_line_count = diff.lines().count();
@@ -691,6 +1038,10 @@ mod tests {
         assert_eq!(classify_diff_line(" context"), DiffLineKind::Context);
     }
 
+    fn checkout(root: &Path) -> Source {
+        Source::Checkout(root.to_path_buf())
+    }
+
     fn git(repo: &PathBuf, args: &[&str]) {
         let out = Command::new("git")
             .arg("-C")
@@ -731,11 +1082,11 @@ mod tests {
         assert!(fresh.is_untracked());
 
         assert!(has_head(&repo));
-        let diff = diff_for(&repo, tracked, &DiffBase::WorkingTree, true);
+        let diff = diff_for(&checkout(&repo), tracked, &DiffBase::WorkingTree, true);
         assert!(diff.contains("-old line"), "{diff}");
         assert!(diff.contains("+new line"), "{diff}");
         // Untracked goes through the --no-index exit-1 path.
-        let diff = diff_for(&repo, fresh, &DiffBase::WorkingTree, true);
+        let diff = diff_for(&checkout(&repo), fresh, &DiffBase::WorkingTree, true);
         assert!(diff.contains("+hello"), "{diff}");
     }
 
@@ -747,7 +1098,7 @@ mod tests {
         std::fs::write(repo.join(".gitignore"), "ignored.txt\n").unwrap();
         std::fs::write(repo.join("ignored.txt"), "nope\n").unwrap();
 
-        let files = list_files(&repo).unwrap();
+        let files = list_files(&checkout(&repo)).unwrap();
         assert!(files.contains(&"tracked.txt".to_string()), "{files:?}");
         assert!(files.contains(&"fresh.txt".to_string()), "{files:?}");
         assert!(!files.contains(&"ignored.txt".to_string()), "{files:?}");
@@ -756,7 +1107,7 @@ mod tests {
     #[test]
     fn list_files_errors_outside_a_repo() {
         let dir = tempfile::tempdir().unwrap();
-        let err = list_files(dir.path()).unwrap_err();
+        let err = list_files(&checkout(dir.path())).unwrap_err();
         assert!(err.contains("git ls-files failed"), "{err}");
     }
 
@@ -784,10 +1135,10 @@ mod tests {
         let files = changed_files(&repo).unwrap();
         assert_eq!(files.len(), 1);
         assert!(files[0].is_untracked());
-        let diff = diff_for(&repo, &files[0], &DiffBase::WorkingTree, false);
+        let diff = diff_for(&checkout(&repo), &files[0], &DiffBase::WorkingTree, false);
         assert!(diff.contains("+content"), "{diff}");
         assert!(
-            recent_commits(&repo).unwrap().is_empty(),
+            recent_commits(&checkout(&repo)).unwrap().is_empty(),
             "unborn: no picker rows"
         );
     }
@@ -803,7 +1154,7 @@ mod tests {
         git(&repo, &["mv", "added.txt", "moved.txt"]);
         git(&repo, &["commit", "-m", "third"]);
 
-        let commits = recent_commits(&repo).unwrap();
+        let commits = recent_commits(&checkout(&repo)).unwrap();
         assert_eq!(commits.len(), 3);
         assert_eq!(commits[0].subject, "third");
         assert_eq!(commits[2].subject, "init");
@@ -819,7 +1170,7 @@ mod tests {
         assert_eq!(tracked.xy, ['M', ' ']);
         let added = files.iter().find(|f| f.path == "added.txt").unwrap();
         assert_eq!(added.xy, ['A', ' ']);
-        let diff = diff_for(&repo, tracked, &base, true);
+        let diff = diff_for(&checkout(&repo), tracked, &base, true);
         assert!(diff.contains("-old line"), "{diff}");
         assert!(diff.contains("+new line"), "{diff}");
 
@@ -830,7 +1181,7 @@ mod tests {
         assert_eq!(files[0].orig_path.as_deref(), Some("added.txt"));
         assert_eq!(files[0].xy[0], 'R');
         let diff = diff_for(
-            &repo,
+            &checkout(&repo),
             &files[0],
             &DiffBase::Commit(commits[0].clone()),
             true,
@@ -842,7 +1193,7 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].xy, ['A', ' ']);
         let diff = diff_for(
-            &repo,
+            &checkout(&repo),
             &files[0],
             &DiffBase::Commit(commits[2].clone()),
             true,
@@ -854,11 +1205,11 @@ mod tests {
     fn upstream_base_diffs_the_working_tree_against_the_tracking_ref() {
         let dir = tempfile::tempdir().unwrap();
         let repo = make_repo(&dir);
-        assert!(upstream_name(&repo).is_none(), "no remote yet");
+        assert!(upstream_name(&checkout(&repo)).is_none(), "no remote yet");
         // A local "remote": branch `base` tracked as the upstream of main.
         git(&repo, &["branch", "base"]);
         git(&repo, &["branch", "--set-upstream-to=base"]);
-        assert_eq!(upstream_name(&repo).as_deref(), Some("base"));
+        assert_eq!(upstream_name(&checkout(&repo)), Some(GitRef::local("base")));
         std::fs::write(repo.join("tracked.txt"), "committed\n").unwrap();
         git(&repo, &["commit", "-am", "local work"]);
         std::fs::write(repo.join("fresh.txt"), "hello\n").unwrap();
@@ -867,16 +1218,16 @@ mod tests {
         let files = changed_files(&repo).unwrap();
         assert_eq!(files.len(), 1);
         // … but against the upstream the committed edit shows too.
-        let base = DiffBase::Upstream("base".into());
-        let files = files_since(&repo, &base.rev_args().unwrap()).unwrap();
+        let base = DiffBase::Upstream(GitRef::local("base"));
+        let files = files_since(&checkout(&repo), &base).unwrap();
         assert_eq!(files.len(), 2, "{files:?}");
         let tracked = files.iter().find(|f| f.path == "tracked.txt").unwrap();
         assert_eq!(tracked.xy, ['M', ' ']);
-        let diff = diff_for(&repo, tracked, &base, true);
+        let diff = diff_for(&checkout(&repo), tracked, &base, true);
         assert!(diff.contains("-old line"), "{diff}");
         assert!(diff.contains("+committed"), "{diff}");
         let fresh = files.iter().find(|f| f.path == "fresh.txt").unwrap();
-        assert!(diff_for(&repo, fresh, &base, true).contains("+hello"));
+        assert!(diff_for(&checkout(&repo), fresh, &base, true).contains("+hello"));
     }
 
     #[test]
@@ -897,13 +1248,13 @@ mod tests {
         git(&repo, &["commit", "-m", "dev moved"]);
         git(&repo, &["checkout", "feat"]);
 
-        assert_eq!(branches(&repo, "feat").unwrap(), ["dev"]);
-        let base = DiffBase::Branch("dev".into());
-        let files = files_since(&repo, &base.rev_args().unwrap()).unwrap();
+        assert_eq!(branches(&repo, "feat").unwrap(), [GitRef::local("dev")]);
+        let base = DiffBase::Branch(GitRef::local("dev"));
+        let files = files_since(&checkout(&repo), &base).unwrap();
         // Both feat commits as one change; dev's own commit stays out.
         assert_eq!(files.len(), 1, "{files:?}");
         assert_eq!(files[0].path, "mine.txt");
-        let diff = diff_for(&repo, &files[0], &base, true);
+        let diff = diff_for(&checkout(&repo), &files[0], &base, true);
         assert!(diff.contains("+one") && diff.contains("+two"), "{diff}");
     }
 
@@ -920,10 +1271,23 @@ mod tests {
         let repo = make_repo(&dir);
         branch_with_one_commit(&repo);
 
-        let (base, files) = opening_diff(&repo, "feat", None).unwrap();
-        assert_eq!(base, DiffBase::Branch("main".into()));
+        let (base, files) = opening_diff(&checkout(&repo), "feat", None, None).unwrap();
+        assert_eq!(base, DiffBase::Branch(GitRef::local("main")));
         let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
         assert_eq!(paths, ["mine.txt"]);
+    }
+
+    #[test]
+    fn a_recorded_base_named_like_a_commit_id_is_the_branch_of_that_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = make_repo(&dir);
+        git(&repo, &["branch", "cafe1234"]);
+        branch_with_one_commit(&repo);
+
+        assert_eq!(
+            review_base(&repo, "feat", Some("cafe1234")),
+            Some(GitRef::local("cafe1234"))
+        );
     }
 
     #[test]
@@ -933,8 +1297,8 @@ mod tests {
         git(&repo, &["branch", "release"]);
         branch_with_one_commit(&repo);
 
-        let (base, _) = opening_diff(&repo, "feat", Some("release")).unwrap();
-        assert_eq!(base, DiffBase::Branch("release".into()));
+        let (base, _) = opening_diff(&checkout(&repo), "feat", Some("release"), None).unwrap();
+        assert_eq!(base, DiffBase::Branch(GitRef::local("release")));
     }
 
     #[test]
@@ -944,7 +1308,7 @@ mod tests {
         branch_with_one_commit(&repo);
         std::fs::write(repo.join("tracked.txt"), "new line\n").unwrap();
 
-        let (base, files) = opening_diff(&repo, "feat", None).unwrap();
+        let (base, files) = opening_diff(&checkout(&repo), "feat", None, None).unwrap();
         assert_eq!(base, DiffBase::WorkingTree);
         let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
         assert_eq!(paths, ["tracked.txt"]);
@@ -955,7 +1319,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = make_repo(&dir);
 
-        let (base, files) = opening_diff(&repo, "main", None).unwrap();
+        let (base, files) = opening_diff(&checkout(&repo), "main", None, None).unwrap();
         assert_eq!(base, DiffBase::WorkingTree);
         assert!(files.is_empty(), "{files:?}");
     }
@@ -972,7 +1336,7 @@ mod tests {
 
         let files = changed_files(&repo).unwrap();
         assert_eq!(
-            line_counts(&repo, &DiffBase::WorkingTree, &files, false),
+            line_counts(&checkout(&repo), &DiffBase::WorkingTree, &files, false),
             (3, 0)
         );
     }

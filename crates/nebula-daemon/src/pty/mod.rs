@@ -25,6 +25,11 @@ const READER_CHANNEL_BOUND: usize = 64;
 /// After the polite SIGHUP, how long the child gets to exit before its whole
 /// process group is SIGKILLed.
 const KILL_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+const SIGKILL_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long a primary switch waits for the PTY children it stopped to exit:
+/// [`KILL_GRACE`] for the hangup, then time for the SIGKILL to land. A child
+/// still present then makes the switch refuse.
+pub const STOP_DEADLINE: std::time::Duration = KILL_GRACE.saturating_add(SIGKILL_SETTLE);
 /// What a tty in line mode queues before it drops input: MAX_CANON on macOS,
 /// the smallest such limit among the supported platforms.
 const LINE_MODE_INPUT_MAX: usize = 1024;
@@ -73,6 +78,7 @@ pub struct PtySession {
     kitty: Mutex<kitty::KittyScanner>,
     /// OSC 9;4 busy/idle tracking, likewise fed from live output.
     progress: Mutex<ProgressScanner>,
+    killed: std::sync::atomic::AtomicBool,
 }
 
 pub struct SpawnSpec {
@@ -134,6 +140,7 @@ impl PtySession {
             last_size: Mutex::new((spec.cols, spec.rows)),
             kitty: Mutex::new(kitty::KittyScanner::new()),
             progress: Mutex::new(ProgressScanner::new()),
+            killed: std::sync::atomic::AtomicBool::new(false),
         });
 
         let (tx, rx) = mpsc::channel::<ReaderMsg>(READER_CHANNEL_BOUND);
@@ -207,6 +214,7 @@ impl PtySession {
     /// that would otherwise hold the slave fd open (no EOF → reader thread,
     /// pump task, and the 1MB ring all pinned forever).
     pub fn kill(&self) {
+        self.killed.store(true, std::sync::atomic::Ordering::SeqCst);
         // Subscribe before signalling so an immediate exit can't be missed.
         let mut rx = self.events.subscribe();
         let _ = self.killer.lock().unwrap().kill();
@@ -241,6 +249,11 @@ impl PtySession {
                 let _ = nix::sys::signal::killpg(nix_pid, nix::sys::signal::Signal::SIGKILL);
             })
             .expect("spawn pty kill watchdog");
+    }
+
+    /// A kill was requested. The process may still be running.
+    pub fn was_killed(&self) -> bool {
+        self.killed.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Ring snapshot for attach replay: (base_seq, bytes).

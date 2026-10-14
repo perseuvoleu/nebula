@@ -85,6 +85,10 @@ enum Command {
         /// Project name (default: the project owning this shell or cwd).
         #[arg(long)]
         project: Option<String>,
+        /// Stop the agents and shells on the primary checkout instead of
+        /// refusing; warm agent PTYs are always stopped.
+        #[arg(long)]
+        stop_busy: bool,
     },
     /// Spawn and inspect agent sessions from the command line — how a
     /// session delegates work to and manages its workers.
@@ -282,8 +286,10 @@ enum WorktreeCommand {
         #[arg(long)]
         project: Option<String>,
     },
-    /// Deliberately switch primary. Refused while another live session depends
-    /// on it or the branch already has a checkout; use that checkout instead.
+    /// Deliberately switch primary. Refused while other sessions run there
+    /// (unless `--stop-busy`), primary has uncommitted changes, an untracked
+    /// file the branch would overwrite, or the branch already has a checkout;
+    /// use that checkout instead.
     Checkout {
         /// Local branch name.
         branch: String,
@@ -291,6 +297,10 @@ enum WorktreeCommand {
         /// calling session's project).
         #[arg(long)]
         project: Option<String>,
+        /// Stop the agents and shells on the primary checkout instead of
+        /// refusing; warm agent PTYs are always stopped.
+        #[arg(long)]
+        stop_busy: bool,
     },
 }
 
@@ -652,16 +662,19 @@ fn main() -> Result<()> {
                 force,
                 project,
             } => nebula_tui::run_worktree_delete(name, force, project),
-            WorktreeCommand::Checkout { branch, project } => {
-                nebula_tui::run_worktree_checkout(branch, project)
-            }
+            WorktreeCommand::Checkout {
+                branch,
+                project,
+                stop_busy,
+            } => nebula_tui::run_worktree_checkout(branch, project, stop_busy),
         },
         Some(Command::Switch {
             branch,
             from,
             worktree,
             project,
-        }) => nebula_tui::run_switch(branch, from, worktree, project),
+            stop_busy,
+        }) => nebula_tui::run_switch(branch, from, worktree, project, stop_busy),
         Some(Command::Agent { command }) => match command {
             AgentCommand::New {
                 worktree,

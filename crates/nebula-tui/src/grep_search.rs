@@ -3,7 +3,7 @@
 //! Synchronous `std::process` on purpose (the git_diff.rs precedent): a
 //! search runs only on key events, and `git grep` over a checkout is fast.
 
-use std::path::Path;
+use crate::git_diff::Source;
 use std::process::Command;
 
 /// Queries shorter than this don't search — one character would light up
@@ -25,25 +25,42 @@ pub struct GrepHit {
     pub text: String,
 }
 
-/// Fixed-string smart-case search over the checkout (tracked + untracked,
-/// gitignore respected, binaries skipped). Returns `(hits, truncated)`;
-/// `Err` is a user-facing message shown inside the overlay.
-pub fn search(root: &Path, query: &str) -> Result<(Vec<GrepHit>, bool), String> {
-    let mut args = vec!["grep", "-z", "-n", "-I", "--untracked", "--no-color", "-F"];
+/// Fixed-string smart-case search over the source: a checkout's tracked +
+/// untracked files (gitignore respected), or a revision's tree; binaries
+/// skipped. Returns `(hits, truncated)`; `Err` is a user-facing message
+/// shown inside the overlay.
+pub fn search(source: &Source, query: &str) -> Result<(Vec<GrepHit>, bool), String> {
+    let mut args = vec!["grep", "-z", "-n", "-I", "--no-color", "-F"];
+    if source.has_working_tree() {
+        args.push("--untracked");
+    }
     // Smart case: literal case only when the query has an uppercase char.
     if !query.chars().any(char::is_uppercase) {
         args.push("-i");
     }
-    args.extend(["-e", query, "--", "."]);
+    args.extend(["-e", query]);
+    args.extend(source.rev());
+    args.extend(["--", "."]);
     // Over ssh for a remote checkout — same argv, other machine.
-    let (program, argv) = nebula_core::remote::git_command(root, &args);
+    let (program, argv) = nebula_core::remote::git_command(source.dir(), &args);
     let output = Command::new(program)
         .args(argv)
         .output()
         .map_err(|e| format!("failed to run git: {e}"))?;
     // git grep exits 1 for "no matches" — only >= 2 is an error.
     match output.status.code() {
-        Some(0) => Ok(parse_grep_z(&output.stdout)),
+        Some(0) => {
+            let (mut hits, truncated) = parse_grep_z(&output.stdout);
+            if let Some(rev) = source.rev() {
+                let prefix = format!("{rev}:");
+                for hit in &mut hits {
+                    if let Some(path) = hit.path.strip_prefix(&prefix) {
+                        hit.path = path.to_string();
+                    }
+                }
+            }
+            Ok((hits, truncated))
+        }
         Some(1) => Ok((Vec::new(), false)),
         _ => {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -154,7 +171,7 @@ mod tests {
         std::fs::write(repo.join("fresh.txt"), "another Needle here\n").unwrap();
 
         // Lowercase query is case-insensitive (smart case): both files hit.
-        let (hits, truncated) = search(&repo, "needle").unwrap();
+        let (hits, truncated) = search(&Source::Checkout(repo.clone()), "needle").unwrap();
         assert!(!truncated);
         assert_eq!(hits.len(), 2, "{hits:?}");
         let tracked = hits.iter().find(|h| h.path == "tracked.txt").unwrap();
@@ -163,19 +180,19 @@ mod tests {
         assert!(hits.iter().any(|h| h.path == "fresh.txt"), "{hits:?}");
 
         // An uppercase char makes the query literal: only fresh.txt hits.
-        let (hits, _) = search(&repo, "Needle").unwrap();
+        let (hits, _) = search(&Source::Checkout(repo.clone()), "Needle").unwrap();
         assert_eq!(hits.len(), 1, "{hits:?}");
         assert_eq!(hits[0].path, "fresh.txt");
 
         // No matches is Ok(empty), not an error (exit code 1).
-        let (hits, _) = search(&repo, "no_such_string_zzz").unwrap();
+        let (hits, _) = search(&Source::Checkout(repo.clone()), "no_such_string_zzz").unwrap();
         assert!(hits.is_empty());
     }
 
     #[test]
     fn search_errors_outside_a_repo() {
         let dir = tempfile::tempdir().unwrap();
-        let err = search(dir.path(), "anything").unwrap_err();
+        let err = search(&Source::Checkout(dir.path().to_path_buf()), "anything").unwrap_err();
         assert!(err.contains("git grep failed"), "{err}");
     }
 }

@@ -190,9 +190,11 @@ pub struct Agent {
     pub alive: bool,
     /// Branch expected at spawn/resume, or last deliberately moved to.
     /// Execution identity is `worktree_id` on its owning host. A mismatch
-    /// is shown as a recovery warning and blocks spawning; it never moves
-    /// a live process or changes sidebar membership. None denotes legacy
-    /// rows with unknown affinity, validated against their checkout row.
+    /// blocks spawning and never moves a live process. A live agent stays
+    /// listed under `worktree_id`, with a recovery warning on a mismatch;
+    /// a stopped one is listed under this branch's checkout, else its
+    /// branch row. None denotes legacy rows with unknown affinity,
+    /// validated against their checkout row.
     #[serde(default)]
     pub branch: Option<String>,
 }

@@ -67,7 +67,8 @@ impl Changes {
         head_ok: bool,
         reviewed: usize,
     ) -> Self {
-        let (added, removed) = git_diff::line_counts(root, &base, files, head_ok);
+        let source = git_diff::Source::Checkout(root.to_path_buf());
+        let (added, removed) = git_diff::line_counts(&source, &base, files, head_ok);
         Self {
             base,
             files: files.len(),
@@ -190,7 +191,8 @@ fn inspect(worktree: &Worktree) -> Result<Option<Changes>, String> {
         return Ok(None);
     }
     let created_from = worktree.created_from.as_deref();
-    let (base, files) = git_diff::opening_diff(root, &worktree.branch, created_from)?;
+    let source = git_diff::Source::Checkout(root.to_path_buf());
+    let (base, files) = git_diff::opening_diff(&source, &worktree.branch, created_from, None)?;
     if files.is_empty() {
         return Ok(None);
     }
@@ -216,11 +218,12 @@ pub fn marks_on_unchanged_diffs(
     head_ok: bool,
     stored: &FileMarks,
 ) -> FileMarks {
+    let source = git_diff::Source::Checkout(root.to_path_buf());
     files
         .iter()
         .filter_map(|file| {
             let mark = *stored.get(&file.path)?;
-            let diff = git_diff::diff_for(root, file, base, head_ok);
+            let diff = git_diff::diff_for(&source, file, base, head_ok);
             (review::fingerprint(&diff) == mark).then(|| (file.path.clone(), mark))
         })
         .collect()
@@ -304,7 +307,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         review::with_store_path(dir.path().join("reviewed.json"), || {
             let queue = build(&three_checkouts(&dir));
-            let on_main = DiffBase::Branch("main".into());
+            let on_main = DiffBase::Branch(crate::git_diff::GitRef::local("main"));
             assert_eq!(
                 queue.entries,
                 [
@@ -342,13 +345,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         review::with_store_path(dir.path().join("reviewed.json"), || {
             let checkouts = three_checkouts(&dir);
-            let base = DiffBase::Branch("main".into());
+            let base = DiffBase::Branch(crate::git_diff::GitRef::local("main"));
             let file = DiffFile {
                 path: "a.txt".into(),
                 orig_path: None,
                 xy: ['A', ' '],
             };
-            let approved = git_diff::diff_for(&checkouts[1].path, &file, &base, true);
+            let approved = git_diff::diff_for(
+                &git_diff::Source::Checkout(checkouts[1].path.clone()),
+                &file,
+                &base,
+                true,
+            );
             review::store_marks(
                 &checkouts[1].path,
                 review::MarkScope::Branch { base: "main" },

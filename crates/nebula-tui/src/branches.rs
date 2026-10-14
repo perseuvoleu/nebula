@@ -50,7 +50,7 @@ pub fn local_branches(repo: &Path) -> Vec<String> {
             "for-each-ref",
             "--sort=-committerdate",
             "refs/heads/",
-            "--format=%(refname:short)",
+            "--format=%(refname)",
         ],
     )
     .output()
@@ -59,8 +59,7 @@ pub fn local_branches(repo: &Path) -> Vec<String> {
     .map(|o| {
         String::from_utf8_lossy(&o.stdout)
             .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
+            .filter_map(|refname| refname.strip_prefix("refs/heads/"))
             .map(str::to_owned)
             .collect()
     })
