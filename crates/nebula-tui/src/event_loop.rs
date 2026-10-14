@@ -6832,6 +6832,11 @@ fn start_open_session(
     });
     let sref = SessionRef::Agent(id.clone());
     jump_to_target(app, PaletteTarget::Session(id.clone()), true, out);
+    // Re-attaching the pane it already holds keeps a ⌘D split's focus;
+    // the input belongs to the session that was asked for.
+    if app.term.as_ref().is_some_and(|t| t.sref == sref) {
+        app.split_focused = false;
+    }
     let attach_sent = out
         .iter()
         .any(|r| matches!(r, ClientRequest::Attach { session, .. } if *session == sref));

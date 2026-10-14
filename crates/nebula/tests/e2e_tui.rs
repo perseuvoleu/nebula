@@ -972,6 +972,21 @@ fn open_session_attaches_it_in_the_running_tui() {
     tui.wait_for_text(FOOTER_TERMINAL_LOCKED);
     assert_typing_reaches(&mut tui, "t1", &ids[1]);
 
+    // A shell split beside it takes the input lock; reopening the session
+    // must hand the lock back to the session's own pane.
+    tui.send(&[0x11]);
+    tui.wait_for_text(FOOTER_SESSIONS);
+    tui.send(b"|");
+    tui.wait_for_text("Terminal (shell)");
+    tui.send(b"\x1b[B\x1b[B\x1b[B\x1b[B\r");
+    tui.wait_for_gone("Terminal (shell)");
+    tui.wait_for_text(FOOTER_TERMINAL_LOCKED);
+    tui.type_str("echo split-$((6*7))\r");
+    tui.wait_for_text("split-42");
+    let reopen = nebula_cli(&tui, &["open", "--session", &ids[1]]);
+    assert_eq!(reopen.status.code(), Some(0), "{reopen:?}");
+    assert_typing_reaches(&mut tui, "t1b", &ids[1]);
+
     tui.send(&[0x11]);
     tui.wait_for_text(FOOTER_SESSIONS);
     let by_id = nebula_cli(&tui, &["open", "--session", &ids[0]]);
