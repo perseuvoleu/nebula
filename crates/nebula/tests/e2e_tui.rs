@@ -970,6 +970,23 @@ fn open_session_attaches_it_in_the_running_tui() {
     tui.wait_for_selected("first");
     tui.wait_for_text(FOOTER_TERMINAL_LOCKED);
 
+    for args in [
+        &["workspace", "add", "other"][..],
+        &["workspace", "open", "other"],
+    ] {
+        let out = nebula_cli(&tui, args);
+        assert!(out.status.success(), "{args:?}: {out:?}");
+    }
+    tui.wait_for_gone("alpha-proj");
+    let out_of_scope = nebula_cli(&tui, &["open", "--session", "second"]);
+    assert_eq!(out_of_scope.status.code(), Some(1), "{out_of_scope:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out_of_scope.stderr).trim(),
+        "Error: the running nebula TUI could not show \"second\" — its project is outside the open workspace or hidden"
+    );
+    let out = nebula_cli(&tui, &["workspace", "open", "default"]);
+    assert!(out.status.success(), "{out:?}");
+
     tui.child.kill().unwrap();
     tui.child.wait().unwrap();
     let no_tui = nebula_cli(&tui, &["open", "--session", "first"]);

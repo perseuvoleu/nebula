@@ -436,7 +436,7 @@ async fn main_loop(
                     }
                     app.dirty = true;
                 }
-                if let Some(id) =
+                if let Some(request) =
                     crate::session_open::take_request(&session_request, crate::app::now_ms())
                 {
                     // The session is what was asked for: nothing stays over it.
@@ -444,7 +444,20 @@ async fn main_loop(
                         repaint_everything(terminal)?;
                     }
                     app.overlay = None;
-                    jump_to_target(&mut app, PaletteTarget::Session(id), true, &mut out);
+                    let id = request.agent.clone();
+                    jump_to_target(&mut app, PaletteTarget::Session(id.clone()), true, &mut out);
+                    let landed = matches!(
+                        app.selected_session_row(),
+                        Some(SessionRow::Agent(a)) if a.id == id
+                    );
+                    let error = (!landed).then(|| {
+                        let name = app.tree.agents.iter().find(|a| a.id == id).map(|a| a.name.as_str());
+                        format!(
+                            "the running nebula TUI could not show \"{}\" — its project is outside the open workspace or hidden",
+                            name.unwrap_or(id.as_str())
+                        )
+                    });
+                    crate::session_open::ack(&request, error);
                     app.dirty = true;
                 }
             }

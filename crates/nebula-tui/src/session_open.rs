@@ -2,7 +2,8 @@
 //! daemon, then hand the attach to a running TUI through a request file in
 //! the runtime dir (the `nebula diagram open` mechanism, no daemon protocol
 //! involved). The TUI that takes the request answers with an ack naming its
-//! pid, which is how the command knows a TUI landed it.
+//! pid and whether it could show the session, which is how the command
+//! knows a TUI landed it.
 
 use crate::ipc;
 use anyhow::{bail, Result};
@@ -23,6 +24,12 @@ pub struct Resolved {
     pub name: String,
     pub project: String,
     pub host: Option<String>,
+}
+
+/// What a TUI that took a request must answer through [`ack`].
+pub struct Request {
+    pub agent: AgentId,
+    nonce: serde_json::Value,
 }
 
 pub fn request_path() -> PathBuf {
@@ -103,8 +110,9 @@ pub async fn resolve(reference: &str, project_flag: Option<&str>) -> Result<Reso
     }
 }
 
-/// Ask a running TUI to attach `id`; `Some(pid)` of the TUI that took it,
-/// `None` when no TUI answered (the request is withdrawn).
+/// Ask a running TUI to attach `id`; `Some(pid)` of the TUI that landed it,
+/// `None` when no TUI answered (the request is withdrawn), an error when
+/// the TUI that took it could not show the session.
 pub fn hand_to_running_tui(id: &AgentId) -> Result<Option<u32>> {
     let nonce = format!("{}-{}", std::process::id(), crate::app::now_ms());
     let request = request_path();
@@ -117,8 +125,8 @@ pub fn hand_to_running_tui(id: &AgentId) -> Result<Option<u32>> {
     )?;
     let deadline = Instant::now() + ACK_WAIT;
     while Instant::now() < deadline {
-        if let Some(pid) = take_ack(&nonce) {
-            return Ok(Some(pid));
+        if let Some(answer) = take_ack(&nonce) {
+            return answer.map(Some);
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -129,10 +137,10 @@ pub fn hand_to_running_tui(id: &AgentId) -> Result<Option<u32>> {
     if ours {
         let _ = std::fs::remove_file(&request);
     }
-    Ok(take_ack(&nonce))
+    take_ack(&nonce).transpose()
 }
 
-fn take_ack(nonce: &str) -> Option<u32> {
+fn take_ack(nonce: &str) -> Option<Result<u32>> {
     let path = ack_path();
     let value: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&path).ok()?).ok()?;
@@ -140,28 +148,42 @@ fn take_ack(nonce: &str) -> Option<u32> {
         return None;
     }
     let _ = std::fs::remove_file(&path);
-    value["pid"].as_u64().map(|pid| pid as u32)
+    if let Some(error) = value["error"].as_str() {
+        return Some(Err(anyhow::anyhow!("{error}")));
+    }
+    value["pid"].as_u64().map(|pid| Ok(pid as u32))
 }
 
-/// The TUI side: consume a pending request (first TUI to see it wins) and
-/// return the agent to attach, acking with this process's pid.
-pub fn take_request(path: &Path, now_ms: i64) -> Option<AgentId> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let _ = std::fs::remove_file(path);
+/// The TUI side: claim a pending request — the rename lets exactly one of
+/// several running TUIs have it. The caller answers it with [`ack`].
+pub fn take_request(path: &Path, now_ms: i64) -> Option<Request> {
+    let claimed = path.with_extension(format!("claimed-{}", std::process::id()));
+    std::fs::rename(path, &claimed).ok()?;
+    let text = std::fs::read_to_string(&claimed).ok()?;
+    let _ = std::fs::remove_file(&claimed);
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
     let age = now_ms - value["ts"].as_i64()?;
     if !(0..=REQUEST_TTL_MS).contains(&age) {
         return None;
     }
-    let agent = AgentId::from(value["agent"].as_str()?.to_owned());
-    let ack = json!({ "nonce": value["nonce"], "pid": std::process::id() });
+    Some(Request {
+        agent: AgentId::from(value["agent"].as_str()?.to_owned()),
+        nonce: value["nonce"].clone(),
+    })
+}
+
+/// Answer `request`: landed, or the reason the session could not be shown.
+pub fn ack(request: &Request, error: Option<String>) {
+    let ack = match error {
+        Some(error) => json!({ "nonce": request.nonce, "error": error }),
+        None => json!({ "nonce": request.nonce, "pid": std::process::id() }),
+    };
     let _ = write_atomically(&ack_path(), &ack.to_string());
-    Some(agent)
 }
 
 /// Write-then-rename: the reader never sees half a file.
 fn write_atomically(path: &Path, text: &str) -> Result<()> {
-    let tmp = path.with_extension("json.tmp");
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
     std::fs::write(&tmp, text)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
