@@ -265,9 +265,12 @@ nebula add <host>:<dir>   # add a checkout on another machine (an ssh destinatio
                           # sessions, shells and git all run there over ssh — see below
 nebula add .              # same, for the repo you're in (bare `nebula <dir>` / `nebula .` also work)
 nebula open [dir]         # the TUI landed on the project owning dir (what `ng` runs)
-nebula open --session <id|name> [--project p[@host]]  # land attached to that session: a running
-                          # TUI takes it (prints {"landed":"tui","tui_pid",…}); none running →
-                          # starts here in a terminal, else exit 3; unknown/ambiguous → exit 1
+nebula open --session <id|name> [--project p[@host]] [--no-focus]  # land attached to that
+                          # session (its workspace opened, its project unhidden): a running TUI
+                          # takes it, its window comes forward, and once the pane holds the
+                          # session's terminal it prints {"landed":"tui","tui_pid",…,"focused"};
+                          # none running → starts here in a terminal, else exit 3; unknown,
+                          # archived or ambiguous session or a failed attach → exit 1
 nebula daemon             # run the daemon (normally auto-spawned)
 nebula daemon --foreground  # daemon with logs to stderr, for debugging
 nebula kill               # stop the daemon and all sessions cleanly

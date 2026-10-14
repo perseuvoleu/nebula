@@ -53,6 +53,8 @@ enum Command {
         #[arg(long, requires = "session")]
         project: Option<String>,
         /// Leave the window where it is (the attach still happens).
+        /// Focusing goes through System Events, so the calling app needs
+        /// macOS Automation permission for it.
         #[arg(long, requires = "session")]
         no_focus: bool,
     },

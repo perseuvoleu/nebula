@@ -1,9 +1,9 @@
 //! `nebula open --session <id|name>`: resolve one session against the
 //! daemon, then hand the attach to a running TUI through a request file in
 //! the runtime dir (the `nebula diagram open` mechanism, no daemon protocol
-//! involved). The TUI that takes the request answers with an ack naming its
-//! pid and whether it could show the session, which is how the command
-//! knows a TUI landed it.
+//! involved). The TUI that claims the request answers once its pane holds
+//! the session's terminal (an ack naming its pid) or with the reason it
+//! could not, which is how the command knows a TUI landed it.
 
 use crate::ipc;
 use anyhow::{bail, Context, Result};
@@ -28,19 +28,25 @@ const ANSWER_WAIT: Duration = Duration::from_secs(20);
 /// (a remote one comes over ssh) before answering that the attach failed.
 pub const ATTACH_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// The session a `--session` reference names, as the command reports it.
 pub struct Resolved {
     pub id: AgentId,
+    /// The session's name, as the panels show it.
     pub name: String,
+    /// The owning project's name, without any `@host`.
     pub project: String,
+    /// The ssh host of a remote session; None for a local one.
     pub host: Option<String>,
 }
 
 /// What a TUI that took a request must answer through [`ack`].
 pub struct Request {
+    /// The session to land on and attach.
     pub agent: AgentId,
     nonce: serde_json::Value,
 }
 
+/// Where the command leaves its request for a running TUI to claim.
 pub fn request_path() -> PathBuf {
     paths::runtime_dir().join("session-open.json")
 }
