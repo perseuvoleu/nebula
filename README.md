@@ -101,12 +101,20 @@ The panels aren't the only view. With a worktree selected, from any panel:
 
 - **`g` — git diff.** Changed files down the left, the diff on the right, with
   a live fuzzy filter. It opens on the working tree (uncommitted changes vs
-  HEAD); `Ctrl+g` picks something else to compare — the working tree against
-  the branch's upstream, or any recent commit on its own (what that commit
+  HEAD); when the tree is clean and the work is already committed, it opens
+  on everything since the branch the checkout was cut from. `Ctrl+g` picks
+  something else to compare — the working tree against the branch's upstream
+  or another branch, or any recent commit on its own (what that commit
   changed vs its parent). `Ctrl+r` marks a file reviewed ✓ and sinks it to the
-  bottom — nebula-side bookkeeping only, no git state is touched — and every
-  mark clears itself when HEAD moves or the file changes again, so what's left
-  unticked is genuinely what you haven't read.
+  bottom — nebula-side bookkeeping only, no git state is touched. On the
+  working tree every mark clears itself when HEAD moves or the file changes
+  again; against a branch a mark survives new commits until the file's own
+  diff changes, so what's left unticked is genuinely what you haven't read.
+  When several of the project's local checkouts wait for review (uncommitted
+  changes, or commits since the branch they were cut from), a line above the
+  viewer says which one is on show (`review 2/5 ‹ fix-login › vs main`):
+  `Ctrl+n` / `Ctrl+p` load the next / previous one into the same viewer, and
+  `Ctrl+l` lists them all, the fully reviewed ones last.
 - **`f` — find file.** Fuzzy finder over the worktree. `Enter` opens the file
   in an editor modal (vim by default; the `editor` setting or `NEBULA_EDITOR`
   picks another), `Ctrl+y` copies the path — ready to paste into an agent.
@@ -241,7 +249,7 @@ Defaults — every one of them is rebindable in Settings → Hotkeys (`s`).
 | Sessions | `n` | new session (agent or shell terminal) |
 | Sessions | `r`, `a`, `u`, `d`, `A` | rename, archive, unarchive, delete, toggle archived |
 | Any panel | `Shift+D` | delete every row of the focused panel (confirm lists the casualties) |
-| Any panel | `g` | git diff for the selected worktree: filter, `↑↓` files, `Shift+↑↓`/`PgUp/PgDn`/`Ctrl+d/u` scroll, `Ctrl+g` picks what to compare (working tree, upstream, a commit), `Ctrl+r` marks a file reviewed ✓ |
+| Any panel | `g` | git diff for the selected worktree (the uncommitted changes, or everything since the branch it was cut from when the tree is clean): filter, `↑↓` files, `Shift+↑↓`/`PgUp/PgDn`/`Ctrl+d/u` scroll, `Ctrl+g` picks what to compare (working tree, upstream, a commit), `Tab`/`Shift+Tab` step through the recent commits listed under the filter, `Ctrl+r` marks a file reviewed ✓ (on the working tree or against a branch), `Ctrl+n`/`Ctrl+p` step to the next/previous checkout that waits for review, `Ctrl+l` lists them |
 | Any panel | `Shift+G` | open the selected repo's page on its git host — the `origin` remote (`git@github.com:o/r.git`, `ssh://`, `https://`) turned into a browsable URL, credentials stripped |
 | Any panel | `f` / `F` / `b` | find file / find in files (`git grep`) / file tree browser, all scoped to the selected worktree — `Enter` opens the file in an editor modal (at the matched line, for `F`); in `f` and `b`, `Ctrl+y` copies the path |
 | Any panel | `l` | attach a link (pull request, doc, ticket) to the selected worktree — it lands in the Sessions panel's LINKS group, above any open pull request nebula finds with `gh` |

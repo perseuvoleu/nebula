@@ -715,8 +715,8 @@ pub struct DiffView {
     /// Nebula-side bookkeeping only (persisted via `review::store_marks`);
     /// never stages or otherwise touches git state.
     pub reviewed: HashMap<String, u64>,
-    /// HEAD OID the marks are scoped to (empty on an unborn HEAD). A moved
-    /// HEAD — commit, checkout — resets the worktree's marks on next open.
+    /// HEAD OID the working-tree marks are scoped to (empty on an unborn
+    /// HEAD). A moved HEAD — commit, checkout — resets them on next open.
     pub head_key: String,
     /// What `files` and `diff` compare (see `DiffBase`); the ^g picker
     /// switches it. Default: the working tree against HEAD.
@@ -737,7 +737,46 @@ pub struct DiffView {
     /// change pulls it back so the selected row stays on screen
     /// (`follow_selection`).
     pub list_scroll: usize,
+    /// First visible row of the commit strip under the ▾ base row. The
+    /// wheel moves it freely; a base change pulls it back to the picked
+    /// commit (`follow_commit`).
+    pub commit_scroll: usize,
+    /// Screen rect of the commit strip, written back during draw so
+    /// clicks and the wheel can hit-test it.
+    pub commits_area: Rect,
+    /// Screen rect of the pinned "Current" row above the strip (the way
+    /// back to the uncommitted changes), written back during draw.
+    pub current_area: Rect,
+    /// The checkout on show; `None` for a view not opened from the panel.
+    pub worktree: Option<WorktreeId>,
+    /// The project's review queue as last built: when the viewer opened,
+    /// a ^n/^p step landed, or the ^l list opened.
+    pub queue_snapshot: crate::review_queue::ReviewQueue,
+    /// The ^l review list while it is open.
+    pub queue_picker: Option<QueuePicker>,
 }
+
+/// The ^l popup over the diff viewer: one row per review queue entry.
+#[derive(Debug, Clone, Default)]
+pub struct QueuePicker {
+    /// Index of the hovered entry.
+    pub hover: usize,
+    /// Screen rect of the rows (border excluded), written back during
+    /// draw for click hit-testing.
+    pub list_area: Rect,
+    /// Full popup rect, written back during draw; a click outside closes.
+    pub area: Rect,
+}
+
+impl QueuePicker {
+    /// First visible row for a window `visible` rows tall.
+    pub fn scroll_offset(&self, visible: usize) -> usize {
+        (self.hover + 1).saturating_sub(visible.max(1))
+    }
+}
+
+/// Rows of the commit strip under the diff viewer's ▾ base row.
+pub const DIFF_COMMIT_ROWS: usize = 5;
 
 /// The ^g popup over the diff viewer: pick what the diff compares. Two
 /// modes, flipped with Tab. Commits: row 0 is the working tree vs HEAD,
@@ -832,6 +871,65 @@ impl DiffView {
         }
     }
 
+    /// The base `delta` steps along the strip's order — the working tree,
+    /// then the commits newest first — or `None` at either end. An
+    /// upstream or branch base counts as the working tree's position.
+    pub fn step_base(&self, delta: i64) -> Option<DiffBase> {
+        let pos = match &self.base {
+            DiffBase::Commit(c) => self
+                .commits
+                .iter()
+                .position(|e| e == c)
+                .map_or(0, |i| i + 1),
+            _ => 0,
+        };
+        let next = (pos as i64 + delta).clamp(0, self.commits.len() as i64) as usize;
+        let base = match next.checked_sub(1) {
+            Some(i) => DiffBase::Commit(self.commits[i].clone()),
+            None => DiffBase::WorkingTree,
+        };
+        (base != self.base).then_some(base)
+    }
+
+    /// First visible strip row for a strip `height` rows tall:
+    /// `commit_scroll`, re-clamped so the last page stays full.
+    pub fn commit_window_start(&self, height: usize) -> usize {
+        self.commit_scroll
+            .min(self.commits.len().saturating_sub(height.max(1)))
+    }
+
+    /// Pull `commit_scroll` so the base's commit is inside the strip.
+    pub fn follow_commit(&mut self) {
+        let DiffBase::Commit(c) = &self.base else {
+            return;
+        };
+        let Some(i) = self.commits.iter().position(|e| e == c) else {
+            return;
+        };
+        let height = match self.commits_area.height as usize {
+            0 => DIFF_COMMIT_ROWS,
+            h => h,
+        };
+        if i < self.commit_scroll {
+            self.commit_scroll = i;
+        } else if i >= self.commit_scroll + height {
+            self.commit_scroll = i + 1 - height;
+        }
+    }
+
+    /// Wheel over the commit strip: move its window, leave the base alone.
+    pub fn scroll_commits_by(&mut self, delta: i32) {
+        let height = (self.commits_area.height as usize).max(1);
+        let max = self.commits.len().saturating_sub(height) as i32;
+        self.commit_scroll = (self.commit_scroll as i32 + delta).clamp(0, max) as usize;
+    }
+
+    /// Where the current base's ✓ marks are stored; `None` for the bases
+    /// that have none (the upstream, a commit).
+    pub fn mark_scope(&self) -> Option<crate::review::MarkScope<'_>> {
+        self.base.mark_scope(&self.head_key)
+    }
+
     pub fn new(root: PathBuf, branch: String, files: Vec<DiffFile>, head_ok: bool) -> Self {
         let mut view = Self {
             root,
@@ -858,6 +956,12 @@ impl DiffView {
             picker: None,
             base_area: Rect::default(),
             list_scroll: 0,
+            commit_scroll: 0,
+            commits_area: Rect::default(),
+            current_area: Rect::default(),
+            worktree: None,
+            queue_snapshot: Default::default(),
+            queue_picker: None,
         };
         view.apply_filter();
         view
@@ -1633,7 +1737,7 @@ pub enum Overlay {
     Prompt(PromptDialog),
     Help,
     Settings(SettingsView),
-    Diff(DiffView),
+    Diff(Box<DiffView>),
     Palette(Palette),
     Files(FileFinder),
     Grep(GrepView),

@@ -1098,6 +1098,15 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
         Overlay::Diff(view) => {
             let area = centered_rect_pct(f.area(), 92, 90);
             f.render_widget(Clear, area);
+            let area = match review_status_line(&view, area.width, th) {
+                Some(line) => {
+                    let [status, rest] =
+                        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+                    f.render_widget(Paragraph::new(line), status);
+                    rest
+                }
+                None => area,
+            };
             // Cap first, floor second: on a tiny screen the file list keeps
             // its minimum and Min(20) squeezes the diff pane instead.
             let files_w = view
@@ -1146,9 +1155,74 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     base_area,
                 );
             }
-            let list_inner = Rect {
+            // Under it: a pinned "Current" row (the uncommitted changes)
+            // and the recent commits, a short scrollable strip (⇥/⇧⇥ step
+            // through both); the file list keeps at least one row.
+            let strip_h =
+                view.commits
+                    .len()
+                    .min(crate::app::DIFF_COMMIT_ROWS)
+                    .min(files_inner.height.saturating_sub(4) as usize) as u16;
+            let current_area = Rect {
                 y: files_inner.y + 2,
-                height: files_inner.height.saturating_sub(2),
+                height: strip_h.min(1),
+                ..files_inner
+            };
+            if current_area.height > 0 {
+                let on = view.base.is_working_tree();
+                let style = if on {
+                    Style::default().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(th.dim)
+                };
+                f.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::styled(if on { "● " } else { "  " }, Style::default().fg(th.ok)),
+                        Span::styled("Current", style),
+                        Span::styled("  uncommitted", Style::default().fg(th.dim)),
+                    ])),
+                    current_area,
+                );
+            }
+            let commits_area = Rect {
+                y: current_area.y + current_area.height,
+                height: strip_h,
+                ..files_inner
+            };
+            let commit_start = view.commit_window_start(strip_h as usize);
+            for (row, c) in view.commits.iter().skip(commit_start).enumerate() {
+                let Some(row_area) = row_rect(commits_area, row) else {
+                    break;
+                };
+                let current = matches!(&view.base, DiffBase::Commit(b) if b == c);
+                let subject_style = if current {
+                    Style::default().add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(th.dim)
+                };
+                let age = format!(" {}", c.age());
+                let budget = (row_area.width as usize)
+                    .saturating_sub(3 + c.short.chars().count() + age.chars().count());
+                let subject = truncate(&c.subject, budget);
+                let pad = budget.saturating_sub(subject.chars().count());
+                f.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::styled(
+                            if current { "● " } else { "  " },
+                            Style::default().fg(th.ok),
+                        ),
+                        Span::styled(format!("{} ", c.short), Style::default().fg(th.accent)),
+                        Span::styled(subject, subject_style),
+                        Span::styled(format!("{:pad$}{age}", ""), Style::default().fg(th.dim)),
+                    ])),
+                    row_area,
+                );
+            }
+            let list_inner = Rect {
+                y: commits_area.y + strip_h,
+                height: files_inner
+                    .height
+                    .saturating_sub(2 + current_area.height + strip_h),
                 ..files_inner
             };
             let start = view.window_start(list_inner.height as usize);
@@ -1212,10 +1286,10 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 ),
                 (diff_a.width as usize).saturating_sub(4),
             );
-            let hint = if view.base.is_working_tree() {
-                " ^g/⌘G: compare with…  ^r: toggle reviewed "
+            let hint = if view.mark_scope().is_some() {
+                " ⇥/⇧⇥: commits  ^g/⌘G: compare with…  ^r: toggle reviewed "
             } else {
-                " ^g/⌘G: compare with… "
+                " ⇥/⇧⇥: commits  ^g/⌘G: compare with… "
             };
             let mut block = panel_block(&title, true, th)
                 .title_bottom(Line::from(Span::styled(hint, Style::default().fg(th.dim))));
@@ -1358,14 +1432,92 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 (popup, inner)
             });
 
+            let queue_rects = view.queue_picker.as_ref().map(|picker| {
+                let entries = &view.queue_snapshot.entries;
+                let width = (area.width.saturating_sub(8)).clamp(24, 96);
+                let height = (entries.len() as u16 + 2).min(area.height.saturating_sub(4).max(3));
+                let popup = centered_rect(area, width, height);
+                f.render_widget(Clear, popup);
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(th.accent))
+                    .title(Span::styled(" To review ", Style::default().fg(th.accent)))
+                    .title_bottom(Line::from(Span::styled(
+                        " ↑↓ move  ⏎ open  esc ",
+                        Style::default().fg(th.dim),
+                    )));
+                let inner = block.inner(popup);
+                f.render_widget(block, popup);
+                let name_w = entries
+                    .iter()
+                    .map(|e| e.branch.chars().count())
+                    .max()
+                    .unwrap_or(0)
+                    .min((inner.width as usize).saturating_sub(44));
+                let offset = picker.scroll_offset(inner.height as usize);
+                for (row, entry) in entries.iter().enumerate().skip(offset) {
+                    let Some(row_area) = row_rect(inner, row - offset) else {
+                        break;
+                    };
+                    let marker = if entry.fully_reviewed() {
+                        "✓ "
+                    } else if Some(&entry.worktree) == view.worktree.as_ref() {
+                        "● "
+                    } else {
+                        "  "
+                    };
+                    let mut spans = vec![
+                        Span::styled(marker, Style::default().fg(th.ok)),
+                        Span::raw(format!("{:name_w$}", truncate(&entry.branch, name_w))),
+                    ];
+                    match &entry.changes {
+                        Ok(_) if entry.fully_reviewed() => {
+                            spans.push(Span::styled("   reviewed", Style::default().fg(th.dim)))
+                        }
+                        Ok(changes) => spans.extend([
+                            Span::styled(
+                                format!("   {:<14}", entry.agents.label()),
+                                Style::default().fg(th.dim),
+                            ),
+                            Span::raw(format!("  {:>9}", changes.files_label())),
+                            Span::styled(
+                                format!("  {:>5}", format!("+{}", changes.added)),
+                                Style::default().fg(th.ok),
+                            ),
+                            Span::styled(
+                                format!(" −{}", changes.removed),
+                                Style::default().fg(th.err),
+                            ),
+                        ]),
+                        Err(error) => spans.push(Span::styled(
+                            truncate(
+                                &format!("   {error}"),
+                                (inner.width as usize).saturating_sub(name_w + 2),
+                            ),
+                            Style::default().fg(th.err),
+                        )),
+                    }
+                    render_row(f, row_area, spans, row == picker.hover, true, th);
+                }
+                (popup, inner)
+            });
+
             // Write-back (draw works on a clone): page size for key paging,
             // scroll re-clamped so resizes never strand the view.
             if let Some(Overlay::Diff(v)) = &mut app.overlay {
+                if let (Some(p), Some((popup, inner))) = (&mut v.queue_picker, queue_rects) {
+                    p.area = popup;
+                    p.list_area = inner;
+                }
                 v.view_height = diff_inner.height;
                 v.scroll = scroll;
                 v.list_area = list_inner;
                 v.list_scroll = start;
                 v.base_area = base_area;
+                v.commits_area = commits_area;
+                v.current_area = current_area;
+                v.commit_scroll = commit_start;
                 v.area = area;
                 v.files_width = files_w;
                 if let (Some(p), Some((popup, inner))) = (&mut v.picker, picker_rects) {
@@ -2453,6 +2605,48 @@ fn settings_keys_hint(view: &crate::app::SettingsView) -> &'static str {
 
 pub(crate) fn command_palette_area(frame: Rect) -> Rect {
     centered_rect(frame, 64, 18)
+}
+
+fn review_status_line(view: &crate::app::DiffView, width: u16, th: Theme) -> Option<Line<'static>> {
+    let entries = &view.queue_snapshot.entries;
+    let on_show = view.worktree.as_ref();
+    if entries.iter().all(|entry| Some(&entry.worktree) == on_show) {
+        return None;
+    }
+    let position = view.queue_snapshot.position(on_show);
+    let place = position.map_or("–".to_string(), |index| (index + 1).to_string());
+    let dim = Style::default().fg(th.dim);
+    let keys = "^n next  ^p prev  ^l list ";
+    let mut spans = vec![
+        Span::styled(format!(" review {place}/{}   ‹ ", entries.len()), dim),
+        Span::styled(
+            view.branch.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" ›", dim),
+    ];
+    match position.map(|index| &entries[index].changes) {
+        Some(Ok(changes)) => spans.extend([
+            Span::styled(format!("   {}   ", changes.comparison()), dim),
+            Span::raw(changes.files_label()),
+            Span::styled(format!("  +{}", changes.added), Style::default().fg(th.ok)),
+            Span::styled(
+                format!(" −{}", changes.removed),
+                Style::default().fg(th.err),
+            ),
+        ]),
+        Some(Err(error)) => spans.push(Span::styled(
+            format!("   {error}"),
+            Style::default().fg(th.err),
+        )),
+        None => {}
+    }
+    let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
+    let gap = (width as usize)
+        .saturating_sub(used + keys.chars().count())
+        .max(4);
+    spans.push(Span::styled(format!("{:gap$}{keys}", ""), dim));
+    Some(Line::from(spans))
 }
 
 fn centered_rect(frame: Rect, width: u16, height: u16) -> Rect {

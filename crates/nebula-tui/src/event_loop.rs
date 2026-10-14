@@ -2003,36 +2003,133 @@ fn open_repo_in_browser(app: &mut App) {
 }
 
 fn open_diff_view(app: &mut App) {
-    // Clone before touching app.overlay — selected_worktree borrows app.
-    let Some((path, branch)) = app
-        .selected_worktree()
-        .map(|w| (w.path.clone(), w.branch.clone()))
-    else {
+    let Some(id) = app.selected_worktree().map(|w| w.id.clone()) else {
         app.flash = Some("no worktree selected".into());
         return;
     };
-    if let Some(msg) = checkout_unreachable(&path) {
-        app.flash = Some(msg);
-        return;
+    match load_diff_view(app, &id) {
+        Ok(view) => app.overlay = Some(Overlay::Diff(Box::new(view))),
+        Err(msg) => app.flash = Some(msg),
     }
-    let files = match crate::git_diff::changed_files(&path) {
-        Ok(files) => files,
+}
+
+/// The diff viewer for checkout `id`, loaded and with the review queue
+/// around it; nothing in `app` changes. `Err` is a user-facing flash
+/// message.
+fn load_diff_view(app: &App, id: &nebula_core::WorktreeId) -> Result<DiffView, String> {
+    let worktree = app
+        .tree
+        .worktrees
+        .iter()
+        .find(|w| &w.id == id)
+        .ok_or("that checkout is no longer in the panel")?;
+    if let Some(msg) = checkout_unreachable(&worktree.path) {
+        return Err(msg);
+    }
+    let (base, files) = crate::git_diff::opening_diff(
+        &worktree.path,
+        &worktree.branch,
+        worktree.created_from.as_deref(),
+    )?;
+    let head = crate::git_diff::head_oid(&worktree.path);
+    let head_ok = head.is_some();
+    let mut view = DiffView::new(
+        worktree.path.clone(),
+        worktree.branch.clone(),
+        files,
+        head_ok,
+    );
+    view.base = base;
+    view.head_key = head.unwrap_or_default();
+    view.files_width = app.diff_files_width;
+    view.upstream = crate::git_diff::upstream_name(&view.root);
+    // The commit strip shows them at once; a failure leaves it empty and
+    // the ^g picker retries.
+    view.commits = crate::git_diff::recent_commits(&view.root).unwrap_or_default();
+    reload_reviewed_marks(&mut view);
+    crate::git_diff::load_selected_diff(&mut view);
+    view.worktree = Some(id.clone());
+    let changes = crate::review_queue::Changes::measure(
+        &view.root,
+        view.base.clone(),
+        &view.files,
+        view.head_ok,
+        view.reviewed.len(),
+    );
+    view.queue_snapshot = review_queue(app, Some((id, &changes)));
+    Ok(view)
+}
+
+fn review_queue(
+    app: &App,
+    loaded: Option<(&nebula_core::WorktreeId, &crate::review_queue::Changes)>,
+) -> crate::review_queue::ReviewQueue {
+    use crate::review_queue::{AgentsState, ReviewQueue};
+    let checkouts = app.visible_worktrees().into_iter().map(|worktree| {
+        let statuses = app
+            .tree
+            .agents
+            .iter()
+            .filter(|a| a.worktree_id == worktree.id && !a.archived)
+            .map(|a| a.status);
+        (worktree, AgentsState::of(statuses))
+    });
+    ReviewQueue::build(checkouts, loaded)
+}
+
+fn step_review(app: &mut App, forward: bool, out: &mut Vec<ClientRequest>) {
+    let Some(Overlay::Diff(view)) = &app.overlay else {
+        return;
+    };
+    let target = view
+        .queue_snapshot
+        .step(view.worktree.as_ref(), forward)
+        .map(|entry| entry.worktree.clone());
+    match target {
+        Ok(id) => open_diff_then_select_checkout(app, &id, out),
+        Err(msg) => app.flash = Some(msg.into()),
+    }
+}
+
+fn open_diff_then_select_checkout(
+    app: &mut App,
+    id: &nebula_core::WorktreeId,
+    out: &mut Vec<ClientRequest>,
+) {
+    let view = match load_diff_view(app, id) {
+        Ok(view) => view,
         Err(msg) => {
             app.flash = Some(msg);
             return;
         }
     };
-    // A clean tree still opens: the ^g picker can switch to the upstream
-    // or a past commit from there.
-    let head = crate::git_diff::head_oid(&path);
-    let head_ok = head.is_some();
-    let mut view = DiffView::new(path, branch, files, head_ok);
-    view.head_key = head.unwrap_or_default();
-    view.files_width = app.diff_files_width;
-    view.upstream = crate::git_diff::upstream_name(&view.root);
-    restore_reviewed_marks(&mut view);
-    crate::git_diff::load_selected_diff(&mut view);
-    app.overlay = Some(Overlay::Diff(view));
+    if let Some(index) = app.worktree_row_index(id) {
+        if app.sel_worktree != index {
+            remember_context(app);
+            app.sel_worktree = index;
+            restore_session(app, out);
+        }
+    }
+    app.overlay = Some(Overlay::Diff(Box::new(view)));
+}
+
+fn open_review_list(app: &mut App) {
+    let queue = review_queue(app, None);
+    let Some(Overlay::Diff(view)) = &mut app.overlay else {
+        return;
+    };
+    view.queue_snapshot = queue;
+    if view.queue_snapshot.entries.is_empty() {
+        app.flash = Some("no checkout waits for review".into());
+        return;
+    }
+    view.queue_picker = Some(crate::app::QueuePicker {
+        hover: view
+            .queue_snapshot
+            .position(view.worktree.as_ref())
+            .unwrap_or(0),
+        ..Default::default()
+    });
 }
 
 /// Open the diff viewer's ^g base picker, loading the commit and branch
@@ -2062,11 +2159,6 @@ fn open_diff_base_picker(app: &mut App) {
     view.open_picker();
 }
 
-/// Switch what the diff viewer compares: reload the file list for `base`,
-/// keep the filter, and re-select the top row. Reviewed ✓ marks only
-/// apply to the working-tree view (they are keyed to HEAD's uncommitted
-/// diff), so they clear for any other base and come back when it returns.
-/// A git failure flashes and leaves the current base in place.
 fn set_diff_base(app: &mut App, base: crate::git_diff::DiffBase) {
     use crate::git_diff::DiffBase;
     let Some(Overlay::Diff(view)) = &mut app.overlay else {
@@ -2087,42 +2179,28 @@ fn set_diff_base(app: &mut App, base: crate::git_diff::DiffBase) {
         }
     };
     view.base = base;
+    view.follow_commit();
     view.files = files;
-    view.reviewed.clear();
-    if view.base.is_working_tree() {
-        restore_reviewed_marks(view);
-    }
+    reload_reviewed_marks(view);
     view.apply_filter();
     crate::git_diff::load_selected_diff(view);
 }
 
-/// Restore the worktree's reviewed ✓ marks into `view.reviewed`, dropping
-/// any that no longer apply: `load_marks` already returns nothing when HEAD
-/// moved (a commit resets the whole worktree), and a mark whose file left
-/// the change list or whose diff text changed since it was approved is
-/// pruned here — then the pruned set is written back. Restored marks sink
-/// to the bottom, so the modal opens on the first unreviewed file.
-fn restore_reviewed_marks(view: &mut DiffView) {
-    let stored = crate::review::load_marks(&view.root, &view.head_key);
-    if stored.is_empty() {
-        return;
-    }
-    view.reviewed = view
-        .files
-        .iter()
-        .filter_map(|file| {
-            let mark = *stored.get(&file.path)?;
-            let diff = crate::git_diff::diff_for(
-                &view.root,
-                file,
-                &crate::git_diff::DiffBase::WorkingTree,
-                view.head_ok,
-            );
-            (crate::review::fingerprint(&diff) == mark).then(|| (file.path.clone(), mark))
-        })
-        .collect();
-    if view.reviewed.len() != stored.len() {
-        crate::review::store_marks(&view.root, &view.head_key, &view.reviewed);
+fn reload_reviewed_marks(view: &mut DiffView) {
+    view.reviewed.clear();
+    if let Some(scope) = view.mark_scope() {
+        let stored = crate::review::load_marks(&view.root, scope);
+        let unchanged = crate::review_queue::marks_on_unchanged_diffs(
+            &view.root,
+            &view.files,
+            &view.base,
+            view.head_ok,
+            &stored,
+        );
+        if unchanged.len() != stored.len() {
+            crate::review::store_marks(&view.root, scope, &unchanged);
+        }
+        view.reviewed = unchanged;
     }
     view.recompute_matches();
 }
@@ -5030,10 +5108,50 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 app.dirty = true;
                 return;
             }
+            if let Some(picker) = &mut view.queue_picker {
+                let last = view.queue_snapshot.entries.len().saturating_sub(1);
+                let down = key.code == KeyCode::Down || (ctrl && key.code == KeyCode::Char('n'));
+                let up = key.code == KeyCode::Up || (ctrl && key.code == KeyCode::Char('p'));
+                match key.code {
+                    _ if down => picker.hover = (picker.hover + 1).min(last),
+                    _ if up => picker.hover = picker.hover.saturating_sub(1),
+                    KeyCode::Enter => {
+                        let id = view
+                            .queue_snapshot
+                            .entries
+                            .get(picker.hover)
+                            .map(|e| e.worktree.clone());
+                        view.queue_picker = None;
+                        if let Some(id) = id {
+                            open_diff_then_select_checkout(app, &id, out);
+                        }
+                    }
+                    KeyCode::Esc => view.queue_picker = None,
+                    KeyCode::Char('l') if ctrl => view.queue_picker = None,
+                    _ => {}
+                }
+                app.dirty = true;
+                return;
+            }
             match key.code {
+                KeyCode::Char('n') if ctrl => step_review(app, true, out),
+                KeyCode::Char('p') if ctrl => step_review(app, false, out),
+                KeyCode::Char('l') if ctrl => open_review_list(app),
                 // ^g: pick what the diff compares (working tree, upstream,
                 // a commit).
                 KeyCode::Char('g') if cmd_or_ctrl => open_diff_base_picker(app),
+                // ⇥/⇧⇥ step the base along the commit strip: working tree,
+                // then the commits newest first.
+                KeyCode::Tab | KeyCode::BackTab => {
+                    let delta = if key.code == KeyCode::BackTab || shift {
+                        -1
+                    } else {
+                        1
+                    };
+                    if let Some(base) = view.step_base(delta) {
+                        set_diff_base(app, base);
+                    }
+                }
                 // Two-stage escape: an active filter is cleared before the
                 // second Esc closes the modal.
                 KeyCode::Esc if !view.filter.is_empty() => {
@@ -5047,15 +5165,11 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 // Ctrl+u is the line editor's kill-to-start while something
                 // is typed; only with an empty filter does it scroll.
                 KeyCode::Char('u') if ctrl && view.filter.is_empty() => view.scroll_by(-half),
-                // Ctrl+r toggles the reviewed ✓ on the selected file —
-                // nebula-side bookkeeping only, no git state is touched.
-                // Reviewed files sink to the bottom; marking advances to the
-                // next file and unmarking to the next still-marked file, so
-                // held Ctrl+r sweeps either way (see
-                // `DiffView::toggle_reviewed`).
-                KeyCode::Char('r') if ctrl && view.base.is_working_tree() => {
+                KeyCode::Char('r') if ctrl && view.mark_scope().is_some() => {
                     if let Some(changed) = view.toggle_reviewed() {
-                        crate::review::store_marks(&view.root, &view.head_key, &view.reviewed);
+                        if let Some(scope) = view.mark_scope() {
+                            crate::review::store_marks(&view.root, scope, &view.reviewed);
+                        }
                         if changed {
                             crate::git_diff::load_selected_diff(view);
                         }
@@ -7944,11 +8058,17 @@ fn pointer_wants_hand(app: &App, column: u16, row: u16) -> bool {
             g.window_start(g.list_area.height as usize),
             g.hits.len(),
         ),
-        Some(Overlay::Diff(v)) => list_row(
-            v.list_area,
-            v.window_start(v.list_area.height as usize),
-            v.matches.len(),
-        ),
+        Some(Overlay::Diff(v)) => {
+            list_row(
+                v.list_area,
+                v.window_start(v.list_area.height as usize),
+                v.matches.len(),
+            ) || list_row(
+                v.commits_area,
+                v.commit_window_start(v.commits_area.height as usize),
+                v.commits.len(),
+            ) || inside(v.current_area)
+        }
         Some(Overlay::Tree(t)) => list_row(
             t.list_area,
             t.window_start(t.list_area.height as usize),
@@ -8176,6 +8296,39 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
     // selects that file, a drag on the files/diff border resizes the file
     // list; everything else is swallowed.
     if let Some(Overlay::Diff(view)) = &mut app.overlay {
+        if let Some(picker) = &mut view.queue_picker {
+            let last = view.queue_snapshot.entries.len().saturating_sub(1);
+            let inside = |r: ratatui::layout::Rect| {
+                mouse.column >= r.x
+                    && mouse.column < r.x + r.width
+                    && mouse.row >= r.y
+                    && mouse.row < r.y + r.height
+            };
+            match mouse.kind {
+                MouseEventKind::ScrollUp => picker.hover = picker.hover.saturating_sub(1),
+                MouseEventKind::ScrollDown => picker.hover = (picker.hover + 1).min(last),
+                MouseEventKind::Down(MouseButton::Left) if inside(picker.list_area) => {
+                    let list = picker.list_area;
+                    let row =
+                        picker.scroll_offset(list.height as usize) + (mouse.row - list.y) as usize;
+                    if let Some(id) = view
+                        .queue_snapshot
+                        .entries
+                        .get(row)
+                        .map(|e| e.worktree.clone())
+                    {
+                        view.queue_picker = None;
+                        open_diff_then_select_checkout(app, &id, out);
+                    }
+                }
+                MouseEventKind::Down(MouseButton::Left) if !inside(picker.area) => {
+                    view.queue_picker = None
+                }
+                _ => return,
+            }
+            app.dirty = true;
+            return;
+        }
         // The ^g base picker on top: the wheel moves the hover, a click on
         // a row picks it, a click outside closes; everything else is
         // swallowed.
@@ -8217,7 +8370,40 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
             && mouse.column < view.splitter_x()
             && mouse.row >= view.area.y
             && mouse.row < view.area.y + view.area.height;
+        // The commit strip under the ▾ base row: the wheel scrolls it, a
+        // click on a row compares with that commit.
+        let strip = view.commits_area;
+        let over_commits = strip.width > 0
+            && mouse.column >= strip.x
+            && mouse.column < strip.x + strip.width
+            && mouse.row >= strip.y
+            && mouse.row < strip.y + strip.height;
+        let cur = view.current_area;
+        let over_current = cur.height > 0
+            && mouse.row == cur.y
+            && mouse.column >= cur.x
+            && mouse.column < cur.x + cur.width;
         match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) if over_current => {
+                set_diff_base(app, crate::git_diff::DiffBase::WorkingTree);
+                app.dirty = true;
+            }
+            MouseEventKind::ScrollUp if over_commits => {
+                view.scroll_commits_by(-1);
+                app.dirty = true;
+            }
+            MouseEventKind::ScrollDown if over_commits => {
+                view.scroll_commits_by(1);
+                app.dirty = true;
+            }
+            MouseEventKind::Down(MouseButton::Left) if over_commits => {
+                let index = view.commit_window_start(strip.height as usize)
+                    + (mouse.row - strip.y) as usize;
+                if let Some(c) = view.commits.get(index).cloned() {
+                    set_diff_base(app, crate::git_diff::DiffBase::Commit(c));
+                    app.dirty = true;
+                }
+            }
             MouseEventKind::ScrollUp if over_files => {
                 view.scroll_list_by(-3);
                 app.dirty = true;
@@ -19805,7 +19991,7 @@ mod tests {
         view.files_width = 30;
         view.list_area = ratatui::layout::Rect::new(1, 3, 28, 10);
         let mut app = App::new();
-        app.overlay = Some(Overlay::Diff(view));
+        app.overlay = Some(Overlay::Diff(Box::new(view)));
         let wheel = |app: &mut App, col: u16, kind: MouseEventKind| {
             handle_mouse(
                 app,
@@ -19912,6 +20098,103 @@ mod tests {
         let v = diff_view(&app);
         assert!(v.base.is_working_tree());
         assert_eq!(v.files[0].path, "z.txt");
+    }
+
+    /// The commit strip under the ▾ base row lists the recent commits as
+    /// soon as the viewer opens: ⇥ steps down it, ⇧⇥ back up to the
+    /// working tree, and a click on a row picks that commit.
+    #[test]
+    fn tab_steps_through_the_commit_strip() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo(&dir);
+        std::fs::write(repo.join("a.txt"), "committed\n").unwrap();
+        run_git(&repo, &["commit", "-am", "second"]);
+        std::fs::write(repo.join("z.txt"), "fresh\n").unwrap();
+        let mut app = App::new();
+        seed_repo_tree(&mut app, &repo);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
+        assert_eq!(diff_view(&app).commits.len(), 2, "loaded on open");
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("second"), "strip row:\n{text}");
+        let strip = diff_view(&app).commits_area;
+        assert_eq!(strip.height, 2);
+        assert_eq!(diff_view(&app).list_area.y, strip.y + 2, "files below");
+
+        let subject = |app: &App| match &diff_view(app).base {
+            crate::git_diff::DiffBase::Commit(c) => c.subject.clone(),
+            other => format!("{other:?}"),
+        };
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+        assert_eq!(subject(&app), "second");
+        assert_eq!(diff_view(&app).files[0].path, "a.txt");
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+        let oldest = diff_view(&app).commits[1].subject.clone();
+        assert_eq!(subject(&app), oldest);
+        press(&mut app, KeyCode::Tab, KeyModifiers::NONE, &mut out);
+        assert_eq!(subject(&app), oldest, "the last commit is the end");
+        press(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT, &mut out);
+        press(&mut app, KeyCode::BackTab, KeyModifiers::SHIFT, &mut out);
+        assert!(diff_view(&app).base.is_working_tree());
+        assert_eq!(diff_view(&app).files[0].path, "z.txt");
+
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: strip.x + 3,
+                row: strip.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut out,
+        );
+        assert_eq!(subject(&app), "second", "a click picks the row");
+
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("Current  uncommitted"), "pinned row:\n{text}");
+        let current = diff_view(&app).current_area;
+        assert_eq!(current.y + 1, strip.y, "pinned above the commits");
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: current.x + 3,
+                row: current.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut out,
+        );
+        assert!(
+            diff_view(&app).base.is_working_tree(),
+            "back to uncommitted"
+        );
+    }
+
+    /// The strip shows five rows; stepping past them scrolls it along.
+    #[test]
+    fn commit_strip_follows_the_picked_commit() {
+        let mut view = fake_diff_view(4);
+        view.commits = (0..12)
+            .map(|i| crate::git_diff::CommitEntry {
+                oid: format!("oid{i}"),
+                short: format!("s{i}"),
+                parent: None,
+                when: String::new(),
+                subject: format!("commit {i}"),
+            })
+            .collect();
+        for expected in [0, 0, 0, 0, 0, 1, 2] {
+            view.base = view.step_base(1).expect("more commits");
+            view.follow_commit();
+            assert_eq!(view.commit_scroll, expected);
+        }
+        view.base = crate::git_diff::DiffBase::Commit(view.commits[1].clone());
+        view.follow_commit();
+        assert_eq!(view.commit_scroll, 1);
     }
 
     /// Tab in the ^g picker flips to the branch list; Enter on a branch
@@ -20095,7 +20378,7 @@ mod tests {
     fn diff_modal_keys_switch_files_and_scroll() {
         let mut app = App::new();
         seed_tree(&mut app);
-        app.overlay = Some(Overlay::Diff(fake_diff_view(100)));
+        app.overlay = Some(Overlay::Diff(Box::new(fake_diff_view(100))));
         let mut out = Vec::new();
         let scroll = |app: &App| match &app.overlay {
             Some(Overlay::Diff(v)) => (v.selected, v.scroll),
@@ -20141,7 +20424,7 @@ mod tests {
     fn diff_modal_type_to_filter() {
         let mut app = App::new();
         seed_tree(&mut app);
-        app.overlay = Some(Overlay::Diff(fake_diff_view(10)));
+        app.overlay = Some(Overlay::Diff(Box::new(fake_diff_view(10))));
         let mut out = Vec::new();
         let view = |app: &App| match &app.overlay {
             Some(Overlay::Diff(v)) => v.clone(),
@@ -20327,10 +20610,330 @@ mod tests {
     }
 
     #[test]
+    fn a_branch_base_mark_survives_commits_to_other_files_only() {
+        use nebula_core::{Entity, ProjectId, Worktree, WorktreeId};
+        let dir = tempfile::tempdir().unwrap();
+        crate::review::with_store_path(dir.path().join("reviewed.json"), || {
+            let repo = test_repo(&dir);
+            run_git(&repo, &["checkout", "-b", "feat"]);
+            std::fs::write(repo.join("a.txt"), "feat\n").unwrap();
+            std::fs::write(repo.join("b.txt"), "new\n").unwrap();
+            run_git(&repo, &["add", "."]);
+            run_git(&repo, &["commit", "-m", "feat work"]);
+
+            let mut app = App::new();
+            seed_repo_tree(&mut app, &repo);
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Worktree(Worktree {
+                        id: WorktreeId("w1".into()),
+                        project_id: ProjectId("p1".into()),
+                        path: repo.clone(),
+                        branch: "feat".into(),
+                        is_main: true,
+                        created_from: Some("main".into()),
+                        pinned: false,
+                        for_branch: false,
+                        sort_order: 0,
+                    }),
+                },
+            );
+            let mut out = Vec::new();
+            let reviewed = |app: &App| {
+                let mut paths: Vec<String> = diff_view(app).reviewed.keys().cloned().collect();
+                paths.sort();
+                paths
+            };
+            let on_main = crate::git_diff::DiffBase::Branch("main".into());
+
+            press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
+            assert_eq!(diff_view(&app).base, on_main, "clean tree: review base");
+            assert_eq!(diff_order(&app), ["a.txt", "b.txt"]);
+            press(
+                &mut app,
+                KeyCode::Char('r'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
+            assert_eq!(reviewed(&app), ["a.txt"]);
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+
+            std::fs::write(repo.join("c.txt"), "more\n").unwrap();
+            run_git(&repo, &["add", "."]);
+            run_git(&repo, &["commit", "-m", "another file"]);
+            press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
+            assert_eq!(diff_view(&app).base, on_main);
+            assert_eq!(reviewed(&app), ["a.txt"], "a.txt was not touched");
+            assert_eq!(diff_order(&app), ["b.txt", "c.txt", "a.txt"]);
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+
+            std::fs::write(repo.join("a.txt"), "feat again\n").unwrap();
+            run_git(&repo, &["commit", "-am", "a.txt again"]);
+            press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
+            assert_eq!(diff_view(&app).base, on_main);
+            assert_eq!(reviewed(&app), [] as [&str; 0], "a.txt changed again");
+        });
+    }
+
+    /// Two checkouts of `repo` cut from `main`, each one commit ahead:
+    /// "a" on `feat-a` adds `x.txt`, "b" on `feat-b` adds `y.txt`.
+    fn seed_feature_checkouts(app: &mut App, dir: &tempfile::TempDir, repo: &std::path::Path) {
+        use nebula_core::{Entity, ProjectId, Worktree, WorktreeId};
+        for (id, branch, file, order) in [("a", "feat-a", "x.txt", 1), ("b", "feat-b", "y.txt", 2)]
+        {
+            let path = dir.path().join(branch);
+            run_git(
+                repo,
+                &["worktree", "add", "-b", branch, path.to_str().unwrap()],
+            );
+            std::fs::write(path.join(file), "new\n").unwrap();
+            run_git(&path, &["add", "."]);
+            run_git(&path, &["commit", "-m", branch]);
+            hse(
+                app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Worktree(Worktree {
+                        id: WorktreeId(id.into()),
+                        project_id: ProjectId("p1".into()),
+                        path,
+                        branch: branch.into(),
+                        is_main: false,
+                        created_from: Some("main".into()),
+                        pinned: false,
+                        for_branch: false,
+                        sort_order: order,
+                    }),
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn a_review_step_clears_the_filter_and_loads_the_next_checkout() {
+        use nebula_core::WorktreeId;
+        let dir = tempfile::tempdir().unwrap();
+        crate::review::with_store_path(dir.path().join("reviewed.json"), || {
+            let repo = test_repo(&dir);
+            let mut app = App::new();
+            seed_repo_tree(&mut app, &repo);
+            seed_feature_checkouts(&mut app, &dir, &repo);
+            let mut out = Vec::new();
+            let ctrl = |app: &mut App, c: char, out: &mut Vec<ClientRequest>| {
+                press(app, KeyCode::Char(c), KeyModifiers::CONTROL, out)
+            };
+            let shown = |app: &App| {
+                let v = diff_view(app);
+                let reviewed: Vec<String> = v.reviewed.keys().cloned().collect();
+                (
+                    v.branch.clone(),
+                    v.filter.as_str().to_string(),
+                    diff_order(app),
+                    reviewed,
+                )
+            };
+            let none: Vec<String> = Vec::new();
+
+            app.sel_worktree = app.worktree_row_index(&WorktreeId("b".into())).unwrap();
+            press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
+            ctrl(&mut app, 'r', &mut out);
+            ctrl(&mut app, 'p', &mut out);
+            assert_eq!(
+                shown(&app),
+                (
+                    "feat-a".into(),
+                    String::new(),
+                    vec!["x.txt".to_string()],
+                    none.clone()
+                )
+            );
+
+            press(&mut app, KeyCode::Char('x'), KeyModifiers::NONE, &mut out);
+            assert_eq!(diff_view(&app).filter.as_str(), "x");
+            ctrl(&mut app, 'n', &mut out);
+            assert_eq!(
+                shown(&app),
+                (
+                    "feat-b".into(),
+                    String::new(),
+                    vec!["y.txt".to_string()],
+                    vec!["y.txt".to_string()]
+                )
+            );
+            assert_eq!(app.selected_worktree().unwrap().branch, "feat-b");
+
+            ctrl(&mut app, 'n', &mut out);
+            assert_eq!(app.flash.as_deref(), Some("no next checkout to review"));
+            assert_eq!(diff_view(&app).branch, "feat-b");
+        });
+    }
+
+    #[test]
+    fn a_review_step_that_cannot_open_its_target_stays_on_the_checkout_shown() {
+        use nebula_core::WorktreeId;
+        let dir = tempfile::tempdir().unwrap();
+        crate::review::with_store_path(dir.path().join("reviewed.json"), || {
+            let repo = test_repo(&dir);
+            let mut app = App::new();
+            seed_repo_tree(&mut app, &repo);
+            seed_feature_checkouts(&mut app, &dir, &repo);
+            let mut out = Vec::new();
+            app.sel_worktree = app.worktree_row_index(&WorktreeId("a".into())).unwrap();
+            press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
+
+            let gone = dir.path().join("feat-b");
+            std::fs::remove_dir_all(&gone).unwrap();
+            press(
+                &mut app,
+                KeyCode::Char('n'),
+                KeyModifiers::CONTROL,
+                &mut out,
+            );
+            assert_eq!(
+                app.flash,
+                Some(format!("worktree path missing on disk: {}", gone.display()))
+            );
+            assert_eq!(diff_view(&app).branch, "feat-a");
+            assert_eq!(app.selected_worktree().unwrap().branch, "feat-a");
+        });
+    }
+
+    fn review_entry(
+        id: &str,
+        branch: &str,
+        changes: Result<crate::review_queue::Changes, String>,
+    ) -> crate::review_queue::ReviewEntry {
+        crate::review_queue::ReviewEntry {
+            worktree: nebula_core::WorktreeId(id.into()),
+            branch: branch.into(),
+            agents: crate::review_queue::AgentsState::Finished,
+            changes,
+        }
+    }
+
+    /// The row above the diff viewer, cut to the viewer's own columns.
+    fn review_status_row(app: &mut App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, app)).unwrap();
+        let viewer = diff_view(app).area;
+        buffer_text(&terminal)
+            .lines()
+            .nth(viewer.y as usize - 1)
+            .expect("a row above the viewer")
+            .chars()
+            .skip(viewer.x as usize)
+            .take(viewer.width as usize)
+            .collect::<String>()
+            .trim()
+            .to_string()
+    }
+
+    #[test]
+    fn the_review_status_line_shows_while_the_queue_leads_elsewhere() {
+        use crate::git_diff::DiffBase;
+        use crate::review_queue::{Changes, ReviewQueue};
+        use nebula_core::WorktreeId;
+        let changes = |base, files, added, removed| {
+            Ok(Changes {
+                base,
+                files,
+                added,
+                removed,
+                reviewed: 0,
+            })
+        };
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut view = fake_diff_view(4);
+        view.branch = "fix-login".into();
+        view.worktree = Some(WorktreeId("b".into()));
+        view.queue_snapshot = ReviewQueue {
+            entries: vec![
+                review_entry(
+                    "a",
+                    "feat-a",
+                    changes(DiffBase::Branch("main".into()), 1, 2, 0),
+                ),
+                review_entry("b", "fix-login", changes(DiffBase::WorkingTree, 3, 48, 12)),
+            ],
+        };
+        app.overlay = Some(Overlay::Diff(Box::new(view)));
+        let keys = "^n next  ^p prev  ^l list";
+        let split = |row: String| {
+            let (left, right) = row.split_once("    ").expect("keys on the right");
+            (left.to_string(), right.trim().to_string())
+        };
+        let view_mut = |app: &mut App, edit: &dyn Fn(&mut DiffView)| match &mut app.overlay {
+            Some(Overlay::Diff(view)) => edit(view),
+            other => panic!("expected diff overlay, got {other:?}"),
+        };
+
+        assert_eq!(
+            split(review_status_row(&mut app)),
+            (
+                "review 2/2   ‹ fix-login ›   uncommitted   3 files  +48 −12".to_string(),
+                keys.to_string()
+            )
+        );
+
+        view_mut(&mut app, &|view| {
+            view.branch = "feat-a".into();
+            view.worktree = Some(WorktreeId("a".into()));
+        });
+        assert_eq!(
+            split(review_status_row(&mut app)),
+            (
+                "review 1/2   ‹ feat-a ›   vs main   1 file  +2 −0".to_string(),
+                keys.to_string()
+            )
+        );
+
+        view_mut(&mut app, &|view| {
+            view.queue_snapshot.entries.remove(1);
+        });
+        let alone = review_status_row(&mut app);
+        assert!(!alone.contains("review"), "the only entry: {alone}");
+        assert!(!alone.contains("^n next"), "the only entry: {alone}");
+
+        view_mut(&mut app, &|view| {
+            view.branch = "main".into();
+            view.worktree = Some(WorktreeId("clean".into()));
+        });
+        assert_eq!(
+            split(review_status_row(&mut app)),
+            ("review –/1   ‹ main ›".to_string(), keys.to_string())
+        );
+    }
+
+    #[test]
+    fn the_review_list_shows_the_error_of_a_checkout_git_cannot_inspect() {
+        use crate::review_queue::ReviewQueue;
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut view = fake_diff_view(4);
+        view.queue_snapshot = ReviewQueue {
+            entries: vec![review_entry(
+                "x",
+                "broken",
+                Err("git status failed: boom".into()),
+            )],
+        };
+        view.queue_picker = Some(Default::default());
+        app.overlay = Some(Overlay::Diff(Box::new(view)));
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("broken   git status failed: boom"),
+            "list row:\n{text}"
+        );
+    }
+
+    #[test]
     fn diff_modal_ctrl_u_clears_filter_before_scrolling() {
         let mut app = App::new();
         seed_tree(&mut app);
-        app.overlay = Some(Overlay::Diff(fake_diff_view(100)));
+        app.overlay = Some(Overlay::Diff(Box::new(fake_diff_view(100))));
         let mut out = Vec::new();
         let view = |app: &App| match &app.overlay {
             Some(Overlay::Diff(v)) => v.clone(),
@@ -20401,7 +21004,7 @@ mod tests {
         let mut view = fake_diff_view(4);
         view.diff = "diff --git a/a.rs b/a.rs\n@@ -1,2 +1,2 @@\n-old line\n+new line".into();
         view.diff_line_count = 4;
-        app.overlay = Some(Overlay::Diff(view));
+        app.overlay = Some(Overlay::Diff(Box::new(view)));
 
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
@@ -20424,7 +21027,7 @@ mod tests {
         let mut app = App::new();
         seed_tree(&mut app);
         app.focus = Focus::Projects;
-        app.overlay = Some(Overlay::Diff(fake_diff_view(100)));
+        app.overlay = Some(Overlay::Diff(Box::new(fake_diff_view(100))));
         let mut out = Vec::new();
 
         let wheel = MouseEvent {
@@ -20460,7 +21063,7 @@ mod tests {
     fn diff_modal_click_selects_file_row() {
         let mut app = App::new();
         seed_tree(&mut app);
-        app.overlay = Some(Overlay::Diff(fake_diff_view(4)));
+        app.overlay = Some(Overlay::Diff(Box::new(fake_diff_view(4))));
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let area = match &app.overlay {
@@ -20514,7 +21117,7 @@ mod tests {
     fn diff_modal_border_drag_resizes_file_list() {
         let mut app = App::new();
         seed_tree(&mut app);
-        app.overlay = Some(Overlay::Diff(fake_diff_view(4)));
+        app.overlay = Some(Overlay::Diff(Box::new(fake_diff_view(4))));
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let (area, width_before) = match &app.overlay {

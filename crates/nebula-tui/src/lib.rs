@@ -25,6 +25,7 @@ pub mod raw_attach;
 pub mod remote;
 pub mod remote_cli;
 pub mod review;
+pub mod review_queue;
 pub mod splash;
 pub mod sync_cli;
 pub mod syntax;

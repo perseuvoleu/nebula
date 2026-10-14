@@ -47,6 +47,31 @@ pub struct CommitEntry {
     pub subject: String,
 }
 
+impl CommitEntry {
+    /// `when` squeezed for a narrow row: "3 hours ago" → "3h". Anything
+    /// git words differently comes back unchanged.
+    pub fn age(&self) -> String {
+        let mut words = self.when.split_whitespace();
+        let (Some(n), Some(unit)) = (words.next(), words.next()) else {
+            return self.when.clone();
+        };
+        let suffix = match unit.trim_end_matches([',', 's']) {
+            "second" => "s",
+            "minute" => "m",
+            "hour" => "h",
+            "day" => "d",
+            "week" => "w",
+            "month" => "mo",
+            "year" => "y",
+            _ => return self.when.clone(),
+        };
+        if n.parse::<u32>().is_err() {
+            return self.when.clone();
+        }
+        format!("{n}{suffix}")
+    }
+}
+
 /// What the diff viewer compares. `WorkingTree` (the default) is the
 /// checkout's uncommitted changes against HEAD; `Upstream` is the working
 /// tree against the branch's tracking ref (everything not yet pushed,
@@ -75,6 +100,17 @@ impl DiffBase {
             DiffBase::WorkingTree => String::new(),
             DiffBase::Upstream(name) | DiffBase::Branch(name) => format!(" vs {name}"),
             DiffBase::Commit(c) => format!(" @ {}", c.short),
+        }
+    }
+
+    /// Where this base's ✓ marks are stored under HEAD OID `head`; `None`
+    /// for the bases that have none (the upstream, a commit).
+    pub fn mark_scope<'a>(&'a self, head: &'a str) -> Option<crate::review::MarkScope<'a>> {
+        use crate::review::MarkScope;
+        match self {
+            DiffBase::WorkingTree => Some(MarkScope::WorkingTree { head }),
+            DiffBase::Branch(base) => Some(MarkScope::Branch { base }),
+            DiffBase::Upstream(_) | DiffBase::Commit(_) => None,
         }
     }
 
@@ -252,6 +288,43 @@ fn creation_base(root: &Path, branch: &str) -> Option<String> {
     (!base.is_empty() && base != "HEAD" && base != branch).then_some(base)
 }
 
+/// The branch a checkout is reviewed against: the one the TUI recorded it
+/// was cut from (`created_from`), else the reflog's. `None` when neither
+/// is known, it names `branch` itself, or it no longer resolves to a commit.
+pub fn review_base(root: &Path, branch: &str, created_from: Option<&str>) -> Option<String> {
+    created_from
+        .map(str::to_owned)
+        .or_else(|| creation_base(root, branch))
+        .filter(|base| base != branch && is_commit(root, base))
+}
+
+fn is_commit(root: &Path, rev: &str) -> bool {
+    let rev = format!("{rev}^{{commit}}");
+    run_git(root, &["rev-parse", "--verify", "--quiet", &rev]).is_ok_and(|o| o.status.success())
+}
+
+/// What the viewer opens on: the uncommitted changes whenever there are
+/// any, else everything since the review base when that shows something,
+/// else the empty working tree. `Err` is a user-facing flash message.
+pub fn opening_diff(
+    root: &Path,
+    branch: &str,
+    created_from: Option<&str>,
+) -> Result<(DiffBase, Vec<DiffFile>), String> {
+    let files = changed_files(root)?;
+    if !files.is_empty() {
+        return Ok((DiffBase::WorkingTree, files));
+    }
+    let Some(base) = review_base(root, branch, created_from) else {
+        return Ok((DiffBase::WorkingTree, files));
+    };
+    let since = files_since(root, &["--merge-base", &base])?;
+    if since.is_empty() {
+        return Ok((DiffBase::WorkingTree, files));
+    }
+    Ok((DiffBase::Branch(base), since))
+}
+
 /// `rev` resolved to its short symbolic name (`origin/main`), or `None`
 /// when git cannot resolve it.
 fn rev_name(root: &Path, rev: &str) -> Option<String> {
@@ -320,6 +393,50 @@ pub fn files_since(root: &Path, rev: &[&str]) -> Result<Vec<DiffFile>, String> {
             .filter(DiffFile::is_untracked),
     );
     Ok(files)
+}
+
+/// Lines added and removed across `files`, the list `base` produced:
+/// tracked ones from `git diff --numstat`, untracked ones as all added.
+/// A git failure or a binary file counts as zero.
+pub fn line_counts(
+    root: &Path,
+    base: &DiffBase,
+    files: &[DiffFile],
+    head_ok: bool,
+) -> (usize, usize) {
+    let mut args = vec!["diff", "--numstat", "-M"];
+    let empty_tree;
+    match base.rev_args() {
+        Some(rev) => args.extend(rev),
+        None if head_ok => args.push("HEAD"),
+        None => {
+            empty_tree = empty_tree_oid(root);
+            args.push(&empty_tree);
+        }
+    }
+    let tracked = run_git(root, &args).map(|o| o.stdout).unwrap_or_default();
+    let (mut added, mut removed) = (0, 0);
+    for line in String::from_utf8_lossy(&tracked).lines() {
+        let mut columns = line.split('\t');
+        added += columns.next().and_then(|n| n.parse().ok()).unwrap_or(0);
+        removed += columns.next().and_then(|n| n.parse().ok()).unwrap_or(0);
+    }
+    for file in files.iter().filter(|f| f.is_untracked()) {
+        let bytes = std::fs::read(root.join(&file.path)).unwrap_or_default();
+        if !bytes.contains(&0) {
+            added += String::from_utf8_lossy(&bytes).lines().count();
+        }
+    }
+    (added, removed)
+}
+
+/// The empty tree's OID in this repository's hash format: what an unborn
+/// HEAD is compared against so staged files count.
+fn empty_tree_oid(root: &Path) -> String {
+    let output = run_git(root, &["hash-object", "-t", "tree", "/dev/null"]);
+    output
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
 }
 
 /// Parse `%H\x1f%h\x1f%P\x1f%ar\x1f%s` lines.
@@ -790,6 +907,76 @@ mod tests {
         assert!(diff.contains("+one") && diff.contains("+two"), "{diff}");
     }
 
+    fn branch_with_one_commit(repo: &PathBuf) {
+        git(repo, &["checkout", "-b", "feat", "main"]);
+        std::fs::write(repo.join("mine.txt"), "one\n").unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-m", "feat 1"]);
+    }
+
+    #[test]
+    fn a_committed_branch_opens_on_the_branch_it_was_cut_from() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = make_repo(&dir);
+        branch_with_one_commit(&repo);
+
+        let (base, files) = opening_diff(&repo, "feat", None).unwrap();
+        assert_eq!(base, DiffBase::Branch("main".into()));
+        let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["mine.txt"]);
+    }
+
+    #[test]
+    fn the_recorded_base_wins_over_the_reflog() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = make_repo(&dir);
+        git(&repo, &["branch", "release"]);
+        branch_with_one_commit(&repo);
+
+        let (base, _) = opening_diff(&repo, "feat", Some("release")).unwrap();
+        assert_eq!(base, DiffBase::Branch("release".into()));
+    }
+
+    #[test]
+    fn an_uncommitted_edit_opens_on_the_working_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = make_repo(&dir);
+        branch_with_one_commit(&repo);
+        std::fs::write(repo.join("tracked.txt"), "new line\n").unwrap();
+
+        let (base, files) = opening_diff(&repo, "feat", None).unwrap();
+        assert_eq!(base, DiffBase::WorkingTree);
+        let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["tracked.txt"]);
+    }
+
+    #[test]
+    fn a_clean_branch_with_no_known_base_opens_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = make_repo(&dir);
+
+        let (base, files) = opening_diff(&repo, "main", None).unwrap();
+        assert_eq!(base, DiffBase::WorkingTree);
+        assert!(files.is_empty(), "{files:?}");
+    }
+
+    #[test]
+    fn line_counts_before_the_first_commit_include_staged_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        std::fs::write(repo.join("staged.txt"), "one\ntwo\n").unwrap();
+        git(&repo, &["add", "."]);
+        std::fs::write(repo.join("loose.txt"), "three\n").unwrap();
+
+        let files = changed_files(&repo).unwrap();
+        assert_eq!(
+            line_counts(&repo, &DiffBase::WorkingTree, &files, false),
+            (3, 0)
+        );
+    }
+
     #[test]
     fn parse_name_status_z_handles_renames() {
         let files = parse_name_status_z(b"M\0a.rs\0R100\0old.rs\0new.rs\0A\0b.rs\0");
@@ -798,6 +985,26 @@ mod tests {
         assert_eq!(files[1].path, "new.rs");
         assert_eq!(files[1].orig_path.as_deref(), Some("old.rs"));
         assert_eq!(files[2].path, "b.rs");
+    }
+
+    #[test]
+    fn commit_age_is_the_relative_date_squeezed() {
+        let age = |when: &str| {
+            CommitEntry {
+                oid: String::new(),
+                short: String::new(),
+                parent: None,
+                when: when.into(),
+                subject: String::new(),
+            }
+            .age()
+        };
+        assert_eq!(age("12 minutes ago"), "12m");
+        assert_eq!(age("3 hours ago"), "3h");
+        assert_eq!(age("1 day ago"), "1d");
+        assert_eq!(age("5 months ago"), "5mo");
+        assert_eq!(age("1 year, 2 months ago"), "1y");
+        assert_eq!(age("now"), "now");
     }
 
     #[test]
