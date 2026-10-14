@@ -906,6 +906,14 @@ fn nebula_cli(tui: &TuiHarness, args: &[&str]) -> std::process::Output {
         .unwrap()
 }
 
+/// Type into the attached pane and wait for the session's own agent id —
+/// proof that the pane holds that session's live PTY. `tag` keeps an echo
+/// replayed from an earlier visit from satisfying the wait.
+fn assert_typing_reaches(tui: &mut TuiHarness, tag: &str, id: &str) {
+    tui.type_str(&format!("echo {tag}-$NEBULA_AGENT_ID\r"));
+    tui.wait_for_text(&format!("{tag}-{id}"));
+}
+
 /// `nebula open --session` from a launcher (no terminal): a running TUI
 /// takes the request and attaches the session; with none running the
 /// command says so with exit 3 instead of starting a TUI it has no
@@ -962,6 +970,7 @@ fn open_session_attaches_it_in_the_running_tui() {
     );
     tui.wait_for_selected("second");
     tui.wait_for_text(FOOTER_TERMINAL_LOCKED);
+    assert_typing_reaches(&mut tui, "t1", &ids[1]);
 
     tui.send(&[0x11]);
     tui.wait_for_text(FOOTER_SESSIONS);
@@ -969,6 +978,7 @@ fn open_session_attaches_it_in_the_running_tui() {
     assert_eq!(by_id.status.code(), Some(0), "{by_id:?}");
     tui.wait_for_selected("first");
     tui.wait_for_text(FOOTER_TERMINAL_LOCKED);
+    assert_typing_reaches(&mut tui, "t2", &ids[0]);
 
     for args in [
         &["workspace", "add", "other"][..],
@@ -1003,4 +1013,5 @@ fn open_session_attaches_it_in_the_running_tui() {
     tui.relaunch(&["open", "--session", "second"]);
     tui.wait_for_selected("second");
     tui.wait_for_text(FOOTER_TERMINAL_LOCKED);
+    assert_typing_reaches(&mut tui, "t3", &ids[1]);
 }
