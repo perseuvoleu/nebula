@@ -24,6 +24,7 @@ pub mod raw_attach;
 pub mod remote;
 pub mod remote_cli;
 pub mod review;
+pub mod session_open;
 pub mod splash;
 pub mod sync_cli;
 pub mod syntax;
@@ -47,8 +48,33 @@ fn runtime() -> Result<tokio::runtime::Runtime> {
 /// binary crate stays a thin arg-parser. `Some(entry)` means the user picked
 /// a recent ssh host — the terminal is restored and the caller should exec
 /// `nebula ssh` at it.
-pub fn run_tui(open_at: Option<std::path::PathBuf>) -> Result<event_loop::Handoff> {
+pub fn run_tui(open_at: Option<app::OpenAt>) -> Result<event_loop::Handoff> {
     runtime()?.block_on(event_loop::run_app(open_at))
+}
+
+/// `nebula open --session`: resolve the session, then land it in a running
+/// TUI, printing what landed as one JSON object. `Some(id)` when no TUI
+/// answered — the caller starts one landed on `id` when it has a terminal.
+pub fn run_open_session(
+    reference: String,
+    project: Option<String>,
+) -> Result<Option<nebula_core::AgentId>> {
+    let resolved = runtime()?.block_on(session_open::resolve(&reference, project.as_deref()))?;
+    let Some(pid) = session_open::hand_to_running_tui(&resolved.id)? else {
+        return Ok(Some(resolved.id));
+    };
+    println!(
+        "{}",
+        serde_json::json!({
+            "landed": "tui",
+            "tui_pid": pid,
+            "id": resolved.id.as_str(),
+            "name": resolved.name,
+            "project": resolved.project,
+            "host": resolved.host,
+        })
+    );
+    Ok(None)
 }
 
 /// Phase-2 throwaway raw-mode client (`nebula _raw-attach`).

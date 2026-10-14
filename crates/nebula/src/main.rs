@@ -31,10 +31,25 @@ enum Command {
     /// Open the TUI landed straight on the project owning a directory
     /// (default: the current one) — the repo is added as a project first
     /// when nebula doesn't know it yet. The `ng` launcher uses this.
+    ///
+    /// With --session it lands attached to that session instead. A running
+    /// TUI takes the attach and the command prints
+    /// {"landed":"tui","tui_pid",id,name,project,host} (host null when
+    /// local); with none running it starts the TUI here when run in a
+    /// terminal, else exits 3. An unknown, archived or ambiguous session
+    /// exits 1.
     Open {
         /// Directory to land on (default: the current directory).
-        #[arg(default_value = ".")]
+        #[arg(default_value = ".", conflicts_with = "session")]
         path: String,
+        /// Session to attach: its id or its name, as `nebula agent list
+        /// --all` prints them (remote @host sessions included).
+        #[arg(long, value_name = "ID|NAME")]
+        session: Option<String>,
+        /// Look the --session name up in this project only, `name@host`
+        /// for a remote one (default: every project).
+        #[arg(long, requires = "session")]
+        project: Option<String>,
     },
     /// Run the daemon process (normally auto-spawned by the TUI).
     Daemon {
@@ -592,12 +607,29 @@ fn main() -> Result<()> {
                 std::fs::canonicalize(&dir).with_context(|| format!("{dir} does not exist"))?;
             nebula_daemon::hooks::installer::install_for_kind(kind, &dir)
         }
-        Some(Command::Open { path }) => {
+        Some(Command::Open {
+            session: Some(reference),
+            project,
+            ..
+        }) => {
+            use std::io::IsTerminal;
+            let Some(id) = nebula_tui::run_open_session(reference, project)? else {
+                return Ok(());
+            };
+            if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+                return run_tui_and_handoff(Some(nebula_tui::app::OpenAt::Session(id)));
+            }
+            eprintln!(
+                "nebula: no nebula TUI is running — start one in a terminal with `nebula open --session {id}`"
+            );
+            std::process::exit(3);
+        }
+        Some(Command::Open { path, .. }) => {
             // Absolute before the TUI starts: the daemon and the panels
             // both need a path that survives any later cwd changes.
             let dir = std::fs::canonicalize(&path)
                 .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join(&path));
-            run_tui_and_handoff(Some(dir))
+            run_tui_and_handoff(Some(nebula_tui::app::OpenAt::Dir(dir)))
         }
         Some(Command::Workspace { command }) => {
             use nebula_tui::WorkspaceOp;
@@ -815,7 +847,7 @@ fn main() -> Result<()> {
 /// handoff: the TUI quit and restored the terminal so a fresh process can
 /// exec over us — `nebula ssh` for the hosts picker, or the binary on
 /// disk for `⌘K r` reload (the local daemon and its sessions stay up).
-fn run_tui_and_handoff(open_at: Option<std::path::PathBuf>) -> Result<()> {
+fn run_tui_and_handoff(open_at: Option<nebula_tui::app::OpenAt>) -> Result<()> {
     use nebula_tui::event_loop::Handoff;
     init_tui_logging()?;
     let handoff = log_fatal(

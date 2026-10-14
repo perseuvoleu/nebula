@@ -59,54 +59,7 @@ impl TuiHarness {
         let _ = std::fs::remove_dir_all(&runtime_dir);
         let _ = std::fs::remove_dir_all(&data_dir);
         let repos = tempfile::tempdir().unwrap();
-
-        let pty = native_pty_system()
-            .openpty(PtySize {
-                rows: ROWS,
-                cols: COLS,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .unwrap();
-        let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_nebula"));
-        cmd.env("NEBULA_RUNTIME_DIR", &runtime_dir);
-        cmd.env("NEBULA_DATA_DIR", &data_dir);
-        cmd.env("NEBULA_AGENT_CMD", "/bin/sh"); // stand-in for claude
-        cmd.env("NEBULA_WORKTREE_SYNC_MS", "100"); // fast external-change pickup
-        cmd.env("NEBULA_LOG", "debug");
-        cmd.env("SHELL", "/bin/sh");
-        cmd.env("TERM", "xterm-256color");
-        // Agent/CI shells often export NO_COLOR; crossterm then strips the
-        // reverse/bold attrs wait_for_selected relies on.
-        cmd.env_remove("NO_COLOR");
-        cmd.env_remove("FORCE_COLOR");
-        for (k, v) in extra_env {
-            cmd.env(k, v);
-        }
-        cmd.cwd(repos.path());
-        let child = pty.slave.spawn_command(cmd).unwrap();
-        drop(pty.slave);
-
-        let mut reader = pty.master.try_clone_reader().unwrap();
-        let writer = pty.master.take_writer().unwrap();
-        // Keep the master alive for the whole test (dropping it hangs up the
-        // TUI's tty); leak is fine in a test process.
-        std::mem::forget(pty.master);
-
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(ROWS, COLS, 0)));
-        {
-            let parser = parser.clone();
-            std::thread::spawn(move || {
-                let mut buf = [0u8; 8192];
-                while let Ok(n) = reader.read(&mut buf) {
-                    if n == 0 {
-                        break;
-                    }
-                    parser.lock().unwrap().process(&buf[..n]);
-                }
-            });
-        }
-
+        let (writer, parser, child) = launch(&runtime_dir, &data_dir, repos.path(), &[], extra_env);
         Self {
             writer,
             parser,
@@ -115,6 +68,23 @@ impl TuiHarness {
             data_dir,
             _repos: repos,
         }
+    }
+
+    /// Replace the TUI with a fresh one launched with `args`, on the same
+    /// daemon and repos.
+    fn relaunch(&mut self, args: &[&str]) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let (writer, parser, child) = launch(
+            &self.runtime_dir,
+            &self.data_dir,
+            self._repos.path(),
+            args,
+            &[],
+        );
+        self.writer = writer;
+        self.parser = parser;
+        self.child = child;
     }
 
     /// A committed git repo named `name` (fresh `git init` + one commit —
@@ -218,6 +188,69 @@ impl TuiHarness {
             !sessions_panel_contains(s, needle)
         });
     }
+}
+
+#[allow(clippy::type_complexity)]
+fn launch(
+    runtime_dir: &Path,
+    data_dir: &Path,
+    cwd: &Path,
+    args: &[&str],
+    extra_env: &[(&str, String)],
+) -> (
+    Box<dyn Write + Send>,
+    Arc<Mutex<vt100::Parser>>,
+    Box<dyn portable_pty::Child + Send + Sync>,
+) {
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: ROWS,
+            cols: COLS,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_nebula"));
+    cmd.args(args);
+    cmd.env("NEBULA_RUNTIME_DIR", runtime_dir);
+    cmd.env("NEBULA_DATA_DIR", data_dir);
+    cmd.env("NEBULA_AGENT_CMD", "/bin/sh"); // stand-in for claude
+    cmd.env("NEBULA_WORKTREE_SYNC_MS", "100"); // fast external-change pickup
+    cmd.env("NEBULA_LOG", "debug");
+    cmd.env("SHELL", "/bin/sh");
+    cmd.env("TERM", "xterm-256color");
+    // Agent/CI shells often export NO_COLOR; crossterm then strips the
+    // reverse/bold attrs wait_for_selected relies on.
+    cmd.env_remove("NO_COLOR");
+    cmd.env_remove("FORCE_COLOR");
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    cmd.cwd(cwd);
+    let child = pty.slave.spawn_command(cmd).unwrap();
+    drop(pty.slave);
+
+    let mut reader = pty.master.try_clone_reader().unwrap();
+    let writer = pty.master.take_writer().unwrap();
+    // Keep the master alive for the whole test (dropping it hangs up the
+    // TUI's tty); leak is fine in a test process.
+    std::mem::forget(pty.master);
+
+    let parser = Arc::new(Mutex::new(vt100::Parser::new(ROWS, COLS, 0)));
+    {
+        let parser = parser.clone();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            while let Ok(n) = reader.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                parser.lock().unwrap().process(&buf[..n]);
+            }
+        });
+    }
+
+    (writer, parser, child)
 }
 
 impl Drop for TuiHarness {
@@ -861,4 +894,96 @@ fn tui_reloads_in_place_from_the_palette() {
     tui.wait_for_text("proj");
     tui.send(b"?");
     tui.wait_for_text("NAVIGATE & SEARCH");
+}
+
+fn nebula_cli(tui: &TuiHarness, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        .args(args)
+        .env("NEBULA_RUNTIME_DIR", &tui.runtime_dir)
+        .env("NEBULA_DATA_DIR", &tui.data_dir)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap()
+}
+
+/// `nebula open --session` from a launcher (no terminal): a running TUI
+/// takes the request and attaches the session; with none running the
+/// command says so with exit 3 instead of starting a TUI it has no
+/// terminal for. From a terminal it starts the TUI landed on the session.
+#[test]
+fn open_session_attaches_it_in_the_running_tui() {
+    let mut tui = TuiHarness::spawn();
+    let repo = tui.make_repo("alpha-proj");
+    add_project(&mut tui, &repo, "alpha-proj");
+    let mut ids = Vec::new();
+    for name in ["first", "second"] {
+        let out = nebula_cli(
+            &tui,
+            &[
+                "agent",
+                "new",
+                "--project",
+                "alpha-proj",
+                "--worktree",
+                "main",
+                "--name",
+                name,
+            ],
+        );
+        assert!(out.status.success(), "agent new {name}: {out:?}");
+        let row: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        ids.push(row["id"].as_str().unwrap().to_owned());
+    }
+    tui.wait_for_text("second");
+
+    let unknown = nebula_cli(&tui, &["open", "--session", "nope"]);
+    assert_eq!(unknown.status.code(), Some(1), "{unknown:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&unknown.stderr).trim(),
+        "Error: no session \"nope\" (pass a name from `nebula agent list --all` or its id)"
+    );
+
+    let by_name = nebula_cli(
+        &tui,
+        &["open", "--session", "second", "--project", "alpha-proj"],
+    );
+    assert_eq!(by_name.status.code(), Some(0), "{by_name:?}");
+    let landed: serde_json::Value = serde_json::from_slice(&by_name.stdout).unwrap();
+    assert_eq!(
+        landed,
+        serde_json::json!({
+            "landed": "tui",
+            "tui_pid": tui.child.process_id().unwrap(),
+            "id": ids[1],
+            "name": "second",
+            "project": "alpha-proj",
+            "host": null,
+        })
+    );
+    tui.wait_for_selected("second");
+    tui.wait_for_text(FOOTER_TERMINAL_LOCKED);
+
+    tui.send(&[0x11]);
+    tui.wait_for_text(FOOTER_SESSIONS);
+    let by_id = nebula_cli(&tui, &["open", "--session", &ids[0]]);
+    assert_eq!(by_id.status.code(), Some(0), "{by_id:?}");
+    tui.wait_for_selected("first");
+    tui.wait_for_text(FOOTER_TERMINAL_LOCKED);
+
+    tui.child.kill().unwrap();
+    tui.child.wait().unwrap();
+    let no_tui = nebula_cli(&tui, &["open", "--session", "first"]);
+    assert_eq!(no_tui.status.code(), Some(3), "{no_tui:?}");
+    assert!(no_tui.stdout.is_empty(), "{no_tui:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&no_tui.stderr).trim(),
+        "nebula: no nebula TUI is running — start one in a terminal with `nebula open --session "
+            .to_owned()
+            + &ids[0]
+            + "`"
+    );
+
+    tui.relaunch(&["open", "--session", "second"]);
+    tui.wait_for_selected("second");
+    tui.wait_for_text(FOOTER_TERMINAL_LOCKED);
 }

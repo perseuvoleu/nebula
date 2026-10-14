@@ -120,7 +120,7 @@ pub enum Handoff {
     Reload,
 }
 
-pub async fn run_app(open_at: Option<std::path::PathBuf>) -> Result<Handoff> {
+pub async fn run_app(open_at: Option<crate::app::OpenAt>) -> Result<Handoff> {
     let conn = ipc::connect_or_spawn().await?;
     let mut channels = ipc::split_connection(conn);
     channels.tx.send(ClientRequest::Subscribe).await?;
@@ -196,7 +196,7 @@ pub fn restore_terminal() {
 async fn main_loop(
     terminal: &mut Terminal<CrosstermBackend<BufWriter<Stdout>>>,
     channels: &mut ipc::IpcChannels,
-    open_at: Option<std::path::PathBuf>,
+    open_at: Option<crate::app::OpenAt>,
 ) -> Result<Handoff> {
     let mut app = App::new();
     app.open_at = open_at;
@@ -248,6 +248,8 @@ async fn main_loop(
     // `nebula diagram open` leaves its request as a file in the runtime dir
     // (no daemon protocol involved); one stat per tick finds it.
     let diagram_request = crate::diagram_cli::open_request_path();
+    // `nebula open --session` asks a running TUI the same way.
+    let session_request = crate::session_open::request_path();
     let mut next_diagram_request = tokio::time::Instant::now();
 
     loop {
@@ -432,6 +434,17 @@ async fn main_loop(
                         Ok(html) => html_viewer = Some(html),
                         Err(error) => app.flash = Some(error),
                     }
+                    app.dirty = true;
+                }
+                if let Some(id) =
+                    crate::session_open::take_request(&session_request, crate::app::now_ms())
+                {
+                    // The session is what was asked for: nothing stays over it.
+                    if html_viewer.take().is_some() {
+                        repaint_everything(terminal)?;
+                    }
+                    app.overlay = None;
+                    jump_to_target(&mut app, PaletteTarget::Session(id), true, &mut out);
                     app.dirty = true;
                 }
             }
@@ -9172,10 +9185,14 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             // Boot the restored worktree's sessions right away — the first
             // thing the user does after launch is walk into one of them.
             schedule_prewarm(app);
-            // `nebula open <dir>`: the first snapshot is the moment the
-            // tree exists to land on. Reconnect snapshots find None here.
-            if let Some(dir) = app.open_at.take() {
-                land_open_at(app, &dir, out);
+            // `nebula open`: the first snapshot is the moment the tree
+            // exists to land on. Reconnect snapshots find None here.
+            match app.open_at.take() {
+                Some(crate::app::OpenAt::Dir(dir)) => land_open_at(app, &dir, out),
+                Some(crate::app::OpenAt::Session(id)) => {
+                    jump_to_target(app, PaletteTarget::Session(id), true, out)
+                }
+                None => {}
             }
             app.dirty = true;
         }

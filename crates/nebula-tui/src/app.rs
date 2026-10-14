@@ -972,6 +972,16 @@ impl DiffView {
     }
 }
 
+/// Where `nebula open` lands the TUI.
+#[derive(Debug, Clone)]
+pub enum OpenAt {
+    /// `nebula open <dir>`: whichever project/worktree owns the directory
+    /// (adding the repo as a project when nebula doesn't know it yet).
+    Dir(std::path::PathBuf),
+    /// `nebula open --session`: that session, attached.
+    Session(AgentId),
+}
+
 /// What a `/` palette row jumps to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaletteTarget {
@@ -2496,10 +2506,9 @@ pub struct App {
     /// Project added by `nebula open`, awaiting its upsert to land the
     /// selection on it.
     pub select_project_when_seen: Option<ProjectId>,
-    /// Directory handed to `nebula open <dir>`: the first snapshot lands
-    /// the selection on whichever project/worktree owns it (adding the
-    /// repo as a project when nebula doesn't know it yet), then clears.
-    pub open_at: Option<std::path::PathBuf>,
+    /// What `nebula open` named: the first snapshot lands on it, then
+    /// clears.
+    pub open_at: Option<OpenAt>,
     /// Note created by us, awaiting its upsert to land the modal's cursor.
     pub select_note_when_seen: Option<NoteId>,
     /// Todo created by us, awaiting its upsert to land the modal's cursor.

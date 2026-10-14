@@ -563,7 +563,7 @@ pub(crate) async fn subscribe_snapshot(
 
 /// Resolve which project a control verb targets: `--project <name>` wins,
 /// otherwise the caller's own session (NEBULA_AGENT_ID) names it.
-fn resolve_project(
+pub(crate) fn resolve_project(
     projects: &[nebula_core::Project],
     worktrees: &[nebula_core::Worktree],
     agents: &[nebula_core::Agent],
