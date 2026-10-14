@@ -445,20 +445,20 @@ async fn main_loop(
                     }
                     app.overlay = None;
                     let id = request.agent.clone();
-                    jump_to_target(&mut app, PaletteTarget::Session(id.clone()), true, &mut out);
-                    let landed = matches!(
-                        app.selected_session_row(),
-                        Some(SessionRow::Agent(a)) if a.id == id
-                    );
-                    let error = (!landed).then(|| {
-                        let name = app.tree.agents.iter().find(|a| a.id == id).map(|a| a.name.as_str());
-                        format!(
-                            "the running nebula TUI could not show \"{}\" — its project is outside the open workspace or hidden",
-                            name.unwrap_or(id.as_str())
-                        )
-                    });
-                    crate::session_open::ack(&request, error);
+                    start_open_session(&mut app, id, Some(request), &mut out);
                     app.dirty = true;
+                }
+                if app
+                    .open_session
+                    .as_ref()
+                    .is_some_and(|o| std::time::Instant::now() >= o.deadline)
+                {
+                    let error = format!(
+                        "nebula could not attach \"{}\": no screen from the daemon within {}s",
+                        agent_label(&app, &app.open_session.as_ref().unwrap().agent),
+                        crate::session_open::ATTACH_TIMEOUT.as_secs()
+                    );
+                    finish_open_session(&mut app, Err(error));
                 }
             }
             ev = input.next() => match ev {
@@ -6811,6 +6811,71 @@ fn land_open_at(app: &mut App, dir: &std::path::Path, out: &mut Vec<ClientReques
     });
 }
 
+/// `nebula open --session`: land on the session and attach it. The landing
+/// ends when the daemon sends its screen (see the Scrollback and Error
+/// arms), at once when the pane already holds it, or with an error when it
+/// cannot be shown. A newer request replaces one still in flight.
+fn start_open_session(
+    app: &mut App,
+    id: AgentId,
+    request: Option<crate::session_open::Request>,
+    out: &mut Vec<ClientRequest>,
+) {
+    if app.open_session.is_some() {
+        finish_open_session(app, Err("replaced by a newer nebula open --session".into()));
+    }
+    app.open_session = Some(crate::app::OpenSession {
+        agent: id.clone(),
+        request,
+        attaching: false,
+        deadline: std::time::Instant::now() + crate::session_open::ATTACH_TIMEOUT,
+    });
+    let sref = SessionRef::Agent(id.clone());
+    jump_to_target(app, PaletteTarget::Session(id.clone()), true, out);
+    let attach_sent = out
+        .iter()
+        .any(|r| matches!(r, ClientRequest::Attach { session, .. } if *session == sref));
+    let shown = app
+        .term
+        .as_ref()
+        .is_some_and(|t| t.sref == sref && !t.exited)
+        || app.split_term.as_ref().is_some_and(|t| t.sref == sref);
+    if attach_sent {
+        if let Some(open) = app.open_session.as_mut() {
+            open.attaching = true;
+        }
+    } else if shown {
+        finish_open_session(app, Ok(()));
+    } else {
+        let error = format!(
+            "the running nebula TUI could not show \"{}\" — its project is outside the open workspace or hidden",
+            agent_label(app, &id)
+        );
+        finish_open_session(app, Err(error));
+    }
+}
+
+/// End the landing in flight: answer the command that asked, or flash
+/// the error in a TUI the command started.
+fn finish_open_session(app: &mut App, result: Result<(), String>) {
+    let Some(open) = app.open_session.take() else {
+        return;
+    };
+    match (open.request, result) {
+        (Some(request), result) => crate::session_open::ack(&request, result.err()),
+        (None, Err(error)) => app.flash = Some(error),
+        (None, Ok(())) => {}
+    }
+}
+
+fn agent_label(app: &App, id: &AgentId) -> String {
+    app.tree
+        .agents
+        .iter()
+        .find(|a| &a.id == id)
+        .map_or_else(|| id.to_string(), |a| a.name.clone())
+}
+
 /// Land on a project added by `nebula open` — jump once its row exists.
 fn select_added_project(
     app: &mut App,
@@ -9202,9 +9267,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             // exists to land on. Reconnect snapshots find None here.
             match app.open_at.take() {
                 Some(crate::app::OpenAt::Dir(dir)) => land_open_at(app, &dir, out),
-                Some(crate::app::OpenAt::Session(id)) => {
-                    jump_to_target(app, PaletteTarget::Session(id), true, out)
-                }
+                Some(crate::app::OpenAt::Session(id)) => start_open_session(app, id, None, out),
                 None => {}
             }
             app.dirty = true;
@@ -9214,6 +9277,13 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             base_seq,
             data,
         } => {
+            if app
+                .open_session
+                .as_ref()
+                .is_some_and(|o| o.attaching && session == SessionRef::Agent(o.agent.clone()))
+            {
+                finish_open_session(app, Ok(()));
+            }
             if let Some(term) = app.term.as_mut().filter(|t| t.sref == session) {
                 // A replay whose base is exactly where the parser stopped is
                 // a delta on top of state we already hold — the whole point
@@ -9504,6 +9574,16 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             app.dirty = true;
         }
         ServerEvent::Error { req_id, message } => {
+            // The daemon answers a failed Attach with an unnumbered error.
+            if req_id.is_none() && message.starts_with("attach:") {
+                if let Some(open) = app.open_session.as_ref().filter(|o| o.attaching) {
+                    let error = format!(
+                        "nebula could not attach \"{}\": {message}",
+                        agent_label(app, &open.agent)
+                    );
+                    finish_open_session(app, Err(error));
+                }
+            }
             // A failed request's intent never gets an Ack; clear it — and if
             // it was an optimistic worktree delete, put the rows back.
             if let Some(PendingIntent::DeleteWorktree(rollback)) =

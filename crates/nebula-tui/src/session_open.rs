@@ -16,8 +16,17 @@ use std::time::{Duration, Instant};
 /// a request left behind with no TUI running never attaches later.
 const REQUEST_TTL_MS: i64 = 10_000;
 
-/// Longer than the TUI's 500 ms request poll, with room for a busy frame.
-const ACK_WAIT: Duration = Duration::from_millis(1_500);
+/// Longer than the TUI's 500 ms request poll, with room for a busy frame:
+/// a request still unclaimed by then means no TUI is running.
+const CLAIM_WAIT: Duration = Duration::from_millis(1_500);
+
+/// How long a TUI gets to confirm the attach once it has claimed the
+/// request — past its own [`ATTACH_TIMEOUT`], so its answer arrives first.
+const ANSWER_WAIT: Duration = Duration::from_secs(20);
+
+/// How long the TUI waits for the daemon's first screen of the session
+/// (a remote one comes over ssh) before answering that the attach failed.
+pub const ATTACH_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub struct Resolved {
     pub id: AgentId,
@@ -110,9 +119,10 @@ pub async fn resolve(reference: &str, project_flag: Option<&str>) -> Result<Reso
     }
 }
 
-/// Ask a running TUI to attach `id`; `Some(pid)` of the TUI that landed it,
-/// `None` when no TUI answered (the request is withdrawn), an error when
-/// the TUI that took it could not show the session.
+/// Ask a running TUI to attach `id`; `Some(pid)` of the TUI once its pane
+/// holds the session's terminal, `None` when no TUI claimed the request
+/// (it is withdrawn), an error when the TUI that claimed it could not show
+/// or attach the session.
 pub fn hand_to_running_tui(id: &AgentId) -> Result<Option<u32>> {
     let nonce = format!("{}-{}", std::process::id(), crate::app::now_ms());
     let request = request_path();
@@ -123,21 +133,26 @@ pub fn hand_to_running_tui(id: &AgentId) -> Result<Option<u32>> {
         &request,
         &json!({ "agent": id.as_str(), "nonce": nonce, "ts": crate::app::now_ms() }).to_string(),
     )?;
-    let deadline = Instant::now() + ACK_WAIT;
-    while Instant::now() < deadline {
-        if let Some(answer) = take_ack(&nonce) {
-            return answer.map(Some);
-        }
+    let claim_deadline = Instant::now() + CLAIM_WAIT;
+    while request.exists() && Instant::now() < claim_deadline {
         std::thread::sleep(Duration::from_millis(50));
     }
     let ours = std::fs::read_to_string(&request)
         .ok()
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
         .is_some_and(|v| v["nonce"] == nonce);
-    if ours {
-        let _ = std::fs::remove_file(&request);
+    // A failed remove means a TUI claimed it after all.
+    if ours && std::fs::remove_file(&request).is_ok() {
+        return Ok(None);
     }
-    take_ack(&nonce).transpose()
+    let deadline = Instant::now() + ANSWER_WAIT;
+    while Instant::now() < deadline {
+        if let Some(answer) = take_ack(&nonce) {
+            return answer.map(Some);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    bail!("the running nebula TUI took the request but never answered")
 }
 
 fn take_ack(nonce: &str) -> Option<Result<u32>> {

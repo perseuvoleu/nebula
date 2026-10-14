@@ -982,6 +982,19 @@ pub enum OpenAt {
     Session(AgentId),
 }
 
+/// A `nebula open --session` landing: the session is shown, then attached;
+/// it ends once the daemon sends the session's screen, or with an error.
+pub struct OpenSession {
+    pub agent: AgentId,
+    /// The running-TUI request to answer; None when the command started
+    /// this TUI (an error is then only flashed).
+    pub request: Option<crate::session_open::Request>,
+    /// Set once the Attach is on its way; the landing then waits for the
+    /// session's Scrollback until `deadline`.
+    pub attaching: bool,
+    pub deadline: std::time::Instant,
+}
+
 /// What a `/` palette row jumps to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaletteTarget {
@@ -2509,6 +2522,8 @@ pub struct App {
     /// What `nebula open` named: the first snapshot lands on it, then
     /// clears.
     pub open_at: Option<OpenAt>,
+    /// A `nebula open --session` landing in flight.
+    pub open_session: Option<OpenSession>,
     /// Note created by us, awaiting its upsert to land the modal's cursor.
     pub select_note_when_seen: Option<NoteId>,
     /// Todo created by us, awaiting its upsert to land the modal's cursor.
@@ -2733,6 +2748,7 @@ impl App {
             select_worktree_when_seen: None,
             select_project_when_seen: None,
             open_at: None,
+            open_session: None,
             select_note_when_seen: None,
             select_todo_when_seen: None,
             select_link_when_seen: None,

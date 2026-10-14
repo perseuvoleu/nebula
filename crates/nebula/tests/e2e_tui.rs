@@ -1015,3 +1015,62 @@ fn open_session_attaches_it_in_the_running_tui() {
     tui.wait_for_text(FOOTER_TERMINAL_LOCKED);
     assert_typing_reaches(&mut tui, "t3", &ids[1]);
 }
+
+/// An attach the daemon cannot complete (the agent CLI vanished, so the
+/// respawn fails) is a failure, not a landing: the command waits for the
+/// attach itself.
+#[test]
+fn open_session_fails_when_the_attach_fails() {
+    let bin = tempfile::tempdir().unwrap();
+    let agent_cmd = bin.path().join("agent");
+    std::fs::write(&agent_cmd, "#!/bin/sh\nexec /bin/sh \"$@\"\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&agent_cmd, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut tui =
+        TuiHarness::spawn_with_env(&[("NEBULA_AGENT_CMD", agent_cmd.display().to_string())]);
+    let repo = tui.make_repo("alpha-proj");
+    add_project(&mut tui, &repo, "alpha-proj");
+    let new = nebula_cli(
+        &tui,
+        &[
+            "agent",
+            "new",
+            "--project",
+            "alpha-proj",
+            "--worktree",
+            "main",
+            "--name",
+            "broken",
+        ],
+    );
+    assert!(new.status.success(), "{new:?}");
+    tui.wait_for_text("broken");
+    std::fs::remove_file(&agent_cmd).unwrap();
+    let exit = nebula_cli(
+        &tui,
+        &["agent", "send", "broken", "exit", "--project", "alpha-proj"],
+    );
+    assert!(exit.status.success(), "{exit:?}");
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let show = nebula_cli(
+            &tui,
+            &["agent", "show", "broken", "--project", "alpha-proj"],
+        );
+        let row: serde_json::Value = serde_json::from_slice(&show.stdout).unwrap();
+        if row["alive"] == false {
+            break;
+        }
+        assert!(Instant::now() < deadline, "PTY never exited: {row}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let out = nebula_cli(&tui, &["open", "--session", "broken"]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.starts_with("Error: nebula could not attach \"broken\": attach: "),
+        "{stderr}"
+    );
+}
