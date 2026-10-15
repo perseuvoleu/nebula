@@ -59,6 +59,8 @@ impl TestEnv {
             .env("NEBULA_RUNTIME_DIR", &self.runtime_dir)
             .env("NEBULA_DATA_DIR", self.tmp.path().join("data"))
             .env("SHELL", shell)
+            .env("CLAUDE_CONFIG_DIR", self.tmp.path().join("claude"))
+            .env("CODEX_HOME", self.tmp.path().join("codex"))
             .env_remove("NEBULA_AGENT_CMD")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())

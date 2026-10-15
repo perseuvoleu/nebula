@@ -3147,6 +3147,11 @@ impl Daemon {
         }
 
         let cmd_override = self.agent_cmd_override.as_deref();
+        if cmd_override.is_none() {
+            if let Err(e) = hooks::installer::trust_for_kind(agent.kind, &worktree.path) {
+                tracing::warn!(error = %e, cwd = %worktree.path.display(), "trust pre-accept failed");
+            }
+        }
         let (program, args, resumed) = agent_spawn_command(
             agent.kind,
             agent.session_id.as_deref(),

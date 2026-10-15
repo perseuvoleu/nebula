@@ -192,6 +192,18 @@ pub fn install_for_kind(kind: AgentKind, cwd: &Path) -> Result<()> {
     }
 }
 
+/// Pre-accept the CLI's folder-trust prompt for `cwd`, so a fresh worktree
+/// starts straight into the session. Kept apart from `install_for_kind`
+/// because it writes the user's global CLI state: only a real CLI launch
+/// calls it, never a test spawn with a command override.
+pub fn trust_for_kind(kind: AgentKind, cwd: &Path) -> Result<()> {
+    match kind {
+        AgentKind::Claude => trust_claude_project(&claude_config_file(), cwd),
+        AgentKind::Codex => trust_codex_project(&codex_home(), cwd),
+        AgentKind::Cursor | AgentKind::Pi => Ok(()),
+    }
+}
+
 pub fn install_claude_hooks(cwd: &Path) -> Result<()> {
     let dir = cwd.join(".claude");
     let path = dir.join("settings.local.json");
@@ -237,6 +249,84 @@ fn ensure_permission_allow(
         allow_arr.push(json!(entry));
     }
     Ok(())
+}
+
+/// Claude's global state file: `$CLAUDE_CONFIG_DIR/.claude.json`, else
+/// `~/.claude.json`.
+pub fn claude_config_file() -> PathBuf {
+    match std::env::var("CLAUDE_CONFIG_DIR") {
+        Ok(dir) if !dir.is_empty() => PathBuf::from(dir).join(".claude.json"),
+        _ => PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".claude.json"),
+    }
+}
+
+/// Pre-accept Claude's "Do you trust this folder?" dialog for `cwd`. Claude
+/// asks once per exact path (a trusted parent does not cover it, and
+/// `--dangerously-skip-permissions` does not skip it), so every fresh
+/// worktree would stop on it. Claude rewrites this file itself, so an
+/// already-trusted path is left alone instead of racing it for nothing.
+pub fn trust_claude_project(config: &Path, cwd: &Path) -> Result<()> {
+    let mut root = load_hooks_root(config)?;
+    let key = cwd.to_string_lossy();
+    if root["projects"][key.as_ref()]["hasTrustDialogAccepted"] == json!(true) {
+        return Ok(());
+    }
+    let Some(root_obj) = root.as_object_mut() else {
+        bail!(
+            "{} is not a JSON object — refusing to modify it",
+            config.display()
+        );
+    };
+    let projects = root_obj.entry("projects").or_insert_with(|| json!({}));
+    let Some(project) = projects
+        .as_object_mut()
+        .map(|p| p.entry(key.into_owned()).or_insert_with(|| json!({})))
+        .and_then(Value::as_object_mut)
+    else {
+        bail!(
+            "projects in {} is not an object — refusing to modify it",
+            config.display()
+        );
+    };
+    project.insert("hasTrustDialogAccepted".into(), json!(true));
+    let (dir, name) = (
+        config.parent().unwrap_or(Path::new(".")),
+        config.file_name(),
+    );
+    let name = name
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    write_text_atomic(dir, &name, &serde_json::to_string_pretty(&root)?)
+}
+
+/// Pre-trust `cwd` in `<codex_home>/config.toml`, so codex starts without
+/// its trust prompt. Appended as text to keep the user's formatting and
+/// comments; a path that already has an entry (trusted or not) is the
+/// user's call and stays as it is.
+pub fn trust_codex_project(codex_home: &Path, cwd: &Path) -> Result<()> {
+    let path = codex_home.join("config.toml");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+    let quoted = cwd
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    let header = format!("[projects.\"{quoted}\"]");
+    if text.lines().any(|l| l.trim() == header) {
+        return Ok(());
+    }
+    let mut out = text.clone();
+    if !out.is_empty() {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    out.push_str(&format!("{header}\ntrust_level = \"trusted\"\n"));
+    write_text_atomic(codex_home, "config.toml", &out)
 }
 
 /// Codex's home (`$CODEX_HOME`, else `~/.codex`) — where its hooks live so
@@ -642,6 +732,67 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(!submit.contains(">/dev/null 2>&1"), "stdout: {submit}");
+    }
+
+    #[test]
+    fn claude_trust_marks_cwd_and_keeps_other_projects() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join(".claude.json");
+        std::fs::write(
+            &config,
+            r#"{"userID":"u","projects":{"/old":{"hasTrustDialogAccepted":false,"x":1}}}"#,
+        )
+        .unwrap();
+        trust_claude_project(&config, Path::new("/work/wt-1")).unwrap();
+        trust_claude_project(&config, Path::new("/old")).unwrap();
+        let root = read_json(tmp.path(), ".claude.json");
+        assert_eq!(root["userID"], json!("u"));
+        assert_eq!(
+            root["projects"]["/work/wt-1"],
+            json!({"hasTrustDialogAccepted": true})
+        );
+        assert_eq!(
+            root["projects"]["/old"],
+            json!({"hasTrustDialogAccepted": true, "x": 1})
+        );
+    }
+
+    #[test]
+    fn claude_trust_leaves_a_trusted_file_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join(".claude.json");
+        let text = r#"{"projects":{"/w":{"hasTrustDialogAccepted":true}},"a":1}"#;
+        std::fs::write(&config, text).unwrap();
+        trust_claude_project(&config, Path::new("/w")).unwrap();
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), text);
+    }
+
+    #[test]
+    fn codex_trust_appends_once_and_respects_existing_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config.toml");
+        std::fs::write(
+            &config,
+            "model = \"gpt\"\n\n[projects.\"/no\"]\ntrust_level = \"untrusted\"\n",
+        )
+        .unwrap();
+        trust_codex_project(tmp.path(), Path::new("/work/wt-1")).unwrap();
+        trust_codex_project(tmp.path(), Path::new("/work/wt-1")).unwrap();
+        trust_codex_project(tmp.path(), Path::new("/no")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            "model = \"gpt\"\n\n[projects.\"/no\"]\ntrust_level = \"untrusted\"\n\n[projects.\"/work/wt-1\"]\ntrust_level = \"trusted\"\n"
+        );
+    }
+
+    #[test]
+    fn codex_trust_creates_missing_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        trust_codex_project(tmp.path(), Path::new("/w")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("config.toml")).unwrap(),
+            "[projects.\"/w\"]\ntrust_level = \"trusted\"\n"
+        );
     }
 
     #[test]

@@ -648,7 +648,8 @@ fn main() -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("unknown agent kind: {kind}"))?;
             let dir =
                 std::fs::canonicalize(&dir).with_context(|| format!("{dir} does not exist"))?;
-            nebula_daemon::hooks::installer::install_for_kind(kind, &dir)
+            nebula_daemon::hooks::installer::install_for_kind(kind, &dir)?;
+            nebula_daemon::hooks::installer::trust_for_kind(kind, &dir)
         }
         Some(Command::Open {
             session: Some(reference),
