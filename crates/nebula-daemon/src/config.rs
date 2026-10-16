@@ -3,6 +3,8 @@
 //! unknown fields fall back to defaults; a malformed file is logged and
 //! ignored rather than failing the operation that read it.
 
+use crate::dispatcher::Limits;
+use nebula_core::AgentKind;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -31,6 +33,8 @@ pub struct Config {
     /// attach or prewarm (agents resume their conversation). Malformed
     /// values fall back to the 5m default.
     pub session_idle_timeout: String,
+    /// Memory admission for heavy commands and agent sessions.
+    pub heavy: HeavyConfig,
 }
 
 impl Default for Config {
@@ -41,8 +45,101 @@ impl Default for Config {
             prewarm_sessions: true,
             seed_node_modules: true,
             session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT.into(),
+            heavy: HeavyConfig::default(),
         }
     }
+}
+
+/// A negative or non-finite value falls back to its default.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct HeavyConfig {
+    /// What running heavy commands and sessions may hold together.
+    pub budget_gib: f64,
+    /// Free memory admission never dips below; on macOS it applies to free swap.
+    pub floor_gib: f64,
+    /// Linux memory PSI `some avg10` (percent) above which nothing is admitted.
+    pub psi_some_avg10_max: f64,
+    /// Reservation for a heavy command that names no size.
+    pub command_reservation_gib: f64,
+    pub session_reservation_gib: SessionReservations,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct SessionReservations {
+    pub claude: f64,
+    pub codex: f64,
+    pub cursor: f64,
+    pub pi: f64,
+}
+
+impl Default for HeavyConfig {
+    fn default() -> Self {
+        Self {
+            budget_gib: if cfg!(target_os = "macos") { 6.0 } else { 7.0 },
+            floor_gib: 2.0,
+            psi_some_avg10_max: 10.0,
+            command_reservation_gib: 4.0,
+            session_reservation_gib: SessionReservations::default(),
+        }
+    }
+}
+
+impl Default for SessionReservations {
+    fn default() -> Self {
+        Self {
+            claude: 1.0,
+            codex: 1.0,
+            cursor: 1.0,
+            pi: 0.5,
+        }
+    }
+}
+
+impl HeavyConfig {
+    pub fn limits(&self) -> Limits {
+        let d = Self::default();
+        Limits {
+            budget_bytes: gib_bytes(valid_or(self.budget_gib, d.budget_gib)),
+            floor_bytes: gib_bytes(valid_or(self.floor_gib, d.floor_gib)),
+            psi_some_avg10_max: valid_or(self.psi_some_avg10_max, d.psi_some_avg10_max),
+        }
+    }
+
+    pub fn command_reservation_bytes(&self) -> u64 {
+        let d = Self::default();
+        gib_bytes(valid_or(
+            self.command_reservation_gib,
+            d.command_reservation_gib,
+        ))
+    }
+
+    pub fn session_reservation_bytes(&self, kind: AgentKind) -> u64 {
+        let (r, d) = (
+            &self.session_reservation_gib,
+            SessionReservations::default(),
+        );
+        let (gib, default) = match kind {
+            AgentKind::Claude => (r.claude, d.claude),
+            AgentKind::Codex => (r.codex, d.codex),
+            AgentKind::Cursor => (r.cursor, d.cursor),
+            AgentKind::Pi => (r.pi, d.pi),
+        };
+        gib_bytes(valid_or(gib, default))
+    }
+}
+
+fn valid_or(value: f64, default: f64) -> f64 {
+    if value.is_finite() && value >= 0.0 {
+        value
+    } else {
+        default
+    }
+}
+
+fn gib_bytes(gib: f64) -> u64 {
+    (gib * (1u64 << 30) as f64) as u64
 }
 
 /// Fallback for `session_idle_timeout` when the value is malformed.

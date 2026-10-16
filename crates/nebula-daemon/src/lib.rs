@@ -1,5 +1,6 @@
 pub mod config;
 mod collect;
+pub mod dispatcher;
 pub mod git;
 pub mod hooks;
 pub mod lifecycle;
