@@ -1,5 +1,5 @@
-/** One build/test run on Cloudflare Containers, as normalized by the gateway. Times are epoch ms. */
 export interface Step { name: string; ms: number | null; exitCode: number | null }
+/** One build/test run on Cloudflare Containers, as normalized by the gateway. Times are epoch ms. */
 export interface Run {
   id: string;
   repo: string | null;
@@ -32,11 +32,13 @@ const pad = (value: number) => String(value).padStart(2, "0");
 
 export function formatDuration(ms: number): string {
   const safe = Math.max(0, ms);
-  if (safe < 60_000) return `${decimal.format(safe / 1000)} s`;
+  if (safe < 60_000) return formatSeconds(safe);
   const seconds = Math.floor(safe / 1000);
   if (seconds < 3600) return `${Math.floor(seconds / 60)} min ${pad(seconds % 60)} s`;
   return `${Math.floor(seconds / 3600)} h ${pad(Math.floor(seconds / 60) % 60)} min`;
 }
+
+export const formatSeconds = (ms: number | null): string => ms === null ? "—" : `${decimal.format(Math.max(0, ms) / 1000)} s`;
 
 export const runDuration = (run: Run, now: number): number => (run.ended_at ?? now) - run.started_at;
 
@@ -49,7 +51,7 @@ export const formatStart = (ms: number): string =>
 export const failedStep = (steps: Step[]): number => steps.findIndex(step => step.exitCode !== null && step.exitCode !== 0);
 
 /** Poll every 5 s while the page is visible; a hidden page cancels the timer and resumes on return. */
-export function startRunsPolling(read: (signal: AbortSignal) => Promise<unknown>, publish: (value: unknown) => void,
+export function startRunsPolling<T>(read: (signal: AbortSignal) => Promise<T>, publish: (value: T | Error) => void,
   document: Pick<Document, "hidden" | "addEventListener" | "removeEventListener">): () => void {
   let disposed = false;
   let active: AbortController | null = null;

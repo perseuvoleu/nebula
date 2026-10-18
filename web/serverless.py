@@ -47,7 +47,8 @@ def _steps(raw):
 
 def _run(row):
     if (not isinstance(row, dict) or not isinstance(row.get("id"), str)
-            or _number(row.get("started_at")) is None or row.get("status") not in STATUSES):
+            or _number(row.get("started_at")) is None or not isinstance(row.get("status"), str)
+            or row["status"] not in STATUSES):
         return None
     return {"id": row["id"], "repo": _text(row.get("repo")), "ref": _text(row.get("ref")),
             "cache_mode": _text(row.get("cache_mode")), "instance": _text(row.get("instance")),

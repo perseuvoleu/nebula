@@ -436,11 +436,9 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertEqual(json.loads(body), {"configured": False, "runs": []})
-        upstream = SimpleNamespace(get=lambda limit: (_ for _ in ()).throw(
-            serverless.ServerlessError(504, "Worker-ul serverless nu a răspuns la timp")))
-        with patch.object(self.server.gateway, "serverless", upstream):
+        with patch.object(self.server.gateway, "serverless", serverless.ServerlessRuns("http://127.0.0.1:1", "cf-secret")):
             status, _, body = self.request("/api/serverless/runs?limit=5", headers=self.auth())
-        self.assertEqual((status, json.loads(body)), (504, {"error": "Worker-ul serverless nu a răspuns la timp"}))
+        self.assertEqual((status, json.loads(body)), (502, {"error": "Worker-ul serverless nu poate fi contactat"}))
 
     def test_wrong_host_and_origin(self):
         self.assertEqual(self.request("/", headers={"Host": "evil.example"})[0], 403)

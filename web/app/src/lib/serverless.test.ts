@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { failedStep, formatCost, formatDuration, runDuration, shortRepo, startRunsPolling, type Run } from "./serverless.ts";
+import { failedStep, formatCost, formatDuration, formatSeconds, runDuration, shortRepo, startRunsPolling, type Run } from "./serverless.ts";
 
 const run: Run = {
   id: "e564497e", repo: "https://github.com/unjs/h3", ref: null, cache_mode: "modules", instance: "standard-2",
@@ -21,6 +21,12 @@ test("durations read in seconds, minutes and hours", () => {
   assert.equal(formatDuration(125_000), "2 min 05 s");
   assert.equal(formatDuration(3_720_000), "1 h 02 min");
   assert.equal(formatDuration(-5), "0,0 s");
+});
+
+test("step durations always read in seconds", () => {
+  assert.equal(formatSeconds(184), "0,2 s");
+  assert.equal(formatSeconds(125_000), "125,0 s");
+  assert.equal(formatSeconds(null), "—");
 });
 
 test("a finished run lasts until its end; a running one keeps ticking with the clock", () => {

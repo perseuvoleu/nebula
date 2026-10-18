@@ -63,7 +63,7 @@ class ServerlessTests(unittest.TestCase):
 
     def test_malformed_steps_and_rows_never_break_the_list(self):
         broken = {**FINISHED, "steps": "not json"}
-        self.worker.answer = (200, [broken, "junk", {"id": 3}], 0)
+        self.worker.answer = (200, [broken, "junk", {"id": 3}, {"id": "x", "started_at": 1, "status": []}], 0)
         result = self.runs.get(None)
         self.assertEqual([run["id"] for run in result["runs"]], ["e564497e"])
         self.assertEqual(result["runs"][0]["steps"], [])

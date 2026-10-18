@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { ArrowLeftIcon, ChevronDownIcon } from "lucide-react";
 import { api, ApiError, describeError } from "@/lib/api";
-import { failedStep, formatCost, formatDuration, formatStart, RUN_STATUS_LABEL, runDuration, shortRepo, startRunsPolling, type Run, type RunsResponse } from "@/lib/serverless";
+import { failedStep, formatCost, formatDuration, formatSeconds, formatStart, RUN_STATUS_LABEL, runDuration, shortRepo, startRunsPolling, type Run, type RunsResponse } from "@/lib/serverless";
 import { Button } from "@/components/ui/button";
 
 const COLUMNS = "md:grid md:grid-cols-[minmax(0,1.6fr)_minmax(0,0.8fr)_6rem_minmax(0,1.2fr)_7rem_10rem_6rem_7rem_1rem] md:items-center md:gap-3";
@@ -14,7 +14,7 @@ function Steps({ run }: { run: Run }) {
       {run.steps.map((step, index) => (
         <li key={index} className={`flex items-center gap-3 px-2.5 py-1.5 ${index === failed ? "bg-foreground font-medium text-background" : ""}`}>
           <span className="min-w-0 flex-1 truncate font-mono">{step.name}</span>
-          <span className="tabular-nums">{step.ms === null ? "—" : formatDuration(step.ms)}</span>
+          <span className="tabular-nums">{formatSeconds(step.ms)}</span>
           <span className="w-16 text-right tabular-nums">{step.exitCode === null ? "cod —" : `cod ${step.exitCode}`}</span>
         </li>
       ))}
@@ -66,7 +66,7 @@ export function ServerlessRuns({ onBack }: { onBack?: () => void }) {
     signal => api<RunsResponse>("serverless/runs", { limit: "100" }, undefined, { signal, timeoutMs: 15000 }),
     value => {
       setNow(Date.now());
-      if (!(value instanceof Error)) { setData(value as RunsResponse); setError(null); return; }
+      if (!(value instanceof Error)) { setData(value); setError(null); return; }
       // A rejected gateway token already logs out through api(); keep the last list otherwise.
       if (!(value instanceof ApiError && value.status === 401)) setError(describeError(value));
     }, document), []);
