@@ -20,7 +20,7 @@ portable-pty = "0.9"
 vt100 = "0.16"
 rusqlite = { version = "0.40", features = ["bundled"] }
 axum = "0.8"
-nix = { version = "0.31", features = ["process", "fs", "signal", "term"] }
+nix = { version = "0.31", features = ["process", "fs", "signal", "term", "resource"] }
 tokio-util = "0.7"
 rand = "0.10"
 subtle = "2"

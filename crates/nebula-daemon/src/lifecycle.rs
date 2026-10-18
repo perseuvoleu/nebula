@@ -130,6 +130,24 @@ pub fn ensure_runtime_dir() -> Result<()> {
     Ok(())
 }
 
+/// macOS's OPEN_MAX: setrlimit refuses a higher soft NOFILE there.
+const FD_LIMIT_CAP: u64 = 10240;
+
+/// Each session holds about three PTY fds, so launchd's default soft limit
+/// of 256 runs out near 70 sessions and `accept` starts failing with EMFILE.
+pub fn raise_fd_limit() {
+    use nix::sys::resource::{getrlimit, setrlimit, Resource};
+    let Ok((soft, hard)) = getrlimit(Resource::RLIMIT_NOFILE) else {
+        return;
+    };
+    let target = hard.min(FD_LIMIT_CAP);
+    if soft < target {
+        if let Err(error) = setrlimit(Resource::RLIMIT_NOFILE, target, hard) {
+            tracing::warn!(%error, soft, target, "could not raise the open-file limit");
+        }
+    }
+}
+
 /// Remove a socket file left behind by a dead daemon.
 pub fn unlink_stale_socket(path: &Path) {
     let _ = fs::remove_file(path);
@@ -138,6 +156,16 @@ pub fn unlink_stale_socket(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raising_the_fd_limit_lifts_the_soft_limit_off_the_macos_default() {
+        use nix::sys::resource::{getrlimit, setrlimit, Resource};
+        let (_, hard) = getrlimit(Resource::RLIMIT_NOFILE).unwrap();
+        setrlimit(Resource::RLIMIT_NOFILE, 256, hard).unwrap();
+        raise_fd_limit();
+        let (soft, _) = getrlimit(Resource::RLIMIT_NOFILE).unwrap();
+        assert_eq!(soft, hard.min(FD_LIMIT_CAP));
+    }
 
     #[test]
     fn fingerprint_is_stable_for_identical_content() {

@@ -31,6 +31,7 @@ async fn serve() -> Result<()> {
     // Record which build this daemon runs so installers can tell an
     // up-to-date daemon from a stale one (`nebula _stale-daemon-note`).
     lifecycle::write_buildstamp();
+    lifecycle::raise_fd_limit();
 
     let sock = paths::socket_path();
     lifecycle::unlink_stale_socket(&sock);
