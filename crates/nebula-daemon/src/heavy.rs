@@ -9,12 +9,14 @@ use crate::config::{Config, HeavyConfig};
 use crate::dispatcher::{Consumer, Dispatcher, LeaseId, Limits, Standing, UNBOUNDED_BYTES};
 use nebula_core::heavy::{daemon_id, processes, HeavyMark};
 use nebula_core::mem::{machine_memory, MachineMemory, ProbeError};
-use nebula_core::{paths, Blocked, ServerEvent};
+use nebula_core::{
+    paths, Blocked, HeavyLease, HeavySnapshot, RunningLease, ServerEvent, SessionRef, Waiting,
+};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 const TICK: Duration = Duration::from_secs(2);
@@ -51,6 +53,16 @@ impl Link {
 }
 
 enum Msg {
+    Change(Change),
+    Status(oneshot::Sender<LedgerView>),
+}
+
+struct LedgerView {
+    running: Vec<HeavyLease>,
+    queued: Vec<Waiting>,
+}
+
+enum Change {
     Request {
         id: LeaseId,
         reserve_bytes: Option<u64>,
@@ -88,25 +100,68 @@ impl Desk {
     /// Queue a command; the link gets its `HeavyQueued`/`HeavyGranted`.
     pub fn request(&self, reserve_bytes: Option<u64>, command: String, link: Link) -> Lease {
         let lease = self.lease();
-        let _ = self.tx.send(Msg::Request {
+        let _ = self.tx.send(Msg::Change(Change::Request {
             id: lease.id,
             reserve_bytes,
             command,
             link,
-        });
+        }));
         lease
     }
 
     /// Re-attach a wrapper this daemon counted at startup.
     pub fn running(&self, reserved_bytes: u64, command: String, link: Link) -> Lease {
         let lease = self.lease();
-        let _ = self.tx.send(Msg::Running {
+        let _ = self.tx.send(Msg::Change(Change::Running {
             id: lease.id,
             reserved_bytes,
             command,
             link,
-        });
+        }));
         lease
+    }
+
+    /// What `heavy status` shows; None once the ledger task has stopped.
+    pub async fn status(&self, sessions: Vec<(SessionRef, u32)>) -> Option<HeavySnapshot> {
+        let ledger = self.ledger().await?;
+        let roots: Vec<u32> = ledger.running.iter().filter_map(|l| l.pid).collect();
+        let (memory, trees) = tokio::task::spawn_blocking(move || {
+            let trees = crate::metrics::sessions_and_trees(&sessions, &roots);
+            (
+                machine_memory(),
+                trees.map(|(s, rss)| (s, roots.into_iter().zip(rss))),
+            )
+        })
+        .await
+        .ok()?;
+        let (sessions, tree_rss): (_, HashMap<u32, Option<u64>>) = match trees {
+            Ok((sessions, rss)) => (Ok(sessions), rss.collect()),
+            Err(e) => (Err(e.to_string()), HashMap::new()),
+        };
+        let limits = Config::load().heavy.limits();
+        Some(HeavySnapshot {
+            memory: memory.map_err(|e| e.to_string()),
+            budget_bytes: limits.budget_bytes,
+            floor_bytes: limits.floor_bytes,
+            sessions,
+            running: ledger
+                .running
+                .into_iter()
+                .map(|lease| RunningLease {
+                    rss_bytes: lease
+                        .pid
+                        .and_then(|pid| tree_rss.get(&pid).copied().flatten()),
+                    lease,
+                })
+                .collect(),
+            queued: ledger.queued,
+        })
+    }
+
+    async fn ledger(&self) -> Option<LedgerView> {
+        let (reply, view) = oneshot::channel();
+        self.tx.send(Msg::Status(reply)).ok()?;
+        view.await.ok()
     }
 
     fn lease(&self) -> Lease {
@@ -119,7 +174,7 @@ impl Desk {
 
 impl Drop for Lease {
     fn drop(&mut self) {
-        let _ = self.tx.send(Msg::Release(self.id));
+        let _ = self.tx.send(Msg::Change(Change::Release(self.id)));
     }
 }
 
@@ -179,10 +234,17 @@ async fn run(
     });
     let mut tick = tokio::time::interval(TICK);
     loop {
-        tokio::select! {
+        let may_admit = tokio::select! {
             _ = shutdown.cancelled() => break,
             msg = rx.recv() => match msg {
-                Some(msg) => ledger.apply(msg, &Config::load().heavy),
+                Some(Msg::Change(change)) => {
+                    ledger.apply(change, &Config::load().heavy);
+                    true
+                }
+                Some(Msg::Status(reply)) => {
+                    let _ = reply.send(ledger.view());
+                    false
+                }
                 None => break,
             },
             _ = tick.tick() => {
@@ -194,9 +256,10 @@ async fn run(
                         .unwrap_or_else(|e| Err(ProbeError::Unreadable(e.to_string())));
                     ledger.observe(roots, rss);
                 }
+                true
             }
-        }
-        if ledger.dispatcher.has_queued() {
+        };
+        if may_admit && ledger.dispatcher.has_queued() {
             let machine = tokio::task::spawn_blocking(machine_memory)
                 .await
                 .unwrap_or_else(|e| Err(ProbeError::Unreadable(e.to_string())));
@@ -269,9 +332,9 @@ impl Ledger {
             .map(|(id, _)| *id)
     }
 
-    fn apply(&mut self, msg: Msg, heavy: &HeavyConfig) {
-        match msg {
-            Msg::Request {
+    fn apply(&mut self, change: Change, heavy: &HeavyConfig) {
+        match change {
+            Change::Request {
                 id,
                 reserve_bytes,
                 command,
@@ -311,7 +374,7 @@ impl Ledger {
                     },
                 );
             }
-            Msg::Running {
+            Change::Running {
                 id,
                 reserved_bytes,
                 command,
@@ -350,7 +413,41 @@ impl Ledger {
                     },
                 );
             }
-            Msg::Release(id) => self.release(id),
+            Change::Release(id) => self.release(id),
+        }
+    }
+
+    fn view(&self) -> LedgerView {
+        let lease = |id: &LeaseId| {
+            let entry = self.leases.get(id)?;
+            Some(HeavyLease {
+                lease: id.0,
+                pid: entry.wrapper_pid,
+                reserved_bytes: (entry.reserved_bytes != UNBOUNDED_BYTES)
+                    .then_some(entry.reserved_bytes),
+                command: entry.command.clone(),
+            })
+        };
+        LedgerView {
+            running: self
+                .dispatcher
+                .running()
+                .filter_map(|consumer| match consumer {
+                    Consumer::Command(id) => lease(id),
+                    Consumer::Session(_) => None,
+                })
+                .collect(),
+            queued: self
+                .dispatcher
+                .queued()
+                .filter_map(|(consumer, reserved_bytes)| match consumer {
+                    Consumer::Command(id) => lease(id).map(Waiting::Command),
+                    Consumer::Session(agent) => Some(Waiting::Session {
+                        agent: agent.clone(),
+                        reserved_bytes,
+                    }),
+                })
+                .collect(),
         }
     }
 
@@ -467,13 +564,13 @@ mod tests {
             command_reservation_gib: 0.6,
             ..HeavyConfig::default()
         };
-        let msg = Msg::Request {
+        let change = Change::Request {
             id: LeaseId(id),
             reserve_bytes: None,
             command: format!("command {id}"),
             link: link.clone(),
         };
-        ledger.apply(msg, &heavy);
+        ledger.apply(change, &heavy);
     }
 
     #[test]
@@ -484,7 +581,9 @@ mod tests {
             psi_some_avg10_max: 100.0,
         };
         let roomy = Ok(MachineMemory::Linux {
+            total_bytes: 64 * GIB,
             available_bytes: 64 * GIB,
+            swap_total_bytes: 0,
             swap_free_bytes: 0,
             psi_some_avg10: 0.0,
         });

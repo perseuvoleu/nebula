@@ -123,7 +123,10 @@ enum Command {
     /// terminal, its stdio and its exit status; one `heavy: waited …` line
     /// follows on stderr. Also installed as `heavy`. With no daemon to ask,
     /// it warns and runs the command at once.
+    #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
     Heavy {
+        #[command(subcommand)]
+        action: Option<HeavyCommand>,
         /// GiB to reserve (default: the daemon's configured reservation).
         #[arg(value_parser = nebula_tui::heavy_cli::parse_gib)]
         gb: Option<u64>,
@@ -484,6 +487,14 @@ enum AgentCommand {
         #[arg(long)]
         project: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum HeavyCommand {
+    /// Show this machine's memory, swap and pressure, the heavy budget,
+    /// each session's RSS, and the running and queued heavy commands and
+    /// sessions. Fails when no daemon answers.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -855,6 +866,11 @@ fn main() -> Result<()> {
             nebula_tui::run_todo(op)
         }
         Some(Command::Heavy {
+            action: Some(HeavyCommand::Status),
+            ..
+        }) => nebula_tui::run_heavy_status(),
+        Some(Command::Heavy {
+            action: None,
             gb,
             here: _,
             command,

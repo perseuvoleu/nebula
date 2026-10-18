@@ -1,6 +1,6 @@
 use nebula_core::codec::{read_frame, write_frame};
 use nebula_core::heavy::{daemon_id, HeavyMark};
-use nebula_core::{ClientRequest, ServerEvent, PROTOCOL_VERSION};
+use nebula_core::{ClientRequest, Entity, EntityId, ServerEvent, SessionRef, PROTOCOL_VERSION};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -462,6 +462,317 @@ fn hq_t08_absent_daemon_warns_and_runs_directly() {
         "{}",
         done.stderr
     );
+}
+
+#[test]
+fn hq_t09_status_shows_running_and_queued_commands_in_fifo_order() {
+    let env = Env::new();
+    let _daemon = env.spawn_daemon();
+
+    let _running = env.heavy(&["--", "sh", "-c", &held("a")], None);
+    wait_until(Duration::from_secs(20), "first command starts", || {
+        env.path("a.started").exists()
+    });
+    let first_waiter = env.heavy(&["--", "sh", "-c", "touch b.started"], None);
+    first_waiter.wait_stderr("heavy: queued at position 1,");
+    let second_waiter = env.heavy(&["0.3", "--", "sh", "-c", "touch c.started"], None);
+    second_waiter.wait_stderr("heavy: queued at position 2,");
+
+    let link = env.path("heavy");
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_nebula"), &link).unwrap();
+    let status = env.heavy_at(&link, &[], &["status"], None).finish();
+    assert!(status.status.success(), "{}", status.stderr);
+    let out = status.stdout;
+    for line in [
+        "memory            available ",
+        "swap              free ",
+        "budget            1.00 GiB, floor 0.00 GiB\n",
+        "sessions          none\n",
+        "queued sessions   none\n",
+    ] {
+        assert!(out.contains(line), "missing {line:?} in:\n{out}");
+    }
+    assert!(pressure_reads_as_this_platform(&out), "{out}");
+    let running_line = section(&out, "running commands");
+    assert_eq!(running_line.len(), 1, "{out}");
+    assert!(
+        running_line[0].starts_with("  lease ")
+            && running_line[0].contains("  reserved 0.60 GiB  rss ")
+            && running_line[0].ends_with(&format!("  sh -c {}", held("a"))),
+        "{out}"
+    );
+    let queued = section(&out, "queued commands");
+    assert_eq!(queued.len(), 2, "{out}");
+    assert!(queued[0].starts_with("  1. lease "), "{out}");
+    assert!(
+        queued[0].ends_with("  reserved 0.60 GiB  sh -c touch b.started"),
+        "{out}"
+    );
+    assert!(queued[1].starts_with("  2. lease "), "{out}");
+    assert!(
+        queued[1].ends_with("  reserved 0.30 GiB  sh -c touch c.started"),
+        "{out}"
+    );
+}
+
+#[test]
+fn hq_t10_reading_status_again_and_again_changes_no_lease_or_place() {
+    let env = Env::new();
+    let _daemon = env.spawn_daemon();
+
+    let running = env.heavy(&["--", "sh", "-c", &held("a")], None);
+    wait_until(Duration::from_secs(20), "first command starts", || {
+        env.path("a.started").exists()
+    });
+    let first_waiter = env.heavy(&["--", "sh", "-c", "touch b.started"], None);
+    first_waiter.wait_stderr("heavy: queued at position 1,");
+    let second_waiter = env.heavy(&["--", "sh", "-c", "touch c.started"], None);
+    second_waiter.wait_stderr("heavy: queued at position 2,");
+
+    let reads: Vec<String> = (0..3)
+        .map(|_| {
+            let done = env.heavy(&["status"], None).finish();
+            assert!(done.status.success(), "{}", done.stderr);
+            without_live_readings(&done.stdout)
+        })
+        .collect();
+    assert_eq!(reads[0], reads[1]);
+    assert_eq!(reads[1], reads[2]);
+    assert!(!env.path("b.started").exists(), "status admitted a waiter");
+    assert!(!env.path("c.started").exists(), "status admitted a waiter");
+    assert_eq!(
+        first_waiter
+            .stderr()
+            .matches("heavy: queued at position")
+            .count(),
+        1,
+        "status moved a waiter: {}",
+        first_waiter.stderr()
+    );
+
+    std::fs::write(env.path("a.release"), "").unwrap();
+    assert!(running.finish().status.success());
+    let first_waiter = first_waiter.finish();
+    assert!(first_waiter.status.success(), "{}", first_waiter.stderr);
+    let second_waiter = second_waiter.finish();
+    assert!(second_waiter.status.success(), "{}", second_waiter.stderr);
+    let after = env.heavy(&["status"], None).finish();
+    assert!(
+        after.stdout.contains("running commands  none\n")
+            && after.stdout.contains("queued commands   none\n"),
+        "{}",
+        after.stdout
+    );
+}
+
+#[test]
+fn hq_t09_status_lists_a_live_session_with_its_rss() {
+    let env = Env::new();
+    let _daemon = env.spawn_daemon();
+    let terminal = open_terminal(&env);
+
+    let done = env.heavy(&["status"], None).finish();
+    assert!(done.status.success(), "{}", done.stderr);
+    let sessions = section(&done.stdout, "sessions");
+    assert_eq!(sessions.len(), 1, "{}", done.stdout);
+    assert!(
+        sessions[0].starts_with(&format!("  terminal {terminal}  pid ")),
+        "{}",
+        done.stdout
+    );
+    assert!(
+        sessions[0].contains(" GiB  ") && sessions[0].ends_with(" procs"),
+        "{}",
+        done.stdout
+    );
+}
+
+#[test]
+fn hq_t10_status_without_a_daemon_fails_and_runs_nothing() {
+    let env = Env::new();
+    let bin = env.path("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let status_command = bin.join("status");
+    std::fs::write(&status_command, "#!/bin/sh\ntouch status.ran\n").unwrap();
+    std::fs::set_permissions(
+        &status_command,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_nebula"));
+    let done = command
+        .args(["heavy", "status"])
+        .current_dir(env.tmp.path())
+        .env("PATH", path)
+        .env("NEBULA_RUNTIME_DIR", env.runtime_dir())
+        .env("NEBULA_DATA_DIR", env.data_dir())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&done.stderr);
+    assert!(!done.status.success(), "{stderr}");
+    assert!(stderr.contains("no nebula daemon reachable"), "{stderr}");
+    assert!(!stderr.contains("running without"), "{stderr}");
+    assert!(done.stdout.is_empty());
+    assert!(!env.path("status.ran").exists(), "status failed open");
+    assert!(
+        !env.runtime_dir().join("daemon.sock").exists(),
+        "status started a daemon"
+    );
+}
+
+#[test]
+fn status_against_a_protocol_30_daemon_names_the_mismatch_and_the_restart() {
+    let env = Env::new();
+    let old = FakeDaemon::bind(&env, Answer::Protocol(30));
+    let done = env.heavy(&["status"], None).finish();
+    assert!(!done.status.success(), "{}", done.stderr);
+    assert_eq!(
+        done.stderr,
+        "Error: daemon speaks protocol v30, this client v31 — run `nebula kill` and relaunch\n"
+    );
+    assert!(done.stdout.is_empty(), "{}", done.stdout);
+    assert_eq!(old.accepted(), 1);
+}
+
+fn pressure_reads_as_this_platform(out: &str) -> bool {
+    let Some(value) = out
+        .lines()
+        .find_map(|l| l.strip_prefix("pressure          "))
+    else {
+        return false;
+    };
+    if cfg!(target_os = "macos") {
+        matches!(
+            value,
+            "macOS level normal" | "macOS level warn" | "macOS level critical"
+        )
+    } else {
+        value
+            .strip_prefix("PSI some avg10 ")
+            .and_then(|v| v.strip_suffix('%'))
+            .is_some_and(|v| v.parse::<f64>().is_ok())
+    }
+}
+
+fn section(out: &str, heading: &str) -> Vec<String> {
+    out.lines()
+        .skip_while(|l| *l != heading)
+        .skip(1)
+        .take_while(|l| l.starts_with("  "))
+        .map(str::to_string)
+        .collect()
+}
+
+fn without_live_readings(out: &str) -> String {
+    out.lines()
+        .filter(|l| {
+            !["memory ", "swap ", "pressure "]
+                .iter()
+                .any(|p| l.starts_with(p))
+        })
+        .map(without_rss)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn without_rss(line: &str) -> String {
+    match line.split_once("  rss ") {
+        Some((head, tail)) => {
+            let command = tail.split_once("  ").map_or("", |(_rss, command)| command);
+            format!("{head}  {command}")
+        }
+        None => line.to_string(),
+    }
+}
+
+fn open_terminal(env: &Env) -> String {
+    let socket = env.runtime_dir().join("daemon.sock");
+    let repo = env.path("repo");
+    std::fs::create_dir(&repo).unwrap();
+    for args in [
+        &["init", "-q", "-b", "main"][..],
+        &["commit", "-q", "--allow-empty", "-m", "init"],
+    ] {
+        let ok = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["-c", "user.email=t@nebula.dev", "-c", "user.name=t"])
+            .args(args)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+    runtime().block_on(async {
+        let mut stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        let hello = ClientRequest::Hello {
+            protocol_version: PROTOCOL_VERSION,
+        };
+        write_frame(&mut stream, &hello).await.unwrap();
+        write_frame(&mut stream, &ClientRequest::Subscribe)
+            .await
+            .unwrap();
+        let add = ClientRequest::AddProject {
+            req_id: 1,
+            path: repo,
+            name: None,
+            create_missing: false,
+            host: None,
+        };
+        write_frame(&mut stream, &add).await.unwrap();
+        let mut worktree = None;
+        while worktree.is_none() {
+            match next_event(&mut stream).await {
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Worktree(w),
+                } if w.is_main => worktree = Some(w.id),
+                ServerEvent::Error { message, .. } => panic!("{message}"),
+                _ => {}
+            }
+        }
+        let create = ClientRequest::CreateTerminal {
+            req_id: 2,
+            worktree: worktree.unwrap(),
+            expected_branch: None,
+            name: None,
+        };
+        write_frame(&mut stream, &create).await.unwrap();
+        let terminal = loop {
+            match next_event(&mut stream).await {
+                ServerEvent::Ack {
+                    req_id: 2,
+                    created: Some(EntityId::Terminal(id)),
+                } => break id,
+                ServerEvent::Error { message, .. } => panic!("{message}"),
+                _ => {}
+            }
+        };
+        let attach = ClientRequest::Attach {
+            session: SessionRef::Terminal(terminal.clone()),
+            from_seq: None,
+            cols: 80,
+            rows: 24,
+        };
+        write_frame(&mut stream, &attach).await.unwrap();
+        while !matches!(
+            next_event(&mut stream).await,
+            ServerEvent::Scrollback { .. }
+        ) {}
+        terminal.0
+    })
+}
+
+async fn next_event(stream: &mut tokio::net::UnixStream) -> ServerEvent {
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        read_frame::<ServerEvent, _>(stream),
+    )
+    .await
+    .expect("daemon answered within 10s")
+    .unwrap()
+    .expect("daemon kept the connection open")
 }
 
 #[test]

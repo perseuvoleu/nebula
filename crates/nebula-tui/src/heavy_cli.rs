@@ -7,9 +7,14 @@
 
 use crate::ipc::{handshake, split_connection, try_connect, Incompatible, IpcChannels};
 use nebula_core::heavy::{daemon_id, processes, HeavyMark, Process};
-use nebula_core::{paths, Blocked, ClientRequest, ServerEvent, PROTOCOL_VERSION};
+use nebula_core::mem::{MachineMemory, VmPressureLevel};
+use nebula_core::{
+    paths, Blocked, ClientRequest, HeavySnapshot, ServerEvent, SessionRef, Waiting,
+    PROTOCOL_VERSION,
+};
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::fs::File;
 use std::future::Future;
 use std::os::fd::AsRawFd;
@@ -512,6 +517,189 @@ fn reason(blocked: Blocked) -> &'static str {
     }
 }
 
+/// `heavy status`. Unlike running a command, it fails when no daemon answers.
+pub async fn status() -> anyhow::Result<()> {
+    let mut channels = connect().await.map_err(|e| {
+        if e.is::<Incompatible>() {
+            e
+        } else {
+            anyhow::anyhow!("no nebula daemon reachable ({e})")
+        }
+    })?;
+    channels.tx.send(ClientRequest::HeavyStatus).await?;
+    loop {
+        let event = tokio::time::timeout(ANSWER_WITHIN, channels.rx.recv())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "the nebula daemon did not answer within {}s",
+                    ANSWER_WITHIN.as_secs()
+                )
+            })?;
+        match event {
+            Some(ServerEvent::HeavyStatus { snapshot }) => {
+                print!("{}", render(&snapshot));
+                return Ok(());
+            }
+            Some(_) => {}
+            None => anyhow::bail!("the nebula daemon hung up without a status"),
+        }
+    }
+}
+
+fn render(snapshot: &HeavySnapshot) -> String {
+    let mut out = String::new();
+    let mut field = |label: &str, value: String| line(&mut out, label, &value);
+    match &snapshot.memory {
+        Ok(MachineMemory::Linux {
+            total_bytes,
+            available_bytes,
+            swap_total_bytes,
+            swap_free_bytes,
+            psi_some_avg10,
+        }) => {
+            field(
+                "memory",
+                format!(
+                    "available {} of {}",
+                    gib(*available_bytes),
+                    gib(*total_bytes)
+                ),
+            );
+            field(
+                "swap",
+                format!(
+                    "free {} of {}",
+                    gib(*swap_free_bytes),
+                    gib(*swap_total_bytes)
+                ),
+            );
+            field("pressure", format!("PSI some avg10 {psi_some_avg10:.2}%"));
+        }
+        Ok(MachineMemory::Macos {
+            total_bytes,
+            swap_total_bytes,
+            swap_free_bytes,
+            pressure,
+        }) => {
+            field(
+                "memory",
+                format!("available unreported by macOS of {}", gib(*total_bytes)),
+            );
+            field(
+                "swap",
+                format!(
+                    "free {} of {}",
+                    gib(*swap_free_bytes),
+                    gib(*swap_total_bytes)
+                ),
+            );
+            let level = match pressure {
+                VmPressureLevel::Normal => "normal",
+                VmPressureLevel::Warn => "warn",
+                VmPressureLevel::Critical => "critical",
+            };
+            field("pressure", format!("macOS level {level}"));
+        }
+        Err(why) => {
+            for label in ["memory", "swap", "pressure"] {
+                field(label, format!("unavailable ({why})"));
+            }
+        }
+    }
+    field(
+        "budget",
+        format!(
+            "{}, floor {}",
+            gib(snapshot.budget_bytes),
+            gib(snapshot.floor_bytes)
+        ),
+    );
+    match &snapshot.sessions {
+        Ok(sessions) => {
+            let mut sessions: Vec<_> = sessions.iter().collect();
+            sessions.sort_by_key(|s| (std::cmp::Reverse(s.tree.map(|t| t.rss_bytes)), s.pid));
+            let items = sessions.iter().map(|s| {
+                let session = match &s.session {
+                    SessionRef::Agent(id) => format!("agent {}", id.0),
+                    SessionRef::Terminal(id) => format!("terminal {}", id.0),
+                };
+                let tree = s.tree.map_or("rss unavailable (exited)".into(), |t| {
+                    format!("{}  {} procs", gib(t.rss_bytes), t.procs)
+                });
+                format!("{session}  pid {}  {tree}", s.pid)
+            });
+            list(&mut out, "sessions", items);
+        }
+        Err(why) => line(&mut out, "sessions", &format!("unavailable ({why})")),
+    }
+    let running = snapshot.running.iter().map(|r| {
+        let rss = r.rss_bytes.map_or("unavailable".into(), gib);
+        let lease = &r.lease;
+        format!(
+            "lease {}  pid {}  reserved {}  rss {rss}  {}",
+            lease.lease,
+            pid(lease.pid),
+            reserved(lease.reserved_bytes),
+            lease.command
+        )
+    });
+    list(&mut out, "running commands", running);
+    let positions = || snapshot.queued.iter().zip(1..);
+    let commands = positions().filter_map(|(waiting, position)| match waiting {
+        Waiting::Command(lease) => Some(format!(
+            "{position}. lease {}  pid {}  reserved {}  {}",
+            lease.lease,
+            pid(lease.pid),
+            reserved(lease.reserved_bytes),
+            lease.command
+        )),
+        Waiting::Session { .. } => None,
+    });
+    list(&mut out, "queued commands", commands);
+    let sessions = positions().filter_map(|(waiting, position)| match waiting {
+        Waiting::Session {
+            agent,
+            reserved_bytes,
+        } => Some(format!(
+            "{position}. agent {}  reserved {}",
+            agent.0,
+            gib(*reserved_bytes)
+        )),
+        Waiting::Command(_) => None,
+    });
+    list(&mut out, "queued sessions", sessions);
+    out
+}
+
+fn list(out: &mut String, label: &str, items: impl Iterator<Item = String>) {
+    let mut items = items.peekable();
+    if items.peek().is_none() {
+        line(out, label, "none");
+        return;
+    }
+    let _ = writeln!(out, "{label}");
+    for item in items {
+        let _ = writeln!(out, "  {item}");
+    }
+}
+
+fn line(out: &mut String, label: &str, value: &str) {
+    let _ = writeln!(out, "{label:<18}{value}");
+}
+
+fn gib(bytes: u64) -> String {
+    format!("{:.2} GiB", bytes as f64 / GIB)
+}
+
+fn pid(pid: Option<u32>) -> String {
+    pid.map_or("unknown".into(), |p| p.to_string())
+}
+
+fn reserved(bytes: Option<u64>) -> String {
+    bytes.map_or("unknown".into(), gib)
+}
+
 fn report_wait(waited: Duration) {
     eprintln!("heavy: waited {:.1}s for memory", waited.as_secs_f64());
 }
@@ -655,6 +843,185 @@ fn exit_like(status: ExitStatus) -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nebula_core::{AgentId, HeavyLease, HeavySession, ProcessTree, RunningLease, TerminalId};
+
+    const GIB_BYTES: u64 = 1 << 30;
+    const MIB_BYTES: u64 = 1 << 20;
+
+    fn lease(
+        lease: u64,
+        pid: Option<u32>,
+        reserved_bytes: Option<u64>,
+        command: &str,
+    ) -> HeavyLease {
+        HeavyLease {
+            lease,
+            pid,
+            reserved_bytes,
+            command: command.into(),
+        }
+    }
+
+    fn session(session: SessionRef, pid: u32, rss_bytes: u64, procs: u32) -> HeavySession {
+        HeavySession {
+            session,
+            pid,
+            tree: Some(ProcessTree { rss_bytes, procs }),
+        }
+    }
+
+    fn busy_linux() -> HeavySnapshot {
+        HeavySnapshot {
+            memory: Ok(MachineMemory::Linux {
+                total_bytes: 16 * GIB_BYTES,
+                available_bytes: 15 * GIB_BYTES / 2,
+                swap_total_bytes: 6 * GIB_BYTES,
+                swap_free_bytes: GIB_BYTES / 2,
+                psi_some_avg10: 12.5,
+            }),
+            budget_bytes: 7 * GIB_BYTES,
+            floor_bytes: 2 * GIB_BYTES,
+            sessions: Ok(vec![
+                HeavySession {
+                    session: SessionRef::Agent(AgentId("01GONE".into())),
+                    pid: 4100,
+                    tree: None,
+                },
+                session(
+                    SessionRef::Terminal(TerminalId("01TINY".into())),
+                    4400,
+                    1772 * 1024,
+                    1,
+                ),
+                session(
+                    SessionRef::Terminal(TerminalId("01TERM".into())),
+                    4300,
+                    50 * MIB_BYTES,
+                    1,
+                ),
+                session(
+                    SessionRef::Agent(AgentId("01AGENT".into())),
+                    4242,
+                    5 * GIB_BYTES / 4,
+                    12,
+                ),
+            ]),
+            running: vec![
+                RunningLease {
+                    lease: lease(3, Some(5000), Some(4 * GIB_BYTES), "cargo test --workspace"),
+                    rss_bytes: Some(GIB_BYTES),
+                },
+                RunningLease {
+                    lease: lease(9, Some(5100), None, "pid 5100"),
+                    rss_bytes: None,
+                },
+            ],
+            queued: vec![
+                Waiting::Command(lease(
+                    4,
+                    Some(5001),
+                    Some(2 * GIB_BYTES),
+                    "cargo build --release",
+                )),
+                Waiting::Session {
+                    agent: AgentId("01QUEUED".into()),
+                    reserved_bytes: 3 * GIB_BYTES,
+                },
+                Waiting::Command(lease(5, Some(5002), Some(3 * GIB_BYTES / 2), "pnpm test")),
+            ],
+        }
+    }
+
+    #[test]
+    fn hq_t09_status_shows_memory_sessions_and_the_queue_in_gib() {
+        assert_eq!(
+            render(&busy_linux()),
+            "\
+memory            available 7.50 GiB of 16.00 GiB
+swap              free 0.50 GiB of 6.00 GiB
+pressure          PSI some avg10 12.50%
+budget            7.00 GiB, floor 2.00 GiB
+sessions
+  agent 01AGENT  pid 4242  1.25 GiB  12 procs
+  terminal 01TERM  pid 4300  0.05 GiB  1 procs
+  terminal 01TINY  pid 4400  0.00 GiB  1 procs
+  agent 01GONE  pid 4100  rss unavailable (exited)
+running commands
+  lease 3  pid 5000  reserved 4.00 GiB  rss 1.00 GiB  cargo test --workspace
+  lease 9  pid 5100  reserved unknown  rss unavailable  pid 5100
+queued commands
+  1. lease 4  pid 5001  reserved 2.00 GiB  cargo build --release
+  3. lease 5  pid 5002  reserved 1.50 GiB  pnpm test
+queued sessions
+  2. agent 01QUEUED  reserved 3.00 GiB
+"
+        );
+    }
+
+    #[test]
+    fn hq_t09_status_on_macos_names_the_pressure_level_and_the_missing_available() {
+        let snapshot = HeavySnapshot {
+            memory: Ok(MachineMemory::Macos {
+                total_bytes: 32 * GIB_BYTES,
+                swap_total_bytes: 20 * GIB_BYTES,
+                swap_free_bytes: 1680 * MIB_BYTES,
+                pressure: VmPressureLevel::Warn,
+            }),
+            ..busy_linux()
+        };
+        let out = render(&snapshot);
+        let head: Vec<&str> = out.lines().take(3).collect();
+        assert_eq!(
+            head,
+            [
+                "memory            available unreported by macOS of 32.00 GiB",
+                "swap              free 1.64 GiB of 20.00 GiB",
+                "pressure          macOS level warn",
+            ]
+        );
+    }
+
+    #[test]
+    fn hq_t10_empty_and_unreadable_status_says_so() {
+        let empty = HeavySnapshot {
+            sessions: Ok(Vec::new()),
+            running: Vec::new(),
+            queued: Vec::new(),
+            ..busy_linux()
+        };
+        assert!(
+            render(&empty).ends_with(
+                "\
+budget            7.00 GiB, floor 2.00 GiB
+sessions          none
+running commands  none
+queued commands   none
+queued sessions   none
+"
+            ),
+            "{}",
+            render(&empty)
+        );
+
+        let unreadable = HeavySnapshot {
+            memory: Err("/proc/meminfo: No such file or directory (os error 2)".into()),
+            sessions: Err("ps: exit status: 1".into()),
+            ..empty
+        };
+        assert_eq!(
+            render(&unreadable),
+            "\
+memory            unavailable (/proc/meminfo: No such file or directory (os error 2))
+swap              unavailable (/proc/meminfo: No such file or directory (os error 2))
+pressure          unavailable (/proc/meminfo: No such file or directory (os error 2))
+budget            7.00 GiB, floor 2.00 GiB
+sessions          unavailable (ps: exit status: 1)
+running commands  none
+queued commands   none
+queued sessions   none
+"
+        );
+    }
 
     const NOT_NESTED: i32 = 99;
 

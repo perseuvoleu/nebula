@@ -276,6 +276,11 @@ pub fn run_heavy(opts: heavy_cli::HeavyOpts) -> Result<std::convert::Infallible>
     runtime()?.block_on(heavy_cli::run(opts))
 }
 
+/// `heavy status` / `nebula heavy status`.
+pub fn run_heavy_status() -> Result<()> {
+    runtime()?.block_on(heavy_cli::status())
+}
+
 /// Collect a remote branch or worktree into a safe local destination.
 pub fn run_collect(opts: collect_cli::CollectOpts) -> Result<()> {
     runtime()?.block_on(collect_cli::run(opts))

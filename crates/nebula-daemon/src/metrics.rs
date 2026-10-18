@@ -4,7 +4,7 @@
 //! whole tree, not just the root).
 
 use nebula_core::mem::ProbeError;
-use nebula_core::{MetricsSnapshot, SessionMetrics, SessionRef};
+use nebula_core::{HeavySession, MetricsSnapshot, ProcessTree, SessionMetrics, SessionRef};
 use std::collections::{HashMap, HashSet};
 
 /// Take one reading. Blocking (shells out to `ps`); call via spawn_blocking.
@@ -21,13 +21,54 @@ pub fn collect(sessions: Vec<(SessionRef, u32)>) -> MetricsSnapshot {
 /// root that is gone. Blocking.
 pub fn tree_rss(roots: &[u32]) -> Result<Vec<Option<u64>>, ProbeError> {
     let (rss, children) = parse_table(&ps_table()?);
-    Ok(roots
+    Ok(roots_rss(roots, &rss, &children))
+}
+
+/// Each session's tree and `tree_rss(roots)`, from one `ps` sweep. Blocking.
+pub fn sessions_and_trees(
+    sessions: &[(SessionRef, u32)],
+    roots: &[u32],
+) -> Result<(Vec<HeavySession>, Vec<Option<u64>>), ProbeError> {
+    Ok(status_trees(&ps_table()?, sessions, roots))
+}
+
+fn status_trees(
+    table: &str,
+    sessions: &[(SessionRef, u32)],
+    roots: &[u32],
+) -> (Vec<HeavySession>, Vec<Option<u64>>) {
+    let (rss, children) = parse_table(table);
+    let sessions = sessions
         .iter()
-        .map(|&root| {
-            rss.contains_key(&root)
-                .then(|| subtree_rss(root, &rss, &children).0)
+        .map(|(sref, pid)| HeavySession {
+            session: sref.clone(),
+            pid: *pid,
+            tree: tree(*pid, &rss, &children),
         })
-        .collect())
+        .collect();
+    (sessions, roots_rss(roots, &rss, &children))
+}
+
+fn roots_rss(
+    roots: &[u32],
+    rss: &HashMap<u32, u64>,
+    children: &HashMap<u32, Vec<u32>>,
+) -> Vec<Option<u64>> {
+    roots
+        .iter()
+        .map(|&root| tree(root, rss, children).map(|t| t.rss_bytes))
+        .collect()
+}
+
+fn tree(
+    root: u32,
+    rss: &HashMap<u32, u64>,
+    children: &HashMap<u32, Vec<u32>>,
+) -> Option<ProcessTree> {
+    rss.contains_key(&root).then(|| {
+        let (rss_bytes, procs) = subtree_rss(root, rss, children);
+        ProcessTree { rss_bytes, procs }
+    })
 }
 
 fn ps_table() -> Result<String, ProbeError> {
@@ -158,6 +199,20 @@ mod tests {
         let snap = snapshot_from_table(" 10 1 100\n", 10, &[(sref("a"), 555)], 0);
         assert_eq!(snap.sessions[0].rss_bytes, 0);
         assert_eq!(snap.sessions[0].procs, 0);
+    }
+
+    #[test]
+    fn status_reads_a_session_gone_before_the_sweep_as_unavailable() {
+        let table = " 10 1 100\n 20 10 2000\n 21 20 300\n";
+        let (sessions, roots) = status_trees(
+            table,
+            &[(sref("gone"), 555), (sref("live"), 20)],
+            &[556, 20],
+        );
+        assert!(sessions[0].tree.is_none(), "{:?}", sessions[0]);
+        let live = sessions[1].tree.expect("live session measured");
+        assert_eq!((live.rss_bytes, live.procs), (2300 * 1024, 2));
+        assert_eq!(roots, [None, Some(2300 * 1024)]);
     }
 
     #[test]

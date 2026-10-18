@@ -3,12 +3,13 @@ use crate::entities::{
     Todo, TodoOwner, Workspace, Worktree,
 };
 use crate::ids::{AgentId, LinkId, NoteId, ProjectId, TerminalId, TodoId, WorkspaceId, WorktreeId};
+use crate::mem::MachineMemory;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 30;
+pub const PROTOCOL_VERSION: u32 = 31;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -439,6 +440,59 @@ pub enum ClientRequest {
         reserved_bytes: u64,
         command: String,
     },
+    /// One look at this machine's memory and heavy queue, answered by
+    /// `ServerEvent::HeavyStatus`. Admits, releases and reorders nothing.
+    HeavyStatus,
+}
+
+/// What `heavy status` shows.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeavySnapshot {
+    pub memory: Result<MachineMemory, String>,
+    pub budget_bytes: u64,
+    pub floor_bytes: u64,
+    pub sessions: Result<Vec<HeavySession>, String>,
+    /// In admission order.
+    pub running: Vec<RunningLease>,
+    /// The one FIFO queue commands and sessions share, head first.
+    pub queued: Vec<Waiting>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeavySession {
+    pub session: SessionRef,
+    pub pid: u32,
+    /// None: the session's root had exited by the `ps` sweep.
+    pub tree: Option<ProcessTree>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ProcessTree {
+    pub rss_bytes: u64,
+    pub procs: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HeavyLease {
+    pub lease: u64,
+    /// The wrapper's, the root of the command's process tree.
+    pub pid: Option<u32>,
+    /// None: counted at startup without a known size.
+    pub reserved_bytes: Option<u64>,
+    pub command: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunningLease {
+    pub lease: HeavyLease,
+    /// The whole tree's RSS now; None when it could not be read.
+    pub rss_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Waiting {
+    Command(HeavyLease),
+    Session { agent: AgentId, reserved_bytes: u64 },
 }
 
 /// Why the head of the heavy queue waits.
@@ -598,4 +652,7 @@ pub enum ServerEvent {
         budget_bytes: u64,
     },
     HeavyRunningRefused,
+    HeavyStatus {
+        snapshot: HeavySnapshot,
+    },
 }

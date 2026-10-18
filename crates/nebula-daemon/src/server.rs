@@ -291,6 +291,15 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 ClientRequest::HeavyRunning { reserved_bytes, command } => {
                     lease = Some(daemon.heavy.running(reserved_bytes, command, heavy_link()));
                 }
+                ClientRequest::HeavyStatus => {
+                    let daemon = daemon.clone();
+                    let out_tx = out_tx.clone();
+                    tokio::spawn(async move {
+                        if let Some(snapshot) = daemon.heavy.status(daemon.session_pids()).await {
+                            let _ = out_tx.send(ServerEvent::HeavyStatus { snapshot }).await;
+                        }
+                    });
+                }
                 ClientRequest::SaveUiState { json } => {
                     let _ = daemon.store.save_ui_state(&json);
                 }

@@ -127,6 +127,16 @@ impl Dispatcher {
         self.observe_rss(&to, rss_bytes);
     }
 
+    /// In admission order.
+    pub fn running(&self) -> impl Iterator<Item = &Consumer> {
+        self.running.iter().map(|r| &r.consumer)
+    }
+
+    /// Head first, with each reservation.
+    pub fn queued(&self) -> impl Iterator<Item = (&Consumer, u64)> {
+        self.queue.iter().map(|(c, bytes)| (c, *bytes))
+    }
+
     /// Queue positions are zero-based.
     pub fn standing(&self, consumer: &Consumer) -> Option<Standing> {
         if self.running.iter().any(|r| &r.consumer == consumer) {
@@ -232,7 +242,9 @@ mod tests {
 
     fn linux(available_gib: u64, psi: f64) -> Result<MachineMemory, ProbeError> {
         Ok(MachineMemory::Linux {
+            total_bytes: 64 * GIB,
             available_bytes: available_gib * GIB,
+            swap_total_bytes: 0,
             swap_free_bytes: 0,
             psi_some_avg10: psi,
         })
@@ -241,6 +253,7 @@ mod tests {
     fn macos(swap_free_gib: u64, pressure: VmPressureLevel) -> Result<MachineMemory, ProbeError> {
         Ok(MachineMemory::Macos {
             total_bytes: 32 * GIB,
+            swap_total_bytes: 8 * GIB,
             swap_free_bytes: swap_free_gib * GIB,
             pressure,
         })

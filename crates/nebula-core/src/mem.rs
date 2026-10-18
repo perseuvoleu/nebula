@@ -2,6 +2,8 @@
 //! shell out (macOS has no /proc) and only run on the metrics modal's slow
 //! poll, never on a hot path.
 
+use serde::{Deserialize, Serialize};
+
 /// Resident set size of one process, bytes.
 pub fn process_rss_bytes(pid: u32) -> Option<u64> {
     let out = std::process::Command::new("ps")
@@ -34,22 +36,25 @@ pub fn system_total_bytes() -> Option<u64> {
 /// One reading of how much room the machine has, in the signals each
 /// platform actually exposes: Linux has `MemAvailable` and PSI, macOS has
 /// only the kernel's pressure level.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum MachineMemory {
     Linux {
+        total_bytes: u64,
         available_bytes: u64,
+        swap_total_bytes: u64,
         swap_free_bytes: u64,
         psi_some_avg10: f64,
     },
     Macos {
         total_bytes: u64,
+        swap_total_bytes: u64,
         swap_free_bytes: u64,
         pressure: VmPressureLevel,
     },
 }
 
 /// `kern.memorystatus_vm_pressure_level`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VmPressureLevel {
     Normal,
     Warn,
@@ -60,6 +65,15 @@ pub enum VmPressureLevel {
 pub enum ProbeError {
     Unreadable(String),
     Malformed(&'static str),
+}
+
+impl std::fmt::Display for ProbeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProbeError::Unreadable(why) => f.write_str(why),
+            ProbeError::Malformed(field) => write!(f, "malformed {field}"),
+        }
+    }
 }
 
 /// Read this machine's memory signals. Blocking (file reads or `sysctl`).
@@ -110,6 +124,8 @@ pub fn parse_linux(meminfo: &str, psi: &str) -> Result<MachineMemory, ProbeError
     Ok(MachineMemory::Linux {
         available_bytes: kb("MemAvailable")?,
         swap_free_bytes: kb("SwapFree")?,
+        total_bytes: kb("MemTotal")?,
+        swap_total_bytes: kb("SwapTotal")?,
         psi_some_avg10,
     })
 }
@@ -128,13 +144,22 @@ pub fn parse_macos_sysctl(text: &str) -> Result<MachineMemory, ProbeError> {
         .next()
         .and_then(|l| l.parse().ok())
         .ok_or(ProbeError::Malformed("hw.memsize"))?;
-    let swap_free_bytes = lines
-        .next()
-        .and_then(|l| l.split("free = ").nth(1)?.split_whitespace().next())
-        .and_then(parse_sysctl_size)
-        .ok_or(ProbeError::Malformed("vm.swapusage"))?;
+    let swap = lines.next().unwrap_or_default();
+    let swap_field = |name: &str| {
+        swap.split(name)
+            .nth(1)?
+            .split_whitespace()
+            .next()
+            .and_then(parse_sysctl_size)
+    };
+    let (Some(swap_total_bytes), Some(swap_free_bytes)) =
+        (swap_field("total = "), swap_field("free = "))
+    else {
+        return Err(ProbeError::Malformed("vm.swapusage"));
+    };
     Ok(MachineMemory::Macos {
         total_bytes,
+        swap_total_bytes,
         swap_free_bytes,
         pressure,
     })
@@ -174,7 +199,9 @@ full avg10=3.00 avg60=0.01 avg300=0.00 total=1604359218
         assert_eq!(
             parse_linux(MEMINFO, PSI),
             Ok(MachineMemory::Linux {
+                total_bytes: 16382172 * 1024,
                 available_bytes: 7479388 * 1024,
+                swap_total_bytes: 6291452 * 1024,
                 swap_free_bytes: 528812 * 1024,
                 psi_some_avg10: 12.5,
             })
@@ -183,28 +210,54 @@ full avg10=3.00 avg60=0.01 avg300=0.00 total=1604359218
 
     #[test]
     fn linux_rejects_missing_or_malformed_fields() {
+        let edit = |line: &str, by: &str| MEMINFO.replace(line, by);
         let cases = [
-            ("MemTotal: 1 kB\nSwapFree: 2 kB\n", PSI, "MemAvailable"),
             (
-                "MemAvailable: lots kB\nSwapFree: 2 kB\n",
+                edit("MemAvailable:    7479388 kB\n", ""),
                 PSI,
                 "MemAvailable",
             ),
-            ("MemAvailable: 1 kB\n", PSI, "SwapFree"),
-            (MEMINFO, "", "psi some avg10"),
-            (MEMINFO, "some avg10=high avg60=0.00\n", "psi some avg10"),
-            (MEMINFO, "full avg10=0.00 avg60=0.00\n", "psi some avg10"),
-            (MEMINFO, "some avg10=NaN avg60=0.00\n", "psi some avg10"),
-            (MEMINFO, "some avg10=inf avg60=0.00\n", "psi some avg10"),
             (
-                "MemAvailable: 18014398509481984 kB\nSwapFree: 0 kB\n",
+                edit("MemAvailable:    7479388 kB", "MemAvailable: lots kB"),
                 PSI,
                 "MemAvailable",
+            ),
+            (
+                edit(
+                    "MemAvailable:    7479388 kB",
+                    "MemAvailable: 18014398509481984 kB",
+                ),
+                PSI,
+                "MemAvailable",
+            ),
+            (edit("SwapFree:         528812 kB\n", ""), PSI, "SwapFree"),
+            (edit("MemTotal:       16382172 kB\n", ""), PSI, "MemTotal"),
+            (edit("SwapTotal:       6291452 kB\n", ""), PSI, "SwapTotal"),
+            (MEMINFO.to_string(), "", "psi some avg10"),
+            (
+                MEMINFO.to_string(),
+                "some avg10=high avg60=0.00\n",
+                "psi some avg10",
+            ),
+            (
+                MEMINFO.to_string(),
+                "full avg10=0.00 avg60=0.00\n",
+                "psi some avg10",
+            ),
+            (
+                MEMINFO.to_string(),
+                "some avg10=NaN avg60=0.00\n",
+                "psi some avg10",
+            ),
+            (
+                MEMINFO.to_string(),
+                "some avg10=inf avg60=0.00\n",
+                "psi some avg10",
             ),
         ];
         for (meminfo, psi, field) in cases {
             assert_eq!(
-                parse_linux(meminfo, psi),
+                parse_linux(&meminfo, psi),
                 Err(ProbeError::Malformed(field)),
                 "meminfo={meminfo:?} psi={psi:?}"
             );
@@ -219,6 +272,7 @@ full avg10=3.00 avg60=0.01 avg300=0.00 total=1604359218
             parse_macos_sysctl(text),
             Ok(MachineMemory::Macos {
                 total_bytes: 16 * GIB,
+                swap_total_bytes: 20 * GIB,
                 swap_free_bytes: 1680 * 1024 * 1024,
                 pressure: VmPressureLevel::Normal,
             })
@@ -239,6 +293,8 @@ full avg10=3.00 avg60=0.01 avg300=0.00 total=1604359218
     #[test]
     fn macos_rejects_unknown_level_and_malformed_lines() {
         let swap = "total = 0.00M  used = 0.00M  free = 1.00M";
+        let with_free =
+            |free: &str| format!("1\n17179869184\ntotal = 1.00M  used = 0.00M  free = {free}\n");
         let cases = [
             (format!("3\n17179869184\n{swap}\n"), "vm_pressure_level"),
             (format!("\n17179869184\n{swap}\n"), "vm_pressure_level"),
@@ -249,9 +305,15 @@ full avg10=3.00 avg60=0.01 avg300=0.00 total=1604359218
                 "vm.swapusage",
             ),
             ("".to_string(), "vm_pressure_level"),
-            ("1\n17179869184\nfree = infM\n".to_string(), "vm.swapusage"),
-            ("1\n17179869184\nfree = NaNM\n".to_string(), "vm.swapusage"),
-            ("1\n17179869184\nfree = 1é\n".to_string(), "vm.swapusage"),
+            (
+                "1\n17179869184\nused = 0.00M  free = 1.00M\n".to_string(),
+                "vm.swapusage",
+            ),
+            (with_free("infM"), "vm.swapusage"),
+            (with_free("NaNM"), "vm.swapusage"),
+            (with_free("-1.00M"), "vm.swapusage"),
+            (with_free("1e20G"), "vm.swapusage"),
+            (with_free("1é"), "vm.swapusage"),
         ];
         for (text, field) in cases {
             assert_eq!(
