@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 29;
+pub const PROTOCOL_VERSION: u32 = 30;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -419,6 +419,35 @@ pub enum ClientRequest {
     },
 
     Shutdown,
+
+    /// Ask for room to run a heavy command. The connection then belongs to
+    /// the lease: `HeavyQueued` updates stream while it waits, `HeavyGranted`
+    /// admits it, and closing the connection, however the client dies,
+    /// frees it. Once granted, the sender's own process tree counts against
+    /// the lease when its RSS outgrows the reservation.
+    HeavyLease {
+        /// None takes the daemon's configured command reservation.
+        reserve_bytes: Option<u64>,
+        command: String,
+    },
+    /// Re-attach a wrapper whose command already runs, granted by a daemon
+    /// that has since restarted. Admitted at once, never queued, so the
+    /// command is not run twice; answered by `HeavyGranted`, or by
+    /// `HeavyRunningRefused` unless this daemon counted the sender as a
+    /// marked wrapper when it started.
+    HeavyRunning {
+        reserved_bytes: u64,
+        command: String,
+    },
+}
+
+/// Why the head of the heavy queue waits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Blocked {
+    OverBudget,
+    LowMemory,
+    Pressure,
+    ProbeFailed,
 }
 
 /// How much of a pull request's conversation the user had already seen the
@@ -552,4 +581,21 @@ pub enum ServerEvent {
         rows: u16,
         text: String,
     },
+
+    /// The lease waits; sent whenever its place or the head's reason changes.
+    HeavyQueued {
+        /// 1 = next to be admitted.
+        position: u32,
+        blocked: Blocked,
+    },
+    HeavyGranted {
+        reserved_bytes: u64,
+    },
+    /// The reservation exceeds the whole budget, so it could never be
+    /// admitted; nothing was queued.
+    HeavyTooLarge {
+        reserved_bytes: u64,
+        budget_bytes: u64,
+    },
+    HeavyRunningRefused,
 }

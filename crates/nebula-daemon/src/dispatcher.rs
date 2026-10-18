@@ -7,6 +7,9 @@ use nebula_core::mem::{MachineMemory, ProbeError, VmPressureLevel};
 use nebula_core::AgentId;
 use std::collections::VecDeque;
 
+/// A reservation whose size is unknown: nothing is admitted beside it.
+pub const UNBOUNDED_BYTES: u64 = u64::MAX;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Limits {
     pub budget_bytes: u64,
@@ -23,14 +26,7 @@ pub enum Consumer {
     Session(AgentId),
 }
 
-/// Why the queue head waits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Blocked {
-    OverBudget,
-    LowMemory,
-    Pressure,
-    ProbeFailed,
-}
+use nebula_core::Blocked;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Standing {
@@ -86,6 +82,27 @@ impl Dispatcher {
         Standing::Queued(self.queue.len() - 1)
     }
 
+    pub fn set_limits(&mut self, limits: Limits) {
+        self.limits = limits;
+    }
+
+    pub fn has_queued(&self) -> bool {
+        !self.queue.is_empty()
+    }
+
+    /// Count a consumer that is already running, skipping the queue.
+    pub fn admit_running(&mut self, consumer: Consumer, reserved_bytes: u64) {
+        if self.standing(&consumer) == Some(Standing::Running) {
+            return;
+        }
+        self.queue.retain(|(c, _)| c != &consumer);
+        self.running.push(Running {
+            consumer,
+            reserved_bytes,
+            rss_bytes: 0,
+        });
+    }
+
     /// Drop a consumer, running or still queued.
     pub fn release(&mut self, consumer: &Consumer) {
         self.running.retain(|r| &r.consumer != consumer);
@@ -96,6 +113,18 @@ impl Dispatcher {
         if let Some(r) = self.running.iter_mut().find(|r| &r.consumer == consumer) {
             r.rss_bytes = rss_bytes;
         }
+    }
+
+    /// Move a running consumer to a new key, keeping its measured RSS.
+    pub fn rekey_running(&mut self, from: &Consumer, to: Consumer, reserved_bytes: u64) {
+        let rss_bytes = self
+            .running
+            .iter()
+            .find(|r| &r.consumer == from)
+            .map_or(0, |r| r.rss_bytes);
+        self.release(from);
+        self.admit_running(to.clone(), reserved_bytes);
+        self.observe_rss(&to, rss_bytes);
     }
 
     /// Queue positions are zero-based.
@@ -138,7 +167,12 @@ impl Dispatcher {
             .iter()
             .map(Running::held_bytes)
             .try_fold(reserved_bytes, u64::checked_add);
-        if held_after.is_none_or(|bytes| bytes > self.limits.budget_bytes) {
+        if self
+            .running
+            .iter()
+            .any(|r| r.reserved_bytes == UNBOUNDED_BYTES)
+            || held_after.is_none_or(|bytes| bytes > self.limits.budget_bytes)
+        {
             return Err(Blocked::OverBudget);
         }
         let unseen_reservations = self
@@ -530,6 +564,26 @@ mod tests {
                 head_blocked: Some(Blocked::LowMemory)
             },
             "floor plus request"
+        );
+    }
+
+    #[test]
+    fn an_unbounded_reservation_admits_nothing_beside_it() {
+        let mut d = Dispatcher::new(Limits {
+            budget_bytes: u64::MAX,
+            floor_bytes: 0,
+            ..LIMITS
+        });
+        d.admit_running(cmd(100), UNBOUNDED_BYTES);
+        d.observe_rss(&cmd(100), GIB);
+        d.enqueue(cmd(1), 0);
+        assert_eq!(
+            d.pump(&linux(64, 0.0)),
+            Pump {
+                admitted: vec![],
+                head_blocked: Some(Blocked::OverBudget)
+            },
+            "a zero-byte request under an unbounded budget"
         );
     }
 

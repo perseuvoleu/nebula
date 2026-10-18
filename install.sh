@@ -98,6 +98,7 @@ main() {
     say "installed $version → $installed"
 
     bin_dir=$(dirname "$installed")
+    ln -sf nebula "$bin_dir/heavy"
     case ":$PATH:" in
     *":$bin_dir:"*) ;;
     *) say "note: $bin_dir is not on your PATH — add: export PATH=\"$bin_dir:\$PATH\"" ;;

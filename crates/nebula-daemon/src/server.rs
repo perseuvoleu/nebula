@@ -35,6 +35,11 @@ pub async fn accept_loop(daemon: Arc<Daemon>, listener: UnixListener) {
 }
 
 async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
+    let peer = stream
+        .peer_cred()
+        .ok()
+        .and_then(|cred| cred.pid())
+        .and_then(|pid| u32::try_from(pid).ok());
     let (read_half, write_half) = stream.into_split();
     let mut reader = tokio::io::BufReader::new(read_half);
 
@@ -81,6 +86,12 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
     // Per-connection attach state: forward-task handles keyed by session.
     let mut attached: HashMap<SessionRef, tokio::task::JoinHandle<()>> = HashMap::new();
     let mut handshaken = false;
+    let mut lease: Option<crate::heavy::Lease> = None;
+    let heavy_link = || crate::heavy::Link {
+        events: out_tx.clone(),
+        closed: closed.clone(),
+        peer_pid: peer,
+    };
 
     let result: Result<()> = tokio::select! {
         _ = closed.cancelled() => Ok(()),
@@ -273,6 +284,12 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     tracing::info!("shutdown requested by client");
                     daemon.shutdown.cancel();
                     break;
+                }
+                ClientRequest::HeavyLease { reserve_bytes, command } => {
+                    lease = Some(daemon.heavy.request(reserve_bytes, command, heavy_link()));
+                }
+                ClientRequest::HeavyRunning { reserved_bytes, command } => {
+                    lease = Some(daemon.heavy.running(reserved_bytes, command, heavy_link()));
                 }
                 ClientRequest::SaveUiState { json } => {
                     let _ = daemon.store.save_ui_state(&json);
@@ -708,6 +725,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
         h.abort();
         daemon.note_detached(&sref);
     }
+    drop(lease);
     finished.cancel();
     drop(relay_client);
     drop(out_tx);

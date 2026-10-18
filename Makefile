@@ -27,12 +27,14 @@ build-novt:
 install: build
 	cp $(BIN) $(PREFIX)/nebula.new
 	mv $(PREFIX)/nebula.new $(PREFIX)/nebula
+	ln -sf nebula $(PREFIX)/heavy
 	@$(PREFIX)/nebula --version
 	@$(PREFIX)/nebula _stale-daemon-note
 
 install-novt: build-novt
 	cp $(BIN) $(PREFIX)/nebula.new
 	mv $(PREFIX)/nebula.new $(PREFIX)/nebula
+	ln -sf nebula $(PREFIX)/heavy
 	@$(PREFIX)/nebula --version
 
 # Stops every active session — run only when you're ready to cut over.

@@ -2,6 +2,7 @@ pub mod config;
 mod collect;
 pub mod dispatcher;
 pub mod git;
+pub mod heavy;
 pub mod hooks;
 pub mod lifecycle;
 pub mod metrics;
@@ -63,6 +64,7 @@ async fn serve() -> Result<()> {
     tracing::info!(port = hook_env.port, "hook receiver listening");
 
     let daemon = registry::Daemon::new(store, hook_env);
+    daemon.heavy.spawn(daemon.shutdown.clone());
     daemon.refresh_remote_hosts();
     daemon.ensure_relays();
 

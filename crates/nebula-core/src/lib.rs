@@ -2,6 +2,7 @@ pub mod codec;
 pub mod crashlog;
 pub mod entities;
 pub mod envfiles;
+pub mod heavy;
 pub mod host;
 pub mod ids;
 pub mod mem;

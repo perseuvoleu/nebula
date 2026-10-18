@@ -121,13 +121,28 @@ pub(crate) async fn handshake(mut stream: UnixStream) -> Result<Connection> {
         Some(ServerEvent::HelloOk { daemon_pid, .. }) => Ok(Connection { stream, daemon_pid }),
         Some(ServerEvent::Incompatible {
             daemon_protocol_version,
-        }) => bail!(
-            "daemon speaks protocol v{daemon_protocol_version}, this client v{PROTOCOL_VERSION} — \
-             run `nebula kill` and relaunch"
-        ),
+        }) => Err(Incompatible(daemon_protocol_version).into()),
         other => bail!("unexpected handshake reply: {other:?}"),
     }
 }
+
+/// The daemon on the socket speaks another protocol version; retrying will
+/// not change that.
+#[derive(Debug)]
+pub(crate) struct Incompatible(pub u32);
+
+impl std::fmt::Display for Incompatible {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "daemon speaks protocol v{}, this client v{PROTOCOL_VERSION} — \
+             run `nebula kill` and relaunch",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for Incompatible {}
 
 /// Channel-based IPC handle for the TUI event loop: outbound requests go
 /// through `tx`; inbound events arrive on `rx`. Reader/writer tasks own the

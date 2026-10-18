@@ -3,33 +3,47 @@
 //! fans out into node workers, shells, MCP servers — the user cares about the
 //! whole tree, not just the root).
 
+use nebula_core::mem::ProbeError;
 use nebula_core::{MetricsSnapshot, SessionMetrics, SessionRef};
 use std::collections::{HashMap, HashSet};
 
 /// Take one reading. Blocking (shells out to `ps`); call via spawn_blocking.
 pub fn collect(sessions: Vec<(SessionRef, u32)>) -> MetricsSnapshot {
-    let table = std::process::Command::new("ps")
-        .args(["-axo", "pid=,ppid=,rss="])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .unwrap_or_default();
     snapshot_from_table(
-        &table,
+        &ps_table().unwrap_or_default(),
         std::process::id(),
         &sessions,
         nebula_core::mem::system_total_bytes().unwrap_or(0),
     )
 }
 
-/// Pure core, unit-testable: `table` is `ps -axo pid=,ppid=,rss=` output
-/// (one process per line, rss in KB).
-fn snapshot_from_table(
-    table: &str,
-    daemon_pid: u32,
-    sessions: &[(SessionRef, u32)],
-    system_total_bytes: u64,
-) -> MetricsSnapshot {
+/// RSS of each root's whole process tree, in `roots` order; None for a
+/// root that is gone. Blocking.
+pub fn tree_rss(roots: &[u32]) -> Result<Vec<Option<u64>>, ProbeError> {
+    let (rss, children) = parse_table(&ps_table()?);
+    Ok(roots
+        .iter()
+        .map(|&root| {
+            rss.contains_key(&root)
+                .then(|| subtree_rss(root, &rss, &children).0)
+        })
+        .collect())
+}
+
+fn ps_table() -> Result<String, ProbeError> {
+    let out = std::process::Command::new("ps")
+        .args(["-axo", "pid=,ppid=,rss="])
+        .output()
+        .map_err(|e| ProbeError::Unreadable(format!("ps: {e}")))?;
+    if !out.status.success() {
+        return Err(ProbeError::Unreadable(format!("ps: {}", out.status)));
+    }
+    String::from_utf8(out.stdout).map_err(|_| ProbeError::Malformed("ps output is not UTF-8"))
+}
+
+/// `table` is `ps -axo pid=,ppid=,rss=` output (one process per line, rss
+/// in KB), read into RSS bytes per pid and children per parent.
+fn parse_table(table: &str) -> (HashMap<u32, u64>, HashMap<u32, Vec<u32>>) {
     let mut rss: HashMap<u32, u64> = HashMap::new();
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
     for line in table.lines() {
@@ -44,7 +58,16 @@ fn snapshot_from_table(
         rss.insert(pid, kb * 1024);
         children.entry(ppid).or_default().push(pid);
     }
+    (rss, children)
+}
 
+fn snapshot_from_table(
+    table: &str,
+    daemon_pid: u32,
+    sessions: &[(SessionRef, u32)],
+    system_total_bytes: u64,
+) -> MetricsSnapshot {
+    let (rss, children) = parse_table(table);
     let sessions = sessions
         .iter()
         .map(|(sref, pid)| {

@@ -13,6 +13,7 @@ pub mod fuzzy;
 pub mod ghostty_pane;
 pub mod git_diff;
 pub mod grep_search;
+pub mod heavy_cli;
 pub mod hosts;
 mod html_prototype;
 mod html_viewer;
@@ -267,6 +268,12 @@ pub fn run_kill() -> Result<()> {
         }
         Ok(())
     })
+}
+
+/// `heavy` / `nebula heavy`: never returns; the process ends as the command did.
+pub fn run_heavy(opts: heavy_cli::HeavyOpts) -> Result<std::convert::Infallible> {
+    heavy_cli::mark_or_run_nested(&opts);
+    runtime()?.block_on(heavy_cli::run(opts))
 }
 
 /// Collect a remote branch or worktree into a safe local destination.

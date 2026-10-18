@@ -5833,19 +5833,19 @@ async fn mobile_safe_removal_preserves_dirty_unmerged_occupied_and_protected_che
 
 /// Use literal peer versions so a simultaneous client/server constant change cannot mask a mismatch.
 #[tokio::test]
-async fn protocol29_handshake_accepts_repeated_probes_and_rejects_protocol28() {
+async fn protocol30_handshake_accepts_repeated_probes_and_rejects_protocol29() {
     let env = TestEnv::new();
     let _daemon = MobileFixtureDaemon(env.spawn_daemon());
     let mut c = connect(&env.sock()).await;
     for _ in 0..2 {
-        write_frame(&mut c, &ClientRequest::Hello { protocol_version: 29 }).await.unwrap();
+        write_frame(&mut c, &ClientRequest::Hello { protocol_version: 30 }).await.unwrap();
         let reply = tokio::time::timeout(Duration::from_secs(3), read_frame::<ServerEvent, _>(&mut c)).await.unwrap().unwrap();
-        assert!(matches!(reply, Some(ServerEvent::HelloOk { protocol_version: 29, .. })), "{reply:?}");
+        assert!(matches!(reply, Some(ServerEvent::HelloOk { protocol_version: 30, .. })), "{reply:?}");
     }
     let mut old = connect(&env.sock()).await;
-    write_frame(&mut old, &ClientRequest::Hello { protocol_version: 28 }).await.unwrap();
+    write_frame(&mut old, &ClientRequest::Hello { protocol_version: 29 }).await.unwrap();
     let reply = tokio::time::timeout(Duration::from_secs(3), read_frame::<ServerEvent, _>(&mut old)).await.unwrap().unwrap();
-    assert!(matches!(reply, Some(ServerEvent::Incompatible { daemon_protocol_version: 29 })), "{reply:?}");
+    assert!(matches!(reply, Some(ServerEvent::Incompatible { daemon_protocol_version: 30 })), "{reply:?}");
 }
 
 /// A fake agent CLI that records every byte its PTY hands it. `raw` picks

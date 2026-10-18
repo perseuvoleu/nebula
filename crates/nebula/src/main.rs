@@ -118,6 +118,21 @@ enum Command {
         #[command(subcommand)]
         command: AgentCommand,
     },
+    /// Run a memory-heavy command once this machine's daemon has room for
+    /// it, waiting in a FIFO queue until then. The command keeps this
+    /// terminal, its stdio and its exit status; one `heavy: waited …` line
+    /// follows on stderr. Also installed as `heavy`. With no daemon to ask,
+    /// it warns and runs the command at once.
+    Heavy {
+        /// GiB to reserve (default: the daemon's configured reservation).
+        #[arg(value_parser = nebula_tui::heavy_cli::parse_gib)]
+        gb: Option<u64>,
+        /// Run on this machine, the only placement there is so far.
+        #[arg(long)]
+        here: bool,
+        #[arg(last = true, required = true, value_name = "CMD")]
+        command: Vec<std::ffi::OsString>,
+    },
     /// Diagrams for this checkout: self-contained HTML pages in
     /// `.scratch/diagrams/`, shown inside the TUI with ⌘X. Agents create
     /// them with `new`, edit the file, then `open` it for the user.
@@ -630,8 +645,22 @@ enum WorkspaceCommand {
     Rename { name: String, new_name: String },
 }
 
+/// Runs before Rust's runtime replaces an inherited SIGPIPE disposition.
+#[used]
+#[cfg_attr(target_os = "linux", link_section = ".init_array")]
+#[cfg_attr(target_os = "macos", link_section = "__DATA,__mod_init_func")]
+static NOTE_INHERITED_SIGPIPE: extern "C" fn() = nebula_tui::heavy_cli::note_inherited_sigpipe;
+
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let mut args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if args
+        .first()
+        .and_then(|argv0| std::path::Path::new(argv0).file_name())
+        .is_some_and(|name| name == "heavy")
+    {
+        args.splice(..1, ["nebula".into(), "heavy".into()]);
+    }
+    let cli = Cli::parse_from(args);
     match cli.command {
         Some(Command::Daemon { foreground }) => {
             init_daemon_logging(foreground)?;
@@ -825,6 +854,14 @@ fn main() -> Result<()> {
             };
             nebula_tui::run_todo(op)
         }
+        Some(Command::Heavy {
+            gb,
+            here: _,
+            command,
+        }) => match nebula_tui::run_heavy(nebula_tui::heavy_cli::HeavyOpts {
+            reserve_bytes: gb,
+            command,
+        })? {},
         Some(Command::Kill) => nebula_tui::run_kill(),
         Some(Command::Rename { title, force }) => nebula_tui::run_rename(title.join(" "), force),
         Some(Command::Remote { host, command }) => nebula_tui::run_remote(

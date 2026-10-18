@@ -111,6 +111,7 @@ pub struct Daemon {
     /// daemon's tree for those projects and forwards our clients' requests
     /// to it (see `relay.rs`).
     relays: Mutex<HashMap<String, Arc<crate::relay::Relay>>>,
+    pub heavy: crate::heavy::Desk,
 }
 
 impl Daemon {
@@ -153,6 +154,7 @@ impl Daemon {
             session_interest: Mutex::new(HashMap::new()),
             last_cwd: Mutex::new(HashMap::new()),
             relays: Mutex::new(HashMap::new()),
+            heavy: crate::heavy::Desk::default(),
         })
     }
 
