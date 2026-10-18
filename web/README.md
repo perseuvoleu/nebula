@@ -10,6 +10,11 @@ Radix, the AI Elements conversation primitive), Python 3.10+ standard-library ga
 - Persistent weekly Codex and Claude account quota navbar on every authenticated screen.
   Tap for reset/freshness/errors; unavailable and stale values are explicit. Sources, caching,
   limitations and private preview instructions: [Weekly account quotas](USAGE.md).
+- **Rulări serverless** (`/serverless`, link in the sidebar): build/test runs on Cloudflare
+  Containers — repo, ref, status, cache, instance, start, duration (live while running), upper-bound
+  cost; tap a row for its steps. Polled every 5 s while visible. The gateway reads the Worker's
+  `/runs` with `NEBULA_SERVERLESS_URL` and `NEBULA_SERVERLESS_TOKEN` (the token never reaches the
+  browser); without both, the section says it is not configured.
 
 - Explicitly enabled projects (`NEBULA_WEB_PROJECTS`), active sessions with kind, checkout,
   status and feedback requests, existing checkouts, local search.
