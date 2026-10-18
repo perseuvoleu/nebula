@@ -1,4 +1,4 @@
-// Selection ↔ URL: /p/<project>/s/<session id>. Non-secret identifiers only.
+// Selection ↔ URL: /p/<project>/s/<session id> or /serverless. Non-secret identifiers only.
 import { useCallback, useEffect, useState } from "react";
 
 export interface Selection {
@@ -7,6 +7,8 @@ export interface Selection {
   session: string | null;
   /** Keep the aggregate list context when opening a real project session. */
   all: boolean;
+  /** The serverless runs section; overrides project and session in the URL. */
+  serverless?: boolean;
 }
 
 const PATTERN = /^\/(?:p\/([A-Za-z0-9._@-]{1,80})(?:\/s\/([A-Za-z0-9._-]{1,80}))?)?\/?$/;
@@ -14,6 +16,7 @@ const PATTERN = /^\/(?:p\/([A-Za-z0-9._@-]{1,80})(?:\/s\/([A-Za-z0-9._-]{1,80}))
 /** Decode a list or conversation route, including its aggregate list context. */
 export function parseSelection(path: string): Selection {
   const [pathname, query] = path.split("?");
+  if (/^\/serverless\/?$/.test(pathname)) return { project: null, session: null, all: false, serverless: true };
   const match = PATTERN.exec(pathname);
   return { project: match?.[1] ?? null, session: match?.[2] ?? null,
     all: new URLSearchParams(query).get("view") === "all" };
@@ -21,6 +24,7 @@ export function parseSelection(path: string): Selection {
 
 /** Encode real session identity separately from the virtual All filter. */
 export function selectionPath(selection: Selection): string {
+  if (selection.serverless) return "/serverless";
   if (selection.all && !selection.session) return "/?view=all";
   if (!selection.project) return "/";
   return `/p/${encodeURIComponent(selection.project)}${selection.session ? `/s/${encodeURIComponent(selection.session)}` : ""}${selection.all ? "?view=all" : ""}`;

@@ -12,3 +12,10 @@ test("All is a virtual list route; opening preserves real project identity and a
   }
   assert.deepEqual(parseSelection("/p/alpha/s/same"), { project: "alpha", session: "same", all: false });
 });
+
+test("/serverless is its own section and does not shadow project or session routes", () => {
+  assert.deepEqual(parseSelection("/serverless"), { project: null, session: null, all: false, serverless: true });
+  assert.equal(selectionPath({ project: "alpha", session: "one", all: true, serverless: true }), "/serverless");
+  assert.deepEqual(parseSelection("/p/serverless/s/one"), { project: "serverless", session: "one", all: false });
+  assert.deepEqual(parseSelection("/serverless/x"), { project: null, session: null, all: false });
+});

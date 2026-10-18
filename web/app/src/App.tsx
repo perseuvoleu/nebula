@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { ExternalLinkIcon, LogOutIcon, MenuIcon } from "lucide-react";
+import { CloudIcon, ExternalLinkIcon, LogOutIcon, MenuIcon } from "lucide-react";
 import { api, ApiError, describeError, getToken, onAuthChange, setToken } from "@/lib/api";
 import { useConversation } from "@/lib/conversation";
 import { fetchSessionList } from "@/lib/session-fetch";
@@ -19,6 +19,7 @@ import { CheckoutPanel } from "./components/CheckoutPanel";
 import { InstallApp } from "./components/InstallApp";
 import { UsageNavbar } from "./components/UsageNavbar";
 import { PushNotifications } from "./components/PushNotifications";
+import { ServerlessRuns } from "./components/ServerlessRuns";
 
 interface Workspace { projects: string[]; host: string }
 
@@ -170,12 +171,13 @@ function Shell({ workspace }: { workspace: Workspace }) {
 
   // Normalise the URL to a valid project once the allowlist is known.
   useEffect(() => {
+    if (selection.serverless) return;
     if (selection.project && !workspace.projects.includes(selection.project)) {
       navigate({ project: selection.all ? null : project, session: null, all: selection.all }, true);
     } else if (!selection.all && selection.project !== project) {
       navigate({ project, session: selection.session, all: false }, true);
     }
-  }, [project, selection.project, selection.session, selection.all, workspace.projects, navigate]);
+  }, [project, selection.project, selection.session, selection.all, selection.serverless, workspace.projects, navigate]);
 
   const row = sessions.rows.find((r) => r.project === project && r.id === sessionId) ?? null;
   const currentPath = row?.path ?? (checkout?.project === project ? checkout.path : undefined);
@@ -223,6 +225,13 @@ function Shell({ workspace }: { workspace: Workspace }) {
     setChooseProject(true);
     document.querySelector<HTMLSelectElement>('select[aria-label="Proiect"]')?.focus();
   };
+  const openServerless = () => { navigate({ project: null, session: null, all: false, serverless: true }); setMenuOpen(false); };
+  const serverlessLink = (
+    <button type="button" onClick={openServerless} aria-current={selection.serverless ? "page" : undefined}
+      className={`flex min-h-11 items-center gap-2 border-t border-sidebar-border px-3 text-left text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${selection.serverless ? "bg-secondary font-medium" : "hover:bg-muted/60"}`}>
+      <CloudIcon aria-hidden className="size-4" />Rulări serverless
+    </button>
+  );
   const targetNotice = chooseProject && <p role="status" className="px-3 py-2 text-sm">Alege un proiect din selector pentru agentul nou.</p>;
 
   const sidebar = (
@@ -244,13 +253,15 @@ function Shell({ workspace }: { workspace: Workspace }) {
       {checkoutPanel}
       {created && <p role="status" className="border-b border-sidebar-border px-3 py-2 text-xs">Agent pornit ca „{created}”. Identitatea nu a putut fi confirmată încă: alege-l din listă.</p>}
       <SessionList sessions={orderedRows} phase={sessions.phase} error={sessions.error} selected={selectedKey} unseen={unseenFinished} onSelect={select} onNew={newAgent} project={selection.all ? "All" : project} showProject={selection.all} onDeleted={onDeleted} />
+      {serverlessLink}
       {desktop && <PushNotifications />}
       <InstallApp />
       <p className="border-t border-sidebar-border px-3 py-2 text-[11px] text-muted-foreground">Telefonul se poate deconecta. Agenții rămân pe server.</p>
     </aside>
   );
 
-  const conversation = sessionId && controller && state ? (
+  const closeServerless = () => navigate({ project, session: null, all: false });
+  const conversation = selection.serverless ? <ServerlessRuns onBack={desktop ? undefined : closeServerless} /> : sessionId && controller && state ? (
     <ConversationView key={`${project}/${sessionId}`} project={project} previewUrl={previewUrl} row={row} state={state} controller={controller} sessions={orderedRows} unseen={unseenFinished} onSelect={select} showProjects={selection.all} showBack={!desktop} onBack={() => navigate({ project, session: null, all: selection.all })} />
   ) : (
     <section className="flex min-h-0 flex-1 flex-col">
@@ -285,7 +296,7 @@ function Shell({ workspace }: { workspace: Workspace }) {
   }
   return (
     <>
-      {sessionId ? <main className="flex min-h-0 flex-1 flex-col">{conversation}</main> : (
+      {sessionId || selection.serverless ? <main className="flex min-h-0 flex-1 flex-col">{conversation}</main> : (
         <main className="flex min-h-0 flex-1 flex-col">
           <header className="flex min-h-14 items-center gap-2 border-b border-border px-3">
             <h1 className="text-[15px] font-semibold">Sesiuni</h1>
@@ -306,6 +317,7 @@ function Shell({ workspace }: { workspace: Workspace }) {
           {targetNotice}
           {checkoutPanel}
           <SessionList sessions={orderedRows} phase={sessions.phase} error={sessions.error} selected={selectedKey} unseen={unseenFinished} onSelect={select} onNew={newAgent} project={selection.all ? "All" : project} showProject={selection.all} onDeleted={onDeleted} />
+          {serverlessLink}
           <PushNotifications />
           <InstallApp />
         </main>
