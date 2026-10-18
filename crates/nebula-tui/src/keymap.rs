@@ -71,6 +71,8 @@ pub enum Action {
     SessionPalette,
     CommandPalette,
     NextAttention,
+    NextNeedsYou,
+    PrevNeedsYou,
     // projects & worktrees
     AddProject,
     New,
@@ -337,6 +339,24 @@ pub const ACTIONS: &[ActionSpec] = &[
         group: "NAVIGATE",
         scope: Scope::Global,
         defaults: &["space"],
+    },
+    ActionSpec {
+        action: Action::NextNeedsYou,
+        id: "next_needs_you",
+        label: "Next session needing you",
+        hint: "Select the next waiting session, then the running ones, across every project",
+        group: "NAVIGATE",
+        scope: Scope::Global,
+        defaults: &["]"],
+    },
+    ActionSpec {
+        action: Action::PrevNeedsYou,
+        id: "prev_needs_you",
+        label: "Previous session needing you",
+        hint: "Step back through the waiting, then running, sessions",
+        group: "NAVIGATE",
+        scope: Scope::Global,
+        defaults: &["["],
     },
     // ---- PROJECTS & WORKTREES ----
     ActionSpec {

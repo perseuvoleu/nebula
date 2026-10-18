@@ -184,18 +184,24 @@ remote twin refuses all four (`<branch> is a branch on <host> — open it there`
   platform equivalent): projects, worktrees, agents (with kind + CLI session
   ids), notes, links, workspaces, pins, and your last selection.
 - **Sessions warm up, then get reaped.** The daemon can pre-spawn an agent CLI
-  while you're still naming the session, and pre-boot a worktree's dead
-  sessions while your selection rests on it, so attaching lands on a booted
-  screen instead of a booting shell. To bound what that costs, idle PTYs in
-  worktrees no client is watching are killed after `session_idle_timeout` (5m
-  by default) — pinned agents, working agents, ones waiting on you, and
-  terminals with a command running are all spared, and a reaped agent revives
-  on the next attach with its conversation resumed.
+  while you're still naming the session, so creating one lands on a booted
+  screen instead of a booting shell. An existing session boots when you
+  attach it. To bound what that costs, idle PTYs no
+  client is attached to are killed after `session_idle_timeout` (5m by
+  default), even on the worktree you're looking at — pinned agents, working
+  agents, ones waiting on you, and terminals with a command running are all
+  spared, and a reaped agent revives on the next attach with its conversation
+  resumed. Turning `prewarm_agents` off drains the warm pool on the next sweep.
+- **Stale sessions archive themselves.** An unpinned agent that has sat
+  finished, fresh or disconnected longer than `auto_archive_after` (24h by
+  default, `off` disables) is archived on the daemon's 30 s tick, which also
+  ends its CLI. Pinned, working and waiting agents and any session a client
+  is attached to are spared; `A` still shows archived rows.
 - **Settings live in one JSON file** (`config.json`, beside the database), read
   fresh on each use by both the daemon and the TUI, so hand edits apply without
   a restart. `s` opens the settings overlay over the same file: color theme,
   animations, focused-panel tint, editor, default model and reasoning effort
-  per agent CLI, the idle timeout, and whether new sessions
+  per agent CLI, the idle timeout, auto-archive, and whether new sessions
   stop to ask for a name.
 - **Every panel key is rebindable.** The overlay's Hotkeys tab lists every
   action and what it answers to, and writes overrides into the same file
@@ -261,6 +267,7 @@ Defaults — every one of them is rebindable in Settings → Hotkeys (`s`).
 | Panels | `Ctrl+→` | cross into the terminal pane without attaching (plain `→` stops at Sessions) |
 | Panels | `Enter` | drill in; on a `(branch)` row: switch primary to that branch; on a session: attach (a session under a `(branch)` row switches primary first, then resumes) |
 | Any panel | `/` | fuzzy jump across every project, worktree and session (`Ctrl+n/p` move, `Ctrl+o` opens the hit, `Ctrl+f` just lands the selection on it) |
+| Any panel | `]` / `[` | select the next / previous session that needs you, across every project: those waiting on an answer first, then the running ones, each longest-in-that-state first, wrapping round; it previews without attaching. Project rows count them, e.g. `2▶ 1?` (2 running, 1 waiting) |
 | Projects | `n` / `d` | add project / remove from list |
 | Any panel | `o` | add ("open") a project — same prompt as `n`, from any focus |
 | Add project | type + `Tab`, `↓↑` / `→` / `←` | browse for the repo: type to filter (bash-style Tab completion), arrows pick a directory, `→` steps in, `←` steps up, `Enter` adds the highlighted (or typed) path; `●` marks git repos |

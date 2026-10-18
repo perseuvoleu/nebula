@@ -211,16 +211,10 @@ pub enum ClientRequest {
         model: Option<String>,
         effort: Option<String>,
     },
-    /// Fire-and-forget: pre-spawn every dead (non-archived) session under a
-    /// worktree so attaching later replays an already-booted screen instead
-    /// of watching a login shell + CLI boot. Sent once the worktree
-    /// selection has rested (debounced client-side); already-alive sessions
-    /// are untouched. No reply; a failed spawn degrades to today's lazy
-    /// spawn-on-attach.
+    /// Retired: the daemon ignores it. Kept so older clients still parse
+    /// against the same PROTOCOL_VERSION.
     PrewarmWorktreeSessions {
         worktree: WorktreeId,
-        /// Pane size the sessions boot at, so the later Attach resizes to
-        /// the same grid and full-screen apps need no reflow.
         cols: u16,
         rows: u16,
     },
@@ -378,8 +372,9 @@ pub enum ClientRequest {
     /// One plain-text reading of a live session's screen — scrollback tail
     /// included — rendered daemon-side at the session's current size, so
     /// nothing is attached, resized, or respawned by looking. Answered by
-    /// `ServerEvent::SessionText` (or Error when the PTY is not live).
-    /// `nebula agent read` is the caller.
+    /// `ServerEvent::SessionText`. With no live PTY it answers the screen
+    /// saved when the session stopped, headed by a not-running line, or an
+    /// Error when nothing was saved. `nebula agent read` is the caller.
     ReadSession {
         req_id: u64,
         session: SessionRef,
@@ -545,7 +540,8 @@ pub enum ServerEvent {
     },
 
     /// Reply to `ClientRequest::ReadSession`: the session's screen (and
-    /// scrollback tail) as plain text, plus the grid it was rendered at.
+    /// scrollback tail) as plain text, plus the grid it was rendered at
+    /// (0×0 for a stopped session's saved screen).
     SessionText {
         req_id: u64,
         cols: u16,

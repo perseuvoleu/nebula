@@ -88,6 +88,16 @@ pub fn tui_log_path() -> PathBuf {
     log_dir().join("tui.log")
 }
 
+/// Last screen of a session whose PTY stopped, as plain text, so
+/// `nebula agent read` still answers after a reap or exit.
+pub fn saved_screen_path(sref: &crate::SessionRef) -> PathBuf {
+    let name = match sref {
+        crate::SessionRef::Agent(id) => format!("agent-{}.txt", id.as_str()),
+        crate::SessionRef::Terminal(id) => format!("terminal-{}.txt", id.as_str()),
+    };
+    log_dir().join("screens").join(name)
+}
+
 /// Directory a nebula-made worktree for `branch` lives in:
 /// `<repo>/../<repo-name>-worktrees/<branch>` (slashes in branch → dashes).
 /// Shared by the daemon (which creates checkouts here) and the TUI (which

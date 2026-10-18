@@ -325,12 +325,20 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                             });
                         }
                         None => {
-                            let _ = out_tx
-                                .send(ServerEvent::Error {
+                            let path = nebula_core::paths::saved_screen_path(&session);
+                            let event = match std::fs::read_to_string(path) {
+                                Ok(saved) => ServerEvent::SessionText {
+                                    req_id,
+                                    cols: 0,
+                                    rows: 0,
+                                    text: stale_screen_text(&saved, lines),
+                                },
+                                Err(_) => ServerEvent::Error {
                                     req_id: Some(req_id),
                                     message: "session is not running — nothing to read".into(),
-                                })
-                                .await;
+                                },
+                            };
+                            let _ = out_tx.send(event).await;
                         }
                     }
                 }
@@ -538,18 +546,10 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         }
                     });
                 }
-                ClientRequest::PrewarmWorktreeSessions {
-                    worktree,
-                    cols,
-                    rows,
-                } => {
-                    // Deliberately inline: an Attach for one of these
-                    // sessions is then ordered after it instead of racing it
-                    // (two concurrent ensure_session calls for the same sref
-                    // would double-spawn). Spawns are forkpty-fast; the
-                    // children boot in the background.
-                    daemon.prewarm_worktree_sessions(&worktree, cols, rows);
-                }
+                // Retired: booting a worktree's every session on selection
+                // caused spawn storms. Still accepted so older clients keep
+                // the same PROTOCOL_VERSION.
+                ClientRequest::PrewarmWorktreeSessions { .. } => {}
                 ClientRequest::RenameAgent { req_id, id, name } => {
                     reply(
                         &out_tx,
@@ -820,4 +820,18 @@ async fn reply(
         },
     };
     let _ = out_tx.send(ev).await;
+}
+
+/// A stopped session's saved screen, tailed to `lines` and headed by a
+/// line saying it is not live, so a reader never mistakes it for now.
+fn stale_screen_text(saved: &str, lines: Option<usize>) -> String {
+    let body: Vec<&str> = saved.lines().collect();
+    let keep = lines.map_or(body.len(), |n| n.min(body.len()));
+    let mut text =
+        String::from("[nebula] session not running — last screen saved when it stopped:");
+    for line in &body[body.len() - keep..] {
+        text.push('\n');
+        text.push_str(line);
+    }
+    text
 }

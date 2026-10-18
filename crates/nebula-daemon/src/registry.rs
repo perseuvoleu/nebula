@@ -31,6 +31,9 @@ const PREWARM_RECYCLE_AGE: Duration = Duration::from_secs(10 * 60);
 /// Hook events buffered on a warm session before its row exists (oldest
 /// dropped beyond this).
 const PREWARM_HOOK_BUFFER_CAP: usize = 64;
+/// Lines (scrollback tail plus screen) kept when a stopped session's
+/// screen is saved for `ReadSession`.
+const SAVED_SCREEN_LINES: usize = 200;
 
 /// A pre-spawned agent CLI waiting to be adopted by the next CreateAgent for
 /// the same (worktree, kind). The PTY lives in the normal sessions map under
@@ -95,12 +98,12 @@ pub struct Daemon {
     /// re-probed (login shell spawn) on every prewarm request.
     cli_probes: Mutex<HashMap<AgentKind, (bool, Instant)>>,
     /// How many client connections are attached per session — a session
-    /// with attachments (and its whole worktree) is "in view" and exempt
-    /// from idle reaping.
+    /// with attachments is "in view" and exempt from idle reaping.
     attach_counts: Mutex<HashMap<SessionRef, usize>>,
     /// When each live session was last "looked at": spawned, prewarmed,
-    /// attached, or covered by the in-view sweep refresh. The idle reaper
-    /// kills sessions whose stamp ages past `session_idle_timeout`.
+    /// attached, detached, or refreshed by the reaper while attached. The
+    /// idle reaper kills sessions whose stamp ages past
+    /// `session_idle_timeout`.
     session_interest: Mutex<HashMap<SessionRef, Instant>>,
     /// Last hook-reported cwd per agent, recorded only for payloads that
     /// passed the foreign-session gate. An agent that walks into a checkout
@@ -601,21 +604,49 @@ impl Daemon {
 
     pub fn kill_session(&self, sref: &SessionRef) {
         if let Some(s) = self.remove_session(sref) {
+            self.save_screen(&s);
             s.kill();
         }
     }
 
     pub fn kill_all(&self) {
-        for (_, s) in self.sessions.lock().unwrap().drain() {
+        let sessions: Vec<Arc<PtySession>> =
+            self.sessions.lock().unwrap().drain().map(|(_, s)| s).collect();
+        for s in sessions {
+            self.save_screen(&s);
             s.kill();
         }
+    }
+
+    /// Keep the stopping session's screen on disk for `ReadSession`. Rows
+    /// without a store entry (the prewarm pool) are never read back.
+    fn save_screen(&self, session: &PtySession) {
+        if self.session_worktree(&session.sref).is_none() {
+            return;
+        }
+        let (_, data) = session.snapshot(None);
+        let (cols, rows) = session.size();
+        let text =
+            crate::pty::render::ring_to_text(&data, cols, rows, Some(SAVED_SCREEN_LINES));
+        let path = nebula_core::paths::saved_screen_path(&session.sref);
+        let written = path
+            .parent()
+            .map_or(Ok(()), std::fs::create_dir_all)
+            .and_then(|_| std::fs::write(&path, text));
+        if let Err(e) = written {
+            tracing::warn!(session = ?session.sref, error = %e, "could not save the last screen");
+        }
+    }
+
+    fn forget_screen(sref: &SessionRef) {
+        let _ = std::fs::remove_file(nebula_core::paths::saved_screen_path(sref));
     }
 
     // ---- attach tracking & idle reaping ----
 
     /// A client attached to `sref` (the server dedupes re-attaches per
-    /// connection). While any attachment exists, the session — and its
-    /// whole worktree — counts as "in view".
+    /// connection). While any attachment exists, the session counts as
+    /// "in view".
     pub fn note_attached(&self, sref: &SessionRef) {
         *self
             .attach_counts
@@ -649,11 +680,13 @@ impl Daemon {
             .insert(sref.clone(), Instant::now());
     }
 
-    /// Kill idle sessions in worktrees no client is looking at, per
+    /// Kill idle sessions no client is attached to, per
     /// `session_idle_timeout` — this bounds what prewarming and
-    /// walked-away-from sessions cost. "In view" = the worktree holding any
-    /// attached session; in-view sessions get their stamps refreshed
-    /// instead, so the full timeout starts only when the user leaves.
+    /// walked-away-from sessions cost. "In view" = attached (main pane or
+    /// split), not the whole worktree: workers pile up on the primary, so a
+    /// worktree-wide rule would keep hundreds of them alive. Attached
+    /// sessions get their stamps refreshed instead, and detach stamps too,
+    /// so the full timeout starts only when the user leaves the tab.
     /// Spared regardless of age: pinned agents (the user's "never kill
     /// this" mark — a running schedule or background job is invisible to
     /// the status machine), agents that are running or waiting on feedback,
@@ -673,17 +706,13 @@ impl Daemon {
             .collect();
         let attached: std::collections::HashSet<SessionRef> =
             self.attach_counts.lock().unwrap().keys().cloned().collect();
-        let viewed_worktrees: std::collections::HashSet<WorktreeId> = attached
-            .iter()
-            .filter_map(|sref| self.session_worktree(sref))
-            .collect();
         let now = Instant::now();
         for (sref, session) in sessions {
             // No store row = prewarm-pool session (or deleted mid-sweep).
-            let Some(worktree_id) = self.session_worktree(&sref) else {
+            if self.session_worktree(&sref).is_none() {
                 continue;
-            };
-            if attached.contains(&sref) || viewed_worktrees.contains(&worktree_id) {
+            }
+            if attached.contains(&sref) {
                 self.touch_session(&sref);
                 continue;
             }
@@ -1114,10 +1143,14 @@ impl Daemon {
             .map(|w| w.id)
             .collect();
         for a in agents.iter().filter(|a| wt_ids.contains(&a.worktree_id)) {
-            self.kill_session(&SessionRef::Agent(a.id.clone()));
+            let sref = SessionRef::Agent(a.id.clone());
+            self.kill_session(&sref);
+            Self::forget_screen(&sref);
         }
         for t in terminals.iter().filter(|t| wt_ids.contains(&t.worktree_id)) {
-            self.kill_session(&SessionRef::Terminal(t.id.clone()));
+            let sref = SessionRef::Terminal(t.id.clone());
+            self.kill_session(&sref);
+            Self::forget_screen(&sref);
         }
         self.kill_prewarmed_in(&wt_ids);
         // Removing a project only forgets it in nebula — never touches disk.
@@ -1594,10 +1627,14 @@ impl Daemon {
         // Kill sessions living in this worktree.
         let (_, _, agents, terminals) = self.store.load_tree()?;
         for a in agents.iter().filter(|a| &a.worktree_id == id) {
-            self.kill_session(&SessionRef::Agent(a.id.clone()));
+            let sref = SessionRef::Agent(a.id.clone());
+            self.kill_session(&sref);
+            Self::forget_screen(&sref);
         }
         for t in terminals.iter().filter(|t| &t.worktree_id == id) {
-            self.kill_session(&SessionRef::Terminal(t.id.clone()));
+            let sref = SessionRef::Terminal(t.id.clone());
+            self.kill_session(&sref);
+            Self::forget_screen(&sref);
         }
         self.kill_prewarmed_in(std::slice::from_ref(id));
 
@@ -2302,15 +2339,21 @@ impl Daemon {
         Some(entry)
     }
 
-    /// Drop warm sessions that died or sat unclaimed past the max age
-    /// (runs on the daemon's periodic tick).
+    /// Drop warm sessions that died or sat unclaimed past the max age, or
+    /// all of them once `prewarm_agents` is off (runs on the daemon's
+    /// periodic tick).
     pub fn reap_prewarmed(&self) {
+        self.sweep_prewarmed(crate::config::Config::load().prewarm_agents);
+    }
+
+    fn sweep_prewarmed(&self, prewarm_enabled: bool) {
         let doomed: Vec<AgentId> = {
             let mut pool = self.prewarmed.lock().unwrap();
             let expired: Vec<_> = pool
                 .iter()
                 .filter(|(_, e)| {
-                    e.spawned_at.elapsed() > PREWARM_MAX_AGE
+                    !prewarm_enabled
+                        || e.spawned_at.elapsed() > PREWARM_MAX_AGE
                         || !self.is_alive(&SessionRef::Agent(e.agent_id.clone()))
                 })
                 .map(|(k, _)| k.clone())
@@ -2748,6 +2791,37 @@ impl Daemon {
         Ok(())
     }
 
+    /// Archive agents left finished, fresh or disconnected longer than
+    /// `auto_archive_after` (runs on the daemon's periodic tick).
+    pub fn auto_archive_stale(self: &Arc<Self>) {
+        self.sweep_stale_agents(crate::config::Config::load().auto_archive_after());
+    }
+
+    fn sweep_stale_agents(self: &Arc<Self>, after: Option<Duration>) {
+        let Some(after) = after else {
+            return;
+        };
+        let cutoff = epoch_ms() - after.as_millis() as i64;
+        let stale = match self.store.stale_idle_agent_ids(cutoff) {
+            Ok(ids) => ids,
+            Err(e) => {
+                tracing::warn!(error = %e, "auto-archive query failed");
+                return;
+            }
+        };
+        let attached: HashSet<SessionRef> =
+            self.attach_counts.lock().unwrap().keys().cloned().collect();
+        for id in stale {
+            if attached.contains(&SessionRef::Agent(id.clone())) {
+                continue;
+            }
+            tracing::info!(agent = %id, "auto-archiving stale agent");
+            if let Err(e) = self.archive_agent(&id) {
+                tracing::warn!(agent = %id, error = %e, "auto-archive failed");
+            }
+        }
+    }
+
     pub fn unarchive_agent(self: &Arc<Self>, id: &AgentId) -> Result<()> {
         self.store.set_agent_archived(id, false)?;
         let agent = self.agent_entity(id)?;
@@ -2775,9 +2849,11 @@ impl Daemon {
     }
 
     pub fn delete_agent(self: &Arc<Self>, id: &AgentId) -> Result<()> {
-        self.kill_session(&SessionRef::Agent(id.clone()));
+        let sref = SessionRef::Agent(id.clone());
+        self.kill_session(&sref);
         self.last_cwd.lock().unwrap().remove(id);
         self.store.delete_agent(id)?;
+        Self::forget_screen(&sref);
         self.broadcast(ServerEvent::EntityRemoved {
             id: EntityId::Agent(id.clone()),
         });
@@ -2862,8 +2938,10 @@ impl Daemon {
     }
 
     pub fn close_terminal(self: &Arc<Self>, id: &TerminalId) -> Result<()> {
-        self.kill_session(&SessionRef::Terminal(id.clone()));
+        let sref = SessionRef::Terminal(id.clone());
+        self.kill_session(&sref);
         self.store.delete_terminal(id)?;
+        Self::forget_screen(&sref);
         self.broadcast(ServerEvent::EntityRemoved {
             id: EntityId::Terminal(id.clone()),
         });
@@ -3081,43 +3159,6 @@ impl Daemon {
         }
     }
 
-    /// Boot every dead, non-archived session under `worktree_id` (agents and
-    /// terminals) so a later Attach replays an already-running screen.
-    /// Already-alive sessions pass through ensure_session untouched; one
-    /// session failing to spawn (missing CLI, deleted checkout) is logged
-    /// and doesn't stop the rest.
-    pub fn prewarm_worktree_sessions(
-        self: &Arc<Self>,
-        worktree_id: &WorktreeId,
-        cols: u16,
-        rows: u16,
-    ) {
-        if !crate::config::Config::load().prewarm_sessions {
-            return;
-        }
-        let Ok((_, _, agents, terminals)) = self.store.load_tree() else {
-            return;
-        };
-        let srefs = agents
-            .iter()
-            .filter(|a| &a.worktree_id == worktree_id && !a.archived)
-            .map(|a| SessionRef::Agent(a.id.clone()))
-            .chain(
-                terminals
-                    .iter()
-                    .filter(|t| &t.worktree_id == worktree_id)
-                    .map(|t| SessionRef::Terminal(t.id.clone())),
-            );
-        for sref in srefs {
-            // The prewarm doubles as a "user is looking here" signal for
-            // the idle reaper, for alive sessions as much as fresh spawns.
-            self.touch_session(&sref);
-            if let Err(e) = self.ensure_session(&sref, cols, rows) {
-                tracing::debug!(session = ?sref, error = %e, "session prewarm failed");
-            }
-        }
-    }
-
     fn spawn_agent_session(
         self: &Arc<Self>,
         agent: &Agent,
@@ -3322,6 +3363,7 @@ impl Daemon {
                             break;
                         }
                         tracing::info!(session = ?sref, exit_code, "session exited");
+                        daemon.save_screen(&session);
                         daemon.publish_session_end(&sref, SessionEnd::Exited(exit_code));
                         break;
                     }
@@ -6441,6 +6483,101 @@ exec sleep 60
         );
         daemon.reap_prewarmed();
         assert!(daemon.prewarmed.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn auto_archive_takes_only_stale_idle_unpinned_unattached_agents() {
+        let daemon = test_daemon();
+        seed_projects(&daemon, &["p"]);
+        seed_worktree(&daemon, "p", "w1", "/nebula-test/p", true);
+        let day_ms = 24 * 3_600_000;
+        let old = epoch_ms() - day_ms - 60_000;
+        let recent = epoch_ms() - 60_000;
+        let rows = [
+            ("old-finished", AgentStatus::Finished, old, false),
+            ("old-fresh", AgentStatus::Fresh, old, false),
+            ("old-disconnected", AgentStatus::Disconnected, old, false),
+            ("recent-finished", AgentStatus::Finished, recent, false),
+            ("old-pinned", AgentStatus::Finished, old, true),
+            ("old-running", AgentStatus::Running, old, false),
+            ("old-feedback", AgentStatus::NeedsFeedback, old, false),
+            ("old-attached", AgentStatus::Finished, old, false),
+        ];
+        for (id, status, stamp, pinned) in rows {
+            daemon
+                .store
+                .insert_agent(&Agent {
+                    id: AgentId(id.into()),
+                    worktree_id: WorktreeId("w1".into()),
+                    name: id.into(),
+                    status,
+                    archived: false,
+                    archived_at: 0,
+                    pinned,
+                    kind: AgentKind::Claude,
+                    model: None,
+                    effort: None,
+                    session_id: None,
+                    sort_order: 0,
+                    status_changed_at: stamp,
+                    alive: false,
+                    branch: None,
+                })
+                .unwrap();
+        }
+        daemon.note_attached(&SessionRef::Agent(AgentId("old-attached".into())));
+        let archived = |d: &Daemon| -> Vec<String> {
+            let mut ids: Vec<String> = d
+                .store
+                .load_tree()
+                .unwrap()
+                .2
+                .into_iter()
+                .filter(|a| a.archived)
+                .map(|a| a.id.0)
+                .collect();
+            ids.sort();
+            ids
+        };
+
+        daemon.sweep_stale_agents(None);
+        assert!(archived(&daemon).is_empty(), "\"off\" archives nothing");
+
+        daemon.sweep_stale_agents(Some(Duration::from_secs(24 * 3600)));
+        assert_eq!(
+            archived(&daemon),
+            vec!["old-disconnected", "old-finished", "old-fresh"]
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_prewarm_drains_live_pool() {
+        let daemon = test_daemon();
+        let cwd = tempfile::tempdir().unwrap();
+        let warm = AgentId("warm-live".into());
+        let pid = spawn_live(
+            &daemon,
+            SessionRef::Agent(warm.clone()),
+            cwd.path(),
+            "exec sleep 60",
+        );
+        daemon.prewarmed.lock().unwrap().insert(
+            (WorktreeId("w1".into()), AgentKind::Claude),
+            PrewarmEntry {
+                agent_id: warm.clone(),
+                spawned_at: Instant::now(),
+                model: None,
+                effort: None,
+                buffered_hooks: Vec::new(),
+            },
+        );
+
+        daemon.sweep_prewarmed(true);
+        assert_eq!(daemon.prewarmed.lock().unwrap().len(), 1, "young live slot kept");
+
+        daemon.sweep_prewarmed(false);
+        assert!(daemon.prewarmed.lock().unwrap().is_empty());
+        assert!(process_exits(pid).await, "warm CLI killed");
     }
 
     #[test]

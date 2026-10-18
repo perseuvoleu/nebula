@@ -111,14 +111,15 @@ async fn serve() -> Result<()> {
                     _ = interval.tick() => {
                         daemon.tick_status_machines();
                         daemon.reap_prewarmed();
+                        daemon.auto_archive_stale();
                     }
                 }
             }
         });
     }
 
-    // Idle-session reaper: kill PTYs in worktrees no client is looking at
-    // once they age past `session_idle_timeout` (bounds what prewarmed and
+    // Idle-session reaper: kill PTYs no client is attached to once they
+    // age past `session_idle_timeout` (bounds what prewarmed and
     // walked-away-from sessions cost). Its own loop so tests can speed the
     // sweep up without touching the status-machine cadence.
     {

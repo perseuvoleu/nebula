@@ -43,10 +43,10 @@ const GIT_POLL: Duration = Duration::from_secs(2);
 /// under the resolution anyone can see.
 const AGO_REFRESH: Duration = Duration::from_secs(30);
 
-/// How long the worktree selection must rest before asking the daemon to
-/// pre-spawn that worktree's dead sessions — long enough that walking the
-/// list doesn't boot every CLI passed, short enough that the sessions are
-/// booting well before the user picks one.
+/// How long the worktree selection must rest before asking the daemon for
+/// that worktree's warm Claude slot — long enough that walking the list
+/// doesn't boot a CLI per worktree passed, short enough that it is booting
+/// well before the user creates a session.
 const PREWARM_DEBOUNCE: Duration = Duration::from_millis(250);
 
 /// How long the session selection must rest on a Claude row before its
@@ -350,14 +350,6 @@ async fn main_loop(
                     app.dirty = true;
                 }
                 next_ago_refresh = tokio::time::Instant::now() + AGO_REFRESH;
-            }
-            // The worktree selection rested past the debounce: ask the
-            // daemon to boot its dead sessions in the background so
-            // attaching one replays a live screen instead of a cold boot.
-            _ = tokio::time::sleep(app.prewarm_delay().unwrap_or_default()),
-                if app.pending_prewarm.is_some() =>
-            {
-                fire_pending_prewarm(&mut app, &mut out);
             }
             // Standing keep-warm: periodically re-assert the selected
             // worktree's warm default-spec Claude session so the daemon's
@@ -1749,6 +1741,8 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         // Answer sessions in the order they started waiting: jump to the
         // oldest needs-feedback session and attach it.
         Action::NextAttention => next_attention(app, out),
+        Action::NextNeedsYou => step_needs_you(app, true, out),
+        Action::PrevNeedsYou => step_needs_you(app, false, out),
         Action::ToggleDivider => {
             if app.focus == Focus::Projects {
                 match app.selected_project_row() {
@@ -3372,10 +3366,7 @@ fn attach_split(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
 /// the left-pane session. `take_focus` moves the input lock onto it (the
 /// ⌘D-create path); the restore-on-return path leaves focus where it is.
 fn mount_split(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>, take_focus: bool) {
-    // Same visit rule as `attach`: the split pane is on the worktree too.
-    if let Some(worktree) = app.worktree_of_sref(&sref) {
-        app.mark_worktree_seen(&worktree);
-    }
+    app.mark_session_seen(&sref);
     if let Some(existing) = app.split_term.take() {
         if existing.sref != sref {
             out.push(ClientRequest::Detach {
@@ -7387,6 +7378,16 @@ fn next_attention(app: &mut App, out: &mut Vec<ClientRequest>) {
     }
 }
 
+/// `]` / `[`: land the selection on the next (previous) session in
+/// [`App::attention_step`]'s cycle, previewing it without attaching.
+fn step_needs_you(app: &mut App, forward: bool, out: &mut Vec<ClientRequest>) {
+    let current = app.selected_session().map(|a| a.id);
+    match app.attention_step(current.as_ref(), forward) {
+        Some(id) => jump_to_target(app, PaletteTarget::Session(id), false, out),
+        None => app.flash = Some("no session is running or waiting on you".into()),
+    }
+}
+
 /// Land the panel selections on a `/` palette pick. A project or worktree
 /// pick moves the selection (restoring remembered child rows, like a manual
 /// switch), then hands focus one column right — a project pick lands in its
@@ -7890,31 +7891,12 @@ fn pane_size(app: &App) -> (u16, u16) {
     }
 }
 
-/// Arm the debounced session prewarm for the selected worktree; the main
-/// loop fires it once the selection has rested there (PREWARM_DEBOUNCE).
+/// Arm the keep-warm for the selected worktree to fire once the selection
+/// has rested there (PREWARM_DEBOUNCE).
 fn schedule_prewarm(app: &mut App) {
-    app.pending_prewarm = app
+    app.next_keepwarm = app
         .selected_worktree()
-        .map(|w| (w.id.clone(), std::time::Instant::now() + PREWARM_DEBOUNCE));
-}
-
-/// Send the armed worktree-sessions prewarm. Re-firing for an already-warm
-/// worktree is a cheap daemon-side no-op, so staleness needs no handling
-/// beyond the daemon skipping rows that no longer exist.
-fn fire_pending_prewarm(app: &mut App, out: &mut Vec<ClientRequest>) {
-    let Some((worktree, _)) = app.pending_prewarm.take() else {
-        return;
-    };
-    let (cols, rows) = pane_size(app);
-    out.push(ClientRequest::PrewarmWorktreeSessions {
-        worktree: worktree.clone(),
-        cols,
-        rows,
-    });
-    // The selected worktree also keeps one Claude session standing by, so
-    // creating a session there adopts an already-booted CLI.
-    out.push(default_claude_prewarm(worktree));
-    app.next_keepwarm = Some(std::time::Instant::now() + KEEPWARM_REFRESH);
+        .map(|_| std::time::Instant::now() + PREWARM_DEBOUNCE);
 }
 
 /// Ask the daemon for a new agent session and attach it once the Ack lands.
@@ -9910,8 +9892,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             }
             clamp_selections(app);
             refresh_palette(app);
-            // Boot the restored worktree's sessions right away — the first
-            // thing the user does after launch is walk into one of them.
+            // Warm the restored worktree's Claude slot right away.
             schedule_prewarm(app);
             // `nebula open`: the first snapshot is the moment the tree
             // exists to land on. Reconnect snapshots find None here.
@@ -11840,6 +11821,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn brackets_step_the_selection_through_sessions_needing_you() {
+        use nebula_core::{AgentStatus, Entity};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let template = app.tree.agents[0].clone();
+        for (id, status, changed_at) in [
+            ("busy", AgentStatus::Running, 5),
+            ("blocked", AgentStatus::NeedsFeedback, 9),
+        ] {
+            let mut a = template.clone();
+            a.id = AgentId(id.into());
+            a.name = id.into();
+            a.status = status;
+            a.status_changed_at = changed_at;
+            hse(
+                &mut app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Agent(a),
+                },
+            );
+        }
+        let selected = |app: &App| app.selected_session().map(|a| a.id.0);
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char(']'), KeyModifiers::NONE, &mut out);
+        assert_eq!(selected(&app).as_deref(), Some("blocked"));
+        assert_eq!(app.focus, Focus::Sessions);
+        assert!(!app.term_locked, "stepping previews, it does not attach");
+        press(&mut app, KeyCode::Char(']'), KeyModifiers::NONE, &mut out);
+        assert_eq!(selected(&app).as_deref(), Some("busy"));
+        press(&mut app, KeyCode::Char(']'), KeyModifiers::NONE, &mut out);
+        assert_eq!(selected(&app).as_deref(), Some("blocked"), "wraps around");
+        press(&mut app, KeyCode::Char('['), KeyModifiers::NONE, &mut out);
+        assert_eq!(selected(&app).as_deref(), Some("busy"), "[ steps back");
+    }
+
     /// With no session waiting on feedback, space flashes and moves
     /// nothing.
     #[test]
@@ -13150,11 +13167,11 @@ mod tests {
         assert!(matched(&app) > 0, "clearing the query restores every row");
     }
 
-    /// Resting the worktree selection arms the debounced prewarm; firing it
-    /// sends one PrewarmWorktreeSessions plus the standing default-spec
-    /// Claude keep-warm for that worktree, then disarms.
+    /// Moving to a worktree arms the keep-warm within the debounce; firing
+    /// it sends only the default-spec Claude prewarm for that worktree, never
+    /// a boot of the worktree's existing sessions.
     #[test]
-    fn worktree_move_arms_prewarm_and_fire_sends_request() {
+    fn worktree_move_arms_keepwarm_for_new_worktree() {
         use nebula_core::{Entity, ProjectId, Worktree, WorktreeId};
         let mut app = App::new();
         seed_tree(&mut app);
@@ -13174,29 +13191,24 @@ mod tests {
                 }),
             },
         );
-        app.pending_prewarm = None;
+        app.next_keepwarm = None;
         app.focus = Focus::Worktrees;
         let mut out = Vec::new();
         move_selection(&mut app, 1, &mut out);
-        let (armed, _) = app.pending_prewarm.clone().expect("prewarm armed");
-        assert_eq!(armed, WorktreeId("w2".into()));
+        let due = app.keepwarm_delay().expect("keep-warm armed");
+        assert!(due <= PREWARM_DEBOUNCE, "armed for the rest, not the refresh");
 
         out.clear();
-        with_default_config(|| fire_pending_prewarm(&mut app, &mut out));
-        assert!(app.pending_prewarm.is_none(), "fires once, then disarms");
+        with_default_config(|| fire_keepwarm(&mut app, &mut out));
         assert!(matches!(
             out.as_slice(),
-            [
-                ClientRequest::PrewarmWorktreeSessions { worktree, .. },
-                ClientRequest::PrewarmAgent {
-                    worktree: agent_wt,
-                    kind: AgentKind::Claude,
-                    model: None,
-                    effort: None,
-                },
-            ] if worktree == &WorktreeId("w2".into()) && agent_wt == &WorktreeId("w2".into())
+            [ClientRequest::PrewarmAgent {
+                worktree,
+                kind: AgentKind::Claude,
+                model: None,
+                effort: None,
+            }] if worktree == &WorktreeId("w2".into())
         ));
-        assert!(app.next_keepwarm.is_some(), "keep-warm re-send is armed");
     }
 
     /// An empty `gh` answer doesn't retire the worktree: the next attempt
@@ -13488,15 +13500,15 @@ mod tests {
         })
     }
 
-    /// The startup snapshot arms the prewarm for the restored worktree, so
-    /// its sessions boot before the user presses anything.
+    /// The startup snapshot arms the keep-warm for the restored worktree, so
+    /// its warm Claude slot boots before the user presses anything.
     #[test]
-    fn snapshot_arms_prewarm_for_selected_worktree() {
+    fn snapshot_arms_keepwarm_for_selected_worktree() {
         let mut app = App::new();
         seed_tree(&mut app);
         let tree = app.tree.clone();
         let mut fresh = App::new();
-        assert!(fresh.pending_prewarm.is_none());
+        assert!(fresh.next_keepwarm.is_none());
         hse(
             &mut fresh,
             ServerEvent::Snapshot {
@@ -13513,8 +13525,8 @@ mod tests {
                 ui_state: None,
             },
         );
-        let (armed, _) = fresh.pending_prewarm.clone().expect("prewarm armed");
-        assert_eq!(armed, nebula_core::WorktreeId("w1".into()));
+        let due = fresh.keepwarm_delay().expect("keep-warm armed");
+        assert!(due <= PREWARM_DEBOUNCE, "armed for the rest, not the refresh");
     }
 
     /// The footer's right edge shows live session counts and nebula's

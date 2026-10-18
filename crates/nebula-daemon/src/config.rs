@@ -13,11 +13,6 @@ pub struct Config {
     /// Pre-spawn agent CLIs while the user is still naming the session so
     /// creation feels instant. Costs one idle CLI process per warm slot.
     pub prewarm_agents: bool,
-    /// Pre-spawn a worktree's dead sessions when the user's selection rests
-    /// on it, so attaching shows an already-booted screen instead of a
-    /// booting shell. Costs idle shell/CLI processes for sessions the user
-    /// may never open.
-    pub prewarm_sessions: bool,
     /// Clone a matching primary checkout's top-level `node_modules` into new
     /// worktrees with APFS copy-on-write. Failures are ignored and Nebula
     /// never runs a package-manager install.
@@ -28,9 +23,15 @@ pub struct Config {
     /// Bounds what prewarming and walked-away-from sessions cost. Pinned
     /// agents, running or feedback-waiting agents, and terminals with a
     /// command running are spared; a reaped session revives on the next
-    /// attach or prewarm (agents resume their conversation). Malformed
-    /// values fall back to the 5m default.
+    /// attach (agents resume their conversation). Malformed values fall
+    /// back to the 5m default.
     pub session_idle_timeout: String,
+    /// Archive unpinned agents that have sat finished, fresh or
+    /// disconnected this long: "24h" by default, "off" disables, and any
+    /// `<n>s`/`<n>m`/`<n>h` works. Running and feedback-waiting agents and
+    /// sessions a client is attached to are never archived. Malformed
+    /// values fall back to the default.
+    pub auto_archive_after: String,
 }
 
 impl Default for Config {
@@ -38,15 +39,18 @@ impl Default for Config {
         Self {
             git_init_on_create: true,
             prewarm_agents: true,
-            prewarm_sessions: true,
             seed_node_modules: true,
             session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT.into(),
+            auto_archive_after: DEFAULT_AUTO_ARCHIVE_AFTER.into(),
         }
     }
 }
 
 /// Fallback for `session_idle_timeout` when the value is malformed.
 pub const DEFAULT_SESSION_IDLE_TIMEOUT: &str = "5m";
+
+/// Fallback for `auto_archive_after` when the value is malformed.
+pub const DEFAULT_AUTO_ARCHIVE_AFTER: &str = "24h";
 
 impl Config {
     pub fn load() -> Self {
@@ -64,6 +68,12 @@ impl Config {
     pub fn session_idle_timeout(&self) -> Option<std::time::Duration> {
         parse_timeout(&self.session_idle_timeout)
             .unwrap_or_else(|| parse_timeout(DEFAULT_SESSION_IDLE_TIMEOUT).expect("default parses"))
+    }
+
+    /// `auto_archive_after` parsed to a duration; None = auto-archive off.
+    pub fn auto_archive_after(&self) -> Option<std::time::Duration> {
+        parse_timeout(&self.auto_archive_after)
+            .unwrap_or_else(|| parse_timeout(DEFAULT_AUTO_ARCHIVE_AFTER).expect("default parses"))
     }
 }
 
@@ -140,12 +150,26 @@ mod tests {
     }
 
     #[test]
-    fn defaults_enable_session_prewarm_and_allow_opt_out() {
-        assert!(Config::default().prewarm_sessions);
-        let cfg: Config = serde_json::from_str("{}").unwrap();
-        assert!(cfg.prewarm_sessions);
-        let cfg: Config = serde_json::from_str(r#"{"prewarm_sessions": false}"#).unwrap();
-        assert!(!cfg.prewarm_sessions);
+    fn auto_archive_after_defaults_to_a_day_and_parses() {
+        use std::time::Duration;
+        let after = |v: &str| {
+            let cfg: Config =
+                serde_json::from_str(&format!(r#"{{"auto_archive_after": "{v}"}}"#)).unwrap();
+            cfg.auto_archive_after()
+        };
+        let day = Some(Duration::from_secs(24 * 3600));
+        assert_eq!(serde_json::from_str::<Config>("{}").unwrap().auto_archive_after(), day);
+        assert_eq!(after("12h"), Some(Duration::from_secs(12 * 3600)));
+        assert_eq!(after("off"), None);
+        assert_eq!(after("soon"), day, "malformed falls back to the default");
+    }
+
+    #[test]
+    fn retired_prewarm_sessions_key_still_loads() {
+        let cfg: Config =
+            serde_json::from_str(r#"{"prewarm_sessions": true, "prewarm_agents": false}"#)
+                .unwrap();
+        assert!(!cfg.prewarm_agents);
     }
 
     #[test]

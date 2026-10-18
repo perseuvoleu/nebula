@@ -3190,7 +3190,14 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
 
     // Projects and their dividers are one selectable row list; the payload
     // pre-collects per-row display data to end the tree borrow.
-    let rows: Vec<(ProjectRow, String, Option<AgentStatus>, (usize, usize))> = app
+    type Row = (
+        ProjectRow,
+        String,
+        Option<AgentStatus>,
+        (usize, usize),
+        crate::app::Activity,
+    );
+    let rows: Vec<Row> = app
         .project_rows()
         .into_iter()
         .map(|row| match row {
@@ -3201,6 +3208,7 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
                     p.name.clone(),
                     app.project_rollup(&p.id),
                     app.note_stats(&nebula_core::NoteOwner::Project(p.id.clone())),
+                    app.project_activity(&p.id),
                 )
             }
             ProjectRow::Divider { project, before } => {
@@ -3211,7 +3219,7 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
                     p.divider_label.clone()
                 }
                 .unwrap_or_default();
-                (row, label, None, (0, 0))
+                (row, label, None, (0, 0), Default::default())
             }
         })
         .collect();
@@ -3230,7 +3238,7 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
         .collect();
     let skip = scroll_skip(&heights, app.sel_project, mid);
     let mut screen_row = 0usize;
-    for (row_idx, (row, text, roll, notes)) in rows.iter().enumerate().skip(skip) {
+    for (row_idx, (row, text, roll, notes, activity)) in rows.iter().enumerate().skip(skip) {
         match row {
             ProjectRow::Project(i) => {
                 // Compact 2-row pill stride, same as the worktree rows —
@@ -3257,8 +3265,22 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
                         hosts.push(Span::styled(" ●", Style::default().fg(color)));
                     }
                 }
-                let badge_len =
-                    note_badge.as_ref().map_or(0, |(s, _)| s.chars().count()) + hosts.len() * 2;
+                // Live sessions mid-turn, e.g. ` 2▶ 1?`: running, then waiting on you.
+                let mut active = Vec::new();
+                for (count, glyph, color) in [
+                    (activity.running, '▶', th.warn),
+                    (activity.waiting, '?', th.err),
+                ] {
+                    if count > 0 {
+                        active.push(Span::styled(
+                            format!(" {count}{glyph}"),
+                            Style::default().fg(color),
+                        ));
+                    }
+                }
+                let badge_len = note_badge.as_ref().map_or(0, |(s, _)| s.chars().count())
+                    + hosts.len() * 2
+                    + active.iter().map(|s| s.content.chars().count()).sum::<usize>();
                 // Bold name: the top of the tree reads "biggest".
                 let mut spans = vec![status_dot(*roll, th)];
                 spans.extend(status_name_spans(
@@ -3267,6 +3289,7 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
                     sweep_ramp(*roll, th, app.animations),
                     app.sweep_phase(),
                 ));
+                spans.extend(active);
                 spans.extend(hosts);
                 if let Some((text, style)) = note_badge {
                     spans.push(Span::styled(text, style));

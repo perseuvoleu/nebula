@@ -716,6 +716,22 @@ impl Store {
         Ok(())
     }
 
+    /// Unarchived, unpinned agents idle (finished, fresh or disconnected)
+    /// since before `cutoff_ms`. A 0 stamp means the age is unknown, so
+    /// those rows are left alone.
+    pub fn stale_idle_agent_ids(&self, cutoff_ms: i64) -> Result<Vec<AgentId>> {
+        let conn = self.conn.lock().unwrap();
+        let ids = conn
+            .prepare(
+                "SELECT id FROM agents WHERE archived = 0 AND pinned = 0
+                 AND status IN ('finished', 'fresh', 'disconnected')
+                 AND status_changed_at > 0 AND status_changed_at < ?1",
+            )?
+            .query_map(params![cutoff_ms], |r| Ok(AgentId(r.get(0)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(ids)
+    }
+
     pub fn set_agent_pinned(&self, id: &AgentId, pinned: bool) -> Result<()> {
         self.conn.lock().unwrap().execute(
             "UPDATE agents SET pinned = ?2 WHERE id = ?1",

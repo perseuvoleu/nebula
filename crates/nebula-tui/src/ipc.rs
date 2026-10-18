@@ -1307,7 +1307,8 @@ pub async fn agent_show(name: String, project_flag: Option<String>) -> Result<()
 
 /// `nebula agent read <name> [--lines N]`: the session's screen (and
 /// scrollback tail) as plain text — rendered daemon-side at the live grid
-/// size, so reading never attaches, resizes, or respawns anything.
+/// size, so reading never attaches, resizes, or respawns anything. A
+/// stopped session prints the screen the daemon saved when it stopped.
 pub async fn agent_read(
     name: String,
     lines: Option<usize>,
@@ -1321,12 +1322,6 @@ pub async fn agent_read(
     let (projects, worktrees, agents) = subscribe_snapshot(&mut conn).await?;
     let project = resolve_project(&projects, &worktrees, &agents, project_flag.as_deref())?;
     let (a, _) = resolve_agent(&agents, &worktrees, &project, &name)?;
-    if !a.alive {
-        bail!(
-            "\"{name}\" holds no live PTY (status: {}) — `nebula agent restart {name}` respawns it",
-            a.status.as_str()
-        );
-    }
     let req_id = 1u64;
     write_frame(
         &mut conn.stream,
@@ -1351,6 +1346,13 @@ pub async fn agent_read(
                 println!("{text}");
                 return Ok(());
             }
+            // A stopped session with no saved screen: point at the respawn.
+            Some(ServerEvent::Error {
+                req_id: Some(r), ..
+            }) if r == req_id && !a.alive => bail!(
+                "\"{name}\" holds no live PTY (status: {}) — `nebula agent restart {name}` respawns it",
+                a.status.as_str()
+            ),
             Some(ServerEvent::Error {
                 req_id: Some(r),
                 message,

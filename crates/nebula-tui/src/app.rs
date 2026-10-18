@@ -1303,12 +1303,13 @@ fn build_palette_items(tree: &Tree, show_archived: bool, sessions_only: bool) ->
     let projects: Vec<&Project> = tree.projects.iter().filter(|p| tree.is_listed(p)).collect();
     let mut items = Vec::new();
     if !sessions_only {
+        let rollups = Rollups::new(tree, |i| tree.agent_home(&tree.agents[i]));
         for p in &projects {
             items.push(PaletteItem {
                 target: PaletteTarget::Project(p.id.clone()),
                 text: p.name.clone(),
                 archived: false,
-                status: project_rollup(tree, &p.id),
+                status: rollups.project(&p.id),
             });
         }
         for p in &projects {
@@ -1317,7 +1318,7 @@ fn build_palette_items(tree: &Tree, show_archived: bool, sessions_only: bool) ->
                     target: PaletteTarget::Worktree(w.id.clone()),
                     text: format!("{}/{}", p.name, w.branch),
                     archived: false,
-                    status: worktree_rollup(tree, &w.id),
+                    status: rollups.worktree(&w.id),
                 });
             }
         }
@@ -2032,10 +2033,13 @@ pub enum RowKey {
 }
 
 /// Aggregate status for a worktree row: red > yellow > green > gray,
-/// archived agents excluded. Free-standing so the `/` palette can roll a
-/// row up straight from the tree, with no `App` in hand. Rolls up the
-/// sessions the row *lists* — those homed on the checkout's branch (see
-/// [`Tree::agent_home`]), on this host-owned checkout only.
+/// archived agents excluded. Rolls up the sessions the row *lists* —
+/// those homed on the checkout's branch (see [`Tree::agent_home`]), on
+/// this host-owned checkout only.
+///
+/// The per-row reference definition; the panels and the palette read
+/// [`Rollups`], and tests hold the two to the same answer.
+#[cfg(test)]
 pub fn worktree_rollup(tree: &Tree, worktree_id: &WorktreeId) -> Option<AgentStatus> {
     let family = tree.worktree_family(worktree_id);
     rollup(
@@ -2051,6 +2055,7 @@ pub fn worktree_rollup(tree: &Tree, worktree_id: &WorktreeId) -> Option<AgentSta
 
 /// The same aggregate over every worktree of a project — and of its
 /// twins, whose sessions the row lists too.
+#[cfg(test)]
 pub fn project_rollup(tree: &Tree, project_id: &ProjectId) -> Option<AgentStatus> {
     let projects = tree.project_family(project_id);
     let wt_ids: Vec<&WorktreeId> = tree
@@ -2065,6 +2070,99 @@ pub fn project_rollup(tree: &Tree, project_id: &ProjectId) -> Option<AgentStatus
             .filter(|a| wt_ids.contains(&&a.worktree_id) && !a.archived)
             .map(|a| a.status),
     )
+}
+
+/// A project row's live sessions mid-turn: running, and waiting on the user.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Activity {
+    pub running: usize,
+    pub waiting: usize,
+}
+
+/// Every worktree and project rollup from one pass over the live agents,
+/// so a frame reads each row's status instead of rescanning every agent.
+#[derive(Default)]
+struct Rollups {
+    worktrees: HashMap<WorktreeId, AgentStatus>,
+    projects: HashMap<ProjectId, AgentStatus>,
+    activity: HashMap<ProjectId, Activity>,
+}
+
+impl Rollups {
+    /// `home(i)` is `tree.agents[i]`'s home, asked only for live agents.
+    fn new(tree: &Tree, home: impl Fn(usize) -> SessionHome) -> Self {
+        let live: Vec<usize> = (0..tree.agents.len())
+            .filter(|&i| !tree.agents[i].archived)
+            .collect();
+        let mut by_worktree: HashMap<WorktreeId, Vec<AgentStatus>> = HashMap::new();
+        for &i in &live {
+            if let SessionHome::Worktree(w) = home(i) {
+                by_worktree
+                    .entry(w)
+                    .or_default()
+                    .push(tree.agents[i].status);
+            }
+        }
+        let mut projects_of: HashMap<&WorktreeId, Vec<&ProjectId>> = HashMap::new();
+        for w in &tree.worktrees {
+            let projects = projects_of.entry(&w.id).or_default();
+            if !projects.contains(&&w.project_id) {
+                projects.push(&w.project_id);
+            }
+        }
+        let mut by_project: HashMap<&ProjectId, Vec<usize>> = HashMap::new();
+        for &i in &live {
+            for p in projects_of
+                .get(&tree.agents[i].worktree_id)
+                .into_iter()
+                .flatten()
+            {
+                by_project.entry(p).or_default().push(i);
+            }
+        }
+        let mut projects = HashMap::new();
+        let mut activity = HashMap::new();
+        for p in &tree.projects {
+            // Tree order across the family, so rank ties resolve as one scan would.
+            let mut indexes: Vec<usize> = tree
+                .project_family(&p.id)
+                .iter()
+                .filter_map(|q| by_project.get(q))
+                .flatten()
+                .copied()
+                .collect();
+            indexes.sort_unstable();
+            indexes.dedup();
+            let mut counts = Activity::default();
+            for &i in &indexes {
+                match tree.agents[i].status {
+                    AgentStatus::Running => counts.running += 1,
+                    AgentStatus::NeedsFeedback => counts.waiting += 1,
+                    _ => {}
+                }
+            }
+            activity.insert(p.id.clone(), counts);
+            if let Some(status) = rollup(indexes.into_iter().map(|i| tree.agents[i].status)) {
+                projects.insert(p.id.clone(), status);
+            }
+        }
+        Self {
+            worktrees: by_worktree
+                .into_iter()
+                .filter_map(|(w, statuses)| Some((w, rollup(statuses.into_iter())?)))
+                .collect(),
+            projects,
+            activity,
+        }
+    }
+
+    fn worktree(&self, id: &WorktreeId) -> Option<AgentStatus> {
+        self.worktrees.get(id).copied()
+    }
+
+    fn project(&self, id: &ProjectId) -> Option<AgentStatus> {
+        self.projects.get(id).copied()
+    }
 }
 
 /// One selectable row in the Projects panel. The payload indexes
@@ -2498,6 +2596,7 @@ struct PanelProjection {
     key: PanelKey,
     entries: Vec<PanelEntry>,
     homes: HomeIndex,
+    rollups: Rollups,
 }
 
 /// Agents and terminals grouped by the row they are listed under, as
@@ -2876,11 +2975,6 @@ pub struct App {
     /// skip from the top). The section has no cursor, so this is real
     /// state; the draw clamps it to the list.
     pub global_sessions_scroll: usize,
-    /// Debounced session prewarm: the worktree whose dead sessions the
-    /// daemon should pre-spawn once the selection has rested on it past the
-    /// deadline — armed on every worktree context switch, so walking the
-    /// list doesn't boot every CLI it passes.
-    pub pending_prewarm: Option<(WorktreeId, std::time::Instant)>,
     /// Standing keep-warm: when to next re-assert the selected worktree's
     /// warm default-spec Claude session, so one is always ready to adopt.
     /// Re-armed after every send; disarmed when nothing is selected.
@@ -3095,7 +3189,6 @@ impl App {
             last_session_for_project: HashMap::new(),
             last_session_for_worktree: HashMap::new(),
             global_sessions_scroll: 0,
-            pending_prewarm: None,
             next_keepwarm: None,
             term_selection: None,
             last_term_click: None,
@@ -3922,10 +4015,12 @@ impl App {
                 keep
             });
         }
+        let rollups = Rollups::new(&self.tree, |i| homes.agent_homes[i].clone());
         let projection = std::rc::Rc::new(PanelProjection {
             key,
             entries,
             homes,
+            rollups,
         });
         *self.panel_cache.borrow_mut() = Some(projection.clone());
         projection
@@ -4425,13 +4520,6 @@ impl App {
         (pinned, unpinned, archived)
     }
 
-    /// Delay until the pending worktree-sessions prewarm is due, so the
-    /// event loop can wake up and fire it. None when nothing is armed.
-    pub fn prewarm_delay(&self) -> Option<std::time::Duration> {
-        let (_, at) = self.pending_prewarm.as_ref()?;
-        Some(at.saturating_duration_since(std::time::Instant::now()))
-    }
-
     /// Whether `gh` should be asked about this worktree now: not while an
     /// answer is in flight, and not before the timer the last answer armed.
     /// A found PR no longer retires the worktree — the PR doesn't change,
@@ -4486,7 +4574,7 @@ impl App {
     /// Aggregate status for a worktree row: red > yellow > green > gray,
     /// archived agents excluded.
     pub fn worktree_rollup(&self, worktree_id: &WorktreeId) -> Option<AgentStatus> {
-        worktree_rollup(&self.tree, worktree_id)
+        self.projection().rollups.worktree(worktree_id)
     }
 
     /// Aggregate status for a checkout-less branch row of the selected
@@ -4503,7 +4591,46 @@ impl App {
     }
 
     pub fn project_rollup(&self, project_id: &ProjectId) -> Option<AgentStatus> {
-        project_rollup(&self.tree, project_id)
+        self.projection().rollups.project(project_id)
+    }
+
+    pub fn project_activity(&self, project_id: &ProjectId) -> Activity {
+        self.projection()
+            .rollups
+            .activity
+            .get(project_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// The session after `current` (`forward`) or before it in the cycle of
+    /// listed live sessions that need the user: waiting on an answer
+    /// first, then running, each longest-in-that-state first. The cycle
+    /// wraps; a `current` outside it steps onto its first (or, backwards,
+    /// last) session.
+    pub fn attention_step(&self, current: Option<&AgentId>, forward: bool) -> Option<AgentId> {
+        let mut cycle: Vec<&Agent> = self
+            .tree
+            .agents
+            .iter()
+            .filter(|a| {
+                !a.archived
+                    && matches!(a.status, AgentStatus::NeedsFeedback | AgentStatus::Running)
+                    && self.listed_project_for(&a.worktree_id).is_some()
+            })
+            .collect();
+        cycle.sort_by_key(|a| (a.status != AgentStatus::NeedsFeedback, a.status_changed_at));
+        let len = cycle.len();
+        if len == 0 {
+            return None;
+        }
+        let next = match (current.and_then(|c| cycle.iter().position(|a| &a.id == c)), forward) {
+            (Some(i), true) => (i + 1) % len,
+            (Some(i), false) => (i + len - 1) % len,
+            (None, true) => 0,
+            (None, false) => len - 1,
+        };
+        Some(cycle[next].id.clone())
     }
 
     pub fn hit_at(&self, x: u16, y: u16) -> Option<HitTarget> {
@@ -5224,6 +5351,214 @@ mod tests {
         }
     }
 
+    /// Twins, a second project with two checkouts, archived rows that
+    /// outrank every live one, and rank ties broken by tree order.
+    fn rollup_app() -> App {
+        let (mut app, _, _) = twin_app();
+        for (name, status, archived) in [
+            ("on-main", AgentStatus::NeedsFeedback, true),
+            ("moved-to-feature", AgentStatus::Running, false),
+            ("on-remote", AgentStatus::Disconnected, false),
+        ] {
+            let a = app.tree.agents.iter_mut().find(|a| a.name == name).unwrap();
+            a.status = status;
+            a.archived = archived;
+        }
+        let mut other = app.tree.projects[0].clone();
+        other.id = ProjectId("p2".into());
+        other.name = "other".into();
+        app.tree.projects.push(other);
+        for (id, branch) in [("w2a", "main"), ("w2b", "topic")] {
+            let mut w = app.tree.worktrees[0].clone();
+            w.id = WorktreeId(id.into());
+            w.project_id = ProjectId("p2".into());
+            w.branch = branch.into();
+            app.tree.worktrees.push(w);
+        }
+        for (id, worktree, status, archived) in [
+            ("p2-old", "w2a", AgentStatus::NeedsFeedback, true),
+            ("p2-gone", "w2b", AgentStatus::Disconnected, false),
+            ("p2-stopped", "w2a", AgentStatus::Terminated, false),
+            ("p2-done", "w2a", AgentStatus::Fresh, false),
+        ] {
+            let mut a = agent_on(id, &WorktreeId(worktree.into()), None);
+            a.status = status;
+            a.archived = archived;
+            app.tree.agents.push(a);
+        }
+        app
+    }
+
+    /// The memoized rollups answer exactly what the per-row scans answer,
+    /// under every host filter, and drop archived rows.
+    #[test]
+    fn memoized_rollups_match_the_per_row_scans() {
+        let mut app = rollup_app();
+        let wt = |id: &str| WorktreeId(id.into());
+        let pr = |id: &str| ProjectId(id.into());
+        for (hide_local, hide_remote) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            app.hide_local = hide_local;
+            app.hide_remote = hide_remote;
+            let rollups = &app.projection().rollups;
+            let mut worktrees: Vec<WorktreeId> =
+                app.tree.worktrees.iter().map(|w| w.id.clone()).collect();
+            worktrees.push(wt("deleted"));
+            for id in &worktrees {
+                assert_eq!(
+                    rollups.worktree(id),
+                    worktree_rollup(&app.tree, id),
+                    "{id:?}"
+                );
+                assert_eq!(app.worktree_rollup(id), worktree_rollup(&app.tree, id));
+            }
+            for p in &app.tree.projects {
+                assert_eq!(
+                    rollups.project(&p.id),
+                    project_rollup(&app.tree, &p.id),
+                    "{:?}",
+                    p.id
+                );
+                assert_eq!(app.project_rollup(&p.id), project_rollup(&app.tree, &p.id));
+            }
+        }
+        assert_eq!(app.worktree_rollup(&wt("w1")), None, "only archived on w1");
+        assert_eq!(
+            app.worktree_rollup(&wt("w-feature")),
+            Some(AgentStatus::Running)
+        );
+        assert_eq!(
+            app.worktree_rollup(&wt("remote-checkout")),
+            Some(AgentStatus::Disconnected)
+        );
+        assert_eq!(
+            app.worktree_rollup(&wt("w2a")),
+            Some(AgentStatus::Terminated)
+        );
+        assert_eq!(app.project_rollup(&pr("p1")), Some(AgentStatus::Running));
+        assert_eq!(
+            app.project_rollup(&pr("remote-project")),
+            Some(AgentStatus::Running),
+            "a twin rolls up the family"
+        );
+        assert_eq!(
+            app.project_rollup(&pr("p2")),
+            Some(AgentStatus::Disconnected),
+            "a rank tie keeps the first row in tree order"
+        );
+        let palette = Palette::new(&app.tree, false, false);
+        for item in &palette.items {
+            let expected = match &item.target {
+                PaletteTarget::Project(id) => project_rollup(&app.tree, id),
+                PaletteTarget::Worktree(id) => worktree_rollup(&app.tree, id),
+                _ => continue,
+            };
+            assert_eq!(item.status, expected, "palette {:?}", item.target);
+        }
+    }
+
+    /// `rollup_app` plus two waiting and two running agents across both
+    /// projects, stamped so neither the tree order nor the project order
+    /// is the cycle order.
+    fn attention_app() -> App {
+        let mut app = rollup_app();
+        for (id, worktree, status, at) in [
+            ("run-late", "w2b", AgentStatus::Running, 40),
+            ("ask-late", "w1", AgentStatus::NeedsFeedback, 30),
+            ("ask-early", "w2a", AgentStatus::NeedsFeedback, 10),
+            ("run-early", "w-feature", AgentStatus::Running, 20),
+        ] {
+            let mut a = agent_on(id, &WorktreeId(worktree.into()), None);
+            a.status = status;
+            a.status_changed_at = at;
+            app.tree.agents.push(a);
+        }
+        app
+    }
+
+    #[test]
+    fn attention_cycle_steps_waiting_then_running_and_wraps() {
+        let app = attention_app();
+        let step = |current: Option<&str>, forward: bool| {
+            app.attention_step(current.map(|c| AgentId(c.into())).as_ref(), forward)
+                .map(|id| id.0)
+        };
+        let mut walked = vec![];
+        let mut current = None;
+        for _ in 0..6 {
+            current = step(current.as_deref(), true);
+            walked.push(current.clone().unwrap());
+        }
+        assert_eq!(
+            walked,
+            [
+                "ask-early",
+                "ask-late",
+                "moved-to-feature",
+                "run-early",
+                "run-late",
+                "ask-early"
+            ],
+            "waiting oldest-first, then running oldest-first, then around"
+        );
+        assert_eq!(step(None, false).as_deref(), Some("run-late"));
+        assert_eq!(step(Some("ask-early"), false).as_deref(), Some("run-late"));
+        assert_eq!(step(Some("run-early"), false).as_deref(), Some("moved-to-feature"));
+        assert_eq!(
+            step(Some("p2-done"), true).as_deref(),
+            Some("ask-early"),
+            "a session outside the cycle steps onto its start"
+        );
+    }
+
+    #[test]
+    fn attention_cycle_skips_archived_and_unlisted_sessions() {
+        let mut app = attention_app();
+        app.tree.hidden_projects.insert(ProjectId("p2".into()));
+        app.tree
+            .agents
+            .iter_mut()
+            .find(|a| a.id.0 == "ask-late")
+            .unwrap()
+            .archived = true;
+        let mut walked = vec![];
+        let mut current: Option<AgentId> = None;
+        for _ in 0..3 {
+            current = app.attention_step(current.as_ref(), true);
+            walked.push(current.clone().unwrap().0);
+        }
+        assert_eq!(walked, ["moved-to-feature", "run-early", "moved-to-feature"]);
+        for a in &mut app.tree.agents {
+            a.status = AgentStatus::Finished;
+        }
+        assert_eq!(app.attention_step(None, true), None);
+    }
+
+    #[test]
+    fn project_rows_count_running_and_waiting_sessions() {
+        let app = attention_app();
+        assert_eq!(
+            app.project_activity(&ProjectId("p1".into())),
+            Activity {
+                running: 2,
+                waiting: 1
+            },
+            "the twin family's live rows; the archived ask on main is left out"
+        );
+        assert_eq!(
+            app.project_activity(&ProjectId("p2".into())),
+            Activity {
+                running: 1,
+                waiting: 1
+            }
+        );
+        assert_eq!(
+            app.project_activity(&ProjectId("nope".into())),
+            Activity::default()
+        );
+    }
+
     #[test]
     fn panel_projection_is_built_once_and_shared_by_every_helper() {
         let (app, _, _) = twin_app();
@@ -5238,6 +5573,10 @@ mod tests {
             app.visible_terminals();
             app.git_changes_stale();
             app.worktree_row_index(&WorktreeId("w-feature".into()));
+            app.worktree_rollup(&WorktreeId("w-feature".into()));
+            for p in &app.tree.projects {
+                app.project_rollup(&p.id);
+            }
             for entry in app.panel_entries() {
                 app.sessions_for_panel_row(&entry.row);
             }

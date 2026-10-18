@@ -2846,12 +2846,10 @@ async fn archive_sigkills_an_agent_that_ignores_sighup() {
     wait_for_exit(&mut daemon);
 }
 
-/// One PrewarmWorktreeSessions must revive every dead session under the
-/// worktree — no Attach involved — so the TUI can boot a worktree's
-/// sessions the moment the user's selection rests on it. Archived agents
-/// stay dead.
+/// PrewarmWorktreeSessions is a retired request: the daemon still accepts
+/// it from older clients but boots nothing, so a dead session stays dead.
 #[tokio::test]
-async fn prewarm_worktree_sessions_boots_dead_sessions() {
+async fn prewarm_worktree_sessions_boots_nothing() {
     let env = TestEnv::new();
     let repo = env.make_repo();
     let mut daemon = env.spawn_daemon();
@@ -2859,20 +2857,13 @@ async fn prewarm_worktree_sessions_boots_dead_sessions() {
     handshake(&mut c).await;
     let worktree = add_project_get_main_worktree(&mut c, &repo).await;
 
-    // One agent, one terminal, one archived agent — every PTY dies with the
-    // daemon below.
     write_frame(
         &mut c,
-        &ClientRequest::CreateAgent {
+        &ClientRequest::CreateTerminal {
             expected_branch: None,
             req_id: 2,
             worktree: worktree.id.clone(),
-            name: "warmed".into(),
-            kind: AgentKind::Claude,
-            model: None,
-            effort: None,
-            auto_title: false,
-            prompt: None,
+            name: None,
         },
     )
     .await
@@ -2882,107 +2873,19 @@ async fn prewarm_worktree_sessions_boots_dead_sessions() {
     })
     .await;
     let ServerEvent::Ack {
-        created: Some(EntityId::Agent(agent_id)),
-        ..
-    } = find_ack(&events, 2).unwrap()
-    else {
-        panic!("CreateAgent failed: {events:#?}");
-    };
-    let agent_id = agent_id.clone();
-
-    write_frame(
-        &mut c,
-        &ClientRequest::CreateTerminal {
-            expected_branch: None,
-            req_id: 3,
-            worktree: worktree.id.clone(),
-            name: None,
-        },
-    )
-    .await
-    .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        find_ack(evs, 3).is_some()
-    })
-    .await;
-    let ServerEvent::Ack {
         created: Some(EntityId::Terminal(term_id)),
         ..
-    } = find_ack(&events, 3).unwrap()
+    } = find_ack(&events, 2).unwrap()
     else {
         panic!("CreateTerminal failed: {events:#?}");
     };
     let term_id = term_id.clone();
 
-    write_frame(
-        &mut c,
-        &ClientRequest::CreateAgent {
-            expected_branch: None,
-            req_id: 4,
-            worktree: worktree.id.clone(),
-            name: "shelved".into(),
-            kind: AgentKind::Claude,
-            model: None,
-            effort: None,
-            auto_title: false,
-            prompt: None,
-        },
-    )
-    .await
-    .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        find_ack(evs, 4).is_some()
-    })
-    .await;
-    let ServerEvent::Ack {
-        created: Some(EntityId::Agent(archived_id)),
-        ..
-    } = find_ack(&events, 4).unwrap()
-    else {
-        panic!("CreateAgent failed: {events:#?}");
-    };
-    let archived_id = archived_id.clone();
-    write_frame(
-        &mut c,
-        &ClientRequest::ArchiveAgent {
-            req_id: 5,
-            id: archived_id.clone(),
-        },
-    )
-    .await
-    .unwrap();
-    read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        find_ack(evs, 5).is_some()
-    })
-    .await;
-
-    // Restart: rows persist, every PTY is dead.
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
     wait_for_exit(&mut daemon);
     let mut daemon2 = env.spawn_daemon();
     let mut c2 = connect(&env.sock()).await;
     handshake(&mut c2).await;
-    write_frame(&mut c2, &ClientRequest::Subscribe)
-        .await
-        .unwrap();
-    let events = read_events_until(&mut c2, Duration::from_secs(5), |evs| {
-        evs.iter()
-            .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
-    })
-    .await;
-    let ServerEvent::Snapshot {
-        agents, terminals, ..
-    } = &events[0]
-    else {
-        panic!("expected snapshot");
-    };
-    assert!(agents.iter().all(|a| !a.alive), "agents dead after restart");
-    assert!(
-        terminals.iter().all(|t| !t.alive),
-        "terminals dead after restart"
-    );
-
-    // One prewarm revives the agent and the terminal (upserts flip alive)…
     write_frame(
         &mut c2,
         &ClientRequest::PrewarmWorktreeSessions {
@@ -2993,28 +2896,41 @@ async fn prewarm_worktree_sessions_boots_dead_sessions() {
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c2, Duration::from_secs(10), |evs| {
-        let agent_alive = evs.iter().any(|e| {
-            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
-                if a.id == agent_id && a.alive)
-        });
-        let term_alive = evs.iter().any(|e| {
-            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Terminal(t) }
-                if t.id == term_id && t.alive)
-        });
-        agent_alive && term_alive
+    write_frame(
+        &mut c2,
+        &ClientRequest::RenameTerminal {
+            req_id: 3,
+            id: term_id.clone(),
+            name: "still-dead".into(),
+        },
+    )
+    .await
+    .unwrap();
+    read_events_until(&mut c2, Duration::from_secs(5), |evs| {
+        find_ack(evs, 3).is_some()
     })
     .await;
-    // …and never touches the archived agent.
-    assert!(
-        !events.iter().any(|e| {
-            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
-                if a.id == archived_id && a.alive)
-        }),
-        "archived agent stayed dead: {events:#?}"
-    );
 
-    write_frame(&mut c2, &ClientRequest::Shutdown)
+    let mut c3 = connect(&env.sock()).await;
+    handshake(&mut c3).await;
+    write_frame(&mut c3, &ClientRequest::Subscribe)
+        .await
+        .unwrap();
+    let events = read_events_until(&mut c3, Duration::from_secs(5), |evs| {
+        evs.iter()
+            .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
+    })
+    .await;
+    let Some(ServerEvent::Snapshot { terminals, .. }) = events
+        .iter()
+        .find(|e| matches!(e, ServerEvent::Snapshot { .. }))
+    else {
+        panic!("expected snapshot");
+    };
+    let term = terminals.iter().find(|t| t.id == term_id).expect("terminal row");
+    assert!(!term.alive, "the retired prewarm booted a session: {term:#?}");
+
+    write_frame(&mut c3, &ClientRequest::Shutdown)
         .await
         .unwrap();
     wait_for_exit(&mut daemon2);
@@ -3233,11 +3149,224 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
     );
     assert!(
         !term_reaped(&events),
-        "in-view terminal spared: {events:#?}"
+        "busy terminal still spared: {events:#?}"
     );
     assert!(
         !pinned_reaped(&events),
         "pinned agent still spared: {events:#?}"
+    );
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
+/// "In view" is the attached session, not its whole worktree: workers pile
+/// up on the primary, so a sibling the user isn't attached to is reaped once
+/// it idles past the timeout while the attached one stays up.
+#[tokio::test]
+async fn idle_reaper_kills_unattached_sibling_on_viewed_worktree() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    env.write_config(r#"{"session_idle_timeout": "2s"}"#);
+    let mut daemon = env.spawn_daemon_with("/bin/sh", &[("NEBULA_IDLE_REAP_MS", "200")]);
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+
+    let mut ids = Vec::new();
+    for (req_id, name) in [(2, "watched"), (3, "sibling")] {
+        write_frame(
+            &mut c,
+            &ClientRequest::CreateAgent {
+                expected_branch: None,
+                req_id,
+                worktree: worktree.id.clone(),
+                name: name.into(),
+                kind: AgentKind::Claude,
+                model: None,
+                effort: None,
+                auto_title: false,
+                prompt: None,
+            },
+        )
+        .await
+        .unwrap();
+        let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+            find_ack(evs, req_id).is_some()
+        })
+        .await;
+        let ServerEvent::Ack {
+            created: Some(EntityId::Agent(id)),
+            ..
+        } = find_ack(&events, req_id).unwrap()
+        else {
+            panic!("CreateAgent failed: {events:#?}");
+        };
+        ids.push(id.clone());
+    }
+    let (watched_id, sibling_id) = (ids[0].clone(), ids[1].clone());
+
+    write_frame(
+        &mut c,
+        &ClientRequest::Attach {
+            session: SessionRef::Agent(watched_id.clone()),
+            from_seq: None,
+            cols: 80,
+            rows: 24,
+        },
+    )
+    .await
+    .unwrap();
+
+    let reaped = |evs: &[ServerEvent], id: &nebula_core::AgentId| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
+                if &a.id == id && !a.alive)
+        })
+    };
+    let events = read_events_until(&mut c, Duration::from_secs(10), |evs| {
+        reaped(evs, &sibling_id)
+    })
+    .await;
+    assert!(
+        !reaped(&events, &watched_id),
+        "attached agent never reaped: {events:#?}"
+    );
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
+/// A reaped agent keeps its last screen: ReadSession serves the saved text,
+/// marked stale, instead of "not running".
+#[tokio::test]
+async fn read_session_serves_the_last_screen_of_a_reaped_agent() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    env.write_config(r#"{"session_idle_timeout": "2s"}"#);
+    let mut daemon = env.spawn_daemon_with("/bin/sh", &[("NEBULA_IDLE_REAP_MS", "200")]);
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let agent_id = create_agent_get_id(&mut c, &worktree.id, "worker", 2).await;
+    let sref = SessionRef::Agent(agent_id.clone());
+
+    let marker = "nebula_reaped_screen_marker";
+    {
+        let mut viewer = connect(&env.sock()).await;
+        handshake(&mut viewer).await;
+        write_frame(
+            &mut viewer,
+            &ClientRequest::Attach {
+                session: sref.clone(),
+                from_seq: None,
+                cols: 80,
+                rows: 24,
+            },
+        )
+        .await
+        .unwrap();
+        write_frame(
+            &mut viewer,
+            &ClientRequest::Input {
+                session: sref.clone(),
+                data: format!("echo {marker}\n").into_bytes(),
+            },
+        )
+        .await
+        .unwrap();
+        read_events_until(&mut viewer, Duration::from_secs(5), |evs| {
+            String::from_utf8_lossy(&collected_output(evs))
+                .matches(marker)
+                .count()
+                >= 2
+        })
+        .await;
+    }
+
+    read_events_until(&mut c, Duration::from_secs(10), |evs| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
+                if a.id == agent_id && !a.alive)
+        })
+    })
+    .await;
+
+    write_frame(
+        &mut c,
+        &ClientRequest::ReadSession {
+            req_id: 9,
+            session: sref.clone(),
+            lines: None,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        find_ack(evs, 9).is_some()
+            || evs
+                .iter()
+                .any(|e| matches!(e, ServerEvent::SessionText { req_id: 9, .. }))
+    })
+    .await;
+    let text = events
+        .iter()
+        .find_map(|e| match e {
+            ServerEvent::SessionText {
+                req_id: 9, text, ..
+            } => Some(text.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("reaped agent has no saved screen: {events:#?}"));
+    assert!(text.contains(marker), "saved screen has the echo: {text:?}");
+    assert!(
+        text.lines().next().is_some_and(|l| l.contains("not running")),
+        "saved screen is marked stale: {text:?}"
+    );
+    let cli = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        .args(["agent", "read", "--project", "repo", "--", "worker"])
+        .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
+        .output()
+        .unwrap();
+    assert!(cli.status.success(), "`nebula agent read` on a reaped agent: {cli:?}");
+    assert!(
+        String::from_utf8_lossy(&cli.stdout).contains(marker),
+        "`nebula agent read` prints the saved screen: {cli:?}"
+    );
+
+    write_frame(
+        &mut c,
+        &ClientRequest::DeleteAgent {
+            req_id: 10,
+            id: agent_id.clone(),
+        },
+    )
+    .await
+    .unwrap();
+    read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        find_ack(evs, 10).is_some()
+    })
+    .await;
+    write_frame(
+        &mut c,
+        &ClientRequest::ReadSession {
+            req_id: 11,
+            session: sref.clone(),
+            lines: None,
+        },
+    )
+    .await
+    .unwrap();
+    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        find_ack(evs, 11).is_some()
+            || evs
+                .iter()
+                .any(|e| matches!(e, ServerEvent::SessionText { req_id: 11, .. }))
+    })
+    .await;
+    assert!(
+        matches!(find_ack(&events, 11), Some(ServerEvent::Error { .. })),
+        "a deleted agent's saved screen is gone: {events:#?}"
     );
 
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();

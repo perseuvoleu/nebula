@@ -17,6 +17,11 @@ use std::path::{Path, PathBuf};
 /// is reaped).
 pub const SESSION_IDLE_TIMEOUTS: &[&str] = &["off", "1m", "5m", "15m", "30m", "1h"];
 
+/// Values the settings overlay cycles through for `auto_archive_after`
+/// (daemon-owned: how long finished/fresh/disconnected agents stay
+/// unarchived).
+pub const AUTO_ARCHIVE_AFTERS: &[&str] = &["off", "1h", "12h", "24h", "72h", "168h"];
+
 /// Editor commands the settings overlay cycles through. Every entry
 /// accepts `+<line> <file>`, which is how the overlays launch it. As with
 /// models, hand-edited configs can name any command the list doesn't.
@@ -91,6 +96,7 @@ pub enum SettingKind {
     Editor,
     SkipSessionNaming,
     SessionIdleTimeout,
+    AutoArchiveAfter,
     Notifications,
     Theme,
     Animations,
@@ -139,6 +145,11 @@ pub const SETTINGS_TABS: &[SettingsTab] = &[
                 kind: SettingKind::SessionIdleTimeout,
                 label: "Idle session timeout",
                 hint: "Kill idle sessions in unviewed worktrees (pinned/busy spared; off disables)",
+            },
+            SettingSpec {
+                kind: SettingKind::AutoArchiveAfter,
+                label: "Auto-archive after",
+                hint: "Archive sessions idle this long (pinned/busy/attached spared; off disables)",
             },
             SettingSpec {
                 kind: SettingKind::Notifications,
@@ -352,6 +363,10 @@ pub struct Config {
     /// disables. Owned by the daemon (which does the parsing and reaping);
     /// the TUI writes it so the settings overlay can cycle it.
     pub session_idle_timeout: String,
+    /// How long an unpinned agent may sit finished, fresh or disconnected
+    /// before the daemon archives it: "24h" by default; "off" disables.
+    /// Daemon-owned like `session_idle_timeout`.
+    pub auto_archive_after: String,
     /// Post a macOS notification when the window isn't focused and an
     /// agent flips to needs-feedback or finishes a run. No-op on other
     /// platforms.
@@ -393,6 +408,7 @@ impl Default for Config {
             editor: "vim".into(),
             skip_session_naming: false,
             session_idle_timeout: "5m".into(),
+            auto_archive_after: "24h".into(),
             notifications: true,
             theme: "default".into(),
             animations: true,
@@ -450,6 +466,10 @@ impl Config {
         obj.insert(
             "session_idle_timeout".into(),
             serde_json::json!(self.session_idle_timeout),
+        );
+        obj.insert(
+            "auto_archive_after".into(),
+            serde_json::json!(self.auto_archive_after),
         );
         obj.insert(
             "notifications".into(),
@@ -527,6 +547,7 @@ impl Config {
             SettingKind::Editor => self.editor.clone(),
             SettingKind::SkipSessionNaming => on_off(self.skip_session_naming).into(),
             SettingKind::SessionIdleTimeout => self.session_idle_timeout.clone(),
+            SettingKind::AutoArchiveAfter => self.auto_archive_after.clone(),
             SettingKind::Notifications => on_off(self.notifications).into(),
             SettingKind::Theme => self.theme.clone(),
             SettingKind::Animations => on_off(self.animations).into(),
@@ -564,6 +585,10 @@ impl Config {
             SettingKind::SessionIdleTimeout => {
                 self.session_idle_timeout =
                     cycle_choice(&self.session_idle_timeout, SESSION_IDLE_TIMEOUTS, step).into();
+            }
+            SettingKind::AutoArchiveAfter => {
+                self.auto_archive_after =
+                    cycle_choice(&self.auto_archive_after, AUTO_ARCHIVE_AFTERS, step).into();
             }
             SettingKind::Notifications => {
                 self.notifications = !self.notifications;
@@ -783,6 +808,26 @@ mod tests {
     }
 
     #[test]
+    fn auto_archive_after_cycles_and_persists() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.auto_archive_after, "24h");
+        let (tab, row) = locate(SettingKind::AutoArchiveAfter).unwrap();
+        assert_eq!(locate(SettingKind::SessionIdleTimeout).unwrap(), (tab, row - 1));
+        cfg.cycle(tab, row, 1);
+        assert_eq!(cfg.auto_archive_after, "72h");
+        cfg.cycle(tab, row, -2);
+        assert_eq!(cfg.auto_archive_after, "12h");
+        cfg.cycle(tab, row, -2);
+        assert_eq!(cfg.auto_archive_after, "off");
+        assert_eq!(cfg.value_label(SettingKind::AutoArchiveAfter), "off");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        cfg.save_to(&path).unwrap();
+        assert_eq!(load_from(&path).auto_archive_after, "off");
+    }
+
+    #[test]
     fn theme_cycles_through_presets_and_resolves() {
         let mut cfg = Config::default();
         assert_eq!(cfg.theme, "default");
@@ -914,7 +959,8 @@ mod tests {
             r#"{
   "git_init_on_create": false,
   "future_daemon_flag": true,
-  "recent_window": "5m"
+  "recent_window": "5m",
+  "prewarm_sessions": true
 }
 "#,
         )
@@ -931,6 +977,7 @@ mod tests {
         assert_eq!(saved["palette_enter_attaches"], false);
         assert_eq!(saved["git_init_on_create"], true);
         assert_eq!(saved["recent_window"], "5m", "a retired key is left alone");
+        assert_eq!(saved["prewarm_sessions"], true, "a retired key is left alone");
         assert_eq!(saved["future_daemon_flag"], true);
     }
 
