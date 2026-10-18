@@ -7747,12 +7747,9 @@ fn park_mounted_term(app: &mut App, out: &mut Vec<ClientRequest>) {
 }
 
 fn mount_session(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
-    // Entering ANY session of a worktree marks all of its unseen-finished
-    // sessions seen at once — before the dedupe early-returns below, so
-    // re-entering the already-attached session still counts as a visit.
-    if let Some(worktree) = app.worktree_of_sref(&sref) {
-        app.mark_worktree_seen(&worktree);
-    }
+    // Before the dedupe early-returns below, so re-entering the
+    // already-attached session still counts as a visit.
+    app.mark_session_seen(&sref);
     // The ⌘D split's shell never mounts as the left/primary pane: that
     // would show the same PTY in both halves, and the second Attach
     // rebinds the daemon-side forward task out from under the split.
@@ -9777,22 +9774,22 @@ fn should_notify(prev: AgentStatus, next: AgentStatus, focused: bool) -> Option<
 }
 
 /// A session just flipped to Finished: give it the blue "unseen" accent
-/// unless the user is currently attached inside its worktree (either
-/// pane) — a finish on the worktree they're watching counts as seen, so
-/// it never needs clicking away. The accent clears per-worktree on the
-/// next [`attach`].
+/// unless the user is attached to that very session (either pane). The
+/// accent clears only when that session is entered.
 fn mark_unseen_finished(app: &mut App, agent: &AgentId) {
-    let Some(a) = app.tree.agents.iter().find(|a| &a.id == agent) else {
-        return;
-    };
-    if a.archived {
+    if !app
+        .tree
+        .agents
+        .iter()
+        .any(|a| &a.id == agent && !a.archived)
+    {
         return;
     }
-    let worktree = a.worktree_id.clone();
+    let sref = SessionRef::Agent(agent.clone());
     let viewing = [app.term.as_ref(), app.split_term.as_ref()]
         .into_iter()
         .flatten()
-        .any(|t| app.worktree_of_sref(&t.sref).as_ref() == Some(&worktree));
+        .any(|t| t.sref == sref);
     if !viewing {
         app.unseen_finished.insert(agent.clone());
         app.dirty = true;
@@ -14091,11 +14088,10 @@ mod tests {
         );
     }
 
-    /// Attaching to ANY session of a worktree validates every unseen
-    /// finish on it at once — the user shouldn't have to enter each one.
-    /// Other worktrees' marks stay put.
+    /// Only entering the session itself clears its unseen mark: siblings
+    /// on the same worktree, or another worktree, keep theirs.
     #[test]
-    fn attaching_a_sibling_session_marks_the_whole_worktree_seen() {
+    fn attaching_a_session_marks_only_that_session_seen() {
         let mut app = App::new();
         seed_tree(&mut app);
         seed_extra_worktrees(&mut app, 2, 2);
@@ -14109,24 +14105,25 @@ mod tests {
         let mut out = Vec::new();
         attach(&mut app, SessionRef::Agent(AgentId("a2".into())), &mut out);
         assert!(
-            !app.unseen_finished.contains(&AgentId("a1".into())),
-            "entering the sibling validated a1 too"
-        );
-        assert!(
             !app.unseen_finished.contains(&AgentId("a2".into())),
             "the entered session is seen"
+        );
+        assert!(
+            app.unseen_finished.contains(&AgentId("a1".into())),
+            "a sibling on the same worktree stays unseen"
         );
         assert!(
             app.unseen_finished.contains(&AgentId("a3".into())),
             "another worktree's unseen finish is untouched"
         );
 
+        attach(&mut app, SessionRef::Agent(AgentId("a1".into())), &mut out);
         attach(&mut app, SessionRef::Agent(AgentId("a3".into())), &mut out);
         assert!(app.unseen_finished.is_empty());
     }
 
-    /// A finish the user is watching — attached to the session itself, or
-    /// to any session on the same worktree — never marks unseen.
+    /// Only a finish of the attached session itself is seen live; a
+    /// sibling finishing on the same worktree is unseen.
     #[test]
     fn finishing_while_attached_never_marks_unseen() {
         let mut app = App::new();
@@ -14144,8 +14141,8 @@ mod tests {
         );
         finish(&mut app, "a2");
         assert!(
-            app.unseen_finished.is_empty(),
-            "a sibling finishing on the watched worktree is seen live"
+            app.unseen_finished.contains(&AgentId("a2".into())),
+            "a sibling finishing on the same worktree is unseen"
         );
         finish(&mut app, "a3");
         assert!(

@@ -3213,20 +3213,12 @@ impl App {
         }
     }
 
-    /// Attaching anywhere on a worktree validates every unseen-finished
-    /// session on it at once — the user shouldn't have to walk into each
-    /// one to drop its blue accent.
-    pub fn mark_worktree_seen(&mut self, worktree: &WorktreeId) {
-        let tree = &self.tree;
-        let before = self.unseen_finished.len();
-        self.unseen_finished.retain(|id| {
-            tree.agents
-                .iter()
-                .find(|a| &a.id == id)
-                .is_some_and(|a| &a.worktree_id != worktree)
-        });
-        if self.unseen_finished.len() != before {
-            self.dirty = true;
+    /// Entering a session drops its blue unseen-finished accent.
+    pub fn mark_session_seen(&mut self, sref: &SessionRef) {
+        if let SessionRef::Agent(id) = sref {
+            if self.unseen_finished.remove(id) {
+                self.dirty = true;
+            }
         }
     }
 
