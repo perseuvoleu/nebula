@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import serverless
 from server import Gateway, Handler, Problem, PushService, StaticFiles, ThreadingHTTPServer
 from test_pi_history import SID_A, SID_B, assistant, user, write_session
 
@@ -401,7 +402,7 @@ class HTTPTests(unittest.TestCase):
 
     def test_shell_assets_and_route_fallback(self):
         for path in ["/", "/assets/app-abc123.js", "/manifest.webmanifest", "/icon.svg", "/sw.js",
-                     "/p/project", "/p/project/s/one"]:
+                     "/p/project", "/p/project/s/one", "/serverless"]:
             status, headers, body = self.request(path)
             self.assertEqual(status, 200, path)
             self.assertTrue(body)
@@ -428,6 +429,18 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(headers["Cache-Control"], "no-store")
         self.assertEqual(set(json.loads(body)), {"codex", "claude"})
         self.assertEqual(self.request("/api/usage", headers=self.auth(Origin="https://evil.example"))[0], 403)
+
+    def test_serverless_runs_are_authenticated_and_explicit_when_unconfigured(self):
+        self.assertEqual(self.request("/api/serverless/runs")[0], 401)
+        status, headers, body = self.request("/api/serverless/runs", headers=self.auth())
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertEqual(json.loads(body), {"configured": False, "runs": []})
+        upstream = SimpleNamespace(get=lambda limit: (_ for _ in ()).throw(
+            serverless.ServerlessError(504, "Worker-ul serverless nu a răspuns la timp")))
+        with patch.object(self.server.gateway, "serverless", upstream):
+            status, _, body = self.request("/api/serverless/runs?limit=5", headers=self.auth())
+        self.assertEqual((status, json.loads(body)), (504, {"error": "Worker-ul serverless nu a răspuns la timp"}))
 
     def test_wrong_host_and_origin(self):
         self.assertEqual(self.request("/", headers={"Host": "evil.example"})[0], 403)

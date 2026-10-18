@@ -25,12 +25,13 @@ from urllib.parse import parse_qs, quote, urlsplit
 
 import pi_history
 import claude_history
+import serverless
 import usage
 
 STATIC = Path(__file__).parent / "static"
 KINDS = {"pi", "claude", "codex", "cursor"}
 ATTEMPT = re.compile(r"[A-Za-z0-9_-]{4,64}")
-ROUTE = re.compile(r"/(?:p/[A-Za-z0-9._@-]{1,80}(?:/s/[A-Za-z0-9._-]{1,80})?)?/?")
+ROUTE = re.compile(r"/(?:serverless|p/[A-Za-z0-9._@-]{1,80}(?:/s/[A-Za-z0-9._-]{1,80})?)?/?")
 ASSET_TYPES = {".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml",
                ".png": "image/png", ".ico": "image/x-icon", ".webmanifest": "application/manifest+json",
                ".json": "application/json", ".woff2": "font/woff2", ".woff": "font/woff", ".txt": "text/plain",
@@ -222,7 +223,7 @@ class StaticFiles:
 
 
 class Gateway:
-    def __init__(self, token, origin, projects, binary="nebula", static=None, pi_agent_dir=None, db_path=None, *, preview_binary=None, push=None, usage_service, claude_config_dir=None):
+    def __init__(self, token, origin, projects, binary="nebula", static=None, pi_agent_dir=None, db_path=None, *, preview_binary=None, push=None, usage_service, claude_config_dir=None, serverless_runs=None):
         if len(token) < 8:
             raise ValueError("NEBULA_WEB_TOKEN must contain at least 8 characters")
         parsed = urlsplit(origin)
@@ -252,6 +253,7 @@ class Gateway:
         self.push = push
         # None explicitly disables provider reads (e.g. synthetic previews).
         self.usage = usage_service
+        self.serverless = serverless_runs
 
     def run(self, *args, json_output=True, binary=None):
         if not self.slots.acquire(blocking=False):
@@ -379,6 +381,13 @@ class Gateway:
     def get(self, path, query):
         if path == "/api/usage":
             return self.usage.get() if self.usage else usage.unavailable()
+        if path == "/api/serverless/runs":
+            if not self.serverless:
+                return serverless.unconfigured()
+            try:
+                return self.serverless.get(query.get("limit", [None])[0])
+            except serverless.ServerlessError as error:
+                raise Problem(error.status, error.message)
         if path == "/api/projects":
             return {"projects": self.projects, "host": self.hostname}
         if path == "/api/push":
@@ -654,7 +663,8 @@ def main():
                       db_path=os.environ.get("NEBULA_WEB_DB") or None,
                       claude_config_dir=os.environ.get("NEBULA_WEB_CLAUDE_DIR") or os.environ.get("CLAUDE_CONFIG_DIR"),
                       preview_binary=os.environ.get("NEBULA_WEB_PREVIEW_BINARY"), push=push,
-                      usage_service=usage.from_environment() if os.environ.get("NEBULA_WEB_USAGE", "1") != "0" else None)
+                      usage_service=usage.from_environment() if os.environ.get("NEBULA_WEB_USAGE", "1") != "0" else None,
+                      serverless_runs=serverless.from_environment())
     if not gateway.static.files.get("/index.html"):
         raise SystemExit(f"No built app in {gateway.static.root}; run `pnpm --dir web/app build` first")
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
