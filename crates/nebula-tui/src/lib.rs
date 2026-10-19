@@ -255,11 +255,10 @@ pub fn run_agent_wait(
     timeout: u64,
     project: Option<String>,
 ) -> Result<()> {
-    if let ipc::WaitEnd::Message { from } =
+    if let ipc::WaitEnd::Message =
         runtime()?.block_on(ipc::agent_wait(names, any, timeout, project))?
     {
-        let from = from.map_or(String::new(), |name| format!(" from \"{name}\""));
-        eprintln!("a message{from} is queued for this session; wait ended early");
+        eprintln!("a message is queued for this session; wait ended early");
         std::process::exit(3);
     }
     Ok(())

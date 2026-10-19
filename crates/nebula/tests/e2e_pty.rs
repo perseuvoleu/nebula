@@ -1246,7 +1246,16 @@ async fn agent_wait_any_returns_first_settled_worker() {
 
     let waiting = agent_cli(
         &env,
-        &["wait", "w1", "w2", "--any", "--timeout", "30"],
+        &[
+            "wait",
+            "w1",
+            "w2",
+            "--any",
+            "--timeout",
+            "30",
+            "--project",
+            "repo",
+        ],
         None,
     )
     .spawn()
@@ -1271,9 +1280,13 @@ async fn agent_wait_any_returns_first_settled_worker() {
     assert_eq!(rows[0]["name"], "w1");
     assert_eq!(rows[0]["status"], "finished");
 
-    let all = agent_cli(&env, &["wait", "w1", "w2", "--timeout", "1"], None)
-        .output()
-        .unwrap();
+    let all = agent_cli(
+        &env,
+        &["wait", "w1", "w2", "--timeout", "1", "--project", "repo"],
+        None,
+    )
+    .output()
+    .unwrap();
     assert!(
         !all.status.success(),
         "a wait without --any needs every worker settled: {all:?}"
@@ -1306,14 +1319,22 @@ async fn agent_wait_returns_early_when_the_caller_gets_a_message() {
     attach_agent(&mut c, &worker).await;
     emit_progress(&mut c, &worker, "3", nebula_core::AgentStatus::Running).await;
 
-    let waiting = agent_cli(&env, &["wait", "worker", "--timeout", "30"], Some(&lead))
-        .spawn()
-        .unwrap();
+    let waiting = agent_cli(
+        &env,
+        &["wait", "worker", "--timeout", "30", "--project", "repo"],
+        Some(&lead),
+    )
+    .spawn()
+    .unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
     let sent_at = std::time::Instant::now();
-    let send = agent_cli(&env, &["send", "lead", "status?"], None)
-        .output()
-        .unwrap();
+    let send = agent_cli(
+        &env,
+        &["send", "lead", "status?", "--project", "repo"],
+        None,
+    )
+    .output()
+    .unwrap();
     assert!(send.status.success(), "send failed: {send:?}");
 
     let out = tokio::task::spawn_blocking(move || waiting.wait_with_output().unwrap())
@@ -1334,6 +1355,167 @@ async fn agent_wait_returns_early_when_the_caller_gets_a_message() {
 
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
     wait_for_exit(&mut daemon);
+}
+
+/// A message that lands while `agent wait` is still connecting counts: the
+/// wait is frozen right after it opened its daemon connection (before the
+/// snapshot), the message is sent, and the resumed wait must exit 3.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn agent_wait_counts_a_message_sent_while_it_starts() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let mut daemon = env.spawn_daemon();
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let lead = create_agent_get_id(&mut c, &worktree.id, "lead", 2).await;
+    let worker = create_agent_get_id(&mut c, &worktree.id, "worker", 3).await;
+    attach_agent(&mut c, &lead).await;
+    attach_agent(&mut c, &worker).await;
+    emit_progress(&mut c, &worker, "3", nebula_core::AgentStatus::Running).await;
+
+    let waiting = agent_cli(
+        &env,
+        &["wait", "worker", "--timeout", "10", "--project", "repo"],
+        Some(&lead),
+    )
+    .spawn()
+    .unwrap();
+    let pid = waiting.id().to_string();
+    let fds = format!("/proc/{pid}/fd");
+    let connected = || {
+        std::fs::read_dir(&fds)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|fd| {
+                std::fs::read_link(fd.path())
+                    .is_ok_and(|l| l.to_string_lossy().starts_with("socket:"))
+            })
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !connected() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "wait never connected to the daemon"
+        );
+        std::thread::yield_now();
+    }
+    let signal = |sig: &str| {
+        let ok = std::process::Command::new("kill")
+            .args([sig, &pid])
+            .status()
+            .unwrap();
+        assert!(ok.success(), "kill {sig} {pid}");
+    };
+    signal("-STOP");
+    let send = agent_cli(
+        &env,
+        &["send", "lead", "status?", "--project", "repo"],
+        None,
+    )
+    .output()
+    .unwrap();
+    assert!(send.status.success(), "send failed: {send:?}");
+    signal("-CONT");
+
+    let out = tokio::task::spawn_blocking(move || waiting.wait_with_output().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "a message sent during startup ends the wait with 3: {out:?}"
+    );
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
+/// A lead on the laptop steering a worker on findl: the send goes through
+/// the viewer daemon's relay, and the wait running on the host must still
+/// end with 3 while the worker it waits on keeps running.
+#[tokio::test]
+async fn agent_wait_on_a_host_returns_early_for_a_relayed_send() {
+    let host_env = TestEnv::new();
+    let repo = host_env.make_repo();
+    let mut host_daemon = host_env.spawn_daemon();
+    let mut h = connect(&host_env.sock()).await;
+    handshake(&mut h).await;
+    let worktree = add_project_get_main_worktree(&mut h, &repo).await;
+    let lead = create_agent_get_id(&mut h, &worktree.id, "lead", 2).await;
+    let worker = create_agent_get_id(&mut h, &worktree.id, "worker", 3).await;
+    attach_agent(&mut h, &lead).await;
+    attach_agent(&mut h, &worker).await;
+    emit_progress(&mut h, &worker, "3", nebula_core::AgentStatus::Running).await;
+
+    let proxy = format!(
+        "NEBULA_RUNTIME_DIR='{}' NEBULA_DATA_DIR='{}' '{}' proxy",
+        host_env.runtime_dir.display(),
+        host_env.tmp.path().join("data").display(),
+        env!("CARGO_BIN_EXE_nebula")
+    );
+    let env = TestEnv::new();
+    let mut daemon = env.spawn_daemon_with("/bin/sh", &[("NEBULA_RELAY_CMD", proxy.as_str())]);
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    write_frame(&mut c, &ClientRequest::Subscribe)
+        .await
+        .unwrap();
+    write_frame(
+        &mut c,
+        &ClientRequest::AddProject {
+            req_id: 1,
+            path: repo.clone(),
+            name: None,
+            create_missing: false,
+            host: Some("testhost".into()),
+        },
+    )
+    .await
+    .unwrap();
+    read_events_until(&mut c, Duration::from_secs(15), |evs| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
+                if a.id == lead && a.alive)
+        })
+    })
+    .await;
+
+    let waiting = agent_cli(
+        &host_env,
+        &["wait", "worker", "--timeout", "30", "--project", "repo"],
+        Some(&lead),
+    )
+    .spawn()
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let send = agent_cli(
+        &env,
+        &["send", "lead", "status?", "--project", "repo@testhost"],
+        None,
+    )
+    .output()
+    .unwrap();
+    assert!(send.status.success(), "relayed send failed: {send:?}");
+
+    let out = tokio::task::spawn_blocking(move || waiting.wait_with_output().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "a relayed message ends the host-side wait with 3: {out:?}"
+    );
+    let rows: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(rows, serde_json::json!([]), "the worker is still running");
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+    write_frame(&mut h, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut host_daemon);
 }
 
 async fn attach_agent(c: &mut UnixStream, agent: &nebula_core::AgentId) {
@@ -1376,8 +1558,8 @@ async fn emit_progress(
     .await;
 }
 
-/// `nebula agent <args> --project repo` against the test daemon, run as the
-/// session `caller` when given (as from inside it), else as no session.
+/// `nebula agent <args>` against the test daemon, run as the session
+/// `caller` when given (as from inside it), else as no session.
 fn agent_cli(
     env: &TestEnv,
     args: &[&str],
@@ -1386,7 +1568,6 @@ fn agent_cli(
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"));
     cmd.arg("agent")
         .args(args)
-        .args(["--project", "repo"])
         .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());

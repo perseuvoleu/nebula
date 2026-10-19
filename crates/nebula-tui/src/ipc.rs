@@ -1415,12 +1415,6 @@ pub async fn agent_send(name: String, text: String, project_flag: Option<String>
         .await?;
         await_ack(&mut conn, req_id, &mut Vec::new()).await?;
     }
-    let from = env_agent_id()
-        .and_then(|id| agents.iter().find(|s| s.id.as_str() == id))
-        .map(|s| s.name.clone());
-    if let Err(e) = append_inbox(a.id.as_str(), from.as_deref()) {
-        eprintln!("warning: sent, but a wait in \"{name}\" will not return early: {e}");
-    }
     println!(
         "{}",
         serde_json::json!({
@@ -1429,18 +1423,6 @@ pub async fn agent_send(name: String, text: String, project_flag: Option<String>
             "sent": text,
         })
     );
-    Ok(())
-}
-
-fn append_inbox(agent_id: &str, from: Option<&str>) -> Result<()> {
-    use std::io::Write;
-    let path = paths::inbox_path(agent_id);
-    std::fs::create_dir_all(path.parent().context("inbox path has no parent")?)?;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
-    writeln!(file, "{}", serde_json::json!({ "from": from }))?;
     Ok(())
 }
 
@@ -1760,10 +1742,8 @@ fn agent_settled(status: nebula_core::AgentStatus) -> bool {
 /// Why `agent wait` stopped short of its timeout.
 pub enum WaitEnd {
     Settled,
-    /// `agent send` queued a message for the waiting session itself.
-    Message {
-        from: Option<String>,
-    },
+    /// A message was submitted to the waiting session itself.
+    Message,
 }
 
 /// `nebula agent wait [<name>...] [--any] [--timeout <secs>] [--project <name>]`:
@@ -1772,14 +1752,29 @@ pub enum WaitEnd {
 /// project has. Also returns once a message is sent to the calling session.
 /// Prints the settled targets as JSON (same shape as `agent list`); errors
 /// out past --timeout. Composes the existing Subscribe stream (snapshot +
-/// StatusChanged / EntityUpserted deltas) and the inbox file `agent send`
-/// appends to, so no protocol bump — works against a running daemon.
+/// StatusChanged / EntityUpserted deltas) and the inbox file the session's
+/// daemon appends to, so no protocol bump — works against a running daemon
+/// (one older than the inbox just never ends a wait early).
 pub async fn agent_wait(
     names: Vec<String>,
     any: bool,
     timeout_secs: u64,
     project_flag: Option<String>,
 ) -> Result<WaitEnd> {
+    let self_id = std::env::var("NEBULA_AGENT_ID")
+        .ok()
+        .filter(|v| !v.is_empty());
+    // Measured before any await: a message submitted while this wait is
+    // still connecting is newer than the baseline and ends it. Anything
+    // older reached the session before it called `agent wait`.
+    let inbox = self_id.as_deref().map(paths::inbox_path);
+    let inbox_len = |inbox: &Option<std::path::PathBuf>| {
+        inbox
+            .as_ref()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map_or(0, |m| m.len())
+    };
+    let inbox_start = inbox_len(&inbox);
     let sock = paths::socket_path();
     let Ok(stream) = try_connect(&sock).await else {
         bail!("no nebula daemon is running");
@@ -1787,9 +1782,6 @@ pub async fn agent_wait(
     let mut conn = handshake(stream).await?;
     let (projects, mut worktrees, mut agents) = subscribe_snapshot(&mut conn).await?;
     let project = resolve_project(&projects, &worktrees, &agents, project_flag.as_deref())?;
-    let self_id = std::env::var("NEBULA_AGENT_ID")
-        .ok()
-        .filter(|v| !v.is_empty());
 
     let in_project = |a: &nebula_core::Agent, worktrees: &[nebula_core::Worktree]| {
         worktrees
@@ -1849,16 +1841,6 @@ pub async fn agent_wait(
         let pending = pending(agents).len();
         pending == 0 || (any && pending < targets.len())
     };
-    // Only lines appended after the wait began count: anything older was
-    // already delivered to this session before it called `agent wait`.
-    let inbox = self_id.as_deref().map(paths::inbox_path);
-    let inbox_len = |inbox: &Option<std::path::PathBuf>| {
-        inbox
-            .as_ref()
-            .and_then(|p| std::fs::metadata(p).ok())
-            .map_or(0, |m| m.len())
-    };
-    let inbox_start = inbox_len(&inbox);
     // Frames come off a reader task so the inbox check below can interrupt
     // the wait without cancelling a half-read frame.
     let (frame_tx, mut frames) = tokio::sync::mpsc::unbounded_channel();
@@ -1878,9 +1860,7 @@ pub async fn agent_wait(
             break WaitEnd::Settled;
         }
         if inbox_len(&inbox) > inbox_start {
-            break WaitEnd::Message {
-                from: last_sender(inbox.as_deref()),
-            };
+            break WaitEnd::Message;
         }
         if tokio::time::Instant::now() >= deadline {
             bail!(
@@ -1944,12 +1924,6 @@ pub async fn agent_wait(
         .collect();
     println!("{}", serde_json::Value::Array(rows));
     Ok(end)
-}
-
-fn last_sender(inbox: Option<&std::path::Path>) -> Option<String> {
-    let text = std::fs::read_to_string(inbox?).ok()?;
-    let line: serde_json::Value = serde_json::from_str(text.lines().last()?).ok()?;
-    line["from"].as_str().map(str::to_owned)
 }
 
 pub enum NotesOp {

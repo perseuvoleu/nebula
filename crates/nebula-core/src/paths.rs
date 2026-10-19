@@ -34,10 +34,11 @@ pub fn pidfile_path() -> PathBuf {
     runtime_dir().join("daemon.pid")
 }
 
-/// One line per `nebula agent send` to this agent, appended by the sender.
-/// A session blocked in `nebula agent wait` watches its own file so a
-/// message queued behind the wait ends it early. Lives beside the socket,
-/// so only senders on the same host reach it.
+/// One byte per Enter typed into this agent's PTY (`nebula agent send`, the
+/// TUI, the web app), appended by the daemon that owns the session — so a
+/// relayed send lands on the session's host. A session blocked in `nebula
+/// agent wait` watches its own file so a message queued behind the wait
+/// ends it early.
 pub fn inbox_path(agent_id: &str) -> PathBuf {
     runtime_dir().join("inbox").join(agent_id)
 }

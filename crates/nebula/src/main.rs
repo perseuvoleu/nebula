@@ -361,9 +361,12 @@ enum AgentCommand {
     /// row shape. No names means every unarchived worker of the project.
     ///
     /// Exit codes: 0 the workers settled (with --any, at least one);
-    /// 1 timed out or failed; 3 a message was sent to the calling session
-    /// (`agent send` from this host), which ends the wait early so the
-    /// session reads it — stdout then lists only the workers already settled.
+    /// 1 timed out or failed; 3 a message was submitted to the calling
+    /// session (`agent send` from any host or version, the TUI, the web app),
+    /// which ends the wait early so the session reads it — stdout then lists
+    /// only the workers already settled. Exit 3 needs the daemon on the
+    /// session's host to be this build or newer; an older one never ends a
+    /// wait early.
     Wait {
         /// Session names to wait on (as shown in the panels).
         names: Vec<String>,

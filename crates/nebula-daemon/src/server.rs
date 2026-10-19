@@ -246,17 +246,22 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     });
                 }
                 ClientRequest::InputAcknowledged { req_id, id, project, data } => {
+                    let session = SessionRef::Agent(id.clone());
                     let result = daemon.validate_agent_project(&id, &project).and_then(|_| {
-                        daemon.session(&SessionRef::Agent(id))
+                        daemon.session(&session)
                             .ok_or_else(|| anyhow::anyhow!("Session has no live PTY"))
                             .and_then(|s| s.write_input_whole(&data))
                     });
+                    if result.is_ok() {
+                        note_submitted(&session, &data);
+                    }
                     reply(&out_tx, req_id, result.map(|_| None)).await;
                 }
                 ClientRequest::Input { session, data } => {
                     if let Some(s) = daemon.session(&session) {
-                        if let Err(e) = s.write_input(&data) {
-                            tracing::warn!(error = %e, "pty write failed");
+                        match s.write_input(&data) {
+                            Ok(()) => note_submitted(&session, &data),
+                            Err(e) => tracing::warn!(error = %e, "pty write failed"),
                         }
                     }
                 }
@@ -834,4 +839,31 @@ fn stale_screen_text(saved: &str, lines: Option<usize>) -> String {
         text.push_str(line);
     }
     text
+}
+
+/// Enter reaching an agent's PTY submits a message, or queues it behind a
+/// running tool call. Marking it in the agent's inbox lets the session's
+/// own `nebula agent wait` return early instead of sitting on the message.
+fn note_submitted(session: &SessionRef, data: &[u8]) {
+    use std::io::Write;
+    let SessionRef::Agent(id) = session else {
+        return;
+    };
+    if !data.contains(&b'\r') {
+        return;
+    }
+    let path = nebula_core::paths::inbox_path(id.as_str());
+    let appended = path
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)?
+                .write_all(b"\n")
+        });
+    if let Err(e) = appended {
+        tracing::warn!(error = %e, path = %path.display(), "inbox mark failed");
+    }
 }
