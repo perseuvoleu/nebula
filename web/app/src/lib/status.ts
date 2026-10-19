@@ -1,6 +1,9 @@
+import type { AgentStatus } from "./types.ts";
+
 // Romanian labels for daemon statuses and agent kinds. Status is conveyed by text, never color alone.
-export const STATUS_LABEL: Record<string, string> = {
+export const STATUS_LABEL: Record<AgentStatus, string> = {
   fresh: "Nou",
+  queued: "Așteaptă memorie",
   running: "Lucrează",
   finished: "Gata",
   needs_feedback: "Așteaptă răspuns",
@@ -15,7 +18,7 @@ export const KIND_LABEL: Record<string, string> = {
   cursor: "Cursor",
 };
 
-export const statusLabel = (status: string): string => STATUS_LABEL[status] ?? status;
+export const statusLabel = (status: AgentStatus): string => STATUS_LABEL[status];
 export const kindLabel = (kind: string): string => KIND_LABEL[kind] ?? kind;
 
 export function formatTime(value: string | number | null | undefined): string {

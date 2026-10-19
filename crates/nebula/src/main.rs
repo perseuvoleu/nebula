@@ -479,9 +479,23 @@ enum AgentCommand {
         project: Option<String>,
     },
     /// Respawn a worker's CLI, resuming its stored session when one exists.
+    /// Refused for a worker queued for memory.
     Restart {
         /// Session name (as shown in the panels).
         name: String,
+        /// Project name, or `name@host` for a remote project (default: the
+        /// calling session's project).
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Start a worker queued for memory now, skipping the queue. A queued
+    /// worker otherwise starts by itself in queue order, so `--force` is
+    /// required.
+    Start {
+        /// Session name (as shown in the panels); must name one row.
+        name: String,
+        #[arg(long, required = true)]
+        force: bool,
         /// Project name, or `name@host` for a remote project (default: the
         /// calling session's project).
         #[arg(long)]
@@ -808,6 +822,9 @@ fn main() -> Result<()> {
             }
             AgentCommand::Restart { name, project } => {
                 nebula_tui::run_agent_ctl(nebula_tui::AgentCtl::Restart, name, project)
+            }
+            AgentCommand::Start { name, force: _, project } => {
+                nebula_tui::run_agent_force_start(name, project)
             }
         },
         Some(Command::Diagram { command }) => {

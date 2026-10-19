@@ -248,6 +248,11 @@ pub fn run_agent_ctl(op: AgentCtl, name: String, project: Option<String>) -> Res
     runtime()?.block_on(ipc::agent_ctl(op, name, project))
 }
 
+/// `nebula agent start <name> --force`.
+pub fn run_agent_force_start(name: String, project: Option<String>) -> Result<()> {
+    runtime()?.block_on(ipc::agent_force_start(name, project))
+}
+
 /// `nebula agent wait` — block until workers settle out of running.
 pub fn run_agent_wait(names: Vec<String>, timeout: u64, project: Option<String>) -> Result<()> {
     runtime()?.block_on(ipc::agent_wait(names, timeout, project))

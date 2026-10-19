@@ -12,13 +12,10 @@ use serde::Deserialize;
 pub struct Config {
     /// Run `git init` after AddProject creates a missing directory.
     pub git_init_on_create: bool,
-    /// Pre-spawn agent CLIs while the user is still naming the session so
-    /// creation feels instant. Costs one idle CLI process per warm slot.
-    pub prewarm_agents: bool,
-    /// Pre-spawn a worktree's dead sessions when the user's selection rests
+    /// Pre-spawn a worktree's dead shells when the user's selection rests
     /// on it, so attaching shows an already-booted screen instead of a
-    /// booting shell. Costs idle shell/CLI processes for sessions the user
-    /// may never open.
+    /// booting shell. Costs idle shell processes for tabs the user may
+    /// never open.
     pub prewarm_sessions: bool,
     /// Clone a matching primary checkout's top-level `node_modules` into new
     /// worktrees with APFS copy-on-write. Failures are ignored and Nebula
@@ -41,7 +38,6 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             git_init_on_create: true,
-            prewarm_agents: true,
             prewarm_sessions: true,
             seed_node_modules: true,
             session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT.into(),
@@ -200,12 +196,11 @@ mod tests {
     }
 
     #[test]
-    fn defaults_enable_prewarm_and_allow_opt_out() {
-        assert!(Config::default().prewarm_agents);
-        let cfg: Config = serde_json::from_str("{}").unwrap();
-        assert!(cfg.prewarm_agents);
-        let cfg: Config = serde_json::from_str(r#"{"prewarm_agents": false}"#).unwrap();
-        assert!(!cfg.prewarm_agents);
+    fn a_config_naming_the_retired_agent_prewarm_still_loads() {
+        let cfg: Config =
+            serde_json::from_str(r#"{"prewarm_agents": true, "git_init_on_create": false}"#)
+                .unwrap();
+        assert!(!cfg.git_init_on_create);
     }
 
     #[test]

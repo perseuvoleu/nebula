@@ -4,7 +4,6 @@
 //! readings and RSS samples and act on the consumers it admits.
 
 use nebula_core::mem::{MachineMemory, ProbeError, VmPressureLevel};
-use nebula_core::AgentId;
 use std::collections::VecDeque;
 
 /// A reservation whose size is unknown: nothing is admitted beside it.
@@ -23,7 +22,7 @@ pub struct LeaseId(pub u64);
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Consumer {
     Command(LeaseId),
-    Session(AgentId),
+    SessionLaunch(LeaseId),
 }
 
 use nebula_core::Blocked;
@@ -37,6 +36,9 @@ pub enum Standing {
 #[derive(Debug, Default, PartialEq)]
 pub struct Pump {
     pub admitted: Vec<Consumer>,
+    /// Heads larger than the whole budget, dropped so they cannot block the
+    /// queue forever.
+    pub refused: Vec<Consumer>,
     pub head_blocked: Option<Blocked>,
 }
 
@@ -152,6 +154,11 @@ impl Dispatcher {
     pub fn pump(&mut self, machine: &Result<MachineMemory, ProbeError>) -> Pump {
         let mut pump = Pump::default();
         while let Some((consumer, reserved_bytes)) = self.queue.front().cloned() {
+            if reserved_bytes > self.limits.budget_bytes {
+                self.queue.pop_front();
+                pump.refused.push(consumer);
+                continue;
+            }
             if let Err(blocked) = self.room_for(reserved_bytes, machine) {
                 pump.head_blocked = Some(blocked);
                 break;
@@ -263,8 +270,8 @@ mod tests {
         Consumer::Command(LeaseId(n))
     }
 
-    fn session(id: &str) -> Consumer {
-        Consumer::Session(AgentId(id.into()))
+    fn session(n: u64) -> Consumer {
+        Consumer::SessionLaunch(LeaseId(n))
     }
 
     struct Job {
@@ -458,6 +465,7 @@ mod tests {
                     vec![]
                 },
                 head_blocked: blocked,
+                refused: vec![],
             };
             assert_eq!(d.pump(&machine), expected, "{name}");
         }
@@ -470,14 +478,15 @@ mod tests {
             reserved: 5 * GIB,
             rss: 0,
         }]);
-        d.enqueue(session("a"), 3 * GIB);
+        d.enqueue(session(11), 3 * GIB);
         d.enqueue(cmd(2), GIB);
-        d.enqueue(session("b"), GIB);
+        d.enqueue(session(12), GIB);
         assert_eq!(
             d.pump(&ample),
             Pump {
                 admitted: vec![],
-                head_blocked: Some(Blocked::OverBudget)
+                head_blocked: Some(Blocked::OverBudget),
+                refused: vec![],
             },
             "a smaller request behind a blocked head still waits"
         );
@@ -487,12 +496,13 @@ mod tests {
         assert_eq!(
             d.pump(&ample),
             Pump {
-                admitted: vec![session("a"), cmd(2), session("b")],
-                head_blocked: None
+                admitted: vec![session(11), cmd(2), session(12)],
+                head_blocked: None,
+                refused: vec![],
             },
             "freed room admits heads in order while they fit"
         );
-        assert_eq!(d.standing(&session("b")), Some(Standing::Running));
+        assert_eq!(d.standing(&session(12)), Some(Standing::Running));
     }
 
     #[test]
@@ -509,7 +519,7 @@ mod tests {
             },
         ]);
         d.enqueue(cmd(1), 3 * GIB);
-        d.enqueue(session("a"), 3 * GIB);
+        d.enqueue(session(11), 3 * GIB);
         d.enqueue(cmd(2), GIB);
         assert_eq!(d.pump(&ample).admitted, vec![]);
 
@@ -518,11 +528,12 @@ mod tests {
             d.pump(&ample),
             Pump {
                 admitted: vec![cmd(1)],
-                head_blocked: Some(Blocked::OverBudget)
+                head_blocked: Some(Blocked::OverBudget),
+                refused: vec![],
             },
             "the next head fits, the one after does not, and the 1 GiB job behind it may not jump"
         );
-        assert_eq!(d.standing(&session("a")), Some(Standing::Queued(0)));
+        assert_eq!(d.standing(&session(11)), Some(Standing::Queued(0)));
         assert_eq!(d.standing(&cmd(2)), Some(Standing::Queued(1)));
     }
 
@@ -530,18 +541,19 @@ mod tests {
     fn enqueueing_a_queued_or_running_consumer_again_holds_one_place() {
         let ample = linux(64, 0.0);
         let mut d = Dispatcher::new(LIMITS);
-        d.enqueue(session("a"), GIB);
-        assert_eq!(d.enqueue(session("a"), GIB), Standing::Queued(0));
-        d.enqueue(session("b"), 6 * GIB);
+        d.enqueue(session(11), GIB);
+        assert_eq!(d.enqueue(session(11), GIB), Standing::Queued(0));
+        d.enqueue(session(12), 6 * GIB);
         assert_eq!(
             d.pump(&ample),
             Pump {
-                admitted: vec![session("a"), session("b")],
-                head_blocked: None
+                admitted: vec![session(11), session(12)],
+                head_blocked: None,
+                refused: vec![],
             },
             "a repeated enqueue is counted once"
         );
-        assert_eq!(d.enqueue(session("a"), GIB), Standing::Running);
+        assert_eq!(d.enqueue(session(11), GIB), Standing::Running);
         assert_eq!(
             d.pump(&ample),
             Pump::default(),
@@ -551,16 +563,18 @@ mod tests {
 
     #[test]
     fn reservations_too_large_to_add_up_wait() {
-        let mut d = running(&[Job {
-            reserved: GIB,
-            rss: 0,
-        }]);
-        d.enqueue(cmd(1), u64::MAX);
+        let mut d = Dispatcher::new(Limits {
+            budget_bytes: u64::MAX,
+            ..LIMITS
+        });
+        d.admit_running(cmd(100), GIB);
+        d.enqueue(cmd(1), u64::MAX - 1);
         assert_eq!(
             d.pump(&linux(64, 0.0)),
             Pump {
                 admitted: vec![],
-                head_blocked: Some(Blocked::OverBudget)
+                head_blocked: Some(Blocked::OverBudget),
+                refused: vec![],
             },
             "held plus request"
         );
@@ -574,7 +588,8 @@ mod tests {
             d.pump(&linux(64, 0.0)),
             Pump {
                 admitted: vec![],
-                head_blocked: Some(Blocked::LowMemory)
+                head_blocked: Some(Blocked::LowMemory),
+                refused: vec![],
             },
             "floor plus request"
         );
@@ -594,7 +609,8 @@ mod tests {
             d.pump(&linux(64, 0.0)),
             Pump {
                 admitted: vec![],
-                head_blocked: Some(Blocked::OverBudget)
+                head_blocked: Some(Blocked::OverBudget),
+                refused: vec![],
             },
             "a zero-byte request under an unbounded budget"
         );
@@ -606,10 +622,31 @@ mod tests {
             reserved: 4 * GIB,
             rss: 0,
         }]);
-        d.enqueue(session("big"), 6 * GIB);
+        d.enqueue(session(13), 6 * GIB);
         d.enqueue(cmd(1), 2 * GIB);
         assert_eq!(d.pump(&linux(64, 0.0)).admitted, vec![]);
-        d.release(&session("big"));
+        d.release(&session(13));
         assert_eq!(d.pump(&linux(64, 0.0)).admitted, vec![cmd(1)]);
+    }
+
+    #[test]
+    fn a_head_larger_than_the_whole_budget_is_refused_and_the_next_one_admitted() {
+        let mut d = Dispatcher::new(Limits {
+            budget_bytes: 8 * GIB,
+            ..LIMITS
+        });
+        d.enqueue(session(11), 8 * GIB);
+        d.enqueue(cmd(1), GIB);
+        d.set_limits(LIMITS);
+        assert_eq!(
+            d.pump(&linux(64, 0.0)),
+            Pump {
+                admitted: vec![cmd(1)],
+                head_blocked: None,
+                refused: vec![session(11)],
+            },
+            "a budget lowered after the enqueue"
+        );
+        assert_eq!(d.standing(&session(11)), None);
     }
 }

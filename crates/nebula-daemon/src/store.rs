@@ -8,7 +8,7 @@ use nebula_core::{
     ProjectId, TerminalId, TerminalTab, Todo, TodoId, TodoOwner, Workspace, WorkspaceId, Worktree,
     WorktreeId, DEFAULT_WORKSPACE_ID,
 };
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -275,6 +275,13 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE terminals ADD COLUMN branch TEXT;
     UPDATE agents SET branch = (SELECT w.branch FROM worktrees w WHERE w.id = agents.worktree_id);
     UPDATE terminals SET branch = (SELECT w.branch FROM worktrees w WHERE w.id = terminals.worktree_id);
+    ",
+    // 26: the initial task of a session that has not spawned yet (queued
+    // for memory), cleared by the spawn that hands it to the CLI. Status
+    // 'queued' arrives with it; an older binary reads that as fresh, so this
+    // schema does not downgrade.
+    "
+    ALTER TABLE agents ADD COLUMN pending_prompt TEXT;
     ",
 ];
 
@@ -606,9 +613,19 @@ impl Store {
     /// (`nebula rename` from inside the CLI). The flag is store-internal:
     /// clients never see it, they only observe the eventual rename.
     pub fn insert_agent_with_auto_title(&self, a: &Agent, auto_title: bool) -> Result<()> {
+        self.insert_agent_with_prompt(a, auto_title, None)
+    }
+
+    /// `pending_prompt` waits with the row for its first spawn.
+    pub fn insert_agent_with_prompt(
+        &self,
+        a: &Agent,
+        auto_title: bool,
+        pending_prompt: Option<&str>,
+    ) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO agents (id, worktree_id, name, status, archived, archived_at, pinned, kind, claude_session_id, sort_order, created_at, status_changed_at, model, effort, auto_title_pending, branch)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            "INSERT INTO agents (id, worktree_id, name, status, archived, archived_at, pinned, kind, claude_session_id, sort_order, created_at, status_changed_at, model, effort, auto_title_pending, branch, pending_prompt)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 a.id.as_str(),
                 a.worktree_id.as_str(),
@@ -625,8 +642,37 @@ impl Store {
                 a.model,
                 a.effort,
                 auto_title as i64,
-                a.branch
+                a.branch,
+                pending_prompt
             ],
+        )?;
+        Ok(())
+    }
+
+    /// Read and clear in one transaction, so a prompt is handed out once.
+    pub fn take_agent_pending_prompt(&self, id: &AgentId) -> Result<Option<String>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let prompt: Option<String> = tx
+            .query_row(
+                "SELECT pending_prompt FROM agents WHERE id = ?1",
+                params![id.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        tx.execute(
+            "UPDATE agents SET pending_prompt = NULL WHERE id = ?1",
+            params![id.as_str()],
+        )?;
+        tx.commit()?;
+        Ok(prompt)
+    }
+
+    pub fn set_agent_pending_prompt(&self, id: &AgentId, prompt: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE agents SET pending_prompt = ?2 WHERE id = ?1",
+            params![id.as_str(), prompt],
         )?;
         Ok(())
     }
@@ -725,14 +771,24 @@ impl Store {
     }
 
     /// Returns the epoch-ms stamp written to `status_changed_at`, so the
-    /// caller can broadcast the exact same timestamp it persisted.
+    /// caller can broadcast the exact same timestamp it persisted. It is
+    /// always past the row's previous stamp, so a client can tell the newer
+    /// of two statuses that arrive out of order.
     pub fn set_agent_status(&self, id: &AgentId, status: AgentStatus) -> Result<i64> {
-        let stamp = now_ms();
-        self.conn.lock().unwrap().execute(
-            "UPDATE agents SET status = ?2, status_changed_at = ?3 WHERE id = ?1",
-            params![id.as_str(), status.as_str(), stamp],
+        let now = now_ms();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE agents SET status = ?2, status_changed_at = MAX(?3, status_changed_at + 1) WHERE id = ?1",
+            params![id.as_str(), status.as_str(), now],
         )?;
-        Ok(stamp)
+        let stamp = conn
+            .query_row(
+                "SELECT status_changed_at FROM agents WHERE id = ?1",
+                params![id.as_str()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(stamp.unwrap_or(now))
     }
 
     pub fn set_agent_session_id(&self, id: &AgentId, session_id: Option<&str>) -> Result<()> {
@@ -1445,6 +1501,72 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_status_change_is_stamped_after_the_one_before_it() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .insert_project(&Project {
+                workspace_id: Default::default(),
+                id: ProjectId("p".into()),
+                name: "p".into(),
+                repo_path: "/tmp/p".into(),
+                sort_order: 0,
+                divider_after: false,
+                divider_label: None,
+                divider_before: false,
+                divider_before_label: None,
+                host: None,
+            })
+            .unwrap();
+        store
+            .insert_worktree(&Worktree {
+                id: WorktreeId("w".into()),
+                project_id: ProjectId("p".into()),
+                path: "/tmp/p".into(),
+                branch: "main".into(),
+                is_main: true,
+                created_from: None,
+                pinned: false,
+                for_branch: false,
+                sort_order: 0,
+            })
+            .unwrap();
+        let ahead = now_ms() + 60_000;
+        let id = AgentId("a".into());
+        store
+            .insert_agent(&Agent {
+                id: id.clone(),
+                worktree_id: WorktreeId("w".into()),
+                name: "a".into(),
+                status: AgentStatus::Fresh,
+                archived: false,
+                archived_at: 0,
+                pinned: false,
+                kind: AgentKind::Claude,
+                model: None,
+                effort: None,
+                session_id: None,
+                sort_order: 0,
+                status_changed_at: ahead,
+                alive: false,
+                branch: None,
+            })
+            .unwrap();
+
+        let running = store.set_agent_status(&id, AgentStatus::Running).unwrap();
+        let finished = store.set_agent_status(&id, AgentStatus::Finished).unwrap();
+
+        assert!(
+            running > ahead,
+            "a status read older than the one it replaced"
+        );
+        assert!(finished > running);
+        assert_eq!(
+            store.get_agent(&id).unwrap().unwrap().status_changed_at,
+            finished
+        );
+    }
 
     #[test]
     fn roundtrip_tree() {

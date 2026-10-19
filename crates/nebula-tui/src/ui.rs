@@ -1613,6 +1613,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                         Some(AgentStatus::NeedsFeedback) => (solid, th.err),
                         Some(AgentStatus::Terminated) => (solid, th.special),
                         Some(AgentStatus::Fresh) => (solid, th.dim),
+                        Some(AgentStatus::Queued) => (QUEUED_GLYPH, th.info),
                         Some(AgentStatus::Disconnected) | None => (hollow, th.dim),
                     }
                 };
@@ -2859,9 +2860,13 @@ fn unseen_or(unseen: bool, th: Theme, fallback: Style) -> Style {
     }
 }
 
+/// A session waiting for memory: no process yet.
+const QUEUED_GLYPH: &str = "◌ ";
+
 fn status_dot(status: Option<AgentStatus>, th: Theme) -> Span<'static> {
     match status {
         Some(AgentStatus::Fresh) => Span::styled("● ", Style::default().fg(th.dim)),
+        Some(AgentStatus::Queued) => Span::styled(QUEUED_GLYPH, Style::default().fg(th.info)),
         Some(AgentStatus::Running) => Span::styled("● ", Style::default().fg(th.warn)),
         Some(AgentStatus::Finished) => Span::styled("● ", Style::default().fg(th.ok)),
         Some(AgentStatus::NeedsFeedback) => Span::styled("● ", Style::default().fg(th.err)),
@@ -2881,7 +2886,7 @@ fn terminal_glyph(t: &nebula_core::TerminalTab, th: Theme) -> Span<'static> {
         Some(AgentStatus::Finished) => th.ok,
         Some(AgentStatus::NeedsFeedback) => th.err,
         Some(AgentStatus::Terminated) => th.special,
-        Some(AgentStatus::Fresh | AgentStatus::Disconnected) | None => {
+        Some(AgentStatus::Fresh | AgentStatus::Queued | AgentStatus::Disconnected) | None => {
             if t.busy {
                 th.warn
             } else if t.alive {
@@ -4471,6 +4476,30 @@ fn draw_terminal(f: &mut Frame, app: &mut App, area: Rect) {
         app.term_file_links = Vec::new();
         return;
     }
+    if let Some(agent) = app.queued_placeholder() {
+        let inner = terminal_frame(f, area, Vec::new(), None, focused, th);
+        app.term_area = inner;
+        let msg = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("{} is waiting for memory", agent.name),
+                Style::default().fg(th.muted).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                format!(
+                    "it starts by itself when room frees · {} starts it now",
+                    key_hint(app, Action::ForceStart)
+                ),
+                Style::default().fg(th.dim),
+            )),
+        ])
+        .centered();
+        f.render_widget(msg, inner);
+        app.term_links = Vec::new();
+        app.term_file_links = Vec::new();
+        return;
+    }
     if let Some(branch) = app.parked_placeholder_branch() {
         let inner = terminal_frame(f, area, Vec::new(), None, focused, th);
         app.term_area = inner;
@@ -5091,6 +5120,20 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                 k(Action::ContextMenu),
                 k(Action::Help)
             ),
+            Focus::Sessions
+                if app
+                    .selected_session()
+                    .is_some_and(|a| a.status == AgentStatus::Queued) =>
+            {
+                format!(
+                    "waiting for memory  {}: start now  {}: archive  {}: del  {}: menu  {}: help",
+                    k(Action::ForceStart),
+                    k(Action::Archive),
+                    k(Action::Delete),
+                    k(Action::ContextMenu),
+                    k(Action::Help)
+                )
+            }
             Focus::Sessions => format!(
                 "{}: focus  {}: agent  {}: terminal  {}: link  {}: rename  {}: archive  {}: del  {}: menu  {}: help",
                 k(Action::Activate),
@@ -5655,6 +5698,28 @@ mod tests {
     /// status renders still text, and the animations setting kills even
     /// those two.
     #[test]
+    fn a_queued_session_has_its_own_dot() {
+        let th = Theme::default();
+        let queued = status_dot(Some(AgentStatus::Queued), th);
+        assert_eq!(queued.content, "◌ ");
+        assert_eq!(queued.style.fg, Some(th.info));
+        for other in [
+            AgentStatus::Fresh,
+            AgentStatus::Running,
+            AgentStatus::Finished,
+            AgentStatus::NeedsFeedback,
+            AgentStatus::Terminated,
+            AgentStatus::Disconnected,
+        ] {
+            assert_ne!(
+                status_dot(Some(other), th).content,
+                queued.content,
+                "{other:?}"
+            );
+        }
+    }
+
+    #[test]
     fn sweep_ramp_gates_on_live_statuses_and_the_setting() {
         let th = Theme::default();
         assert_eq!(
@@ -5667,6 +5732,7 @@ mod tests {
         );
         for status in [
             AgentStatus::Fresh,
+            AgentStatus::Queued,
             AgentStatus::Finished,
             AgentStatus::Terminated,
             AgentStatus::Disconnected,

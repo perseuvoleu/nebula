@@ -64,7 +64,7 @@ async fn serve() -> Result<()> {
     tracing::info!(port = hook_env.port, "hook receiver listening");
 
     let daemon = registry::Daemon::new(store, hook_env);
-    daemon.heavy.spawn(daemon.shutdown.clone());
+    registry::session_start::start(&daemon).await;
     daemon.refresh_remote_hosts();
     daemon.ensure_relays();
 
@@ -110,10 +110,7 @@ async fn serve() -> Result<()> {
             loop {
                 tokio::select! {
                     _ = daemon.shutdown.cancelled() => break,
-                    _ = interval.tick() => {
-                        daemon.tick_status_machines();
-                        daemon.reap_prewarmed();
-                    }
+                    _ = interval.tick() => daemon.tick_status_machines(),
                 }
             }
         });

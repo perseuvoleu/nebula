@@ -94,6 +94,7 @@ pub enum Action {
     CloseSession,
     Archive,
     Unarchive,
+    ForceStart,
     ToggleArchived,
     ContextMenu,
     Delete,
@@ -528,6 +529,15 @@ pub const ACTIONS: &[ActionSpec] = &[
         group: "SESSIONS",
         scope: Scope::Global,
         defaults: &["u"],
+    },
+    ActionSpec {
+        action: Action::ForceStart,
+        id: "force_start",
+        label: "Start queued session now",
+        hint: "Start the selected session waiting for memory, skipping the queue",
+        group: "SESSIONS",
+        scope: Scope::Global,
+        defaults: &["shift+r"],
     },
     ActionSpec {
         action: Action::ToggleArchived,

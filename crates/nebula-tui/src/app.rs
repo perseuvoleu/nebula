@@ -2238,7 +2238,7 @@ fn rollup(statuses: impl Iterator<Item = AgentStatus>) -> Option<AgentStatus> {
             AgentStatus::Running => 3,
             AgentStatus::Finished => 2,
             AgentStatus::Terminated | AgentStatus::Disconnected => 1,
-            AgentStatus::Fresh => 0,
+            AgentStatus::Fresh | AgentStatus::Queued => 0,
         }
     }
     for s in statuses {
@@ -2881,10 +2881,6 @@ pub struct App {
     /// deadline — armed on every worktree context switch, so walking the
     /// list doesn't boot every CLI it passes.
     pub pending_prewarm: Option<(WorktreeId, std::time::Instant)>,
-    /// Standing keep-warm: when to next re-assert the selected worktree's
-    /// warm default-spec Claude session, so one is always ready to adopt.
-    /// Re-armed after every send; disarmed when nothing is selected.
-    pub next_keepwarm: Option<std::time::Instant>,
     /// Mouse drag-selection over the terminal pane, if any.
     pub term_selection: Option<TermSelection>,
     /// Last left-click on the terminal pane (time + pane-relative cell), for
@@ -3096,7 +3092,6 @@ impl App {
             last_session_for_worktree: HashMap::new(),
             global_sessions_scroll: 0,
             pending_prewarm: None,
-            next_keepwarm: None,
             term_selection: None,
             last_term_click: None,
             last_session_click: None,
@@ -3563,6 +3558,27 @@ impl App {
             SessionHome::Branch(project, branch) => Some((project, branch)),
             SessionHome::Worktree(_) => None,
         }
+    }
+
+    pub fn is_queued(&self, sref: &SessionRef) -> bool {
+        let SessionRef::Agent(id) = sref else {
+            return false;
+        };
+        self.tree
+            .agents
+            .iter()
+            .any(|a| &a.id == id && a.status == AgentStatus::Queued)
+    }
+
+    /// The selected session when it waits for memory and nothing is mounted for it.
+    pub fn queued_placeholder(&self) -> Option<Agent> {
+        if self.quick_term {
+            return None;
+        }
+        let agent = self.selected_session()?;
+        let sref = SessionRef::Agent(agent.id.clone());
+        (agent.status == AgentStatus::Queued && self.term.as_ref().is_none_or(|t| t.sref != sref))
+            .then_some(agent)
     }
 
     pub fn parked_placeholder_branch(&self) -> Option<String> {
@@ -4453,12 +4469,6 @@ impl App {
             Some((due, _)) => std::time::Instant::now() >= *due,
             None => true,
         }
-    }
-
-    /// Delay until the standing keep-warm re-send is due. None when disarmed.
-    pub fn keepwarm_delay(&self) -> Option<std::time::Duration> {
-        let at = self.next_keepwarm.as_ref()?;
-        Some(at.saturating_duration_since(std::time::Instant::now()))
     }
 
     /// An owner's notes, in tree order (snapshot order; new ones append).

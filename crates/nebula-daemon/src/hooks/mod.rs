@@ -404,7 +404,7 @@ mod tests {
         .await;
         assert_eq!((status, body.as_str()), (200, ""));
 
-        // Unknown agent (prewarm/stale env): same silence.
+        // Unknown agent (stale env): same silence.
         let (_, body) = http_post(
             env.port,
             "/api/hooks/claude?agentId=ghost&hookEvent=UserPromptSubmit",
@@ -877,7 +877,7 @@ async fn receive_hook(
         // todos pointers while the project/worktree has undone entries, the
         // shared-checkout pointer while sibling sessions have run on the
         // same worktree, and the twin pointer while the project has a
-        // checkout on a host. Unknown ids (prewarm, stale env) and store
+        // checkout on a host. Unknown ids (stale env) and store
         // errors degrade to no injection.
         let mut parts = Vec::new();
         if state

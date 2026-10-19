@@ -658,6 +658,29 @@ async fn await_ack(
     req_id: u64,
     upserts: &mut Vec<nebula_core::Entity>,
 ) -> Result<Option<nebula_core::EntityId>> {
+    match await_reply(conn, req_id, upserts).await? {
+        Reply::Ack(created) => Ok(created),
+        Reply::Row(agent) => Ok(Some(nebula_core::EntityId::Agent(agent.id))),
+    }
+}
+
+async fn await_row(conn: &mut Connection, req_id: u64) -> Result<nebula_core::Agent> {
+    match await_reply(conn, req_id, &mut Vec::new()).await? {
+        Reply::Row(agent) => Ok(agent),
+        Reply::Ack(_) => bail!("the daemon answered without the agent's row"),
+    }
+}
+
+enum Reply {
+    Ack(Option<nebula_core::EntityId>),
+    Row(nebula_core::Agent),
+}
+
+async fn await_reply(
+    conn: &mut Connection,
+    req_id: u64,
+    upserts: &mut Vec<nebula_core::Entity>,
+) -> Result<Reply> {
     loop {
         let event = tokio::time::timeout(
             Duration::from_secs(60),
@@ -666,7 +689,12 @@ async fn await_ack(
         .await
         .context("timed out waiting for the daemon's reply")??;
         match event {
-            Some(ServerEvent::Ack { req_id: r, created }) if r == req_id => return Ok(created),
+            Some(ServerEvent::Ack { req_id: r, created }) if r == req_id => {
+                return Ok(Reply::Ack(created))
+            }
+            Some(ServerEvent::AgentRow { req_id: r, agent }) if r == req_id => {
+                return Ok(Reply::Row(agent))
+            }
             Some(ServerEvent::Error {
                 req_id: Some(r),
                 message,
@@ -1192,6 +1220,19 @@ pub async fn worktree_checkout(
     Ok(())
 }
 
+fn no_live_pty(name: &str, status: nebula_core::AgentStatus) -> anyhow::Error {
+    let quoted = nebula_core::remote::ssh_quote(name);
+    match status {
+        nebula_core::AgentStatus::Queued => anyhow::anyhow!(
+            "\"{name}\" is queued for memory and has no PTY yet; it starts by itself, or `nebula agent start {quoted} --force` starts it now"
+        ),
+        _ => anyhow::anyhow!(
+            "\"{name}\" holds no live PTY (status: {}) — `nebula agent restart {quoted}` respawns it",
+            status.as_str()
+        ),
+    }
+}
+
 /// Resolve one agent of `project` by session name (the name shown in the
 /// panels) — the shared lookup behind read/send/show/archive/delete/restart.
 fn resolve_agent<'a>(
@@ -1337,10 +1378,7 @@ pub async fn agent_read(
     let project = resolve_project(&projects, &worktrees, &agents, project_flag.as_deref())?;
     let (a, _) = resolve_agent(&agents, &worktrees, &project, &name)?;
     if !a.alive {
-        bail!(
-            "\"{name}\" holds no live PTY (status: {}) — `nebula agent restart {name}` respawns it",
-            a.status.as_str()
-        );
+        return Err(no_live_pty(&name, a.status));
     }
     let req_id = 1u64;
     write_frame(
@@ -1406,10 +1444,7 @@ pub async fn agent_send(name: String, text: String, project_flag: Option<String>
     let project = resolve_project(&projects, &worktrees, &agents, project_flag.as_deref())?;
     let (a, w) = resolve_agent(&agents, &worktrees, &project, &name)?;
     if !a.alive {
-        bail!(
-            "\"{name}\" holds no live PTY (status: {}) — `nebula agent restart {name}` respawns it",
-            a.status.as_str()
-        );
+        return Err(no_live_pty(&name, a.status));
     }
     // Acknowledged writes: "sent" is printed only for text the PTY took.
     for (req_id, data) in [(1, send_payload(&text)), (2, b"\r".to_vec())] {
@@ -1528,15 +1563,22 @@ pub async fn agent_ctl(op: AgentCtl, name: String, project_flag: Option<String>)
         ),
     };
     write_frame(&mut conn.stream, &request).await?;
-    await_ack(&mut conn, req_id, &mut Vec::new()).await?;
-    println!(
-        "{}",
-        serde_json::json!({
-            "name": a.name,
-            "worktree": w.branch,
-            "result": verb,
-        })
-    );
+    let mut out = serde_json::json!({
+        "name": a.name,
+        "worktree": w.branch,
+        "result": verb,
+    });
+    if let Reply::Row(row) = await_reply(&mut conn, req_id, &mut Vec::new()).await? {
+        if row.status == nebula_core::AgentStatus::Queued {
+            eprintln!(
+                "nebula: \"{}\" is queued for memory and starts by itself when room frees",
+                row.name
+            );
+            out["result"] = "queued".into();
+        }
+        out["status"] = row.status.as_str().into();
+    }
+    println!("{out}");
     Ok(())
 }
 
@@ -1661,20 +1703,83 @@ pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
         },
     )
     .await?;
-    let mut upserts = Vec::new();
-    let created = await_ack(&mut conn, req_id, &mut upserts).await?;
-    let id = match created {
-        Some(nebula_core::EntityId::Agent(id)) => id.to_string(),
-        _ => String::new(),
-    };
+    let agent = await_row(&mut conn, req_id).await?;
+    if agent.status == nebula_core::AgentStatus::Queued {
+        eprintln!(
+            "nebula: \"{}\" is queued for memory and starts by itself when room frees",
+            agent.name
+        );
+    }
     println!(
         "{}",
         serde_json::json!({
-            "id": id,
-            "name": name,
-            "kind": opts.kind,
+            "id": agent.id.to_string(),
+            "name": agent.name,
+            "kind": agent.kind.as_str(),
+            "status": agent.status.as_str(),
             "project": project.name,
             "worktree": target.branch,
+        })
+    );
+    Ok(())
+}
+
+/// `nebula agent start <name> --force`: start a worker waiting for memory
+/// now. The name must pick exactly one row; the owning daemon refuses one
+/// that is not queued.
+pub async fn agent_force_start(name: String, project_flag: Option<String>) -> Result<()> {
+    let sock = paths::socket_path();
+    let Ok(stream) = try_connect(&sock).await else {
+        bail!("no nebula daemon is running");
+    };
+    let mut conn = handshake(stream).await?;
+    let (projects, worktrees, agents) = subscribe_snapshot(&mut conn).await?;
+    let project = resolve_project(&projects, &worktrees, &agents, project_flag.as_deref())?;
+    let in_project: Vec<&nebula_core::Agent> = agents
+        .iter()
+        .filter(|a| {
+            a.name == name
+                && worktrees
+                    .iter()
+                    .any(|w| w.id == a.worktree_id && w.project_id == project.id)
+        })
+        .collect();
+    let target = match in_project.as_slice() {
+        [one] => (*one).clone(),
+        [] => bail!("no agent named \"{name}\" in {}", project.name),
+        many => bail!(
+            "{} agents are named \"{name}\" in {} ({}); rename one first",
+            many.len(),
+            project.name,
+            many.iter()
+                .map(|a| format!("{} {}", a.id, a.status.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    let req_id = 1u64;
+    write_frame(
+        &mut conn.stream,
+        &ClientRequest::ForceStartAgent {
+            req_id,
+            id: target.id.clone(),
+        },
+    )
+    .await?;
+    let agent = await_row(&mut conn, req_id).await?;
+    let worktree = worktrees
+        .iter()
+        .find(|w| w.id == agent.worktree_id)
+        .map(|w| w.branch.clone());
+    println!(
+        "{}",
+        serde_json::json!({
+            "id": agent.id.to_string(),
+            "name": agent.name,
+            "kind": agent.kind.as_str(),
+            "status": agent.status.as_str(),
+            "project": project.name,
+            "worktree": worktree,
         })
     );
     Ok(())
@@ -1741,15 +1846,16 @@ pub async fn agent_list(
     Ok(())
 }
 
-/// A worker has settled once it is out of the busy states: `fresh` (spawned,
-/// first turn not started) and `running` both mean "still working" from the
-/// delegator's seat; everything else (finished, needs_feedback,
-/// terminated, disconnected) is something to act on.
+/// A worker has settled once it is out of the busy states: `queued`
+/// (waiting for memory), `fresh` (spawned, first turn not started) and
+/// `running` all mean "still working" from the delegator's seat; everything
+/// else is something to act on.
 fn agent_settled(status: nebula_core::AgentStatus) -> bool {
-    !matches!(
-        status,
-        nebula_core::AgentStatus::Fresh | nebula_core::AgentStatus::Running
-    )
+    use nebula_core::AgentStatus::*;
+    match status {
+        Queued | Fresh | Running => false,
+        Finished | NeedsFeedback | Terminated | Disconnected => true,
+    }
 }
 
 /// `nebula agent wait [<name>...] [--timeout <secs>] [--project <name>]`:
@@ -2293,6 +2399,38 @@ pub async fn run_todo(op: TodoOp) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_queued_worker_points_at_the_forced_start_not_a_restart() {
+        let queued = no_live_pty("w", nebula_core::AgentStatus::Queued).to_string();
+        assert!(
+            queued.contains("`nebula agent start 'w' --force`"),
+            "{queued}"
+        );
+        let dead = no_live_pty("w", nebula_core::AgentStatus::Finished).to_string();
+        assert!(dead.contains("`nebula agent restart 'w'`"), "{dead}");
+        let spaced = no_live_pty("Mobile ab's", nebula_core::AgentStatus::Queued).to_string();
+        assert!(
+            spaced.contains(r"`nebula agent start 'Mobile ab'\''s' --force`"),
+            "{spaced}"
+        );
+    }
+
+    #[test]
+    fn agent_wait_keeps_waiting_on_a_queued_worker() {
+        use nebula_core::AgentStatus::*;
+        for (status, settled) in [
+            (Queued, false),
+            (Fresh, false),
+            (Running, false),
+            (Finished, true),
+            (NeedsFeedback, true),
+            (Terminated, true),
+            (Disconnected, true),
+        ] {
+            assert_eq!(agent_settled(status), settled, "{status:?}");
+        }
+    }
 
     #[test]
     fn the_switch_first_hint_names_the_resolved_project_and_host() {

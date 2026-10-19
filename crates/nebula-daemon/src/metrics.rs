@@ -17,11 +17,28 @@ pub fn collect(sessions: Vec<(SessionRef, u32)>) -> MetricsSnapshot {
     )
 }
 
-/// RSS of each root's whole process tree, in `roots` order; None for a
-/// root that is gone. Blocking.
-pub fn tree_rss(roots: &[u32]) -> Result<Vec<Option<u64>>, ProbeError> {
-    let (rss, children) = parse_table(&ps_table()?);
-    Ok(roots_rss(roots, &rss, &children))
+/// What the ledger charges, from one sweep: each command root's whole
+/// tree, and each session root's tree without the command trees inside it,
+/// so a heavy command run from a session counts once, against its lease.
+/// Blocking.
+pub fn ledger_rss(commands: &[u32], sessions: &[u32]) -> Result<(RootsRss, RootsRss), ProbeError> {
+    Ok(ledger_trees(&ps_table()?, commands, sessions))
+}
+
+/// One reading per root, in order; None for a root that is gone.
+pub type RootsRss = Vec<Option<u64>>;
+
+fn ledger_trees(table: &str, commands: &[u32], sessions: &[u32]) -> (RootsRss, RootsRss) {
+    let (rss, children) = parse_table(table);
+    let excluded: HashSet<u32> = commands.iter().copied().collect();
+    let sessions = sessions
+        .iter()
+        .map(|&root| {
+            rss.contains_key(&root)
+                .then(|| subtree_rss_without(root, &rss, &children, &excluded).0)
+        })
+        .collect();
+    (roots_rss(commands, &rss, &children), sessions)
 }
 
 /// Each session's tree and `tree_rss(roots)`, from one `ps` sweep. Blocking.
@@ -138,11 +155,20 @@ fn subtree_rss(
     rss: &HashMap<u32, u64>,
     children: &HashMap<u32, Vec<u32>>,
 ) -> (u64, u32) {
+    subtree_rss_without(root, rss, children, &HashSet::new())
+}
+
+fn subtree_rss_without(
+    root: u32,
+    rss: &HashMap<u32, u64>,
+    children: &HashMap<u32, Vec<u32>>,
+    excluded: &HashSet<u32>,
+) -> (u64, u32) {
     let mut stack = vec![root];
     let mut seen = HashSet::new();
     let (mut bytes, mut procs) = (0u64, 0u32);
     while let Some(pid) = stack.pop() {
-        if !seen.insert(pid) {
+        if !seen.insert(pid) || (pid != root && excluded.contains(&pid)) {
             continue;
         }
         if let Some(b) = rss.get(&pid) {
@@ -213,6 +239,24 @@ mod tests {
         let live = sessions[1].tree.expect("live session measured");
         assert_eq!((live.rss_bytes, live.procs), (2300 * 1024, 2));
         assert_eq!(roots, [None, Some(2300 * 1024)]);
+    }
+
+    #[test]
+    fn a_heavy_command_inside_a_session_is_charged_to_the_command_only() {
+        let table = "\
+ 10     1   100
+ 20    10  1000
+ 21    20   200
+ 22    20   300
+ 30    21    10
+ 31    30  4000
+";
+        let (commands, sessions) = ledger_trees(table, &[30], &[20, 555]);
+        assert_eq!(commands, [Some(4010 * 1024)]);
+        assert_eq!(sessions, [Some(1500 * 1024), None]);
+        let charged: u64 = commands.iter().chain(&sessions).flatten().sum();
+        let whole_session_tree = (1000 + 200 + 300 + 10 + 4000) * 1024;
+        assert_eq!(charged, whole_session_tree, "each byte is charged once");
     }
 
     #[test]

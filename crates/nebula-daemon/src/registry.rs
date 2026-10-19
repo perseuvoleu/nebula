@@ -19,35 +19,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
 
-/// A warm agent CLI older than this is reaped — it holds memory and its
-/// conversation context grows stale.
-const PREWARM_MAX_AGE: Duration = Duration::from_secs(15 * 60);
-/// A live same-spec warm CLI older than this is recycled (killed and
-/// re-booted fresh) when its slot is re-requested, instead of being kept.
-/// Clients keep-warm the selected worktree on a cadence shorter than
-/// `PREWARM_MAX_AGE - PREWARM_RECYCLE_AGE`, so a slot they still care about
-/// is always refreshed before the reaper can empty it.
-const PREWARM_RECYCLE_AGE: Duration = Duration::from_secs(10 * 60);
-/// Hook events buffered on a warm session before its row exists (oldest
-/// dropped beyond this).
-const PREWARM_HOOK_BUFFER_CAP: usize = 64;
-
-/// A pre-spawned agent CLI waiting to be adopted by the next CreateAgent for
-/// the same (worktree, kind). The PTY lives in the normal sessions map under
-/// a pre-generated agent id, so its NEBULA_AGENT_ID env is already the id
-/// the adopted row will use. Hook events that arrive before the row exists
-/// (SessionStart carries the resume session id) are buffered here and
-/// replayed at adoption.
-struct PrewarmEntry {
-    agent_id: AgentId,
-    spawned_at: Instant,
-    /// Model/effort the warm CLI booted with; a CreateAgent asking for a
-    /// different spec can't adopt it (the CLI is already running the wrong
-    /// model), so the entry is discarded instead.
-    model: Option<String>,
-    effort: Option<String>,
-    buffered_hooks: Vec<(HookEvent, Option<String>)>,
-}
+#[cfg(test)]
+pub(crate) mod pause;
+pub mod session_start;
 
 /// Terminal tabs export `NEBULA_AGENT_ID` with this prefix on their
 /// TerminalId, so an agent CLI run by hand inside the shell reports
@@ -62,6 +36,11 @@ fn epoch_ms() -> i64 {
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
 }
+
+/// A resumed session (`claude --resume` / `codex resume` /
+/// `cursor-agent --resume`) that fails this fast is stale/deleted; it falls
+/// back to a fresh session instead of leaving a dead pane.
+const RESUME_GRACE: Duration = Duration::from_secs(2);
 
 pub struct Daemon {
     /// Runtime handoff reservations and accepted prompt notifications.
@@ -89,10 +68,8 @@ pub struct Daemon {
     checkout_execution: tokio::sync::RwLock<()>,
     stop_deadline: Duration,
     agent_cmd_override: Option<String>,
-    /// Warm agent CLIs awaiting adoption, at most one per (worktree, kind).
-    prewarmed: Mutex<HashMap<(WorktreeId, AgentKind), PrewarmEntry>>,
     /// Cached `command -v` results per CLI so a missing binary doesn't get
-    /// re-probed (login shell spawn) on every prewarm request.
+    /// re-probed (login shell spawn) on every create.
     cli_probes: Mutex<HashMap<AgentKind, (bool, Instant)>>,
     /// How many client connections are attached per session — a session
     /// with attachments (and its whole worktree) is "in view" and exempt
@@ -112,6 +89,80 @@ pub struct Daemon {
     /// to it (see `relay.rs`).
     relays: Mutex<HashMap<String, Arc<crate::relay::Relay>>>,
     pub heavy: crate::heavy::Desk,
+    starts: session_start::Starts,
+    /// Created rows whose start has not asked the ledger for memory yet.
+    unstarted_creates: Mutex<HashSet<AgentId>>,
+    #[cfg(test)]
+    pub(crate) pauses: pause::Pauses,
+}
+
+/// A create cancelled before its start asked the ledger for memory leaves a
+/// row nothing would ever start, so dropping this deletes it. Once any start
+/// of the row has asked, its answer finds an owner and the row stays.
+struct UnstartedCreate {
+    daemon: Arc<Daemon>,
+    id: AgentId,
+}
+
+impl UnstartedCreate {
+    fn arm(daemon: &Arc<Daemon>, id: &AgentId) -> Self {
+        daemon.unstarted_creates.lock().unwrap().insert(id.clone());
+        Self {
+            daemon: daemon.clone(),
+            id: id.clone(),
+        }
+    }
+
+    fn disarm(self) {
+        self.daemon
+            .unstarted_creates
+            .lock()
+            .unwrap()
+            .remove(&self.id);
+    }
+}
+
+impl Drop for UnstartedCreate {
+    fn drop(&mut self) {
+        if !self
+            .daemon
+            .unstarted_creates
+            .lock()
+            .unwrap()
+            .remove(&self.id)
+        {
+            return;
+        }
+        tracing::info!(agent = %self.id, "create cancelled before its start; row removed");
+        if let Err(e) = self.daemon.store.delete_agent(&self.id) {
+            tracing::warn!(agent = %self.id, error = %e, "removing the cancelled create failed");
+            return;
+        }
+        self.daemon.broadcast(ServerEvent::EntityRemoved {
+            id: EntityId::Agent(self.id.clone()),
+        });
+    }
+}
+
+pub struct Viewing {
+    daemon: Arc<Daemon>,
+    sref: SessionRef,
+    kept: bool,
+}
+
+impl Viewing {
+    /// The attach went through; its connection detaches it from now on.
+    pub fn keep(mut self) {
+        self.kept = true;
+    }
+}
+
+impl Drop for Viewing {
+    fn drop(&mut self) {
+        if !self.kept {
+            self.daemon.note_detached(&self.sref);
+        }
+    }
 }
 
 impl Daemon {
@@ -148,13 +199,16 @@ impl Daemon {
             checkout_execution: tokio::sync::RwLock::new(()),
             stop_deadline: overrides.stop_deadline,
             agent_cmd_override: overrides.agent_cmd,
-            prewarmed: Mutex::new(HashMap::new()),
             cli_probes: Mutex::new(HashMap::new()),
             attach_counts: Mutex::new(HashMap::new()),
             session_interest: Mutex::new(HashMap::new()),
             last_cwd: Mutex::new(HashMap::new()),
             relays: Mutex::new(HashMap::new()),
             heavy: crate::heavy::Desk::default(),
+            starts: session_start::Starts::default(),
+            unstarted_creates: Mutex::new(HashSet::new()),
+            #[cfg(test)]
+            pauses: pause::Pauses::default(),
         })
     }
 
@@ -286,7 +340,7 @@ impl Daemon {
         let submitted = matches!(event, HookEvent::UserPromptSubmit);
         enum Outcome {
             Effects(Vec<Effect>),
-            UnknownAgent(HookEvent, Option<String>),
+            UnknownAgent,
         }
         let outcome = {
             let mut machines = self.status_machines.lock().unwrap();
@@ -310,7 +364,7 @@ impl Daemon {
                                 Instant::now(),
                             ),
                         ),
-                        _ => Outcome::UnknownAgent(event, session_id),
+                        _ => Outcome::UnknownAgent,
                     }
                 }
             }
@@ -325,26 +379,7 @@ impl Daemon {
                     let _ = self.collect_events.send(crate::collect::CollectEvent::Prompt(agent_id.clone()));
                 }
             },
-            // Ids with no row are prewarmed sessions (buffer for replay at
-            // adoption) or stale env / deleted agents (dropped, as before).
-            Outcome::UnknownAgent(event, session_id) => {
-                self.buffer_prewarm_hook(agent_id, event, session_id)
-            }
-        }
-    }
-
-    fn buffer_prewarm_hook(
-        &self,
-        agent_id: &AgentId,
-        event: HookEvent,
-        session_id: Option<String>,
-    ) {
-        let mut pool = self.prewarmed.lock().unwrap();
-        if let Some(entry) = pool.values_mut().find(|e| &e.agent_id == agent_id) {
-            if entry.buffered_hooks.len() >= PREWARM_HOOK_BUFFER_CAP {
-                entry.buffered_hooks.remove(0);
-            }
-            entry.buffered_hooks.push((event, session_id));
+            Outcome::UnknownAgent => {}
         }
     }
 
@@ -435,6 +470,12 @@ impl Daemon {
         if let Err(e) = self.store.set_terminal_status(id, None) {
             tracing::warn!(error = %e, "clear terminal status failed");
         }
+    }
+
+    fn override_hook_status(&self, agent_id: &AgentId, status: AgentStatus) {
+        let _delivery = self.status_delivery.lock().unwrap();
+        self.status_machines.lock().unwrap().remove(agent_id);
+        self.apply_status_effects(agent_id, vec![Effect::SetStatus(status)]);
     }
 
     fn apply_status_effects(&self, agent_id: &AgentId, effects: Vec<Effect>) {
@@ -628,6 +669,25 @@ impl Daemon {
         self.touch_session(sref);
     }
 
+    /// A new client's session for `sref`, with its interest counted before
+    /// the session is looked up so the idle reaper cannot kill what this
+    /// returns. Dropping the `Viewing` without `keep` takes the interest back.
+    pub async fn view_session(
+        self: &Arc<Self>,
+        sref: &SessionRef,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(Arc<PtySession>, Viewing)> {
+        self.note_attached(sref);
+        let viewing = Viewing {
+            daemon: self.clone(),
+            sref: sref.clone(),
+            kept: false,
+        };
+        let session = self.ensure_session(sref, cols, rows).await?;
+        Ok((session, viewing))
+    }
+
     /// A client detached from `sref` (or its connection dropped). Restamps
     /// the session so the idle clock starts at "stopped looking", not at
     /// spawn time.
@@ -659,13 +719,15 @@ impl Daemon {
     /// Spared regardless of age: pinned agents (the user's "never kill
     /// this" mark — a running schedule or background job is invisible to
     /// the status machine), agents that are running or waiting on feedback,
-    /// terminals with a command running, and prewarm-pool sessions
-    /// (`reap_prewarmed` owns those). A reaped session revives on the next
-    /// attach or prewarm; agents resume their conversation.
+    /// and terminals with a command running. A reaped session revives on the
+    /// next attach or prewarm; agents resume their conversation.
     pub fn reap_idle_sessions(self: &Arc<Self>) {
-        let Some(timeout) = crate::config::Config::load().session_idle_timeout() else {
-            return;
-        };
+        if let Some(timeout) = crate::config::Config::load().session_idle_timeout() {
+            self.reap_sessions_idle_for(timeout);
+        }
+    }
+
+    fn reap_sessions_idle_for(self: &Arc<Self>, timeout: Duration) {
         let sessions: Vec<(SessionRef, Arc<PtySession>)> = self
             .sessions
             .lock()
@@ -681,7 +743,6 @@ impl Daemon {
             .collect();
         let now = Instant::now();
         for (sref, session) in sessions {
-            // No store row = prewarm-pool session (or deleted mid-sweep).
             let Some(worktree_id) = self.session_worktree(&sref) else {
                 continue;
             };
@@ -716,20 +777,46 @@ impl Daemon {
             if spared {
                 continue;
             }
-            tracing::info!(session = ?sref, idle_secs = age.as_secs(), "reaping idle session");
-            self.kill_session(&sref);
-            let upsert = match &sref {
-                SessionRef::Agent(id) => self.agent_entity(id).map(Entity::Agent),
-                SessionRef::Terminal(id) => self.terminal_entity(id).map(Entity::Terminal),
-            };
-            if let Ok(entity) = upsert {
-                self.broadcast(ServerEvent::EntityUpserted { entity });
-            }
+            self.reap_if_still_idle(&sref, &session, timeout);
         }
     }
 
-    /// The worktree a session's row lives under; None when the row is gone
-    /// or never existed (prewarm pool).
+    /// Kill `candidate` only if it is still the mapped session and nothing in
+    /// its checkout is watched. Deciding and killing hold the attach lock,
+    /// which an attach takes before it looks the session up, so the attach
+    /// either keeps this process alive or finds it dying and waits for its
+    /// replacement.
+    fn reap_if_still_idle(
+        &self,
+        sref: &SessionRef,
+        candidate: &Arc<PtySession>,
+        timeout: Duration,
+    ) {
+        let attached = self.attach_counts.lock().unwrap();
+        let mapped = self
+            .session(sref)
+            .is_some_and(|s| Arc::ptr_eq(&s, candidate));
+        let viewed = self.session_worktree(sref).is_none_or(|worktree| {
+            attached
+                .keys()
+                .any(|a| self.session_worktree(a).as_ref() == Some(&worktree))
+        });
+        let idle_for = self
+            .session_interest
+            .lock()
+            .unwrap()
+            .get(sref)
+            .map(|stamp| stamp.elapsed());
+        if !mapped || viewed || candidate.was_killed() || idle_for.is_none_or(|age| age < timeout) {
+            return;
+        }
+        tracing::info!(session = ?sref, idle_secs = idle_for.unwrap_or_default().as_secs(), "reaping idle session");
+        #[cfg(test)]
+        self.pauses.at_blocking(pause::Point::ReapDecided);
+        candidate.kill();
+    }
+
+    /// The worktree a session's row lives under; None when the row is gone.
     fn session_worktree(&self, sref: &SessionRef) -> Option<WorktreeId> {
         match sref {
             SessionRef::Agent(id) => self
@@ -1080,10 +1167,11 @@ impl Daemon {
         Ok(EntityId::Project(project.id))
     }
 
-    pub fn remove_project(self: &Arc<Self>, id: &ProjectId) -> Result<()> {
+    pub async fn remove_project(self: &Arc<Self>, id: &ProjectId) -> Result<()> {
         if let Some(result) = self.detach_mirrored_project(id) {
             return result;
         }
+        let _owner = self.starts.hold().await;
         // Kill any live sessions under this project first.
         let (all_projects, worktrees, agents, terminals) = self.store.load_tree()?;
         // Divider bookkeeping is per-workspace: the list clients see is the
@@ -1117,11 +1205,11 @@ impl Daemon {
             .collect();
         for a in agents.iter().filter(|a| wt_ids.contains(&a.worktree_id)) {
             self.kill_session(&SessionRef::Agent(a.id.clone()));
+            self.cancel_queued_start(&a.id);
         }
         for t in terminals.iter().filter(|t| wt_ids.contains(&t.worktree_id)) {
             self.kill_session(&SessionRef::Terminal(t.id.clone()));
         }
-        self.kill_prewarmed_in(&wt_ids);
         // Removing a project only forgets it in nebula — never touches disk.
         self.store.delete_project(id)?;
         self.broadcast(ServerEvent::EntityRemoved {
@@ -1535,7 +1623,6 @@ impl Daemon {
         }
         git::safe_remove_worktree(&project.repo_path, &w.path, branch, delete).await?;
         if delete {
-            self.kill_prewarmed_in(std::slice::from_ref(id));
             self.store.delete_worktree(id)?;
             self.broadcast(ServerEvent::EntityRemoved { id: EntityId::Worktree(id.clone()) });
         }
@@ -1597,11 +1684,11 @@ impl Daemon {
         let (_, _, agents, terminals) = self.store.load_tree()?;
         for a in agents.iter().filter(|a| &a.worktree_id == id) {
             self.kill_session(&SessionRef::Agent(a.id.clone()));
+            self.cancel_queued_start(&a.id);
         }
         for t in terminals.iter().filter(|t| &t.worktree_id == id) {
             self.kill_session(&SessionRef::Terminal(t.id.clone()));
         }
-        self.kill_prewarmed_in(std::slice::from_ref(id));
 
         git::remove_worktree(&project.repo_path, &worktree.path, force).await?;
         self.store.delete_worktree(id)?;
@@ -1727,30 +1814,18 @@ impl Daemon {
                 stopping.join(", ")
             );
         }
-        let mut stops: Vec<Stop> = self
-            .prewarmed_in(&primary.id)
-            .into_iter()
-            .map(|(sref, session)| Stop {
-                sref,
-                label: "a warm agent PTY".to_owned(),
-                session,
-                kind: StopKind::Warm,
-            })
-            .collect();
-        for occupant in &occupants {
-            if let Some(session) = self.session(&occupant.sref) {
-                stops.push(Stop {
+        let stops: Vec<Stop> = occupants
+            .iter()
+            .filter_map(|occupant| {
+                Some(Stop {
                     sref: occupant.sref.clone(),
                     label: occupant.describe(),
-                    session,
-                    kind: StopKind::Park,
-                });
-            }
-        }
+                    session: self.session(&occupant.sref)?,
+                })
+            })
+            .collect();
         for stop in &stops {
-            if let StopKind::Park = stop.kind {
-                self.stamp_branch(&stop.sref, &current)?;
-            }
+            self.stamp_branch(&stop.sref, &current)?;
         }
         for stop in &stops {
             stop.session.kill();
@@ -1793,14 +1868,7 @@ impl Daemon {
 
     fn finalize_stop(&self, stop: &Stop) {
         self.unregister_if_current(&stop.sref, &stop.session);
-        match stop.kind {
-            StopKind::Park => self.publish_session_end(&stop.sref, SessionEnd::Parked),
-            StopKind::Warm => self
-                .prewarmed
-                .lock()
-                .unwrap()
-                .retain(|_, e| SessionRef::Agent(e.agent_id.clone()) != stop.sref),
-        }
+        self.publish_session_end(&stop.sref, SessionEnd::Parked);
     }
 
     fn unregister_if_current(&self, sref: &SessionRef, session: &Arc<PtySession>) -> bool {
@@ -1899,7 +1967,7 @@ impl Daemon {
         }
     }
 
-    /// Refuse to invalidate any live PTY, including finished agents and warm sessions.
+    /// Refuse to invalidate any live PTY, including finished agents.
     fn require_checkout_unoccupied(
         &self,
         id: &WorktreeId,
@@ -1917,16 +1985,8 @@ impl Daemon {
                     .map(|t| SessionRef::Terminal(t.id.clone())),
             )
             .any(|s| Some(&s) != mover && self.is_alive(&s));
-        let warm = self
-            .prewarmed
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|((w, _), entry)| {
-                w == id && self.is_alive(&SessionRef::Agent(entry.agent_id.clone()))
-            });
-        if occupied || warm {
-            bail!("primary checkout has another live session; close the other sessions or let warm PTYs expire, then retry (finished agents and shells still count); no worktree was created");
+        if occupied {
+            bail!("primary checkout has another live session; close the other sessions, then retry (finished agents and shells still count); no worktree was created");
         }
         Ok(())
     }
@@ -2114,7 +2174,9 @@ impl Daemon {
     // ---- agents ----
 
     #[allow(clippy::too_many_arguments)]
-    /// Spawn in a host-owned checkout, validating a branch intent when supplied.
+    /// Create in a host-owned checkout, validating a branch intent when
+    /// supplied, and start it, or queue it when memory is short. Returns
+    /// the row as created.
     pub async fn create_agent(
         self: &Arc<Self>,
         worktree_id: &WorktreeId,
@@ -2125,34 +2187,29 @@ impl Daemon {
         effort: Option<String>,
         auto_title: bool,
         prompt: Option<String>,
-    ) -> Result<EntityId> {
-        let _execution = self.checkout_execution.read().await;
+    ) -> Result<Agent> {
+        let execution = self.checkout_execution.read().await;
         let worktree = self
             .store
             .get_worktree(worktree_id)?
             .context("worktree not found")?;
         self.validate_execution_branch(&worktree, expected_branch.or(Some(&worktree.branch)))?;
-        // A warm session for this (worktree, kind) hands over its PTY and
-        // its pre-generated id — the CLI booted while the user typed the
-        // name, so the create feels instant. An initial prompt forces the
-        // cold path: it rides the CLI's argv, which a booted CLI can't take.
-        let adopted = if prompt.is_some() {
-            None
-        } else {
-            self.take_prewarmed(worktree_id, kind, &model, &effort)
-        };
-        // Only the cold path needs asking: an adopted warm session is proof
-        // the CLI runs. Without this, a missing CLI still "succeeds" — the
-        // login shell prints `command not found` into a PTY that dies at
-        // once, leaving a dead row that looks identical to a fresh one.
-        if adopted.is_none() && !self.cli_available_for_create(kind).await {
+        if !self.cli_available_for_create(kind).await {
             bail!("{}", cli_missing_message(kind));
         }
+        let heavy = crate::config::Config::load().heavy;
+        let (reserved, budget) = (
+            heavy.session_reservation_bytes(kind),
+            heavy.limits().budget_bytes,
+        );
+        if reserved > budget {
+            bail!(
+                "{}",
+                session_start::too_large_message(kind, reserved, budget)
+            );
+        }
         let agent = Agent {
-            id: adopted
-                .as_ref()
-                .map(|e| e.agent_id.clone())
-                .unwrap_or_else(AgentId::generate),
+            id: AgentId::generate(),
             worktree_id: worktree_id.clone(),
             name: if name.trim().is_empty() {
                 "agent".into()
@@ -2173,192 +2230,22 @@ impl Daemon {
             branch: Some(worktree.branch.clone()),
         };
         self.store
-            .insert_agent_with_auto_title(&agent, auto_title)?;
-        if adopted.is_none() {
-            // Cold path: boot the CLI right away.
-            self.spawn_agent_session_with_prompt(&agent, &worktree, 80, 24, prompt.as_deref())?;
-        }
-        let mut broadcast_agent = agent.clone();
-        broadcast_agent.alive = true;
+            .insert_agent_with_prompt(&agent, auto_title, prompt.as_deref())?;
+        // Clients know the row before its process can report a status.
         self.broadcast(ServerEvent::EntityUpserted {
-            entity: Entity::Agent(broadcast_agent),
+            entity: Entity::Agent(agent.clone()),
         });
-        if let Some(entry) = adopted {
-            // Now that the row exists, replay the hooks the warm CLI fired
-            // before adoption (SessionStart stores the resume session id).
-            for (event, sid) in entry.buffered_hooks {
-                self.apply_hook_event(&agent.id, event, sid);
-            }
-        }
-        Ok(EntityId::Agent(agent.id))
-    }
-
-    // ---- prewarm pool ----
-
-    /// Pre-spawn an agent CLI for (worktree, kind) so the next create adopts
-    /// an already-booted session. Fail-soft by design: a disabled config,
-    /// missing CLI, or spawn error just means the create stays cold.
-    pub async fn prewarm_agent(
-        self: &Arc<Self>,
-        worktree_id: &WorktreeId,
-        kind: AgentKind,
-        model: Option<String>,
-        effort: Option<String>,
-    ) -> Result<()> {
-        let _execution = self.checkout_execution.read().await;
-        if !crate::config::Config::load().prewarm_agents {
-            return Ok(());
-        }
-        let Some(worktree) = self.store.get_worktree(worktree_id)? else {
-            return Ok(());
-        };
-        let stale = {
-            // One warm slot per key; keep a live, young one with the same
-            // spec, replace a dead, wrong-spec, or aging one (recycling
-            // before the reaper hits keeps a re-requested slot gap-free).
-            let mut pool = self.prewarmed.lock().unwrap();
-            if let Some(entry) = pool.get(&(worktree_id.clone(), kind)) {
-                if self.is_alive(&SessionRef::Agent(entry.agent_id.clone()))
-                    && entry.model == model
-                    && entry.effort == effort
-                    && entry.spawned_at.elapsed() < PREWARM_RECYCLE_AGE
-                {
-                    return Ok(());
-                }
-                pool.remove(&(worktree_id.clone(), kind))
-            } else {
-                None
-            }
-        };
-        if let Some(old) = stale {
-            self.kill_session(&SessionRef::Agent(old.agent_id));
-        }
-        if !self.cli_available(kind).await {
-            tracing::debug!(kind = kind.as_str(), "prewarm skipped: CLI not installed");
-            return Ok(());
-        }
-        let agent = Agent {
-            id: AgentId::generate(),
-            worktree_id: worktree_id.clone(),
-            name: "prewarm".into(),
-            status: AgentStatus::Fresh,
-            archived: false,
-            archived_at: 0,
-            pinned: false,
-            kind,
-            model: model.clone(),
-            effort: effort.clone(),
-            session_id: None,
-            sort_order: 0,
-            status_changed_at: 0,
-            alive: false,
-            branch: None,
-        };
-        self.spawn_agent_session(&agent, &worktree, 80, 24)?;
-        tracing::info!(agent = %agent.id, kind = kind.as_str(), worktree = %worktree.branch, "prewarmed agent session");
-        let replaced = self.prewarmed.lock().unwrap().insert(
-            (worktree_id.clone(), kind),
-            PrewarmEntry {
-                agent_id: agent.id,
-                spawned_at: Instant::now(),
-                model,
-                effort,
-                buffered_hooks: Vec::new(),
-            },
-        );
-        // Two racing prewarms for the same key: the loser's session would
-        // otherwise leak as an orphan CLI process.
-        if let Some(old) = replaced {
-            self.kill_session(&SessionRef::Agent(old.agent_id));
-        }
-        Ok(())
-    }
-
-    /// Pop the warm entry for (worktree, kind) if its PTY is still running
-    /// and it booted with the requested model/effort. A dead entry (CLI
-    /// missing/crashed while warm) is dropped, a wrong-spec one is killed;
-    /// either way the caller falls back to a cold spawn.
-    fn take_prewarmed(
-        &self,
-        worktree_id: &WorktreeId,
-        kind: AgentKind,
-        model: &Option<String>,
-        effort: &Option<String>,
-    ) -> Option<PrewarmEntry> {
-        let key = (worktree_id.clone(), kind);
-        let entry = {
-            let mut pool = self.prewarmed.lock().unwrap();
-            let sref = SessionRef::Agent(pool.get(&key)?.agent_id.clone());
-            if self.session(&sref).is_some_and(|s| s.was_killed()) {
-                return None;
-            }
-            pool.remove(&key)?
-        };
-        if !self.is_alive(&SessionRef::Agent(entry.agent_id.clone())) {
-            return None;
-        }
-        if entry.model != *model || entry.effort != *effort {
-            self.kill_session(&SessionRef::Agent(entry.agent_id));
-            return None;
-        }
-        Some(entry)
-    }
-
-    /// Drop warm sessions that died or sat unclaimed past the max age
-    /// (runs on the daemon's periodic tick).
-    pub fn reap_prewarmed(&self) {
-        let doomed: Vec<AgentId> = {
-            let mut pool = self.prewarmed.lock().unwrap();
-            let expired: Vec<_> = pool
-                .iter()
-                .filter(|(_, e)| {
-                    e.spawned_at.elapsed() > PREWARM_MAX_AGE
-                        || !self.is_alive(&SessionRef::Agent(e.agent_id.clone()))
-                })
-                .map(|(k, _)| k.clone())
-                .collect();
-            expired
-                .into_iter()
-                .filter_map(|k| pool.remove(&k))
-                .map(|e| e.agent_id)
-                .collect()
-        };
-        for id in doomed {
-            tracing::debug!(agent = %id, "reaping prewarmed session");
-            self.kill_session(&SessionRef::Agent(id));
-        }
-    }
-
-    /// Kill warm sessions homed in any of these worktrees (worktree delete,
-    /// project remove — their store rows are gone or going).
-    fn kill_prewarmed_in(&self, worktree_ids: &[WorktreeId]) {
-        let doomed: Vec<AgentId> = {
-            let mut pool = self.prewarmed.lock().unwrap();
-            let keys: Vec<_> = pool
-                .keys()
-                .filter(|(w, _)| worktree_ids.contains(w))
-                .cloned()
-                .collect();
-            keys.into_iter()
-                .filter_map(|k| pool.remove(&k))
-                .map(|e| e.agent_id)
-                .collect()
-        };
-        for id in doomed {
-            self.kill_session(&SessionRef::Agent(id));
-        }
-    }
-
-    fn prewarmed_in(&self, worktree: &WorktreeId) -> Vec<(SessionRef, Arc<PtySession>)> {
-        let pool = self.prewarmed.lock().unwrap();
-        pool.iter()
-            .filter(|((w, _), _)| w == worktree)
-            .filter_map(|(_, e)| {
-                let sref = SessionRef::Agent(e.agent_id.clone());
-                let session = self.session(&sref)?;
-                Some((sref, session))
-            })
-            .collect()
+        let rollback = UnstartedCreate::arm(self, &agent.id);
+        let started = self
+            .start_held(&agent.id, session_start::Start::Admit, 80, 24, &execution)
+            .await;
+        rollback.disarm();
+        started.map_err(session_start::StartError::into_anyhow)?;
+        let created = self.agent_entity(&agent.id)?;
+        self.broadcast(ServerEvent::EntityUpserted {
+            entity: Entity::Agent(created.clone()),
+        });
+        Ok(created)
     }
 
     /// Is the kind's CLI on the user's PATH (as their login shell sees it)?
@@ -2475,10 +2362,14 @@ impl Daemon {
     /// old checkout, so left alone `reparent_agent_by_cwd` would snap the
     /// row straight back on the next hook event: kill it and respawn resumed
     /// in the target so the process and the row agree. A respawn failure
-    /// degrades to a dead session the next attach/prewarm revives via
+    /// degrades to a dead session the next attach revives via
     /// `ensure_session`.
-    pub fn move_agent(self: &Arc<Self>, id: &AgentId, worktree_id: &WorktreeId) -> Result<()> {
-        let _execution = self
+    pub async fn move_agent(
+        self: &Arc<Self>,
+        id: &AgentId,
+        worktree_id: &WorktreeId,
+    ) -> Result<()> {
+        let execution = self
             .checkout_execution
             .try_read()
             .map_err(|_| anyhow::anyhow!("checkout operation in progress; retry session action"))?;
@@ -2498,23 +2389,20 @@ impl Daemon {
             bail!("target worktree belongs to a different project");
         }
         self.validate_execution_branch(&target, Some(&target.branch))?;
-        let sref = SessionRef::Agent(id.clone());
-        let was_alive = self.session(&sref).is_some();
-        if was_alive {
-            self.kill_session(&sref);
+        let respawned = self
+            .respawn(id, &execution, false, || {
+                // A deliberate move invalidates the remembered hook cwd: it still
+                // points at the old checkout, and the next worktree sync would
+                // replay it straight back over the user's choice.
+                self.last_cwd.lock().unwrap().remove(id);
+                self.store.set_agent_worktree(id, worktree_id)?;
+                self.store.set_agent_branch(id, Some(&target.branch))
+            })
+            .await?;
+        if let Some(Err(e)) = respawned {
+            tracing::warn!(agent = %id, error = %e.into_anyhow(), "respawn after move failed");
         }
-        // A deliberate move invalidates the remembered hook cwd: it still
-        // points at the old checkout, and the next worktree sync would
-        // replay it straight back over the user's choice.
-        self.last_cwd.lock().unwrap().remove(id);
-        self.store.set_agent_worktree(id, worktree_id)?;
-        self.store.set_agent_branch(id, Some(&target.branch))?;
-        if was_alive {
-            let agent = self.store.get_agent(id)?.context("agent not found")?;
-            if let Err(e) = self.spawn_agent_session(&agent, &target, 80, 24) {
-                tracing::warn!(agent = %id, error = %e, "respawn after move failed");
-            }
-        }
+        drop(execution);
         let agent = self.agent_entity(id)?;
         self.broadcast(ServerEvent::EntityUpserted {
             entity: Entity::Agent(agent),
@@ -2740,8 +2628,12 @@ impl Daemon {
         }
     }
 
-    pub fn archive_agent(self: &Arc<Self>, id: &AgentId) -> Result<()> {
+    pub async fn archive_agent(self: &Arc<Self>, id: &AgentId) -> Result<()> {
+        let _one = self.starts.hold().await;
         self.kill_session(&SessionRef::Agent(id.clone()));
+        if self.cancel_queued_start(id) {
+            self.override_hook_status(id, AgentStatus::Fresh);
+        }
         self.store.set_agent_archived(id, true)?;
         let agent = self.agent_entity(id)?;
         self.broadcast(ServerEvent::EntityUpserted {
@@ -2776,8 +2668,10 @@ impl Daemon {
         Ok(())
     }
 
-    pub fn delete_agent(self: &Arc<Self>, id: &AgentId) -> Result<()> {
+    pub async fn delete_agent(self: &Arc<Self>, id: &AgentId) -> Result<()> {
+        let _one = self.starts.hold().await;
         self.kill_session(&SessionRef::Agent(id.clone()));
+        self.cancel_queued_start(id);
         self.last_cwd.lock().unwrap().remove(id);
         self.store.delete_agent(id)?;
         self.broadcast(ServerEvent::EntityRemoved {
@@ -2786,26 +2680,68 @@ impl Daemon {
         Ok(())
     }
 
-    pub fn restart_agent(self: &Arc<Self>, id: &AgentId) -> Result<()> {
-        let _execution = self
-            .checkout_execution
-            .try_read()
-            .map_err(|_| anyhow::anyhow!("checkout operation in progress; retry session action"))?;
+    /// Kill the agent's live process for a respawn and wait until it is
+    /// reaped and its memory charge released, so the start that follows is
+    /// not admitted against it. It stays the agent's mapped session until
+    /// then, so a retry or an attach after a timeout finds it instead of
+    /// starting a second process beside it. False when nothing was running.
+    async fn stop_for_respawn(&self, id: &AgentId) -> Result<bool> {
+        let sref = SessionRef::Agent(id.clone());
+        let Some(old) = self.session(&sref) else {
+            return Ok(false);
+        };
+        old.kill();
+        self.outlive(&old).await?;
+        self.unregister_if_current(&sref, &old);
+        Ok(true)
+    }
+
+    /// The row after the restart: started, or `Queued` when it does not fit.
+    pub async fn restart_agent(self: &Arc<Self>, id: &AgentId) -> Result<Agent> {
         let agent = self.store.get_agent(id)?.context("agent not found")?;
-        if agent.archived {
-            bail!("agent is archived — unarchive it first");
+        if agent.status == AgentStatus::Queued {
+            bail!("{}", session_start::queued_message(&agent));
         }
         let worktree = self
             .store
             .get_worktree(&agent.worktree_id)?
             .context("worktree not found")?;
+        let execution = self
+            .checkout_execution
+            .try_read()
+            .map_err(|_| anyhow::anyhow!("checkout operation in progress; retry session action"))?;
+        if agent.archived {
+            bail!("agent is archived — unarchive it first");
+        }
         self.validate_execution_branch(&worktree, agent.branch.as_deref())?;
-        self.kill_session(&SessionRef::Agent(id.clone()));
-        self.spawn_agent_session(&agent, &worktree, 80, 24)?;
-        self.broadcast(ServerEvent::EntityUpserted {
-            entity: Entity::Agent(self.agent_entity(id)?),
-        });
-        Ok(())
+        if let Some(started) = self.respawn(id, &execution, true, || Ok(())).await? {
+            started.map_err(session_start::StartError::into_anyhow)?;
+        }
+        drop(execution);
+        self.agent_entity(id)
+    }
+
+    /// Stop the agent's process, `rehome` its row, and start it again, all
+    /// as the one owner of its starts, so no grant, force or attach starts
+    /// it in between. With nothing running it starts again only when
+    /// `always_start`; None when no start was attempted.
+    async fn respawn(
+        self: &Arc<Self>,
+        id: &AgentId,
+        execution: &tokio::sync::RwLockReadGuard<'_, ()>,
+        always_start: bool,
+        rehome: impl FnOnce() -> Result<()>,
+    ) -> Result<Option<Result<session_start::Launch, session_start::StartError>>> {
+        let owner = self.starts.hold().await;
+        let was_alive = self.stop_for_respawn(id).await?;
+        rehome()?;
+        if !was_alive && !always_start {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.start_owned(id, session_start::Start::Respawn, 80, 24, execution, &owner)
+                .await,
+        ))
     }
 
     // ---- terminals ----
@@ -3036,57 +2972,73 @@ impl Daemon {
     // ---- attach / spawn ----
 
     /// Get the live session for an entity, lazily (re)spawning its PTY when
-    /// none is running (restored agents, closed shells).
-    pub fn ensure_session(
+    /// none is running (restored agents, closed shells). An agent's respawn
+    /// asks for memory first and may queue it instead.
+    pub async fn ensure_session(
         self: &Arc<Self>,
         sref: &SessionRef,
         cols: u16,
         rows: u16,
     ) -> Result<Arc<PtySession>> {
-        if let Some(s) = self.session(sref) {
+        match sref {
+            SessionRef::Agent(id) => {
+                match self
+                    .start_agent(id, session_start::Start::Admit, cols, rows)
+                    .await
+                    .map_err(session_start::StartError::into_anyhow)?
+                {
+                    session_start::Launch::Started(session) => Ok(session),
+                    session_start::Launch::Queued => {
+                        bail!("queued for memory; it starts by itself when room frees")
+                    }
+                }
+            }
+            SessionRef::Terminal(id) => {
+                if let Some(old) = self
+                    .session(sref)
+                    .filter(|s| s.was_killed() || s.has_exited())
+                {
+                    let exit_code = self.outlive(&old).await?;
+                    if self.unregister_if_current(sref, &old) {
+                        self.publish_session_end(sref, SessionEnd::Exited(exit_code));
+                    }
+                }
+                self.ensure_terminal_session(id, cols, rows)
+            }
+        }
+    }
+
+    fn ensure_terminal_session(
+        self: &Arc<Self>,
+        id: &TerminalId,
+        cols: u16,
+        rows: u16,
+    ) -> Result<Arc<PtySession>> {
+        let sref = SessionRef::Terminal(id.clone());
+        if let Some(s) = self.session(&sref) {
             return Ok(s);
         }
         let _execution = self
             .checkout_execution
             .try_read()
             .map_err(|_| anyhow::anyhow!("checkout operation in progress; retry resume"))?;
-        match sref {
-            SessionRef::Agent(id) => {
-                let agent = self.store.get_agent(id)?.context("agent not found")?;
-                if agent.archived {
-                    bail!("agent is archived — unarchive it first");
-                }
-                let worktree = self
-                    .store
-                    .get_worktree(&agent.worktree_id)?
-                    .context("worktree not found")?;
-                let session = self.spawn_agent_session(&agent, &worktree, cols, rows)?;
-                self.broadcast(ServerEvent::EntityUpserted {
-                    entity: Entity::Agent(self.agent_entity(id)?),
-                });
-                Ok(session)
-            }
-            SessionRef::Terminal(id) => {
-                let term = self.store.get_terminal(id)?.context("terminal not found")?;
-                let worktree = self
-                    .store
-                    .get_worktree(&term.worktree_id)?
-                    .context("worktree not found")?;
-                let session = self.spawn_terminal_session(&term, &worktree, cols, rows)?;
-                let mut broadcast_term = term;
-                broadcast_term.alive = true;
-                self.broadcast(ServerEvent::EntityUpserted {
-                    entity: Entity::Terminal(broadcast_term),
-                });
-                Ok(session)
-            }
-        }
+        let term = self.store.get_terminal(id)?.context("terminal not found")?;
+        let worktree = self
+            .store
+            .get_worktree(&term.worktree_id)?
+            .context("worktree not found")?;
+        let session = self.spawn_terminal_session(&term, &worktree, cols, rows)?;
+        let mut broadcast_term = term;
+        broadcast_term.alive = true;
+        self.broadcast(ServerEvent::EntityUpserted {
+            entity: Entity::Terminal(broadcast_term),
+        });
+        Ok(session)
     }
 
-    /// Boot every dead, non-archived session under `worktree_id` (agents and
-    /// terminals) so a later Attach replays an already-running screen.
-    /// Already-alive sessions pass through ensure_session untouched; one
-    /// session failing to spawn (missing CLI, deleted checkout) is logged
+    /// Boot every dead shell under `worktree_id` so a later Attach replays
+    /// an already-running screen. Already-alive sessions pass through
+    /// untouched; one shell failing to spawn (deleted checkout) is logged
     /// and doesn't stop the rest.
     pub fn prewarm_worktree_sessions(
         self: &Arc<Self>,
@@ -3114,7 +3066,10 @@ impl Daemon {
             // The prewarm doubles as a "user is looking here" signal for
             // the idle reaper, for alive sessions as much as fresh spawns.
             self.touch_session(&sref);
-            if let Err(e) = self.ensure_session(&sref, cols, rows) {
+            let SessionRef::Terminal(id) = &sref else {
+                continue;
+            };
+            if let Err(e) = self.ensure_terminal_session(id, cols, rows) {
                 tracing::debug!(session = ?sref, error = %e, "session prewarm failed");
             }
         }
@@ -3126,22 +3081,9 @@ impl Daemon {
         worktree: &Worktree,
         cols: u16,
         rows: u16,
+        charge: crate::heavy::Lease,
     ) -> Result<Arc<PtySession>> {
-        self.spawn_agent_session_with_prompt(agent, worktree, cols, rows, None)
-    }
-
-    /// `initial_prompt` rides the CLI's positional prompt argument, so it
-    /// only applies to a fresh spawn — respawns resume by session id and
-    /// never repeat it (`agent_spawn_command` drops it when resuming).
-    fn spawn_agent_session_with_prompt(
-        self: &Arc<Self>,
-        agent: &Agent,
-        worktree: &Worktree,
-        cols: u16,
-        rows: u16,
-        initial_prompt: Option<&str>,
-    ) -> Result<Arc<PtySession>> {
-        self.validate_execution_branch(worktree, agent.branch.as_deref())?;
+        let initial_prompt = self.store.take_agent_pending_prompt(&agent.id)?;
         // Managed status hooks; a failure here degrades to "no status
         // updates", never blocks the spawn.
         if let Err(e) = hooks::installer::install_for_kind(agent.kind, &worktree.path) {
@@ -3160,7 +3102,7 @@ impl Daemon {
             agent.model.as_deref(),
             agent.effort.as_deref(),
             cmd_override,
-            initial_prompt,
+            initial_prompt.as_deref(),
         );
         let hook_env = self.hook_env_pairs(&agent.id.to_string());
         // Run the agent through the user's login+interactive shell so it sees
@@ -3183,71 +3125,116 @@ impl Daemon {
             rows,
         };
         let sref = SessionRef::Agent(agent.id.clone());
-        let session = PtySession::spawn(sref, spec)?;
-        self.install_session(session.clone());
-        if resumed {
-            self.arm_resume_fallback(agent.clone(), worktree.clone(), session.clone(), cols, rows);
+        let launch = charge.consumer().clone();
+        let session = match PtySession::spawn_holding(sref, spec, Box::new(charge)) {
+            Ok(session) => session,
+            Err(e) => {
+                if let Some(prompt) = &initial_prompt {
+                    if let Err(restore) = self.store.set_agent_pending_prompt(&agent.id, prompt) {
+                        tracing::warn!(agent = %agent.id, error = %restore, "the unspawned prompt was lost");
+                    }
+                }
+                return Err(e);
+            }
+        };
+        if let Some(pid) = session.child_pid {
+            self.heavy.session_spawned(launch, pid);
         }
+        if resumed {
+            session.resumed_until(Instant::now() + RESUME_GRACE);
+        }
+        self.install_session(session.clone());
         Ok(session)
     }
 
-    /// A resumed session (`claude --resume` / `codex resume` /
-    /// `cursor-agent --resume`) dies fast when
-    /// it is stale/deleted — fall back to a fresh session instead of leaving
-    /// a dead pane.
-    fn arm_resume_fallback(
+    /// After a process exits: unmap it and publish its end, or start fresh
+    /// in place of a resume that failed fast. An agent's run ends as the
+    /// owner of its starts, so it never lands on a replacement.
+    async fn end_run(self: &Arc<Self>, session: &Arc<PtySession>, exit_code: Option<i32>) {
+        let sref = &session.sref;
+        let SessionRef::Agent(id) = sref else {
+            if self.unregister_if_current(sref, session) {
+                tracing::info!(session = ?sref, exit_code, "session exited");
+                self.publish_session_end(sref, SessionEnd::Exited(exit_code));
+            }
+            return;
+        };
+        let owner = self.starts.hold().await;
+        let retired = self.retire(session, exit_code, &owner);
+        #[cfg(test)]
+        self.pauses.at(pause::Point::ExitRetired).await;
+        let fresh = match retired {
+            Retired::Gone => return,
+            Retired::Ended => false,
+            Retired::ResumeFailed => self.start_fresh(id, session.size(), &owner).await,
+        };
+        if !fresh {
+            tracing::info!(session = ?sref, exit_code, "session exited");
+            self.publish_session_end(sref, SessionEnd::Exited(exit_code));
+        }
+    }
+
+    /// Unmap `session` if it is still the agent's process. A resume that
+    /// failed fast also forgets the conversation it could not resume; owning
+    /// the starts means no newer process has saved one since.
+    fn retire(
+        &self,
+        session: &Arc<PtySession>,
+        exit_code: Option<i32>,
+        _owner: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> Retired {
+        if !self.unregister_if_current(&session.sref, session) {
+            return Retired::Gone;
+        }
+        match &session.sref {
+            SessionRef::Agent(id) if session.resume_failed(exit_code) => {
+                tracing::info!(agent = %id, "resume failed fast — respawning fresh");
+                let _ = self.store.set_agent_session_id(id, None);
+                Retired::ResumeFailed
+            }
+            _ => Retired::Ended,
+        }
+    }
+
+    async fn start_fresh(
         self: &Arc<Self>,
-        agent: Agent,
-        worktree: Worktree,
-        session: Arc<PtySession>,
-        cols: u16,
-        rows: u16,
-    ) {
-        let daemon = self.clone();
-        let mut rx = session.events.subscribe();
-        tokio::spawn(async move {
-            let early_exit = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                loop {
-                    match rx.recv().await {
-                        Ok(PtyEvent::Exited { exit_code }) => return exit_code.unwrap_or(1) != 0,
-                        Ok(_) => continue,
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(broadcast::error::RecvError::Closed) => return false,
-                    }
-                }
+        id: &AgentId,
+        (cols, rows): (u16, u16),
+        owner: &tokio::sync::MutexGuard<'_, ()>,
+    ) -> bool {
+        let Ok(execution) = self.checkout_execution.try_read() else {
+            tracing::info!(agent = %id, "fresh respawn after a failed resume refused: checkout operation in progress");
+            return false;
+        };
+        match self
+            .start_owned(
+                id,
+                session_start::Start::Admit,
+                cols,
+                rows,
+                &execution,
+                owner,
+            )
+            .await
+        {
+            Ok(session_start::Launch::Started(_)) => true,
+            Ok(session_start::Launch::Queued) => false,
+            Err(e) => {
+                tracing::info!(agent = %id, error = %e.into_anyhow(), "fresh respawn after a failed resume refused");
+                false
+            }
+        }
+    }
+
+    async fn outlive(&self, old: &PtySession) -> Result<Option<i32>> {
+        tokio::time::timeout(crate::pty::STOP_DEADLINE, old.exited())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "its old process is still running after {}s; nothing was started, retry once it exits",
+                    crate::pty::STOP_DEADLINE.as_secs()
+                )
             })
-            .await;
-            if early_exit != Ok(true) || session.was_killed() {
-                return;
-            }
-            match daemon.store.get_agent(&agent.id) {
-                Ok(Some(current)) if !current.archived => {}
-                _ => return,
-            }
-            let Ok(_execution) = daemon.checkout_execution.try_read() else {
-                return;
-            };
-            if daemon
-                .validate_execution_branch(&worktree, agent.branch.as_deref())
-                .is_err()
-            {
-                return;
-            }
-            tracing::info!(agent = %agent.id, "resume failed fast — respawning fresh");
-            let _ = daemon.store.set_agent_session_id(&agent.id, None);
-            let mut fresh = agent.clone();
-            fresh.session_id = None;
-            if daemon
-                .spawn_agent_session(&fresh, &worktree, cols, rows)
-                .is_ok()
-            {
-                if let Ok(agent) = daemon.agent_entity(&fresh.id) {
-                    daemon.broadcast(ServerEvent::EntityUpserted {
-                        entity: Entity::Agent(agent),
-                    });
-                }
-            }
-        });
     }
 
     fn spawn_terminal_session(
@@ -3315,18 +3302,19 @@ impl Daemon {
         let sref = session.sref.clone();
         tokio::spawn(async move {
             loop {
-                match rx.recv().await {
-                    Ok(PtyEvent::Exited { exit_code }) => {
+                let event = tokio::select! {
+                    exit_code = session.exited() => {
                         if session.was_killed() {
                             daemon.wait_for_checkout_switch().await;
                         }
-                        if !daemon.unregister_if_current(&sref, &session) {
-                            break;
-                        }
-                        tracing::info!(session = ?sref, exit_code, "session exited");
-                        daemon.publish_session_end(&sref, SessionEnd::Exited(exit_code));
+                        #[cfg(test)]
+                        daemon.pauses.at(pause::Point::ExitSeen).await;
+                        daemon.end_run(&session, exit_code).await;
                         break;
                     }
+                    event = rx.recv() => event,
+                };
+                match event {
                     // The CLI's own busy/idle bit, read off its output. It is
                     // the only end-of-turn news after a user cancel: Claude
                     // Code fires no Stop for an interrupted turn, and
@@ -3376,7 +3364,8 @@ impl Daemon {
 }
 
 /// Program + args for an agent PTY. An override (tests) is used verbatim —
-/// no resume args. Otherwise the kind picks the CLI and its resume shape:
+/// no resume args — with the initial prompt last, as a real CLI gets it.
+/// Otherwise the kind picks the CLI and its resume shape:
 /// `claude --resume <sid>` and `cursor-agent --resume <sid>` (flag),
 /// `pi --session <sid>` (flag, takes a full or partial session id) vs
 /// `codex resume <sid>` (subcommand, so resume args must lead). Claude,
@@ -3401,6 +3390,7 @@ fn agent_spawn_command(
             parts.push(kind.cli_program().into());
         }
         let program = parts.remove(0);
+        parts.extend(initial_prompt.map(String::from));
         return (program, parts, false);
     }
     let program = kind.cli_program().to_string();
@@ -3535,12 +3525,6 @@ struct Stop {
     sref: SessionRef,
     label: String,
     session: Arc<PtySession>,
-    kind: StopKind,
-}
-
-enum StopKind {
-    Park,
-    Warm,
 }
 
 fn child_running(session: &PtySession) -> bool {
@@ -3553,6 +3537,12 @@ fn child_running(session: &PtySession) -> bool {
 enum SessionEnd {
     Exited(Option<i32>),
     Parked,
+}
+
+enum Retired {
+    Gone,
+    Ended,
+    ResumeFailed,
 }
 
 struct Occupant {
@@ -3803,6 +3793,21 @@ mod tests {
                 None
             ),
             ("/bin/sh".into(), vec![], false)
+        );
+        assert_eq!(
+            agent_spawn_command(
+                AgentKind::Claude,
+                None,
+                None,
+                None,
+                Some("/bin/sh worker.sh"),
+                Some("the task")
+            ),
+            (
+                "/bin/sh".into(),
+                vec!["worker.sh".to_string(), "the task".to_string()],
+                false
+            )
         );
     }
 
@@ -4180,15 +4185,15 @@ mod tests {
         assert_eq!(leading(&daemon), Some(Some("top".to_string())));
     }
 
-    #[test]
-    fn removing_the_top_project_hands_the_leading_divider_down() {
+    #[tokio::test]
+    async fn removing_the_top_project_hands_the_leading_divider_down() {
         let daemon = test_daemon();
         seed_projects(&daemon, &["a", "b"]);
         daemon
             .set_project_divider(&ProjectId("a".into()), true, true, Some("work".into()))
             .unwrap();
 
-        daemon.remove_project(&ProjectId("a".into())).unwrap();
+        daemon.remove_project(&ProjectId("a".into())).await.unwrap();
         assert_eq!(names(&daemon), ["b"]);
         assert_eq!(leading(&daemon), Some(Some("work".to_string())));
     }
@@ -4363,8 +4368,8 @@ mod tests {
             .to_string()
     }
 
-    #[test]
-    fn move_agent_rehomes_row_and_broadcasts() {
+    #[tokio::test]
+    async fn move_agent_rehomes_row_and_broadcasts() {
         let daemon = test_daemon();
         seed_projects(&daemon, &["p"]);
         let tmp = tempfile::tempdir().unwrap();
@@ -4384,6 +4389,7 @@ mod tests {
 
         daemon
             .move_agent(&AgentId("a1".into()), &WorktreeId("feat".into()))
+            .await
             .unwrap();
         assert_eq!(agent_worktree(&daemon, "a1"), "feat");
         match rx.try_recv().unwrap() {
@@ -4396,6 +4402,7 @@ mod tests {
         // Moving to the worktree it already lives in is a silent no-op.
         daemon
             .move_agent(&AgentId("a1".into()), &WorktreeId("feat".into()))
+            .await
             .unwrap();
         assert!(rx.try_recv().is_err(), "no broadcast for a no-op move");
     }
@@ -4495,8 +4502,8 @@ mod tests {
         assert!(!sanitize_title(&long).ends_with(' '));
     }
 
-    #[test]
-    fn move_agent_rejects_cross_project_targets() {
+    #[tokio::test]
+    async fn move_agent_rejects_cross_project_targets() {
         let daemon = test_daemon();
         seed_projects(&daemon, &["p", "q"]);
         seed_worktree(&daemon, "p", "p-root", "/nebula-test/p", true);
@@ -4505,6 +4512,7 @@ mod tests {
 
         let err = daemon
             .move_agent(&AgentId("a1".into()), &WorktreeId("q-root".into()))
+            .await
             .unwrap_err();
         assert!(err.to_string().contains("different project"));
         assert_eq!(agent_worktree(&daemon, "a1"), "p-root");
@@ -4647,6 +4655,7 @@ mod tests {
         // drops the remembered cwd, so replaying it can't overrule the user.
         daemon
             .move_agent(&AgentId("a1".into()), &WorktreeId("root".into()))
+            .await
             .unwrap();
         let other = root.join("repo-worktrees").join("other");
         git_in(
@@ -4986,6 +4995,7 @@ mod tests {
         };
         let (_, worktrees, _, _) = daemon.store.load_tree().unwrap();
         let primary = worktrees.into_iter().find(|w| w.is_main).unwrap();
+        session_start::start(&daemon).await;
         (tmp, repo, daemon, pid, primary)
     }
 
@@ -5006,6 +5016,26 @@ mod tests {
         let pid = session.child_pid.unwrap();
         daemon.install_session(session);
         pid
+    }
+
+    #[tokio::test]
+    async fn a_stop_for_respawn_unregisters_its_reaped_session_itself_before_returning() {
+        let (_tmp, repo, daemon, _pid, primary) = primary_with_feat().await;
+        seed_agent(&daemon, "a", primary.id.as_str(), None);
+        let sref = SessionRef::Agent(AgentId("a".into()));
+        spawn_live(&daemon, sref.clone(), &repo, "exec sleep 30");
+        let probe = {
+            let (daemon, sref) = (daemon.clone(), sref.clone());
+            tokio::spawn(async move {
+                let stopped = daemon.stop_for_respawn(&AgentId("a".into())).await.unwrap();
+                (stopped, daemon.session(&sref).is_some())
+            })
+        };
+        assert_eq!(
+            probe.await.unwrap(),
+            (true, false),
+            "returned with the reaped session still mapped, so the start after it would reuse it"
+        );
     }
 
     async fn process_exits(pid: u32) -> bool {
@@ -5116,23 +5146,6 @@ mod tests {
         }
     }
 
-    async fn until_running_sleep(pid: u32) {
-        for _ in 0..50 {
-            let out = std::process::Command::new("ps")
-                .args(["-o", "comm=", "-p", &pid.to_string()])
-                .output()
-                .unwrap();
-            if String::from_utf8_lossy(&out.stdout)
-                .trim()
-                .ends_with("sleep")
-            {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        panic!("{pid} never reached its sleep");
-    }
-
     fn process_alive(pid: u32) -> bool {
         std::process::Command::new("kill")
             .args(["-0", &pid.to_string()])
@@ -5174,8 +5187,10 @@ mod tests {
         daemon.store.set_agent_branch(&id, Some("main")).unwrap();
         let agent = SessionRef::Agent(id.clone());
         spawn_live(&daemon, agent.clone(), &repo, "exec sleep 60");
-        let row = daemon.store.get_agent(&id).unwrap().unwrap();
-        daemon.arm_resume_fallback(row, primary, daemon.session(&agent).unwrap(), 80, 24);
+        daemon
+            .session(&agent)
+            .unwrap()
+            .resumed_until(Instant::now() + RESUME_GRACE);
 
         daemon.kill_session(&agent);
         daemon.publish_session_end(&agent, SessionEnd::Parked);
@@ -5265,7 +5280,7 @@ mod tests {
         let tab = terminals.iter().find(|t| t.id.as_str() == "shell").unwrap();
         assert!(!tab.alive);
         assert_eq!(tab.branch.as_deref(), Some("main"));
-        let resumed = daemon.ensure_session(&shell, 80, 24).unwrap();
+        let resumed = daemon.ensure_session(&shell, 80, 24).await.unwrap();
         assert!(!Arc::ptr_eq(&dead, &resumed), "resume spawns a new PTY");
         assert!(daemon.is_alive(&shell));
         daemon.kill_all();
@@ -5288,92 +5303,6 @@ exec sleep 60
         (dir, Some(cmd))
     }
 
-    fn pid_of(daemon: &Daemon, sref: &SessionRef) -> Option<u32> {
-        daemon
-            .session_pids()
-            .into_iter()
-            .find_map(|(s, pid)| (&s == sref).then_some(pid))
-    }
-
-    async fn warm_pid(daemon: &Arc<Daemon>, primary: &WorktreeId) -> u32 {
-        daemon
-            .prewarm_agent(primary, AgentKind::Claude, None, None)
-            .await
-            .unwrap();
-        let pids = daemon.session_pids();
-        assert_eq!(pids.len(), 1, "one warm PTY: {pids:?}");
-        until_running_sleep(pids[0].1).await;
-        pids[0].1
-    }
-
-    async fn create_on(daemon: &Arc<Daemon>, primary: &WorktreeId, name: &str) -> SessionRef {
-        let EntityId::Agent(id) = daemon
-            .create_agent(
-                primary,
-                None,
-                name,
-                AgentKind::Claude,
-                None,
-                None,
-                false,
-                None,
-            )
-            .await
-            .unwrap()
-        else {
-            panic!()
-        };
-        SessionRef::Agent(id)
-    }
-
-    #[tokio::test]
-    async fn a_healthy_warm_pty_is_adopted_and_a_timed_out_one_is_waited_for_by_the_retry() {
-        let (_script, agent) = stand_in_agent(&[2]);
-        let (_tmp, repo, daemon, pid, primary) =
-            primary_with_feat_on(test_daemon_with(DaemonOverrides {
-                stop_deadline: Duration::from_millis(1500),
-                agent_cmd: agent,
-                ..DaemonOverrides::default()
-            }))
-            .await;
-
-        let healthy = warm_pid(&daemon, &primary.id).await;
-        let adopted = create_on(&daemon, &primary.id, "adopted").await;
-        assert_eq!(
-            pid_of(&daemon, &adopted),
-            Some(healthy),
-            "the warm PTY was adopted"
-        );
-        daemon.kill_session(&adopted);
-
-        let stopping = warm_pid(&daemon, &primary.id).await;
-        let err = daemon
-            .checkout_primary(&pid, "feat", None, false)
-            .await
-            .unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "a warm agent PTY still running; primary stays on \"main\""
-        );
-        let cold = create_on(&daemon, &primary.id, "cold").await;
-        assert_ne!(
-            pid_of(&daemon, &cold),
-            Some(stopping),
-            "adopted a PTY being stopped"
-        );
-        daemon.kill_session(&cold);
-
-        daemon
-            .checkout_primary(&pid, "feat", None, false)
-            .await
-            .unwrap();
-        assert!(
-            !process_alive(stopping),
-            "the retry waited for the warm PTY"
-        );
-        assert_eq!(git::current_branch(&repo).await.unwrap(), "feat");
-    }
-
     #[tokio::test]
     async fn a_resume_that_falls_back_publishes_the_respawned_agent() {
         let (_script, agent) = stand_in_agent(&[]);
@@ -5389,11 +5318,13 @@ exec sleep 60
             .store
             .set_agent_status(&id, AgentStatus::Disconnected)
             .unwrap();
-        let row = daemon.store.get_agent(&id).unwrap().unwrap();
         let agent = SessionRef::Agent(id.clone());
         spawn_live(&daemon, agent.clone(), &repo, "sleep 0.3; exit 1");
         let mut events = daemon.events.subscribe();
-        daemon.arm_resume_fallback(row, primary, daemon.session(&agent).unwrap(), 80, 24);
+        daemon
+            .session(&agent)
+            .unwrap()
+            .resumed_until(Instant::now() + RESUME_GRACE);
 
         let upsert = tokio::time::timeout(Duration::from_secs(3), async {
             loop {
@@ -5411,6 +5342,436 @@ exec sleep 60
         .expect("the fallback respawned the agent");
         daemon.kill_all();
         assert_eq!(upsert, (AgentStatus::Fresh, true));
+    }
+
+    fn spec(cwd: &Path, script: &str) -> SpawnSpec {
+        SpawnSpec {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), script.into()],
+            cwd: cwd.to_path_buf(),
+            env: Vec::new(),
+            scrub_env: Vec::new(),
+            cols: 80,
+            rows: 24,
+        }
+    }
+
+    async fn until_unmapped(daemon: &Daemon, sref: &SessionRef) -> bool {
+        for _ in 0..100 {
+            if daemon.session(sref).is_none() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn a_session_that_exited_before_it_was_registered_is_still_ended_with_its_exit_code() {
+        let (_tmp, repo, daemon, _pid, primary) = primary_with_feat().await;
+        seed_agent(&daemon, "quick", primary.id.as_str(), None);
+        let sref = SessionRef::Agent(AgentId("quick".into()));
+        let session = PtySession::spawn(sref.clone(), spec(&repo, "exit 0")).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), session.reaped())
+            .await
+            .unwrap();
+        daemon.install_session(session);
+        assert!(
+            until_unmapped(&daemon, &sref).await,
+            "a dead session stayed mapped, so every attach would get it"
+        );
+        assert_eq!(
+            agent_status(&daemon, "quick"),
+            AgentStatus::Finished,
+            "its exit code 0 was lost"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resume_that_failed_before_the_fallback_watched_still_falls_back() {
+        let (_script, agent) = stand_in_agent(&[]);
+        let (_tmp, repo, daemon, _pid, primary) =
+            primary_with_feat_on(test_daemon_with(DaemonOverrides {
+                agent_cmd: agent,
+                ..DaemonOverrides::default()
+            }))
+            .await;
+        seed_agent(&daemon, "stale", primary.id.as_str(), Some("gone"));
+        let id = AgentId("stale".into());
+        daemon
+            .store
+            .set_agent_status(&id, AgentStatus::Disconnected)
+            .unwrap();
+        let sref = SessionRef::Agent(id.clone());
+        let session = PtySession::spawn(sref.clone(), spec(&repo, "exit 1")).unwrap();
+        session.resumed_until(Instant::now() + RESUME_GRACE);
+        tokio::time::timeout(Duration::from_secs(5), session.reaped())
+            .await
+            .unwrap();
+        let mut events = daemon.events.subscribe();
+        daemon.install_session(session);
+        let respawned = tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                if let Ok(ServerEvent::EntityUpserted {
+                    entity: Entity::Agent(a),
+                }) = events.recv().await
+                {
+                    if a.id == id && a.alive {
+                        return;
+                    }
+                }
+            }
+        })
+        .await;
+        daemon.kill_all();
+        assert!(respawned.is_ok(), "the failed resume was never noticed");
+    }
+
+    #[tokio::test]
+    async fn an_idle_sweep_spares_a_replacement_and_a_session_attached_after_it_looked() {
+        let (_tmp, repo, daemon, _pid, primary) = primary_with_feat().await;
+        seed_agent(&daemon, "idle", primary.id.as_str(), None);
+        let sref = SessionRef::Agent(AgentId("idle".into()));
+        let age = |daemon: &Daemon| {
+            daemon
+                .session_interest
+                .lock()
+                .unwrap()
+                .insert(sref.clone(), Instant::now() - Duration::from_secs(3600));
+        };
+        spawn_live(&daemon, sref.clone(), &repo, "exec sleep 30");
+        let candidate = daemon.session(&sref).unwrap();
+        spawn_live(&daemon, sref.clone(), &repo, "exec sleep 30");
+        let replacement = daemon.session(&sref).unwrap();
+        age(&daemon);
+        daemon.reap_if_still_idle(&sref, &candidate, Duration::from_secs(60));
+        assert!(
+            !replacement.was_killed() && !candidate.was_killed(),
+            "the sweep killed by name, not the session it judged"
+        );
+
+        daemon.note_attached(&sref);
+        age(&daemon);
+        daemon.reap_if_still_idle(&sref, &replacement, Duration::from_secs(60));
+        assert!(
+            !replacement.was_killed(),
+            "killed a session attached since the sweep looked"
+        );
+
+        daemon.note_detached(&sref);
+        age(&daemon);
+        daemon.reap_if_still_idle(&sref, &replacement, Duration::from_secs(60));
+        assert!(
+            replacement.was_killed(),
+            "an unwatched idle session is still reaped"
+        );
+        candidate.kill();
+    }
+
+    #[tokio::test]
+    async fn an_attach_to_an_idle_session_being_reaped_waits_for_it_and_gets_its_replacement() {
+        let (_tmp, repo, daemon, _pid, primary) = primary_with_feat().await;
+        seed_agent(&daemon, "idle", primary.id.as_str(), None);
+        let id = AgentId("idle".into());
+        daemon
+            .store
+            .set_agent_status(&id, AgentStatus::Finished)
+            .unwrap();
+        let sref = SessionRef::Agent(id.clone());
+        let detached = repo.join("detached");
+        spawn_live(
+            &daemon,
+            sref.clone(),
+            &repo,
+            &format!(
+                "setsid sh -c 'touch {}; exec sleep 2' & exec sleep 30",
+                detached.display()
+            ),
+        );
+        for _ in 0..250 {
+            if detached.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            detached.exists(),
+            "the terminal-holding child never started"
+        );
+        let stopping = daemon.session(&sref).unwrap();
+        daemon
+            .session_interest
+            .lock()
+            .unwrap()
+            .insert(sref.clone(), Instant::now() - Duration::from_secs(3600));
+
+        daemon.reap_sessions_idle_for(Duration::from_secs(60));
+        assert!(
+            daemon
+                .session(&sref)
+                .is_some_and(|s| Arc::ptr_eq(&s, &stopping)),
+            "unmapped while its process still runs"
+        );
+        assert!(
+            !stopping.has_exited(),
+            "the stop window closed before the attach, so this proved nothing"
+        );
+        let Ok(session_start::Launch::Started(attached)) = daemon
+            .start_agent(&id, session_start::Start::Admit, 80, 24)
+            .await
+        else {
+            panic!("the attach did not get a session");
+        };
+        assert!(
+            !Arc::ptr_eq(&attached, &stopping),
+            "the attach was handed the dying process"
+        );
+        assert!(
+            stopping.has_exited(),
+            "the replacement started beside the stopping process"
+        );
+        assert!(!attached.was_killed() && !attached.has_exited());
+        daemon.kill_all();
+    }
+
+    /// Waits for `expected`: a just-spawned shell may not have run its first
+    /// line yet.
+    async fn spawned(script_dir: &Path, expected: usize) -> usize {
+        let count = || {
+            std::fs::read_dir(script_dir)
+                .unwrap()
+                .filter(|e| {
+                    e.as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("spawn-")
+                })
+                .count()
+        };
+        for _ in 0..100 {
+            if count() >= expected {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        count()
+    }
+
+    async fn started(daemon: &Arc<Daemon>, id: &AgentId) -> Arc<PtySession> {
+        let Ok(session_start::Launch::Started(session)) = daemon
+            .start_agent(id, session_start::Start::Admit, 80, 24)
+            .await
+        else {
+            panic!("the agent did not start");
+        };
+        session
+    }
+
+    fn attach_in_background(
+        daemon: &Arc<Daemon>,
+        sref: &SessionRef,
+    ) -> tokio::task::JoinHandle<Result<Arc<PtySession>>> {
+        let (daemon, sref) = (daemon.clone(), sref.clone());
+        tokio::spawn(async move {
+            let (session, viewing) = daemon.view_session(&sref, 80, 24).await?;
+            viewing.keep();
+            Ok(session)
+        })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_attach_while_the_reaper_kills_gets_a_live_replacement_not_the_dying_process() {
+        let (script, agent) = stand_in_agent(&[]);
+        let (_tmp, _repo, daemon, _pid, primary) =
+            primary_with_feat_on(test_daemon_with(DaemonOverrides {
+                agent_cmd: agent,
+                ..DaemonOverrides::default()
+            }))
+            .await;
+        seed_agent(&daemon, "idle", primary.id.as_str(), None);
+        let id = AgentId("idle".into());
+        let sref = SessionRef::Agent(id.clone());
+        let idle = started(&daemon, &id).await;
+        assert_eq!(spawned(script.path(), 1).await, 1);
+        daemon.override_hook_status(&id, AgentStatus::Finished);
+        daemon
+            .session_interest
+            .lock()
+            .unwrap()
+            .insert(sref.clone(), Instant::now() - Duration::from_secs(3600));
+
+        let mut decided = daemon.pauses.arm(pause::Point::ReapDecided);
+        let reaper = {
+            let daemon = daemon.clone();
+            tokio::task::spawn_blocking(move || {
+                daemon.reap_sessions_idle_for(Duration::from_secs(60))
+            })
+        };
+        decided.reached().await;
+        let attach = attach_in_background(&daemon, &sref);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        decided.release();
+        reaper.await.unwrap();
+        let attached = tokio::time::timeout(Duration::from_secs(10), attach)
+            .await
+            .expect("the attach never finished")
+            .unwrap()
+            .unwrap();
+
+        assert!(idle.was_killed(), "the reaper decided, so it must kill");
+        assert!(
+            !Arc::ptr_eq(&attached, &idle),
+            "the attach was handed the process being reaped"
+        );
+        assert!(
+            idle.has_exited(),
+            "the replacement started beside the dying process"
+        );
+        assert!(!attached.was_killed() && !attached.has_exited());
+        assert_eq!(spawned(script.path(), 2).await, 2);
+        daemon.kill_all();
+    }
+
+    #[tokio::test]
+    async fn an_attach_to_a_shell_being_reaped_gets_a_new_shell_not_the_dying_one() {
+        let (_tmp, repo, daemon, _pid, primary) = primary_with_feat().await;
+        seed_terminal(&daemon, "shell", primary.id.as_str());
+        let sref = SessionRef::Terminal(TerminalId("shell".into()));
+        spawn_live(&daemon, sref.clone(), &repo, "exec sleep 30");
+        let dying = daemon.session(&sref).unwrap();
+        dying.kill();
+
+        let (attached, _viewing) = daemon.view_session(&sref, 80, 24).await.unwrap();
+
+        assert!(
+            !Arc::ptr_eq(&attached, &dying),
+            "the attach was handed the dying shell"
+        );
+        assert!(dying.has_exited());
+        assert!(!attached.was_killed() && !attached.has_exited());
+        daemon.kill_all();
+    }
+
+    #[tokio::test]
+    async fn the_last_idle_check_spares_a_session_whose_checkout_came_into_view() {
+        let (_tmp, repo, daemon, _pid, primary) = primary_with_feat().await;
+        seed_agent(&daemon, "idle", primary.id.as_str(), None);
+        seed_terminal(&daemon, "beside", primary.id.as_str());
+        let sref = SessionRef::Agent(AgentId("idle".into()));
+        spawn_live(&daemon, sref.clone(), &repo, "exec sleep 30");
+        let idle = daemon.session(&sref).unwrap();
+        daemon
+            .session_interest
+            .lock()
+            .unwrap()
+            .insert(sref.clone(), Instant::now() - Duration::from_secs(3600));
+
+        daemon.note_attached(&SessionRef::Terminal(TerminalId("beside".into())));
+        daemon.reap_if_still_idle(&sref, &idle, Duration::from_secs(60));
+
+        assert!(
+            !idle.was_killed(),
+            "killed although a session in its checkout was attached after the sweep looked"
+        );
+        daemon.kill_all();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_old_run_ends_before_its_replacement_starts_and_never_lands_on_it() {
+        let (script, agent) = stand_in_agent(&[]);
+        let (_tmp, _repo, daemon, _pid, primary) =
+            primary_with_feat_on(test_daemon_with(DaemonOverrides {
+                agent_cmd: agent,
+                ..DaemonOverrides::default()
+            }))
+            .await;
+        seed_agent(&daemon, "turns", primary.id.as_str(), None);
+        let id = AgentId("turns".into());
+        let sref = SessionRef::Agent(id.clone());
+        let old = started(&daemon, &id).await;
+        assert_eq!(spawned(script.path(), 1).await, 1);
+
+        let mut retired = daemon.pauses.arm(pause::Point::ExitRetired);
+        old.kill();
+        retired.reached().await;
+        let attach = attach_in_background(&daemon, &sref);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !attach.is_finished(),
+            "a replacement started while the old run was still ending"
+        );
+        retired.release();
+        let replacement = tokio::time::timeout(Duration::from_secs(10), attach)
+            .await
+            .expect("the attach never finished")
+            .unwrap()
+            .unwrap();
+        daemon.apply_hook_event(&id, HookEvent::UserPromptSubmit, None);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert!(!Arc::ptr_eq(&replacement, &old));
+        assert_eq!(spawned(script.path(), 2).await, 2);
+        assert_eq!(
+            agent_status(&daemon, "turns"),
+            AgentStatus::Running,
+            "the old run's end overwrote its replacement's turn"
+        );
+        daemon.kill_all();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_late_fallback_of_a_failed_resume_leaves_the_newer_conversation_alone() {
+        let (script, agent) = stand_in_agent(&[]);
+        let (_tmp, repo, daemon, _pid, primary) =
+            primary_with_feat_on(test_daemon_with(DaemonOverrides {
+                agent_cmd: agent,
+                ..DaemonOverrides::default()
+            }))
+            .await;
+        seed_agent(&daemon, "stale", primary.id.as_str(), Some("gone"));
+        let id = AgentId("stale".into());
+        let sref = SessionRef::Agent(id.clone());
+
+        let mut seen = daemon.pauses.arm(pause::Point::ExitSeen);
+        let failed = PtySession::spawn(sref.clone(), spec(&repo, "exit 1")).unwrap();
+        failed.resumed_until(Instant::now() + RESUME_GRACE);
+        daemon.install_session(failed.clone());
+        seen.reached().await;
+        let newer = started(&daemon, &id).await;
+        assert!(
+            !Arc::ptr_eq(&newer, &failed),
+            "the start was handed the dead process"
+        );
+        assert_eq!(
+            daemon.store.get_agent(&id).unwrap().unwrap().session_id,
+            None,
+            "the start resumed the conversation that just failed"
+        );
+        daemon
+            .store
+            .set_agent_session_id(&id, Some("newer"))
+            .unwrap();
+        seen.release();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        assert_eq!(
+            daemon
+                .store
+                .get_agent(&id)
+                .unwrap()
+                .unwrap()
+                .session_id
+                .as_deref(),
+            Some("newer"),
+            "the late fallback erased the newer process's conversation"
+        );
+        assert_eq!(spawned(script.path(), 1).await, 1);
+        assert!(daemon
+            .session(&sref)
+            .is_some_and(|s| Arc::ptr_eq(&s, &newer)));
+        daemon.kill_all();
     }
 
     #[tokio::test]
@@ -6204,12 +6565,16 @@ exec sleep 60
         ] {
             let err = daemon
                 .ensure_session(&session, 80, 24)
+                .await
                 .err()
                 .expect("resume must refuse mismatched files");
             assert!(err.to_string().contains("expects branch \"main\""), "{err}");
             assert!(!daemon.is_alive(&session));
         }
-        let err = daemon.restart_agent(&AgentId("legacy".into())).unwrap_err();
+        let err = daemon
+            .restart_agent(&AgentId("legacy".into()))
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("expects branch \"main\""), "{err}");
         let ServerEvent::Snapshot { agents, .. } = daemon.snapshot().unwrap() else {
             panic!()
@@ -6256,7 +6621,7 @@ exec sleep 60
             .await
             .unwrap();
         let shell = SessionRef::Terminal(TerminalId("legacy-shell".into()));
-        let live = daemon.ensure_session(&shell, 80, 24).unwrap();
+        let live = daemon.ensure_session(&shell, 80, 24).await.unwrap();
         // A sole calling shell may deliberately move itself and keep its PTY.
         daemon
             .checkout_primary(&project, "feature", Some(&shell), false)
@@ -6264,7 +6629,7 @@ exec sleep 60
             .unwrap();
         assert!(Arc::ptr_eq(
             &live,
-            &daemon.ensure_session(&shell, 80, 24).unwrap()
+            &daemon.ensure_session(&shell, 80, 24).await.unwrap()
         ));
         let ServerEvent::Snapshot { terminals, .. } = daemon.snapshot().unwrap() else {
             panic!()
@@ -6364,106 +6729,6 @@ exec sleep 60
             assert!(msg.contains("try again"), "{msg}");
             assert!(!msg.contains("restart"), "{msg}");
         }
-    }
-
-    #[test]
-    fn prewarm_pool_buffers_hooks_and_drops_dead_entries() {
-        let daemon = test_daemon();
-        let key = (WorktreeId("w1".into()), AgentKind::Claude);
-        daemon.prewarmed.lock().unwrap().insert(
-            key.clone(),
-            PrewarmEntry {
-                agent_id: AgentId("warm-1".into()),
-                spawned_at: Instant::now(),
-                model: None,
-                effort: None,
-                buffered_hooks: Vec::new(),
-            },
-        );
-
-        // Hooks for the warm (row-less) id are buffered on the entry, not
-        // dropped; hooks for unrelated unknown ids still vanish quietly.
-        daemon.apply_hook_event(
-            &AgentId("warm-1".into()),
-            HookEvent::SessionStart { source: None },
-            Some("sid-9".into()),
-        );
-        daemon.apply_hook_event(&AgentId("stranger".into()), HookEvent::Stop, None);
-        {
-            let pool = daemon.prewarmed.lock().unwrap();
-            let entry = pool.get(&key).unwrap();
-            assert_eq!(entry.buffered_hooks.len(), 1);
-            assert_eq!(
-                entry.buffered_hooks[0],
-                (
-                    HookEvent::SessionStart { source: None },
-                    Some("sid-9".to_string())
-                )
-            );
-        }
-
-        // The buffer is bounded: overflow drops the oldest.
-        for i in 0..(PREWARM_HOOK_BUFFER_CAP + 5) {
-            daemon.apply_hook_event(
-                &AgentId("warm-1".into()),
-                HookEvent::Notification {
-                    notification_type: Some(format!("n{i}")),
-                },
-                None,
-            );
-        }
-        assert_eq!(
-            daemon
-                .prewarmed
-                .lock()
-                .unwrap()
-                .get(&key)
-                .unwrap()
-                .buffered_hooks
-                .len(),
-            PREWARM_HOOK_BUFFER_CAP
-        );
-
-        // No live PTY backs the entry, so take() refuses it (create falls
-        // back to a cold spawn) and reap clears it out.
-        assert!(daemon
-            .take_prewarmed(&WorktreeId("w1".into()), AgentKind::Claude, &None, &None)
-            .is_none());
-        assert!(daemon.prewarmed.lock().unwrap().is_empty());
-
-        daemon.prewarmed.lock().unwrap().insert(
-            key.clone(),
-            PrewarmEntry {
-                agent_id: AgentId("warm-2".into()),
-                spawned_at: Instant::now(),
-                model: None,
-                effort: None,
-                buffered_hooks: Vec::new(),
-            },
-        );
-        daemon.reap_prewarmed();
-        assert!(daemon.prewarmed.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn kill_prewarmed_in_scopes_to_worktrees() {
-        let daemon = test_daemon();
-        for (wt, id) in [("w1", "a"), ("w2", "b")] {
-            daemon.prewarmed.lock().unwrap().insert(
-                (WorktreeId(wt.into()), AgentKind::Codex),
-                PrewarmEntry {
-                    agent_id: AgentId(id.into()),
-                    spawned_at: Instant::now(),
-                    model: None,
-                    effort: None,
-                    buffered_hooks: Vec::new(),
-                },
-            );
-        }
-        daemon.kill_prewarmed_in(&[WorktreeId("w1".into())]);
-        let pool = daemon.prewarmed.lock().unwrap();
-        assert_eq!(pool.len(), 1);
-        assert!(pool.contains_key(&(WorktreeId("w2".into()), AgentKind::Codex)));
     }
 
     #[test]

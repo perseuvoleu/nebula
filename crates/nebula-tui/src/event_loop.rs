@@ -53,13 +53,6 @@ const PREWARM_DEBOUNCE: Duration = Duration::from_millis(250);
 /// transcript tail is read for the last-message sub-line — walking the
 /// list with j/k must not read a file per row passed.
 
-/// How often the standing keep-warm request for the selected worktree's
-/// default-spec Claude session is re-sent. Must stay comfortably under the
-/// daemon's reap window minus its recycle threshold, so the warm slot is
-/// refreshed (a young session is a no-op, an aging one is recycled) before
-/// the reaper can empty it.
-const KEEPWARM_REFRESH: Duration = Duration::from_secs(4 * 60);
-
 /// How soon a worktree that came back without a pull request is asked
 /// again, and how far that gap may grow. Switching into a worktree resets
 /// it to the floor, so a PR an agent opens while the user watches lands on
@@ -358,14 +351,6 @@ async fn main_loop(
                 if app.pending_prewarm.is_some() =>
             {
                 fire_pending_prewarm(&mut app, &mut out);
-            }
-            // Standing keep-warm: periodically re-assert the selected
-            // worktree's warm default-spec Claude session so the daemon's
-            // reaper never leaves the next create cold.
-            _ = tokio::time::sleep(app.keepwarm_delay().unwrap_or_default()),
-                if app.next_keepwarm.is_some() =>
-            {
-                fire_keepwarm(&mut app, &mut out);
             }
             // The connection dropped (daemon killed, restarted, crashed):
             // keep re-dialing until a daemon answers — connect_or_spawn
@@ -1701,6 +1686,11 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                         out.push(ClientRequest::UnarchiveAgent { req_id, id: a.id });
                     }
                 }
+            }
+        }
+        Action::ForceStart => {
+            if app.focus == Focus::Sessions {
+                force_start_selected(app, out);
             }
         }
         Action::ToggleArchived => {
@@ -5039,24 +5029,7 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
         },
         Overlay::Prompt(prompt) => match key.code {
             KeyCode::Esc => {
-                // Abandoning a Claude name prompt can leave the warm slot
-                // holding the submenu's off-default spec (its prewarm fired
-                // on kind-pick); put the standing default spec back. Same
-                // spec = daemon-side no-op.
-                let restore = match &prompt.kind {
-                    // Only a worktree target had a prewarm fired — a
-                    // not-yet-created branch checkout has nothing to warm.
-                    PromptKind::NewAgent {
-                        target: crate::app::SpawnTarget::Worktree(worktree),
-                        kind: AgentKind::Claude,
-                        ..
-                    } => Some(worktree.clone()),
-                    _ => None,
-                };
                 app.overlay = None;
-                if let Some(worktree) = restore {
-                    out.push(default_claude_prewarm(worktree));
-                }
             }
             KeyCode::Enter => {
                 // Enter on a highlighted listing row adds that directory;
@@ -6604,23 +6577,10 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
             };
             let model = resolve(model, cfg.default_model(kind));
             let effort = resolve(effort, cfg.default_effort(kind));
-            // No name prompt means no typing window to warm through, so
-            // create straight from the picker: the standing default-spec
-            // warm slot gets adopted where it matches, and the refill
-            // behind the create re-warms it either way.
             if cfg.skip_session_naming {
                 create_agent(app, worktree, kind, model, effort, String::new(), out);
                 return;
             }
-            // Warm the CLI while the user types the name: the daemon
-            // pre-spawns the session so CreateAgent adopts an already-booted
-            // PTY. Fail-soft — a missing CLI just means a cold spawn later.
-            out.push(ClientRequest::PrewarmAgent {
-                worktree: worktree.clone(),
-                kind,
-                model: model.clone(),
-                effort: effort.clone(),
-            });
             open_prompt(
                 app,
                 PromptKind::NewAgent {
@@ -7572,10 +7532,6 @@ fn create_default_agent(
         auto_title: true,
         prompt: None,
     });
-    // Same warm-slot refill as `create_agent`.
-    if kind == AgentKind::Claude {
-        out.push(default_claude_prewarm(worktree));
-    }
 }
 
 fn move_selection(app: &mut App, delta: i64, out: &mut Vec<ClientRequest>) {
@@ -7722,11 +7678,71 @@ fn mark_pr_seen(app: &mut App, url: &str, out: &mut Vec<ClientRequest>) {
 }
 
 fn attach(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
-    if app.parked_branch(&sref).is_some() {
+    if app.parked_branch(&sref).is_some() || app.is_queued(&sref) {
         show_parked_placeholder(app, out);
         return;
     }
     mount_session(app, sref, out);
+}
+
+fn attach_created(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
+    app.select_when_seen = Some(sref.clone());
+    land_pending_selection(app, out);
+    let queued = app.is_queued(&sref);
+    attach(app, sref, out);
+    if !queued {
+        app.focus = Focus::Terminal;
+        app.term_locked = true;
+    }
+}
+
+fn attach_created_split(app: &mut App, sref: SessionRef, out: &mut Vec<ClientRequest>) {
+    if app.is_queued(&sref) {
+        app.flash = Some("the new session is waiting for memory; open it once it starts".into());
+        return;
+    }
+    attach_split(app, sref, out);
+}
+
+fn follow_queue_edge(
+    app: &mut App,
+    agent: &AgentId,
+    was: Option<AgentStatus>,
+    now: AgentStatus,
+    out: &mut Vec<ClientRequest>,
+) {
+    let sref = SessionRef::Agent(agent.clone());
+    let selected = app.selected_session().is_some_and(|a| &a.id == agent);
+    let mounted = app.term.as_ref().is_some_and(|t| t.sref == sref);
+    let started = match now {
+        AgentStatus::Fresh
+        | AgentStatus::Running
+        | AgentStatus::Finished
+        | AgentStatus::NeedsFeedback => true,
+        AgentStatus::Queued | AgentStatus::Terminated | AgentStatus::Disconnected => false,
+    };
+    match (was, now) {
+        (Some(AgentStatus::Queued), _) if started && selected && !mounted => {
+            mount_session(app, sref, out)
+        }
+        (Some(was), AgentStatus::Queued) if was != AgentStatus::Queued && mounted => {
+            show_parked_placeholder(app, out)
+        }
+        _ => {}
+    }
+}
+
+fn force_start_selected(app: &mut App, out: &mut Vec<ClientRequest>) {
+    match app.selected_session_row() {
+        Some(SessionRow::Agent(a)) if a.status == AgentStatus::Queued => {
+            let req_id = app.alloc_req_id(PendingIntent::None);
+            out.push(ClientRequest::ForceStartAgent { req_id, id: a.id });
+        }
+        Some(SessionRow::Agent(_)) => {
+            app.flash = Some("only a session waiting for memory can be force-started".into());
+        }
+        _ => {}
+    }
 }
 
 fn show_parked_placeholder(app: &mut App, out: &mut Vec<ClientRequest>) {
@@ -7910,14 +7926,10 @@ fn fire_pending_prewarm(app: &mut App, out: &mut Vec<ClientRequest>) {
     };
     let (cols, rows) = pane_size(app);
     out.push(ClientRequest::PrewarmWorktreeSessions {
-        worktree: worktree.clone(),
+        worktree,
         cols,
         rows,
     });
-    // The selected worktree also keeps one Claude session standing by, so
-    // creating a session there adopts an already-booted CLI.
-    out.push(default_claude_prewarm(worktree));
-    app.next_keepwarm = Some(std::time::Instant::now() + KEEPWARM_REFRESH);
 }
 
 /// Ask the daemon for a new agent session and attach it once the Ack lands.
@@ -7954,38 +7966,6 @@ fn create_agent(
         auto_title,
         prompt: None,
     });
-    // The create consumes (or, off-spec, discards) the worktree's warm
-    // Claude slot; refill it so the next create is instant too.
-    if kind == AgentKind::Claude {
-        out.push(default_claude_prewarm(worktree));
-    }
-}
-
-/// The one spec kept permanently warm: a Claude CLI at the configured
-/// default model/effort. Creates matching it adopt the warm session
-/// instantly; any other spec launches cold on purpose — off-default CLIs
-/// would sit idle holding memory for a spec the user rarely repeats.
-fn default_claude_prewarm(worktree: WorktreeId) -> ClientRequest {
-    let cfg = crate::config::Config::load();
-    ClientRequest::PrewarmAgent {
-        worktree,
-        kind: AgentKind::Claude,
-        model: cfg.default_model(AgentKind::Claude),
-        effort: cfg.default_effort(AgentKind::Claude),
-    }
-}
-
-/// Periodic re-assert of the standing warm Claude session for the selected
-/// worktree. A young same-spec session makes this a daemon-side no-op and an
-/// aging one is recycled in place, so without this tick the daemon's reaper
-/// would empty the slot at its max age and the next create would boot cold.
-fn fire_keepwarm(app: &mut App, out: &mut Vec<ClientRequest>) {
-    let Some(worktree) = app.selected_worktree().map(|w| w.id.clone()) else {
-        app.next_keepwarm = None;
-        return;
-    };
-    out.push(default_claude_prewarm(worktree));
-    app.next_keepwarm = Some(std::time::Instant::now() + KEEPWARM_REFRESH);
 }
 
 /// Mouse position → pane-relative cell, clamped into the terminal area (so a
@@ -10051,9 +10031,11 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             let before = selection_snapshot(app);
             let mut notify = None;
             let mut finished = false;
+            let mut was = None;
             if let Some(a) = app.tree.agents.iter_mut().find(|a| a.id == agent) {
                 notify = should_notify(a.status, status, app.window_focused);
                 finished = status == AgentStatus::Finished && a.status != AgentStatus::Finished;
+                was = Some(a.status);
                 a.status = status;
                 a.status_changed_at = changed_at;
                 app.dirty = true;
@@ -10065,6 +10047,35 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                 mark_unseen_finished(app, &agent);
             }
             reconcile_selection(app, before, out);
+            follow_queue_edge(app, &agent, was, status, out);
+        }
+        ServerEvent::AgentRow { req_id, agent } => {
+            let before = selection_snapshot(app);
+            let sref = SessionRef::Agent(agent.id.clone());
+            let id = agent.id.clone();
+            let status = |app: &App| {
+                app.tree
+                    .agents
+                    .iter()
+                    .find(|a| a.id == id)
+                    .map(|a| a.status)
+            };
+            let was = status(app);
+            apply_upsert(app, nebula_core::Entity::Agent(agent));
+            let now = status(app).expect("the row was just applied");
+            reconcile_selection(app, before, out);
+            follow_queue_edge(app, &id, was, now, out);
+            let ended = matches!(now, AgentStatus::Terminated | AgentStatus::Disconnected);
+            match app.pending.remove(&req_id) {
+                Some(PendingIntent::AttachCreated | PendingIntent::AttachCreatedSplit) if ended => {
+                    app.flash =
+                        Some("the new session ended at once; open it to start it again".into());
+                }
+                Some(PendingIntent::AttachCreated) => attach_created(app, sref, out),
+                Some(PendingIntent::AttachCreatedSplit) => attach_created_split(app, sref, out),
+                _ => {}
+            }
+            app.dirty = true;
         }
         ServerEvent::Ack { req_id, created } => {
             match (app.pending.remove(&req_id), created) {
@@ -10075,13 +10086,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                         _ => None,
                     };
                     if let Some(sref) = sref {
-                        app.select_when_seen = Some(sref.clone());
-                        // Its upsert usually lands just before this Ack; land
-                        // the selection now, or on the upsert otherwise.
-                        land_pending_selection(app, out);
-                        attach(app, sref, out);
-                        app.focus = Focus::Terminal;
-                        app.term_locked = true;
+                        attach_created(app, sref, out);
                     }
                 }
                 (Some(PendingIntent::AttachCreatedSplit), Some(id)) => {
@@ -10093,7 +10098,7 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                         _ => None,
                     };
                     if let Some(sref) = sref {
-                        attach_split(app, sref, out);
+                        attach_created_split(app, sref, out);
                     }
                 }
                 (Some(PendingIntent::PickAgentOnCreatedWorktree), Some(EntityId::Worktree(id))) => {
@@ -10416,7 +10421,18 @@ fn apply_upsert(app: &mut App, entity: nebula_core::Entity) {
             }
             app.sync_remote_hosts();
         }
-        Entity::Agent(a) => {
+        Entity::Agent(mut a) => {
+            // A reply or upsert read before a later status change can land
+            // after it; the status keeps the newer stamp.
+            if let Some(newer) = app
+                .tree
+                .agents
+                .iter()
+                .find(|x| x.id == a.id && x.status_changed_at > a.status_changed_at)
+            {
+                a.status = newer.status;
+                a.status_changed_at = newer.status_changed_at;
+            }
             // Create Ack and entity broadcast race; attach may mount before
             // the row supplying its kind arrives.
             for term in [app.term.as_mut(), app.split_term.as_mut()]
@@ -11751,6 +11767,324 @@ mod tests {
                 }),
             },
         );
+    }
+
+    fn queue_a1(app: &mut App) {
+        hse(
+            app,
+            ServerEvent::StatusChanged {
+                agent: AgentId("a1".into()),
+                status: AgentStatus::Queued,
+                changed_at: 1,
+            },
+        );
+    }
+
+    #[test]
+    fn hq_t15_the_force_key_starts_only_the_selected_queued_row() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.focus = Focus::Sessions;
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('R'), KeyModifiers::SHIFT, &mut out);
+        assert!(out.is_empty(), "a fresh row is not force-started: {out:?}");
+        assert_eq!(
+            app.flash.as_deref(),
+            Some("only a session waiting for memory can be force-started")
+        );
+
+        queue_a1(&mut app);
+        out.clear();
+        press(&mut app, KeyCode::Char('R'), KeyModifiers::SHIFT, &mut out);
+        assert!(
+            matches!(out.as_slice(), [ClientRequest::ForceStartAgent { id, .. }] if id.as_str() == "a1"),
+            "{out:?}"
+        );
+
+        out.clear();
+        app.focus = Focus::Worktrees;
+        press(&mut app, KeyCode::Char('R'), KeyModifiers::SHIFT, &mut out);
+        assert!(out.is_empty(), "outside the sessions panel: {out:?}");
+    }
+
+    #[test]
+    fn a_queued_create_waits_on_its_placeholder_and_attaches_once_it_starts() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.focus = Focus::Sessions;
+        let req_id = app.alloc_req_id(PendingIntent::AttachCreated);
+        let mut row = app.tree.agents[0].clone();
+        row.id = AgentId("a9".into());
+        row.name = "queued".into();
+        row.status = AgentStatus::Queued;
+        row.alive = false;
+        let mut out = Vec::new();
+        handle_server_event(
+            &mut app,
+            ServerEvent::AgentRow { req_id, agent: row },
+            &mut out,
+        );
+        assert!(
+            !out.iter()
+                .any(|r| matches!(r, ClientRequest::Attach { .. })),
+            "a queued session has nothing to attach to: {out:?}"
+        );
+        assert_eq!(
+            app.selected_session().map(|a| a.id.0),
+            Some("a9".to_string())
+        );
+        assert_eq!(
+            app.queued_placeholder().map(|a| a.name),
+            Some("queued".to_string())
+        );
+        assert_ne!(app.focus, Focus::Terminal);
+        assert!(!app.term_locked);
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("queued is waiting for memory"), "{text}");
+
+        out.clear();
+        handle_server_event(
+            &mut app,
+            ServerEvent::StatusChanged {
+                agent: AgentId("a9".into()),
+                status: AgentStatus::Fresh,
+                changed_at: 2,
+            },
+            &mut out,
+        );
+        assert!(
+            matches!(out.as_slice(), [ClientRequest::Attach { session: SessionRef::Agent(id), .. }] if id.as_str() == "a9"),
+            "the admitted session attaches: {out:?}"
+        );
+        assert!(app.queued_placeholder().is_none());
+    }
+
+    #[test]
+    fn a_queued_row_that_fails_to_start_is_not_attached_in_either_reply_order() {
+        for row_first in [true, false] {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            app.focus = Focus::Sessions;
+            queue_a1(&mut app);
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Char('R'), KeyModifiers::SHIFT, &mut out);
+            let [ClientRequest::ForceStartAgent { req_id, .. }] = out.as_slice() else {
+                panic!("{out:?}");
+            };
+            let req_id = *req_id;
+            let mut failed = app.tree.agents[0].clone();
+            failed.status = AgentStatus::Terminated;
+            failed.alive = false;
+            let row = ServerEvent::AgentRow {
+                req_id,
+                agent: failed,
+            };
+            let status = ServerEvent::StatusChanged {
+                agent: AgentId("a1".into()),
+                status: AgentStatus::Terminated,
+                changed_at: 2,
+            };
+            let order = if row_first {
+                [row, status]
+            } else {
+                [status, row]
+            };
+            out.clear();
+            for event in order {
+                handle_server_event(&mut app, event, &mut out);
+            }
+            assert!(
+                !out.iter().any(|r| matches!(r, ClientRequest::Attach { .. })),
+                "row_first={row_first}: a failed start was attached, which starts it again: {out:?}"
+            );
+        }
+    }
+
+    fn stale_reply_after(
+        app: &mut App,
+        id: &str,
+        req_id: u64,
+        newer: AgentStatus,
+        stale: AgentStatus,
+        out: &mut Vec<ClientRequest>,
+    ) {
+        let mut row = app
+            .tree
+            .agents
+            .iter()
+            .find(|a| a.id.as_str() == id)
+            .unwrap()
+            .clone();
+        handle_server_event(
+            app,
+            ServerEvent::StatusChanged {
+                agent: row.id.clone(),
+                status: newer,
+                changed_at: row.status_changed_at + 2,
+            },
+            out,
+        );
+        row.status = stale;
+        row.status_changed_at += 1;
+        handle_server_event(app, ServerEvent::AgentRow { req_id, agent: row }, out);
+    }
+
+    fn created_a9(app: &mut App) {
+        let mut row = app.tree.agents[0].clone();
+        row.id = AgentId("a9".into());
+        row.name = "late".into();
+        row.status = AgentStatus::Fresh;
+        row.status_changed_at = 10;
+        hse(
+            app,
+            ServerEvent::EntityUpserted {
+                entity: nebula_core::Entity::Agent(row),
+            },
+        );
+    }
+
+    fn attaches(out: &[ClientRequest], agent: &str) -> usize {
+        out.iter()
+            .filter(|r| matches!(r, ClientRequest::Attach { session: SessionRef::Agent(id), .. } if id.as_str() == agent))
+            .count()
+    }
+
+    #[test]
+    fn a_create_reply_older_than_the_status_before_it_keeps_the_newer_status() {
+        for (newer, stale, expected_attaches) in [
+            (AgentStatus::Running, AgentStatus::Fresh, 1),
+            (AgentStatus::Running, AgentStatus::Queued, 1),
+            (AgentStatus::Terminated, AgentStatus::Fresh, 0),
+            (AgentStatus::Terminated, AgentStatus::Queued, 0),
+        ] {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            app.focus = Focus::Sessions;
+            created_a9(&mut app);
+            let req_id = app.alloc_req_id(PendingIntent::AttachCreated);
+            let mut out = Vec::new();
+            stale_reply_after(&mut app, "a9", req_id, newer, stale, &mut out);
+            let row = app
+                .tree
+                .agents
+                .iter()
+                .find(|a| a.id.as_str() == "a9")
+                .unwrap();
+            assert_eq!(row.status, newer, "{newer:?} then a stale {stale:?} reply");
+            assert_eq!(row.name, "late");
+            assert_eq!(
+                attaches(&out, "a9"),
+                expected_attaches,
+                "{newer:?} then a stale {stale:?} reply: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_force_reply_older_than_the_status_before_it_keeps_the_newer_status() {
+        for (newer, expected_attaches) in [(AgentStatus::Running, 1), (AgentStatus::Terminated, 0)]
+        {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            app.focus = Focus::Sessions;
+            queue_a1(&mut app);
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Char('R'), KeyModifiers::SHIFT, &mut out);
+            let [ClientRequest::ForceStartAgent { req_id, .. }] = out.as_slice() else {
+                panic!("{out:?}");
+            };
+            let req_id = *req_id;
+            out.clear();
+            stale_reply_after(&mut app, "a1", req_id, newer, AgentStatus::Fresh, &mut out);
+            let row = app
+                .tree
+                .agents
+                .iter()
+                .find(|a| a.id.as_str() == "a1")
+                .unwrap();
+            assert_eq!(row.status, newer, "{newer:?} then a stale Fresh reply");
+            assert_eq!(
+                attaches(&out, "a1"),
+                expected_attaches,
+                "{newer:?}: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_forced_start_attaches_the_selected_row_once_whichever_reply_lands_first() {
+        for row_first in [true, false] {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            app.focus = Focus::Sessions;
+            queue_a1(&mut app);
+            let mut out = Vec::new();
+            press(&mut app, KeyCode::Char('R'), KeyModifiers::SHIFT, &mut out);
+            let [ClientRequest::ForceStartAgent { req_id, .. }] = out.as_slice() else {
+                panic!("{out:?}");
+            };
+            let req_id = *req_id;
+            let mut started = app.tree.agents[0].clone();
+            started.status = AgentStatus::Fresh;
+            started.alive = true;
+            let row = ServerEvent::AgentRow {
+                req_id,
+                agent: started,
+            };
+            let status = ServerEvent::StatusChanged {
+                agent: AgentId("a1".into()),
+                status: AgentStatus::Fresh,
+                changed_at: 2,
+            };
+            let order = if row_first {
+                [row, status]
+            } else {
+                [status, row]
+            };
+            out.clear();
+            for event in order {
+                handle_server_event(&mut app, event, &mut out);
+            }
+            let attaches = out
+                .iter()
+                .filter(|r| {
+                    matches!(r, ClientRequest::Attach { session: SessionRef::Agent(id), .. } if id.as_str() == "a1")
+                })
+                .count();
+            assert_eq!(attaches, 1, "row_first={row_first}: {out:?}");
+        }
+    }
+
+    #[test]
+    fn a_queued_split_create_leaves_the_left_pane_alone() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        attach(&mut app, SessionRef::Agent(AgentId("a1".into())), &mut out);
+        let req_id = app.alloc_req_id(PendingIntent::AttachCreatedSplit);
+        let mut row = app.tree.agents[0].clone();
+        row.id = AgentId("a9".into());
+        row.status = AgentStatus::Queued;
+        row.alive = false;
+        out.clear();
+        handle_server_event(
+            &mut app,
+            ServerEvent::AgentRow { req_id, agent: row },
+            &mut out,
+        );
+        assert!(out.is_empty(), "{out:?}");
+        assert!(app.split_term.is_none());
+        assert_eq!(
+            app.term.as_ref().map(|t| t.sref.clone()),
+            Some(SessionRef::Agent(AgentId("a1".into())))
+        );
+        assert!(app
+            .flash
+            .as_deref()
+            .is_some_and(|f| f.contains("waiting for memory")));
     }
 
     /// An empty tree replaces the panel columns with the animated splash
@@ -13153,9 +13487,6 @@ mod tests {
         assert!(matched(&app) > 0, "clearing the query restores every row");
     }
 
-    /// Resting the worktree selection arms the debounced prewarm; firing it
-    /// sends one PrewarmWorktreeSessions plus the standing default-spec
-    /// Claude keep-warm for that worktree, then disarms.
     #[test]
     fn worktree_move_arms_prewarm_and_fire_sends_request() {
         use nebula_core::{Entity, ProjectId, Worktree, WorktreeId};
@@ -13189,17 +13520,9 @@ mod tests {
         assert!(app.pending_prewarm.is_none(), "fires once, then disarms");
         assert!(matches!(
             out.as_slice(),
-            [
-                ClientRequest::PrewarmWorktreeSessions { worktree, .. },
-                ClientRequest::PrewarmAgent {
-                    worktree: agent_wt,
-                    kind: AgentKind::Claude,
-                    model: None,
-                    effort: None,
-                },
-            ] if worktree == &WorktreeId("w2".into()) && agent_wt == &WorktreeId("w2".into())
+            [ClientRequest::PrewarmWorktreeSessions { worktree, .. }]
+                if worktree == &WorktreeId("w2".into())
         ));
-        assert!(app.next_keepwarm.is_some(), "keep-warm re-send is armed");
     }
 
     /// An empty `gh` answer doesn't retire the worktree: the next attempt
@@ -13424,71 +13747,6 @@ mod tests {
             Some(w2.clone())
         );
         assert!(app.pr_lookup_due(&w2), "the switch re-arms the lookup");
-    }
-
-    /// The keep-warm tick re-sends the default-spec Claude prewarm for the
-    /// selected worktree and re-arms itself; with nothing selected it
-    /// disarms until the next worktree rest re-arms it.
-    #[test]
-    fn keepwarm_refires_for_selected_worktree_and_rearms() {
-        with_default_config(|| {
-            let mut app = App::new();
-            seed_tree(&mut app);
-            app.next_keepwarm = Some(std::time::Instant::now());
-            let mut out = Vec::new();
-            fire_keepwarm(&mut app, &mut out);
-            assert!(matches!(
-                out.as_slice(),
-                [ClientRequest::PrewarmAgent {
-                    worktree,
-                    kind: AgentKind::Claude,
-                    model: None,
-                    effort: None,
-                }] if worktree == &nebula_core::WorktreeId("w1".into())
-            ));
-            assert!(app.next_keepwarm.is_some(), "re-arms after sending");
-
-            let mut empty = App::new();
-            empty.next_keepwarm = Some(std::time::Instant::now());
-            out.clear();
-            fire_keepwarm(&mut empty, &mut out);
-            assert!(out.is_empty(), "nothing selected, nothing to keep warm");
-            assert!(empty.next_keepwarm.is_none(), "disarms without a worktree");
-        })
-    }
-
-    /// Esc on a Claude name prompt restores the standing default-spec warm
-    /// session — the submenu's off-default pick had already replaced it the
-    /// moment the kind was chosen.
-    #[test]
-    fn esc_on_claude_name_prompt_restores_default_prewarm() {
-        with_default_config(|| {
-            let mut app = App::new();
-            seed_tree(&mut app);
-            app.overlay = Some(Overlay::Prompt(PromptDialog::new(
-                "New agent (opus · high)",
-                "name",
-                "",
-                PromptKind::NewAgent {
-                    target: crate::app::SpawnTarget::Worktree(nebula_core::WorktreeId("w1".into())),
-                    kind: AgentKind::Claude,
-                    model: Some("opus".into()),
-                    effort: Some("high".into()),
-                },
-            )));
-            let mut out = Vec::new();
-            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
-            assert!(app.overlay.is_none());
-            assert!(matches!(
-                out.as_slice(),
-                [ClientRequest::PrewarmAgent {
-                    worktree,
-                    kind: AgentKind::Claude,
-                    model: None,
-                    effort: None,
-                }] if worktree == &nebula_core::WorktreeId("w1".into())
-            ));
-        })
     }
 
     /// The startup snapshot arms the prewarm for the restored worktree, so
@@ -14968,19 +15226,11 @@ mod tests {
             assert_eq!(menu.items[4].label, "Terminal (shell)");
             assert_eq!(menu.hover, 0, "Claude is the default");
 
-            // Enter on the default chains into the name prompt with
-            // kind=Claude, and fires the prewarm so the CLI boots while the
-            // user types. Nothing configured → no model/effort flags.
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-            assert!(matches!(
-                out.last(),
-                Some(ClientRequest::PrewarmAgent {
-                    kind: AgentKind::Claude,
-                    model: None,
-                    effort: None,
-                    ..
-                })
-            ));
+            assert!(
+                out.is_empty(),
+                "nothing spawns while the user types: {out:?}"
+            );
             let Some(Overlay::Prompt(p)) = &app.overlay else {
                 panic!("expected name prompt, got {:?}", app.overlay);
             };
@@ -14997,23 +15247,11 @@ mod tests {
                 }
             ));
 
-            // Accepting the empty prompt falls back to the next free default
-            // name, and the consumed warm slot is refilled right behind the
-            // create so the next one adopts a booted CLI too.
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
             assert!(app.overlay.is_none());
             assert!(matches!(
-                &out[out.len() - 2],
-                ClientRequest::CreateAgent { name, kind: AgentKind::Claude, model: None, effort: None, .. } if name == "agent-2"
-            ));
-            assert!(matches!(
-                out.last(),
-                Some(ClientRequest::PrewarmAgent {
-                    kind: AgentKind::Claude,
-                    model: None,
-                    effort: None,
-                    ..
-                })
+                out.as_slice(),
+                [ClientRequest::CreateAgent { name, kind: AgentKind::Claude, model: None, effort: None, .. }] if name == "agent-2"
             ));
         })
     }
@@ -15053,24 +15291,7 @@ mod tests {
                     ..
                 } if name == "agent-2"
             ));
-            // Only the refill behind the create — the warm-while-typing
-            // prewarm has no typing to cover, so it never fires.
-            assert!(matches!(
-                out.last(),
-                Some(ClientRequest::PrewarmAgent {
-                    kind: AgentKind::Claude,
-                    model: None,
-                    effort: None,
-                    ..
-                })
-            ));
-            assert_eq!(
-                out.iter()
-                    .filter(|r| matches!(r, ClientRequest::PrewarmAgent { .. }))
-                    .count(),
-                1,
-                "one prewarm, the refill: {out:?}"
-            );
+            assert_eq!(out.len(), 1, "the create alone: {out:?}");
         })
     }
 
@@ -15212,15 +15433,6 @@ mod tests {
             press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
 
-            assert!(matches!(
-                out.last(),
-                Some(ClientRequest::PrewarmAgent {
-                    kind: AgentKind::Codex,
-                    model: Some(m),
-                    effort: Some(e),
-                    ..
-                }) if m == "gpt-5.5" && e == "minimal"
-            ));
             let Some(Overlay::Prompt(p)) = &app.overlay else {
                 panic!("expected name prompt, got {:?}", app.overlay);
             };
@@ -15256,19 +15468,19 @@ mod tests {
             // Enter straight on the Claude row: both settings apply.
             press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-            assert!(matches!(
-                out.last(),
-                Some(ClientRequest::PrewarmAgent {
-                    kind: AgentKind::Claude,
-                    model: Some(m),
-                    effort: Some(e),
-                    ..
-                }) if m == "sonnet" && e == "max"
-            ));
             let Some(Overlay::Prompt(p)) = &app.overlay else {
                 panic!("expected name prompt");
             };
             assert_eq!(p.title, "New agent (sonnet · max)");
+            assert!(matches!(
+                &p.kind,
+                PromptKind::NewAgent {
+                    kind: AgentKind::Claude,
+                    model: Some(m),
+                    effort: Some(e),
+                    ..
+                } if m == "sonnet" && e == "max"
+            ));
             press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
 
             // The model submenu highlights and checks the configured model,
@@ -15285,12 +15497,15 @@ mod tests {
             press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
             assert!(matches!(
-                out.last(),
-                Some(ClientRequest::PrewarmAgent {
-                    model: Some(m),
-                    effort: Some(e),
+                &app.overlay,
+                Some(Overlay::Prompt(PromptDialog {
+                    kind: PromptKind::NewAgent {
+                        model: Some(m),
+                        effort: Some(e),
+                        ..
+                    },
                     ..
-                }) if m == "sonnet" && e == "max"
+                })) if m == "sonnet" && e == "max"
             ));
         })
     }
@@ -17157,8 +17372,6 @@ mod tests {
             "the attached Claude's kind row starts hovered: {hovered:?}"
         );
 
-        // Enter picks it: a sibling Claude agent is created right away
-        // (plus the usual warm-slot refill) — no name prompt.
         out.clear();
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
         assert!(app.overlay.is_none(), "the pick closes the menu");
@@ -17171,11 +17384,7 @@ mod tests {
                 effort: None,
                 auto_title: true,
                 ..
-            }, ClientRequest::PrewarmAgent { .. }]
-                if worktree == &WorktreeId("w1".into()) =>
-            {
-                *req_id
-            }
+            }] if worktree == &WorktreeId("w1".into()) => *req_id,
             other => panic!("expected a sibling Claude agent in w1: {other:?}"),
         };
 
@@ -17536,9 +17745,7 @@ mod tests {
         );
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
         let req_id = match out.as_slice() {
-            [ClientRequest::CreateAgent { req_id, .. }, ClientRequest::PrewarmAgent { .. }] => {
-                *req_id
-            }
+            [ClientRequest::CreateAgent { req_id, .. }] => *req_id,
             other => panic!("expected CreateAgent: {other:?}"),
         };
         seed_agent(&mut app, "a9", "w1");

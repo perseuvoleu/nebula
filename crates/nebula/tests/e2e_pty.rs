@@ -190,7 +190,7 @@ async fn read_events_until(
 
 fn find_ack(events: &[ServerEvent], want_req: u64) -> Option<&ServerEvent> {
     events.iter().find(|e| {
-        matches!(e, ServerEvent::Ack { req_id, .. } if *req_id == want_req)
+        matches!(e, ServerEvent::Ack { req_id, .. } | ServerEvent::AgentRow { req_id, .. } if *req_id == want_req)
             || matches!(e, ServerEvent::Error { req_id: Some(r), .. } if *r == want_req)
     })
 }
@@ -354,13 +354,7 @@ async fn full_crud_attach_and_restart_persistence() {
     })
     .await;
     assert!(
-        matches!(
-            find_ack(&events, 3),
-            Some(ServerEvent::Ack {
-                created: Some(EntityId::Agent(_)),
-                ..
-            })
-        ),
+        matches!(find_ack(&events, 3), Some(ServerEvent::AgentRow { .. })),
         "CreateAgent failed: {events:#?}"
     );
 
@@ -742,8 +736,8 @@ async fn hook_post_from_agent_pty_drives_status() {
         find_ack(evs, 2).is_some()
     })
     .await;
-    let ServerEvent::Ack {
-        created: Some(EntityId::Agent(agent_id)),
+    let ServerEvent::AgentRow {
+        agent: nebula_core::Agent { id: agent_id, .. },
         ..
     } = find_ack(&events, 2).unwrap()
     else {
@@ -1293,8 +1287,8 @@ async fn hook_cwd_rehomes_agent_to_other_worktree() {
         find_ack(evs, 3).is_some()
     })
     .await;
-    let ServerEvent::Ack {
-        created: Some(EntityId::Agent(agent_id)),
+    let ServerEvent::AgentRow {
+        agent: nebula_core::Agent { id: agent_id, .. },
         ..
     } = find_ack(&events, 3).unwrap()
     else {
@@ -1456,8 +1450,8 @@ async fn move_agent_respawns_live_session_in_target_worktree() {
         find_ack(evs, 3).is_some()
     })
     .await;
-    let ServerEvent::Ack {
-        created: Some(EntityId::Agent(agent_id)),
+    let ServerEvent::AgentRow {
+        agent: nebula_core::Agent { id: agent_id, .. },
         ..
     } = find_ack(&events, 3).unwrap()
     else {
@@ -1639,8 +1633,8 @@ async fn codex_hooks_install_and_drive_status() {
         find_ack(evs, 2).is_some()
     })
     .await;
-    let ServerEvent::Ack {
-        created: Some(EntityId::Agent(agent_id)),
+    let ServerEvent::AgentRow {
+        agent: nebula_core::Agent { id: agent_id, .. },
         ..
     } = find_ack(&events, 2).unwrap()
     else {
@@ -2170,265 +2164,6 @@ async fn add_project_get_main_worktree(c: &mut UnixStream, repo: &Path) -> nebul
         .expect("main worktree upsert")
 }
 
-/// PrewarmAgent boots the CLI while the user is "typing the name"; the
-/// following CreateAgent must adopt that already-running PTY (its slow boot
-/// output is already in scrollback) and replay the hooks it fired before the
-/// row existed (SessionStart → stored resume session id).
-#[tokio::test]
-async fn prewarmed_session_is_adopted_by_create_agent() {
-    let env = TestEnv::new();
-    let repo = env.make_repo();
-    // Stand-in agent CLI with a deliberately slow boot: posts SessionStart
-    // (like claude does), sleeps, prints a marker, then becomes a shell. If
-    // adoption works, the marker is in scrollback the moment we attach; a
-    // cold spawn at CreateAgent time couldn't print it for another 3s.
-    let script = env.tmp.path().join("slow-agent.sh");
-    std::fs::write(
-        &script,
-        concat!(
-            "#!/bin/sh\n",
-            "echo $$ >> \"$(dirname \"$0\")/warm-pids\"\n",
-            "curl -sS -m 3 -X POST -H \"Authorization: Bearer $NEBULA_API_TOKEN\" \\\n",
-            "  -H 'Content-Type: application/json' -d '{\"session_id\":\"warm-sid-99\"}' \\\n",
-            "  \"$NEBULA_API_URL/api/hooks/claude?agentId=$NEBULA_AGENT_ID&hookEvent=SessionStart\" \\\n",
-            "  >/dev/null 2>&1\n",
-            "sleep 3\n",
-            "echo PREWARM_READY\n",
-            "exec /bin/sh\n",
-        ),
-    )
-    .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    let mut daemon = env.spawn_daemon_with_agent_cmd(script.to_str().unwrap());
-
-    let mut c = connect(&env.sock()).await;
-    handshake(&mut c).await;
-    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
-
-    let prewarm = ClientRequest::PrewarmAgent {
-        worktree: worktree.id.clone(),
-        kind: AgentKind::Claude,
-        model: None,
-        effort: None,
-    };
-    // Kind picked — warm the CLI. No reply expected.
-    write_frame(&mut c, &prewarm).await.unwrap();
-    // "User types the name": long enough for the warm boot to finish.
-    tokio::time::sleep(Duration::from_millis(4500)).await;
-    let branch = std::process::Command::new("git")
-        .arg("-C")
-        .arg(&repo)
-        .args(["branch", "warm-blocked"])
-        .status()
-        .unwrap();
-    assert!(branch.success());
-    write_frame(
-        &mut c,
-        &ClientRequest::ResolveBranchCheckout {
-            req_id: 901,
-            project: worktree.project_id.clone(),
-            branch: "warm-blocked".into(),
-        },
-    )
-    .await
-    .unwrap();
-    let switched = read_events_until(&mut c, Duration::from_secs(10), |e| {
-        find_ack(e, 901).is_some()
-    })
-    .await;
-    assert!(
-        matches!(find_ack(&switched, 901), Some(ServerEvent::Ack { .. })),
-        "{switched:?}"
-    );
-    assert!(!repo.with_file_name("repo-worktrees").exists());
-    let head = std::process::Command::new("git")
-        .arg("-C")
-        .arg(&repo)
-        .args(["branch", "--show-current"])
-        .output()
-        .unwrap();
-    assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), "warm-blocked");
-    let pids = std::fs::read_to_string(env.tmp.path().join("warm-pids")).unwrap();
-    let stopped = pids.lines().next().unwrap();
-    let alive = std::process::Command::new("kill")
-        .args(["-0", stopped])
-        .stderr(std::process::Stdio::null())
-        .status()
-        .unwrap();
-    assert!(!alive.success(), "the switch stopped the warm PTY");
-
-    write_frame(&mut c, &prewarm).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(4500)).await;
-
-    write_frame(
-        &mut c,
-        &ClientRequest::CreateAgent {
-            expected_branch: None,
-            req_id: 2,
-            worktree: worktree.id.clone(),
-            name: "warm-agent".into(),
-            kind: AgentKind::Claude,
-            model: None,
-            effort: None,
-            auto_title: false,
-            prompt: None,
-        },
-    )
-    .await
-    .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        find_ack(evs, 2).is_some()
-    })
-    .await;
-    let ServerEvent::Ack {
-        created: Some(EntityId::Agent(agent_id)),
-        ..
-    } = find_ack(&events, 2).unwrap()
-    else {
-        panic!("CreateAgent failed: {events:#?}");
-    };
-    let agent_id = agent_id.clone();
-
-    // Attach: the boot marker must already be there (window far shorter
-    // than the script's 3s boot, so a cold spawn cannot pass).
-    let sref = SessionRef::Agent(agent_id.clone());
-    write_frame(
-        &mut c,
-        &ClientRequest::Attach {
-            session: sref.clone(),
-            from_seq: None,
-            cols: 100,
-            rows: 30,
-        },
-    )
-    .await
-    .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(2), |evs| {
-        String::from_utf8_lossy(&collected_output(evs)).contains("PREWARM_READY")
-    })
-    .await;
-    drop(events);
-
-    // The adopted PTY is interactive.
-    let marker = "adopted_marker_7731";
-    write_frame(
-        &mut c,
-        &ClientRequest::Input {
-            session: sref.clone(),
-            data: format!("echo {marker}\n").into_bytes(),
-        },
-    )
-    .await
-    .unwrap();
-    read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        String::from_utf8_lossy(&collected_output(evs))
-            .matches(marker)
-            .count()
-            >= 2
-    })
-    .await;
-
-    // The SessionStart the warm CLI posted before the row existed was
-    // buffered and replayed: the agent row carries the resume session id.
-    let mut c2 = connect(&env.sock()).await;
-    handshake(&mut c2).await;
-    write_frame(&mut c2, &ClientRequest::Subscribe)
-        .await
-        .unwrap();
-    let events = read_events_until(&mut c2, Duration::from_secs(5), |evs| {
-        evs.iter()
-            .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
-    })
-    .await;
-    let ServerEvent::Snapshot { agents, .. } = &events[0] else {
-        panic!("expected snapshot");
-    };
-    let agent = agents.iter().find(|a| a.id == agent_id).expect("agent row");
-    assert_eq!(agent.name, "warm-agent");
-    assert!(agent.alive, "adopted session is live");
-    assert_eq!(
-        agent.session_id.as_deref(),
-        Some("warm-sid-99"),
-        "buffered SessionStart replayed at adoption"
-    );
-
-    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
-    wait_for_exit(&mut daemon);
-}
-
-/// A prewarmed CLI that dies immediately (the "claude/codex not installed"
-/// shape) must not poison creation: CreateAgent quietly falls back to a
-/// fresh spawn and still succeeds.
-#[tokio::test]
-async fn dead_prewarm_falls_back_to_cold_spawn() {
-    let env = TestEnv::new();
-    let repo = env.make_repo();
-    let script = env.tmp.path().join("dying-agent.sh");
-    std::fs::write(&script, "#!/bin/sh\nexit 127\n").unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    let mut daemon = env.spawn_daemon_with_agent_cmd(script.to_str().unwrap());
-
-    let mut c = connect(&env.sock()).await;
-    handshake(&mut c).await;
-    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
-
-    write_frame(
-        &mut c,
-        &ClientRequest::PrewarmAgent {
-            worktree: worktree.id.clone(),
-            kind: AgentKind::Claude,
-            model: None,
-            effort: None,
-        },
-    )
-    .await
-    .unwrap();
-    // Give the warm spawn time to die.
-    tokio::time::sleep(Duration::from_millis(1000)).await;
-
-    write_frame(
-        &mut c,
-        &ClientRequest::CreateAgent {
-            expected_branch: None,
-            req_id: 2,
-            worktree: worktree.id.clone(),
-            name: "fallback-agent".into(),
-            kind: AgentKind::Claude,
-            model: None,
-            effort: None,
-            auto_title: false,
-            prompt: None,
-        },
-    )
-    .await
-    .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        find_ack(evs, 2).is_some()
-    })
-    .await;
-    assert!(
-        matches!(
-            find_ack(&events, 2),
-            Some(ServerEvent::Ack {
-                created: Some(EntityId::Agent(_)),
-                ..
-            })
-        ),
-        "CreateAgent must survive a dead prewarm: {events:#?}"
-    );
-
-    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
-    wait_for_exit(&mut daemon);
-}
-
 /// `kill -0` liveness probe (also true for an unreaped zombie).
 /// An agent CLI that isn't installed must be refused up front. Before this
 /// check the create "succeeded": the login shell printed `command not found`
@@ -2576,13 +2311,7 @@ async fn create_agent_succeeds_when_the_cli_is_on_the_login_shell_path() {
     })
     .await;
     assert!(
-        matches!(
-            find_ack(&events, 7),
-            Some(ServerEvent::Ack {
-                created: Some(EntityId::Agent(_)),
-                ..
-            })
-        ),
+        matches!(find_ack(&events, 7), Some(ServerEvent::AgentRow { .. })),
         "an installed CLI must still create: {events:#?}"
     );
 
@@ -2636,8 +2365,8 @@ async fn create_agent_get_id(
         find_ack(evs, req_id).is_some()
     })
     .await;
-    let ServerEvent::Ack {
-        created: Some(EntityId::Agent(id)),
+    let ServerEvent::AgentRow {
+        agent: nebula_core::Agent { id, .. },
         ..
     } = find_ack(&events, req_id).unwrap()
     else {
@@ -2814,8 +2543,8 @@ async fn archive_sigkills_an_agent_that_ignores_sighup() {
         find_ack(evs, 2).is_some()
     })
     .await;
-    let ServerEvent::Ack {
-        created: Some(EntityId::Agent(agent_id)),
+    let ServerEvent::AgentRow {
+        agent: nebula_core::Agent { id: agent_id, .. },
         ..
     } = find_ack(&events, 2).unwrap()
     else {
@@ -2846,12 +2575,11 @@ async fn archive_sigkills_an_agent_that_ignores_sighup() {
     wait_for_exit(&mut daemon);
 }
 
-/// One PrewarmWorktreeSessions must revive every dead session under the
-/// worktree — no Attach involved — so the TUI can boot a worktree's
-/// sessions the moment the user's selection rests on it. Archived agents
-/// stay dead.
+/// One PrewarmWorktreeSessions must revive every dead shell under the
+/// worktree — no Attach involved — so the TUI can boot a worktree's shells
+/// the moment the user's selection rests on it. Agents stay dead.
 #[tokio::test]
-async fn prewarm_worktree_sessions_boots_dead_sessions() {
+async fn prewarm_worktree_sessions_boots_dead_shells_and_leaves_agents() {
     let env = TestEnv::new();
     let repo = env.make_repo();
     let mut daemon = env.spawn_daemon();
@@ -2881,8 +2609,8 @@ async fn prewarm_worktree_sessions_boots_dead_sessions() {
         find_ack(evs, 2).is_some()
     })
     .await;
-    let ServerEvent::Ack {
-        created: Some(EntityId::Agent(agent_id)),
+    let ServerEvent::AgentRow {
+        agent: nebula_core::Agent { id: agent_id, .. },
         ..
     } = find_ack(&events, 2).unwrap()
     else {
@@ -2934,8 +2662,10 @@ async fn prewarm_worktree_sessions_boots_dead_sessions() {
         find_ack(evs, 4).is_some()
     })
     .await;
-    let ServerEvent::Ack {
-        created: Some(EntityId::Agent(archived_id)),
+    let ServerEvent::AgentRow {
+        agent: nebula_core::Agent {
+            id: archived_id, ..
+        },
         ..
     } = find_ack(&events, 4).unwrap()
     else {
@@ -2982,7 +2712,6 @@ async fn prewarm_worktree_sessions_boots_dead_sessions() {
         "terminals dead after restart"
     );
 
-    // One prewarm revives the agent and the terminal (upserts flip alive)…
     write_frame(
         &mut c2,
         &ClientRequest::PrewarmWorktreeSessions {
@@ -2993,31 +2722,49 @@ async fn prewarm_worktree_sessions_boots_dead_sessions() {
     )
     .await
     .unwrap();
-    let events = read_events_until(&mut c2, Duration::from_secs(10), |evs| {
-        let agent_alive = evs.iter().any(|e| {
-            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
-                if a.id == agent_id && a.alive)
-        });
-        let term_alive = evs.iter().any(|e| {
+    let mut events = read_events_until(&mut c2, Duration::from_secs(10), |evs| {
+        evs.iter().any(|e| {
             matches!(e, ServerEvent::EntityUpserted { entity: Entity::Terminal(t) }
                 if t.id == term_id && t.alive)
-        });
-        agent_alive && term_alive
+        })
     })
     .await;
-    // …and never touches the archived agent.
+    events.extend(events_broadcast_before_a_rename_of(&mut c2, &agent_id).await);
     assert!(
         !events.iter().any(|e| {
             matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
-                if a.id == archived_id && a.alive)
+                if (a.id == agent_id || a.id == archived_id) && a.alive)
         }),
-        "archived agent stayed dead: {events:#?}"
+        "an agent was prewarmed: {events:#?}"
     );
 
     write_frame(&mut c2, &ClientRequest::Shutdown)
         .await
         .unwrap();
     wait_for_exit(&mut daemon2);
+}
+
+async fn events_broadcast_before_a_rename_of(
+    c: &mut UnixStream,
+    agent: &nebula_core::AgentId,
+) -> Vec<ServerEvent> {
+    write_frame(
+        c,
+        &ClientRequest::RenameAgent {
+            req_id: 9,
+            id: agent.clone(),
+            name: "renamed-as-barrier".into(),
+        },
+    )
+    .await
+    .unwrap();
+    read_events_until(c, Duration::from_secs(5), |evs| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
+                if a.name == "renamed-as-barrier")
+        })
+    })
+    .await
 }
 
 /// The idle reaper kills sessions in worktrees no client is looking at once
@@ -3054,8 +2801,8 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
         find_ack(evs, 2).is_some()
     })
     .await;
-    let ServerEvent::Ack {
-        created: Some(EntityId::Agent(agent_id)),
+    let ServerEvent::AgentRow {
+        agent: nebula_core::Agent { id: agent_id, .. },
         ..
     } = find_ack(&events, 2).unwrap()
     else {
@@ -3110,8 +2857,8 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
         find_ack(evs, 4).is_some()
     })
     .await;
-    let ServerEvent::Ack {
-        created: Some(EntityId::Agent(pinned_id)),
+    let ServerEvent::AgentRow {
+        agent: nebula_core::Agent { id: pinned_id, .. },
         ..
     } = find_ack(&events, 4).unwrap()
     else {
@@ -3552,8 +3299,8 @@ async fn auto_title_instruction_and_rename_flow() {
         find_ack(evs, 2).is_some()
     })
     .await;
-    let ServerEvent::Ack {
-        created: Some(EntityId::Agent(agent_id)),
+    let ServerEvent::AgentRow {
+        agent: nebula_core::Agent { id: agent_id, .. },
         ..
     } = find_ack(&events, 2).unwrap()
     else {
@@ -5336,8 +5083,8 @@ async fn a_parked_agent_resumes_its_conversation_once_primary_is_back_on_its_bra
         find_ack(evs, 2).is_some()
     })
     .await;
-    let Some(ServerEvent::Ack {
-        created: Some(EntityId::Agent(agent_id)),
+    let Some(ServerEvent::AgentRow {
+        agent: nebula_core::Agent { id: agent_id, .. },
         ..
     }) = find_ack(&events, 2)
     else {
@@ -5833,19 +5580,60 @@ async fn mobile_safe_removal_preserves_dirty_unmerged_occupied_and_protected_che
 
 /// Use literal peer versions so a simultaneous client/server constant change cannot mask a mismatch.
 #[tokio::test]
-async fn protocol31_handshake_accepts_repeated_probes_and_rejects_protocol30() {
+async fn protocol32_handshake_accepts_repeated_probes_and_rejects_protocol31() {
     let env = TestEnv::new();
     let _daemon = MobileFixtureDaemon(env.spawn_daemon());
     let mut c = connect(&env.sock()).await;
     for _ in 0..2 {
-        write_frame(&mut c, &ClientRequest::Hello { protocol_version: 31 }).await.unwrap();
-        let reply = tokio::time::timeout(Duration::from_secs(3), read_frame::<ServerEvent, _>(&mut c)).await.unwrap().unwrap();
-        assert!(matches!(reply, Some(ServerEvent::HelloOk { protocol_version: 31, .. })), "{reply:?}");
+        write_frame(
+            &mut c,
+            &ClientRequest::Hello {
+                protocol_version: 32,
+            },
+        )
+        .await
+        .unwrap();
+        let reply =
+            tokio::time::timeout(Duration::from_secs(3), read_frame::<ServerEvent, _>(&mut c))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(
+            matches!(
+                reply,
+                Some(ServerEvent::HelloOk {
+                    protocol_version: 32,
+                    ..
+                })
+            ),
+            "{reply:?}"
+        );
     }
     let mut old = connect(&env.sock()).await;
-    write_frame(&mut old, &ClientRequest::Hello { protocol_version: 30 }).await.unwrap();
-    let reply = tokio::time::timeout(Duration::from_secs(3), read_frame::<ServerEvent, _>(&mut old)).await.unwrap().unwrap();
-    assert!(matches!(reply, Some(ServerEvent::Incompatible { daemon_protocol_version: 31 })), "{reply:?}");
+    write_frame(
+        &mut old,
+        &ClientRequest::Hello {
+            protocol_version: 31,
+        },
+    )
+    .await
+    .unwrap();
+    let reply = tokio::time::timeout(
+        Duration::from_secs(3),
+        read_frame::<ServerEvent, _>(&mut old),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        matches!(
+            reply,
+            Some(ServerEvent::Incompatible {
+                daemon_protocol_version: 32
+            })
+        ),
+        "{reply:?}"
+    );
 }
 
 /// A fake agent CLI that records every byte its PTY hands it. `raw` picks

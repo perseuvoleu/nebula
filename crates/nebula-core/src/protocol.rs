@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 31;
+pub const PROTOCOL_VERSION: u32 = 32;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -179,6 +179,8 @@ pub enum ClientRequest {
         id: WorktreeId,
         pinned: bool,
     },
+    /// Answered by `AgentRow`: the row as created, `Queued` when it waits
+    /// for memory.
     CreateAgent {
         req_id: u64,
         worktree: WorktreeId,
@@ -196,27 +198,20 @@ pub enum ClientRequest {
         /// runs `nebula rename` on its first prompt).
         auto_title: bool,
         /// Initial task handed to the CLI as its positional prompt argument
-        /// (`nebula agent new --prompt`). Skips warm-slot adoption — an
-        /// already-booted CLI can't take a launch argument.
+        /// (`nebula agent new --prompt`). Kept with the row until the first
+        /// spawn uses it, so a queued session still gets it.
         prompt: Option<String>,
     },
-    /// Fire-and-forget: pre-spawn an agent CLI for this (worktree, kind) so
-    /// the next CreateAgent adopts an already-booted session. Sent the
-    /// moment the user picks the kind, before they type the name. No reply;
-    /// a missing CLI or failed spawn silently degrades to a cold spawn.
-    PrewarmAgent {
-        worktree: WorktreeId,
-        kind: AgentKind,
-        /// Must match the CreateAgent that follows or the warm session is
-        /// discarded (a CLI booted with the wrong model can't be adopted).
-        model: Option<String>,
-        effort: Option<String>,
+    /// Start a queued agent now, bypassing memory admission. Refused for a
+    /// row that is not queued. Answered by `AgentRow`.
+    ForceStartAgent {
+        req_id: u64,
+        id: AgentId,
     },
-    /// Fire-and-forget: pre-spawn every dead (non-archived) session under a
-    /// worktree so attaching later replays an already-booted screen instead
-    /// of watching a login shell + CLI boot. Sent once the worktree
-    /// selection has rested (debounced client-side); already-alive sessions
-    /// are untouched. No reply; a failed spawn degrades to today's lazy
+    /// Fire-and-forget: pre-spawn every dead shell under a worktree so
+    /// attaching later replays an already-booted screen. Sent once the
+    /// worktree selection has rested (debounced client-side); already-alive
+    /// sessions are untouched. No reply; a failed spawn degrades to the lazy
     /// spawn-on-attach.
     PrewarmWorktreeSessions {
         worktree: WorktreeId,
@@ -275,7 +270,9 @@ pub enum ClientRequest {
         id: AgentId,
     },
     /// Respawn; resumes the stored session id (`claude --resume` /
-    /// `codex resume` / `cursor-agent --resume`) when one is stored.
+    /// `codex resume` / `cursor-agent --resume`) when one is stored. The
+    /// respawn asks for memory like any start; a queued row is refused.
+    /// Answered by `AgentRow`, `Queued` when the respawn waits for memory.
     RestartAgent {
         req_id: u64,
         id: AgentId,
@@ -570,6 +567,11 @@ pub enum ServerEvent {
         req_id: u64,
         created: Option<EntityId>,
     },
+    /// Reply to `CreateAgent` and `ForceStartAgent`.
+    AgentRow {
+        req_id: u64,
+        agent: Agent,
+    },
     Error {
         req_id: Option<u64>,
         message: String,
@@ -655,4 +657,70 @@ pub enum ServerEvent {
     HeavyStatus {
         snapshot: HeavySnapshot,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn every_status() -> Vec<AgentStatus> {
+        use AgentStatus::*;
+        let all = vec![
+            Fresh,
+            Queued,
+            Running,
+            Finished,
+            NeedsFeedback,
+            Terminated,
+            Disconnected,
+        ];
+        for status in &all {
+            match status {
+                Fresh | Queued | Running | Finished | NeedsFeedback | Terminated | Disconnected => {
+                }
+            }
+        }
+        all
+    }
+
+    #[test]
+    fn every_status_round_trips_through_its_stored_name_and_the_wire() {
+        for status in every_status() {
+            assert_eq!(AgentStatus::parse(status.as_str()), Some(status));
+            let event = ServerEvent::StatusChanged {
+                agent: AgentId("a".into()),
+                status,
+                changed_at: 7,
+            };
+            let bytes = rmp_serde::to_vec(&event).unwrap();
+            match rmp_serde::from_slice(&bytes).unwrap() {
+                ServerEvent::StatusChanged {
+                    status: decoded, ..
+                } => assert_eq!(decoded, status),
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(AgentStatus::Queued.as_str(), "queued");
+    }
+
+    #[test]
+    fn a_v31_peer_cannot_read_a_queued_status() {
+        #[derive(Deserialize, Debug)]
+        #[serde(rename_all = "snake_case")]
+        #[allow(dead_code)]
+        enum V31Status {
+            Fresh,
+            Running,
+            Finished,
+            NeedsFeedback,
+            Terminated,
+            Disconnected,
+        }
+        let bytes = rmp_serde::to_vec(&AgentStatus::Queued).unwrap();
+        assert!(rmp_serde::from_slice::<V31Status>(&bytes).is_err());
+        assert!(rmp_serde::from_slice::<V31Status>(
+            &rmp_serde::to_vec(&AgentStatus::Fresh).unwrap()
+        )
+        .is_ok());
+    }
 }

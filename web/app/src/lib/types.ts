@@ -1,13 +1,14 @@
 // Wire types of the Nebula web gateway (web/server.py). Identity is always the Nebula session id.
 
 export type AgentKind = "pi" | "claude" | "codex" | "cursor";
-export type AgentStatus = "fresh" | "running" | "finished" | "needs_feedback" | "terminated" | "disconnected";
+export const AGENT_STATUSES = ["fresh", "queued", "running", "finished", "needs_feedback", "terminated", "disconnected"] as const;
+export type AgentStatus = (typeof AGENT_STATUSES)[number];
 
 export interface SessionRow {
   id: string;
   name: string;
   kind: AgentKind | string;
-  status: AgentStatus | string;
+  status: AgentStatus;
   project: string;
   worktree: string;
   path: string;
@@ -19,7 +20,7 @@ export interface Worktree {
   branch: string;
   is_main: boolean;
   project: string;
-  sessions: { name: string; kind: string; status: string; alive: boolean }[];
+  sessions: { name: string; kind: string; status: AgentStatus; alive: boolean }[];
 }
 
 export interface Capabilities {

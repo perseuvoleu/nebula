@@ -333,6 +333,10 @@ impl Relay {
                 req_id: local,
                 created,
             },
+            ServerEvent::AgentRow { agent, .. } => ServerEvent::AgentRow {
+                req_id: local,
+                agent,
+            },
             ServerEvent::Error { message, .. } => ServerEvent::Error {
                 req_id: Some(local),
                 message,
@@ -966,6 +970,13 @@ async fn handle_event(
                 .await;
             None
         }
+        ev @ ServerEvent::AgentRow { .. } => {
+            if let ServerEvent::AgentRow { req_id, .. } = &ev {
+                let r = *req_id;
+                relay.answer(r, ev).await;
+            }
+            None
+        }
         ev @ ServerEvent::Metrics { .. } => {
             if let ServerEvent::Metrics { req_id, .. } = &ev {
                 let r = *req_id;
@@ -1181,7 +1192,7 @@ fn with_req_id(req: &ClientRequest, req_id: u64) -> Option<ClientRequest> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nebula_core::{AgentId, WorktreeId};
+    use nebula_core::{AgentId, AgentKind, AgentStatus, WorktreeId};
     use tokio::io::AsyncWriteExt;
 
     /// A byte transport that acknowledges when a supplied fragment has been
@@ -1573,6 +1584,132 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn a_v31_host_is_refused_before_the_relay_subscribes() {
+        let (daemon, relay, mut requests) = test_relay();
+        let (transport, mut host) = tokio::io::duplex(4096);
+        let (read, write) = tokio::io::split(transport);
+        let host_side = async {
+            let hello = read_frame::<ClientRequest, _>(&mut host).await.unwrap();
+            assert!(
+                matches!(
+                    hello,
+                    Some(ClientRequest::Hello {
+                        protocol_version: 32
+                    })
+                ),
+                "{hello:?}"
+            );
+            write_frame(
+                &mut host,
+                &ServerEvent::Incompatible {
+                    daemon_protocol_version: 31,
+                },
+            )
+            .await
+            .unwrap();
+            read_frame::<ClientRequest, _>(&mut host).await.unwrap()
+        };
+        let (result, after) = tokio::join!(
+            pump_transport(
+                &relay,
+                &daemon,
+                &mut requests,
+                read,
+                write,
+                Duration::from_secs(1)
+            ),
+            host_side
+        );
+        let error = result.unwrap_err().to_string();
+        assert!(
+            error.contains("runs protocol 31, this daemon 32"),
+            "{error}"
+        );
+        assert!(after.is_none(), "the relay went on to send {after:?}");
+    }
+
+    #[tokio::test]
+    async fn a_forced_start_reaches_the_host_and_its_row_answers_the_asking_client() {
+        let (daemon, relay, mut requests) = test_relay();
+        let (client, mut replies) = mpsc::channel(16);
+        let client = RelayClient::new(client, tokio_util::sync::CancellationToken::new());
+        let (transport, mut host) = tokio::io::duplex(4096);
+        let (read, write) = tokio::io::split(transport);
+        let row = Agent {
+            id: AgentId("queued".into()),
+            worktree_id: WorktreeId("worktree".into()),
+            name: "worker".into(),
+            status: AgentStatus::Fresh,
+            archived: false,
+            archived_at: 0,
+            pinned: false,
+            status_changed_at: 0,
+            kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            session_id: None,
+            sort_order: 0,
+            alive: true,
+            branch: None,
+        };
+        let scenario = async {
+            while let Some(request) = read_frame::<ClientRequest, _>(&mut host).await.unwrap() {
+                match request {
+                    ClientRequest::Hello { .. } => write_frame(
+                        &mut host,
+                        &ServerEvent::HelloOk {
+                            protocol_version: PROTOCOL_VERSION,
+                            daemon_pid: 0,
+                        },
+                    )
+                    .await
+                    .unwrap(),
+                    ClientRequest::Subscribe => {
+                        write_frame(&mut host, &daemon.snapshot().unwrap())
+                            .await
+                            .unwrap();
+                        relay
+                            .forward(
+                                ClientRequest::ForceStartAgent {
+                                    req_id: 42,
+                                    id: AgentId("queued".into()),
+                                },
+                                &client,
+                            )
+                            .await
+                    }
+                    ClientRequest::ForceStartAgent { req_id, id } => {
+                        assert_eq!(id.as_str(), "queued");
+                        write_frame(
+                            &mut host,
+                            &ServerEvent::AgentRow {
+                                req_id,
+                                agent: row.clone(),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            match tokio::time::timeout(Duration::from_secs(1), replies.recv()).await {
+                Ok(Some(ServerEvent::AgentRow { req_id, agent })) => {
+                    assert_eq!((req_id, agent.id.as_str()), (42, "queued"))
+                }
+                other => panic!("the asking client got {other:?}"),
+            }
+        };
+        tokio::select! {
+            _ = pump_transport(&relay, &daemon, &mut requests, read, write, Duration::from_secs(5)) => {
+                panic!("the relay stopped before the reply arrived")
+            }
+            () = scenario => {}
+        }
     }
 
     #[tokio::test]
@@ -1999,6 +2136,13 @@ mod tests {
                 worktree: wt
             }),
             vec!["a1", "w1"]
+        );
+        assert_eq!(
+            request_ids(&ClientRequest::ForceStartAgent {
+                req_id: 1,
+                id: AgentId("a1".into()),
+            }),
+            vec!["a1"]
         );
         // Subscribe names nothing: never routed.
         assert!(request_ids(&ClientRequest::Subscribe).is_empty());

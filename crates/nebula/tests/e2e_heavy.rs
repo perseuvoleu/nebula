@@ -24,11 +24,15 @@ struct Env {
 
 impl Env {
     fn new() -> Self {
+        Self::with_config(ONE_COMMAND_BUDGET)
+    }
+
+    fn with_config(config: &str) -> Self {
         let env = Self {
             tmp: tempfile::tempdir().unwrap(),
         };
         std::fs::create_dir_all(env.data_dir()).unwrap();
-        std::fs::write(env.data_dir().join("config.json"), ONE_COMMAND_BUDGET).unwrap();
+        std::fs::write(env.data_dir().join("config.json"), config).unwrap();
         env
     }
 
@@ -630,7 +634,7 @@ fn status_against_a_protocol_30_daemon_names_the_mismatch_and_the_restart() {
     assert!(!done.status.success(), "{}", done.stderr);
     assert_eq!(
         done.stderr,
-        "Error: daemon speaks protocol v30, this client v31 — run `nebula kill` and relaunch\n"
+        "Error: daemon speaks protocol v30, this client v32 — run `nebula kill` and relaunch\n"
     );
     assert!(done.stdout.is_empty(), "{}", done.stdout);
     assert_eq!(old.accepted(), 1);
@@ -689,6 +693,50 @@ fn without_rss(line: &str) -> String {
 
 fn open_terminal(env: &Env) -> String {
     let socket = env.runtime_dir().join("daemon.sock");
+    let worktree = add_repo(env);
+    runtime().block_on(async {
+        let mut stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        let hello = ClientRequest::Hello {
+            protocol_version: PROTOCOL_VERSION,
+        };
+        write_frame(&mut stream, &hello).await.unwrap();
+        write_frame(&mut stream, &ClientRequest::Subscribe)
+            .await
+            .unwrap();
+        let create = ClientRequest::CreateTerminal {
+            req_id: 2,
+            worktree,
+            expected_branch: None,
+            name: None,
+        };
+        write_frame(&mut stream, &create).await.unwrap();
+        let terminal = loop {
+            match next_event(&mut stream).await {
+                ServerEvent::Ack {
+                    req_id: 2,
+                    created: Some(EntityId::Terminal(id)),
+                } => break id,
+                ServerEvent::Error { message, .. } => panic!("{message}"),
+                _ => {}
+            }
+        };
+        let attach = ClientRequest::Attach {
+            session: SessionRef::Terminal(terminal.clone()),
+            from_seq: None,
+            cols: 80,
+            rows: 24,
+        };
+        write_frame(&mut stream, &attach).await.unwrap();
+        while !matches!(
+            next_event(&mut stream).await,
+            ServerEvent::Scrollback { .. }
+        ) {}
+        terminal.0
+    })
+}
+
+fn add_repo(env: &Env) -> nebula_core::WorktreeId {
+    let socket = env.runtime_dir().join("daemon.sock");
     let repo = env.path("repo");
     std::fs::create_dir(&repo).unwrap();
     for args in [
@@ -722,45 +770,15 @@ fn open_terminal(env: &Env) -> String {
             host: None,
         };
         write_frame(&mut stream, &add).await.unwrap();
-        let mut worktree = None;
-        while worktree.is_none() {
+        loop {
             match next_event(&mut stream).await {
                 ServerEvent::EntityUpserted {
                     entity: Entity::Worktree(w),
-                } if w.is_main => worktree = Some(w.id),
+                } if w.is_main => break w.id,
                 ServerEvent::Error { message, .. } => panic!("{message}"),
                 _ => {}
             }
         }
-        let create = ClientRequest::CreateTerminal {
-            req_id: 2,
-            worktree: worktree.unwrap(),
-            expected_branch: None,
-            name: None,
-        };
-        write_frame(&mut stream, &create).await.unwrap();
-        let terminal = loop {
-            match next_event(&mut stream).await {
-                ServerEvent::Ack {
-                    req_id: 2,
-                    created: Some(EntityId::Terminal(id)),
-                } => break id,
-                ServerEvent::Error { message, .. } => panic!("{message}"),
-                _ => {}
-            }
-        };
-        let attach = ClientRequest::Attach {
-            session: SessionRef::Terminal(terminal.clone()),
-            from_seq: None,
-            cols: 80,
-            rows: 24,
-        };
-        write_frame(&mut stream, &attach).await.unwrap();
-        while !matches!(
-            next_event(&mut stream).await,
-            ServerEvent::Scrollback { .. }
-        ) {}
-        terminal.0
     })
 }
 
@@ -1997,4 +2015,1004 @@ impl Drop for Tty {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+const ONE_CONSUMER_BUDGET: &str = r#"{"heavy":{"budget_gib":1.0,"floor_gib":0.0,"psi_some_avg10_max":100.0,"command_reservation_gib":0.6,"session_reservation_gib":{"claude":0.6}}}"#;
+
+fn spawn_queue_daemon(env: &Env) -> Daemon {
+    let worker = env.path("worker.sh");
+    std::fs::write(
+        &worker,
+        format!(
+            r#"echo "$NEBULA_AGENT_ID $*" >> {started}
+if [ -f {dir}/fail-$NEBULA_AGENT_ID ]; then exit 3; fi
+if [ -f {dir}/eager-$NEBULA_AGENT_ID ]; then
+  curl -sS -m 3 -X POST -H "Authorization: Bearer $NEBULA_API_TOKEN" -H 'Content-Type: application/json' -d '{{}}' "$NEBULA_API_URL/api/hooks/claude?agentId=$NEBULA_AGENT_ID&hookEvent=UserPromptSubmit" >/dev/null
+fi
+while [ ! -f {dir}/release-$NEBULA_AGENT_ID ]; do
+  if [ -f {dir}/stubborn-$NEBULA_AGENT_ID ]; then trap '' HUP; fi
+  if [ -f {dir}/cling-$NEBULA_AGENT_ID ]; then
+    rm {dir}/cling-$NEBULA_AGENT_ID
+    setsid sleep 60 &
+  fi
+  if [ -f {dir}/turn-$NEBULA_AGENT_ID ]; then
+    rm {dir}/turn-$NEBULA_AGENT_ID
+    for event in UserPromptSubmit Stop; do
+      curl -sS -m 3 -X POST -H "Authorization: Bearer $NEBULA_API_TOKEN" -H 'Content-Type: application/json' -d '{{}}' "$NEBULA_API_URL/api/hooks/claude?agentId=$NEBULA_AGENT_ID&hookEvent=$event" >/dev/null
+    done
+  fi
+  sleep 0.05
+done
+"#,
+            started = env.path("started").display(),
+            dir = env.tmp.path().display()
+        ),
+    )
+    .unwrap();
+    env.spawn_daemon_with(&[("NEBULA_AGENT_CMD", &format!("/bin/sh {}", worker.display()))])
+}
+
+fn nebula(env: &Env, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_nebula"))
+        .args(args)
+        .current_dir(env.tmp.path())
+        .env("NEBULA_RUNTIME_DIR", env.runtime_dir())
+        .env("NEBULA_DATA_DIR", env.data_dir())
+        .env_remove("NEBULA_AGENT_ID")
+        .output()
+        .unwrap()
+}
+
+fn json(out: &std::process::Output) -> serde_json::Value {
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+fn agent_new(env: &Env, name: &str, prompt: &str) -> (String, std::process::Output) {
+    let out = nebula(
+        env,
+        &[
+            "agent",
+            "new",
+            "--project",
+            "repo",
+            "--worktree",
+            "main",
+            "--kind",
+            "claude",
+            "--name",
+            name,
+            "--prompt",
+            prompt,
+        ],
+    );
+    let row = json(&out);
+    assert_eq!(row["status"], "queued", "{row}");
+    (row["id"].as_str().unwrap().to_string(), out)
+}
+
+fn agent_rows(env: &Env) -> Vec<serde_json::Value> {
+    let rows = json(&nebula(env, &["agent", "list", "--project", "repo"]));
+    rows.as_array().unwrap().clone()
+}
+
+fn status_of(env: &Env, id: &str) -> Option<String> {
+    agent_rows(env)
+        .into_iter()
+        .find(|r| r["id"] == id)
+        .map(|r| r["status"].as_str().unwrap().to_string())
+}
+
+fn started(env: &Env) -> Vec<String> {
+    std::fs::read_to_string(env.path("started"))
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.trim_end().to_string())
+        .collect()
+}
+
+fn release_agent(env: &Env, id: &str) {
+    std::fs::write(env.path(&format!("release-{id}")), "").unwrap();
+}
+
+#[cfg(target_os = "linux")]
+fn agent_processes(id: &str) -> usize {
+    let needle = format!("NEBULA_AGENT_ID={id}");
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().parse::<u32>().is_ok())
+        .filter_map(|e| std::fs::read(e.path().join("environ")).ok())
+        .filter(|env| env.split(|b| *b == 0).any(|var| var == needle.as_bytes()))
+        .count()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn agent_processes(id: &str) -> usize {
+    let out = Command::new("ps")
+        .args(["-axwwE", "-o", "command="])
+        .output()
+        .unwrap();
+    let needle = format!(" NEBULA_AGENT_ID={id}");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| l.contains(&needle))
+        .count()
+}
+
+fn queue_head_first(env: &Env) -> Vec<String> {
+    let status = env.heavy(&["status"], None).finish();
+    assert!(status.status.success(), "{}", status.stderr);
+    let mut entries: Vec<(usize, String)> = ["queued commands", "queued sessions"]
+        .iter()
+        .flat_map(|heading| section(&status.stdout, heading))
+        .map(|line| {
+            let (position, rest) = line.trim().split_once(". ").unwrap();
+            let entry = match rest.strip_prefix("agent ") {
+                Some(agent) => agent.split_once("  ").unwrap().0.to_string(),
+                None => rest.rsplit_once("  ").unwrap().1.to_string(),
+            };
+            (position.parse().unwrap(), entry)
+        })
+        .collect();
+    entries.sort();
+    entries.into_iter().map(|(_, entry)| entry).collect()
+}
+
+fn wait_for_queue(env: &Env, want: &[&str], why: &str) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let now = queue_head_first(env);
+        if now == want {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{why}: queue stayed {now:?}, wanted {want:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn holding_command(env: &Env, name: &str) -> Run {
+    let run = env.heavy(&["--", "sh", "-c", &held(name)], None);
+    wait_until(
+        Duration::from_secs(20),
+        "the holding command starts",
+        || env.path(&format!("{name}.started")).exists(),
+    );
+    run
+}
+
+#[test]
+fn hq_t11_a_session_that_does_not_fit_is_created_queued_with_no_process() {
+    let env = Env::with_config(ONE_CONSUMER_BUDGET);
+    let _daemon = spawn_queue_daemon(&env);
+    add_repo(&env);
+    let holder = holding_command(&env, "a");
+
+    let (id, out) = agent_new(&env, "worker", "task one");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("is queued for memory"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(status_of(&env, &id).as_deref(), Some("queued"));
+    assert_eq!(queue_head_first(&env), std::slice::from_ref(&id));
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        agent_processes(&id),
+        0,
+        "a queued session spawned a process"
+    );
+    assert!(started(&env).is_empty());
+
+    std::fs::write(env.path("a.release"), "").unwrap();
+    assert!(holder.finish().status.success());
+    wait_until(Duration::from_secs(20), "the queued session starts", || {
+        !started(&env).is_empty()
+    });
+    assert_eq!(
+        started(&env),
+        [format!("{id} task one")],
+        "it started once, with its task"
+    );
+    assert!(agent_processes(&id) > 0);
+    assert_eq!(status_of(&env, &id).as_deref(), Some("fresh"));
+    assert!(queue_head_first(&env).is_empty());
+    release_agent(&env, &id);
+}
+
+#[test]
+fn hq_t12_sessions_and_commands_start_in_one_fifo_and_queued_sessions_survive_a_restart() {
+    let env = Env::with_config(ONE_CONSUMER_BUDGET);
+    let daemon = spawn_queue_daemon(&env);
+    add_repo(&env);
+    let holder = holding_command(&env, "a");
+    let (first, _) = agent_new(&env, "first", "task one");
+    let command = env.heavy(&["--", "sh", "-c", "touch b.started"], None);
+    command.wait_stderr("heavy: queued at position 2,");
+    let (second, _) = agent_new(&env, "second", "task two");
+    assert_eq!(
+        queue_head_first(&env),
+        [
+            first.clone(),
+            "sh -c touch b.started".into(),
+            second.clone()
+        ]
+    );
+
+    daemon.stop();
+    let _daemon = spawn_queue_daemon(&env);
+    holder.wait_stderr("heavy: re-registered");
+    wait_for_queue(
+        &env,
+        &[&first, &second, "sh -c touch b.started"],
+        "waiting commands ask again after a restart, behind the restored sessions",
+    );
+    assert_eq!(status_of(&env, &first).as_deref(), Some("queued"));
+    assert_eq!(agent_processes(&first) + agent_processes(&second), 0);
+
+    std::fs::write(env.path("a.release"), "").unwrap();
+    assert!(holder.finish().status.success());
+    wait_until(Duration::from_secs(20), "the first session starts", || {
+        !started(&env).is_empty()
+    });
+    assert_eq!(started(&env), [format!("{first} task one")]);
+    wait_for_queue(
+        &env,
+        &[&second, "sh -c touch b.started"],
+        "the first session took its place",
+    );
+
+    release_agent(&env, &first);
+    wait_until(Duration::from_secs(20), "the second session starts", || {
+        started(&env).len() == 2
+    });
+    assert_eq!(
+        started(&env)[1],
+        format!("{second} task two"),
+        "the task survived the restart"
+    );
+    assert!(
+        !env.path("b.started").exists(),
+        "the command jumped the session ahead of it"
+    );
+
+    release_agent(&env, &second);
+    assert!(command.finish().status.success());
+    assert!(env.path("b.started").exists());
+}
+
+#[test]
+fn hq_t13_only_an_explicit_force_starts_a_queued_session_and_only_once() {
+    let env = Env::with_config(ONE_CONSUMER_BUDGET);
+    let _daemon = spawn_queue_daemon(&env);
+    add_repo(&env);
+    let holder = holding_command(&env, "a");
+    let (id, _) = agent_new(&env, "worker", "task one");
+
+    let plain = nebula(&env, &["agent", "start", "worker"]);
+    assert_eq!(plain.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&plain.stderr).contains("--force"));
+    let restart = nebula(&env, &["agent", "restart", "worker", "--project", "repo"]);
+    assert!(!restart.status.success());
+    assert!(
+        String::from_utf8_lossy(&restart.stderr).contains("is queued for memory"),
+        "{}",
+        String::from_utf8_lossy(&restart.stderr)
+    );
+    let attach = attach_error(&env, &id);
+    assert!(attach.contains("is queued for memory"), "{attach}");
+    assert_eq!(agent_processes(&id), 0, "a normal start bypassed the queue");
+
+    let racers: Vec<_> = (0..2)
+        .map(|_| {
+            Command::new(env!("CARGO_BIN_EXE_nebula"))
+                .args(["agent", "start", "worker", "--force", "--project", "repo"])
+                .env("NEBULA_RUNTIME_DIR", env.runtime_dir())
+                .env("NEBULA_DATA_DIR", env.data_dir())
+                .env_remove("NEBULA_AGENT_ID")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    let outcomes: Vec<_> = racers
+        .into_iter()
+        .map(|c| c.wait_with_output().unwrap())
+        .collect();
+    let won: Vec<_> = outcomes.iter().filter(|o| o.status.success()).collect();
+    assert_eq!(won.len(), 1, "{outcomes:?}");
+    assert_eq!(json(won[0])["status"], "fresh");
+    let lost = outcomes.iter().find(|o| !o.status.success()).unwrap();
+    assert!(
+        String::from_utf8_lossy(&lost.stderr).contains("is not queued (status: fresh)"),
+        "{}",
+        String::from_utf8_lossy(&lost.stderr)
+    );
+    wait_until(Duration::from_secs(10), "the forced session starts", || {
+        started(&env).len() == 1
+    });
+
+    let again = nebula(
+        &env,
+        &["agent", "start", "worker", "--force", "--project", "repo"],
+    );
+    assert!(String::from_utf8_lossy(&again.stderr).contains("is not queued (status: fresh)"));
+    let unknown = nebula(
+        &env,
+        &["agent", "start", "nobody", "--force", "--project", "repo"],
+    );
+    assert!(String::from_utf8_lossy(&unknown.stderr).contains("no agent named \"nobody\""));
+    agent_new(&env, "twin", "one");
+    agent_new(&env, "twin", "two");
+    let ambiguous = nebula(
+        &env,
+        &["agent", "start", "twin", "--force", "--project", "repo"],
+    );
+    assert!(
+        String::from_utf8_lossy(&ambiguous.stderr).contains("2 agents are named \"twin\""),
+        "{}",
+        String::from_utf8_lossy(&ambiguous.stderr)
+    );
+
+    std::fs::write(env.path("a.release"), "").unwrap();
+    assert!(holder.finish().status.success());
+    let twins: Vec<String> = agent_rows(&env)
+        .into_iter()
+        .filter(|r| r["name"] == "twin")
+        .map(|r| r["id"].as_str().unwrap().to_string())
+        .collect();
+    wait_for_queue(
+        &env,
+        &[&twins[0], &twins[1]],
+        "the forced session still holds its room",
+    );
+    assert_eq!(
+        started(&env),
+        [format!("{id} task one")],
+        "the forced session started twice"
+    );
+
+    release_agent(&env, &id);
+    wait_until(Duration::from_secs(10), "the forced session exits", || {
+        agent_processes(&id) == 0
+    });
+    let dead = nebula(
+        &env,
+        &["agent", "start", "worker", "--force", "--project", "repo"],
+    );
+    assert!(
+        String::from_utf8_lossy(&dead.stderr).contains("is not queued (status: fresh)"),
+        "{}",
+        String::from_utf8_lossy(&dead.stderr)
+    );
+    assert_eq!(
+        started(&env).iter().filter(|l| l.starts_with(&id)).count(),
+        1
+    );
+}
+
+#[test]
+fn a_restart_reads_queued_when_it_does_not_fit_and_fresh_when_it_starts() {
+    let env = Env::with_config(ONE_CONSUMER_BUDGET);
+    let _daemon = spawn_queue_daemon(&env);
+    add_repo(&env);
+    let git = |args: &[&str]| {
+        let ok = Command::new("git")
+            .arg("-C")
+            .arg(env.path("repo"))
+            .args(args)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?}");
+    };
+    let holder = holding_command(&env, "a");
+    let (id, _) = agent_new(&env, "worker", "the task");
+    git(&["checkout", "-q", "-b", "elsewhere"]);
+    std::fs::write(env.path("a.release"), "").unwrap();
+    assert!(holder.finish().status.success());
+    wait_until(
+        Duration::from_secs(20),
+        "the unstartable grant fails",
+        || status_of(&env, &id).as_deref() == Some("terminated"),
+    );
+    git(&["checkout", "-q", "main"]);
+
+    let restarted = json(&nebula(
+        &env,
+        &["agent", "restart", "worker", "--project", "repo"],
+    ));
+    assert_eq!(
+        (restarted["result"].as_str(), restarted["status"].as_str()),
+        (Some("restarted"), Some("fresh")),
+        "{restarted}"
+    );
+    assert_eq!(status_of(&env, &id).as_deref(), Some("fresh"));
+    wait_until(Duration::from_secs(10), "the restarted worker runs", || {
+        !started(&env).is_empty()
+    });
+    assert_eq!(started(&env), [format!("{id} the task")]);
+
+    std::fs::write(env.path(&format!("turn-{id}")), "").unwrap();
+    wait_until(
+        Duration::from_secs(10),
+        "the worker's turn finishes",
+        || status_of(&env, &id).as_deref() == Some("finished"),
+    );
+    let again = json(&nebula(
+        &env,
+        &["agent", "restart", "worker", "--project", "repo"],
+    ));
+    assert_eq!(
+        again["status"], "fresh",
+        "a restart ends the finished turn: {again}"
+    );
+    wait_until(Duration::from_secs(10), "the second restart runs", || {
+        started(&env).len() >= 2
+    });
+    assert_eq!(started(&env).len(), 2);
+    release_agent(&env, &id);
+    wait_until(Duration::from_secs(10), "the worker exits", || {
+        agent_processes(&id) == 0
+    });
+
+    let holder = holding_command(&env, "b");
+    let out = nebula(&env, &["agent", "restart", "worker", "--project", "repo"]);
+    let queued = json(&out);
+    assert_eq!(
+        (queued["result"].as_str(), queued["status"].as_str()),
+        (Some("queued"), Some("queued")),
+        "{queued}"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("is queued for memory"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(agent_processes(&id), 0);
+    std::fs::write(env.path("b.release"), "").unwrap();
+    assert!(holder.finish().status.success());
+    wait_until(Duration::from_secs(20), "the queued restart starts", || {
+        started(&env).len() == 3
+    });
+    assert_eq!(status_of(&env, &id).as_deref(), Some("fresh"));
+    std::fs::remove_file(env.path(&format!("release-{id}"))).ok();
+    release_agent(&env, &id);
+}
+
+fn started_worker(env: &Env) -> String {
+    let id = json(&nebula(
+        env,
+        &[
+            "agent",
+            "new",
+            "--project",
+            "repo",
+            "--worktree",
+            "main",
+            "--name",
+            "worker",
+        ],
+    ))["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    wait_until(Duration::from_secs(10), "the worker starts", || {
+        started(env).len() == 1
+    });
+    id
+}
+
+#[test]
+fn a_restart_waits_for_its_own_old_process_instead_of_queueing_behind_it() {
+    let env = Env::with_config(ONE_CONSUMER_BUDGET);
+    let _daemon = spawn_queue_daemon(&env);
+    add_repo(&env);
+    let id = started_worker(&env);
+    std::fs::write(env.path(&format!("stubborn-{id}")), "").unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+
+    let began = Instant::now();
+    let out = nebula(&env, &["agent", "restart", "worker", "--project", "repo"]);
+    let row = json(&out);
+    assert_eq!(
+        (row["result"].as_str(), row["status"].as_str()),
+        (Some("restarted"), Some("fresh")),
+        "the restart was admitted against its own dying process: {row} {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        began.elapsed() >= Duration::from_secs(2),
+        "the old process ignores SIGHUP, so its charge lasts until the SIGKILL: {:?}",
+        began.elapsed()
+    );
+    assert_eq!(started(&env).len(), 2);
+    assert_eq!(status_of(&env, &id).as_deref(), Some("fresh"));
+    release_agent(&env, &id);
+}
+
+#[test]
+fn a_restart_whose_old_process_keeps_its_terminal_gives_up_and_starts_nothing() {
+    let env = Env::with_config(ONE_CONSUMER_BUDGET);
+    let _daemon = spawn_queue_daemon(&env);
+    add_repo(&env);
+    let id = started_worker(&env);
+    let (bystander, _) = agent_new(&env, "bystander", "its own task");
+    json(&nebula(
+        &env,
+        &[
+            "agent",
+            "start",
+            "bystander",
+            "--force",
+            "--project",
+            "repo",
+        ],
+    ));
+    std::fs::write(env.path(&format!("cling-{id}")), "").unwrap();
+    wait_until(Duration::from_secs(5), "the clinging child starts", || {
+        !env.path(&format!("cling-{id}")).exists()
+    });
+
+    let began = Instant::now();
+    let out = nebula(&env, &["agent", "restart", "worker", "--project", "repo"]);
+    let waited = began.elapsed();
+    assert!(
+        !out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("still running"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        waited < Duration::from_secs(15),
+        "the restart's wait is bounded: {waited:?}"
+    );
+    let starts_of = |agent: &str| {
+        started(&env)
+            .iter()
+            .filter(|l| l.starts_with(agent))
+            .count()
+    };
+    assert_eq!(
+        starts_of(&id),
+        1,
+        "a restart that gave up started a process"
+    );
+    assert_ne!(status_of(&env, &id).as_deref(), Some("queued"));
+    assert_eq!(starts_of(&bystander), 1);
+    assert!(
+        agent_processes(&bystander) > 0,
+        "the restart stopped another session"
+    );
+    release_agent(&env, &bystander);
+}
+
+#[test]
+fn moving_a_live_session_waits_for_its_old_process_and_ends_its_turn() {
+    let env = Env::with_config(ONE_CONSUMER_BUDGET);
+    let _daemon = spawn_queue_daemon(&env);
+    add_repo(&env);
+    json(&nebula(
+        &env,
+        &["worktree", "new", "feat", "--project", "repo"],
+    ));
+    let trees = json(&nebula(&env, &["worktree", "list", "--project", "repo"]));
+    let feat = trees
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["branch"] == "feat")
+        .map(|w| w["id"].as_str().unwrap().to_string())
+        .unwrap();
+    let id = started_worker(&env);
+    std::fs::write(env.path(&format!("turn-{id}")), "").unwrap();
+    wait_until(
+        Duration::from_secs(10),
+        "the worker's turn finishes",
+        || status_of(&env, &id).as_deref() == Some("finished"),
+    );
+    std::fs::write(env.path(&format!("stubborn-{id}")), "").unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+
+    let began = Instant::now();
+    let reply = move_agent(&env, &id, &feat);
+    assert!(matches!(reply, ServerEvent::Ack { .. }), "{reply:?}");
+    let row = agent_rows(&env)
+        .into_iter()
+        .find(|r| r["id"] == id)
+        .unwrap();
+    assert_eq!(
+        (row["status"].as_str(), row["worktree"].as_str()),
+        (Some("fresh"), Some("feat")),
+        "the move queued behind its own process or kept the old turn: {row}"
+    );
+    assert!(
+        began.elapsed() >= Duration::from_secs(2),
+        "the move waited for its stubborn old process: {:?}",
+        began.elapsed()
+    );
+    assert_eq!(started(&env).len(), 2);
+    assert!(queue_head_first(&env).is_empty());
+    let beside = env.heavy(&["0.4", "--", "true"], None).finish();
+    assert!(beside.status.success(), "{}", beside.stderr);
+    assert!(
+        !beside.stderr.contains("queued at position"),
+        "the moved session is still charged for its old process too: {}",
+        beside.stderr
+    );
+    release_agent(&env, &id);
+}
+
+#[test]
+fn archived_deleted_and_unstartable_queued_sessions_leave_the_queue_moving() {
+    let env = Env::with_config(ONE_CONSUMER_BUDGET);
+    let _daemon = spawn_queue_daemon(&env);
+    add_repo(&env);
+    let holder = holding_command(&env, "a");
+    let (archived, _) = agent_new(&env, "archived", "x");
+    let (deleted, _) = agent_new(&env, "deleted", "x");
+    let (moved, _) = agent_new(&env, "moved", "x");
+    let command = env.heavy(&["--", "sh", "-c", "touch c.started"], None);
+    command.wait_stderr("heavy: queued at position 4,");
+
+    json(&nebula(
+        &env,
+        &["agent", "archive", "archived", "--project", "repo"],
+    ));
+    json(&nebula(
+        &env,
+        &["agent", "delete", "deleted", "--project", "repo"],
+    ));
+    wait_for_queue(
+        &env,
+        &[&moved, "sh -c touch c.started"],
+        "archived and deleted rows left the queue",
+    );
+    let rows = agent_rows(&env);
+    let archived_row = rows.iter().find(|r| r["id"] == archived).unwrap();
+    assert_eq!(
+        (
+            archived_row["archived"].as_bool(),
+            archived_row["status"].as_str()
+        ),
+        (Some(true), Some("fresh"))
+    );
+    assert!(rows.iter().all(|r| r["id"] != deleted));
+
+    let ok = Command::new("git")
+        .args([
+            "-C",
+            env.path("repo").to_str().unwrap(),
+            "checkout",
+            "-q",
+            "-b",
+            "elsewhere",
+        ])
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok);
+    std::fs::write(env.path("a.release"), "").unwrap();
+    assert!(holder.finish().status.success());
+    assert!(
+        command.finish().status.success(),
+        "the command waited forever behind a head that cannot start"
+    );
+    assert!(env.path("c.started").exists());
+    assert_eq!(status_of(&env, &moved).as_deref(), Some("terminated"));
+    assert!(started(&env).is_empty(), "{:?}", started(&env));
+    for id in [&archived, &deleted, &moved] {
+        assert_eq!(agent_processes(id), 0);
+    }
+}
+
+#[test]
+fn a_session_larger_than_the_whole_budget_is_refused_at_creation() {
+    let env = Env::with_config(
+        r#"{"heavy":{"budget_gib":1.0,"floor_gib":0.0,"psi_some_avg10_max":100.0,"session_reservation_gib":{"claude":2.0}}}"#,
+    );
+    let _daemon = spawn_queue_daemon(&env);
+    add_repo(&env);
+    let out = nebula(
+        &env,
+        &[
+            "agent",
+            "new",
+            "--project",
+            "repo",
+            "--worktree",
+            "main",
+            "--name",
+            "big",
+        ],
+    );
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr)
+            .contains("a claude session reserves 2.0 GiB but the whole memory budget is 1.0 GiB"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(agent_rows(&env).is_empty());
+}
+
+fn move_agent(env: &Env, id: &str, worktree: &str) -> ServerEvent {
+    runtime().block_on(async {
+        let mut stream = tokio::net::UnixStream::connect(env.runtime_dir().join("daemon.sock"))
+            .await
+            .unwrap();
+        let hello = ClientRequest::Hello {
+            protocol_version: PROTOCOL_VERSION,
+        };
+        write_frame(&mut stream, &hello).await.unwrap();
+        let movement = ClientRequest::MoveAgent {
+            req_id: 7,
+            id: nebula_core::AgentId(id.into()),
+            worktree: nebula_core::WorktreeId(worktree.into()),
+        };
+        write_frame(&mut stream, &movement).await.unwrap();
+        loop {
+            let event = tokio::time::timeout(
+                Duration::from_secs(20),
+                read_frame::<ServerEvent, _>(&mut stream),
+            )
+            .await
+            .expect("the move answered")
+            .unwrap()
+            .unwrap();
+            if let ServerEvent::Ack { req_id: 7, .. }
+            | ServerEvent::Error {
+                req_id: Some(7), ..
+            } = event
+            {
+                break event;
+            }
+        }
+    })
+}
+
+fn attach_once(env: &Env, id: &str) {
+    runtime().block_on(async {
+        let mut stream = tokio::net::UnixStream::connect(env.runtime_dir().join("daemon.sock"))
+            .await
+            .unwrap();
+        let hello = ClientRequest::Hello {
+            protocol_version: PROTOCOL_VERSION,
+        };
+        write_frame(&mut stream, &hello).await.unwrap();
+        let attach = ClientRequest::Attach {
+            session: SessionRef::Agent(nebula_core::AgentId(id.into())),
+            from_seq: None,
+            cols: 80,
+            rows: 24,
+        };
+        write_frame(&mut stream, &attach).await.unwrap();
+        loop {
+            match next_event(&mut stream).await {
+                ServerEvent::Scrollback { .. } | ServerEvent::Error { .. } => break,
+                _ => {}
+            }
+        }
+    })
+}
+
+const TWO_SESSION_BUDGET: &str = r#"{"heavy":{"budget_gib":1.2,"floor_gib":0.0,"psi_some_avg10_max":100.0,"command_reservation_gib":0.6,"session_reservation_gib":{"claude":0.6}}}"#;
+
+struct Stuck {
+    env: Env,
+    _daemon: Daemon,
+    worker: String,
+    shell: String,
+    feat: String,
+}
+
+/// A worker whose old process cannot be reaped (a `setsid` child keeps its
+/// terminal) while the budget has room for a second session, beside an
+/// unrelated shell tab.
+fn stuck_worker() -> Stuck {
+    let env = Env::with_config(TWO_SESSION_BUDGET);
+    let daemon = spawn_queue_daemon(&env);
+    let shell = open_terminal(&env);
+    json(&nebula(
+        &env,
+        &["worktree", "new", "feat", "--project", "repo"],
+    ));
+    let feat = json(&nebula(&env, &["worktree", "list", "--project", "repo"]))
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["branch"] == "feat")
+        .map(|w| w["id"].as_str().unwrap().to_string())
+        .unwrap();
+    let worker = started_worker(&env);
+    std::fs::write(env.path(&format!("cling-{worker}")), "").unwrap();
+    wait_until(Duration::from_secs(5), "the clinging child starts", || {
+        !env.path(&format!("cling-{worker}")).exists()
+    });
+    Stuck {
+        env,
+        _daemon: daemon,
+        worker,
+        shell,
+        feat,
+    }
+}
+
+fn assert_still_one_start(stuck: &Stuck) {
+    let env = &stuck.env;
+    assert_eq!(
+        started(env).len(),
+        1,
+        "a second process started beside the unreaped one: {:?}",
+        started(env)
+    );
+    assert!(
+        queue_head_first(env).is_empty(),
+        "{:?}",
+        queue_head_first(env)
+    );
+    assert!(
+        agent_processes(&format!("term:{}", stuck.shell)) > 0,
+        "the shell tab was stopped"
+    );
+}
+
+#[test]
+fn a_timed_out_restart_keeps_the_old_process_mapped_so_a_retry_or_attach_starts_nothing() {
+    let stuck = stuck_worker();
+    let env = &stuck.env;
+    for attempt in ["restart", "retry"] {
+        let out = nebula(env, &["agent", "restart", "worker", "--project", "repo"]);
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("still running"),
+            "{attempt}: {} {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_still_one_start(&stuck);
+    }
+    attach_once(env, &stuck.worker);
+    assert_still_one_start(&stuck);
+}
+
+#[test]
+fn a_timed_out_move_keeps_the_old_process_mapped_so_a_retry_or_attach_starts_nothing() {
+    let stuck = stuck_worker();
+    let env = &stuck.env;
+    for attempt in ["move", "retry"] {
+        let reply = move_agent(env, &stuck.worker, &stuck.feat);
+        assert!(
+            matches!(&reply, ServerEvent::Error { message, .. } if message.contains("still running")),
+            "{attempt}: {reply:?}"
+        );
+        assert_still_one_start(&stuck);
+    }
+    attach_once(env, &stuck.worker);
+    assert_still_one_start(&stuck);
+    let row = agent_rows(env)
+        .into_iter()
+        .find(|r| r["id"] == stuck.worker)
+        .unwrap();
+    assert_eq!(
+        row["worktree"], "main",
+        "a failed move moved the row: {row}"
+    );
+}
+
+#[test]
+fn an_agent_that_dies_at_once_is_started_again_by_each_attach() {
+    let env = Env::with_config(ONE_CONSUMER_BUDGET);
+    let _daemon = spawn_queue_daemon(&env);
+    add_repo(&env);
+    let id = started_worker(&env);
+    std::fs::write(env.path(&format!("fail-{id}")), "").unwrap();
+    release_agent(&env, &id);
+    wait_until(Duration::from_secs(10), "the worker exits", || {
+        agent_processes(&id) == 0
+    });
+    std::fs::remove_file(env.path(&format!("release-{id}"))).unwrap();
+    for attach in 1..=3 {
+        attach_once(&env, &id);
+        wait_until(
+            Duration::from_secs(10),
+            "the attach starts the agent again instead of finding its dead session",
+            || started(&env).len() == 1 + attach,
+        );
+        wait_until(Duration::from_secs(10), "the failed start exits", || {
+            agent_processes(&id) == 0
+        });
+    }
+}
+
+fn eager_turn_survives(env: &Env, id: &str, respawn: impl FnOnce()) {
+    std::fs::write(env.path(&format!("eager-{id}")), "").unwrap();
+    respawn();
+    wait_until(
+        Duration::from_secs(10),
+        "the new process reports its turn",
+        || status_of(env, id).as_deref() == Some("running"),
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        status_of(env, id).as_deref(),
+        Some("running"),
+        "the respawn reset a turn its new process had already started"
+    );
+}
+
+#[test]
+fn a_hook_the_restarted_process_sends_at_once_is_kept() {
+    let env = Env::with_config(ONE_CONSUMER_BUDGET);
+    let _daemon = spawn_queue_daemon(&env);
+    add_repo(&env);
+    let id = started_worker(&env);
+    eager_turn_survives(&env, &id, || {
+        json(&nebula(
+            &env,
+            &["agent", "restart", "worker", "--project", "repo"],
+        ));
+    });
+    release_agent(&env, &id);
+}
+
+#[test]
+fn a_hook_the_moved_process_sends_at_once_is_kept() {
+    let env = Env::with_config(ONE_CONSUMER_BUDGET);
+    let _daemon = spawn_queue_daemon(&env);
+    add_repo(&env);
+    json(&nebula(
+        &env,
+        &["worktree", "new", "feat", "--project", "repo"],
+    ));
+    let feat = json(&nebula(&env, &["worktree", "list", "--project", "repo"]))
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["branch"] == "feat")
+        .map(|w| w["id"].as_str().unwrap().to_string())
+        .unwrap();
+    let id = started_worker(&env);
+    eager_turn_survives(&env, &id, || {
+        let reply = move_agent(&env, &id, &feat);
+        assert!(matches!(reply, ServerEvent::Ack { .. }), "{reply:?}");
+    });
+    release_agent(&env, &id);
+}
+
+fn attach_error(env: &Env, id: &str) -> String {
+    runtime().block_on(async {
+        let mut stream = tokio::net::UnixStream::connect(env.runtime_dir().join("daemon.sock"))
+            .await
+            .unwrap();
+        let hello = ClientRequest::Hello {
+            protocol_version: PROTOCOL_VERSION,
+        };
+        write_frame(&mut stream, &hello).await.unwrap();
+        let attach = ClientRequest::Attach {
+            session: SessionRef::Agent(nebula_core::AgentId(id.into())),
+            from_seq: None,
+            cols: 80,
+            rows: 24,
+        };
+        write_frame(&mut stream, &attach).await.unwrap();
+        loop {
+            match next_event(&mut stream).await {
+                ServerEvent::Error { message, .. } => break message,
+                ServerEvent::Scrollback { .. } => panic!("the queued session attached"),
+                _ => {}
+            }
+        }
+    })
 }

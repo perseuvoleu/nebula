@@ -180,8 +180,13 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     cols,
                     rows,
                 } => {
-                    match daemon.ensure_session(&sref, cols, rows) {
-                        Ok(session) => {
+                    let ensured = if attached.contains_key(&sref) {
+                        daemon.ensure_session(&sref, cols, rows).await.map(|s| (s, None))
+                    } else {
+                        daemon.view_session(&sref, cols, rows).await.map(|(s, v)| (s, Some(v)))
+                    };
+                    match ensured {
+                        Ok((session, viewing)) => {
                             // Subscribe BEFORE snapshotting so nothing falls in
                             // the gap; the forward task drops frames the
                             // snapshot already covers.
@@ -216,8 +221,8 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                             ));
                             // Count this connection once even across
                             // re-attaches to the same session.
-                            if rebind.is_none() {
-                                daemon.note_attached(&sref);
+                            if let Some(viewing) = viewing {
+                                viewing.keep();
                             }
                             attached.insert(sref, handle);
                         }
@@ -396,7 +401,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     .await;
                 }
                 ClientRequest::RemoveProject { req_id, id } => {
-                    reply(&out_tx, req_id, daemon.remove_project(&id).map(|_| None)).await;
+                    reply(&out_tx, req_id, daemon.remove_project(&id).await.map(|_| None)).await;
                 }
                 ClientRequest::MoveProject { req_id, id, delta } => {
                     reply(
@@ -529,40 +534,22 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     auto_title,
                     prompt,
                 } => {
-                    reply(
-                        &out_tx,
-                        req_id,
-                        daemon
-                            .create_agent(
-                                &worktree,
-                                expected_branch.as_deref(),
-                                &name,
-                                kind,
-                                model,
-                                effort,
-                                auto_title,
-                                prompt,
-                            )
-                            .await
-                            .map(Some),
-                    )
-                    .await;
+                    let created = daemon
+                        .create_agent(
+                            &worktree,
+                            expected_branch.as_deref(),
+                            &name,
+                            kind,
+                            model,
+                            effort,
+                            auto_title,
+                            prompt,
+                        )
+                        .await;
+                    reply_row(&out_tx, req_id, created).await;
                 }
-                ClientRequest::PrewarmAgent {
-                    worktree,
-                    kind,
-                    model,
-                    effort,
-                } => {
-                    // Fire-and-forget: boot the CLI while the user is still
-                    // typing the session name; CreateAgent adopts it. Runs
-                    // off the request loop (the CLI probe can take a bit).
-                    let daemon = daemon.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = daemon.prewarm_agent(&worktree, kind, model, effort).await {
-                            tracing::debug!(error = %e, "prewarm failed");
-                        }
-                    });
+                ClientRequest::ForceStartAgent { req_id, id } => {
+                    reply_row(&out_tx, req_id, daemon.force_start_agent(&id).await).await;
                 }
                 ClientRequest::PrewarmWorktreeSessions {
                     worktree,
@@ -600,12 +587,12 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     reply(
                         &out_tx,
                         req_id,
-                        daemon.move_agent(&id, &worktree).map(|_| None),
+                        daemon.move_agent(&id, &worktree).await.map(|_| None),
                     )
                     .await;
                 }
                 ClientRequest::ArchiveAgent { req_id, id } => {
-                    reply(&out_tx, req_id, daemon.archive_agent(&id).map(|_| None)).await;
+                    reply(&out_tx, req_id, daemon.archive_agent(&id).await.map(|_| None)).await;
                 }
                 ClientRequest::UnarchiveAgent { req_id, id } => {
                     reply(&out_tx, req_id, daemon.unarchive_agent(&id).map(|_| None)).await;
@@ -619,14 +606,17 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     .await;
                 }
                 ClientRequest::DeleteAgentScoped { req_id, id, project } => {
-                    let result = daemon.validate_agent_project(&id, &project).and_then(|_| daemon.delete_agent(&id));
+                    let result = match daemon.validate_agent_project(&id, &project) {
+                        Ok(()) => daemon.delete_agent(&id).await,
+                        Err(e) => Err(e),
+                    };
                     reply(&out_tx, req_id, result.map(|_| None)).await;
                 }
                 ClientRequest::DeleteAgent { req_id, id } => {
-                    reply(&out_tx, req_id, daemon.delete_agent(&id).map(|_| None)).await;
+                    reply(&out_tx, req_id, daemon.delete_agent(&id).await.map(|_| None)).await;
                 }
                 ClientRequest::RestartAgent { req_id, id } => {
-                    reply(&out_tx, req_id, daemon.restart_agent(&id).map(|_| None)).await;
+                    reply_row(&out_tx, req_id, daemon.restart_agent(&id).await).await;
                 }
                 ClientRequest::CreateTerminal {
                     req_id,
@@ -832,6 +822,21 @@ async fn forward_pty(
             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         }
     }
+}
+
+async fn reply_row(
+    out_tx: &mpsc::Sender<ServerEvent>,
+    req_id: u64,
+    result: anyhow::Result<nebula_core::Agent>,
+) {
+    let ev = match result {
+        Ok(agent) => ServerEvent::AgentRow { req_id, agent },
+        Err(e) => ServerEvent::Error {
+            req_id: Some(req_id),
+            message: format!("{e:#}"),
+        },
+    };
+    let _ = out_tx.send(ev).await;
 }
 
 async fn reply(

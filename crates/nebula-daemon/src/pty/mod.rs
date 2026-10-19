@@ -10,7 +10,7 @@ use progress::ProgressScanner;
 use ring::ScrollbackRing;
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
 
 const RING_CAPACITY: usize = 1024 * 1024;
 /// Flush coalesced output at this size…
@@ -56,11 +56,6 @@ pub enum PtyEvent {
     },
 }
 
-enum ReaderMsg {
-    Data(Vec<u8>),
-    Eof { exit_code: Option<i32> },
-}
-
 pub struct PtySession {
     pub sref: SessionRef,
     writer: Mutex<Box<dyn Write + Send>>,
@@ -79,6 +74,9 @@ pub struct PtySession {
     /// OSC 9;4 busy/idle tracking, likewise fed from live output.
     progress: Mutex<ProgressScanner>,
     killed: std::sync::atomic::AtomicBool,
+    reaped: tokio::sync::watch::Sender<Option<Option<i32>>>,
+    exited_at: std::sync::OnceLock<std::time::Instant>,
+    resume_until: std::sync::OnceLock<std::time::Instant>,
 }
 
 pub struct SpawnSpec {
@@ -96,6 +94,16 @@ pub struct SpawnSpec {
 impl PtySession {
     /// Spawn the child in a fresh PTY and start its reader thread + pump task.
     pub fn spawn(sref: SessionRef, spec: SpawnSpec) -> Result<Arc<Self>> {
+        Self::spawn_holding(sref, spec, Box::new(()))
+    }
+
+    /// `spawn`, keeping `hold` alive until the child has been reaped (or
+    /// dropping it at once when the spawn fails).
+    pub fn spawn_holding(
+        sref: SessionRef,
+        spec: SpawnSpec,
+        hold: Box<dyn Send>,
+    ) -> Result<Arc<Self>> {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {
@@ -117,7 +125,7 @@ impl PtySession {
             cmd.env(k, v);
         }
 
-        let child = pair
+        let mut child = pair
             .slave
             .spawn_command(cmd)
             .context("spawn child in pty")?;
@@ -125,8 +133,19 @@ impl PtySession {
 
         let killer = child.clone_killer();
         let child_pid = child.process_id();
-        let reader = pair.master.try_clone_reader().context("clone pty reader")?;
-        let writer = pair.master.take_writer().context("take pty writer")?;
+        let io = pair
+            .master
+            .try_clone_reader()
+            .context("clone pty reader")
+            .and_then(|r| Ok((r, pair.master.take_writer().context("take pty writer")?)));
+        let (reader, writer) = match io {
+            Ok(io) => io,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e);
+            }
+        };
 
         let (events, _) = broadcast::channel(256);
         let session = Arc::new(Self {
@@ -141,11 +160,16 @@ impl PtySession {
             kitty: Mutex::new(kitty::KittyScanner::new()),
             progress: Mutex::new(ProgressScanner::new()),
             killed: std::sync::atomic::AtomicBool::new(false),
+            reaped: tokio::sync::watch::Sender::new(None),
+            exited_at: std::sync::OnceLock::new(),
+            resume_until: std::sync::OnceLock::new(),
         });
 
-        let (tx, rx) = mpsc::channel::<ReaderMsg>(READER_CHANNEL_BOUND);
-        spawn_reader_thread(reader, child, tx);
-        tokio::spawn(pump(session.clone(), rx));
+        let (data_tx, data_rx) = mpsc::channel(READER_CHANNEL_BOUND);
+        let (exit_tx, exit_rx) = oneshot::channel();
+        let wait = Box::new(move || child.wait().ok().map(|st| st.exit_code() as i32));
+        spawn_reader_thread(reader, wait, data_tx, exit_tx);
+        tokio::spawn(pump(session.clone(), data_rx, exit_rx, hold));
         Ok(session)
     }
 
@@ -256,6 +280,38 @@ impl PtySession {
         self.killed.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Resolves once the child has been reaped and what `spawn_holding`
+    /// held was dropped.
+    pub async fn reaped(&self) {
+        self.exited().await;
+    }
+
+    pub fn has_exited(&self) -> bool {
+        self.reaped.borrow().is_some()
+    }
+
+    /// Mark this process as a resumed conversation that counts as stale if
+    /// it fails before `until`.
+    pub fn resumed_until(&self, until: std::time::Instant) {
+        let _ = self.resume_until.set(until);
+    }
+
+    pub fn resume_failed(&self, exit_code: Option<i32>) -> bool {
+        let in_time = match (self.resume_until.get(), self.exited_at.get()) {
+            (Some(until), Some(at)) => at <= until,
+            _ => false,
+        };
+        in_time && exit_code.unwrap_or(1) != 0 && !self.was_killed()
+    }
+
+    /// `reaped`, with the child's exit code. It stays answered after the
+    /// fact, for an observer that starts watching only after the exit.
+    pub async fn exited(&self) -> Option<i32> {
+        let mut rx = self.reaped.subscribe();
+        let exit = rx.wait_for(Option::is_some).await;
+        exit.ok().and_then(|code| *code).flatten()
+    }
+
     /// Ring snapshot for attach replay: (base_seq, bytes).
     pub fn snapshot(&self, from_seq: Option<u64>) -> (u64, Vec<u8>) {
         self.ring.lock().unwrap().snapshot_from(from_seq)
@@ -282,36 +338,66 @@ impl PtySession {
 /// the child to get the exit code.
 fn spawn_reader_thread(
     mut reader: Box<dyn Read + Send>,
-    mut child: Box<dyn portable_pty::Child + Send + Sync>,
-    tx: mpsc::Sender<ReaderMsg>,
+    wait: Box<dyn FnOnce() -> Option<i32> + Send>,
+    data: mpsc::Sender<Vec<u8>>,
+    exit: oneshot::Sender<Option<i32>>,
 ) {
     std::thread::Builder::new()
         .name("pty-reader".into())
         .stack_size(256 * 1024)
         .spawn(move || {
-            let mut buf = [0u8; 16 * 1024];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if tx
-                            .blocking_send(ReaderMsg::Data(buf[..n].to_vec()))
-                            .is_err()
-                        {
-                            break;
+            let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut buf = [0u8; 16 * 1024];
+                let mut relaying = true;
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            relaying = relaying && data.blocking_send(buf[..n].to_vec()).is_ok();
                         }
                     }
                 }
+            }));
+            if read.is_err() {
+                tracing::error!("pty reader panicked; waiting for the child anyway");
             }
-            let exit_code = child.wait().ok().map(|st| st.exit_code() as i32);
-            let _ = tx.blocking_send(ReaderMsg::Eof { exit_code });
+            drop(data);
+            let _ = exit.send(wait());
         })
         .expect("spawn pty reader thread");
 }
 
+/// The child's memory charge (`hold`) is released, and `reaped` set, only
+/// after the reader thread reports the child waited for. A reader that
+/// vanishes without that report leaves liveness unknown, so the charge
+/// stays held for good.
+async fn pump(
+    session: Arc<PtySession>,
+    data: mpsc::Receiver<Vec<u8>>,
+    exit: oneshot::Receiver<Option<i32>>,
+    hold: Box<dyn Send>,
+) {
+    let output = tokio::spawn(pump_output(session.clone(), data));
+    let exited = exit.await;
+    let _ = session.exited_at.set(std::time::Instant::now());
+    if let Err(e) = output.await {
+        tracing::error!(session = ?session.sref, error = %e, "pty output pump failed; output after it was dropped");
+    }
+    let Ok(exit_code) = exited else {
+        tracing::error!(session = ?session.sref, "pty reader ended without reaping its child; its memory charge stays held");
+        std::mem::forget(hold);
+        return;
+    };
+    drop(hold);
+    session.reaped.send_replace(Some(exit_code));
+    let _ = session.events.send(PtyEvent::Exited { exit_code });
+    tracing::info!(session = ?session.sref, "pty pump ended");
+}
+
 /// Drains the reader channel: append to the ring (always — detach is free),
 /// coalesce bursts, broadcast to whoever is attached.
-async fn pump(session: Arc<PtySession>, mut rx: mpsc::Receiver<ReaderMsg>) {
+async fn pump_output(session: Arc<PtySession>, mut rx: mpsc::Receiver<Vec<u8>>) {
+    let session = &*session;
     let mut pending: Vec<u8> = Vec::new();
 
     let flush = |session: &PtySession, pending: &mut Vec<u8>| {
@@ -342,15 +428,11 @@ async fn pump(session: Arc<PtySession>, mut rx: mpsc::Receiver<ReaderMsg>) {
         }
     };
 
-    'outer: loop {
+    loop {
         if pending.is_empty() {
             match rx.recv().await {
-                Some(ReaderMsg::Data(d)) => pending.extend_from_slice(&d),
-                Some(ReaderMsg::Eof { exit_code }) => {
-                    let _ = session.events.send(PtyEvent::Exited { exit_code });
-                    break;
-                }
-                None => break,
+                Some(d) => pending.extend_from_slice(&d),
+                None => return,
             }
         }
         // Coalesce until the deadline or the size cap; the deadline is fixed
@@ -359,21 +441,222 @@ async fn pump(session: Arc<PtySession>, mut rx: mpsc::Receiver<ReaderMsg>) {
         while pending.len() < COALESCE_BYTES {
             tokio::select! {
                 msg = rx.recv() => match msg {
-                    Some(ReaderMsg::Data(d)) => pending.extend_from_slice(&d),
-                    Some(ReaderMsg::Eof { exit_code }) => {
-                        flush(&session, &mut pending);
-                        let _ = session.events.send(PtyEvent::Exited { exit_code });
-                        break 'outer;
-                    }
+                    Some(d) => pending.extend_from_slice(&d),
                     None => {
-                        flush(&session, &mut pending);
-                        break 'outer;
+                        flush(session, &mut pending);
+                        return;
                     }
                 },
                 _ = tokio::time::sleep_until(deadline) => break,
             }
         }
-        flush(&session, &mut pending);
+        flush(session, &mut pending);
     }
-    tracing::info!(session = ?session.sref, "pty pump ended");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct SlowRelease(Arc<AtomicBool>);
+
+    impl Drop for SlowRelease {
+        fn drop(&mut self) {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reaped_session_has_already_released_what_it_held() {
+        let released = Arc::new(AtomicBool::new(false));
+        let session = PtySession::spawn_holding(
+            SessionRef::Agent(nebula_core::AgentId("a".into())),
+            SpawnSpec {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "exit 0".into()],
+                cwd: std::env::temp_dir(),
+                env: vec![],
+                scrub_env: vec![],
+                cols: 80,
+                rows: 24,
+            },
+            Box::new(SlowRelease(released.clone())),
+        )
+        .unwrap();
+        let mut events = session.events.subscribe();
+        tokio::time::timeout(std::time::Duration::from_secs(10), session.reaped())
+            .await
+            .expect("the child was reaped");
+        assert!(
+            released.load(Ordering::SeqCst),
+            "reaped before the hold was released"
+        );
+        let exited = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Ok(PtyEvent::Exited { .. }) = events.recv().await {
+                    return released.load(Ordering::SeqCst);
+                }
+            }
+        })
+        .await
+        .expect("Exited was broadcast");
+        assert!(exited, "Exited went out before the hold was released");
+        tokio::time::timeout(std::time::Duration::from_secs(1), session.reaped())
+            .await
+            .expect("a second wait after the exit returns at once");
+    }
+
+    fn sleeping_session() -> Arc<PtySession> {
+        PtySession::spawn(
+            SessionRef::Agent(nebula_core::AgentId("a".into())),
+            SpawnSpec {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "exec sleep 30".into()],
+                cwd: std::env::temp_dir(),
+                env: vec![],
+                scrub_env: vec![],
+                cols: 80,
+                rows: 24,
+            },
+        )
+        .unwrap()
+    }
+
+    /// Reports from its own OS thread, so an early wake cannot hide behind a
+    /// busy tokio worker.
+    fn wake_watcher(
+        session: &Arc<PtySession>,
+        released: &Arc<AtomicBool>,
+    ) -> std::sync::mpsc::Receiver<bool> {
+        let (woke, wake) = std::sync::mpsc::channel();
+        let (session, released) = (session.clone(), released.clone());
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(session.reaped());
+            let _ = woke.send(released.load(Ordering::SeqCst));
+        });
+        wake
+    }
+
+    struct PanickingReader;
+
+    impl Read for PanickingReader {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            panic!("the pty read failed")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reader_that_panics_still_waits_for_its_child_and_reports_the_exit() {
+        let waited = Arc::new(AtomicBool::new(false));
+        let (data_tx, mut data_rx) = mpsc::channel(1);
+        let (exit_tx, exit_rx) = oneshot::channel();
+        let flag = waited.clone();
+        spawn_reader_thread(
+            Box::new(PanickingReader),
+            Box::new(move || {
+                flag.store(true, Ordering::SeqCst);
+                Some(7)
+            }),
+            data_tx,
+            exit_tx,
+        );
+        let exit = tokio::time::timeout(std::time::Duration::from_secs(5), exit_rx)
+            .await
+            .expect("the reader reported");
+        assert_eq!(exit.ok(), Some(Some(7)));
+        assert!(waited.load(Ordering::SeqCst));
+        assert!(data_rx.recv().await.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reader_that_vanishes_without_reaping_keeps_the_charge_and_wakes_no_one() {
+        let session = sleeping_session();
+        let released = Arc::new(AtomicBool::new(false));
+        let wake = wake_watcher(&session, &released);
+        let mut events = session.events.subscribe();
+        let (data_tx, data_rx) = mpsc::channel(1);
+        let (exit_tx, exit_rx) = oneshot::channel::<Option<i32>>();
+        let ending = tokio::spawn(pump(
+            session.clone(),
+            data_rx,
+            exit_rx,
+            Box::new(SlowRelease(released.clone())),
+        ));
+        drop((data_tx, exit_tx));
+        ending.await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            !released.load(Ordering::SeqCst),
+            "released while the child may still run"
+        );
+        assert!(
+            wake.try_recv().is_err(),
+            "signalled reaped with liveness unknown"
+        );
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !matches!(event, PtyEvent::Exited { .. }),
+                "broadcast Exited with no exit report"
+            );
+        }
+        session.kill();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_output_pump_that_panics_holds_the_charge_until_the_child_is_reaped() {
+        let session = sleeping_session();
+        {
+            let session = session.clone();
+            let _ = std::thread::spawn(move || {
+                let _poisoned = session.kitty.lock().unwrap();
+                panic!("poison the scanner the output pump uses");
+            })
+            .join();
+        }
+        let released = Arc::new(AtomicBool::new(false));
+        let wake = wake_watcher(&session, &released);
+        let mut events = session.events.subscribe();
+        let (data_tx, data_rx) = mpsc::channel(1);
+        let (exit_tx, exit_rx) = oneshot::channel();
+        let ending = tokio::spawn(pump(
+            session.clone(),
+            data_rx,
+            exit_rx,
+            Box::new(SlowRelease(released.clone())),
+        ));
+        data_tx.send(b"output".to_vec()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !released.load(Ordering::SeqCst),
+            "the output pump's panic released the charge"
+        );
+        assert!(wake.try_recv().is_err());
+
+        drop(data_tx);
+        exit_tx.send(Some(0)).unwrap();
+        let released_at_wake = tokio::task::spawn_blocking(move || {
+            wake.recv_timeout(std::time::Duration::from_secs(2))
+        })
+        .await
+        .unwrap()
+        .expect("the reaped child woke the waiter");
+        assert!(released_at_wake, "woken before the hold was released");
+        ending.await.unwrap();
+        let exited = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if let Ok(PtyEvent::Exited { exit_code }) = events.recv().await {
+                    return exit_code;
+                }
+            }
+        })
+        .await
+        .expect("Exited was broadcast");
+        assert_eq!(exited, Some(0));
+        session.kill();
+    }
 }

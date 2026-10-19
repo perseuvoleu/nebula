@@ -7,6 +7,9 @@ use std::path::PathBuf;
 pub enum AgentStatus {
     /// Never run yet (gray).
     Fresh,
+    /// Waiting for memory: no process yet; the daemon starts it in queue
+    /// order, or on a forced start.
+    Queued,
     /// Actively working (yellow).
     Running,
     /// Turn complete (green).
@@ -23,6 +26,7 @@ impl AgentStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
             AgentStatus::Fresh => "fresh",
+            AgentStatus::Queued => "queued",
             AgentStatus::Running => "running",
             AgentStatus::Finished => "finished",
             AgentStatus::NeedsFeedback => "needs_feedback",
@@ -34,6 +38,7 @@ impl AgentStatus {
     pub fn parse(s: &str) -> Option<Self> {
         Some(match s {
             "fresh" => AgentStatus::Fresh,
+            "queued" => AgentStatus::Queued,
             "running" => AgentStatus::Running,
             "finished" => AgentStatus::Finished,
             "needs_feedback" => AgentStatus::NeedsFeedback,

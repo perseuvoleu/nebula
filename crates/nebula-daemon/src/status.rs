@@ -71,6 +71,8 @@ pub enum HookEvent {
     Parked,
     /// Synthetic: a new PTY was spawned for the agent.
     PtySpawned,
+    /// Synthetic: an explicit restart replaced the agent's process.
+    Restarted,
 }
 
 impl HookEvent {
@@ -193,7 +195,9 @@ impl AgentStatusMachine {
         now: Instant,
     ) -> Vec<Effect> {
         let mut effects = Vec::new();
-        if self.status == AgentStatus::Disconnected && event != HookEvent::PtySpawned {
+        if matches!(self.status, AgentStatus::Disconnected | AgentStatus::Queued)
+            && event != HookEvent::PtySpawned
+        {
             return effects;
         }
 
@@ -357,9 +361,26 @@ impl AgentStatusMachine {
                 self.finished_at = None;
                 self.set_status(AgentStatus::Disconnected, &mut effects);
             }
-            HookEvent::PtySpawned => {
-                if self.status == AgentStatus::Disconnected {
-                    self.set_status(AgentStatus::Fresh, &mut effects);
+            HookEvent::PtySpawned => match self.status {
+                AgentStatus::Disconnected | AgentStatus::Queued | AgentStatus::Terminated => {
+                    self.set_status(AgentStatus::Fresh, &mut effects)
+                }
+                AgentStatus::Fresh
+                | AgentStatus::Running
+                | AgentStatus::Finished
+                | AgentStatus::NeedsFeedback => {}
+            },
+            HookEvent::Restarted => {
+                self.subagents.clear();
+                self.stop_held = false;
+                self.drain_idle_since = None;
+                self.finished_at = None;
+                match self.status {
+                    AgentStatus::Running
+                    | AgentStatus::Finished
+                    | AgentStatus::NeedsFeedback
+                    | AgentStatus::Terminated => self.set_status(AgentStatus::Fresh, &mut effects),
+                    AgentStatus::Fresh | AgentStatus::Queued | AgentStatus::Disconnected => {}
                 }
             }
         }
@@ -563,6 +584,72 @@ mod tests {
             let fx = idle(&mut m, t0());
             assert!(fx.is_empty(), "{start:?} must not be touched: {fx:?}");
             assert_eq!(m.status(), start);
+        }
+    }
+
+    #[test]
+    fn a_queued_agent_ignores_stray_hooks_until_its_process_spawns() {
+        let now = t0();
+        let mut m = AgentStatusMachine::new(AgentStatus::Queued, Some("s1".into()));
+        for event in [
+            HookEvent::UserPromptSubmit,
+            HookEvent::Stop,
+            HookEvent::PermissionRequest,
+            HookEvent::Progress { busy: true },
+            HookEvent::SessionEnded { exit_code: Some(1) },
+            HookEvent::Parked,
+        ] {
+            let fx = m.handle(event.clone(), Some("s1"), now);
+            assert!(fx.is_empty(), "{event:?} moved a queued agent: {fx:?}");
+            assert_eq!(m.status(), AgentStatus::Queued);
+        }
+        let fx = m.handle(HookEvent::PtySpawned, None, now);
+        assert_eq!(status_of(&fx), Some(AgentStatus::Fresh));
+        m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
+        assert_eq!(m.status(), AgentStatus::Running);
+    }
+
+    #[test]
+    fn a_new_process_makes_a_row_with_none_fresh_and_leaves_live_turn_states() {
+        use AgentStatus::*;
+        for from in [
+            Fresh,
+            Queued,
+            Running,
+            Finished,
+            NeedsFeedback,
+            Terminated,
+            Disconnected,
+        ] {
+            let expected = match from {
+                Queued | Terminated | Disconnected => Fresh,
+                Fresh | Running | Finished | NeedsFeedback => from,
+            };
+            let mut m = AgentStatusMachine::new(from, None);
+            m.handle(HookEvent::PtySpawned, None, t0());
+            assert_eq!(m.status(), expected, "PtySpawned from {from:?}");
+        }
+    }
+
+    #[test]
+    fn an_explicit_restart_ends_whatever_turn_the_old_process_was_in() {
+        use AgentStatus::*;
+        for from in [
+            Fresh,
+            Queued,
+            Running,
+            Finished,
+            NeedsFeedback,
+            Terminated,
+            Disconnected,
+        ] {
+            let expected = match from {
+                Running | Finished | NeedsFeedback | Terminated => Fresh,
+                Fresh | Queued | Disconnected => from,
+            };
+            let mut m = AgentStatusMachine::new(from, Some("s1".into()));
+            m.handle(HookEvent::Restarted, None, t0());
+            assert_eq!(m.status(), expected, "Restarted from {from:?}");
         }
     }
 
