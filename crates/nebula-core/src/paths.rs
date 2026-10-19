@@ -34,6 +34,14 @@ pub fn pidfile_path() -> PathBuf {
     runtime_dir().join("daemon.pid")
 }
 
+/// One line per `nebula agent send` to this agent, appended by the sender.
+/// A session blocked in `nebula agent wait` watches its own file so a
+/// message queued behind the wait ends it early. Lives beside the socket,
+/// so only senders on the same host reach it.
+pub fn inbox_path(agent_id: &str) -> PathBuf {
+    runtime_dir().join("inbox").join(agent_id)
+}
+
 /// Fingerprint of the binary the running daemon was launched from, written
 /// by the daemon at startup. Installers compare it against the binary they
 /// just installed to tell an up-to-date daemon from a stale one.

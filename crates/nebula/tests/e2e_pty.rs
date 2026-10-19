@@ -15,6 +15,36 @@ struct TestEnv {
     runtime_dir: PathBuf,
 }
 
+/// Session identity a test run inherits when started from inside a live
+/// nebula session; a test daemon must not carry it.
+const LIVE_SESSION_ENV: [&str; 3] = ["NEBULA_AGENT_ID", "NEBULA_API_URL", "NEBULA_API_TOKEN"];
+
+/// A test daemon that is killed when dropped, so a test that panics before
+/// its Shutdown cannot leave the daemon (and the fds it inherited) behind.
+struct DaemonChild(std::process::Child);
+
+impl std::ops::Deref for DaemonChild {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for DaemonChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for DaemonChild {
+    fn drop(&mut self) {
+        if let Ok(None) = self.0.try_wait() {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
 impl TestEnv {
     fn new() -> Self {
         let tmp = tempfile::tempdir().unwrap();
@@ -26,15 +56,15 @@ impl TestEnv {
         self.runtime_dir.join("daemon.sock")
     }
 
-    fn spawn_daemon(&self) -> std::process::Child {
+    fn spawn_daemon(&self) -> DaemonChild {
         self.spawn_daemon_with_agent_cmd("/bin/sh") // no real claude in tests
     }
 
-    fn spawn_daemon_with_agent_cmd(&self, agent_cmd: &str) -> std::process::Child {
+    fn spawn_daemon_with_agent_cmd(&self, agent_cmd: &str) -> DaemonChild {
         self.spawn_daemon_with(agent_cmd, &[])
     }
 
-    fn spawn_daemon_with(&self, agent_cmd: &str, envs: &[(&str, &str)]) -> std::process::Child {
+    fn spawn_daemon_with(&self, agent_cmd: &str, envs: &[(&str, &str)]) -> DaemonChild {
         let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"));
         cmd.args(["daemon", "--foreground"])
             .env("NEBULA_RUNTIME_DIR", &self.runtime_dir)
@@ -44,18 +74,21 @@ impl TestEnv {
             .env("NEBULA_WORKTREE_SYNC_MS", "100") // fast external-worktree pickup
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
+        for k in LIVE_SESSION_ENV {
+            cmd.env_remove(k);
+        }
         for (k, v) in envs {
             cmd.env(k, v);
         }
-        cmd.spawn().unwrap()
+        DaemonChild(cmd.spawn().unwrap())
     }
 
     /// Daemon with no `NEBULA_AGENT_CMD` override, so agent spawns take the
     /// real login-shell path, and `$SHELL` set to `shell`. Lets a test decide
     /// what the daemon can find on PATH.
-    fn spawn_daemon_with_shell(&self, shell: &Path) -> std::process::Child {
-        std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
-            .args(["daemon", "--foreground"])
+    fn spawn_daemon_with_shell(&self, shell: &Path) -> DaemonChild {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"));
+        cmd.args(["daemon", "--foreground"])
             .env("NEBULA_RUNTIME_DIR", &self.runtime_dir)
             .env("NEBULA_DATA_DIR", self.tmp.path().join("data"))
             .env("SHELL", shell)
@@ -63,9 +96,11 @@ impl TestEnv {
             .env("CODEX_HOME", self.tmp.path().join("codex"))
             .env_remove("NEBULA_AGENT_CMD")
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap()
+            .stderr(std::process::Stdio::null());
+        for k in LIVE_SESSION_ENV {
+            cmd.env_remove(k);
+        }
+        DaemonChild(cmd.spawn().unwrap())
     }
 
     /// A `$SHELL` that answers `-l -i -c` but sees no agent CLI on PATH.
@@ -1189,6 +1224,179 @@ async fn agent_wait_cli_blocks_until_worker_settles() {
 
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
     wait_for_exit(&mut daemon);
+}
+
+/// `nebula agent wait --any` hands back the first worker to settle while the
+/// others keep running; a plain multi-name wait still holds out for all.
+#[tokio::test]
+async fn agent_wait_any_returns_first_settled_worker() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let mut daemon = env.spawn_daemon();
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let w1 = create_agent_get_id(&mut c, &worktree.id, "w1", 2).await;
+    let w2 = create_agent_get_id(&mut c, &worktree.id, "w2", 3).await;
+    for id in [&w1, &w2] {
+        attach_agent(&mut c, id).await;
+        emit_progress(&mut c, id, "3", nebula_core::AgentStatus::Running).await;
+    }
+
+    let waiting = agent_cli(
+        &env,
+        &["wait", "w1", "w2", "--any", "--timeout", "30"],
+        None,
+    )
+    .spawn()
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    emit_progress(&mut c, &w1, "0", nebula_core::AgentStatus::Finished).await;
+
+    let out = tokio::task::spawn_blocking(move || waiting.wait_with_output().unwrap())
+        .await
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "--any should exit 0 on the first settle: {out:?}"
+    );
+    let rows: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let rows = rows.as_array().unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "only the settled worker is printed: {rows:?}"
+    );
+    assert_eq!(rows[0]["name"], "w1");
+    assert_eq!(rows[0]["status"], "finished");
+
+    let all = agent_cli(&env, &["wait", "w1", "w2", "--timeout", "1"], None)
+        .output()
+        .unwrap();
+    assert!(
+        !all.status.success(),
+        "a wait without --any needs every worker settled: {all:?}"
+    );
+    let stderr = String::from_utf8_lossy(&all.stderr);
+    assert!(
+        stderr.contains("timed out") && stderr.contains("w2"),
+        "timeout should name the worker still running: {stderr}"
+    );
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
+/// A session blocked in `nebula agent wait` comes back within seconds, with
+/// exit code 3, when `nebula agent send` queues a message for it — instead
+/// of sitting on its lead's message until the timeout.
+#[tokio::test]
+async fn agent_wait_returns_early_when_the_caller_gets_a_message() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let mut daemon = env.spawn_daemon();
+
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let lead = create_agent_get_id(&mut c, &worktree.id, "lead", 2).await;
+    let worker = create_agent_get_id(&mut c, &worktree.id, "worker", 3).await;
+    attach_agent(&mut c, &lead).await;
+    attach_agent(&mut c, &worker).await;
+    emit_progress(&mut c, &worker, "3", nebula_core::AgentStatus::Running).await;
+
+    let waiting = agent_cli(&env, &["wait", "worker", "--timeout", "30"], Some(&lead))
+        .spawn()
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let sent_at = std::time::Instant::now();
+    let send = agent_cli(&env, &["send", "lead", "status?"], None)
+        .output()
+        .unwrap();
+    assert!(send.status.success(), "send failed: {send:?}");
+
+    let out = tokio::task::spawn_blocking(move || waiting.wait_with_output().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "a queued message ends the wait with 3: {out:?}"
+    );
+    assert!(
+        sent_at.elapsed() < Duration::from_secs(5),
+        "the wait should notice the message within seconds, took {:?}",
+        sent_at.elapsed()
+    );
+    let rows: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(rows, serde_json::json!([]), "the worker is still running");
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
+async fn attach_agent(c: &mut UnixStream, agent: &nebula_core::AgentId) {
+    write_frame(
+        c,
+        &ClientRequest::Attach {
+            session: SessionRef::Agent(agent.clone()),
+            from_seq: None,
+            cols: 120,
+            rows: 30,
+        },
+    )
+    .await
+    .unwrap();
+}
+
+/// Move an attached agent's status with the OSC 9;4 progress bytes Claude
+/// emits ("3" starts a turn, "0" ends it).
+async fn emit_progress(
+    c: &mut UnixStream,
+    agent: &nebula_core::AgentId,
+    state: &str,
+    want: nebula_core::AgentStatus,
+) {
+    write_frame(
+        c,
+        &ClientRequest::Input {
+            session: SessionRef::Agent(agent.clone()),
+            data: format!("printf '\\033]9;4;{state};\\007'\n").into_bytes(),
+        },
+    )
+    .await
+    .unwrap();
+    read_events_until(c, Duration::from_secs(10), |evs| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::StatusChanged { agent: a, status, .. }
+                if a == agent && *status == want)
+        })
+    })
+    .await;
+}
+
+/// `nebula agent <args> --project repo` against the test daemon, run as the
+/// session `caller` when given (as from inside it), else as no session.
+fn agent_cli(
+    env: &TestEnv,
+    args: &[&str],
+    caller: Option<&nebula_core::AgentId>,
+) -> std::process::Command {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"));
+    cmd.arg("agent")
+        .args(args)
+        .args(["--project", "repo"])
+        .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for k in LIVE_SESSION_ENV {
+        cmd.env_remove(k);
+    }
+    if let Some(id) = caller {
+        cmd.env("NEBULA_AGENT_ID", id.as_str());
+    }
+    cmd
 }
 
 #[tokio::test]
@@ -4629,15 +4837,7 @@ async fn branch_sessions_keep_independent_execution_directories() {
     commit_file(&repo, "README.md", "feature content\n");
     std::fs::write(repo.join("dirty.txt"), "keep me").unwrap();
     let head = git(&["rev-parse", "HEAD"]);
-    // A failed assertion must also reap this fixture's daemon.
-    struct ChildGuard(std::process::Child);
-    impl Drop for ChildGuard {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-    let _daemon = ChildGuard(env.spawn_daemon());
+    let _daemon = env.spawn_daemon();
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
     write_frame(
@@ -4903,7 +5103,7 @@ async fn branch_primary_cli_switch_and_agent_destinations() {
     git(&["checkout", "main"]);
     git(&["branch", "agent-branch", "feature"]);
     git(&["branch", "busy-target"]);
-    let _daemon = MobileFixtureDaemon(env.spawn_daemon());
+    let _daemon = env.spawn_daemon();
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
     write_frame(
@@ -5440,7 +5640,7 @@ async fn a_parked_agent_resumes_its_conversation_once_primary_is_back_on_its_bra
     )
     .unwrap();
     std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let _daemon = MobileFixtureDaemon(env.spawn_daemon_with_shell(&shell));
+    let _daemon = env.spawn_daemon_with_shell(&shell);
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
     let primary = add_project_get_main_worktree(&mut c, &repo).await;
@@ -5597,7 +5797,7 @@ async fn branch_primary_remote_switch_uses_owner_and_rejects_stale_paths() {
         .status()
         .unwrap()
         .success());
-    let mut daemon = MobileFixtureDaemon(env.spawn_daemon());
+    let mut daemon = env.spawn_daemon();
     let mut control = connect(&env.sock()).await;
     handshake(&mut control).await;
     add_project_get_main_worktree(&mut control, &repo).await;
@@ -5725,14 +5925,7 @@ async fn branch_session_cli_rejects_a_checkout_switched_after_resolution() {
             .status
             .success());
     }
-    struct ChildGuard(std::process::Child);
-    impl Drop for ChildGuard {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-    let _daemon = ChildGuard(env.spawn_daemon());
+    let _daemon = env.spawn_daemon();
     let mut control = connect(&env.sock()).await;
     handshake(&mut control).await;
     let primary = add_project_get_main_worktree(&mut control, &repo).await;
@@ -5835,12 +6028,6 @@ async fn branch_session_cli_rejects_a_checkout_switched_after_resolution() {
     );
 }
 
-
-struct MobileFixtureDaemon(std::process::Child);
-impl Drop for MobileFixtureDaemon {
-    fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
-}
-
 /// Fixtures only: no real agent, trust choice, user process or checkout.
 #[tokio::test]
 async fn mobile_keys_and_id_deletion_use_the_exact_pty() {
@@ -5852,7 +6039,7 @@ async fn mobile_keys_and_id_deletion_use_the_exact_pty() {
     let script = env.tmp.path().join("recorder");
     std::fs::write(&script, format!("#!/usr/bin/python3\nimport os, tty\ntty.setraw(0)\nopen({:?}, 'w').close()\nwhile True:\n with open({:?}, 'ab', buffering=0) as f: f.write(os.read(0, 1024))\n", ready, capture)).unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let mut daemon = MobileFixtureDaemon(env.spawn_daemon_with_agent_cmd(script.to_str().unwrap()));
+    let mut daemon = env.spawn_daemon_with_agent_cmd(script.to_str().unwrap());
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
     let main = add_project_get_main_worktree(&mut c, &repo).await;
@@ -5891,14 +6078,14 @@ async fn mobile_keys_and_id_deletion_use_the_exact_pty() {
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("no longer available"));
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
-    wait_for_exit(&mut daemon.0);
+    wait_for_exit(&mut daemon);
 }
 
 #[tokio::test]
 async fn mobile_safe_removal_preserves_dirty_unmerged_occupied_and_protected_checkouts() {
     let env = TestEnv::new();
     let repo = env.make_repo();
-    let mut daemon = MobileFixtureDaemon(env.spawn_daemon());
+    let mut daemon = env.spawn_daemon();
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
     let main = add_project_get_main_worktree(&mut c, &repo).await;
@@ -5957,14 +6144,14 @@ async fn mobile_safe_removal_preserves_dirty_unmerged_occupied_and_protected_che
     let status = std::process::Command::new("git").arg("-C").arg(&repo).args(["show-ref", "--verify", "refs/heads/fixture"]).status().unwrap();
     assert!(status.success(), "branch is always kept");
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
-    wait_for_exit(&mut daemon.0);
+    wait_for_exit(&mut daemon);
 }
 
 /// Use literal peer versions so a simultaneous client/server constant change cannot mask a mismatch.
 #[tokio::test]
 async fn protocol29_handshake_accepts_repeated_probes_and_rejects_protocol28() {
     let env = TestEnv::new();
-    let _daemon = MobileFixtureDaemon(env.spawn_daemon());
+    let _daemon = env.spawn_daemon();
     let mut c = connect(&env.sock()).await;
     for _ in 0..2 {
         write_frame(&mut c, &ClientRequest::Hello { protocol_version: 29 }).await.unwrap();
@@ -6010,7 +6197,7 @@ async fn agent_send_delivers_a_long_line_as_one_bracketed_paste() {
     let env = TestEnv::new();
     let repo = env.make_repo();
     let (script, ready, capture) = input_recorder(&env, true);
-    let mut daemon = MobileFixtureDaemon(env.spawn_daemon_with_agent_cmd(script.to_str().unwrap()));
+    let mut daemon = env.spawn_daemon_with_agent_cmd(script.to_str().unwrap());
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
     let main = add_project_get_main_worktree(&mut c, &repo).await;
@@ -6056,7 +6243,7 @@ async fn agent_send_refuses_a_long_message_the_tty_would_drop() {
     let env = TestEnv::new();
     let repo = env.make_repo();
     let (script, ready, capture) = input_recorder(&env, false);
-    let mut daemon = MobileFixtureDaemon(env.spawn_daemon_with_agent_cmd(script.to_str().unwrap()));
+    let mut daemon = env.spawn_daemon_with_agent_cmd(script.to_str().unwrap());
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
     let main = add_project_get_main_worktree(&mut c, &repo).await;

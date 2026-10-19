@@ -357,11 +357,19 @@ enum AgentCommand {
         prompt: Option<String>,
     },
     /// Block until workers settle out of running (finished, needs_feedback,
-    /// terminated…), then print them as JSON — `agent list`'s row shape.
-    /// No names means every unarchived worker of the project.
+    /// terminated…), then print the settled ones as JSON — `agent list`'s
+    /// row shape. No names means every unarchived worker of the project.
+    ///
+    /// Exit codes: 0 the workers settled (with --any, at least one);
+    /// 1 timed out or failed; 3 a message was sent to the calling session
+    /// (`agent send` from this host), which ends the wait early so the
+    /// session reads it — stdout then lists only the workers already settled.
     Wait {
         /// Session names to wait on (as shown in the panels).
         names: Vec<String>,
+        /// Return as soon as the first named worker settles.
+        #[arg(long, requires = "names")]
+        any: bool,
         /// Give up after this many seconds (nonzero exit).
         #[arg(long, default_value_t = 600)]
         timeout: u64,
@@ -736,9 +744,10 @@ fn main() -> Result<()> {
             }),
             AgentCommand::Wait {
                 names,
+                any,
                 timeout,
                 project,
-            } => nebula_tui::run_agent_wait(names, timeout, project),
+            } => nebula_tui::run_agent_wait(names, any, timeout, project),
             AgentCommand::List {
                 project,
                 all,

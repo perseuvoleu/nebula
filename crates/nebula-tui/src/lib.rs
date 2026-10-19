@@ -247,9 +247,22 @@ pub fn run_agent_ctl(op: AgentCtl, name: String, project: Option<String>) -> Res
     runtime()?.block_on(ipc::agent_ctl(op, name, project))
 }
 
-/// `nebula agent wait` — block until workers settle out of running.
-pub fn run_agent_wait(names: Vec<String>, timeout: u64, project: Option<String>) -> Result<()> {
-    runtime()?.block_on(ipc::agent_wait(names, timeout, project))
+/// `nebula agent wait` — block until workers settle out of running. Exits 3
+/// when a message sent to the calling session cut the wait short.
+pub fn run_agent_wait(
+    names: Vec<String>,
+    any: bool,
+    timeout: u64,
+    project: Option<String>,
+) -> Result<()> {
+    if let ipc::WaitEnd::Message { from } =
+        runtime()?.block_on(ipc::agent_wait(names, any, timeout, project))?
+    {
+        let from = from.map_or(String::new(), |name| format!(" from \"{name}\""));
+        eprintln!("a message{from} is queued for this session; wait ended early");
+        std::process::exit(3);
+    }
+    Ok(())
 }
 
 /// `nebula workspace <add|open|list|delete|rename>` (see `ipc::run_workspace_op`).
