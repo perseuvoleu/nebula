@@ -1358,23 +1358,18 @@ async fn agent_wait_returns_early_when_the_caller_gets_a_message() {
 }
 
 /// A message that lands while `agent wait` is still connecting counts: the
-/// wait is frozen right after it opened its daemon connection (before the
-/// snapshot), the message is sent, and the resumed wait must exit 3.
-#[cfg(target_os = "linux")]
+/// wait's daemon connection is held at a gate (before handshake and
+/// snapshot), the message is sent, and the released wait must exit 3.
 #[tokio::test]
 async fn agent_wait_counts_a_message_sent_while_it_starts() {
     let env = TestEnv::new();
-    let repo = env.make_repo();
-    let mut daemon = env.spawn_daemon();
-
-    let mut c = connect(&env.sock()).await;
-    handshake(&mut c).await;
-    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
-    let lead = create_agent_get_id(&mut c, &worktree.id, "lead", 2).await;
-    let worker = create_agent_get_id(&mut c, &worktree.id, "worker", 3).await;
-    attach_agent(&mut c, &lead).await;
-    attach_agent(&mut c, &worker).await;
-    emit_progress(&mut c, &worker, "3", nebula_core::AgentStatus::Running).await;
+    let LeadAndWorker {
+        mut daemon,
+        mut c,
+        lead,
+        ..
+    } = lead_waiting_on_running_worker(&env).await;
+    let (gate, real) = install_socket_gate(&env);
 
     let waiting = agent_cli(
         &env,
@@ -1383,43 +1378,18 @@ async fn agent_wait_counts_a_message_sent_while_it_starts() {
     )
     .spawn()
     .unwrap();
-    let pid = waiting.id().to_string();
-    let fds = format!("/proc/{pid}/fd");
-    let connected = || {
-        std::fs::read_dir(&fds)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .any(|fd| {
-                std::fs::read_link(fd.path())
-                    .is_ok_and(|l| l.to_string_lossy().starts_with("socket:"))
-            })
-    };
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while !connected() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "wait never connected to the daemon"
-        );
-        std::thread::yield_now();
-    }
-    let signal = |sig: &str| {
-        let ok = std::process::Command::new("kill")
-            .args([sig, &pid])
-            .status()
-            .unwrap();
-        assert!(ok.success(), "kill {sig} {pid}");
-    };
-    signal("-STOP");
-    let send = agent_cli(
+    let held = hold_next(&gate).await;
+    pass_through(gate, real.clone());
+    let mut send = agent_cli(
         &env,
         &["send", "lead", "status?", "--project", "repo"],
         None,
-    )
-    .output()
-    .unwrap();
+    );
+    let send = tokio::task::spawn_blocking(move || send.output().unwrap())
+        .await
+        .unwrap();
     assert!(send.status.success(), "send failed: {send:?}");
-    signal("-CONT");
+    forward(held, real);
 
     let out = tokio::task::spawn_blocking(move || waiting.wait_with_output().unwrap())
         .await
@@ -1432,6 +1402,72 @@ async fn agent_wait_counts_a_message_sent_while_it_starts() {
 
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
     wait_for_exit(&mut daemon);
+}
+
+/// Only a submitted Enter ends a wait: a pasted CRLF that is still draft
+/// text must not, while the kitty-encoded Enter the TUI sends must.
+#[tokio::test]
+async fn agent_wait_ends_on_a_submitted_enter_not_on_a_pasted_newline() {
+    let pasted = b"\x1b[200~first\r\nsecond\x1b[201~".to_vec();
+    let kitty_enter = b"\x1b[13u".to_vec();
+    let mut wrong = Vec::new();
+    for (input, want) in [(pasted, 0), (kitty_enter, 3)] {
+        let env = TestEnv::new();
+        let LeadAndWorker {
+            mut daemon,
+            mut c,
+            lead,
+            worker,
+            project,
+        } = lead_waiting_on_running_worker(&env).await;
+        let (gate, real) = install_socket_gate(&env);
+
+        let waiting = agent_cli(
+            &env,
+            &["wait", "worker", "--timeout", "10", "--project", "repo"],
+            Some(&lead),
+        )
+        .spawn()
+        .unwrap();
+        let held = hold_next(&gate).await;
+        write_frame(
+            &mut c,
+            &ClientRequest::InputAcknowledged {
+                req_id: 9,
+                id: lead.clone(),
+                project,
+                data: input.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let acked = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+            find_ack(evs, 9).is_some()
+        })
+        .await;
+        assert!(
+            matches!(find_ack(&acked, 9), Some(ServerEvent::Ack { .. })),
+            "{acked:?}"
+        );
+        forward(held, real);
+        if want == 0 {
+            emit_progress(&mut c, &worker, "0", nebula_core::AgentStatus::Finished).await;
+        }
+
+        let out = tokio::task::spawn_blocking(move || waiting.wait_with_output().unwrap())
+            .await
+            .unwrap();
+        if out.status.code() != Some(want) {
+            wrong.push(format!(
+                "input {:?} should end the wait with {want}: {out:?}",
+                String::from_utf8_lossy(&input)
+            ));
+        }
+
+        write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+        wait_for_exit(&mut daemon);
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 /// A lead on the laptop steering a worker on findl: the send goes through
@@ -1516,6 +1552,70 @@ async fn agent_wait_on_a_host_returns_early_for_a_relayed_send() {
     wait_for_exit(&mut daemon);
     write_frame(&mut h, &ClientRequest::Shutdown).await.unwrap();
     wait_for_exit(&mut host_daemon);
+}
+
+struct LeadAndWorker {
+    daemon: DaemonChild,
+    c: UnixStream,
+    lead: nebula_core::AgentId,
+    worker: nebula_core::AgentId,
+    project: nebula_core::ProjectId,
+}
+
+/// A test daemon with agents `lead` and `worker` on project `repo`, both
+/// attached on the returned connection, the worker mid-turn (running).
+async fn lead_waiting_on_running_worker(env: &TestEnv) -> LeadAndWorker {
+    let repo = env.make_repo();
+    let daemon = env.spawn_daemon();
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let lead = create_agent_get_id(&mut c, &worktree.id, "lead", 2).await;
+    let worker = create_agent_get_id(&mut c, &worktree.id, "worker", 3).await;
+    attach_agent(&mut c, &lead).await;
+    attach_agent(&mut c, &worker).await;
+    emit_progress(&mut c, &worker, "3", nebula_core::AgentStatus::Running).await;
+    LeadAndWorker {
+        daemon,
+        c,
+        lead,
+        worker,
+        project: worktree.project_id,
+    }
+}
+
+/// Moves the daemon's socket aside (it keeps listening on the moved path)
+/// and binds a gate in its place, so a test controls when a client's
+/// connection reaches the daemon. Returns the gate and the daemon's path.
+fn install_socket_gate(env: &TestEnv) -> (tokio::net::UnixListener, PathBuf) {
+    let real = env.runtime_dir.join("daemon.real.sock");
+    std::fs::rename(env.sock(), &real).unwrap();
+    (tokio::net::UnixListener::bind(env.sock()).unwrap(), real)
+}
+
+/// The next client to connect through the gate, held back from the daemon.
+async fn hold_next(gate: &tokio::net::UnixListener) -> UnixStream {
+    let (held, _) = tokio::time::timeout(Duration::from_secs(10), gate.accept())
+        .await
+        .expect("no client connected through the gate")
+        .unwrap();
+    held
+}
+
+/// Every later client goes straight through to the daemon.
+fn pass_through(gate: tokio::net::UnixListener, real: PathBuf) {
+    tokio::spawn(async move {
+        while let Ok((client, _)) = gate.accept().await {
+            forward(client, real.clone());
+        }
+    });
+}
+
+fn forward(mut client: UnixStream, real: PathBuf) {
+    tokio::spawn(async move {
+        let mut daemon = UnixStream::connect(&real).await.unwrap();
+        let _ = tokio::io::copy_bidirectional(&mut client, &mut daemon).await;
+    });
 }
 
 async fn attach_agent(c: &mut UnixStream, agent: &nebula_core::AgentId) {

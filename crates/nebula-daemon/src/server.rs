@@ -841,15 +841,18 @@ fn stale_screen_text(saved: &str, lines: Option<usize>) -> String {
     text
 }
 
-/// Enter reaching an agent's PTY submits a message, or queues it behind a
-/// running tool call. Marking it in the agent's inbox lets the session's
-/// own `nebula agent wait` return early instead of sitting on the message.
+/// A bare Enter reaching an agent's PTY submits a message, or queues it
+/// behind a running tool call. Marking it in the agent's inbox lets the
+/// session's own `nebula agent wait` return early instead of sitting on the
+/// message. Only a frame that is exactly Enter counts — legacy `\r` or the
+/// kitty `CSI 13 u` — so a pasted newline (still draft text) and the text
+/// frame of `agent send` (its Enter follows as its own frame) do not.
 fn note_submitted(session: &SessionRef, data: &[u8]) {
     use std::io::Write;
     let SessionRef::Agent(id) = session else {
         return;
     };
-    if !data.contains(&b'\r') {
+    if !matches!(data, b"\r" | b"\x1b[13u") {
         return;
     }
     let path = nebula_core::paths::inbox_path(id.as_str());

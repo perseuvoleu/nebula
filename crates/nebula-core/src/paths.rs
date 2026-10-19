@@ -34,7 +34,7 @@ pub fn pidfile_path() -> PathBuf {
     runtime_dir().join("daemon.pid")
 }
 
-/// One byte per Enter typed into this agent's PTY (`nebula agent send`, the
+/// One byte per submitted Enter reaching this agent's PTY (`nebula agent send`, the
 /// TUI, the web app), appended by the daemon that owns the session — so a
 /// relayed send lands on the session's host. A session blocked in `nebula
 /// agent wait` watches its own file so a message queued behind the wait
