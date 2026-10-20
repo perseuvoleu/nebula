@@ -104,7 +104,9 @@ nebula agent send "fix login" "run the tests" --project nebula@findl
 ## `nebula remote <host>`
 
 ```
-status    nebula + daemon on the host, the sessions there (live; archived as a count)
+status    nebula + daemon on the host, the sessions there (live; archived as a count), and drift:
+          `binary: <host sha> vs local <sha> (same|differs|unknown)` from `nebula --version`,
+          `skills: in sync | N files differ` from `nebula-sync-skills --check` (content checksums)
 sessions  every session there, archived included
 watch     `sessions`, live, every 2s
 sync      skills (nebula-sync-skills) + `git pull --ff-only` on every remote checkout + the

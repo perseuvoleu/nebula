@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(
     name = "nebula",
-    version,
+    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("NEBULA_BUILD_ID"), ")"),
     about = "Terminal multiplexer for Claude Code agents"
 )]
 struct Cli {
@@ -253,6 +253,10 @@ enum Command {
     /// a different build than this binary (see `make install` / install.sh).
     #[command(hide = true, name = "_stale-daemon-note")]
     StaleDaemonNote,
+    /// Print the running daemon's build id (`nebula --version`'s sha); exits
+    /// 1 when no daemon runs or it predates build ids. `remote status` reads it.
+    #[command(hide = true, name = "_daemon-build")]
+    DaemonBuild,
     /// Pipe stdin/stdout to this machine's daemon socket — what a remote
     /// nebula runs over ssh to reach the daemon here.
     #[command(hide = true)]
@@ -621,7 +625,8 @@ enum TodoCommand {
 #[derive(Subcommand)]
 enum RemoteCommand {
     /// nebula version and daemon on the host, this daemon's sessions there,
-    /// leftover agent processes.
+    /// leftover agent processes, and whether its build and skills mirror
+    /// match this machine's (reporting only; `sync`/`upgrade` change them).
     Status,
     /// Sessions on the host: this daemon's, plus the host daemon's own.
     Sessions,
@@ -669,6 +674,7 @@ enum WorkspaceCommand {
 }
 
 fn main() -> Result<()> {
+    nebula_core::build_id::set(env!("NEBULA_BUILD_ID"));
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Preview(args)) => preview::run(args),
@@ -970,6 +976,13 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Some(Command::DaemonBuild) => match nebula_daemon::lifecycle::daemon_build_id() {
+            Some(id) => {
+                println!("{id}");
+                Ok(())
+            }
+            None => std::process::exit(1),
+        },
         Some(Command::RawAttach { name }) => nebula_tui::run_raw_attach(&name),
         None => match cli.dir {
             Some(dir) => nebula_tui::run_add_project(dir),

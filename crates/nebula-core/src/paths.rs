@@ -50,6 +50,12 @@ pub fn buildstamp_path() -> PathBuf {
     runtime_dir().join("daemon.build")
 }
 
+/// The git build id (`nebula --version`) of the running daemon, written
+/// next to its buildstamp at startup.
+pub fn daemon_build_id_path() -> PathBuf {
+    runtime_dir().join("daemon.build-id")
+}
+
 pub fn data_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("NEBULA_DATA_DIR") {
         if !dir.is_empty() {

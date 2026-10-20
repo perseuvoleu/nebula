@@ -15,7 +15,11 @@ scripts/sync-skills.sh            # default host: findl
 scripts/sync-skills.sh <host>     # any ssh destination / ~/.ssh/config alias
 ```
 
-It prints one line from the remote at the end: `skills on <host>: N claude, M codex, K broken links`.
+`scripts/sync-skills.sh --check [host]` changes nothing: it prints `differ: N`, the mirrored
+files whose content (cksum) or link target differs, or that exist on one side only — what
+`nebula remote <host> status` reports as `skills: …`.
+
+A sync prints one line from the remote at the end: `skills on <host>: N claude, M codex, K broken links`.
 Compare N/M with the laptop (`ls ~/.claude/skills | wc -l`, `ls ~/.codex/skills | wc -l`); `broken
 links` should match the laptop's own dangling symlinks (check with
 `find ~/.claude/skills ~/.codex/skills -maxdepth 1 -type l ! -exec test -e {} \; -print`), and

@@ -64,13 +64,25 @@ fn libc_flock(fd: i32) -> i32 {
 }
 
 /// Record this process's binary fingerprint so installers can tell whether
-/// the running daemon is already on the build they just installed. Called by
+/// the running daemon is already on the build they just installed, and its
+/// git build id for `nebula _daemon-build`. Called by
 /// the daemon at startup; best-effort (staleness checks treat a missing
 /// stamp as "unknown build", which reads as stale).
 pub fn write_buildstamp() {
     if let Some(stamp) = exe_buildstamp() {
         let _ = fs::write(paths::buildstamp_path(), stamp);
     }
+    let _ = fs::write(paths::daemon_build_id_path(), nebula_core::build_id::get());
+}
+
+/// The live daemon's git build id; None when no daemon runs or it started
+/// from a binary older than build ids.
+pub fn daemon_build_id() -> Option<String> {
+    if !PidfileLock::is_daemon_alive() {
+        return None;
+    }
+    let id = fs::read_to_string(paths::daemon_build_id_path()).ok()?;
+    Some(id.trim().to_string()).filter(|id| !id.is_empty())
 }
 
 /// True when a live daemon is running different code than this binary — or

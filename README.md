@@ -341,7 +341,7 @@ nebula diagram list [query] [--json] | add <file.html> | rm <slug> | path | deci
 nebula diagram open [slug]  # show it in the running TUI's ⌘X viewer (default: the newest)
 nebula hooks install <kind> [dir]  # install an agent CLI's status hooks (what a spawn does;
                           # remote spawns run it on the far host)
-nebula remote <host> status    # nebula + daemon on the host, the sessions there
+nebula remote <host> status    # nebula + daemon on the host, the sessions there, binary/skills drift
 nebula remote <host> sessions  # every session on the host, archived included
 nebula remote <host> watch     # the same, live
 nebula remote <host> sync      # mirror skills (nebula-sync-skills) + ff-pull every remote checkout

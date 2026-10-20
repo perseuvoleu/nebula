@@ -121,16 +121,97 @@ async fn status(host: &str) -> Result<()> {
         );
     }
     // The host itself.
-    match ssh(host, "nebula --version 2>/dev/null || echo 'nebula: not installed'; nebula agent list --all >/dev/null 2>&1 && echo 'daemon: running' || echo 'daemon: not running'", false) {
+    match ssh(host, HOST_STATUS, false) {
         Ok(out) => {
             for l in out.lines() {
                 println!("{host}: {l}");
             }
+            let local = nebula_core::build_id::get();
+            let theirs = out.lines().find_map(version_build_id).unwrap_or("unknown");
+            println!(
+                "binary: {theirs} vs local {local} ({})",
+                build_drift(theirs, local).label()
+            );
         }
         Err(e) => println!("{host}: unreachable — {e}"),
     }
+    println!("skills: {}", skills_drift(host));
     print_sessions(host, &snap, false).await?;
     Ok(())
+}
+
+/// The host's nebula build and its daemon's. Only a binary whose version
+/// shows a build id has `_daemon-build`; an older one would take it for
+/// `nebula <dir>` and add a project.
+const HOST_STATUS: &str = "v=$(nebula --version 2>/dev/null) || v='nebula: not installed'; echo \"$v\"; \
+    if nebula agent list --all >/dev/null 2>&1; then \
+    case \"$v\" in *'('*) b=$(nebula _daemon-build 2>/dev/null);; esac; \
+    echo \"daemon: running${b:+ (build $b)}\"; else echo 'daemon: not running'; fi";
+
+/// The build id in a `nebula --version` line: `nebula 0.6.0 (abc1234)`.
+fn version_build_id(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("nebula ")?;
+    let (_, id) = rest.rsplit_once('(')?;
+    id.strip_suffix(')')
+}
+
+#[derive(Debug, PartialEq)]
+enum Drift {
+    Same,
+    Differs,
+    /// A build without an id, or two dirty builds of one commit.
+    Unknown,
+}
+
+impl Drift {
+    fn label(&self) -> &'static str {
+        match self {
+            Drift::Same => "same",
+            Drift::Differs => "differs",
+            Drift::Unknown => "unknown",
+        }
+    }
+}
+
+fn build_drift(theirs: &str, ours: &str) -> Drift {
+    if theirs == "unknown" || ours == "unknown" {
+        return Drift::Unknown;
+    }
+    let sha = |id: &str| id.trim_end_matches("-dirty").to_string();
+    if sha(theirs) != sha(ours) {
+        Drift::Differs
+    } else if theirs.ends_with("-dirty") || ours.ends_with("-dirty") {
+        Drift::Unknown
+    } else {
+        Drift::Same
+    }
+}
+
+/// `nebula-sync-skills --check`: what a skills sync would change on the
+/// host, by content checksum over the same entries the sync mirrors.
+fn skills_drift(host: &str) -> String {
+    let Some(script) = which("nebula-sync-skills") else {
+        return "unknown — `nebula-sync-skills` not on PATH (see the sync-skills skill)".into();
+    };
+    let out = match Command::new(script).args(["--check", host]).output() {
+        Ok(out) => out,
+        Err(e) => return format!("check failed — {e}"),
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let differ = stdout
+        .lines()
+        .rev()
+        .find_map(|l| l.strip_prefix("differ: "))
+        .and_then(|n| n.trim().parse::<usize>().ok());
+    match differ {
+        Some(0) if out.status.success() => "in sync".into(),
+        Some(1) if out.status.success() => "1 file differs".into(),
+        Some(n) if out.status.success() => format!("{n} files differ"),
+        _ => format!(
+            "check failed — {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+    }
 }
 
 async fn print_sessions(host: &str, snap: &Snapshot, everything: bool) -> Result<()> {

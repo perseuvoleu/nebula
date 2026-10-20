@@ -7066,3 +7066,177 @@ async fn prune_drops_ghost_rows_but_never_one_with_a_live_session() {
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
     wait_for_exit(&mut daemon.0);
 }
+
+fn write_executable(path: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, body).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn version_build_id() -> String {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        .arg("--version")
+        .output()
+        .unwrap();
+    let line = String::from_utf8(out.stdout).unwrap();
+    let id = line.trim().rsplit_once('(').unwrap().1;
+    id.strip_suffix(')').unwrap().to_string()
+}
+
+#[tokio::test]
+async fn version_and_daemon_report_the_git_build() {
+    let head = std::process::Command::new("git")
+        .args([
+            "-C",
+            env!("CARGO_MANIFEST_DIR"),
+            "rev-parse",
+            "--short=7",
+            "HEAD",
+        ])
+        .output()
+        .unwrap();
+    let sha = String::from_utf8(head.stdout).unwrap().trim().to_string();
+    let version = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        .arg("--version")
+        .output()
+        .unwrap();
+    let version = String::from_utf8(version.stdout).unwrap();
+    let prefix = format!("nebula {} ({sha}", env!("CARGO_PKG_VERSION"));
+    let suffix = version
+        .trim()
+        .strip_prefix(&prefix)
+        .unwrap_or_else(|| panic!("`{version}` should start with `{prefix}`"));
+    assert!(suffix == ")" || suffix == "-dirty)", "{version}");
+
+    let env = TestEnv::new();
+    let daemon_build = || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+            .arg("_daemon-build")
+            .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
+            .env("NEBULA_DATA_DIR", env.tmp.path().join("data"))
+            .output()
+            .unwrap()
+    };
+    assert!(!daemon_build().status.success(), "no daemon, no build");
+    let mut daemon = env.spawn_daemon();
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let out = daemon_build();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        version_build_id()
+    );
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon.0);
+}
+
+/// The SSH boundary runs locally against a fake host home; the skills check
+/// is the real sync-skills script, on two disposable homes.
+#[tokio::test]
+async fn remote_status_reports_binary_and_skills_drift() {
+    let env = TestEnv::new();
+    let mut daemon = env.spawn_daemon();
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let laptop = env.tmp.path().join("laptop");
+    let host = env.tmp.path().join("host");
+    let put = |home: &Path, rel: &str, body: &str| {
+        let path = home.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    };
+    put(&laptop, ".claude/skills/same/SKILL.md", "same");
+    put(&host, ".claude/skills/same/SKILL.md", "same");
+    put(&laptop, ".claude/skills/edited/SKILL.md", "new text");
+    put(&host, ".claude/skills/edited/SKILL.md", "old text");
+    put(&host, ".claude/skills/removed/SKILL.md", "gone locally");
+    put(&laptop, ".claude/skills/tool/node_modules/x.js", "excluded");
+    put(&laptop, ".claude/CLAUDE.md", "rules");
+    put(&host, ".claude/CLAUDE.md", "rules");
+    // The sync rewrites a laptop-home link onto the host's home: not drift.
+    std::os::unix::fs::symlink(
+        "/Users/me/.agents/skills/linked",
+        laptop.join(".claude/skills/linked"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(
+        host.join(".agents/skills/linked"),
+        host.join(".claude/skills/linked"),
+    )
+    .unwrap();
+    // Same content, different mtime: not drift.
+    let old = std::fs::File::options()
+        .write(true)
+        .open(host.join(".claude/skills/same/SKILL.md"))
+        .unwrap();
+    old.set_modified(std::time::SystemTime::UNIX_EPOCH).unwrap();
+
+    let bin = env.tmp.path().join("laptop-bin");
+    write_executable(
+        &bin.join("ssh"),
+        &format!(
+            "#!/bin/sh\nwhile [ $# -gt 0 ]; do case \"$1\" in -o) shift 2;; --) shift; break;; -*) shift;; *) break;; esac; done\n\
+             shift\ncd '{h}' && HOME='{h}' exec /bin/sh -c \"$*\"\n",
+            h = host.display()
+        ),
+    );
+    std::os::unix::fs::symlink(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/sync-skills.sh"),
+        bin.join("nebula-sync-skills"),
+    )
+    .unwrap();
+    let host_nebula = |id: &str| {
+        write_executable(
+            &host.join(".local/bin/nebula"),
+            &format!(
+                "#!/bin/sh\ncase \"$1\" in --version) echo 'nebula 0.6.0 ({id})';; _daemon-build) echo {id};; esac\n"
+            ),
+        )
+    };
+    let status = || {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+            .args(["remote", "fixture-host", "status"])
+            .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
+            .env("NEBULA_DATA_DIR", env.tmp.path().join("data"))
+            .env("HOME", &laptop)
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let local = version_build_id();
+
+    host_nebula("0000000");
+    let out = status();
+    assert!(
+        out.contains("fixture-host: daemon: running (build 0000000)\n"),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!("binary: 0000000 vs local {local} (differs)\n")),
+        "{out}"
+    );
+    assert!(out.contains("skills: 2 files differ\n"), "{out}");
+
+    host_nebula(&local);
+    std::fs::remove_dir_all(host.join(".claude/skills/removed")).unwrap();
+    put(&host, ".claude/skills/edited/SKILL.md", "new text");
+    let out = status();
+    let verdict = if local.ends_with("-dirty") {
+        "unknown"
+    } else {
+        "same"
+    };
+    assert!(
+        out.contains(&format!("binary: {local} vs local {local} ({verdict})\n")),
+        "{out}"
+    );
+    assert!(out.contains("skills: in sync\n"), "{out}");
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon.0);
+}

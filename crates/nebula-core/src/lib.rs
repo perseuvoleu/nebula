@@ -1,3 +1,4 @@
+pub mod build_id;
 pub mod codec;
 pub mod crashlog;
 pub mod entities;
