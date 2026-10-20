@@ -298,13 +298,37 @@ enum WorktreeCommand {
         #[arg(long)]
         project: Option<String>,
     },
-    /// Remove only a clean, merged, session-free worktree by ID. Keeps its branch.
+    /// Remove only a clean, merged, session-free worktree by ID. Keeps its
+    /// branch. Prints a verdict per criterion: files (ignored links, env
+    /// copies and setup output such as node_modules/dist pass; other
+    /// ignored files are user data), base (created_from, else git config
+    /// `nebula.base`, else the remote default branch, else main/master;
+    /// never fetches), merged (ancestor, patch-id or squash tree) and
+    /// sessions.
     DeleteSafe {
         id: String,
         branch: String,
         path: std::path::PathBuf,
+        /// Print the verdicts and change nothing.
         #[arg(long)]
         check: bool,
+        /// Delete archived sessions and exited terminals with the checkout;
+        /// live or unarchived sessions still refuse.
+        #[arg(long)]
+        with_archived: bool,
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Drop rows whose checkout directory and git worktree entry are both
+    /// gone. A row with a live or unarchived session is never dropped.
+    Prune {
+        /// List the ghost rows and change nothing.
+        #[arg(long)]
+        check: bool,
+        /// Delete archived sessions and exited terminals with their row.
+        #[arg(long)]
+        with_archived: bool,
+        /// Project name (default: the calling session's project).
         #[arg(long)]
         project: Option<String>,
     },
@@ -707,8 +731,10 @@ fn main() -> Result<()> {
                 from,
                 project,
             } => nebula_tui::run_worktree_new(name.join(" "), from, project),
-            WorktreeCommand::DeleteSafe { id, branch, path, check, project } =>
-                nebula_tui::run_worktree_delete_safe(id, branch, path, check, project),
+            WorktreeCommand::DeleteSafe { id, branch, path, check, with_archived, project } =>
+                nebula_tui::run_worktree_delete_safe(id, branch, path, check, with_archived, project),
+            WorktreeCommand::Prune { check, with_archived, project } =>
+                nebula_tui::run_worktree_prune(check, with_archived, project),
             WorktreeCommand::Delete {
                 name,
                 force,

@@ -453,11 +453,21 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     )
                     .await;
                 }
-                ClientRequest::CheckWorktreeRemoval { req_id, id, branch, path, delete } => {
+                ClientRequest::CheckWorktreeRemoval { req_id, id, branch, path, delete, report } => {
                     let daemon = daemon.clone();
                     let out_tx = out_tx.clone();
                     tokio::spawn(async move {
-                        reply(&out_tx, req_id, daemon.check_worktree_removal(&id, &branch, &path, delete).await.map(|_| None)).await;
+                        let with_archived = report.as_ref().is_some_and(|f| f.with_archived);
+                        let result = daemon.check_worktree_removal(&id, &branch, &path, delete, with_archived).await;
+                        reply_report(&out_tx, req_id, report.is_some(), result).await;
+                    });
+                }
+                ClientRequest::PruneWorktrees { req_id, project, delete, with_archived } => {
+                    let daemon = daemon.clone();
+                    let out_tx = out_tx.clone();
+                    tokio::spawn(async move {
+                        let result = daemon.prune_worktrees(&project, delete, with_archived).await;
+                        reply_report(&out_tx, req_id, true, result).await;
                     });
                 }
                 ClientRequest::DeleteWorktree { req_id, id, force } => {
@@ -825,6 +835,29 @@ async fn reply(
         },
     };
     let _ = out_tx.send(ev).await;
+}
+
+/// Reply to a removal-style request: its verdict lines (when asked for),
+/// then an Ack, or an Error carrying the refusal reasons.
+async fn reply_report(
+    out_tx: &mpsc::Sender<ServerEvent>,
+    req_id: u64,
+    send_lines: bool,
+    result: anyhow::Result<crate::registry::RemovalReport>,
+) {
+    let result = match result {
+        Ok(report) => {
+            if send_lines {
+                let _ = out_tx.send(ServerEvent::Report { req_id, lines: report.lines }).await;
+            }
+            match report.refusals.is_empty() {
+                true => Ok(None),
+                false => Err(anyhow::anyhow!("{}", report.refusals.join("\n"))),
+            }
+        }
+        Err(e) => Err(e),
+    };
+    reply(out_tx, req_id, result).await;
 }
 
 /// A stopped session's saved screen, tailed to `lines` and headed by a

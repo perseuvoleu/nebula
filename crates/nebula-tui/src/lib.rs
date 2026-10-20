@@ -135,8 +135,13 @@ pub fn run_worktree_new(name: String, from: Option<String>, project: Option<Stri
 }
 
 /// Check or remove a clean, merged, session-free checkout by ID while keeping its branch.
-pub fn run_worktree_delete_safe(id: String, branch: String, path: std::path::PathBuf, check: bool, project: Option<String>) -> Result<()> {
-    runtime()?.block_on(ipc::worktree_delete_safe(id, branch, path, check, project))
+pub fn run_worktree_delete_safe(id: String, branch: String, path: std::path::PathBuf, check: bool, with_archived: bool, project: Option<String>) -> Result<()> {
+    runtime()?.block_on(ipc::worktree_delete_safe(id, branch, path, check, with_archived, project))
+}
+
+/// `nebula worktree prune` — drop rows whose checkout and git entry are gone.
+pub fn run_worktree_prune(check: bool, with_archived: bool, project: Option<String>) -> Result<()> {
+    runtime()?.block_on(ipc::worktree_prune(check, with_archived, project))
 }
 
 /// `nebula worktree delete` — the daemon's delete flow (checkout + row).

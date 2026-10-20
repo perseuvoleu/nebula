@@ -6547,3 +6547,134 @@ async fn agent_send_refuses_a_long_message_the_tty_would_drop() {
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
     wait_for_exit(&mut daemon.0);
 }
+
+async fn create_terminal_get_id(c: &mut UnixStream, worktree: &nebula_core::WorktreeId, req_id: u64) -> nebula_core::TerminalId {
+    write_frame(c, &ClientRequest::CreateTerminal { expected_branch: None, req_id, worktree: worktree.clone(), name: None }).await.unwrap();
+    let events = read_events_until(c, Duration::from_secs(5), |evs| find_ack(evs, req_id).is_some()).await;
+    let Some(ServerEvent::Ack { created: Some(EntityId::Terminal(id)), .. }) = find_ack(&events, req_id) else {
+        panic!("CreateTerminal failed: {events:#?}");
+    };
+    id.clone()
+}
+
+async fn exit_terminal(c: &mut UnixStream, id: &nebula_core::TerminalId) {
+    write_frame(c, &ClientRequest::Input { session: SessionRef::Terminal(id.clone()), data: b"exit\n".to_vec() }).await.unwrap();
+    read_events_until(c, Duration::from_secs(5), |evs| evs.iter().any(|e| matches!(e,
+        ServerEvent::EntityUpserted { entity: Entity::Terminal(t) } if t.id == *id && !t.alive))).await;
+}
+
+async fn archive_agent(c: &mut UnixStream, id: &nebula_core::AgentId, req_id: u64) {
+    write_frame(c, &ClientRequest::ArchiveAgent { req_id, id: id.clone() }).await.unwrap();
+    let events = read_events_until(c, Duration::from_secs(5), |evs| find_ack(evs, req_id).is_some()).await;
+    assert!(matches!(find_ack(&events, req_id), Some(ServerEvent::Ack { .. })), "ArchiveAgent failed: {events:#?}");
+}
+
+fn new_worktree(cli: &dyn Fn(&[&str]) -> std::process::Output, branch: &str) -> (String, String) {
+    let result = cli(&["worktree", "new", branch, "--project", "repo"]);
+    assert!(result.status.success(), "{result:?}");
+    let result = cli(&["worktree", "list", "--project", "repo"]);
+    let trees: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    let tree = trees.as_array().unwrap().iter().find(|w| w["branch"] == branch).unwrap();
+    (tree["id"].as_str().unwrap().to_string(), tree["path"].as_str().unwrap().to_string())
+}
+
+fn worktree_ids(cli: &dyn Fn(&[&str]) -> std::process::Output) -> Vec<String> {
+    let result = cli(&["worktree", "list", "--project", "repo"]);
+    let trees: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
+    trees.as_array().unwrap().iter().map(|w| w["id"].as_str().unwrap().to_string()).collect()
+}
+
+#[tokio::test]
+async fn safe_removal_takes_archived_sessions_only_with_the_flag_and_never_live_ones() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let mut daemon = env.spawn_daemon();
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    add_project_get_main_worktree(&mut c, &repo).await;
+    let cli = |args: &[&str]| std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        .args(args).env("NEBULA_RUNTIME_DIR", &env.runtime_dir).output().unwrap();
+    let (id, path) = new_worktree(&cli, "fixture");
+    let wid = nebula_core::WorktreeId(id.clone());
+    let agent = create_agent_get_id(&mut c, &wid, "archived agent", 2).await;
+    archive_agent(&mut c, &agent, 3).await;
+    let _ = std::fs::remove_dir_all(Path::new(&path).join(".claude"));
+    let term = create_terminal_get_id(&mut c, &wid, 4).await;
+    let remove = |flags: &[&str]| {
+        let mut args = vec!["worktree", "delete-safe", "--project", "repo"];
+        args.extend_from_slice(flags);
+        args.extend_from_slice(&["--", id.as_str(), "fixture", path.as_str()]);
+        cli(&args)
+    };
+
+    let result = remove(&["--with-archived"]);
+    assert!(!result.status.success(), "a live terminal always refuses: {result:?}");
+    assert!(String::from_utf8_lossy(&result.stderr).contains("1 live"), "{result:?}");
+
+    exit_terminal(&mut c, &term).await;
+    let result = remove(&[]);
+    assert!(!result.status.success(), "{result:?}");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(stderr.contains("1 archived session(s) and 1 finished terminal(s)") && stderr.contains("--with-archived"), "{stderr}");
+
+    let result = remove(&["--check", "--with-archived"]);
+    assert!(result.status.success(), "{result:?}");
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    for criterion in ["files: ok", "base: ok — main (from created_from `main`)", "merged: ok — ancestor", "sessions: ok"] {
+        assert!(stdout.contains(criterion), "missing {criterion:?} in {stdout}");
+    }
+    assert!(Path::new(&path).exists(), "check is side-effect-free");
+
+    let result = remove(&["--with-archived"]);
+    assert!(result.status.success(), "{result:?}");
+    assert!(!Path::new(&path).exists());
+    read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        evs.iter().any(|e| matches!(e, ServerEvent::EntityRemoved { id: EntityId::Agent(a) } if *a == agent))
+            && evs.iter().any(|e| matches!(e, ServerEvent::EntityRemoved { id: EntityId::Terminal(t) } if *t == term))
+    }).await;
+    assert!(!worktree_ids(&cli).contains(&id));
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon.0);
+}
+
+#[tokio::test]
+async fn prune_drops_ghost_rows_but_never_one_with_a_live_session() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let mut daemon = env.spawn_daemon();
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    add_project_get_main_worktree(&mut c, &repo).await;
+    let cli = |args: &[&str]| std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        .args(args).env("NEBULA_RUNTIME_DIR", &env.runtime_dir).output().unwrap();
+    let (ghost, ghost_path) = new_worktree(&cli, "ghost");
+    let (busy, busy_path) = new_worktree(&cli, "busy");
+    let agent = create_agent_get_id(&mut c, &nebula_core::WorktreeId(ghost.clone()), "archived agent", 2).await;
+    archive_agent(&mut c, &agent, 3).await;
+    create_terminal_get_id(&mut c, &nebula_core::WorktreeId(busy.clone()), 4).await;
+    for path in [&ghost_path, &busy_path] {
+        std::fs::remove_dir_all(path).unwrap();
+    }
+    assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(["worktree", "prune"]).status().unwrap().success());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(worktree_ids(&cli).contains(&ghost), "the sync keeps a ghost row that sessions point at");
+
+    let result = cli(&["worktree", "prune", "--check", "--project", "repo"]);
+    assert!(!result.status.success(), "a kept ghost row is a refusal: {result:?}");
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(stdout.contains("ghost ghost") && stdout.contains("--with-archived"), "{stdout}");
+    assert!(stdout.contains("ghost busy") && stdout.contains("1 live"), "{stdout}");
+
+    let result = cli(&["worktree", "prune", "--check", "--with-archived", "--project", "repo"]);
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(stdout.contains("ghost ghost") && stdout.contains("go with it"), "{stdout}");
+    assert!(worktree_ids(&cli).contains(&ghost), "check is side-effect-free");
+
+    let result = cli(&["worktree", "prune", "--with-archived", "--project", "repo"]);
+    assert!(!result.status.success(), "the live row is still refused: {result:?}");
+    let ids = worktree_ids(&cli);
+    assert!(!ids.contains(&ghost), "the archived-only ghost row is dropped");
+    assert!(ids.contains(&busy), "a row with a live session is never dropped");
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon.0);
+}
