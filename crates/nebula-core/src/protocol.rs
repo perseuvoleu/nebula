@@ -428,12 +428,6 @@ pub enum ClientRequest {
     Shutdown,
 }
 
-/// How much of a pull request's conversation the user had already seen the
-/// last time they opened it. `marker` is the newest thing anyone else had
-/// posted at that moment, as GitHub's RFC 3339 stamp — those sort
-/// lexicographically, so "arrived since" is a string compare and nebula
-/// never has to consult a clock. Empty means the PR was opened while its
-/// conversation was still empty.
 /// CLI options of a safe worktree removal.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemovalFlags {
@@ -441,6 +435,12 @@ pub struct RemovalFlags {
     pub with_archived: bool,
 }
 
+/// How much of a pull request's conversation the user had already seen the
+/// last time they opened it. `marker` is the newest thing anyone else had
+/// posted at that moment, as GitHub's RFC 3339 stamp — those sort
+/// lexicographically, so "arrived since" is a string compare and nebula
+/// never has to consult a clock. Empty means the PR was opened while its
+/// conversation was still empty.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrSeen {
     pub url: String,

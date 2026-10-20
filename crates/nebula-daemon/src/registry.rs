@@ -1654,7 +1654,13 @@ impl Daemon {
         let (_, worktrees, agents, terminals) = self.store.load_tree()?;
         let mut report = RemovalReport::default();
         for w in worktrees.iter().filter(|w| w.project_id == *project_id && !w.is_main) {
-            if w.path.exists() || entries.iter().any(|e| e.path == w.path) {
+            let registered = entries.iter().any(|e| e.path == w.path);
+            if w.path.exists() {
+                continue;
+            }
+            if registered {
+                report.push(&format!("ghost {} {}", w.branch, w.path.display()),
+                    git::Verdict::Refuse("checkout directory is gone but git still lists it; run `git worktree prune` first".into()));
                 continue;
             }
             let (verdict, leftovers) = self.removal_sessions(&w.id, &agents, &terminals, with_archived);

@@ -552,10 +552,13 @@ const REPRODUCIBLE_DIRS: &[&str] =
     &["node_modules", "dist", "build", "out", "generated", ".svelte-kit", ".next", ".turbo", "target"];
 const REPRODUCIBLE_SUFFIXES: &[&str] = &[".d.ts", ".tsbuildinfo"];
 
+/// Where the walk for ignored user data stops counting.
+const WALKED: usize = 200;
+
 /// Collect ignored `rel` (under `root`) that is user data. Symlinks only
 /// point elsewhere, and an env file identical to the primary's is a copy.
 fn ignored_user_data(primary: &Path, root: &Path, rel: &Path, found: &mut Vec<String>) {
-    if found.len() > LISTED {
+    if found.len() >= WALKED {
         return;
     }
     let full = root.join(rel);
@@ -616,7 +619,8 @@ pub async fn removal_files(primary: &Path, path: &Path) -> Result<Verdict> {
             parts.push(format!("untracked/modified: {}", listed(&dirty)));
         }
         if !user_data.is_empty() {
-            parts.push(format!("ignored user data: {}", listed(&user_data)));
+            let more = if user_data.len() >= WALKED { " (stopped counting)" } else { "" };
+            parts.push(format!("ignored user data: {}{more}", listed(&user_data)));
         }
         return Ok(Verdict::Refuse(format!(
             "Dirty checkout ({}); preserve or remove those files manually first",
