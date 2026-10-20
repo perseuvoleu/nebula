@@ -933,6 +933,7 @@ fn ui_state_json(app: &App) -> String {
         hide_local: app.hide_local,
         hide_remote: app.hide_remote,
         hide_empty: app.hide_empty,
+        active_only: app.active_only,
         collapsed: app.collapsed,
         panel_widths: Some(app.desired_panel_widths.to_vec()),
         diff_files_width: Some(app.diff_files_width),
@@ -969,6 +970,7 @@ fn restore_ui_state(app: &mut App, json: &str) {
     app.hide_local = state.hide_local;
     app.hide_remote = state.hide_remote;
     app.hide_empty = state.hide_empty;
+    app.active_only = state.active_only;
     if let Some(w) = state.panel_widths {
         // Coarse sanity clamp; normalize_panel_widths re-fits to the actual
         // screen on the next draw. Older blobs carry a third (sessions)
@@ -2780,6 +2782,7 @@ fn toggle_host_filter(app: &mut App, target: HitTarget, out: &mut Vec<ClientRequ
         HitTarget::ToggleRemote => app.hide_remote = !app.hide_remote,
         HitTarget::ToggleLocal => app.hide_local = !app.hide_local,
         HitTarget::ToggleAll => app.hide_empty = !app.hide_empty,
+        HitTarget::ToggleActive => app.active_only = !app.active_only,
         _ => return,
     }
     app.focus = Focus::Worktrees;
@@ -8348,6 +8351,7 @@ fn pointer_wants_hand(app: &App, column: u16, row: u16) -> bool {
                     | HitTarget::ToggleLocal
                     | HitTarget::ToggleRemote
                     | HitTarget::ToggleAll
+                    | HitTarget::ToggleActive
                     | HitTarget::CheckoutBranch
                     | HitTarget::ArchivedHeader
             )
@@ -9385,6 +9389,9 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                     toggle_host_filter(app, HitTarget::ToggleRemote, out)
                 }
                 Some(HitTarget::ToggleAll) => toggle_host_filter(app, HitTarget::ToggleAll, out),
+                Some(HitTarget::ToggleActive) => {
+                    toggle_host_filter(app, HitTarget::ToggleActive, out)
+                }
                 Some(HitTarget::CheckoutBranch) => {
                     if let Some(project) = app.selected_project().map(|p| p.id.clone()) {
                         open_checkout_picker(app, project, Some((mouse.column, mouse.row + 1)));
@@ -10936,6 +10943,69 @@ mod tests {
     }
 
     #[test]
+    fn active_filter_keeps_only_running_waiting_and_unseen_rows() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        for (n, status) in [
+            (2, AgentStatus::Running),
+            (3, AgentStatus::NeedsFeedback),
+            (4, AgentStatus::Finished),
+            (5, AgentStatus::Finished),
+        ] {
+            let mut worktree = app.tree.worktrees[0].clone();
+            worktree.id = WorktreeId(format!("w{n}"));
+            worktree.path = format!("/tmp/demo-{n}").into();
+            worktree.branch = format!("b{n}");
+            worktree.is_main = false;
+            app.tree.worktrees.push(worktree);
+            let mut agent = app.tree.agents[0].clone();
+            agent.id = AgentId(format!("a{n}"));
+            agent.worktree_id = WorktreeId(format!("w{n}"));
+            agent.status = status;
+            app.tree.agents.push(agent);
+        }
+        app.unseen_finished.insert(AgentId("a5".into()));
+        let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let hit = app
+            .hits
+            .iter()
+            .find(|(_, target)| *target == HitTarget::ToggleActive)
+            .unwrap()
+            .0;
+        handle_mouse(
+            &mut app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: hit.x,
+                row: hit.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut Vec::new(),
+        );
+        let rows = |app: &App| {
+            app.panel_entries()
+                .iter()
+                .map(|e| e.row.clone())
+                .collect::<Vec<_>>()
+        };
+        let worktree = |id: &str| PanelRow::Worktree(WorktreeId(id.into()));
+        assert_eq!(
+            rows(&app),
+            vec![worktree("w2"), worktree("w3"), worktree("w5")]
+        );
+        let mut restored = App::new();
+        restore_ui_state(&mut restored, &ui_state_json(&app));
+        assert!(restored.active_only);
+        app.unseen_finished.remove(&AgentId("a5".into()));
+        assert_eq!(
+            rows(&app),
+            vec![worktree("w2"), worktree("w3")],
+            "a visited blue row leaves the Active filter"
+        );
+    }
+
+    #[test]
     fn project_navigation_restores_linked_checkout_session_and_prefers_unread_completion() {
         let mut app = App::new();
         seed_tree(&mut app);
@@ -12106,8 +12176,8 @@ mod tests {
             "a narrow panel gives it its own row: {text}"
         );
         // A wide panel keeps it beside the checkboxes, right-aligned.
-        app.panel_widths[1] = 45;
-        app.desired_panel_widths[1] = 45;
+        app.panel_widths[1] = 55;
+        app.desired_panel_widths[1] = 55;
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
         let row = text
@@ -13196,7 +13266,10 @@ mod tests {
         let mut out = Vec::new();
         move_selection(&mut app, 1, &mut out);
         let due = app.keepwarm_delay().expect("keep-warm armed");
-        assert!(due <= PREWARM_DEBOUNCE, "armed for the rest, not the refresh");
+        assert!(
+            due <= PREWARM_DEBOUNCE,
+            "armed for the rest, not the refresh"
+        );
 
         out.clear();
         with_default_config(|| fire_keepwarm(&mut app, &mut out));
@@ -13526,7 +13599,10 @@ mod tests {
             },
         );
         let due = fresh.keepwarm_delay().expect("keep-warm armed");
-        assert!(due <= PREWARM_DEBOUNCE, "armed for the rest, not the refresh");
+        assert!(
+            due <= PREWARM_DEBOUNCE,
+            "armed for the rest, not the refresh"
+        );
     }
 
     /// The footer's right edge shows live session counts and nebula's

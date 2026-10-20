@@ -151,9 +151,14 @@ impl Relay {
     pub fn refresh_anchors(&self, daemon: &Daemon) {
         rescope(self, daemon, false);
         let _admission = self.admission.lock().unwrap();
-        if !self.connected.load(Ordering::Relaxed) { return; }
+        if !self.connected.load(Ordering::Relaxed) {
+            return;
+        }
         for req in missing_adds(self, daemon) {
-            if let Err(error) = self.out.try_send(QueuedRequest { request: req, enqueued: tokio::time::Instant::now() }) {
+            if let Err(error) = self.out.try_send(QueuedRequest {
+                request: req,
+                enqueued: tokio::time::Instant::now(),
+            }) {
                 if let Some(id) = request_req_id(&error.into_inner().request) {
                     self.pending_adds.lock().unwrap().remove(&id);
                 }
@@ -570,7 +575,9 @@ async fn pump_connection<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             }
             continue;
         }
-        if matches!(ev, ServerEvent::Snapshot { .. }) { snapshot_received = true; }
+        if matches!(ev, ServerEvent::Snapshot { .. }) {
+            snapshot_received = true;
+        }
         // Abandon the whole connection on timeout: never resume a partial write.
         tokio::time::timeout(progress_timeout, async {
             if let Some(reqs) = handle_event(relay, daemon, ev).await {
@@ -1239,13 +1246,33 @@ mod tests {
         let scenario = async {
             while let Some(request) = read_frame::<ClientRequest, _>(&mut host).await.unwrap() {
                 if matches!(request, ClientRequest::Hello { .. }) {
-                    write_frame(&mut host, &ServerEvent::HelloOk { protocol_version: PROTOCOL_VERSION, daemon_pid: 7 }).await.unwrap();
+                    write_frame(
+                        &mut host,
+                        &ServerEvent::HelloOk {
+                            protocol_version: PROTOCOL_VERSION,
+                            daemon_pid: 7,
+                        },
+                    )
+                    .await
+                    .unwrap();
                 }
             }
         };
         let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
-            tokio::join!(pump_transport(&relay, &daemon, &mut requests, read, write, Duration::from_millis(20)), scenario)
-        }).await.expect("host never supplied the subscribed snapshot");
+            tokio::join!(
+                pump_transport(
+                    &relay,
+                    &daemon,
+                    &mut requests,
+                    read,
+                    write,
+                    Duration::from_millis(20)
+                ),
+                scenario
+            )
+        })
+        .await
+        .expect("host never supplied the subscribed snapshot");
         assert!(result.unwrap_err().to_string().contains("snapshot"));
     }
 
@@ -1533,7 +1560,9 @@ mod tests {
                     .await
                     .unwrap(),
                     ClientRequest::Subscribe => {
-                        write_frame(&mut host, &daemon.snapshot().unwrap()).await.unwrap();
+                        write_frame(&mut host, &daemon.snapshot().unwrap())
+                            .await
+                            .unwrap();
                         relay
                             .forward(
                                 ClientRequest::CreateTerminal {

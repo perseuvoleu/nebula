@@ -739,7 +739,9 @@ async fn create_worktree_path(
             }
         }
         Ok::<_, anyhow::Error>(())
-    }).await.context("worktree was acknowledged but its row did not arrive; inspect before retrying")??;
+    })
+    .await
+    .context("worktree was acknowledged but its row did not arrive; inspect before retrying")??;
     Ok(path)
 }
 
@@ -953,9 +955,12 @@ fn project_owning_cwd(
 /// Print a removal-style request's verdict lines, then its outcome.
 async fn await_report(conn: &mut Connection, req_id: u64) -> Result<()> {
     loop {
-        let event = tokio::time::timeout(Duration::from_secs(120), read_frame::<ServerEvent, _>(&mut conn.stream))
-            .await
-            .context("timed out waiting for the daemon's reply")??;
+        let event = tokio::time::timeout(
+            Duration::from_secs(120),
+            read_frame::<ServerEvent, _>(&mut conn.stream),
+        )
+        .await
+        .context("timed out waiting for the daemon's reply")??;
         match event {
             Some(ServerEvent::Report { req_id: r, lines }) if r == req_id => {
                 for line in lines {
@@ -963,7 +968,10 @@ async fn await_report(conn: &mut Connection, req_id: u64) -> Result<()> {
                 }
             }
             Some(ServerEvent::Ack { req_id: r, .. }) if r == req_id => return Ok(()),
-            Some(ServerEvent::Error { req_id: Some(r), message }) if r == req_id => bail!("{message}"),
+            Some(ServerEvent::Error {
+                req_id: Some(r),
+                message,
+            }) if r == req_id => bail!("{message}"),
             Some(_) => continue,
             None => bail!("daemon closed the connection before replying"),
         }
@@ -971,17 +979,36 @@ async fn await_report(conn: &mut Connection, req_id: u64) -> Result<()> {
 }
 
 /// Check or remove a clean, merged, session-free checkout by stable ID; retain its branch.
-pub async fn worktree_delete_safe(id: String, branch: String, path: std::path::PathBuf, check: bool, with_archived: bool, project_flag: Option<String>) -> Result<()> {
-    let stream = try_connect(&paths::socket_path()).await.context("no nebula daemon is running")?;
+pub async fn worktree_delete_safe(
+    id: String,
+    branch: String,
+    path: std::path::PathBuf,
+    check: bool,
+    with_archived: bool,
+    project_flag: Option<String>,
+) -> Result<()> {
+    let stream = try_connect(&paths::socket_path())
+        .await
+        .context("no nebula daemon is running")?;
     let mut conn = handshake(stream).await?;
     let (projects, worktrees, agents) = subscribe_snapshot(&mut conn).await?;
     let project = resolve_project(&projects, &worktrees, &agents, project_flag.as_deref())?;
-    let worktree = worktrees.iter().find(|w| w.id.as_str() == id && w.project_id == project.id)
+    let worktree = worktrees
+        .iter()
+        .find(|w| w.id.as_str() == id && w.project_id == project.id)
         .context("Checkout no longer available in this project")?;
-    write_frame(&mut conn.stream, &ClientRequest::CheckWorktreeRemoval {
-        req_id: 1, id: worktree.id.clone(), branch: branch.clone(), path: path.clone(), delete: !check,
-        report: Some(nebula_core::RemovalFlags { with_archived }),
-    }).await?;
+    write_frame(
+        &mut conn.stream,
+        &ClientRequest::CheckWorktreeRemoval {
+            req_id: 1,
+            id: worktree.id.clone(),
+            branch: branch.clone(),
+            path: path.clone(),
+            delete: !check,
+            report: Some(nebula_core::RemovalFlags { with_archived }),
+        },
+    )
+    .await?;
     await_report(&mut conn, 1).await?;
     match check {
         true => println!("verdict: safe to remove (--check: nothing changed)"),
@@ -991,14 +1018,27 @@ pub async fn worktree_delete_safe(id: String, branch: String, path: std::path::P
 }
 
 /// `nebula worktree prune [--check] [--with-archived] [--project <name>]`.
-pub async fn worktree_prune(check: bool, with_archived: bool, project_flag: Option<String>) -> Result<()> {
-    let stream = try_connect(&paths::socket_path()).await.context("no nebula daemon is running")?;
+pub async fn worktree_prune(
+    check: bool,
+    with_archived: bool,
+    project_flag: Option<String>,
+) -> Result<()> {
+    let stream = try_connect(&paths::socket_path())
+        .await
+        .context("no nebula daemon is running")?;
     let mut conn = handshake(stream).await?;
     let (projects, worktrees, agents) = subscribe_snapshot(&mut conn).await?;
     let project = resolve_project(&projects, &worktrees, &agents, project_flag.as_deref())?;
-    write_frame(&mut conn.stream, &ClientRequest::PruneWorktrees {
-        req_id: 1, project: project.id.clone(), delete: !check, with_archived,
-    }).await?;
+    write_frame(
+        &mut conn.stream,
+        &ClientRequest::PruneWorktrees {
+            req_id: 1,
+            project: project.id.clone(),
+            delete: !check,
+            with_archived,
+        },
+    )
+    .await?;
     await_report(&mut conn, 1).await?;
     if check {
         println!("--check: nothing changed; rows marked ok are dropped without --check");
@@ -1467,28 +1507,57 @@ pub async fn agent_send(name: String, text: String, project_flag: Option<String>
 }
 
 /// Act on a stable agent ID: Some(key) writes one key; None explicitly deletes the agent.
-pub async fn agent_action_id(id: String, key: Option<String>, project_flag: Option<String>) -> Result<()> {
-    let stream = try_connect(&paths::socket_path()).await.context("no nebula daemon is running")?;
+pub async fn agent_action_id(
+    id: String,
+    key: Option<String>,
+    project_flag: Option<String>,
+) -> Result<()> {
+    let stream = try_connect(&paths::socket_path())
+        .await
+        .context("no nebula daemon is running")?;
     let mut conn = handshake(stream).await?;
     let (projects, worktrees, agents) = subscribe_snapshot(&mut conn).await?;
     let project = resolve_project(&projects, &worktrees, &agents, project_flag.as_deref())?;
-    let agent = agents.iter().find(|a| a.id.as_str() == id && !a.archived &&
-        worktrees.iter().any(|w| w.id == a.worktree_id && w.project_id == project.id))
+    let agent = agents
+        .iter()
+        .find(|a| {
+            a.id.as_str() == id
+                && !a.archived
+                && worktrees
+                    .iter()
+                    .any(|w| w.id == a.worktree_id && w.project_id == project.id)
+        })
         .context("Session no longer available in this project")?;
     let req_id = 1;
     let request = if let Some(key) = key {
-        if !agent.alive { bail!("Session has no live PTY"); }
+        if !agent.alive {
+            bail!("Session has no live PTY");
+        }
         let data: &[u8] = match key.as_str() {
-            "Up" => b"\x1b[A", "Down" => b"\x1b[B", "Right" => b"\x1b[C", "Left" => b"\x1b[D",
-            "Enter" => b"\r", "Escape" => b"\x1b", "Tab" => b"\t",
+            "Up" => b"\x1b[A",
+            "Down" => b"\x1b[B",
+            "Right" => b"\x1b[C",
+            "Left" => b"\x1b[D",
+            "Enter" => b"\r",
+            "Escape" => b"\x1b",
+            "Tab" => b"\t",
             _ => bail!("Unsupported terminal key"),
         };
-        ClientRequest::InputAcknowledged { req_id, id: agent.id.clone(), project: project.id.clone(), data: data.to_vec() }
+        ClientRequest::InputAcknowledged {
+            req_id,
+            id: agent.id.clone(),
+            project: project.id.clone(),
+            data: data.to_vec(),
+        }
     } else {
         if std::env::var("NEBULA_AGENT_ID").is_ok_and(|own| own == id) {
             bail!("Cannot delete this session itself");
         }
-        ClientRequest::DeleteAgentScoped { req_id, id: agent.id.clone(), project: project.id.clone() }
+        ClientRequest::DeleteAgentScoped {
+            req_id,
+            id: agent.id.clone(),
+            project: project.id.clone(),
+        }
     };
     write_frame(&mut conn.stream, &request).await?;
     await_ack(&mut conn, req_id, &mut Vec::new()).await?;

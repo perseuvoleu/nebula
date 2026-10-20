@@ -848,7 +848,12 @@ async fn reply_report(
     let result = match result {
         Ok(report) => {
             if send_lines {
-                let _ = out_tx.send(ServerEvent::Report { req_id, lines: report.lines }).await;
+                let _ = out_tx
+                    .send(ServerEvent::Report {
+                        req_id,
+                        lines: report.lines,
+                    })
+                    .await;
             }
             match report.refusals.is_empty() {
                 true => Ok(None),

@@ -731,10 +731,26 @@ fn main() -> Result<()> {
                 from,
                 project,
             } => nebula_tui::run_worktree_new(name.join(" "), from, project),
-            WorktreeCommand::DeleteSafe { id, branch, path, check, with_archived, project } =>
-                nebula_tui::run_worktree_delete_safe(id, branch, path, check, with_archived, project),
-            WorktreeCommand::Prune { check, with_archived, project } =>
-                nebula_tui::run_worktree_prune(check, with_archived, project),
+            WorktreeCommand::DeleteSafe {
+                id,
+                branch,
+                path,
+                check,
+                with_archived,
+                project,
+            } => nebula_tui::run_worktree_delete_safe(
+                id,
+                branch,
+                path,
+                check,
+                with_archived,
+                project,
+            ),
+            WorktreeCommand::Prune {
+                check,
+                with_archived,
+                project,
+            } => nebula_tui::run_worktree_prune(check, with_archived, project),
             WorktreeCommand::Delete {
                 name,
                 force,
@@ -799,8 +815,12 @@ fn main() -> Result<()> {
             AgentCommand::Unarchive { name, project } => {
                 nebula_tui::run_agent_ctl(nebula_tui::AgentCtl::Unarchive, name, project)
             }
-            AgentCommand::Key { id, key, project } => nebula_tui::run_agent_action_id(id, Some(key), project),
-            AgentCommand::DeleteId { id, project } => nebula_tui::run_agent_action_id(id, None, project),
+            AgentCommand::Key { id, key, project } => {
+                nebula_tui::run_agent_action_id(id, Some(key), project)
+            }
+            AgentCommand::DeleteId { id, project } => {
+                nebula_tui::run_agent_action_id(id, None, project)
+            }
             AgentCommand::Delete { name, project } => {
                 nebula_tui::run_agent_ctl(nebula_tui::AgentCtl::Delete, name, project)
             }
@@ -877,11 +897,31 @@ fn main() -> Result<()> {
             },
         ),
         Some(Command::Rag(args)) => nebula_rag::cli::run(args),
-        Some(Command::Collect { selector, branch, worktree, project, host, agent, dry_run, timeout }) => {
+        Some(Command::Collect {
+            selector,
+            branch,
+            worktree,
+            project,
+            host,
+            agent,
+            dry_run,
+            timeout,
+        }) => {
             use nebula_tui::collect_cli::{CollectOpts, Mode};
             nebula_tui::run_collect(CollectOpts {
-                selector, mode: if branch { Some(Mode::Branch) } else if worktree { Some(Mode::Worktree) } else { None },
-                project, host, agent, dry_run, timeout: std::time::Duration::from_secs(timeout),
+                selector,
+                mode: if branch {
+                    Some(Mode::Branch)
+                } else if worktree {
+                    Some(Mode::Worktree)
+                } else {
+                    None
+                },
+                project,
+                host,
+                agent,
+                dry_run,
+                timeout: std::time::Duration::from_secs(timeout),
             })
         }
         Some(Command::Sync {

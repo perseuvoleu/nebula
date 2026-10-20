@@ -158,7 +158,12 @@ mod tests {
             cfg.auto_archive_after()
         };
         let day = Some(Duration::from_secs(24 * 3600));
-        assert_eq!(serde_json::from_str::<Config>("{}").unwrap().auto_archive_after(), day);
+        assert_eq!(
+            serde_json::from_str::<Config>("{}")
+                .unwrap()
+                .auto_archive_after(),
+            day
+        );
         assert_eq!(after("12h"), Some(Duration::from_secs(12 * 3600)));
         assert_eq!(after("off"), None);
         assert_eq!(after("soon"), day, "malformed falls back to the default");
@@ -167,8 +172,7 @@ mod tests {
     #[test]
     fn retired_prewarm_sessions_key_still_loads() {
         let cfg: Config =
-            serde_json::from_str(r#"{"prewarm_sessions": true, "prewarm_agents": false}"#)
-                .unwrap();
+            serde_json::from_str(r#"{"prewarm_sessions": true, "prewarm_agents": false}"#).unwrap();
         assert!(!cfg.prewarm_agents);
     }
 

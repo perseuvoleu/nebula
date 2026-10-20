@@ -58,6 +58,8 @@ pub enum HitTarget {
     ToggleRemote,
     /// Toggle rows without open sessions.
     ToggleAll,
+    /// Toggle showing only rows with a running, waiting or unseen-finished agent.
+    ToggleActive,
     /// The `⎇ branch ▾` control beside them: a click opens the fuzzy
     /// branch picker that checks the pick out on the primary checkout.
     CheckoutBranch,
@@ -2587,6 +2589,8 @@ struct PanelKey {
     hide_local: bool,
     hide_remote: bool,
     hide_empty: bool,
+    /// The unseen-finished set, kept only while `active_only` reads it.
+    active_only: Option<HashSet<AgentId>>,
     branch_list: Option<(ProjectId, Vec<crate::branches::LocalBranch>)>,
 }
 
@@ -2778,6 +2782,9 @@ pub struct UiState {
     /// Hide branch and worktree rows without non-archived agents or terminals.
     #[serde(default)]
     pub hide_empty: bool,
+    /// Show only rows with a running, waiting or unseen-finished agent.
+    #[serde(default)]
+    pub active_only: bool,
     pub collapsed: bool,
     /// Panel widths (projects, worktrees); absent in older blobs. Kept as a
     /// Vec so blobs written when Sessions was still a third column (3 wide)
@@ -2934,6 +2941,8 @@ pub struct App {
     pub hide_remote: bool,
     /// Show only rows with non-archived agents or terminals when true.
     pub hide_empty: bool,
+    /// Show only rows with a running, waiting or unseen-finished (blue) agent.
+    pub active_only: bool,
     /// Sidebars collapsed (z) — terminal takes the full width.
     pub collapsed: bool,
     pub next_req_id: u64,
@@ -3172,6 +3181,7 @@ impl App {
             hide_local: false,
             hide_remote: false,
             hide_empty: false,
+            active_only: false,
             collapsed: false,
             next_req_id: 1,
             pending: HashMap::new(),
@@ -3978,6 +3988,7 @@ impl App {
                 && key.hide_local == self.hide_local
                 && key.hide_remote == self.hide_remote
                 && key.hide_empty == self.hide_empty
+                && key.active_only.as_ref() == self.active_only.then_some(&self.unseen_finished)
                 && key.branch_list.as_ref().map(|(id, list)| (id, list)) == listing
             {
                 return cached.clone();
@@ -3989,11 +4000,12 @@ impl App {
             hide_local: self.hide_local,
             hide_remote: self.hide_remote,
             hide_empty: self.hide_empty,
+            active_only: self.active_only.then(|| self.unseen_finished.clone()),
             branch_list: listing.map(|(id, list)| (id.clone(), list.clone())),
         };
         let homes = self.build_home_index();
         let mut entries = self.build_panel_entries(&homes);
-        if self.hide_empty {
+        if self.hide_empty || self.active_only {
             let project = self.selected_project().map(|p| p.id.clone());
             let mut retained_depths = Vec::new();
             entries.retain_mut(|entry| {
@@ -4004,11 +4016,16 @@ impl App {
                         SessionHome::Branch(project.clone().unwrap(), name.clone())
                     }
                 };
-                let keep = self
-                    .agents_listed(&homes, &home)
-                    .iter()
-                    .any(|a| !a.archived)
-                    || !self.terminals_listed(&homes, &home).is_empty();
+                let agents = self.agents_listed(&homes, &home);
+                let keep = if self.active_only {
+                    agents.iter().any(|a| {
+                        !a.archived
+                            && (is_active_status(a.status) || self.unseen_finished.contains(&a.id))
+                    })
+                } else {
+                    agents.iter().any(|a| !a.archived)
+                        || !self.terminals_listed(&homes, &home).is_empty()
+                };
                 let depth = retained_depths.iter().filter(|&&kept| kept).count();
                 retained_depths.push(keep);
                 entry.depth = depth;
@@ -4624,7 +4641,10 @@ impl App {
         if len == 0 {
             return None;
         }
-        let next = match (current.and_then(|c| cycle.iter().position(|a| &a.id == c)), forward) {
+        let next = match (
+            current.and_then(|c| cycle.iter().position(|a| &a.id == c)),
+            forward,
+        ) {
             (Some(i), true) => (i + 1) % len,
             (Some(i), false) => (i + len - 1) % len,
             (None, true) => 0,
@@ -5504,7 +5524,10 @@ mod tests {
         );
         assert_eq!(step(None, false).as_deref(), Some("run-late"));
         assert_eq!(step(Some("ask-early"), false).as_deref(), Some("run-late"));
-        assert_eq!(step(Some("run-early"), false).as_deref(), Some("moved-to-feature"));
+        assert_eq!(
+            step(Some("run-early"), false).as_deref(),
+            Some("moved-to-feature")
+        );
         assert_eq!(
             step(Some("p2-done"), true).as_deref(),
             Some("ask-early"),
@@ -5528,7 +5551,10 @@ mod tests {
             current = app.attention_step(current.as_ref(), true);
             walked.push(current.clone().unwrap().0);
         }
-        assert_eq!(walked, ["moved-to-feature", "run-early", "moved-to-feature"]);
+        assert_eq!(
+            walked,
+            ["moved-to-feature", "run-early", "moved-to-feature"]
+        );
         for a in &mut app.tree.agents {
             a.status = AgentStatus::Finished;
         }
