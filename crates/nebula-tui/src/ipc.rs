@@ -4,7 +4,7 @@
 use anyhow::{bail, Context, Result};
 use nebula_core::codec::{read_frame, write_frame};
 use nebula_core::{paths, AgentId, ClientRequest, ServerEvent, PROTOCOL_VERSION};
-use std::time::Duration;
+use std::{path::Path, time::Duration};
 use tokio::net::UnixStream;
 
 pub struct Connection {
@@ -551,6 +551,50 @@ pub(crate) async fn subscribe_snapshot(
 )> {
     let (projects, worktrees, agents, _) = subscribe_snapshot_with_terminals(conn).await?;
     Ok((projects, worktrees, agents))
+}
+
+/// Save a preview URL on its exact checkout so the TUI keeps it beside that
+/// checkout's sessions. Preview startup remains successful when no daemon runs.
+pub async fn pin_checkout_link(checkout: &Path, url: &str) -> Result<()> {
+    let sock = paths::socket_path();
+    let stream = try_connect(&sock)
+        .await
+        .context("no nebula daemon is running")?;
+    let mut conn = handshake(stream).await?;
+    write_frame(&mut conn.stream, &ClientRequest::Subscribe).await?;
+    let (worktrees, links) = loop {
+        match read_frame::<ServerEvent, _>(&mut conn.stream).await? {
+            Some(ServerEvent::Snapshot {
+                worktrees, links, ..
+            }) => break (worktrees, links),
+            Some(_) => continue,
+            None => bail!("daemon closed the connection before the snapshot"),
+        }
+    };
+    let checkout = std::fs::canonicalize(checkout)?;
+    let worktree = worktrees
+        .iter()
+        .find(|w| std::fs::canonicalize(&w.path).ok().as_ref() == Some(&checkout))
+        .context("preview checkout is not registered in nebula")?;
+    if links
+        .iter()
+        .any(|link| link.worktree_id == worktree.id && link.url == url)
+    {
+        return Ok(());
+    }
+    let req_id = 1;
+    write_frame(
+        &mut conn.stream,
+        &ClientRequest::CreateLink {
+            req_id,
+            worktree: worktree.id.clone(),
+            url: url.to_string(),
+        },
+    )
+    .await?;
+    let mut upserts = Vec::new();
+    await_ack(&mut conn, req_id, &mut upserts).await?;
+    Ok(())
 }
 
 async fn subscribe_snapshot_with_terminals(

@@ -1,3 +1,4 @@
+mod preview;
 mod ssh;
 mod upgrade;
 
@@ -21,6 +22,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Manage private previews on this host without contacting the daemon.
+    Preview(preview::Args),
     /// Add a directory as a project, named after the repo's root directory
     /// (`nebula add .` for the current one; bare `nebula <dir>` works too).
     Add {
@@ -668,6 +671,7 @@ enum WorkspaceCommand {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Some(Command::Preview(args)) => preview::run(args),
         Some(Command::Daemon { foreground }) => {
             init_daemon_logging(foreground)?;
             log_fatal(

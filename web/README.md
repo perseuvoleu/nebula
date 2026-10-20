@@ -15,7 +15,10 @@ Radix, the AI Elements conversation primitive), Python 3.10+ standard-library ga
   by the native session id Nebula stored — never from terminal screen text. Details and
   limits: `docs/specs/mobile-chat-redesign-pi-source.md`.
 - Other agent kinds (Claude, Codex, Cursor) and Pi sessions without persisted history show an
-  explicitly labelled terminal snapshot, not reconstructed chat. It starts with 250 lines;
+  explicitly labelled terminal snapshot, not reconstructed chat. The default **Lectură** view
+  renders its Markdown with reflowing prose; **Terminal brut** preserves the terminal text for
+  logs, diffs and interactive prompts. Snapshot wrapping can already have split words or
+  formatting, so this is not a substitute for native structured history. It starts with 250 lines;
   scrolling to the top (or “Output mai vechi”) expands up to 10,000 retained lines while
   preserving the reading position. Older discarded terminal output cannot be recovered.
 - Pi history loads older pages as you reach the top; polling does not evict pages already read.
@@ -32,10 +35,17 @@ Radix, the AI Elements conversation primitive), Python 3.10+ standard-library ga
   ever retried automatically. Repeated taps cannot double-send.
 - Start pi, Claude, Codex or Cursor on an existing checkout; existing agents on that checkout
   are shown first; the new session is selected by id.
+- Project and selected-session preview links appear only when the dedicated preview CLI reports
+  `running` with a valid policy domain. Both open the project's currently published preview;
+  selecting a session does not publish or switch its checkout. Status is polled every five seconds
+  after each response; stopped, malformed, unconfigured and failed responses hide the links.
+  The gateway reads status only and never reads preview credential files or returns CLI diagnostics.
 - Phone: session list → full-screen conversation → back; desktop: persistent sidebar.
   URL carries `/p/<project>/s/<session id>` (no secrets). Per-session drafts in memory.
 - Offline/resume: cursor-based resync without duplicate messages; stale state is labelled.
 - Installable app shell; the service worker caches only public assets, never `/api/*`.
+  Optional standards-based Web Push alerts when an agent finishes or needs feedback, including
+  while the app is closed. Tapping an alert opens that session; logging out unsubscribes the device.
   iPhone: Safari → Share → Add to Home Screen. A visible “Instalează pe telefon” guide is
   available on login and in session navigation; standalone mode, touch icon and HTTPS are supported.
   The installed app may require the same token again; physical iPhone installation/keyboard checks
@@ -43,8 +53,8 @@ Radix, the AI Elements conversation primitive), Python 3.10+ standard-library ga
 - Bearer token in browser **sessionStorage** only, cleared on logout together with drafts and
   subscriptions. No token in URLs, cookies or caches.
 
-Not included: live token streaming (see the Pi source note), archive/delete/restart, file
-access, shell creation/endpoints, notifications, offline actions, multi-user.
+Not included: live token streaming (see the Pi source note), archive/restart, file
+access, shell creation/endpoints, offline actions, multi-user.
 
 ## Build and run locally
 
@@ -57,6 +67,30 @@ export NEBULA_WEB_ORIGIN='http://127.0.0.1:8765'
 export NEBULA_WEB_DB="$HOME/.local/share/nebula/nebula.db"   # see "Native identity"
 python3 web/server.py
 ```
+
+Web Push is optional. To enable it, install its pinned protocol dependencies in a
+venv and generate one persistent VAPID key (never commit the key):
+
+```bash
+python3 -m venv ~/.local/share/nebula/web-venv
+~/.local/share/nebula/web-venv/bin/pip install -r web/requirements.txt
+umask 077
+mkdir -p ~/.config/nebula-web && chmod 700 ~/.config/nebula-web
+cd ~/.config/nebula-web
+# Only when no private key already exists; never rotate an existing key.
+test -e private_key.pem || ~/.local/share/nebula/web-venv/bin/vapid --gen
+export NEBULA_WEB_VAPID_PRIVATE_KEY="$HOME/.config/nebula-web/private_key.pem"
+# Run server.py with the venv's Python. HTTPS is required on the phone.
+```
+
+The notification permission prompt appears only after tapping “Activează notificările”. On
+an iPhone or iPad, Web Push requires iOS/iPadOS 16.4+ and the PWA installed on the Home Screen.
+Subscriptions are stored mode `0600` in `~/.local/share/nebula/web-push.json`; override with
+`NEBULA_WEB_PUSH_STORE`. `NEBULA_WEB_VAPID_SUBJECT` may override the default HTTPS origin.
+Supported destinations are `web.push.apple.com`, `fcm.googleapis.com`, and
+`updates.push.services.mozilla.com`, over HTTPS port 443. Redirects and environment
+proxy/netrc credentials are disabled. Other push providers require a reviewed allowlist update.
+The gateway polls enabled projects every five seconds only while at least one device is subscribed.
 
 Open `http://127.0.0.1:8765` and enter the token. The gateway listens **only on 127.0.0.1**
 and refuses to start without a built app. `NEBULA_WEB_PORT`, `NEBULA_WEB_BINARY` (absolute
@@ -110,29 +144,14 @@ The origin must be exactly the tunnelled URL; no production token or port is inv
 
 ## Deploy on findl (promotion checklist)
 
-The live service serves its own checkout (`~/nebula-worktrees/mobile-web-deploy`) through
-`~/.config/systemd/user/nebula-web.service`, private bridge and Traefik route. Nothing here
-requires DNS, Traefik, bridge, daemon or agent changes: no SSE was introduced, `/assets/*`
-are content-hashed and served with immutable caching, everything else is `no-cache`/`no-store`.
-
-1. Fast-forward the deploy checkout to the reviewed commit (never with uncommitted changes).
-2. `pnpm --dir web/app install --frozen-lockfile && pnpm --dir web/app build` in that checkout
-   (Node 22 + pnpm 10). The gateway refuses to start until `web/static/index.html` exists.
-3. Add `NEBULA_WEB_DB=/home/<user>/.local/share/nebula/nebula.db` to `~/.config/nebula-web.env`
-   (keep the existing token, projects, origin and binary). This is the required identity source
-   for now: the running daemon speaks IPC protocol 28 and a CLI built from this branch (27)
-   cannot connect to it, so the `session_id` CLI field only becomes usable after the branch is
-   merged into whatever source the installed binary comes from and a matching binary is
-   installed. Never restart the daemon for this.
-4. `systemctl --user restart nebula-web` (only the web service). Do not run `nebula kill`.
-5. Check: `systemctl --user status nebula-web`, then on the phone: login with the existing
-   token, all four projects listed, an existing Pi session renders messages, a Claude session
-   shows the terminal label. Phones may need one reload for the new service worker.
-
-**Rollback:** check out the previous commit (`44b3f7a`) in the deploy checkout and restart
-`nebula-web`; the old static app is tracked there and needs no build. Remove `NEBULA_WEB_DB`
-if desired (harmless if kept). The service worker cache name changed (`nebula-shell-v4`); the
-old worker replaces it on the next load.
+The live service runs from a read-only, committed release under
+`~/.local/share/nebula/web-releases/<sha>`, never from a disposable worktree.
+See [Web Push activation and rollback](../docs/operations/web-push-activation.md) for the
+current deployment, and [the durable web recovery runbook](../docs/operations/web-service-recovery.md)
+for the earlier baseline and recovery evidence.
+Build and validate a new committed release before promotion. Preserve existing unit hardening
+and environment entries; change only deployment paths and necessary push configuration.
+Restart only `nebula-web.service`; never restart the Nebula daemon, bridge or proxy.
 
 **The token grants agent control as the server's OS user.** Project allowlisting is an API
 scope, not an OS sandbox. Rotate a leaked token in the env file and restart only `nebula-web`.
@@ -153,3 +172,11 @@ Rendering never uses raw HTML; links are restricted to http(s)/mailto. A maximum
 subprocesses run concurrently with 20-second timeouts; Nebula/MC/Pi identity variables and
 web secrets are stripped from subprocess environments. Access logs contain no paths, tokens
 or content.
+
+To verify frontend changes without replacing a running checkout's `web/static`:
+
+```bash
+pnpm --dir web/app typecheck
+pnpm --dir web/app exec vite build --outDir ../../.scratch/mobile-reading-static
+E2E_STATIC_DIR="$PWD/.scratch/mobile-reading-static" pnpm --dir web/app test:e2e
+```

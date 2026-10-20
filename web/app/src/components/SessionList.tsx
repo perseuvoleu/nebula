@@ -4,16 +4,20 @@ import type { SessionRow } from "@/lib/types";
 import { kindLabel, statusLabel } from "@/lib/status";
 import { Button } from "@/components/ui/button";
 
+import { DeleteSessionButton } from "./DeleteSessionButton";
+
 export type ListPhase = "loading" | "ready" | "error" | "offline";
 
-export function SessionList({ sessions, phase, error, selected, onSelect, onNew, project }: {
+export function SessionList({ sessions, phase, error, selected, unseen, onSelect, onNew, project, onDeleted }: {
   sessions: SessionRow[];
   phase: ListPhase;
   error: string | null;
   selected: string | null;
+  unseen: Set<string>;
   onSelect: (row: SessionRow) => void;
   onNew: () => void;
   project: string;
+  onDeleted: (id: string) => void;
 }) {
   const [filter, setFilter] = useState("");
   const visible = useMemo(() => {
@@ -53,12 +57,14 @@ export function SessionList({ sessions, phase, error, selected, onSelect, onNew,
         <ul className="space-y-0.5">
           {visible.map((row) => {
             const active = row.id === selected;
+            const isUnseen = unseen.has(row.id);
             return (
-              <li key={row.id}>
+              <li key={row.id} className="flex">
                 <button type="button" onClick={() => onSelect(row)} aria-current={active ? "page" : undefined}
-                  className={`flex min-h-14 w-full flex-col gap-0.5 rounded-lg px-3 py-2 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${active ? "bg-secondary" : "hover:bg-muted/60"}`}>
+                  aria-label={isUnseen ? `${row.name}, finalizată și nevizualizată` : undefined}
+                  className={`flex min-h-14 min-w-0 flex-1 flex-col gap-0.5 rounded-lg px-3 py-2 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${active ? "bg-secondary" : "hover:bg-muted/60"}`}>
                   <span className="flex items-center gap-2">
-                    <span className={`min-w-0 flex-1 truncate text-[15px] font-medium ${row.status === "running" ? "session-working" : ""}`}>{row.name}</span>
+                    <span className={`min-w-0 flex-1 truncate text-[15px] font-medium ${isUnseen ? "text-unseen" : row.status === "running" ? "session-working" : ""}`}>{row.name}</span>
                     <span className={`shrink-0 text-[11px] ${row.status === "needs_feedback" ? "rounded border border-foreground px-1.5 py-px font-medium" : "text-muted-foreground"}`}>
                       {row.status === "running" && <span aria-hidden className="mr-1 inline-block size-1.5 animate-pulse rounded-full bg-foreground align-middle" />}
                       {statusLabel(row.status)}
@@ -70,6 +76,7 @@ export function SessionList({ sessions, phase, error, selected, onSelect, onNew,
                     <span className="min-w-0 truncate font-mono">{row.worktree}</span>
                   </span>
                 </button>
+                <DeleteSessionButton project={project} row={row} onDeleted={onDeleted} />
               </li>
             );
           })}

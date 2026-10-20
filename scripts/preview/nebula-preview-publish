@@ -1,0 +1,6 @@
+#!/bin/sh
+# Install this wrapper and /opt/nebula-preview/nebula as root-owned files with
+# root-controlled parent directories. Never point it at a worktree candidate.
+set -eu
+[ "$#" -eq 3 ] || exit 64
+exec /opt/nebula-preview/nebula preview publish "$1" "$2" "$3"

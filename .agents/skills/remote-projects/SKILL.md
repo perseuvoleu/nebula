@@ -88,6 +88,13 @@ Every session picker offers the other side (`Run on findl ▸` in `n`;
 flat `Claude on findl` … rows in ⌘T/⌘D). On the command line two projects share the name, so say
 which: `--project nebula@findl` is the remote twin, `--project nebula` the local one.
 
+A new session on an existing branch uses the selected host's primary checkout, switched under
+`nebula switch`'s rules (refused on uncommitted changes; live sessions there stop only after
+confirmation); it never creates a linked worktree. `--worktree primary` explicitly selects the
+actual primary checkout; identical branch names on another host do not redirect execution.
+Protocol 29 requires matching client and host daemons; schedule any restart with the user
+because restarting ends sessions.
+
 ```bash
 nebula agent new --project nebula@findl --kind pi --worktree root --name fix login
 nebula agent read "fix login" --project nebula@findl

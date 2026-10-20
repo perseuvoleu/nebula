@@ -14,6 +14,10 @@ nebula-daemon = { workspace = true }
 nebula-tui = { workspace = true, default-features = false }
 nebula-rag = { workspace = true }
 anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+ulid = { workspace = true }
+libc = "0.2"
 clap = { version = "4", features = ["derive"] }
 tokio = { workspace = true }
 tracing = { workspace = true }

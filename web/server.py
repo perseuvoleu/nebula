@@ -5,6 +5,7 @@ Owns authentication, the enabled-project scope, argument-safe Nebula CLI control
 read-only Pi conversation contract (see pi_history.py). Serves the built React app from
 `web/static` through a startup allowlist: no directory listing, no arbitrary file reads.
 """
+import base64
 import datetime
 import hmac
 import json
@@ -15,10 +16,12 @@ import secrets
 import socket
 import sqlite3
 import subprocess
+import sys
 import threading
+import tempfile
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, quote, urlsplit
 
 import pi_history
 
@@ -32,6 +35,7 @@ ASSET_TYPES = {".html": "text/html", ".js": "text/javascript", ".css": "text/css
                ".map": "application/json"}
 IDENTITY_TTL = 5.0
 TRANSIENT = {502, 503, 504}  # gateway/CLI trouble: reported as an error, not as a capability
+PUSH_STATES = {"finished", "needs_feedback"}
 CSP = ("default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; "
        "worker-src 'self'; manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 
@@ -39,6 +43,155 @@ CSP = ("default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' 
 class Problem(Exception):
     def __init__(self, status, message):
         self.status, self.message = status, message
+
+
+class PushService:
+    """Persistent Web Push subscriptions and transition-based agent notifications."""
+
+    def __init__(self, private_key, subject, storage, *, sender=None, public_key=None):
+        self.storage = Path(storage)
+        self.lock = threading.Lock()
+        self.statuses = {}
+        if sender is None:
+            try:
+                from cryptography.hazmat.primitives import serialization
+                from py_vapid import Vapid
+                from pywebpush import webpush
+                from requests import Session
+            except ImportError as error:
+                raise ValueError("Web Push dependencies missing; install web/requirements.txt") from error
+            key = Path(private_key)
+            if not key.is_absolute() or not key.is_file():
+                raise ValueError("NEBULA_WEB_VAPID_PRIVATE_KEY must be an absolute existing file")
+            vapid = Vapid.from_file(str(key))
+            raw = vapid.public_key.public_bytes(serialization.Encoding.X962,
+                                                serialization.PublicFormat.UncompressedPoint)
+            public_key = base64.urlsafe_b64encode(raw).decode().rstrip("=")
+            class PushSession(Session):
+                """Send only to the validated provider, without netrc, proxies or redirects."""
+
+                def request(self, method, url, **kwargs):
+                    """Prevent a provider redirect from forwarding encrypted payloads elsewhere."""
+                    kwargs["allow_redirects"] = False
+                    return super().request(method, url, **kwargs)
+
+            transport = PushSession()
+            transport.trust_env = False
+            sender = lambda subscription, data: webpush(
+                subscription_info=subscription, data=json.dumps(data), vapid_private_key=vapid,
+                vapid_claims={"sub": subject}, ttl=300, timeout=10, requests_session=transport)
+        self.sender, self.public_key = sender, public_key
+        if not isinstance(public_key, str) or len(public_key) < 80:
+            raise ValueError("Invalid VAPID public key")
+
+    @staticmethod
+    def validate(subscription):
+        if not isinstance(subscription, dict) or set(subscription) not in ({"endpoint", "keys"}, {"endpoint", "keys", "expirationTime"}):
+            raise Problem(400, "Invalid push subscription")
+        endpoint, keys = subscription["endpoint"], subscription["keys"]
+        try:
+            parsed = urlsplit(endpoint) if isinstance(endpoint, str) else None
+            hostname = parsed.hostname if parsed else None
+            port = parsed.port if parsed else None
+        except ValueError:
+            parsed, hostname = None, None
+        if (parsed is None or parsed.scheme != "https" or not hostname or parsed.username
+                or parsed.password or parsed.fragment or port not in (None, 443)
+                or hostname not in {"web.push.apple.com", "fcm.googleapis.com", "updates.push.services.mozilla.com"}
+                or re.search(r"[\x00-\x20\x7f\\]", endpoint) or len(endpoint) > 4096 or not isinstance(keys, dict)
+                or set(keys) != {"p256dh", "auth"}):
+            raise Problem(400, "Invalid push subscription")
+        for name, minimum in (("p256dh", 40), ("auth", 8)):
+            value = keys.get(name)
+            if not isinstance(value, str) or not minimum <= len(value) <= 256 or not re.fullmatch(r"[A-Za-z0-9_-]+", value):
+                raise Problem(400, "Invalid push subscription")
+        return {"endpoint": endpoint, "keys": keys}
+
+    def subscriptions(self):
+        try:
+            value = json.loads(self.storage.read_text())
+        except (OSError, ValueError):
+            return []
+        if not isinstance(value, list):
+            return []
+        valid = []
+        for subscription in value:
+            try:
+                valid.append(self.validate(subscription))
+            except Problem:
+                pass
+        return valid
+
+    def save(self, subscriptions):
+        self.storage.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        descriptor, name = tempfile.mkstemp(prefix=".push-", dir=self.storage.parent)
+        temporary = Path(name)
+        try:
+            with os.fdopen(descriptor, "w") as file:
+                json.dump(subscriptions, file)
+            temporary.replace(self.storage)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def subscribe(self, subscription):
+        subscription = self.validate(subscription)
+        with self.lock:
+            subscriptions = [s for s in self.subscriptions()
+                             if isinstance(s, dict) and s.get("endpoint") != subscription["endpoint"]]
+            subscriptions.append(subscription)
+            self.save(subscriptions[-8:])
+
+    def unsubscribe(self, endpoint):
+        if not isinstance(endpoint, str) or len(endpoint) > 4096:
+            raise Problem(400, "Invalid push endpoint")
+        with self.lock:
+            subscriptions = [s for s in self.subscriptions()
+                             if isinstance(s, dict) and s.get("endpoint") != endpoint]
+            self.save(subscriptions)
+
+    def notify(self, project, row):
+        status = row["status"]
+        data = {
+            "title": "Nebula",
+            "body": f"{row['name']}: " + ("a terminat" if status == "finished" else "așteaptă răspunsul tău"),
+            "url": f"/p/{quote(project, safe='')}/s/{quote(row['id'], safe='')}",
+            "tag": f"nebula-{row['id']}",
+        }
+        with self.lock:
+            subscriptions = self.subscriptions()
+        expired = set()
+        for subscription in subscriptions:
+            try:
+                self.sender(subscription, data)
+            except Exception as error:
+                response = getattr(error, "response", None)
+                if getattr(response, "status_code", None) in {404, 410}:
+                    expired.add(subscription["endpoint"])
+                else:
+                    print("Nebula Web Push delivery failed", file=sys.stderr, flush=True)
+        if expired:
+            with self.lock:
+                self.save([s for s in self.subscriptions() if s.get("endpoint") not in expired])
+
+    def poll(self, gateway):
+        if not self.subscriptions():
+            self.statuses.clear()
+            return
+        for project in gateway.projects:
+            try:
+                rows = [row for row in gateway.sessions(project) if not row["archived"]]
+            except Problem:
+                continue
+            present = set()
+            for row in rows:
+                key = (project, row["id"])
+                present.add(key)
+                previous = self.statuses.get(key)
+                self.statuses[key] = row["status"]
+                if previous is not None and previous != row["status"] and row["status"] in PUSH_STATES:
+                    self.notify(project, row)
+            for key in [key for key in self.statuses if key[0] == project and key not in present]:
+                del self.statuses[key]
 
 
 class StaticFiles:
@@ -52,24 +205,24 @@ class StaticFiles:
                 relative = "/" + path.relative_to(self.root).as_posix()
                 if (path.is_file() and not path.is_symlink() and path.suffix in ASSET_TYPES
                         and not any(part.startswith(".") for part in path.relative_to(self.root).parts)):
-                    self.files[relative] = path
+                    self.files[relative] = (path.read_bytes(), path.suffix)
 
     def lookup(self, path):
         """(file, mime, cache) for an asset, the app shell for client routes, else None."""
         if path == "/" or (path not in self.files and ROUTE.fullmatch(path)):
             shell = self.files.get("/index.html")
-            return (shell, "text/html", "no-cache") if shell else None
+            return (shell[0], "text/html", "no-cache") if shell else None
         file = self.files.get(path)
         if not file:
             return None
         immutable = path.startswith("/assets/") and re.search(r"-[A-Za-z0-9_-]{6,}\.\w+$", path)
-        return file, ASSET_TYPES[file.suffix], "public, max-age=31536000, immutable" if immutable else "no-cache"
+        return file[0], ASSET_TYPES[file[1]], "public, max-age=31536000, immutable" if immutable else "no-cache"
 
 
 class Gateway:
-    def __init__(self, token, origin, projects, binary="nebula", static=None, pi_agent_dir=None, db_path=None):
-        if len(token) < 32:
-            raise ValueError("NEBULA_WEB_TOKEN must contain at least 32 characters")
+    def __init__(self, token, origin, projects, binary="nebula", static=None, pi_agent_dir=None, db_path=None, *, preview_binary=None, push=None):
+        if len(token) < 8:
+            raise ValueError("NEBULA_WEB_TOKEN must contain at least 8 characters")
         parsed = urlsplit(origin)
         if (parsed.scheme not in {"http", "https"} or not parsed.netloc
                 or parsed.path or parsed.query or parsed.fragment or parsed.username):
@@ -80,6 +233,11 @@ class Gateway:
             raise ValueError("NEBULA_WEB_PROJECTS must list at least one project")
         self.token, self.origin, self.host = token, origin, parsed.netloc
         self.projects, self.binary = projects, binary
+        # None explicitly disables optional preview discovery; never fall back to the main CLI.
+        if preview_binary is not None and (not Path(preview_binary).is_absolute()
+                or not Path(preview_binary).is_file() or not os.access(preview_binary, os.X_OK)):
+            raise ValueError("NEBULA_WEB_PREVIEW_BINARY must be an absolute executable file")
+        self.preview_binary = preview_binary
         self.static = static or StaticFiles(STATIC)
         self.pi_agent_dir = Path(pi_agent_dir) if pi_agent_dir else default_pi_agent_dir()
         self.db_path = Path(db_path) if db_path else None
@@ -88,6 +246,7 @@ class Gateway:
         self.identities = {}  # agent id -> (native session id | None, reason, expires)
         self.lock = threading.Lock()
         self.checkout_lock = threading.Lock()
+        self.push = push
 
     def run(self, *args, json_output=True, binary=None):
         if not self.slots.acquire(blocking=False):
@@ -96,7 +255,13 @@ class Gateway:
             # Never inherit the parent agent's identity or pass gateway credentials to CLIs.
             env = {k: v for k, v in os.environ.items()
                    if not k.startswith(("NEBULA_", "MC_", "PI_"))}
-            result = subprocess.run([binary or self.binary, *args], capture_output=True, text=True,
+            executable = binary or self.binary
+            if binary is None and args[:1] == ("preview",):
+                if (len(args) != 4 or args[1] != "--project" or args[2] not in self.projects
+                        or args[3] != "status" or self.preview_binary is None):
+                    raise Problem(503, "Preview status unavailable")
+                executable = self.preview_binary
+            result = subprocess.run([executable, *args], capture_output=True, text=True,
                                     errors="replace", timeout=20, env=env)
             if result.returncode:
                 raise Problem(502, result.stderr.strip()[:2000] or "Nebula command failed")
@@ -116,13 +281,13 @@ class Gateway:
     def sessions(self, project):
         return self.run("agent", "list", "--project", project)
 
-    def session_row(self, project, session_id):
+    def session_row(self, project, session_id, *, by_name=True):
         rows = self.sessions(project)
         row = next((r for r in rows if r["id"] == session_id and not r["archived"]), None)
         if not row:
             raise Problem(404, "Session no longer available")
-        # The current CLI selects by name, not id. Refuse ambiguous names.
-        if sum(r["name"] == row["name"] for r in rows) != 1:
+        # Legacy read/show/send select by name; ID-only controls do not.
+        if by_name and sum(r["name"] == row["name"] for r in rows) != 1:
             raise Problem(409, "Duplicate session name; rename it in Nebula first")
         return row
 
@@ -208,10 +373,30 @@ class Gateway:
     def get(self, path, query):
         if path == "/api/projects":
             return {"projects": self.projects, "host": self.hostname}
+        if path == "/api/push":
+            return {"available": self.push is not None,
+                    "publicKey": self.push.public_key if self.push else None}
         project = self.project(query.get("project", [None])[0])
         first = {k: v[0] for k, v in query.items()}
         if path == "/api/sessions":
             return {"sessions": [public(r) for r in self.sessions(project) if not r["archived"]]}
+        if path == "/api/preview":
+            try:
+                status = self.run("preview", "--project", project, "status")
+            except Problem:
+                # CLI stderr may contain private diagnostic details. Never return it here.
+                return {"url": None, "phase": None}
+            domain = status.get("domain") if isinstance(status, dict) else None
+            phase = status.get("phase") if isinstance(status, dict) else None
+            # Match the preview policy's DNS-label rules, including its reserved control domain.
+            if (not isinstance(phase, str) or phase not in
+                    {"running", "stopped", "stale", "recovering", "orphaned_route", "unknown"}
+                    or not isinstance(domain, str) or len(domain) > 253 or "." not in domain
+                    or domain == "code.possu.dev" or not all(
+                        re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+                        for label in domain.split("."))):
+                return {"url": None, "phase": None}
+            return {"url": f"https://{domain}" if phase == "running" else None, "phase": phase}
         if path == "/api/worktrees":
             return {"worktrees": self.run("worktree", "list", "--project", project)}
         if path == "/api/output":
@@ -282,9 +467,42 @@ class Gateway:
             self.checkout_lock.release()
 
     def post(self, path, body):
+        if path == "/api/push/subscribe":
+            if not self.push:
+                raise Problem(503, "Push notifications are not configured")
+            self.push.subscribe(body.get("subscription"))
+            return {"ok": True}
+        if path == "/api/push/unsubscribe":
+            if self.push:
+                self.push.unsubscribe(body.get("endpoint"))
+            return {"ok": True}
         project = self.project(body.get("project"))
         if path == "/api/worktrees":
             return self.create_checkout(project, body)
+        if path in {"/api/worktrees/check-delete", "/api/worktrees/delete"}:
+            trees = self.run("worktree", "list", "--project", project)
+            tree = next((w for w in trees if w.get("id") and w["id"] == body.get("id")), None)
+            if not tree:
+                raise Problem(409, "Checkout unavailable or CLI too old; refresh and check installation")
+            if tree["is_main"] or tree["branch"] in {"main", "master"}:
+                raise Problem(409, "Primary checkout and main/master are protected")
+            if tree["path"] != body.get("path") or tree["branch"] != body.get("branch"):
+                raise Problem(409, "Checkout changed; refresh before confirming")
+            args = ("--check",) if path.endswith("check-delete") else ()
+            self.run("worktree", "delete-safe", "--project", project, *args,
+                     "--", tree["id"], tree["branch"], tree["path"])
+            return {"ok": True}
+        if path == "/api/sessions/delete":
+            row = self.session_row(project, body.get("id"), by_name=False)
+            self.run("agent", "delete-id", "--project", project, "--", row["id"])
+            return {"ok": True}
+        if path == "/api/key":
+            key = body.get("key")
+            if not isinstance(key, str) or key not in {"Up", "Down", "Left", "Right", "Enter", "Escape", "Tab"}:
+                raise Problem(400, "Unsupported terminal key")
+            row = self.session_row(project, body.get("id"), by_name=False)
+            self.run("agent", "key", "--project", project, "--", row["id"], key)
+            return {"ok": True}
         text = body.get("text")
         if not isinstance(text, str) or not text.strip() or len(text) > 16000 or "\0" in text:
             raise Problem(400, "Message must contain 1–16000 characters without NUL")
@@ -372,7 +590,7 @@ class Handler(BaseHTTPRequestHandler):
                 if asset is None:
                     raise Problem(404, "Not found")
                 file, mime, cache = asset
-                return self.reply(200, file.read_bytes(), mime, cache)
+                return self.reply(200, file, mime, cache)
             if not path.startswith("/api/"):
                 raise Problem(404, "Not found")
             if not hmac.compare_digest(self.headers.get("Authorization", "").encode(),
@@ -415,15 +633,28 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     port = int(os.environ.get("NEBULA_WEB_PORT", "8765"))
-    gateway = Gateway(os.environ.get("NEBULA_WEB_TOKEN", ""),
-                      os.environ.get("NEBULA_WEB_ORIGIN", f"http://127.0.0.1:{port}"),
+    origin = os.environ.get("NEBULA_WEB_ORIGIN", f"http://127.0.0.1:{port}")
+    private_key = os.environ.get("NEBULA_WEB_VAPID_PRIVATE_KEY")
+    push = PushService(private_key, os.environ.get("NEBULA_WEB_VAPID_SUBJECT", origin),
+                       os.environ.get("NEBULA_WEB_PUSH_STORE", str(Path.home() / ".local/share/nebula/web-push.json"))) if private_key else None
+    gateway = Gateway(os.environ.get("NEBULA_WEB_TOKEN", ""), origin,
                       [p.strip() for p in os.environ.get("NEBULA_WEB_PROJECTS", "").split(",") if p.strip()],
                       os.environ.get("NEBULA_WEB_BINARY", "nebula"),
-                      db_path=os.environ.get("NEBULA_WEB_DB") or None)
+                      db_path=os.environ.get("NEBULA_WEB_DB") or None,
+                      preview_binary=os.environ.get("NEBULA_WEB_PREVIEW_BINARY"), push=push)
     if not gateway.static.files.get("/index.html"):
         raise SystemExit(f"No built app in {gateway.static.root}; run `pnpm --dir web/app build` first")
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     server.gateway = gateway
+    if push:
+        def monitor():
+            while True:
+                try:
+                    push.poll(gateway)
+                except Exception:
+                    print("Nebula Web Push monitor failed", file=sys.stderr, flush=True)
+                time.sleep(5)
+        threading.Thread(target=monitor, name="web-push", daemon=True).start()
     print(f"Nebula web listening on 127.0.0.1:{port}", flush=True)
     server.serve_forever()
 

@@ -1,10 +1,12 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { LogOutIcon, MenuIcon } from "lucide-react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { ExternalLinkIcon, LogOutIcon, MenuIcon } from "lucide-react";
 import { api, ApiError, describeError, getToken, onAuthChange, setToken } from "@/lib/api";
 import { useConversation } from "@/lib/conversation";
 import { clearDrafts } from "@/lib/drafts";
 import { useSelection } from "@/lib/route";
 import type { NewResponse, SessionRow, Worktree } from "@/lib/types";
+import { unsubscribePush } from "@/lib/push";
+import { loadUnseen, reconcileUnseen, saveUnseen } from "@/lib/unseen";
 import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
 import { ConversationView } from "./components/ConversationView";
@@ -13,6 +15,7 @@ import { NewAgentDialog } from "./components/NewAgentDialog";
 import { SessionList, type ListPhase } from "./components/SessionList";
 import { CheckoutPanel } from "./components/CheckoutPanel";
 import { InstallApp } from "./components/InstallApp";
+import { PushNotifications } from "./components/PushNotifications";
 
 interface Workspace { projects: string[]; host: string }
 
@@ -27,6 +30,39 @@ function useMediaQuery(query: string): boolean {
     return () => media.removeEventListener("change", onChange);
   }, [query]);
   return matches;
+}
+
+function usePreview(project: string): string | null {
+  const [preview, setPreview] = useState<{ project: string; url: string | null } | null>(null);
+  useEffect(() => {
+    const abort = new AbortController();
+    let timer: ReturnType<typeof setTimeout>;
+    const refresh = async () => {
+      let url: string | null = null;
+      try {
+        const data = await api<{ url: string | null; phase: string | null }>("preview", { project }, undefined, { signal: abort.signal });
+        if (data.phase === "running" && typeof data.url === "string") url = data.url;
+      } catch { /* An unavailable preview must hide any previously published link. */ }
+      if (!abort.signal.aborted) {
+        setPreview({ project, url });
+        timer = setTimeout(refresh, SESSIONS_POLL_MS);
+      }
+    };
+    void refresh();
+    return () => { abort.abort(); clearTimeout(timer); };
+  }, [project]);
+  // Do not render the previous project's link while its replacement request is pending.
+  return preview?.project === project ? preview.url : null;
+}
+
+function PreviewButton({ url, className }: { url: string | null; className: string }) {
+  return url && (
+    <Button asChild variant="outline" size="icon-lg" className={className}>
+      <a href={url} target="_blank" rel="noopener noreferrer" aria-label="Deschide preview-ul proiectului" title={url}>
+        <ExternalLinkIcon aria-hidden />
+      </a>
+    </Button>
+  );
 }
 
 function useSessions(project: string | null) {
@@ -62,7 +98,8 @@ function useSessions(project: string | null) {
     window.addEventListener("online", wake);
     return () => { cancelled = true; generation.current += 1; if (timer) clearTimeout(timer); document.removeEventListener("visibilitychange", wake); window.removeEventListener("online", wake); };
   }, [refresh]);
-  return { rows, phase, error, refresh };
+  const remove = (id: string) => { generation.current += 1; setRows(old => old.filter(r => r.id !== id)); void refresh(); };
+  return { rows, phase, error, refresh, remove };
 }
 
 export default function App() {
@@ -95,11 +132,20 @@ function Shell({ workspace }: { workspace: Workspace }) {
   const [selection, navigate] = useSelection();
   const project = selection.project && workspace.projects.includes(selection.project) ? selection.project : workspace.projects[0];
   const sessions = useSessions(project);
+  const previewUrl = usePreview(project);
+  const latestSelection = useRef(selection);
+  useLayoutEffect(() => { latestSelection.current = selection; }, [selection]);
+  const onDeleted = (id: string) => {
+    if (latestSelection.current.project !== project) return;
+    sessions.remove(id);
+    if (latestSelection.current.session === id) navigate({ project, session: null });
+  };
   const desktop = useMediaQuery("(min-width: 768px)");
   const [menuOpen, setMenuOpen] = useState(false);
   const [creating, setCreating] = useState(false);
   const [created, setCreated] = useState<string | null>(null);
   const [checkout, setCheckout] = useState<{ project: string; path: string } | null>(null);
+  const [unseenState, setUnseenState] = useState(loadUnseen);
 
   // Normalise the URL to a valid project once the allowlist is known.
   useEffect(() => { if (selection.project !== project) navigate({ project, session: selection.session }, true); }, [project, selection.project, selection.session, navigate]);
@@ -107,6 +153,7 @@ function Shell({ workspace }: { workspace: Workspace }) {
   const row = sessions.rows.find((r) => r.id === selection.session) ?? null;
   const currentPath = row?.path ?? (checkout?.project === project ? checkout.path : undefined);
   const chooseCheckout = (tree: Worktree) => {
+    void sessions.refresh();
     setCheckout({ project, path: tree.path });
     navigate({ project, session: null });
     setMenuOpen(false);
@@ -115,6 +162,15 @@ function Shell({ workspace }: { workspace: Workspace }) {
   const sessionId = selection.session;
   const missing = sessionId !== null && sessions.phase === "ready" && !row;
   const { state, controller } = useConversation(project, sessionId && !missing ? sessionId : null);
+  useEffect(() => {
+    if (sessions.phase !== "ready") return;
+    setUnseenState((previous) => {
+      const next = reconcileUnseen(previous, project, sessions.rows, sessionId);
+      saveUnseen(next);
+      return next;
+    });
+  }, [project, sessionId, sessions.phase, sessions.rows]);
+  const unseenFinished = new Set(unseenState.unseen.filter((id) => id.startsWith(`${project}/`)).map((id) => id.slice(project.length + 1)));
 
   const select = (r: SessionRow) => { navigate({ project, session: r.id }); setMenuOpen(false); setCreated(null); };
   const onCreated = (result: NewResponse) => {
@@ -123,7 +179,11 @@ function Shell({ workspace }: { workspace: Workspace }) {
     if (result.id) navigate({ project, session: result.id }); else setCreated(result.name);
     setMenuOpen(false);
   };
-  const logout = () => { controller?.dispose(); setToken(""); navigate({ project: null, session: null }, true); };
+  const logout = async () => {
+    controller?.dispose();
+    try { await unsubscribePush(); } catch { /* Logging out must not depend on push delivery. */ }
+    setToken(""); navigate({ project: null, session: null }, true);
+  };
 
   const sidebar = (
     <aside className="flex h-full min-h-0 flex-col bg-sidebar" aria-label="Proiecte și sesiuni">
@@ -136,18 +196,20 @@ function Shell({ workspace }: { workspace: Workspace }) {
           </select>
         </label>
         <span className="max-w-24 shrink-0 truncate rounded border border-border px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground" title={`Execuția are loc pe ${workspace.host}`}>@{workspace.host}</span>
+        <PreviewButton url={previewUrl} className="size-10" />
         <Button type="button" variant="ghost" size="icon-lg" aria-label="Deconectare" onClick={logout} className="size-10"><LogOutIcon aria-hidden /></Button>
       </div>
       {checkoutPanel}
       {created && <p role="status" className="border-b border-sidebar-border px-3 py-2 text-xs">Agent pornit ca „{created}”. Identitatea nu a putut fi confirmată încă: alege-l din listă.</p>}
-      <SessionList sessions={sessions.rows} phase={sessions.phase} error={sessions.error} selected={sessionId} onSelect={select} onNew={() => setCreating(true)} project={project} />
+      <SessionList sessions={sessions.rows} phase={sessions.phase} error={sessions.error} selected={sessionId} unseen={unseenFinished} onSelect={select} onNew={() => setCreating(true)} project={project} onDeleted={onDeleted} />
+      {desktop && <PushNotifications />}
       <InstallApp />
       <p className="border-t border-sidebar-border px-3 py-2 text-[11px] text-muted-foreground">Telefonul se poate deconecta. Agenții rămân pe server.</p>
     </aside>
   );
 
   const conversation = sessionId && controller && state ? (
-    <ConversationView key={`${project}/${sessionId}`} project={project} row={row} state={state} controller={controller} sessions={sessions.rows} onSelect={select} showBack={!desktop} onBack={() => navigate({ project, session: null })} />
+    <ConversationView key={`${project}/${sessionId}`} project={project} previewUrl={previewUrl} row={row} state={state} controller={controller} sessions={sessions.rows} unseen={unseenFinished} onSelect={select} showBack={!desktop} onBack={() => navigate({ project, session: null })} />
   ) : (
     <section className="flex min-h-0 flex-1 flex-col">
       {!desktop && (
@@ -196,9 +258,11 @@ function Shell({ workspace }: { workspace: Workspace }) {
                 {workspace.projects.map((p) => <option key={p} value={p}>{p}</option>)}
               </select>
             </label>
+            <PreviewButton url={previewUrl} className="size-11" />
           </div>
           {checkoutPanel}
-          <SessionList sessions={sessions.rows} phase={sessions.phase} error={sessions.error} selected={sessionId} onSelect={select} onNew={() => setCreating(true)} project={project} />
+          <SessionList sessions={sessions.rows} phase={sessions.phase} error={sessions.error} selected={sessionId} unseen={unseenFinished} onSelect={select} onNew={() => setCreating(true)} project={project} onDeleted={onDeleted} />
+          <PushNotifications />
           <InstallApp />
         </main>
       )}

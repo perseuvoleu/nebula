@@ -81,7 +81,38 @@ def main(argv):
         name = positionals(argv[2:])[0]
         count = int((STATE / "output-lines").read_text()) if (STATE / "output-lines").exists() else 40
         lines = [f"$ terminal snapshot for {name}"] + [f"line {i}: build step {i} ok" for i in range(1, count)]
+        if (STATE / "output.txt").exists():
+            lines = (STATE / "output.txt").read_text().splitlines()
         print("\n".join(lines[-int(arg("--lines", argv) or len(lines)):]))
+    elif command in {("agent", "key"), ("agent", "delete-id")}:
+        values = positionals(argv[2:])
+        hits = [a for a in agents if a["id"] == values[0] and a["project"] == project and not a["archived"]]
+        with open(STATE / "sends.log", "a") as handle:
+            handle.write(json.dumps({"action": command[1], "id": values[0], "key": values[1] if len(values) > 1 else ""}) + "\n")
+        if not hits or behaviour == "fail":
+            print("Session unavailable or PTY closed", file=sys.stderr)
+            return 1
+        if behaviour == "hang": time.sleep(30)
+        if command[1] == "delete-id": save("agents.json", [a for a in agents if a["id"] != values[0]])
+        print(json.dumps({"ok": True}))
+    elif command == ("worktree", "delete-safe"):
+        id, branch, path = positionals(argv[2:])
+        trees = load("worktrees.json")
+        tree = next((w for w in trees if w.get("id") == id and w["project"] == project), None)
+        reason = None
+        if not tree or tree["branch"] != branch or tree["path"] != path: reason = "Checkout changed"
+        elif tree["is_main"] or branch in {"main", "master"}: reason = "Protected checkout"
+        elif any(a["path"] == path for a in agents): reason = "Sessions still exist"
+        elif tree.get("dirty"): reason = "Dirty checkout"
+        elif tree.get("unmerged"): reason = "Unmerged commits"
+        elif behaviour == "fail": reason = "Checkout unavailable"
+        if reason:
+            print(reason, file=sys.stderr)
+            return 1
+        if "--check" not in argv:
+            save("worktrees.json", [w for w in trees if w.get("id") != id])
+            with open(STATE / "sends.log", "a") as handle: handle.write(json.dumps({"action": "delete-safe", "id": id}) + "\n")
+        print(json.dumps({"ok": True}))
     elif command == ("agent", "send"):
         name, text = positionals(argv[2:])[:2]
         with open(STATE / "sends.log", "a") as handle:
@@ -124,7 +155,7 @@ def main(argv):
             primary["branch"] = name
             row = primary
         else:
-            row = {"path": f"/srv/{project}-worktrees/{name}", "branch": name, "is_main": False,
+            row = {"id": f"wt-{uuid.uuid4().hex[:8]}", "path": f"/srv/{project}-worktrees/{name}", "branch": name, "is_main": False,
                    "project": project, "created_from": base}
             trees.append(row)
         save("worktrees.json", trees)

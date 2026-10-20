@@ -1,6 +1,6 @@
 // Mounted with key={project/session} by the shell, so draft/terminal state resets per session without effects.
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { ArrowLeftIcon, RefreshCwIcon, TerminalIcon } from "lucide-react";
+import { ArrowLeftIcon, ExternalLinkIcon, RefreshCwIcon, TerminalIcon } from "lucide-react";
 import { useStickToBottomContext } from "use-stick-to-bottom";
 import { Conversation, ConversationContent, ConversationScrollButton } from "@/components/ai-elements/conversation";
 import { Button } from "@/components/ui/button";
@@ -95,14 +95,17 @@ function ConnectionLine({ state }: { state: ConversationState }) {
   );
 }
 
-export function ConversationView({ project, row, state, controller, onBack, showBack, sessions, onSelect }: {
+export function ConversationView({ project, previewUrl, row, state, controller, onBack, showBack, sessions, unseen, onSelect }: {
   project: string;
+  /** Running preview published for this session’s project, or null when unavailable. */
+  previewUrl: string | null;
   row: SessionRow | null;
   state: ConversationState;
   controller: ConversationController;
   onBack: () => void;
   showBack: boolean;
   sessions: SessionRow[];
+  unseen: Set<string>;
   onSelect: (row: SessionRow) => void;
 }) {
   const session = state.session ?? row;
@@ -144,6 +147,13 @@ export function ConversationView({ project, row, state, controller, onBack, show
             </p>
           )}
         </div>
+        {previewUrl && (
+          <Button asChild variant="outline" size="icon-lg" className="size-11">
+            <a href={previewUrl} target="_blank" rel="noopener noreferrer" aria-label="Deschide preview-ul sesiunii" title={previewUrl}>
+              <ExternalLinkIcon aria-hidden className="size-5" />
+            </a>
+          </Button>
+        )}
         {state.capabilities?.structured && (
           <Button type="button" variant={terminal ? "secondary" : "ghost"} size="icon-lg" aria-pressed={terminal}
             aria-label={terminal ? "Arată conversația" : "Arată terminalul"} onClick={() => setTerminal((v) => !v)} className="size-11">
@@ -151,7 +161,7 @@ export function ConversationView({ project, row, state, controller, onBack, show
           </Button>
         )}
       </header>
-      <SessionTabs sessions={sessions} selected={sessionId} onSelect={onSelect} />
+      <SessionTabs sessions={sessions} selected={sessionId} unseen={unseen} onSelect={onSelect} />
 
       {state.phase === "loading" && (
         <div className="flex-1 space-y-4 px-4 py-6" aria-busy="true" aria-label="Se încarcă conversația">
@@ -174,7 +184,16 @@ export function ConversationView({ project, row, state, controller, onBack, show
         </p>
       )}
 
-      {showTerminal && state.phase !== "loading" && state.phase !== "error" && <TerminalView project={project} session={sessionId} />}
+      {showTerminal && state.phase !== "loading" && state.phase !== "error" && (
+        <TerminalView project={project} session={sessionId} revealKey={state.attempts.length}>
+          {state.attempts.length > 0 && (
+            <div className="mt-3 space-y-3 border-t border-border pt-3" aria-label="Mesaje trimise din acest browser">
+              {state.attempts.map(attempt => <PendingAttempt key={attempt.id} attempt={attempt} snapshotOnly
+                onDismiss={() => controller.dismissAttempt(attempt.id)} onRetry={() => retry(attempt)} />)}
+            </div>
+          )}
+        </TerminalView>
+      )}
 
       {structured && !showTerminal && (
         <Conversation className="min-h-0 flex-1" initial="instant" resize="instant">
@@ -192,12 +211,6 @@ export function ConversationView({ project, row, state, controller, onBack, show
         </Conversation>
       )}
 
-      {showTerminal && state.attempts.length > 0 && (
-        <div className="max-h-40 shrink-0 space-y-3 overflow-y-auto border-t border-border px-4 py-3" aria-label="Mesaje trimise din acest browser">
-          {state.attempts.map(attempt => <PendingAttempt key={attempt.id} attempt={attempt} snapshotOnly
-            onDismiss={() => controller.dismissAttempt(attempt.id)} onRetry={() => retry(attempt)} />)}
-        </div>
-      )}
       {state.phase !== "loading" && state.phase !== "error" && (
         <>
           <ConnectionLine state={state} />

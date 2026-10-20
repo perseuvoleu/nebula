@@ -75,9 +75,9 @@ def seed():
     ]
     (STATE / "agents.json").write_text(json.dumps(agents, indent=1))
     (STATE / "worktrees.json").write_text(json.dumps([
-        {"path": "/srv/alpha", "branch": "main", "is_main": True, "project": "alpha", "pinned": False, "created_from": None},
-        {"path": "/srv/alpha-wt", "branch": "feature/homepage", "is_main": False, "project": "alpha", "pinned": False, "created_from": "main"},
-        {"path": "/srv/beta", "branch": "main", "is_main": True, "project": "beta", "pinned": False, "created_from": None},
+        {"id": "wt-alpha", "path": "/srv/alpha", "branch": "main", "is_main": True, "project": "alpha", "pinned": False, "created_from": None},
+        {"id": "wt-feature", "path": "/srv/alpha-wt", "branch": "feature/homepage", "is_main": False, "project": "alpha", "pinned": False, "created_from": "main"},
+        {"id": "wt-beta", "path": "/srv/beta", "branch": "main", "is_main": True, "project": "beta", "pinned": False, "created_from": None},
     ]))
     big = "\n".join(f"[{i:04d}] compiling module {i} … ok" for i in range(400))
     write_session(STATE / "pi", "/srv/alpha", SID["pi-1"], [
@@ -112,7 +112,10 @@ def main():
            "NEBULA_WEB_BINARY": str(HERE / "fake_nebula.py"), "NEBULA_WEB_PI_AGENT_DIR": str(STATE / "pi"),
            "FAKE_NEBULA_STATE": str(STATE), "PYTHONDONTWRITEBYTECODE": "1",
            "PYTHONPATH": str(WEB), "PATH": str(STATE / "bin") + os.pathsep + os.environ["PATH"]}
-    os.execve(sys.executable, [sys.executable, str(WEB / "server.py")], env)
+    # Let browser tests serve an isolated build without replacing live web/static.
+    script = "import os; from pathlib import Path; import server; " \
+             "server.STATIC = Path(os.environ.get('E2E_STATIC_DIR', str(server.STATIC))); server.main()"
+    os.execve(sys.executable, [sys.executable, "-c", script], env)
 
 
 if __name__ == "__main__":

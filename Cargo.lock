@@ -1160,16 +1160,19 @@ version = "0.6.0"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
  "nebula-core",
  "nebula-daemon",
  "nebula-rag",
  "nebula-tui",
  "portable-pty",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "ulid",
  "vt100",
 ]
 
