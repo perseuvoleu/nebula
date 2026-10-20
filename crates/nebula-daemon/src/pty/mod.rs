@@ -161,9 +161,12 @@ impl PtySession {
     /// queue, so input that long is refused instead.
     pub fn write_input_whole(&self, data: &[u8]) -> Result<()> {
         use nix::sys::termios::LocalFlags;
-        let line_mode = self.master.lock().unwrap().get_termios().is_some_and(|t| {
-            t.local_flags.bits() & LocalFlags::ICANON.bits() != 0
-        });
+        let line_mode = self
+            .master
+            .lock()
+            .unwrap()
+            .get_termios()
+            .is_some_and(|t| t.local_flags.bits() & LocalFlags::ICANON.bits() != 0);
         if line_mode && data.len() >= LINE_MODE_INPUT_MAX {
             anyhow::bail!(
                 "the session's terminal is in line mode (its CLI is not reading keys yet) and would drop input past {LINE_MODE_INPUT_MAX} bytes; nothing was sent"

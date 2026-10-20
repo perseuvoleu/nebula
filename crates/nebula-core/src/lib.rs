@@ -7,8 +7,8 @@ pub mod ids;
 pub mod mem;
 pub mod paths;
 pub mod protocol;
-pub mod remote;
 pub mod relay_status;
+pub mod remote;
 
 pub use entities::*;
 pub use ids::*;

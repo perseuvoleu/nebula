@@ -595,9 +595,13 @@ fn tui_slow_agent_shows_starting_until_first_output() {
 /// substitute is the daemon socket; input, event loop, timer and renderer are real.
 #[test]
 fn tui_remote_preview_deadline_attaches_when_the_reply_never_arrives() {
-    use nebula_core::{codec::{read_frame, write_frame}, ClientRequest, ServerEvent, PROTOCOL_VERSION};
+    use nebula_core::{
+        codec::{read_frame, write_frame},
+        ClientRequest, ServerEvent, PROTOCOL_VERSION,
+    };
     let runtime = tempfile::tempdir().unwrap();
-    let listener = std::os::unix::net::UnixListener::bind(runtime.path().join("daemon.sock")).unwrap();
+    let listener =
+        std::os::unix::net::UnixListener::bind(runtime.path().join("daemon.sock")).unwrap();
     listener.set_nonblocking(true).unwrap();
     let (result_tx, result_rx) = std::sync::mpsc::channel();
     let peer = std::thread::spawn(move || {
@@ -642,15 +646,21 @@ fn tui_remote_preview_deadline_attaches_when_the_reply_never_arrives() {
             }).await.unwrap();
         });
     });
-    let mut tui = TuiHarness::spawn_with_env(&[("NEBULA_RUNTIME_DIR", runtime.path().display().to_string())]);
+    let mut tui =
+        TuiHarness::spawn_with_env(&[("NEBULA_RUNTIME_DIR", runtime.path().display().to_string())]);
     tui.wait_for_text("remote");
     tui.send(b"\t");
     tui.wait_for_text(FOOTER_WORKTREES);
     tui.send(b"\r");
     tui.wait_for_text(FOOTER_SESSIONS);
     tui.send(b"\r");
-    let elapsed = result_rx.recv_timeout(WAIT).expect("event loop must send Attach without a preview reply");
-    assert!(elapsed >= Duration::from_millis(100) && elapsed < Duration::from_secs(2), "bounded preview deadline: {elapsed:?}");
+    let elapsed = result_rx
+        .recv_timeout(WAIT)
+        .expect("event loop must send Attach without a preview reply");
+    assert!(
+        elapsed >= Duration::from_millis(100) && elapsed < Duration::from_secs(2),
+        "bounded preview deadline: {elapsed:?}"
+    );
     tui.wait_for_text("DEADLINE_READY");
     assert!(!tui.screen_text().contains("late preview failure"));
     drop(tui);

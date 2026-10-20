@@ -3280,7 +3280,10 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
                 }
                 let badge_len = note_badge.as_ref().map_or(0, |(s, _)| s.chars().count())
                     + hosts.len() * 2
-                    + active.iter().map(|s| s.content.chars().count()).sum::<usize>();
+                    + active
+                        .iter()
+                        .map(|s| s.content.chars().count())
+                        .sum::<usize>();
                 // Bold name: the top of the tree reads "biggest".
                 let mut spans = vec![status_dot(*roll, th)];
                 spans.extend(status_name_spans(
@@ -3534,6 +3537,7 @@ fn draw_host_filters(f: &mut Frame, app: &mut App, area: Rect) -> Rect {
         ("Local", !app.hide_local, HitTarget::ToggleLocal),
         ("Remote", !app.hide_remote, HitTarget::ToggleRemote),
         ("All", !app.hide_empty, HitTarget::ToggleAll),
+        ("Active", app.active_only, HitTarget::ToggleActive),
     ];
     // Move off the left splitter hit lane, using the column's reserved
     // right-padding cell instead (the border itself remains untouched).
@@ -3541,9 +3545,9 @@ fn draw_host_filters(f: &mut Frame, app: &mut App, area: Rect) -> Rect {
         x: area.x + 1,
         ..area
     };
-    let stacked = controls_area.width < 25;
+    let stacked = controls_area.width < 34;
     for (i, (label, checked, target)) in controls.into_iter().enumerate() {
-        let x = controls_area.x + if stacked { 0 } else { [0, 9, 19][i] };
+        let x = controls_area.x + if stacked { 0 } else { [0, 9, 19, 26][i] };
         let y = area.y + if stacked { i as u16 } else { 0 };
         if y >= controls_area.bottom() || x >= controls_area.right() {
             continue;
@@ -3565,7 +3569,7 @@ fn draw_host_filters(f: &mut Frame, app: &mut App, area: Rect) -> Rect {
         );
         app.hits.push((rect, target));
     }
-    let mut used = if stacked { 4 } else { 2 };
+    let mut used = if stacked { 5 } else { 2 };
     // The primary checkout's branch, as a dropdown: right-aligned beside the
     // checkboxes when it fits there, otherwise on a row of its own.
     let primary_branch = app
@@ -3579,7 +3583,7 @@ fn draw_host_filters(f: &mut Frame, app: &mut App, area: Rect) -> Rect {
         .map(|w| w.branch.clone());
     if let Some(branch) = primary_branch {
         const CHROME: usize = 4; // "⎇ " + " ▾"
-        const CHECKBOXES_W: u16 = 26; // Three checkboxes plus a gap
+        const CHECKBOXES_W: u16 = 36; // Four checkboxes plus a gap
         let inline = !stacked && controls_area.width >= CHECKBOXES_W + 8;
         let (x, y, room) = if inline {
             (
@@ -3735,9 +3739,9 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             }
         })
         .collect();
-    if rows.is_empty() && (app.hide_local || app.hide_remote || app.hide_empty) {
+    if rows.is_empty() && (app.hide_local || app.hide_remote || app.hide_empty || app.active_only) {
         f.render_widget(
-            Paragraph::new("No matching rows\nEnable Local / Remote / All")
+            Paragraph::new("No matching rows\nEnable Local / Remote / All or clear Active")
                 .style(Style::default().fg(th.dim)),
             inner,
         );

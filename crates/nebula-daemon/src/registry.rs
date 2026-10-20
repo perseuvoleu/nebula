@@ -323,9 +323,11 @@ impl Daemon {
                 // accepted for a known row. PTY progress may already have
                 // set Running, leaving no SetStatus effect for this hook.
                 if submitted {
-                    let _ = self.collect_events.send(crate::collect::CollectEvent::Prompt(agent_id.clone()));
+                    let _ = self
+                        .collect_events
+                        .send(crate::collect::CollectEvent::Prompt(agent_id.clone()));
                 }
-            },
+            }
             // Ids with no row are prewarmed sessions (buffer for replay at
             // adoption) or stale env / deleted agents (dropped, as before).
             Outcome::UnknownAgent(event, session_id) => {
@@ -454,7 +456,12 @@ impl Daemon {
                         status,
                         changed_at,
                     });
-                    let _ = self.collect_events.send(crate::collect::CollectEvent::Status(agent_id.clone(), status));
+                    let _ = self
+                        .collect_events
+                        .send(crate::collect::CollectEvent::Status(
+                            agent_id.clone(),
+                            status,
+                        ));
                 }
                 Effect::SaveSessionId(sid) => {
                     if let Err(e) = self.store.set_agent_session_id(agent_id, Some(&sid)) {
@@ -610,8 +617,13 @@ impl Daemon {
     }
 
     pub fn kill_all(&self) {
-        let sessions: Vec<Arc<PtySession>> =
-            self.sessions.lock().unwrap().drain().map(|(_, s)| s).collect();
+        let sessions: Vec<Arc<PtySession>> = self
+            .sessions
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, s)| s)
+            .collect();
         for s in sessions {
             self.save_screen(&s);
             s.kill();
@@ -626,8 +638,7 @@ impl Daemon {
         }
         let (_, data) = session.snapshot(None);
         let (cols, rows) = session.size();
-        let text =
-            crate::pty::render::ring_to_text(&data, cols, rows, Some(SAVED_SCREEN_LINES));
+        let text = crate::pty::render::ring_to_text(&data, cols, rows, Some(SAVED_SCREEN_LINES));
         let path = nebula_core::paths::saved_screen_path(&session.sref);
         let written = path
             .parent()
@@ -1551,24 +1562,45 @@ impl Daemon {
     // Checkout lifecycle operations take worktree_ops before exclusive execution.
     // Create/move/reparent/prewarm hold shared execution so no session can arrive
     // between the safety check and removal; ordinary reconciliation can continue.
-    pub async fn check_worktree_removal(self: &Arc<Self>, id: &WorktreeId, branch: &str, path: &Path, delete: bool) -> Result<()> {
+    pub async fn check_worktree_removal(
+        self: &Arc<Self>,
+        id: &WorktreeId,
+        branch: &str,
+        path: &Path,
+        delete: bool,
+    ) -> Result<()> {
         let _ops = self.worktree_ops.lock().await;
         let _execution = self.checkout_execution.write().await;
-        let w = self.store.get_worktree(id)?.context("Checkout no longer available")?;
-        let project = self.store.get_project(&w.project_id)?.context("Project unavailable")?;
-        if w.is_main || matches!(w.branch.as_str(), "main" | "master") || w.path == project.repo_path {
+        let w = self
+            .store
+            .get_worktree(id)?
+            .context("Checkout no longer available")?;
+        let project = self
+            .store
+            .get_project(&w.project_id)?
+            .context("Project unavailable")?;
+        if w.is_main
+            || matches!(w.branch.as_str(), "main" | "master")
+            || w.path == project.repo_path
+        {
             bail!("Primary checkout and main/master are protected");
         }
-        if w.branch != branch || w.path != path { bail!("Checkout changed; refresh before confirming"); }
+        if w.branch != branch || w.path != path {
+            bail!("Checkout changed; refresh before confirming");
+        }
         let (_, _, agents, terminals) = self.store.load_tree()?;
-        if agents.iter().any(|a| a.worktree_id == *id) || terminals.iter().any(|t| t.worktree_id == *id) {
+        if agents.iter().any(|a| a.worktree_id == *id)
+            || terminals.iter().any(|t| t.worktree_id == *id)
+        {
             bail!("Sessions still exist in this checkout (including archived sessions and terminals); delete or move them explicitly first");
         }
         git::safe_remove_worktree(&project.repo_path, &w.path, branch, delete).await?;
         if delete {
             self.kill_prewarmed_in(std::slice::from_ref(id));
             self.store.delete_worktree(id)?;
-            self.broadcast(ServerEvent::EntityRemoved { id: EntityId::Worktree(id.clone()) });
+            self.broadcast(ServerEvent::EntityRemoved {
+                id: EntityId::Worktree(id.clone()),
+            });
         }
         Ok(())
     }
@@ -2842,9 +2874,17 @@ impl Daemon {
 
     /// Require a non-archived agent belonging to the explicitly selected project.
     pub fn validate_agent_project(&self, id: &AgentId, project: &ProjectId) -> Result<()> {
-        let agent = self.store.get_agent(id)?.context("Session no longer available")?;
-        let w = self.store.get_worktree(&agent.worktree_id)?.context("Checkout unavailable")?;
-        if agent.archived || w.project_id != *project { bail!("Session no longer available in this project"); }
+        let agent = self
+            .store
+            .get_agent(id)?
+            .context("Session no longer available")?;
+        let w = self
+            .store
+            .get_worktree(&agent.worktree_id)?
+            .context("Checkout unavailable")?;
+        if agent.archived || w.project_id != *project {
+            bail!("Session no longer available in this project");
+        }
         Ok(())
     }
 
@@ -5825,11 +5865,20 @@ exec sleep 60
         // including when multiple sibling task branches already share that tip.
         let sha = git::branch_tip(&repo, "main").await.unwrap();
         for task in ["pinned-one", "pinned-two"] {
-            daemon.create_worktree(&project.id, task, Some(&sha)).await.unwrap();
+            daemon
+                .create_worktree(&project.id, task, Some(&sha))
+                .await
+                .unwrap();
         }
-        daemon.create_worktree(&project.id, "explicit-dad", Some("dad")).await.unwrap();
+        daemon
+            .create_worktree(&project.id, "explicit-dad", Some("dad"))
+            .await
+            .unwrap();
         git_in(&repo, &["commit", "--allow-empty", "-m", "advance"]);
-        daemon.create_worktree(&project.id, "historical", Some(&sha)).await.unwrap();
+        daemon
+            .create_worktree(&project.id, "historical", Some(&sha))
+            .await
+            .unwrap();
 
         let (_, worktrees, _, _) = daemon.store.load_tree().unwrap();
         let base = |branch: &str| {
@@ -5846,7 +5895,10 @@ exec sleep 60
         assert_eq!(base("pinned-two").as_deref(), Some("main"));
         assert_eq!(base("explicit-dad").as_deref(), Some("dad"));
         assert_eq!(base("historical").as_deref(), Some(sha.as_str()));
-        assert_eq!(git::branch_tip(&repo, "pinned-one").await.as_deref(), Some(sha.as_str()));
+        assert_eq!(
+            git::branch_tip(&repo, "pinned-one").await.as_deref(),
+            Some(sha.as_str())
+        );
         // Identity: checking out a pre-existing branch keeps it a branch;
         // a branch minted by the worktree flow is a worktree.
         let for_branch = |branch: &str| {
@@ -6573,7 +6625,11 @@ exec sleep 60
         );
 
         daemon.sweep_prewarmed(true);
-        assert_eq!(daemon.prewarmed.lock().unwrap().len(), 1, "young live slot kept");
+        assert_eq!(
+            daemon.prewarmed.lock().unwrap().len(),
+            1,
+            "young live slot kept"
+        );
 
         daemon.sweep_prewarmed(false);
         assert!(daemon.prewarmed.lock().unwrap().is_empty());

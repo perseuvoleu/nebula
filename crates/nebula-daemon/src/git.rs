@@ -529,17 +529,39 @@ fn cleanup_partial_node_modules(path: &Path) -> Option<String> {
 }
 
 /// Fail closed: even ignored files are user data, and only main/master is a merge baseline.
-pub async fn safe_remove_worktree(repo: &Path, path: &Path, branch: &str, delete: bool) -> Result<()> {
+pub async fn safe_remove_worktree(
+    repo: &Path,
+    path: &Path,
+    branch: &str,
+    delete: bool,
+) -> Result<()> {
     if current_branch(path).await? != branch {
         bail!("Checkout branch changed; refresh before confirming");
     }
-    if !git(path, &["status", "--porcelain", "--untracked-files=all", "--ignored"]).await?.trim().is_empty() {
+    if !git(
+        path,
+        &[
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+            "--ignored",
+        ],
+    )
+    .await?
+    .trim()
+    .is_empty()
+    {
         bail!("Dirty checkout (including untracked/ignored files); preserve or remove those files manually first");
     }
-    let baseline = if branch_exists(repo, "main").await { "refs/heads/main" }
-        else if branch_exists(repo, "master").await { "refs/heads/master" }
-        else { bail!("No main/master merge baseline; safe removal unsupported"); };
-    git(path, &["merge-base", "--is-ancestor", "HEAD", baseline]).await
+    let baseline = if branch_exists(repo, "main").await {
+        "refs/heads/main"
+    } else if branch_exists(repo, "master").await {
+        "refs/heads/master"
+    } else {
+        bail!("No main/master merge baseline; safe removal unsupported");
+    };
+    git(path, &["merge-base", "--is-ancestor", "HEAD", baseline])
+        .await
         .map_err(|_| anyhow!("Unmerged commits: checkout HEAD is not merged into main/master"))?;
     let entries = list_worktrees(repo).await?;
     if !entries.iter().any(|w| w.path == path) || entries.first().is_some_and(|w| w.path == path) {

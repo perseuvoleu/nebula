@@ -1,5 +1,5 @@
-pub mod config;
 mod collect;
+pub mod config;
 pub mod git;
 pub mod hooks;
 pub mod lifecycle;

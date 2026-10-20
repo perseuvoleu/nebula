@@ -2927,8 +2927,14 @@ async fn prewarm_worktree_sessions_boots_nothing() {
     else {
         panic!("expected snapshot");
     };
-    let term = terminals.iter().find(|t| t.id == term_id).expect("terminal row");
-    assert!(!term.alive, "the retired prewarm booted a session: {term:#?}");
+    let term = terminals
+        .iter()
+        .find(|t| t.id == term_id)
+        .expect("terminal row");
+    assert!(
+        !term.alive,
+        "the retired prewarm booted a session: {term:#?}"
+    );
 
     write_frame(&mut c3, &ClientRequest::Shutdown)
         .await
@@ -3320,7 +3326,9 @@ async fn read_session_serves_the_last_screen_of_a_reaped_agent() {
         .unwrap_or_else(|| panic!("reaped agent has no saved screen: {events:#?}"));
     assert!(text.contains(marker), "saved screen has the echo: {text:?}");
     assert!(
-        text.lines().next().is_some_and(|l| l.contains("not running")),
+        text.lines()
+            .next()
+            .is_some_and(|l| l.contains("not running")),
         "saved screen is marked stale: {text:?}"
     );
     let cli = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
@@ -3328,7 +3336,10 @@ async fn read_session_serves_the_last_screen_of_a_reaped_agent() {
         .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
         .output()
         .unwrap();
-    assert!(cli.status.success(), "`nebula agent read` on a reaped agent: {cli:?}");
+    assert!(
+        cli.status.success(),
+        "`nebula agent read` on a reaped agent: {cli:?}"
+    );
     assert!(
         String::from_utf8_lossy(&cli.stdout).contains(marker),
         "`nebula agent read` prints the saved screen: {cli:?}"
@@ -4004,9 +4015,24 @@ async fn relay_mirrors_a_host_and_its_sessions_outlive_the_viewer() {
 
     // Collect's ownership check must reach the source daemon and correlate
     // its response, rather than consult the viewer's cached mirror.
-    write_frame(&mut c, &ClientRequest::InspectCollect { req_id: 80, worktree: main_worktree.id.clone(), branch: "main".into() }).await.unwrap();
-    let inspected = read_events_until(&mut c, Duration::from_secs(5), |evs| find_ack(evs, 80).is_some()).await;
-    assert!(matches!(find_ack(&inspected, 80), Some(ServerEvent::Ack { .. })), "{inspected:?}");
+    write_frame(
+        &mut c,
+        &ClientRequest::InspectCollect {
+            req_id: 80,
+            worktree: main_worktree.id.clone(),
+            branch: "main".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let inspected = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        find_ack(evs, 80).is_some()
+    })
+    .await;
+    assert!(
+        matches!(find_ack(&inspected, 80), Some(ServerEvent::Ack { .. })),
+        "{inspected:?}"
+    );
 
     // A terminal on the mirrored worktree: created by the host daemon,
     // attached through ours, echoing through two daemons and a pipe.
@@ -4033,9 +4059,24 @@ async fn relay_mirrors_a_host_and_its_sessions_outlive_the_viewer() {
         panic!("CreateTerminal over the relay failed: {events:#?}");
     };
     let term_id = term_id.clone();
-    write_frame(&mut c, &ClientRequest::InspectCollect { req_id: 81, worktree: main_worktree.id.clone(), branch: "main".into() }).await.unwrap();
-    let inspected = read_events_until(&mut c, Duration::from_secs(5), |evs| find_ack(evs, 81).is_some()).await;
-    assert!(matches!(find_ack(&inspected, 81), Some(ServerEvent::Error { message, .. }) if message.contains("source has busy")), "{inspected:?}");
+    write_frame(
+        &mut c,
+        &ClientRequest::InspectCollect {
+            req_id: 81,
+            worktree: main_worktree.id.clone(),
+            branch: "main".into(),
+        },
+    )
+    .await
+    .unwrap();
+    let inspected = read_events_until(&mut c, Duration::from_secs(5), |evs| {
+        find_ack(evs, 81).is_some()
+    })
+    .await;
+    assert!(
+        matches!(find_ack(&inspected, 81), Some(ServerEvent::Error { message, .. }) if message.contains("source has busy")),
+        "{inspected:?}"
+    );
     let sref = SessionRef::Terminal(term_id.clone());
     write_frame(
         &mut c,
@@ -5835,10 +5876,12 @@ async fn branch_session_cli_rejects_a_checkout_switched_after_resolution() {
     );
 }
 
-
 struct MobileFixtureDaemon(std::process::Child);
 impl Drop for MobileFixtureDaemon {
-    fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 /// Fixtures only: no real agent, trust choice, user process or checkout.
@@ -5857,14 +5900,29 @@ async fn mobile_keys_and_id_deletion_use_the_exact_pty() {
     handshake(&mut c).await;
     let main = add_project_get_main_worktree(&mut c, &repo).await;
     let id = create_agent_get_id(&mut c, &main.id, "fixture", 90).await;
-    let cli = |args: &[&str]| std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
-        .args(args).env("NEBULA_RUNTIME_DIR", &env.runtime_dir).output().unwrap();
+    let cli = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+            .args(args)
+            .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
+            .output()
+            .unwrap()
+    };
     for _ in 0..100 {
-        if ready.exists() { break; }
+        if ready.exists() {
+            break;
+        }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(ready.exists());
-    let result = cli(&["agent", "key", "--project", "repo", "--", id.as_str(), "Space"]);
+    let result = cli(&[
+        "agent",
+        "key",
+        "--project",
+        "repo",
+        "--",
+        id.as_str(),
+        "Space",
+    ]);
     assert!(!result.status.success());
     for key in ["Up", "Down", "Left", "Right", "Enter", "Escape", "Tab"] {
         let result = cli(&["agent", "key", "--project", "repo", "--", id.as_str(), key]);
@@ -5872,22 +5930,62 @@ async fn mobile_keys_and_id_deletion_use_the_exact_pty() {
     }
     let expected = b"\x1b[A\x1b[B\x1b[D\x1b[C\r\x1b\t";
     for _ in 0..100 {
-        if std::fs::read(&capture).unwrap_or_default().len() >= expected.len() { break; }
+        if std::fs::read(&capture).unwrap_or_default().len() >= expected.len() {
+            break;
+        }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(std::fs::read(&capture).unwrap(), expected);
     // A caller cannot use a valid ID to delete a session in another project.
-    write_frame(&mut c, &ClientRequest::DeleteAgentScoped {
-        req_id: 91, id: id.clone(), project: nebula_core::ProjectId("other-project".into()),
-    }).await.unwrap();
-    read_events_until(&mut c, Duration::from_secs(5), |events| events.iter().any(|e|
-        matches!(e, ServerEvent::Error { req_id: Some(91), .. }))).await;
-    write_frame(&mut c, &ClientRequest::RenameAgent { req_id: 92, id: id.clone(), name: "renamed fixture".into() }).await.unwrap();
-    read_events_until(&mut c, Duration::from_secs(5), |events| events.iter().any(|e|
-        matches!(e, ServerEvent::Ack { req_id: 92, .. }))).await;
+    write_frame(
+        &mut c,
+        &ClientRequest::DeleteAgentScoped {
+            req_id: 91,
+            id: id.clone(),
+            project: nebula_core::ProjectId("other-project".into()),
+        },
+    )
+    .await
+    .unwrap();
+    read_events_until(&mut c, Duration::from_secs(5), |events| {
+        events.iter().any(|e| {
+            matches!(
+                e,
+                ServerEvent::Error {
+                    req_id: Some(91),
+                    ..
+                }
+            )
+        })
+    })
+    .await;
+    write_frame(
+        &mut c,
+        &ClientRequest::RenameAgent {
+            req_id: 92,
+            id: id.clone(),
+            name: "renamed fixture".into(),
+        },
+    )
+    .await
+    .unwrap();
+    read_events_until(&mut c, Duration::from_secs(5), |events| {
+        events
+            .iter()
+            .any(|e| matches!(e, ServerEvent::Ack { req_id: 92, .. }))
+    })
+    .await;
     let result = cli(&["agent", "delete-id", "--project", "repo", "--", id.as_str()]);
     assert!(result.status.success(), "{result:?}");
-    let result = cli(&["agent", "key", "--project", "repo", "--", id.as_str(), "Enter"]);
+    let result = cli(&[
+        "agent",
+        "key",
+        "--project",
+        "repo",
+        "--",
+        id.as_str(),
+        "Enter",
+    ]);
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("no longer available"));
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
@@ -5902,20 +6000,59 @@ async fn mobile_safe_removal_preserves_dirty_unmerged_occupied_and_protected_che
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
     let main = add_project_get_main_worktree(&mut c, &repo).await;
-    let cli = |args: &[&str]| std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
-        .args(args).env("NEBULA_RUNTIME_DIR", &env.runtime_dir).output().unwrap();
+    let cli = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+            .args(args)
+            .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
+            .output()
+            .unwrap()
+    };
     let result = cli(&["worktree", "new", "fixture", "--project", "repo"]);
     assert!(result.status.success(), "{result:?}");
     let result = cli(&["worktree", "list", "--project", "repo"]);
     let trees: serde_json::Value = serde_json::from_slice(&result.stdout).unwrap();
-    let tree = trees.as_array().unwrap().iter().find(|w| w["branch"] == "fixture").unwrap();
+    let tree = trees
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["branch"] == "fixture")
+        .unwrap();
     let id = tree["id"].as_str().unwrap();
     let path = tree["path"].as_str().unwrap();
-    let remove = || cli(&["worktree", "delete-safe", "--project", "repo", "--", id, "fixture", path]);
-    let result = cli(&["worktree", "delete-safe", "--project", "repo", "--", main.id.as_str(), "main", main.path.to_str().unwrap()]);
+    let remove = || {
+        cli(&[
+            "worktree",
+            "delete-safe",
+            "--project",
+            "repo",
+            "--",
+            id,
+            "fixture",
+            path,
+        ])
+    };
+    let result = cli(&[
+        "worktree",
+        "delete-safe",
+        "--project",
+        "repo",
+        "--",
+        main.id.as_str(),
+        "main",
+        main.path.to_str().unwrap(),
+    ]);
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("protected"));
-    let result = cli(&["worktree", "delete-safe", "--project", "repo", "--", id, "stale-branch", path]);
+    let result = cli(&[
+        "worktree",
+        "delete-safe",
+        "--project",
+        "repo",
+        "--",
+        id,
+        "stale-branch",
+        path,
+    ]);
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("changed"));
     std::fs::write(Path::new(path).join("untracked"), "keep me").unwrap();
@@ -5926,35 +6063,88 @@ async fn mobile_safe_removal_preserves_dirty_unmerged_occupied_and_protected_che
     let result = remove();
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("Unmerged commits"));
-    let status = std::process::Command::new("git").arg("-C").arg(&repo).args(["merge", "--ff-only", "fixture"]).status().unwrap();
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["merge", "--ff-only", "fixture"])
+        .status()
+        .unwrap();
     assert!(status.success());
-    let agent = create_agent_get_id(&mut c, &nebula_core::WorktreeId(id.into()), "fixture agent", 93).await;
+    let agent = create_agent_get_id(
+        &mut c,
+        &nebula_core::WorktreeId(id.into()),
+        "fixture agent",
+        93,
+    )
+    .await;
     let result = remove();
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("Sessions still exist"));
     assert!(Path::new(path).join("untracked").exists());
-    let result = cli(&["agent", "delete-id", "--project", "repo", "--", agent.as_str()]);
+    let result = cli(&[
+        "agent",
+        "delete-id",
+        "--project",
+        "repo",
+        "--",
+        agent.as_str(),
+    ]);
     assert!(result.status.success(), "{result:?}");
     // Claude's fixture hook installer left ignored configuration: preserve-by-default applies to it too.
     let result = remove();
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("Dirty checkout"));
     std::fs::remove_dir_all(Path::new(path).join(".claude")).unwrap();
-    let result = cli(&["worktree", "delete-safe", "--check", "--project", "repo", "--", id, "fixture", path]);
+    let result = cli(&[
+        "worktree",
+        "delete-safe",
+        "--check",
+        "--project",
+        "repo",
+        "--",
+        id,
+        "fixture",
+        path,
+    ]);
     assert!(result.status.success(), "{result:?}");
     assert!(Path::new(path).exists(), "check is side-effect-free");
-    assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(["worktree", "lock", path]).status().unwrap().success());
+    assert!(std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["worktree", "lock", path])
+        .status()
+        .unwrap()
+        .success());
     let result = remove();
-    assert!(!result.status.success(), "safe removal must not silently unlock and retry: {result:?}");
+    assert!(
+        !result.status.success(),
+        "safe removal must not silently unlock and retry: {result:?}"
+    );
     assert!(Path::new(path).exists());
-    let listing = std::process::Command::new("git").arg("-C").arg(&repo).args(["worktree", "list", "--porcelain"]).output().unwrap();
+    let listing = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .unwrap();
     assert!(String::from_utf8_lossy(&listing.stdout).contains("locked"));
-    assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(["worktree", "unlock", path]).status().unwrap().success());
+    assert!(std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["worktree", "unlock", path])
+        .status()
+        .unwrap()
+        .success());
     let result = remove();
     assert!(result.status.success(), "{result:?}");
     assert!(!Path::new(path).exists());
     assert!(repo.exists());
-    let status = std::process::Command::new("git").arg("-C").arg(&repo).args(["show-ref", "--verify", "refs/heads/fixture"]).status().unwrap();
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo)
+        .args(["show-ref", "--verify", "refs/heads/fixture"])
+        .status()
+        .unwrap();
     assert!(status.success(), "branch is always kept");
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
     wait_for_exit(&mut daemon.0);
@@ -5967,14 +6157,55 @@ async fn protocol29_handshake_accepts_repeated_probes_and_rejects_protocol28() {
     let _daemon = MobileFixtureDaemon(env.spawn_daemon());
     let mut c = connect(&env.sock()).await;
     for _ in 0..2 {
-        write_frame(&mut c, &ClientRequest::Hello { protocol_version: 29 }).await.unwrap();
-        let reply = tokio::time::timeout(Duration::from_secs(3), read_frame::<ServerEvent, _>(&mut c)).await.unwrap().unwrap();
-        assert!(matches!(reply, Some(ServerEvent::HelloOk { protocol_version: 29, .. })), "{reply:?}");
+        write_frame(
+            &mut c,
+            &ClientRequest::Hello {
+                protocol_version: 29,
+            },
+        )
+        .await
+        .unwrap();
+        let reply =
+            tokio::time::timeout(Duration::from_secs(3), read_frame::<ServerEvent, _>(&mut c))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(
+            matches!(
+                reply,
+                Some(ServerEvent::HelloOk {
+                    protocol_version: 29,
+                    ..
+                })
+            ),
+            "{reply:?}"
+        );
     }
     let mut old = connect(&env.sock()).await;
-    write_frame(&mut old, &ClientRequest::Hello { protocol_version: 28 }).await.unwrap();
-    let reply = tokio::time::timeout(Duration::from_secs(3), read_frame::<ServerEvent, _>(&mut old)).await.unwrap().unwrap();
-    assert!(matches!(reply, Some(ServerEvent::Incompatible { daemon_protocol_version: 29 })), "{reply:?}");
+    write_frame(
+        &mut old,
+        &ClientRequest::Hello {
+            protocol_version: 28,
+        },
+    )
+    .await
+    .unwrap();
+    let reply = tokio::time::timeout(
+        Duration::from_secs(3),
+        read_frame::<ServerEvent, _>(&mut old),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(
+        matches!(
+            reply,
+            Some(ServerEvent::Incompatible {
+                daemon_protocol_version: 29
+            })
+        ),
+        "{reply:?}"
+    );
 }
 
 /// A fake agent CLI that records every byte its PTY hands it. `raw` picks
@@ -5999,7 +6230,10 @@ fn input_recorder(env: &TestEnv, raw: bool) -> (PathBuf, PathBuf, PathBuf) {
 
 /// 4,200 bytes on one line, every word distinct so a cut shows where it fell.
 fn long_single_line_message() -> String {
-    (0..700).map(|i| format!("w{i:04}")).collect::<Vec<_>>().join(" ")
+    (0..700)
+        .map(|i| format!("w{i:04}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// A tty hands a raw-mode reader a long line in pieces (1,022 bytes each on
@@ -6016,7 +6250,9 @@ async fn agent_send_delivers_a_long_line_as_one_bracketed_paste() {
     let main = add_project_get_main_worktree(&mut c, &repo).await;
     create_agent_get_id(&mut c, &main.id, "fixture", 90).await;
     for _ in 0..100 {
-        if ready.exists() { break; }
+        if ready.exists() {
+            break;
+        }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(ready.exists());
@@ -6037,7 +6273,9 @@ async fn agent_send_delivers_a_long_line_as_one_bracketed_paste() {
         assert!(result.status.success(), "{result:?}");
         expected.extend_from_slice(on_the_wire.as_bytes());
         for _ in 0..100 {
-            if std::fs::read(&capture).unwrap_or_default().len() >= expected.len() { break; }
+            if std::fs::read(&capture).unwrap_or_default().len() >= expected.len() {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert_eq!(
@@ -6062,18 +6300,31 @@ async fn agent_send_refuses_a_long_message_the_tty_would_drop() {
     let main = add_project_get_main_worktree(&mut c, &repo).await;
     create_agent_get_id(&mut c, &main.id, "fixture", 90).await;
     for _ in 0..100 {
-        if ready.exists() { break; }
+        if ready.exists() {
+            break;
+        }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(ready.exists());
 
     let result = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
-        .args(["agent", "send", "--project", "repo", "--", "fixture", &long_single_line_message()])
+        .args([
+            "agent",
+            "send",
+            "--project",
+            "repo",
+            "--",
+            "fixture",
+            &long_single_line_message(),
+        ])
         .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
         .output()
         .unwrap();
     assert!(!result.status.success(), "{result:?}");
-    assert!(String::from_utf8_lossy(&result.stderr).contains("line mode"), "{result:?}");
+    assert!(
+        String::from_utf8_lossy(&result.stderr).contains("line mode"),
+        "{result:?}"
+    );
     assert_eq!(String::from_utf8_lossy(&result.stdout), "");
     assert_eq!(std::fs::read(&capture).unwrap_or_default(), b"");
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();

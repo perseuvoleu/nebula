@@ -37,7 +37,14 @@ pub const CODEX_EFFORTS: &[&str] = &["default", "minimal", "low", "medium", "hig
 /// Pi's `--model` takes a fuzzy pattern resolved against whatever providers
 /// the user configured, so this list is just common picks — hand-edited
 /// configs can name any pattern.
-pub const PI_MODELS: &[&str] = &["default", "gpt-5.6-sol", "gpt-5.5", "fable", "opus"];
+pub const PI_MODELS: &[&str] = &[
+    "default",
+    "gpt-5.6-sol",
+    "gpt-5.5",
+    "fable",
+    "opus",
+    "deepseek-flash",
+];
 /// Pi calls it "thinking level" (`--thinking`); it plays the effort role.
 pub const PI_EFFORTS: &[&str] = &[
     "default", "off", "minimal", "low", "medium", "high", "xhigh", "max",
@@ -812,7 +819,10 @@ mod tests {
         let mut cfg = Config::default();
         assert_eq!(cfg.auto_archive_after, "24h");
         let (tab, row) = locate(SettingKind::AutoArchiveAfter).unwrap();
-        assert_eq!(locate(SettingKind::SessionIdleTimeout).unwrap(), (tab, row - 1));
+        assert_eq!(
+            locate(SettingKind::SessionIdleTimeout).unwrap(),
+            (tab, row - 1)
+        );
         cfg.cycle(tab, row, 1);
         assert_eq!(cfg.auto_archive_after, "72h");
         cfg.cycle(tab, row, -2);
@@ -977,7 +987,10 @@ mod tests {
         assert_eq!(saved["palette_enter_attaches"], false);
         assert_eq!(saved["git_init_on_create"], true);
         assert_eq!(saved["recent_window"], "5m", "a retired key is left alone");
-        assert_eq!(saved["prewarm_sessions"], true, "a retired key is left alone");
+        assert_eq!(
+            saved["prewarm_sessions"], true,
+            "a retired key is left alone"
+        );
         assert_eq!(saved["future_daemon_flag"], true);
     }
 
