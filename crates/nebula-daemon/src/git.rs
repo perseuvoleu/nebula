@@ -528,19 +528,234 @@ fn cleanup_partial_node_modules(path: &Path) -> Option<String> {
     }
 }
 
-/// Fail closed: even ignored files are user data, and only main/master is a merge baseline.
-pub async fn safe_remove_worktree(repo: &Path, path: &Path, branch: &str, delete: bool) -> Result<()> {
-    if current_branch(path).await? != branch {
-        bail!("Checkout branch changed; refresh before confirming");
+/// One safe-removal criterion's outcome: what passed, or why it refuses.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Verdict {
+    Pass(String),
+    Refuse(String),
+}
+
+/// How many paths or commits a refusal names before it summarizes the rest.
+const LISTED: usize = 10;
+
+fn listed(items: &[String]) -> String {
+    let mut out = items.iter().take(LISTED).cloned().collect::<Vec<_>>().join(", ");
+    if items.len() > LISTED {
+        out.push_str(&format!(" … and {} more", items.len() - LISTED));
     }
-    if !git(path, &["status", "--porcelain", "--untracked-files=all", "--ignored"]).await?.trim().is_empty() {
-        bail!("Dirty checkout (including untracked/ignored files); preserve or remove those files manually first");
+    out
+}
+
+/// Ignored paths wt-bootstrap.sh and nebula's own seeding recreate on
+/// demand: installed dependencies and build output.
+const REPRODUCIBLE_DIRS: &[&str] =
+    &["node_modules", "dist", "build", "out", "generated", ".svelte-kit", ".next", ".turbo", "target"];
+const REPRODUCIBLE_SUFFIXES: &[&str] = &[".d.ts", ".tsbuildinfo"];
+
+/// Collect ignored `rel` (under `root`) that is user data. Symlinks only
+/// point elsewhere, and an env file identical to the primary's is a copy.
+fn ignored_user_data(primary: &Path, root: &Path, rel: &Path, found: &mut Vec<String>) {
+    if found.len() > LISTED {
+        return;
     }
-    let baseline = if branch_exists(repo, "main").await { "refs/heads/main" }
-        else if branch_exists(repo, "master").await { "refs/heads/master" }
-        else { bail!("No main/master merge baseline; safe removal unsupported"); };
-    git(path, &["merge-base", "--is-ancestor", "HEAD", baseline]).await
-        .map_err(|_| anyhow!("Unmerged commits: checkout HEAD is not merged into main/master"))?;
+    let full = root.join(rel);
+    let Ok(meta) = std::fs::symlink_metadata(&full) else { return };
+    let name = rel.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    if meta.file_type().is_symlink() {
+        return;
+    }
+    if meta.is_dir() {
+        if REPRODUCIBLE_DIRS.contains(&name.as_str()) {
+            return;
+        }
+        match std::fs::read_dir(&full) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    ignored_user_data(primary, root, &rel.join(entry.file_name()), found);
+                }
+            }
+            Err(_) => found.push(rel.display().to_string()),
+        }
+        return;
+    }
+    if REPRODUCIBLE_SUFFIXES.iter().any(|s| name.ends_with(s)) {
+        return;
+    }
+    let env_copy = (name == ".env" || name.starts_with(".env."))
+        && matches!((std::fs::read(primary.join(rel)), std::fs::read(&full)), (Ok(a), Ok(b)) if a == b);
+    if !env_copy {
+        found.push(rel.display().to_string());
+    }
+}
+
+/// Untracked and modified files always refuse; ignored ones only when they
+/// are user data (a remote checkout can't be inspected, so all of them).
+pub async fn removal_files(primary: &Path, path: &Path) -> Result<Verdict> {
+    let status = git(path, &["status", "--porcelain", "-z", "--untracked-files=all"]).await?;
+    let mut fields = status.split('\0').filter(|f| !f.is_empty());
+    let mut dirty = Vec::new();
+    while let Some(entry) = fields.next() {
+        if entry.starts_with('R') || entry.starts_with('C') {
+            fields.next();
+        }
+        dirty.push(entry.get(3..).unwrap_or(entry).to_string());
+    }
+    let ignored = git(path, &["ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--directory"]).await?;
+    let ignored: Vec<&str> = ignored.split('\0').map(|p| p.trim_end_matches('/')).filter(|p| !p.is_empty()).collect();
+    let mut user_data = Vec::new();
+    for rel in &ignored {
+        if nebula_core::remote::is_remote(path) {
+            user_data.push(rel.to_string());
+        } else {
+            ignored_user_data(primary, path, Path::new(rel), &mut user_data);
+        }
+    }
+    if !dirty.is_empty() || !user_data.is_empty() {
+        let mut parts = Vec::new();
+        if !dirty.is_empty() {
+            parts.push(format!("untracked/modified: {}", listed(&dirty)));
+        }
+        if !user_data.is_empty() {
+            parts.push(format!("ignored user data: {}", listed(&user_data)));
+        }
+        return Ok(Verdict::Refuse(format!(
+            "Dirty checkout ({}); preserve or remove those files manually first",
+            parts.join("; ")
+        )));
+    }
+    Ok(Verdict::Pass(if ignored.is_empty() {
+        "clean".into()
+    } else {
+        format!("clean; ignored paths are links, copies or setup output: {}", listed(&ignored.iter().map(|p| p.to_string()).collect::<Vec<_>>()))
+    }))
+}
+
+/// The ref a branch is checked against, and where that choice came from.
+#[derive(Debug, Clone)]
+pub struct Baseline {
+    pub refname: String,
+    pub source: String,
+}
+
+impl Baseline {
+    pub fn short(&self) -> &str {
+        short_ref(&self.refname)
+    }
+}
+
+fn short_ref(refname: &str) -> &str {
+    refname.strip_prefix("refs/heads/").or_else(|| refname.strip_prefix("refs/remotes/")).unwrap_or(refname)
+}
+
+async fn ref_exists(repo: &Path, refname: &str) -> bool {
+    git(repo, &["show-ref", "--verify", "--quiet", refname]).await.is_ok()
+}
+
+async fn is_ancestor(repo: &Path, older: &str, newer: &str) -> bool {
+    git(repo, &["merge-base", "--is-ancestor", older, newer]).await.is_ok()
+}
+
+/// A branch name as its freshest ref: a local branch yields to its upstream
+/// unless the local one is ahead; a remote-tracking name stands as is.
+async fn branch_ref(repo: &Path, name: &str) -> Option<String> {
+    let local = format!("refs/heads/{name}");
+    if ref_exists(repo, &local).await {
+        let upstream = git(repo, &["rev-parse", "--symbolic-full-name", &format!("{name}@{{upstream}}")]).await.ok();
+        return Some(match upstream.map(|u| u.trim().to_string()).filter(|u| u.starts_with("refs/remotes/")) {
+            Some(upstream) if !is_ancestor(repo, &upstream, &local).await || is_ancestor(repo, &local, &upstream).await => upstream,
+            _ => local,
+        });
+    }
+    let remote = format!("refs/remotes/{name}");
+    ref_exists(repo, &remote).await.then_some(remote)
+}
+
+/// The merge baseline: the base the checkout was created from, else the
+/// project's `nebula.base` git config, else a remote's default branch
+/// (`upstream` before `origin`), else local main/master. Never fetches.
+pub async fn merge_baseline(repo: &Path, created_from: Option<&str>) -> Option<Baseline> {
+    if let Some(from) = created_from {
+        if let Some(refname) = branch_ref(repo, from).await {
+            return Some(Baseline { refname, source: format!("created_from `{from}`") });
+        }
+    }
+    if let Ok(configured) = git(repo, &["config", "--get", "nebula.base"]).await {
+        let configured = configured.trim();
+        if let Some(refname) = branch_ref(repo, configured).await {
+            return Some(Baseline { refname, source: format!("git config nebula.base `{configured}`") });
+        }
+    }
+    let heads = git(repo, &["for-each-ref", "--format=%(refname) %(symref)", "refs/remotes/*/HEAD"]).await.unwrap_or_default();
+    let mut defaults: Vec<(&str, &str)> = heads.lines().filter_map(|l| l.split_once(' ')).filter(|(_, target)| !target.is_empty()).collect();
+    defaults.sort_by_key(|(head, _)| match *head {
+        "refs/remotes/upstream/HEAD" => 0,
+        "refs/remotes/origin/HEAD" => 1,
+        _ => 2,
+    });
+    for (head, target) in defaults {
+        if ref_exists(repo, target).await {
+            return Some(Baseline { refname: target.to_string(), source: format!("remote default {}", short_ref(head)) });
+        }
+    }
+    for name in ["main", "master"] {
+        let local = format!("refs/heads/{name}");
+        if ref_exists(repo, &local).await {
+            return Some(Baseline { refname: local, source: format!("local {name}") });
+        }
+    }
+    None
+}
+
+/// Whether merging HEAD into `base` leaves `base`'s tree unchanged — a squash
+/// merge. `merge-tree --write-tree` needs git 2.38; older git falls back to
+/// the trivial three-way form, whose output is empty exactly then.
+async fn merge_keeps_tree(path: &Path, base: &str) -> bool {
+    let Ok(base_tree) = git(path, &["rev-parse", &format!("{base}^{{tree}}")]).await else { return false };
+    let (program, argv) = nebula_core::remote::git_command(path, &["merge-tree", "--write-tree", base, "HEAD"]);
+    let Ok(out) = Command::new(&program).args(&argv).output().await else { return false };
+    match out.status.code() {
+        Some(0) => String::from_utf8_lossy(&out.stdout).lines().next() == Some(base_tree.trim()),
+        Some(1) => false,
+        _ => {
+            let Ok(merge_base) = git(path, &["merge-base", base, "HEAD"]).await else { return false };
+            git(path, &["merge-tree", merge_base.trim(), base, "HEAD"]).await.is_ok_and(|o| o.trim().is_empty())
+        }
+    }
+}
+
+/// HEAD is merged into `base` when it is an ancestor, when every commit of
+/// `base..HEAD` is already applied by patch-id (rebase merge), or when
+/// merging it changes nothing (squash merge).
+pub async fn merged_into(path: &Path, base: &str) -> Result<Verdict> {
+    let short = short_ref(base);
+    if is_ancestor(path, "HEAD", base).await {
+        return Ok(Verdict::Pass(format!("ancestor: HEAD is contained in {short}")));
+    }
+    let cherry = git(path, &["cherry", "-v", base, "HEAD"]).await?;
+    let missing: Vec<String> = cherry
+        .lines()
+        .filter_map(|l| l.strip_prefix("+ "))
+        .map(|l| match l.split_once(' ') {
+            Some((sha, subject)) => format!("{} {subject}", &sha[..sha.len().min(9)]),
+            None => l.to_string(),
+        })
+        .collect();
+    if missing.is_empty() {
+        return Ok(Verdict::Pass(format!("patch-id: every commit of {short}..HEAD is already applied to {short}")));
+    }
+    if merge_keeps_tree(path, base).await {
+        return Ok(Verdict::Pass(format!("tree: merging HEAD into {short} leaves its tree unchanged")));
+    }
+    Ok(Verdict::Refuse(format!(
+        "Unmerged commits: {} of {short}..HEAD not found in {short}: {}",
+        missing.len(),
+        listed(&missing)
+    )))
+}
+
+/// Remove a registered linked checkout. Never the primary, never with
+/// `--force`, and a locked checkout stays.
+pub async fn safe_remove_worktree(repo: &Path, path: &Path, delete: bool) -> Result<()> {
     let entries = list_worktrees(repo).await?;
     if !entries.iter().any(|w| w.path == path) || entries.first().is_some_and(|w| w.path == path) {
         bail!("Primary or unregistered checkout is protected");
@@ -635,6 +850,134 @@ mod tests {
         // A real git that says "not a repository" must keep saying so.
         let err = repo_toplevel(tmp.path()).await.unwrap_err();
         assert!(!is_missing(&err), "{err:#}");
+    }
+
+    async fn commit(dir: &Path, file: &str, contents: &str, msg: &str) {
+        std::fs::write(dir.join(file), contents).unwrap();
+        git(dir, &["add", file]).await.unwrap();
+        git(dir, &["commit", "-m", msg]).await.unwrap();
+    }
+
+    fn refusal(verdict: Verdict) -> String {
+        match verdict {
+            Verdict::Refuse(reason) => reason,
+            Verdict::Pass(detail) => panic!("expected a refusal, got pass: {detail}"),
+        }
+    }
+
+    fn pass(verdict: Verdict) -> String {
+        match verdict {
+            Verdict::Pass(detail) => detail,
+            Verdict::Refuse(reason) => panic!("expected a pass, got refusal: {reason}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn removal_files_pass_setup_output_but_refuse_user_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        commit(&repo, ".gitignore", "node_modules\ndist\n.env\n.scratch\n", "ignore").await;
+        std::fs::write(repo.join(".env"), "A=1\n").unwrap();
+        std::fs::create_dir(repo.join(".scratch")).unwrap();
+        std::fs::write(repo.join(".scratch/plan.md"), "plan").unwrap();
+        let wt = add_worktree(&repo, "feature", None).await.unwrap();
+        std::fs::create_dir_all(wt.join("node_modules/pkg")).unwrap();
+        std::fs::write(wt.join("node_modules/pkg/index.js"), "x").unwrap();
+        std::fs::create_dir(wt.join("dist")).unwrap();
+        std::fs::write(wt.join("dist/out.js"), "x").unwrap();
+        std::fs::write(wt.join(".env"), "A=1\n").unwrap();
+        std::fs::create_dir(wt.join(".scratch")).unwrap();
+        std::os::unix::fs::symlink(repo.join(".scratch/plan.md"), wt.join(".scratch/plan.md")).unwrap();
+
+        let detail = pass(removal_files(&repo, &wt).await.unwrap());
+        assert!(detail.contains("node_modules") && detail.contains("dist"), "{detail}");
+
+        std::fs::write(wt.join(".scratch/notes.md"), "mine").unwrap();
+        std::fs::write(wt.join(".env"), "A=2\n").unwrap();
+        let reason = refusal(removal_files(&repo, &wt).await.unwrap());
+        assert!(reason.starts_with("Dirty checkout"), "{reason}");
+        assert!(reason.contains(".scratch/notes.md") && reason.contains(".env"), "{reason}");
+        assert!(!reason.contains("plan.md") && !reason.contains("node_modules"), "{reason}");
+
+        std::fs::remove_file(wt.join(".scratch/notes.md")).unwrap();
+        std::fs::write(wt.join(".env"), "A=1\n").unwrap();
+        std::fs::write(wt.join("new.txt"), "untracked").unwrap();
+        std::fs::write(wt.join(".gitignore"), "changed").unwrap();
+        let reason = refusal(removal_files(&repo, &wt).await.unwrap());
+        assert!(reason.contains("new.txt") && reason.contains(".gitignore"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn merge_baseline_follows_created_from_then_config_then_remote_head_then_main() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        git(&repo, &["remote", "add", "upstream", "/nonexistent"]).await.unwrap();
+        git(&repo, &["update-ref", "refs/remotes/upstream/develop", "HEAD"]).await.unwrap();
+        git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]).await.unwrap();
+        git(&repo, &["branch", "develop", "HEAD"]).await.unwrap();
+        git(&repo, &["config", "branch.develop.remote", "upstream"]).await.unwrap();
+        git(&repo, &["config", "branch.develop.merge", "refs/heads/develop"]).await.unwrap();
+        commit(&repo, "f", "1", "upstream moved").await;
+        git(&repo, &["update-ref", "refs/remotes/upstream/develop", "HEAD"]).await.unwrap();
+
+        let base = merge_baseline(&repo, Some("upstream/develop")).await.unwrap();
+        assert_eq!(base.refname, "refs/remotes/upstream/develop");
+        assert!(base.source.contains("created_from"), "{}", base.source);
+        let base = merge_baseline(&repo, Some("develop")).await.unwrap();
+        assert_eq!(base.refname, "refs/remotes/upstream/develop", "a stale local branch yields to its upstream");
+
+        git(&repo, &["config", "nebula.base", "develop"]).await.unwrap();
+        let base = merge_baseline(&repo, None).await.unwrap();
+        assert_eq!(base.refname, "refs/remotes/upstream/develop");
+        assert!(base.source.contains("nebula.base"), "{}", base.source);
+        git(&repo, &["config", "--unset", "nebula.base"]).await.unwrap();
+
+        git(&repo, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"]).await.unwrap();
+        let base = merge_baseline(&repo, Some("deleted-branch")).await.unwrap();
+        assert_eq!(base.refname, "refs/remotes/origin/main");
+        assert!(base.source.contains("remote default"), "{}", base.source);
+        git(&repo, &["symbolic-ref", "--delete", "refs/remotes/origin/HEAD"]).await.unwrap();
+
+        let base = merge_baseline(&repo, None).await.unwrap();
+        assert_eq!(base.refname, "refs/heads/main");
+    }
+
+    #[tokio::test]
+    async fn merged_into_accepts_ancestor_rebase_and_squash_and_lists_the_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo).await;
+        let wt = add_worktree(&repo, "feature", None).await.unwrap();
+        commit(&wt, "a", "a", "feature a").await;
+        commit(&wt, "b", "b", "feature b").await;
+
+        let reason = refusal(merged_into(&wt, "refs/heads/main").await.unwrap());
+        assert!(reason.starts_with("Unmerged commits"), "{reason}");
+        assert!(reason.contains("feature a") && reason.contains("feature b"), "{reason}");
+
+        commit(&repo, "other", "o", "main moved").await;
+        git(&repo, &["cherry-pick", "feature~1", "feature"]).await.unwrap();
+        let detail = pass(merged_into(&wt, "refs/heads/main").await.unwrap());
+        assert!(detail.contains("patch-id"), "{detail}");
+
+        git(&repo, &["reset", "--hard", "HEAD~2"]).await.unwrap();
+        git(&repo, &["merge", "--squash", "feature"]).await.unwrap();
+        git(&repo, &["commit", "-m", "squashed feature"]).await.unwrap();
+        let detail = pass(merged_into(&wt, "refs/heads/main").await.unwrap());
+        assert!(detail.contains("tree"), "{detail}");
+
+        commit(&wt, "c", "c", "feature c").await;
+        let reason = refusal(merged_into(&wt, "refs/heads/main").await.unwrap());
+        assert!(reason.contains("feature c"), "{reason}");
+
+        git(&repo, &["reset", "--hard", "feature"]).await.unwrap();
+        let detail = pass(merged_into(&wt, "refs/heads/main").await.unwrap());
+        assert!(detail.contains("ancestor"), "{detail}");
     }
 
     #[tokio::test]

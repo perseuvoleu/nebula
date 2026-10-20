@@ -1547,11 +1547,64 @@ impl Daemon {
         Ok(EntityId::Worktree(worktree.id))
     }
 
+    /// The sessions criterion of a safe removal. Archived agents and exited
+    /// terminals go with the checkout only under `with_archived`; live or
+    /// unarchived sessions always refuse. Returns what removal would delete.
+    fn removal_sessions(&self, id: &WorktreeId, agents: &[Agent], terminals: &[TerminalTab], with_archived: bool) -> (git::Verdict, Vec<SessionRef>) {
+        let mut live = 0;
+        let mut unarchived = 0;
+        let mut archived = 0;
+        let mut finished = 0;
+        let mut leftovers = Vec::new();
+        for a in agents.iter().filter(|a| a.worktree_id == *id) {
+            let sref = SessionRef::Agent(a.id.clone());
+            if self.is_alive(&sref) {
+                live += 1;
+            } else if !a.archived {
+                unarchived += 1;
+            } else {
+                archived += 1;
+                leftovers.push(sref);
+            }
+        }
+        for t in terminals.iter().filter(|t| t.worktree_id == *id) {
+            let sref = SessionRef::Terminal(t.id.clone());
+            if self.is_alive(&sref) {
+                live += 1;
+            } else {
+                finished += 1;
+                leftovers.push(sref);
+            }
+        }
+        let stored = format!("{archived} archived session(s) and {finished} finished terminal(s)");
+        let verdict = if live + unarchived > 0 {
+            git::Verdict::Refuse(format!("Sessions still exist: {live} live, {unarchived} stopped but not archived (and {stored}); stop and archive or delete them first"))
+        } else if leftovers.is_empty() {
+            git::Verdict::Pass("none".into())
+        } else if !with_archived {
+            git::Verdict::Refuse(format!("Sessions still exist: {stored}; pass --with-archived to delete them with the checkout"))
+        } else {
+            git::Verdict::Pass(format!("{stored} go with it (--with-archived)"))
+        };
+        (verdict, leftovers)
+    }
+
+    fn delete_sessions(self: &Arc<Self>, srefs: &[SessionRef]) -> Result<()> {
+        for sref in srefs {
+            match sref {
+                SessionRef::Agent(id) => self.delete_agent(id)?,
+                SessionRef::Terminal(id) => self.close_terminal(id)?,
+            }
+        }
+        Ok(())
+    }
+
     /// Unlike legacy delete, never stops user sessions or deletes a branch.
+    /// Every criterion is evaluated and reported; removal needs all to pass.
     // Checkout lifecycle operations take worktree_ops before exclusive execution.
     // Create/move/reparent/prewarm hold shared execution so no session can arrive
     // between the safety check and removal; ordinary reconciliation can continue.
-    pub async fn check_worktree_removal(self: &Arc<Self>, id: &WorktreeId, branch: &str, path: &Path, delete: bool) -> Result<()> {
+    pub async fn check_worktree_removal(self: &Arc<Self>, id: &WorktreeId, branch: &str, path: &Path, delete: bool, with_archived: bool) -> Result<RemovalReport> {
         let _ops = self.worktree_ops.lock().await;
         let _execution = self.checkout_execution.write().await;
         let w = self.store.get_worktree(id)?.context("Checkout no longer available")?;
@@ -1560,17 +1613,63 @@ impl Daemon {
             bail!("Primary checkout and main/master are protected");
         }
         if w.branch != branch || w.path != path { bail!("Checkout changed; refresh before confirming"); }
-        let (_, _, agents, terminals) = self.store.load_tree()?;
-        if agents.iter().any(|a| a.worktree_id == *id) || terminals.iter().any(|t| t.worktree_id == *id) {
-            bail!("Sessions still exist in this checkout (including archived sessions and terminals); delete or move them explicitly first");
+        if git::current_branch(path).await? != branch {
+            bail!("Checkout branch changed; refresh before confirming");
         }
-        git::safe_remove_worktree(&project.repo_path, &w.path, branch, delete).await?;
-        if delete {
+        git::safe_remove_worktree(&project.repo_path, &w.path, false).await?;
+        let mut report = RemovalReport::default();
+        report.push("checkout", git::Verdict::Pass(format!("{} on {branch}; the branch is kept", w.path.display())));
+        report.push("files", git::removal_files(&project.repo_path, path).await?);
+        match git::merge_baseline(&project.repo_path, w.created_from.as_deref()).await {
+            Some(base) => {
+                report.push("base", git::Verdict::Pass(format!("{} (from {})", base.short(), base.source)));
+                report.push("merged", git::merged_into(path, &base.refname).await?);
+            }
+            None => report.push("base", git::Verdict::Refuse("Unmerged commits: no merge baseline (created_from, nebula.base, remote default branch or main/master)".into())),
+        }
+        let (_, _, agents, terminals) = self.store.load_tree()?;
+        let (verdict, leftovers) = self.removal_sessions(id, &agents, &terminals, with_archived);
+        report.push("sessions", verdict);
+        if delete && report.refusals.is_empty() {
+            git::safe_remove_worktree(&project.repo_path, &w.path, true).await?;
+            self.delete_sessions(&leftovers)?;
             self.kill_prewarmed_in(std::slice::from_ref(id));
             self.store.delete_worktree(id)?;
             self.broadcast(ServerEvent::EntityRemoved { id: EntityId::Worktree(id.clone()) });
         }
-        Ok(())
+        Ok(report)
+    }
+
+    /// Drop rows whose checkout directory and git worktree entry are both
+    /// gone. The sync keeps such a row while sessions point at it; here
+    /// archived ones go with it under `with_archived`, live ones never do.
+    pub async fn prune_worktrees(self: &Arc<Self>, project_id: &ProjectId, delete: bool, with_archived: bool) -> Result<RemovalReport> {
+        let _ops = self.worktree_ops.lock().await;
+        let _execution = self.checkout_execution.write().await;
+        let project = self.store.get_project(project_id)?.context("Project unavailable")?;
+        if nebula_core::remote::is_remote(&project.repo_path) {
+            bail!("prune runs on the host that owns the checkouts; use the remote project's own nebula");
+        }
+        let entries = git::list_worktrees(&project.repo_path).await?;
+        let (_, worktrees, agents, terminals) = self.store.load_tree()?;
+        let mut report = RemovalReport::default();
+        for w in worktrees.iter().filter(|w| w.project_id == *project_id && !w.is_main) {
+            if w.path.exists() || entries.iter().any(|e| e.path == w.path) {
+                continue;
+            }
+            let (verdict, leftovers) = self.removal_sessions(&w.id, &agents, &terminals, with_archived);
+            let removable = matches!(verdict, git::Verdict::Pass(_));
+            report.push(&format!("ghost {} {}", w.branch, w.path.display()), verdict);
+            if delete && removable {
+                self.delete_sessions(&leftovers)?;
+                self.store.delete_worktree(&w.id)?;
+                self.broadcast(ServerEvent::EntityRemoved { id: EntityId::Worktree(w.id.clone()) });
+            }
+        }
+        if report.lines.is_empty() {
+            report.lines.push("no ghost rows: every row has its checkout or git worktree entry".into());
+        }
+        Ok(report)
     }
 
     pub async fn delete_worktree(self: &Arc<Self>, id: &WorktreeId, force: bool) -> Result<()> {
@@ -3412,6 +3511,26 @@ impl Daemon {
                 }
             }
         });
+    }
+}
+
+/// Per-criterion verdict lines of a safe removal or prune; `refusals` holds
+/// the reasons of the ones that refused.
+#[derive(Debug, Default)]
+pub struct RemovalReport {
+    pub lines: Vec<String>,
+    pub refusals: Vec<String>,
+}
+
+impl RemovalReport {
+    fn push(&mut self, criterion: &str, verdict: git::Verdict) {
+        match verdict {
+            git::Verdict::Pass(detail) => self.lines.push(format!("{criterion}: ok — {detail}")),
+            git::Verdict::Refuse(reason) => {
+                self.lines.push(format!("{criterion}: REFUSE — {reason}"));
+                self.refusals.push(reason);
+            }
+        }
     }
 }
 

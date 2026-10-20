@@ -150,6 +150,18 @@ pub enum ClientRequest {
         branch: String,
         path: PathBuf,
         delete: bool,
+        /// Some: reply with a per-criterion `Report` before the Ack/Error.
+        /// Skipped when None so protocol-29 requests keep their wire shape.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        report: Option<RemovalFlags>,
+    },
+    /// Drop worktree rows whose checkout directory and git worktree entry
+    /// are both gone; replies with a `Report` naming each one first.
+    PruneWorktrees {
+        req_id: u64,
+        project: ProjectId,
+        delete: bool,
+        with_archived: bool,
     },
     DeleteWorktree {
         req_id: u64,
@@ -422,6 +434,13 @@ pub enum ClientRequest {
 /// lexicographically, so "arrived since" is a string compare and nebula
 /// never has to consult a clock. Empty means the PR was opened while its
 /// conversation was still empty.
+/// CLI options of a safe worktree removal.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemovalFlags {
+    /// Delete archived sessions and exited terminals with the checkout.
+    pub with_archived: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrSeen {
     pub url: String,
@@ -485,6 +504,12 @@ pub enum ServerEvent {
     Error {
         req_id: Option<u64>,
         message: String,
+    },
+    /// Verdict lines for a request that asked for them (safe worktree
+    /// removal, prune); precedes that request's Ack or Error.
+    Report {
+        req_id: u64,
+        lines: Vec<String>,
     },
 
     // -- deltas (pushed to all subscribers) --
