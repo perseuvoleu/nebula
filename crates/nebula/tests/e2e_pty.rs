@@ -6889,12 +6889,16 @@ async fn agent_new_writer_exits_2_naming_the_live_holder_unless_forced() {
         "{second:?}"
     );
 
-    for (name, flags) in [
-        ("forced", &["--writer", "--force-writer"][..]),
-        ("reviewer", &[]),
+    for (name, flags, writer) in [
+        ("forced", &["--writer", "--force-writer"][..], true),
+        ("forced-alone", &["--force-writer"], true),
+        ("reviewer", &[], false),
     ] {
         let out = spawn(name, flags);
         assert!(out.status.success(), "{name}: {out:?}");
+        let show = cli(&["agent", "show", name]);
+        let shown: serde_json::Value = serde_json::from_slice(&show.stdout).unwrap();
+        assert_eq!(shown["writer"], writer, "{name}: {show:?}");
     }
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
     wait_for_exit(&mut daemon.0);
