@@ -390,9 +390,9 @@ enum AgentCommand {
         /// while another live session holds that mark.
         #[arg(long)]
         writer: bool,
-        /// Spawn the writer alongside a live one, after the user approved
-        /// two writers on the checkout.
-        #[arg(long, requires = "writer")]
+        /// Spawn as the writer alongside a live one, after the user approved
+        /// two writers on the checkout; implies --writer.
+        #[arg(long)]
         force_writer: bool,
     },
     /// Block until workers settle out of running (finished, needs_feedback,
