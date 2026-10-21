@@ -18,6 +18,10 @@ pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
 /// that resends `CheckoutPrimary` with `stop_busy`.
 pub const BUSY_SESSIONS_REFUSAL: &str = "primary has sessions on";
 
+/// Sits in the `Error` a `CreateAgent` with `WriterClaim::Exclusive` gets
+/// while another live session is the checkout's writer; the CLI exits 2 on it.
+pub const WRITER_HELD_REFUSAL: &str = "is the writer on";
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SessionRef {
     Agent(AgentId),

@@ -12,6 +12,7 @@ use nebula_core::{
     Agent, AgentId, AgentKind, AgentStatus, Entity, EntityId, Link, LinkId, Note, NoteId,
     NoteOwner, Project, ProjectId, ServerEvent, SessionRef, TerminalId, TerminalTab, Todo, TodoId,
     TodoOwner, Workspace, WorkspaceId, Worktree, WorktreeId, WriterClaim, BUSY_SESSIONS_REFUSAL,
+    WRITER_HELD_REFUSAL,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -90,6 +91,8 @@ pub struct Daemon {
     worktree_ops: tokio::sync::Mutex<()>,
     /// Orders physical checkout changes against session creation/resume.
     checkout_execution: tokio::sync::RwLock<()>,
+    /// Makes a writer spawn's holder check and its row insert one step.
+    writer_claims: tokio::sync::Mutex<()>,
     stop_deadline: Duration,
     agent_cmd_override: Option<String>,
     /// Warm agent CLIs awaiting adoption, at most one per (worktree, kind).
@@ -148,6 +151,7 @@ impl Daemon {
             shutdown: tokio_util::sync::CancellationToken::new(),
             worktree_ops: tokio::sync::Mutex::new(()),
             checkout_execution: tokio::sync::RwLock::new(()),
+            writer_claims: tokio::sync::Mutex::new(()),
             stop_deadline: overrides.stop_deadline,
             agent_cmd_override: overrides.agent_cmd,
             prewarmed: Mutex::new(HashMap::new()),
@@ -2332,6 +2336,18 @@ impl Daemon {
             .get_worktree(worktree_id)?
             .context("worktree not found")?;
         self.validate_execution_branch(&worktree, expected_branch.or(Some(&worktree.branch)))?;
+        let _claim = match writer {
+            WriterClaim::Off => None,
+            _ => Some(self.writer_claims.lock().await),
+        };
+        if writer == WriterClaim::Exclusive {
+            if let Some(holder) = self.live_writer(worktree_id)? {
+                bail!(
+                    "\"{holder}\" {WRITER_HELD_REFUSAL} {}; wait for it, archive it, or pass --force-writer after the user approves two writers",
+                    worktree.branch
+                );
+            }
+        }
         // A warm session for this (worktree, kind) hands over its PTY and
         // its pre-generated id — the CLI booted while the user typed the
         // name, so the create feels instant. An initial prompt forces the
@@ -2392,6 +2408,22 @@ impl Daemon {
             }
         }
         Ok(EntityId::Agent(agent.id))
+    }
+
+    /// The unarchived writer on this checkout whose turn can still run:
+    /// a live PTY, or a running/finished status a resume picks up again.
+    fn live_writer(&self, worktree_id: &WorktreeId) -> Result<Option<String>> {
+        let (_, _, agents, _) = self.store.load_tree()?;
+        Ok(agents
+            .into_iter()
+            .find(|a| {
+                a.writer
+                    && !a.archived
+                    && &a.worktree_id == worktree_id
+                    && (self.is_alive(&SessionRef::Agent(a.id.clone()))
+                        || matches!(a.status, AgentStatus::Running | AgentStatus::Finished))
+            })
+            .map(|a| a.name))
     }
 
     // ---- prewarm pool ----
@@ -5638,6 +5670,10 @@ exec sleep 60
     #[tokio::test]
     async fn archiving_the_holder_frees_the_writer_slot() {
         let (_tmp, _script, daemon, checkout, holder) = checkout_with_live_writer().await;
+        daemon
+            .store
+            .set_agent_status(&holder, AgentStatus::Finished)
+            .unwrap();
         daemon.archive_agent(&holder).unwrap();
         spawn_writer(&daemon, &checkout, "next", WriterClaim::Exclusive)
             .await
