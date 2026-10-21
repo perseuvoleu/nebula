@@ -459,7 +459,9 @@ enum AgentCommand {
         #[arg(required_unless_present = "file", num_args = 1..)]
         text: Vec<String>,
         /// Send `Read <absolute path> and act on it.` instead of text; the
-        /// file must exist and be a regular file.
+        /// file must exist and be a regular file. With a `name@host`
+        /// project, give the file's absolute path on that host; it is sent
+        /// as given.
         #[arg(long, conflicts_with = "text")]
         file: Option<std::path::PathBuf>,
         /// Send long or multi-line text as one bracketed paste anyway — for a

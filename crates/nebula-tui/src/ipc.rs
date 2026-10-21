@@ -1518,7 +1518,19 @@ pub fn send_payload(text: &str, paste: bool) -> Result<Vec<u8>, String> {
 }
 
 /// The one-line pointer `agent send --file` sends instead of the file's text.
-pub fn file_pointer(path: &Path, _remote: bool) -> Result<String, String> {
+/// For a `remote` project the path names a file on that host, so it is sent
+/// as given and must be absolute; this machine's filesystem says nothing
+/// about it.
+pub fn file_pointer(path: &Path, remote: bool) -> Result<String, String> {
+    if remote {
+        if !path.is_absolute() {
+            return Err(format!(
+                "--file {}: a remote project needs the file's absolute path on its host. Sync .scratch/ with `nebula sync` or write the file on the host, then pass that absolute path",
+                path.display()
+            ));
+        }
+        return Ok(format!("Read {} and act on it.", path.display()));
+    }
     let absolute =
         std::fs::canonicalize(path).map_err(|e| format!("--file {}: {e}", path.display()))?;
     if !absolute.is_file() {
