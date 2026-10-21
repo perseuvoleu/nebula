@@ -6635,7 +6635,7 @@ async fn mobile_safe_removal_preserves_dirty_unmerged_occupied_and_protected_che
 
 /// Use literal peer versions so a simultaneous client/server constant change cannot mask a mismatch.
 #[tokio::test]
-async fn protocol29_handshake_accepts_repeated_probes_and_rejects_protocol28() {
+async fn protocol30_handshake_accepts_repeated_probes_and_rejects_protocol29() {
     let env = TestEnv::new();
     let _daemon = env.spawn_daemon();
     let mut c = connect(&env.sock()).await;
@@ -6643,7 +6643,7 @@ async fn protocol29_handshake_accepts_repeated_probes_and_rejects_protocol28() {
         write_frame(
             &mut c,
             &ClientRequest::Hello {
-                protocol_version: 29,
+                protocol_version: 30,
             },
         )
         .await
@@ -6657,7 +6657,7 @@ async fn protocol29_handshake_accepts_repeated_probes_and_rejects_protocol28() {
             matches!(
                 reply,
                 Some(ServerEvent::HelloOk {
-                    protocol_version: 29,
+                    protocol_version: 30,
                     ..
                 })
             ),
@@ -6668,7 +6668,7 @@ async fn protocol29_handshake_accepts_repeated_probes_and_rejects_protocol28() {
     write_frame(
         &mut old,
         &ClientRequest::Hello {
-            protocol_version: 28,
+            protocol_version: 29,
         },
     )
     .await
@@ -6684,7 +6684,7 @@ async fn protocol29_handshake_accepts_repeated_probes_and_rejects_protocol28() {
         matches!(
             reply,
             Some(ServerEvent::Incompatible {
-                daemon_protocol_version: 29
+                daemon_protocol_version: 30
             })
         ),
         "{reply:?}"
@@ -6900,10 +6900,8 @@ async fn agent_new_writer_exits_2_naming_the_live_holder_unless_forced() {
     wait_for_exit(&mut daemon.0);
 }
 
-/// An older host daemon cannot decode a writer claim, so the CLI asks the
-/// host over ssh first and drops the claim with a warning instead.
 #[tokio::test]
-async fn agent_new_writer_on_a_host_applies_the_rule_there_or_drops_the_claim() {
+async fn agent_new_writer_on_a_host_applies_the_rule_there() {
     let host_env = TestEnv::new();
     let repo = host_env.make_repo();
     let idle = host_env.tmp.path().join("idle-agent");
@@ -6943,24 +6941,11 @@ async fn agent_new_writer_on_a_host_applies_the_rule_there_or_drops_the_claim() 
     })
     .await;
 
-    let host_home = env.tmp.path().join("host-home");
-    let bin = env.tmp.path().join("laptop-bin");
-    write_executable(
-        &bin.join("ssh"),
-        &format!(
-            "#!/bin/sh\nwhile [ $# -gt 0 ]; do case \"$1\" in -o) shift 2;; --) shift; break;; -*) shift;; *) break;; esac; done\n\
-             shift\nHOME='{}' exec /bin/sh -c \"$*\"\n",
-            host_home.display()
-        ),
-    );
-    let host_nebula = |body: &str| write_executable(&host_home.join(".local/bin/nebula"), body);
     let cli = |args: &[&str]| {
-        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
         std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
             .args(args)
             .args(["--project", "repo@testhost"])
             .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
-            .env("PATH", path)
             .output()
             .unwrap()
     };
@@ -6980,21 +6965,6 @@ async fn agent_new_writer_on_a_host_applies_the_rule_there_or_drops_the_claim() 
         serde_json::from_slice::<serde_json::Value>(&show.stdout).unwrap()["writer"].clone()
     };
 
-    host_nebula("#!/bin/sh\ncase \"$1\" in --version) echo 'nebula 0.6.0 (old1234)';; _daemon-build) echo old1234;; *) echo usage;; esac\n");
-    let old = spawn("on-old");
-    assert!(old.status.success(), "{old:?}");
-    assert!(
-        String::from_utf8_lossy(&old.stderr).contains(
-            "warning: the daemon on testhost does not know --writer; spawning without the writer mark"
-        ),
-        "{old:?}"
-    );
-    assert_eq!(writer_of("on-old"), false);
-
-    host_nebula(&format!(
-        "#!/bin/sh\n{host_vars} exec '{}' \"$@\"\n",
-        env!("CARGO_BIN_EXE_nebula")
-    ));
     let holder = spawn("holder");
     assert!(holder.status.success(), "{holder:?}");
     assert_eq!(String::from_utf8_lossy(&holder.stderr), "");
@@ -7012,6 +6982,52 @@ async fn agent_new_writer_on_a_host_applies_the_rule_there_or_drops_the_claim() 
     handshake(&mut h).await;
     write_frame(&mut h, &ClientRequest::Shutdown).await.unwrap();
     wait_for_exit(&mut host_daemon.0);
+}
+
+/// A daemon from before the writer claim speaks protocol 29: it answers
+/// any other Hello with `Incompatible` and closes, as server.rs does.
+#[tokio::test]
+async fn agent_new_writer_against_a_protocol29_daemon_stops_at_the_handshake() {
+    let env = TestEnv::new();
+    std::fs::create_dir_all(&env.runtime_dir).unwrap();
+    let listener = tokio::net::UnixListener::bind(env.sock()).unwrap();
+    let old_daemon = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let Some(ClientRequest::Hello { protocol_version }) =
+            read_frame::<ClientRequest, _>(&mut stream).await.unwrap()
+        else {
+            panic!("the client must open with Hello");
+        };
+        let reply = if protocol_version == 29 {
+            ServerEvent::HelloOk {
+                protocol_version: 29,
+                daemon_pid: std::process::id(),
+            }
+        } else {
+            ServerEvent::Incompatible {
+                daemon_protocol_version: 29,
+            }
+        };
+        write_frame(&mut stream, &reply).await.unwrap();
+    });
+    let runtime_dir = env.runtime_dir.clone();
+    let out = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+            .args(["agent", "new", "--worktree", "main", "--writer"])
+            .env("NEBULA_RUNTIME_DIR", runtime_dir)
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    old_daemon.await.unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(&format!(
+            "daemon speaks protocol v29, this client v{PROTOCOL_VERSION} — run `nebula kill` and relaunch"
+        )),
+        "{out:?}"
+    );
 }
 
 /// A tty still in line mode silently drops whatever does not fit its input
