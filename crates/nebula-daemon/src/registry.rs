@@ -5564,6 +5564,97 @@ exec sleep 60
         SessionRef::Agent(id)
     }
 
+    async fn spawn_writer(
+        daemon: &Arc<Daemon>,
+        checkout: &WorktreeId,
+        name: &str,
+        writer: WriterClaim,
+    ) -> Result<AgentId> {
+        let id = daemon
+            .create_agent(
+                checkout,
+                None,
+                name,
+                AgentKind::Claude,
+                None,
+                None,
+                false,
+                None,
+                writer,
+            )
+            .await?;
+        let EntityId::Agent(id) = id else { panic!() };
+        Ok(id)
+    }
+
+    async fn checkout_with_live_writer() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Arc<Daemon>,
+        WorktreeId,
+        AgentId,
+    ) {
+        let (script, agent) = stand_in_agent(&[]);
+        let (tmp, _repo, daemon, _pid, primary) =
+            primary_with_feat_on(test_daemon_with(DaemonOverrides {
+                agent_cmd: agent,
+                ..DaemonOverrides::default()
+            }))
+            .await;
+        let holder = spawn_writer(&daemon, &primary.id, "holder", WriterClaim::Exclusive)
+            .await
+            .unwrap();
+        (tmp, script, daemon, primary.id, holder)
+    }
+
+    #[tokio::test]
+    async fn a_second_writer_is_refused_while_the_holder_lives() {
+        let (_tmp, _script, daemon, checkout, _holder) = checkout_with_live_writer().await;
+        let err = spawn_writer(&daemon, &checkout, "second", WriterClaim::Exclusive)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "\"holder\" is the writer on main; wait for it, archive it, or pass --force-writer after the user approves two writers"
+        );
+        let (_, _, agents, _) = daemon.store.load_tree().unwrap();
+        assert!(
+            agents.iter().all(|a| a.name != "second"),
+            "a refused spawn leaves no row"
+        );
+        daemon.kill_all();
+    }
+
+    #[tokio::test]
+    async fn a_forced_writer_spawns_beside_the_live_holder() {
+        let (_tmp, _script, daemon, checkout, _holder) = checkout_with_live_writer().await;
+        let second = spawn_writer(&daemon, &checkout, "second", WriterClaim::Forced)
+            .await
+            .unwrap();
+        assert!(daemon.store.get_agent(&second).unwrap().unwrap().writer);
+        daemon.kill_all();
+    }
+
+    #[tokio::test]
+    async fn archiving_the_holder_frees_the_writer_slot() {
+        let (_tmp, _script, daemon, checkout, holder) = checkout_with_live_writer().await;
+        daemon.archive_agent(&holder).unwrap();
+        spawn_writer(&daemon, &checkout, "next", WriterClaim::Exclusive)
+            .await
+            .unwrap();
+        daemon.kill_all();
+    }
+
+    #[tokio::test]
+    async fn a_spawn_without_writer_ignores_the_holder() {
+        let (_tmp, _script, daemon, checkout, _holder) = checkout_with_live_writer().await;
+        let reviewer = spawn_writer(&daemon, &checkout, "reviewer", WriterClaim::Off)
+            .await
+            .unwrap();
+        assert!(!daemon.store.get_agent(&reviewer).unwrap().unwrap().writer);
+        daemon.kill_all();
+    }
+
     #[tokio::test]
     async fn a_healthy_warm_pty_is_adopted_and_a_timed_out_one_is_waited_for_by_the_retry() {
         let (_script, agent) = stand_in_agent(&[2]);
