@@ -6851,12 +6851,10 @@ async fn agent_send_refuses_paste_sized_text_and_sends_a_file_as_a_one_line_poin
 
 #[tokio::test]
 async fn agent_new_writer_exits_2_naming_the_live_holder_unless_forced() {
-    use std::os::unix::fs::PermissionsExt;
     let env = TestEnv::new();
     let repo = env.make_repo();
     let script = env.tmp.path().join("idle-agent");
-    std::fs::write(&script, "#!/bin/sh\nexec sleep 60\n").unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write_executable(&script, "#!/bin/sh\nexec sleep 60\n");
     let mut daemon = env.spawn_daemon_with_agent_cmd(script.to_str().unwrap());
     let mut c = connect(&env.sock()).await;
     handshake(&mut c).await;
@@ -6900,6 +6898,120 @@ async fn agent_new_writer_exits_2_naming_the_live_holder_unless_forced() {
     }
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
     wait_for_exit(&mut daemon.0);
+}
+
+/// An older host daemon cannot decode a writer claim, so the CLI asks the
+/// host over ssh first and drops the claim with a warning instead.
+#[tokio::test]
+async fn agent_new_writer_on_a_host_applies_the_rule_there_or_drops_the_claim() {
+    let host_env = TestEnv::new();
+    let repo = host_env.make_repo();
+    let idle = host_env.tmp.path().join("idle-agent");
+    write_executable(&idle, "#!/bin/sh\nexec sleep 60\n");
+    let mut host_daemon = host_env.spawn_daemon_with_agent_cmd(idle.to_str().unwrap());
+    let host_vars = format!(
+        "NEBULA_RUNTIME_DIR='{}' NEBULA_DATA_DIR='{}'",
+        host_env.runtime_dir.display(),
+        host_env.tmp.path().join("data").display(),
+    );
+    let proxy = format!("{host_vars} '{}' proxy", env!("CARGO_BIN_EXE_nebula"));
+
+    let env = TestEnv::new();
+    let mut daemon = env.spawn_daemon_with("/bin/sh", &[("NEBULA_RELAY_CMD", proxy.as_str())]);
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    write_frame(
+        &mut c,
+        &ClientRequest::AddProject {
+            req_id: 1,
+            path: repo.clone(),
+            name: None,
+            create_missing: false,
+            host: Some("testhost".into()),
+        },
+    )
+    .await
+    .unwrap();
+    write_frame(&mut c, &ClientRequest::Subscribe)
+        .await
+        .unwrap();
+    read_events_until(&mut c, Duration::from_secs(15), |evs| {
+        find_ack(evs, 1).is_some()
+            && evs.iter().any(|e| {
+                matches!(e, ServerEvent::EntityUpserted { entity: Entity::Worktree(w) } if w.is_main)
+            })
+    })
+    .await;
+
+    let host_home = env.tmp.path().join("host-home");
+    let bin = env.tmp.path().join("laptop-bin");
+    write_executable(
+        &bin.join("ssh"),
+        &format!(
+            "#!/bin/sh\nwhile [ $# -gt 0 ]; do case \"$1\" in -o) shift 2;; --) shift; break;; -*) shift;; *) break;; esac; done\n\
+             shift\nHOME='{}' exec /bin/sh -c \"$*\"\n",
+            host_home.display()
+        ),
+    );
+    let host_nebula = |body: &str| write_executable(&host_home.join(".local/bin/nebula"), body);
+    let cli = |args: &[&str]| {
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+        std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+            .args(args)
+            .args(["--project", "repo@testhost"])
+            .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
+            .env("PATH", path)
+            .output()
+            .unwrap()
+    };
+    let spawn = |name: &str| {
+        cli(&[
+            "agent",
+            "new",
+            "--worktree",
+            "main",
+            "--name",
+            name,
+            "--writer",
+        ])
+    };
+    let writer_of = |name: &str| {
+        let show = cli(&["agent", "show", name]);
+        serde_json::from_slice::<serde_json::Value>(&show.stdout).unwrap()["writer"].clone()
+    };
+
+    host_nebula("#!/bin/sh\ncase \"$1\" in --version) echo 'nebula 0.6.0 (old1234)';; _daemon-build) echo old1234;; *) echo usage;; esac\n");
+    let old = spawn("on-old");
+    assert!(old.status.success(), "{old:?}");
+    assert!(
+        String::from_utf8_lossy(&old.stderr).contains(
+            "warning: the daemon on testhost does not know --writer; spawning without the writer mark"
+        ),
+        "{old:?}"
+    );
+    assert_eq!(writer_of("on-old"), false);
+
+    host_nebula(&format!(
+        "#!/bin/sh\n{host_vars} exec '{}' \"$@\"\n",
+        env!("CARGO_BIN_EXE_nebula")
+    ));
+    let holder = spawn("holder");
+    assert!(holder.status.success(), "{holder:?}");
+    assert_eq!(String::from_utf8_lossy(&holder.stderr), "");
+    assert_eq!(writer_of("holder"), true);
+    let second = spawn("second");
+    assert_eq!(second.status.code(), Some(2), "{second:?}");
+    assert!(
+        String::from_utf8_lossy(&second.stderr).contains("\"holder\" is the writer on main;"),
+        "{second:?}"
+    );
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon.0);
+    let mut h = connect(&host_env.sock()).await;
+    handshake(&mut h).await;
+    write_frame(&mut h, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut host_daemon.0);
 }
 
 /// A tty still in line mode silently drops whatever does not fit its input
