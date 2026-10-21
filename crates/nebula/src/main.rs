@@ -386,6 +386,14 @@ enum AgentCommand {
         /// Initial task, submitted as the CLI's first prompt.
         #[arg(long)]
         prompt: Option<String>,
+        /// Mark the session as the checkout's one writer; refused (exit 2)
+        /// while another live session holds that mark.
+        #[arg(long)]
+        writer: bool,
+        /// Spawn the writer alongside a live one, after the user approved
+        /// two writers on the checkout.
+        #[arg(long, requires = "writer")]
+        force_writer: bool,
     },
     /// Block until workers settle out of running (finished, needs_feedback,
     /// terminated…), then print the settled ones as JSON — `agent list`'s
@@ -800,6 +808,8 @@ fn main() -> Result<()> {
                 effort,
                 name,
                 prompt,
+                writer,
+                force_writer,
             } => nebula_tui::run_agent_new(nebula_tui::NewAgentOpts {
                 worktree,
                 project,
@@ -808,6 +818,11 @@ fn main() -> Result<()> {
                 effort,
                 name: name.map(|words| words.join(" ")),
                 prompt,
+                writer: match (writer, force_writer) {
+                    (_, true) => nebula_core::WriterClaim::Forced,
+                    (true, false) => nebula_core::WriterClaim::Exclusive,
+                    (false, false) => nebula_core::WriterClaim::Off,
+                },
             }),
             AgentCommand::Wait {
                 names,

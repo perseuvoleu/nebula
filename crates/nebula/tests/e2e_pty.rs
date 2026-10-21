@@ -4,7 +4,8 @@
 
 use nebula_core::codec::{read_frame, write_frame};
 use nebula_core::{
-    AgentKind, ClientRequest, Entity, EntityId, ServerEvent, SessionRef, PROTOCOL_VERSION,
+    AgentKind, ClientRequest, Entity, EntityId, ServerEvent, SessionRef, WriterClaim,
+    PROTOCOL_VERSION,
 };
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -380,6 +381,7 @@ async fn full_crud_attach_and_restart_persistence() {
             effort: None,
             auto_title: false,
             prompt: None,
+            writer: WriterClaim::Off,
         },
     )
     .await
@@ -769,6 +771,7 @@ async fn hook_post_from_agent_pty_drives_status() {
             effort: None,
             auto_title: false,
             prompt: None,
+            writer: WriterClaim::Off,
         },
     )
     .await
@@ -1774,6 +1777,7 @@ async fn hook_cwd_rehomes_agent_to_other_worktree() {
             effort: None,
             auto_title: false,
             prompt: None,
+            writer: WriterClaim::Off,
         },
     )
     .await
@@ -1937,6 +1941,7 @@ async fn move_agent_respawns_live_session_in_target_worktree() {
             effort: None,
             auto_title: false,
             prompt: None,
+            writer: WriterClaim::Off,
         },
     )
     .await
@@ -2120,6 +2125,7 @@ async fn codex_hooks_install_and_drive_status() {
             effort: None,
             auto_title: false,
             prompt: None,
+            writer: WriterClaim::Off,
         },
     )
     .await
@@ -2765,6 +2771,7 @@ async fn prewarmed_session_is_adopted_by_create_agent() {
             effort: None,
             auto_title: false,
             prompt: None,
+            writer: WriterClaim::Off,
         },
     )
     .await
@@ -2895,6 +2902,7 @@ async fn dead_prewarm_falls_back_to_cold_spawn() {
             effort: None,
             auto_title: false,
             prompt: None,
+            writer: WriterClaim::Off,
         },
     )
     .await
@@ -2954,6 +2962,7 @@ async fn create_agent_refuses_when_the_cli_is_not_installed() {
                 effort: None,
                 auto_title: false,
                 prompt: None,
+                writer: WriterClaim::Off,
             },
         )
         .await
@@ -3047,6 +3056,7 @@ async fn create_agent_succeeds_when_the_cli_is_on_the_login_shell_path() {
             effort: None,
             auto_title: false,
             prompt: None,
+            writer: WriterClaim::Off,
         },
     )
     .await
@@ -3117,6 +3127,7 @@ async fn create_agent_get_id(
             effort: None,
             auto_title: false,
             prompt: None,
+            writer: WriterClaim::Off,
         },
     )
     .await
@@ -3295,6 +3306,7 @@ async fn archive_sigkills_an_agent_that_ignores_sighup() {
             effort: None,
             auto_title: false,
             prompt: None,
+            writer: WriterClaim::Off,
         },
     )
     .await
@@ -3457,6 +3469,7 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
             effort: None,
             auto_title: false,
             prompt: None,
+            writer: WriterClaim::Off,
         },
     )
     .await
@@ -3513,6 +3526,7 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
             effort: None,
             auto_title: false,
             prompt: None,
+            writer: WriterClaim::Off,
         },
     )
     .await
@@ -3682,6 +3696,7 @@ async fn idle_reaper_kills_unattached_sibling_on_viewed_worktree() {
                 effort: None,
                 auto_title: false,
                 prompt: None,
+                writer: WriterClaim::Off,
             },
         )
         .await
@@ -4173,6 +4188,7 @@ async fn auto_title_instruction_and_rename_flow() {
             effort: None,
             auto_title: true,
             prompt: None,
+            writer: WriterClaim::Off,
         },
     )
     .await
@@ -5979,6 +5995,7 @@ async fn a_parked_agent_resumes_its_conversation_once_primary_is_back_on_its_bra
             effort: None,
             auto_title: false,
             prompt: None,
+            writer: WriterClaim::Off,
         },
     )
     .await

@@ -525,6 +525,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     effort,
                     auto_title,
                     prompt,
+                    writer,
                 } => {
                     reply(
                         &out_tx,
@@ -539,6 +540,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                                 effort,
                                 auto_title,
                                 prompt,
+                                writer,
                             )
                             .await
                             .map(Some),

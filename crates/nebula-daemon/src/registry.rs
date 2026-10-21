@@ -11,7 +11,7 @@ use nebula_core::ClientRequest;
 use nebula_core::{
     Agent, AgentId, AgentKind, AgentStatus, Entity, EntityId, Link, LinkId, Note, NoteId,
     NoteOwner, Project, ProjectId, ServerEvent, SessionRef, TerminalId, TerminalTab, Todo, TodoId,
-    TodoOwner, Workspace, WorkspaceId, Worktree, WorktreeId, BUSY_SESSIONS_REFUSAL,
+    TodoOwner, Workspace, WorkspaceId, Worktree, WorktreeId, WriterClaim, BUSY_SESSIONS_REFUSAL,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -2324,6 +2324,7 @@ impl Daemon {
         effort: Option<String>,
         auto_title: bool,
         prompt: Option<String>,
+        writer: WriterClaim,
     ) -> Result<EntityId> {
         let _execution = self.checkout_execution.read().await;
         let worktree = self
@@ -2370,6 +2371,7 @@ impl Daemon {
             status_changed_at: epoch_ms(),
             alive: false,
             branch: Some(worktree.branch.clone()),
+            writer: !writer.is_off(),
         };
         self.store
             .insert_agent_with_auto_title(&agent, auto_title)?;
@@ -2452,6 +2454,7 @@ impl Daemon {
             status_changed_at: 0,
             alive: false,
             branch: None,
+            writer: false,
         };
         self.spawn_agent_session(&agent, &worktree, 80, 24)?;
         tracing::info!(agent = %agent.id, kind = kind.as_str(), worktree = %worktree.branch, "prewarmed agent session");
@@ -4554,6 +4557,7 @@ mod tests {
                 status_changed_at: 0,
                 alive: false,
                 branch: None,
+                writer: false,
             })
             .unwrap();
     }
@@ -4652,6 +4656,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: false,
                     branch: None,
+                    writer: false,
                 },
                 true,
             )
@@ -5549,6 +5554,7 @@ exec sleep 60
                 None,
                 false,
                 None,
+                WriterClaim::Off,
             )
             .await
             .unwrap()
@@ -6403,6 +6409,7 @@ exec sleep 60
                 None,
                 false,
                 None,
+                WriterClaim::Off,
             )
             .await
             .unwrap_err();
@@ -6726,6 +6733,7 @@ exec sleep 60
                     status_changed_at: stamp,
                     alive: false,
                     branch: None,
+                    writer: false,
                 })
                 .unwrap();
         }

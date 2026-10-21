@@ -24,6 +24,23 @@ pub enum SessionRef {
     Terminal(TerminalId),
 }
 
+/// What a `CreateAgent` claims of its checkout's single writer slot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WriterClaim {
+    #[default]
+    Off,
+    /// Refused while another live session holds the slot.
+    Exclusive,
+    /// Takes the slot alongside a live holder; the user approved two writers.
+    Forced,
+}
+
+impl WriterClaim {
+    pub fn is_off(&self) -> bool {
+        *self == WriterClaim::Off
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientRequest {
     Hello {
@@ -210,6 +227,11 @@ pub enum ClientRequest {
         /// (`nebula agent new --prompt`). Skips warm-slot adoption — an
         /// already-booted CLI can't take a launch argument.
         prompt: Option<String>,
+        /// Skipped when `Off` so the request keeps the wire shape older
+        /// daemons decode; one that trails a value they don't know fails
+        /// to decode there and drops the connection.
+        #[serde(default, skip_serializing_if = "WriterClaim::is_off")]
+        writer: WriterClaim,
     },
     /// Fire-and-forget: pre-spawn an agent CLI for this (worktree, kind) so
     /// the next CreateAgent adopts an already-booted session. Sent the

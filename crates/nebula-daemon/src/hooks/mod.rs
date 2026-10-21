@@ -350,6 +350,7 @@ mod tests {
             status_changed_at: 0,
             alive: false,
             branch: None,
+            writer: false,
         };
         store
             .insert_agent_with_auto_title(&agent("pending"), true)
@@ -654,6 +655,7 @@ mod tests {
             status_changed_at: 0,
             alive: true,
             branch: None,
+            writer: false,
         };
         store
             .insert_agent(&remote_agent("r1", "tw1", false))

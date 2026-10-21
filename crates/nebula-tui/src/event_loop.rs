@@ -19,7 +19,7 @@ use crossterm::event::{
 use futures::StreamExt;
 use nebula_core::{
     AgentId, AgentKind, AgentStatus, ClientRequest, EntityId, LinkId, NoteId, NoteOwner, ProjectId,
-    ServerEvent, SessionRef, TodoId, TodoOwner, WorktreeId,
+    ServerEvent, SessionRef, TodoId, TodoOwner, WorktreeId, WriterClaim,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -7575,6 +7575,7 @@ fn create_default_agent(
         effort: cfg.default_effort(kind),
         auto_title: true,
         prompt: None,
+        writer: WriterClaim::Off,
     });
     // Same warm-slot refill as `create_agent`.
     if kind == AgentKind::Claude {
@@ -7935,6 +7936,7 @@ fn create_agent(
         effort,
         auto_title,
         prompt: None,
+        writer: WriterClaim::Off,
     });
     // The create consumes (or, off-spec, discards) the worktree's warm
     // Claude slot; refill it so the next create is instant too.
@@ -11302,6 +11304,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: false,
                     branch: None,
+                    writer: false,
                 }),
             },
         );
@@ -11464,6 +11467,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: false,
                     branch: None,
+                    writer: false,
                 }),
             },
         );
@@ -11542,6 +11546,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: true,
                     branch: Some("feature-x".into()),
+                    writer: false,
                 }),
             },
         );
@@ -11796,6 +11801,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: true,
                     branch: None,
+                    writer: false,
                 }),
             },
         );
@@ -13718,6 +13724,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: true,
                     branch: None,
+                    writer: false,
                 }),
             },
         );
@@ -13803,6 +13810,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: true,
                     branch: None,
+                    writer: false,
                 }),
             },
         );
@@ -13910,6 +13918,7 @@ mod tests {
                     status_changed_at: at,
                     alive: true,
                     branch: None,
+                    writer: false,
                 }),
             };
         hse(
@@ -14003,6 +14012,7 @@ mod tests {
                         status_changed_at: 0,
                         alive: true,
                         branch: None,
+                        writer: false,
                     }),
                 },
             );
@@ -14087,6 +14097,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: true,
                     branch: None,
+                    writer: false,
                 }),
             },
         );
@@ -14331,6 +14342,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: true,
                     branch: None,
+                    writer: false,
                 }),
             },
         );
@@ -15976,6 +15988,7 @@ mod tests {
                 status_changed_at: 0,
                 alive: true,
                 branch: None,
+                writer: false,
             })
         };
         hse(
@@ -16047,6 +16060,7 @@ mod tests {
             status_changed_at: 0,
             alive: false,
             branch: None,
+            writer: false,
         })
     }
 
@@ -17087,6 +17101,7 @@ mod tests {
                     status_changed_at: crate::app::now_ms() - 2 * 60_000,
                     alive: true,
                     branch: None,
+                    writer: false,
                 }),
             },
         );
@@ -17765,6 +17780,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: true,
                     branch: None,
+                    writer: false,
                 }),
             },
         );
@@ -18422,6 +18438,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: true,
                     branch: None,
+                    writer: false,
                 }),
             },
         );
@@ -18516,6 +18533,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: false,
                     branch: None,
+                    writer: false,
                 }),
             },
         );
@@ -18596,6 +18614,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: true,
                     branch: None,
+                    writer: false,
                 }),
             },
         );
@@ -18790,6 +18809,7 @@ mod tests {
                         status_changed_at: 0,
                         alive: true,
                         branch: None,
+                        writer: false,
                     }),
                 },
             );
@@ -18912,6 +18932,7 @@ mod tests {
                         status_changed_at: 0,
                         alive: true,
                         branch: None,
+                        writer: false,
                     }),
                 },
             );
@@ -20917,6 +20938,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: true,
                     branch: None,
+                    writer: false,
                 }),
             },
         );
@@ -22459,6 +22481,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: true,
                     branch: None,
+                    writer: false,
                 }),
             },
         );
@@ -22481,6 +22504,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: false,
                     branch: None,
+                    writer: false,
                 }),
             },
         );
@@ -22844,6 +22868,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: true,
                     branch: None,
+                    writer: false,
                 }),
             },
         );
@@ -24443,6 +24468,7 @@ mod tests {
                         status_changed_at: 0,
                         alive: true,
                         branch: None,
+                        writer: false,
                     }),
                 },
             );
@@ -24516,6 +24542,7 @@ mod tests {
             status_changed_at: 0,
             alive: true,
             branch: None,
+            writer: false,
         })
     }
 

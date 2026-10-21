@@ -1426,6 +1426,7 @@ pub async fn agent_show(name: String, project_flag: Option<String>) -> Result<()
             "effort": a.effort,
             "archived": a.archived,
             "pinned": a.pinned,
+            "writer": a.writer,
             "alive": a.alive,
             // Native CLI session id (claude/codex/cursor/pi) the daemon stored for
             // resume; read-only consumers (the web gateway) map it to native history.
@@ -1732,6 +1733,7 @@ pub struct NewAgentOpts {
     pub effort: Option<String>,
     pub name: Option<String>,
     pub prompt: Option<String>,
+    pub writer: nebula_core::WriterClaim,
 }
 
 /// Session name when the caller passed no `--name`: derived from the
@@ -1840,6 +1842,7 @@ pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
             effort: opts.effort,
             auto_title,
             prompt: opts.prompt,
+            writer: opts.writer,
         },
     )
     .await?;
@@ -1915,6 +1918,7 @@ pub async fn agent_list(
                 "worktree": worktree.branch,
                 "path": worktree.path.display().to_string(),
                 "archived": a.archived,
+                "writer": a.writer,
                 "session_id": a.session_id,
             }))
         })
@@ -2113,6 +2117,7 @@ pub async fn agent_wait(
                 "worktree": worktree.branch,
                 "path": worktree.path.display().to_string(),
                 "archived": a.archived,
+                "writer": a.writer,
                 "session_id": a.session_id,
             }))
         })
