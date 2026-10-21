@@ -5619,6 +5619,13 @@ exec sleep 60
         Ok(id)
     }
 
+    fn agent_row(daemon: &Daemon, id: &AgentId) -> Agent {
+        let ServerEvent::Snapshot { agents, .. } = daemon.snapshot().unwrap() else {
+            unreachable!()
+        };
+        agents.into_iter().find(|a| &a.id == id).unwrap()
+    }
+
     async fn checkout_with_live_writer() -> (
         tempfile::TempDir,
         tempfile::TempDir,
@@ -5689,6 +5696,40 @@ exec sleep 60
             .unwrap();
         assert!(!daemon.store.get_agent(&reviewer).unwrap().unwrap().writer);
         daemon.kill_all();
+    }
+
+    #[tokio::test]
+    async fn a_holder_mid_turn_keeps_the_slot_across_a_daemon_restart() {
+        for (turn, status) in [
+            (HookEvent::UserPromptSubmit, AgentStatus::Running),
+            (HookEvent::PermissionRequest, AgentStatus::NeedsFeedback),
+        ] {
+            let (_tmp, _script, daemon, checkout, holder) = checkout_with_live_writer().await;
+            daemon.apply_hook_event(&holder, turn, None);
+            assert_eq!(agent_row(&daemon, &holder).status, status);
+            daemon.kill_all();
+            daemon.store.sweep_disconnected().unwrap();
+            let restarted = Daemon::with_overrides(
+                daemon.store.clone(),
+                HookEnv {
+                    port: 0,
+                    token: String::new(),
+                },
+                DaemonOverrides::default(),
+            );
+            assert_eq!(
+                agent_row(&restarted, &holder).status,
+                AgentStatus::Disconnected
+            );
+            let err = spawn_writer(&restarted, &checkout, "second", WriterClaim::Exclusive)
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("\"holder\" is the writer on main"),
+                "{status:?}: {err}"
+            );
+            restarted.kill_all();
+        }
     }
 
     #[tokio::test]
