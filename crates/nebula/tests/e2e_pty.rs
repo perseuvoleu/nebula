@@ -6849,6 +6849,59 @@ async fn agent_send_refuses_paste_sized_text_and_sends_a_file_as_a_one_line_poin
     wait_for_exit(&mut daemon.0);
 }
 
+#[tokio::test]
+async fn agent_new_writer_exits_2_naming_the_live_holder_unless_forced() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let script = env.tmp.path().join("idle-agent");
+    std::fs::write(&script, "#!/bin/sh\nexec sleep 60\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut daemon = env.spawn_daemon_with_agent_cmd(script.to_str().unwrap());
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    add_project_get_main_worktree(&mut c, &repo).await;
+    let cli = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+            .args(args)
+            .args(["--project", "repo"])
+            .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
+            .output()
+            .unwrap()
+    };
+    let spawn = |name: &str, flags: &[&str]| {
+        let mut args = vec!["agent", "new", "--worktree", "main", "--name", name];
+        args.extend_from_slice(flags);
+        cli(&args)
+    };
+
+    let holder = spawn("holder", &["--writer"]);
+    assert!(holder.status.success(), "{holder:?}");
+    let show = cli(&["agent", "show", "holder"]);
+    let shown: serde_json::Value = serde_json::from_slice(&show.stdout).unwrap();
+    assert_eq!(shown["writer"], true, "{show:?}");
+
+    let second = spawn("second", &["--writer"]);
+    assert_eq!(second.status.code(), Some(2), "{second:?}");
+    assert_eq!(String::from_utf8_lossy(&second.stdout), "");
+    assert!(
+        String::from_utf8_lossy(&second.stderr).contains(
+            "\"holder\" is the writer on main; wait for it, archive it, or pass --force-writer after the user approves two writers"
+        ),
+        "{second:?}"
+    );
+
+    for (name, flags) in [
+        ("forced", &["--writer", "--force-writer"][..]),
+        ("reviewer", &[]),
+    ] {
+        let out = spawn(name, flags);
+        assert!(out.status.success(), "{name}: {out:?}");
+    }
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon.0);
+}
+
 /// A tty still in line mode silently drops whatever does not fit its input
 /// queue, so the write "succeeds" for text the CLI will never read.
 #[tokio::test]
