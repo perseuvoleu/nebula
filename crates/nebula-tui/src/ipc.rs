@@ -1733,6 +1733,9 @@ pub struct NewAgentOpts {
     pub effort: Option<String>,
     pub name: Option<String>,
     pub prompt: Option<String>,
+    /// `--writer` / `--force-writer`: what the spawn claims of the checkout's
+    /// writer slot; the owning daemon refuses an `Exclusive` claim while a
+    /// live writer holds it.
     pub writer: nebula_core::WriterClaim,
 }
 

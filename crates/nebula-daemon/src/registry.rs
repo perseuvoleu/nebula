@@ -5663,7 +5663,9 @@ exec sleep 60
             err.to_string(),
             "\"holder\" is the writer on main; wait for it, archive it, or pass --force-writer after the user approves two writers"
         );
-        let (_, _, agents, _) = daemon.store.load_tree().unwrap();
+        let ServerEvent::Snapshot { agents, .. } = daemon.snapshot().unwrap() else {
+            unreachable!()
+        };
         assert!(
             agents.iter().all(|a| a.name != "second"),
             "a refused spawn leaves no row"
@@ -5677,17 +5679,13 @@ exec sleep 60
         let second = spawn_writer(&daemon, &checkout, "second", WriterClaim::Forced)
             .await
             .unwrap();
-        assert!(daemon.store.get_agent(&second).unwrap().unwrap().writer);
+        assert!(agent_row(&daemon, &second).writer);
         daemon.kill_all();
     }
 
     #[tokio::test]
     async fn archiving_the_holder_frees_the_writer_slot() {
         let (_tmp, _script, daemon, checkout, holder) = checkout_with_live_writer().await;
-        daemon
-            .store
-            .set_agent_status(&holder, AgentStatus::Finished)
-            .unwrap();
         daemon.archive_agent(&holder).unwrap();
         spawn_writer(&daemon, &checkout, "next", WriterClaim::Exclusive)
             .await
@@ -5714,7 +5712,7 @@ exec sleep 60
         let reviewer = spawn_writer(&daemon, &checkout, "reviewer", WriterClaim::Off)
             .await
             .unwrap();
-        assert!(!daemon.store.get_agent(&reviewer).unwrap().unwrap().writer);
+        assert!(!agent_row(&daemon, &reviewer).writer);
         daemon.kill_all();
     }
 

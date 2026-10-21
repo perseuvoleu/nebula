@@ -40,6 +40,7 @@ pub enum WriterClaim {
 }
 
 impl WriterClaim {
+    /// True for a spawn that claims nothing, which never checks or takes the slot.
     pub fn is_off(&self) -> bool {
         *self == WriterClaim::Off
     }
