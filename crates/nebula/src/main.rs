@@ -453,9 +453,19 @@ enum AgentCommand {
     Send {
         /// Session name (as shown in the panels).
         name: String,
-        /// The prompt; multiple words need no quotes.
-        #[arg(required = true, num_args = 1..)]
+        /// The prompt; multiple words need no quotes. Up to 1,000 bytes on
+        /// one line: longer or multi-line text is refused (exit 2), since a
+        /// worker reads it as a pasted quote — write it to a file and use `--file`.
+        #[arg(required_unless_present = "file", num_args = 1..)]
         text: Vec<String>,
+        /// Send `Read <absolute path> and act on it.` instead of text; the
+        /// file must exist and be a regular file.
+        #[arg(long, conflicts_with = "text")]
+        file: Option<std::path::PathBuf>,
+        /// Send long or multi-line text as one bracketed paste anyway — for a
+        /// shell tab or a CLI that treats a paste as input.
+        #[arg(long)]
+        paste: bool,
         /// Project name, or `name@host` for a remote project (default: the
         /// calling session's project).
         #[arg(long)]
@@ -817,8 +827,10 @@ fn main() -> Result<()> {
             AgentCommand::Send {
                 name,
                 text,
+                file,
+                paste,
                 project,
-            } => nebula_tui::run_agent_send(name, text.join(" "), project),
+            } => nebula_tui::run_agent_send(name, text.join(" "), file, paste, project),
             AgentCommand::Archive { name, project } => {
                 nebula_tui::run_agent_ctl(nebula_tui::AgentCtl::Archive, name, project)
             }

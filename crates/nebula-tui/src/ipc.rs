@@ -1493,21 +1493,45 @@ pub async fn agent_read(
 /// span two reads goes as a bracketed paste instead.
 const RAW_SEND_MAX: usize = 1000;
 
-fn send_payload(text: &str) -> Vec<u8> {
+/// The bytes `agent send` writes for `text`, or why it refuses. Text that
+/// must go as a bracketed paste is refused unless `paste` asks for one: a
+/// Claude worker reads a paste as quoted content, not as an instruction.
+pub fn send_payload(text: &str, paste: bool) -> Result<Vec<u8>, String> {
     if text.contains('\n') || text.len() > RAW_SEND_MAX {
-        format!("\x1b[200~{text}\x1b[201~").into_bytes()
+        if !paste {
+            return Err(format!(
+                "refusing to send {} bytes{}: it would arrive as a paste, which a worker reads as quoted content, not as an instruction. Write the text to a file under the project's .scratch/ and send `Read <path> and act on it.` (`--file <path>` does that), or pass --paste to send it as a bracketed paste anyway",
+                text.len(),
+                if text.contains('\n') { " over several lines" } else { "" },
+            ));
+        }
+        Ok(format!("\x1b[200~{text}\x1b[201~").into_bytes())
     } else {
-        text.as_bytes().to_vec()
+        Ok(text.as_bytes().to_vec())
     }
+}
+
+/// The one-line pointer `agent send --file` sends instead of the file's text.
+pub fn file_pointer(path: &Path) -> Result<String, String> {
+    let absolute =
+        std::fs::canonicalize(path).map_err(|e| format!("--file {}: {e}", path.display()))?;
+    if !absolute.is_file() {
+        return Err(format!("--file {}: not a regular file", path.display()));
+    }
+    Ok(format!("Read {} and act on it.", absolute.display()))
 }
 
 /// `nebula agent send <name> <text…>`: type a follow-up prompt into a
 /// running worker's CLI and submit it — the steering half of delegation
-/// (`--prompt` only covers the first task). Multi-line text goes in as a
-/// bracketed paste so embedded newlines don't submit early, and so does a
-/// long line (see [`RAW_SEND_MAX`]); Enter follows
+/// (`--prompt` only covers the first task). `payload` is the text as
+/// [`send_payload`] encoded it; Enter follows
 /// after a beat, once the CLI has ingested the text.
-pub async fn agent_send(name: String, text: String, project_flag: Option<String>) -> Result<()> {
+pub async fn agent_send(
+    name: String,
+    text: String,
+    payload: Vec<u8>,
+    project_flag: Option<String>,
+) -> Result<()> {
     let sock = paths::socket_path();
     let Ok(stream) = try_connect(&sock).await else {
         bail!("no nebula daemon is running");
@@ -1523,7 +1547,7 @@ pub async fn agent_send(name: String, text: String, project_flag: Option<String>
         );
     }
     // Acknowledged writes: "sent" is printed only for text the PTY took.
-    for (req_id, data) in [(1, send_payload(&text)), (2, b"\r".to_vec())] {
+    for (req_id, data) in [(1, payload), (2, b"\r".to_vec())] {
         if req_id == 2 {
             tokio::time::sleep(Duration::from_millis(150)).await;
         }
@@ -2526,6 +2550,36 @@ mod tests {
         assert_eq!(
             default_agent_name(None, &["agent-1".into(), "agent-3".into()]),
             "agent-2"
+        );
+    }
+
+    #[test]
+    fn a_send_goes_raw_up_to_1000_bytes_on_one_line() {
+        let line = "x".repeat(1000);
+        assert_eq!(send_payload(&line, false), Ok(line.into_bytes()));
+    }
+
+    #[test]
+    fn a_send_past_1000_bytes_or_with_a_newline_is_refused_and_names_the_pointer() {
+        for text in ["x".repeat(1001), "two\nlines".to_string()] {
+            let why = send_payload(&text, false).unwrap_err();
+            assert!(
+                why.contains(".scratch/") && why.contains("Read <path> and act on it."),
+                "{why}"
+            );
+        }
+    }
+
+    #[test]
+    fn paste_sends_long_or_multi_line_text_as_one_bracketed_paste() {
+        let long = "x".repeat(1001);
+        assert_eq!(
+            send_payload(&long, true),
+            Ok(format!("\x1b[200~{long}\x1b[201~").into_bytes())
+        );
+        assert_eq!(
+            send_payload("two\nlines", true),
+            Ok(b"\x1b[200~two\nlines\x1b[201~".to_vec())
         );
     }
 }

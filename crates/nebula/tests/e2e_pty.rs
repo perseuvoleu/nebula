@@ -6732,7 +6732,16 @@ async fn agent_send_delivers_a_long_line_as_one_bracketed_paste() {
         (long.as_str(), format!("\x1b[200~{long}\x1b[201~\r")),
     ] {
         let result = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
-            .args(["agent", "send", "--project", "repo", "--", "fixture", text])
+            .args([
+                "agent",
+                "send",
+                "--paste",
+                "--project",
+                "repo",
+                "--",
+                "fixture",
+                text,
+            ])
             .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
             .output()
             .unwrap();
@@ -6847,6 +6856,7 @@ async fn agent_send_refuses_a_long_message_the_tty_would_drop() {
         .args([
             "agent",
             "send",
+            "--paste",
             "--project",
             "repo",
             "--",

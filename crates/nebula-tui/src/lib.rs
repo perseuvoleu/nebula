@@ -254,9 +254,27 @@ pub fn run_agent_read(name: String, lines: Option<usize>, project: Option<String
     runtime()?.block_on(ipc::agent_read(name, lines, project))
 }
 
-/// `nebula agent send` — submit a follow-up prompt to a running worker.
-pub fn run_agent_send(name: String, text: String, project: Option<String>) -> Result<()> {
-    runtime()?.block_on(ipc::agent_send(name, text, project))
+/// `nebula agent send` — submit a follow-up prompt to a running worker, or
+/// with `file` a pointer to it. Exits 2, sending nothing, for a missing file
+/// or text that would go as a paste without `paste`.
+pub fn run_agent_send(
+    name: String,
+    text: String,
+    file: Option<std::path::PathBuf>,
+    paste: bool,
+    project: Option<String>,
+) -> Result<()> {
+    let text = match file {
+        Some(path) => ipc::file_pointer(&path),
+        None => Ok(text),
+    };
+    match text.and_then(|text| ipc::send_payload(&text, paste).map(|payload| (text, payload))) {
+        Ok((text, payload)) => runtime()?.block_on(ipc::agent_send(name, text, payload, project)),
+        Err(why) => {
+            eprintln!("{why}");
+            std::process::exit(2);
+        }
+    }
 }
 
 pub use ipc::AgentCtl;
