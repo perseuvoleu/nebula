@@ -2411,7 +2411,8 @@ impl Daemon {
     }
 
     /// The unarchived writer on this checkout whose turn can still run:
-    /// a live PTY, or a running/finished status a resume picks up again.
+    /// a live PTY, or a status a resume picks up again. A daemon restart
+    /// sweeps a mid-turn holder to disconnected, which still holds.
     fn live_writer(&self, worktree_id: &WorktreeId) -> Result<Option<String>> {
         let (_, _, agents, _) = self.store.load_tree()?;
         Ok(agents
@@ -2421,7 +2422,13 @@ impl Daemon {
                     && !a.archived
                     && &a.worktree_id == worktree_id
                     && (self.is_alive(&SessionRef::Agent(a.id.clone()))
-                        || matches!(a.status, AgentStatus::Running | AgentStatus::Finished))
+                        || matches!(
+                            a.status,
+                            AgentStatus::Running
+                                | AgentStatus::NeedsFeedback
+                                | AgentStatus::Finished
+                                | AgentStatus::Disconnected
+                        ))
             })
             .map(|a| a.name))
     }
