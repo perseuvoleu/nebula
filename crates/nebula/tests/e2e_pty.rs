@@ -6732,7 +6732,16 @@ async fn agent_send_delivers_a_long_line_as_one_bracketed_paste() {
         (long.as_str(), format!("\x1b[200~{long}\x1b[201~\r")),
     ] {
         let result = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
-            .args(["agent", "send", "--project", "repo", "--", "fixture", text])
+            .args([
+                "agent",
+                "send",
+                "--paste",
+                "--project",
+                "repo",
+                "--",
+                "fixture",
+                text,
+            ])
             .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
             .output()
             .unwrap();
@@ -6749,6 +6758,76 @@ async fn agent_send_delivers_a_long_line_as_one_bracketed_paste() {
             String::from_utf8_lossy(&expected)
         );
     }
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon.0);
+}
+
+/// A Claude worker reads a pasted message as quoted content, not as an
+/// instruction, so a send that would go as a paste is refused unless asked for.
+#[tokio::test]
+async fn agent_send_refuses_paste_sized_text_and_sends_a_file_as_a_one_line_pointer() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let (script, ready, capture) = input_recorder(&env, true);
+    let mut daemon = env.spawn_daemon_with_agent_cmd(script.to_str().unwrap());
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let main = add_project_get_main_worktree(&mut c, &repo).await;
+    create_agent_get_id(&mut c, &main.id, "fixture", 90).await;
+    for _ in 0..100 {
+        if ready.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(ready.exists());
+    let send = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+            .args(["agent", "send", "--project", "repo"])
+            .args(args)
+            .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
+            .output()
+            .unwrap()
+    };
+
+    let long = long_single_line_message();
+    for text in [long.as_str(), "two\nlines"] {
+        let result = send(&["--", "fixture", text]);
+        assert_eq!(result.status.code(), Some(2), "{result:?}");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains(".scratch/") && stderr.contains("Read <path> and act on it."),
+            "{result:?}"
+        );
+        assert_eq!(String::from_utf8_lossy(&result.stdout), "");
+    }
+
+    let scratch = repo.join(".scratch");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let message = scratch.join("msg-fixture-1.md");
+    std::fs::write(&message, &long).unwrap();
+    for refused in [scratch.join("missing.md"), scratch.clone()] {
+        let result = send(&["fixture", "--file", refused.to_str().unwrap()]);
+        assert_eq!(result.status.code(), Some(2), "{result:?}");
+    }
+    assert_eq!(std::fs::read(&capture).unwrap_or_default(), b"");
+
+    let result = send(&["fixture", "--file", message.to_str().unwrap()]);
+    assert!(result.status.success(), "{result:?}");
+    let expected = format!(
+        "Read {} and act on it.\r",
+        std::fs::canonicalize(&message).unwrap().display()
+    );
+    for _ in 0..100 {
+        if std::fs::read(&capture).unwrap_or_default().len() >= expected.len() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        String::from_utf8_lossy(&std::fs::read(&capture).unwrap_or_default()),
+        expected
+    );
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
     wait_for_exit(&mut daemon.0);
 }
@@ -6777,6 +6856,7 @@ async fn agent_send_refuses_a_long_message_the_tty_would_drop() {
         .args([
             "agent",
             "send",
+            "--paste",
             "--project",
             "repo",
             "--",

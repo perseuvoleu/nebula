@@ -621,6 +621,15 @@ async fn subscribe_snapshot_with_terminals(
     }
 }
 
+/// `--project name@host` split into name and host; `None` for a local name.
+/// A bare name means the local project when both exist (the panel's
+/// `name @host` spelling, minus the space).
+pub fn project_flag_host(flag: Option<&str>) -> Option<(&str, &str)> {
+    flag?
+        .rsplit_once('@')
+        .filter(|(n, h)| !n.is_empty() && !h.is_empty())
+}
+
 /// Resolve which project a control verb targets: `--project <name>` wins,
 /// otherwise the caller's own session (NEBULA_AGENT_ID) names it.
 pub(crate) fn resolve_project(
@@ -630,12 +639,9 @@ pub(crate) fn resolve_project(
     project_flag: Option<&str>,
 ) -> Result<nebula_core::Project> {
     if let Some(flag) = project_flag {
-        // `name@host` picks a remote project's twin; a bare name means the
-        // local one when both exist (the panel's `name @host` spelling,
-        // minus the space).
-        let (name, host) = match flag.rsplit_once('@') {
-            Some((n, h)) if !n.is_empty() && !h.is_empty() => (n, Some(h)),
-            _ => (flag, None),
+        let (name, host) = match project_flag_host(Some(flag)) {
+            Some((n, h)) => (n, Some(h)),
+            None => (flag, None),
         };
         let mut named = projects.iter().filter(|p| p.name == name);
         let hit = match host {
@@ -1493,21 +1499,57 @@ pub async fn agent_read(
 /// span two reads goes as a bracketed paste instead.
 const RAW_SEND_MAX: usize = 1000;
 
-fn send_payload(text: &str) -> Vec<u8> {
+/// The bytes `agent send` writes for `text`, or why it refuses. Text that
+/// must go as a bracketed paste is refused unless `paste` asks for one: a
+/// Claude worker reads a paste as quoted content, not as an instruction.
+pub fn send_payload(text: &str, paste: bool) -> Result<Vec<u8>, String> {
     if text.contains('\n') || text.len() > RAW_SEND_MAX {
-        format!("\x1b[200~{text}\x1b[201~").into_bytes()
+        if !paste {
+            return Err(format!(
+                "refusing to send {} bytes{}: it would arrive as a paste, which a worker reads as quoted content, not as an instruction. Write the text to a file under the project's .scratch/ and send `Read <path> and act on it.` (`--file <path>` does that), or pass --paste to send it as a bracketed paste anyway",
+                text.len(),
+                if text.contains('\n') { " over several lines" } else { "" },
+            ));
+        }
+        Ok(format!("\x1b[200~{text}\x1b[201~").into_bytes())
     } else {
-        text.as_bytes().to_vec()
+        Ok(text.as_bytes().to_vec())
     }
+}
+
+/// The one-line pointer `agent send --file` sends instead of the file's text.
+/// For a `remote` project the path names a file on that host, so it is sent
+/// as given and must be absolute; this machine's filesystem says nothing
+/// about it.
+pub fn file_pointer(path: &Path, remote: bool) -> Result<String, String> {
+    if remote {
+        if !path.is_absolute() {
+            return Err(format!(
+                "--file {}: a remote project needs the file's absolute path on its host. Sync .scratch/ with `nebula sync` or write the file on the host, then pass that absolute path",
+                path.display()
+            ));
+        }
+        return Ok(format!("Read {} and act on it.", path.display()));
+    }
+    let absolute =
+        std::fs::canonicalize(path).map_err(|e| format!("--file {}: {e}", path.display()))?;
+    if !absolute.is_file() {
+        return Err(format!("--file {}: not a regular file", path.display()));
+    }
+    Ok(format!("Read {} and act on it.", absolute.display()))
 }
 
 /// `nebula agent send <name> <text…>`: type a follow-up prompt into a
 /// running worker's CLI and submit it — the steering half of delegation
-/// (`--prompt` only covers the first task). Multi-line text goes in as a
-/// bracketed paste so embedded newlines don't submit early, and so does a
-/// long line (see [`RAW_SEND_MAX`]); Enter follows
+/// (`--prompt` only covers the first task). `payload` is the text as
+/// [`send_payload`] encoded it; Enter follows
 /// after a beat, once the CLI has ingested the text.
-pub async fn agent_send(name: String, text: String, project_flag: Option<String>) -> Result<()> {
+pub async fn agent_send(
+    name: String,
+    text: String,
+    payload: Vec<u8>,
+    project_flag: Option<String>,
+) -> Result<()> {
     let sock = paths::socket_path();
     let Ok(stream) = try_connect(&sock).await else {
         bail!("no nebula daemon is running");
@@ -1523,7 +1565,7 @@ pub async fn agent_send(name: String, text: String, project_flag: Option<String>
         );
     }
     // Acknowledged writes: "sent" is printed only for text the PTY took.
-    for (req_id, data) in [(1, send_payload(&text)), (2, b"\r".to_vec())] {
+    for (req_id, data) in [(1, payload), (2, b"\r".to_vec())] {
         if req_id == 2 {
             tokio::time::sleep(Duration::from_millis(150)).await;
         }
@@ -2527,5 +2569,78 @@ mod tests {
             default_agent_name(None, &["agent-1".into(), "agent-3".into()]),
             "agent-2"
         );
+    }
+
+    #[test]
+    fn a_send_goes_raw_up_to_1000_bytes_on_one_line() {
+        let line = "x".repeat(1000);
+        assert_eq!(send_payload(&line, false), Ok(line.into_bytes()));
+    }
+
+    #[test]
+    fn a_send_past_1000_bytes_or_with_a_newline_is_refused_and_names_the_pointer() {
+        for text in ["x".repeat(1001), "two\nlines".to_string()] {
+            let why = send_payload(&text, false).unwrap_err();
+            assert!(
+                why.contains(".scratch/") && why.contains("Read <path> and act on it."),
+                "{why}"
+            );
+        }
+    }
+
+    #[test]
+    fn paste_sends_long_or_multi_line_text_as_one_bracketed_paste() {
+        let long = "x".repeat(1001);
+        assert_eq!(
+            send_payload(&long, true),
+            Ok(format!("\x1b[200~{long}\x1b[201~").into_bytes())
+        );
+        assert_eq!(
+            send_payload("two\nlines", true),
+            Ok(b"\x1b[200~two\nlines\x1b[201~".to_vec())
+        );
+    }
+
+    #[test]
+    fn send_file_to_a_remote_project_points_at_the_hosts_absolute_path_as_given() {
+        let remote = project_flag_host(Some("nebula@findl")).is_some();
+        assert_eq!(
+            file_pointer(
+                Path::new("/home/nebula/nowhere-on-this-laptop/msg.md"),
+                remote
+            ),
+            Ok("Read /home/nebula/nowhere-on-this-laptop/msg.md and act on it.".to_string())
+        );
+    }
+
+    #[test]
+    fn send_file_to_a_remote_project_refuses_a_relative_path_and_names_the_fix() {
+        let remote = project_flag_host(Some("nebula@findl")).is_some();
+        let why = file_pointer(Path::new(".scratch/msg.md"), remote).unwrap_err();
+        assert!(
+            why.contains("nebula sync") && why.contains("absolute path"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn send_file_to_a_local_project_checks_and_canonicalizes_the_file_here() {
+        for flag in [None, Some("nebula"), Some("@findl"), Some("nebula@")] {
+            assert_eq!(project_flag_host(flag), None, "{flag:?}");
+        }
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        assert_eq!(
+            file_pointer(&manifest, false),
+            Ok(format!(
+                "Read {} and act on it.",
+                manifest.canonicalize().unwrap().display()
+            ))
+        );
+        assert!(file_pointer(
+            Path::new("/home/nebula/nowhere-on-this-laptop/msg.md"),
+            false
+        )
+        .is_err());
+        assert!(file_pointer(Path::new(env!("CARGO_MANIFEST_DIR")), false).is_err());
     }
 }
