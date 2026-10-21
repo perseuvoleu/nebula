@@ -713,9 +713,11 @@ impl Store {
     pub fn set_agent_archived(&self, id: &AgentId, archived: bool) -> Result<()> {
         // Stamp the archive time (cleared on unarchive) so the TUI can
         // order the ARCHIVED group newest-first.
+        // Archiving drops the writer mark for good, so an unarchive never
+        // brings back a second writer beside the one that took the slot.
         let archived_at = if archived { now_ms() } else { 0 };
         self.conn.lock().unwrap().execute(
-            "UPDATE agents SET archived = ?2, archived_at = ?3 WHERE id = ?1",
+            "UPDATE agents SET archived = ?2, archived_at = ?3, writer = writer AND NOT ?2 WHERE id = ?1",
             params![id.as_str(), archived as i64, archived_at],
         )?;
         Ok(())
