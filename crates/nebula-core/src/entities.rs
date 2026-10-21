@@ -198,8 +198,8 @@ pub struct Agent {
     #[serde(default)]
     pub branch: Option<String>,
     /// Spawned with `agent new --writer`: the checkout's one writer while
-    /// the session lives. Skipped when false so the row keeps the wire
-    /// shape daemons without this field decode.
+    /// the session lives. Skipped when false, so a row without the mark
+    /// keeps its protocol-29 bytes.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub writer: bool,
 }
