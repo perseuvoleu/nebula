@@ -621,6 +621,15 @@ async fn subscribe_snapshot_with_terminals(
     }
 }
 
+/// `--project name@host` split into name and host; `None` for a local name.
+/// A bare name means the local project when both exist (the panel's
+/// `name @host` spelling, minus the space).
+pub fn project_flag_host(flag: Option<&str>) -> Option<(&str, &str)> {
+    flag?
+        .rsplit_once('@')
+        .filter(|(n, h)| !n.is_empty() && !h.is_empty())
+}
+
 /// Resolve which project a control verb targets: `--project <name>` wins,
 /// otherwise the caller's own session (NEBULA_AGENT_ID) names it.
 pub(crate) fn resolve_project(
@@ -630,12 +639,9 @@ pub(crate) fn resolve_project(
     project_flag: Option<&str>,
 ) -> Result<nebula_core::Project> {
     if let Some(flag) = project_flag {
-        // `name@host` picks a remote project's twin; a bare name means the
-        // local one when both exist (the panel's `name @host` spelling,
-        // minus the space).
-        let (name, host) = match flag.rsplit_once('@') {
-            Some((n, h)) if !n.is_empty() && !h.is_empty() => (n, Some(h)),
-            _ => (flag, None),
+        let (name, host) = match project_flag_host(Some(flag)) {
+            Some((n, h)) => (n, Some(h)),
+            None => (flag, None),
         };
         let mut named = projects.iter().filter(|p| p.name == name);
         let hit = match host {
@@ -1512,7 +1518,7 @@ pub fn send_payload(text: &str, paste: bool) -> Result<Vec<u8>, String> {
 }
 
 /// The one-line pointer `agent send --file` sends instead of the file's text.
-pub fn file_pointer(path: &Path) -> Result<String, String> {
+pub fn file_pointer(path: &Path, _remote: bool) -> Result<String, String> {
     let absolute =
         std::fs::canonicalize(path).map_err(|e| format!("--file {}: {e}", path.display()))?;
     if !absolute.is_file() {
@@ -2581,5 +2587,48 @@ mod tests {
             send_payload("two\nlines", true),
             Ok(b"\x1b[200~two\nlines\x1b[201~".to_vec())
         );
+    }
+
+    #[test]
+    fn send_file_to_a_remote_project_points_at_the_hosts_absolute_path_as_given() {
+        let remote = project_flag_host(Some("nebula@findl")).is_some();
+        assert_eq!(
+            file_pointer(
+                Path::new("/home/nebula/nowhere-on-this-laptop/msg.md"),
+                remote
+            ),
+            Ok("Read /home/nebula/nowhere-on-this-laptop/msg.md and act on it.".to_string())
+        );
+    }
+
+    #[test]
+    fn send_file_to_a_remote_project_refuses_a_relative_path_and_names_the_fix() {
+        let remote = project_flag_host(Some("nebula@findl")).is_some();
+        let why = file_pointer(Path::new(".scratch/msg.md"), remote).unwrap_err();
+        assert!(
+            why.contains("nebula sync") && why.contains("absolute path"),
+            "{why}"
+        );
+    }
+
+    #[test]
+    fn send_file_to_a_local_project_checks_and_canonicalizes_the_file_here() {
+        for flag in [None, Some("nebula"), Some("@findl"), Some("nebula@")] {
+            assert_eq!(project_flag_host(flag), None, "{flag:?}");
+        }
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        assert_eq!(
+            file_pointer(&manifest, false),
+            Ok(format!(
+                "Read {} and act on it.",
+                manifest.canonicalize().unwrap().display()
+            ))
+        );
+        assert!(file_pointer(
+            Path::new("/home/nebula/nowhere-on-this-laptop/msg.md"),
+            false
+        )
+        .is_err());
+        assert!(file_pointer(Path::new(env!("CARGO_MANIFEST_DIR")), false).is_err());
     }
 }

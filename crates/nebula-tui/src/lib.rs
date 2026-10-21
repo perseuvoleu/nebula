@@ -265,7 +265,9 @@ pub fn run_agent_send(
     project: Option<String>,
 ) -> Result<()> {
     let text = match file {
-        Some(path) => ipc::file_pointer(&path),
+        Some(path) => {
+            ipc::file_pointer(&path, ipc::project_flag_host(project.as_deref()).is_some())
+        }
         None => Ok(text),
     };
     match text.and_then(|text| ipc::send_payload(&text, paste).map(|payload| (text, payload))) {
