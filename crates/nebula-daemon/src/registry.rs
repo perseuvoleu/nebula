@@ -5696,6 +5696,19 @@ exec sleep 60
     }
 
     #[tokio::test]
+    async fn an_unarchived_holder_comes_back_without_the_writer_mark() {
+        let (_tmp, _script, daemon, checkout, holder) = checkout_with_live_writer().await;
+        daemon.archive_agent(&holder).unwrap();
+        let next = spawn_writer(&daemon, &checkout, "next", WriterClaim::Exclusive)
+            .await
+            .unwrap();
+        daemon.unarchive_agent(&holder).unwrap();
+        assert!(!agent_row(&daemon, &holder).writer);
+        assert!(agent_row(&daemon, &next).writer);
+        daemon.kill_all();
+    }
+
+    #[tokio::test]
     async fn a_spawn_without_writer_ignores_the_holder() {
         let (_tmp, _script, daemon, checkout, _holder) = checkout_with_live_writer().await;
         let reviewer = spawn_writer(&daemon, &checkout, "reviewer", WriterClaim::Off)
