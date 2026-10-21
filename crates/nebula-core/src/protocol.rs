@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 29;
+pub const PROTOCOL_VERSION: u32 = 30;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -18,10 +18,32 @@ pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
 /// that resends `CheckoutPrimary` with `stop_busy`.
 pub const BUSY_SESSIONS_REFUSAL: &str = "primary has sessions on";
 
+/// Sits in the `Error` a `CreateAgent` with `WriterClaim::Exclusive` gets
+/// while another live session is the checkout's writer; the CLI exits 2 on it.
+pub const WRITER_HELD_REFUSAL: &str = "is the writer on";
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SessionRef {
     Agent(AgentId),
     Terminal(TerminalId),
+}
+
+/// What a `CreateAgent` claims of its checkout's single writer slot.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WriterClaim {
+    #[default]
+    Off,
+    /// Refused while another live session holds the slot.
+    Exclusive,
+    /// Takes the slot alongside a live holder; the user approved two writers.
+    Forced,
+}
+
+impl WriterClaim {
+    /// True for a spawn that claims nothing, which never checks or takes the slot.
+    pub fn is_off(&self) -> bool {
+        *self == WriterClaim::Off
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -210,6 +232,10 @@ pub enum ClientRequest {
         /// (`nebula agent new --prompt`). Skips warm-slot adoption — an
         /// already-booted CLI can't take a launch argument.
         prompt: Option<String>,
+        /// Skipped when `Off`, so a request without a claim keeps its
+        /// protocol-29 bytes (tests/protocol29.rs).
+        #[serde(default, skip_serializing_if = "WriterClaim::is_off")]
+        writer: WriterClaim,
     },
     /// Fire-and-forget: pre-spawn an agent CLI for this (worktree, kind) so
     /// the next CreateAgent adopts an already-booted session. Sent the

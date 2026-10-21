@@ -370,7 +370,7 @@ badge. Matching branch names retain separate checkout rows (`@local` and `@findl
 and host-specific session ownership. `nebula collect` brings committed remote work into a local
 primary branch or separate worktree, preserving both checkouts and all remote sessions.
 Use `nebula collect --help` for mode, owner, host, dry-run and timeout options.
-Guarded collection requires compatible local and remote daemons (protocol 29); updating the
+Guarded collection requires compatible local and remote daemons (protocol 30); updating the
 CLI alone does not update a running daemon. Plan restarts only when sessions can safely stop.
 Every session picker offers the other side (`Run on findl ▸` in `n`,
 flat `Claude on findl` … rows in ⌘T/⌘D), `--project name@host` picks the

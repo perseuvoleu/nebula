@@ -11,7 +11,8 @@ use nebula_core::ClientRequest;
 use nebula_core::{
     Agent, AgentId, AgentKind, AgentStatus, Entity, EntityId, Link, LinkId, Note, NoteId,
     NoteOwner, Project, ProjectId, ServerEvent, SessionRef, TerminalId, TerminalTab, Todo, TodoId,
-    TodoOwner, Workspace, WorkspaceId, Worktree, WorktreeId, BUSY_SESSIONS_REFUSAL,
+    TodoOwner, Workspace, WorkspaceId, Worktree, WorktreeId, WriterClaim, BUSY_SESSIONS_REFUSAL,
+    WRITER_HELD_REFUSAL,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -90,6 +91,8 @@ pub struct Daemon {
     worktree_ops: tokio::sync::Mutex<()>,
     /// Orders physical checkout changes against session creation/resume.
     checkout_execution: tokio::sync::RwLock<()>,
+    /// Makes a writer spawn's holder check and its row insert one step.
+    writer_claims: tokio::sync::Mutex<()>,
     stop_deadline: Duration,
     agent_cmd_override: Option<String>,
     /// Warm agent CLIs awaiting adoption, at most one per (worktree, kind).
@@ -148,6 +151,7 @@ impl Daemon {
             shutdown: tokio_util::sync::CancellationToken::new(),
             worktree_ops: tokio::sync::Mutex::new(()),
             checkout_execution: tokio::sync::RwLock::new(()),
+            writer_claims: tokio::sync::Mutex::new(()),
             stop_deadline: overrides.stop_deadline,
             agent_cmd_override: overrides.agent_cmd,
             prewarmed: Mutex::new(HashMap::new()),
@@ -2324,6 +2328,7 @@ impl Daemon {
         effort: Option<String>,
         auto_title: bool,
         prompt: Option<String>,
+        writer: WriterClaim,
     ) -> Result<EntityId> {
         let _execution = self.checkout_execution.read().await;
         let worktree = self
@@ -2331,6 +2336,18 @@ impl Daemon {
             .get_worktree(worktree_id)?
             .context("worktree not found")?;
         self.validate_execution_branch(&worktree, expected_branch.or(Some(&worktree.branch)))?;
+        let _claim = match writer {
+            WriterClaim::Off => None,
+            _ => Some(self.writer_claims.lock().await),
+        };
+        if writer == WriterClaim::Exclusive {
+            if let Some(holder) = self.live_writer(worktree_id)? {
+                bail!(
+                    "\"{holder}\" {WRITER_HELD_REFUSAL} {}; wait for it, archive it, or pass --force-writer after the user approves two writers",
+                    worktree.branch
+                );
+            }
+        }
         // A warm session for this (worktree, kind) hands over its PTY and
         // its pre-generated id — the CLI booted while the user typed the
         // name, so the create feels instant. An initial prompt forces the
@@ -2370,6 +2387,7 @@ impl Daemon {
             status_changed_at: epoch_ms(),
             alive: false,
             branch: Some(worktree.branch.clone()),
+            writer: !writer.is_off(),
         };
         self.store
             .insert_agent_with_auto_title(&agent, auto_title)?;
@@ -2390,6 +2408,29 @@ impl Daemon {
             }
         }
         Ok(EntityId::Agent(agent.id))
+    }
+
+    /// The unarchived writer on this checkout whose turn can still run:
+    /// a live PTY, or a status a resume picks up again. A daemon restart
+    /// sweeps a mid-turn holder to disconnected, which still holds.
+    fn live_writer(&self, worktree_id: &WorktreeId) -> Result<Option<String>> {
+        let (_, _, agents, _) = self.store.load_tree()?;
+        Ok(agents
+            .into_iter()
+            .find(|a| {
+                a.writer
+                    && !a.archived
+                    && &a.worktree_id == worktree_id
+                    && (self.is_alive(&SessionRef::Agent(a.id.clone()))
+                        || matches!(
+                            a.status,
+                            AgentStatus::Running
+                                | AgentStatus::NeedsFeedback
+                                | AgentStatus::Finished
+                                | AgentStatus::Disconnected
+                        ))
+            })
+            .map(|a| a.name))
     }
 
     // ---- prewarm pool ----
@@ -2452,6 +2493,7 @@ impl Daemon {
             status_changed_at: 0,
             alive: false,
             branch: None,
+            writer: false,
         };
         self.spawn_agent_session(&agent, &worktree, 80, 24)?;
         tracing::info!(agent = %agent.id, kind = kind.as_str(), worktree = %worktree.branch, "prewarmed agent session");
@@ -4554,6 +4596,7 @@ mod tests {
                 status_changed_at: 0,
                 alive: false,
                 branch: None,
+                writer: false,
             })
             .unwrap();
     }
@@ -4652,6 +4695,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: false,
                     branch: None,
+                    writer: false,
                 },
                 true,
             )
@@ -5549,6 +5593,7 @@ exec sleep 60
                 None,
                 false,
                 None,
+                WriterClaim::Off,
             )
             .await
             .unwrap()
@@ -5556,6 +5601,153 @@ exec sleep 60
             panic!()
         };
         SessionRef::Agent(id)
+    }
+
+    async fn spawn_writer(
+        daemon: &Arc<Daemon>,
+        checkout: &WorktreeId,
+        name: &str,
+        writer: WriterClaim,
+    ) -> Result<AgentId> {
+        let id = daemon
+            .create_agent(
+                checkout,
+                None,
+                name,
+                AgentKind::Claude,
+                None,
+                None,
+                false,
+                None,
+                writer,
+            )
+            .await?;
+        let EntityId::Agent(id) = id else { panic!() };
+        Ok(id)
+    }
+
+    fn agent_row(daemon: &Daemon, id: &AgentId) -> Agent {
+        let ServerEvent::Snapshot { agents, .. } = daemon.snapshot().unwrap() else {
+            unreachable!()
+        };
+        agents.into_iter().find(|a| &a.id == id).unwrap()
+    }
+
+    async fn checkout_with_live_writer() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        Arc<Daemon>,
+        WorktreeId,
+        AgentId,
+    ) {
+        let (script, agent) = stand_in_agent(&[]);
+        let (tmp, _repo, daemon, _pid, primary) =
+            primary_with_feat_on(test_daemon_with(DaemonOverrides {
+                agent_cmd: agent,
+                ..DaemonOverrides::default()
+            }))
+            .await;
+        let holder = spawn_writer(&daemon, &primary.id, "holder", WriterClaim::Exclusive)
+            .await
+            .unwrap();
+        (tmp, script, daemon, primary.id, holder)
+    }
+
+    #[tokio::test]
+    async fn a_second_writer_is_refused_while_the_holder_lives() {
+        let (_tmp, _script, daemon, checkout, _holder) = checkout_with_live_writer().await;
+        let err = spawn_writer(&daemon, &checkout, "second", WriterClaim::Exclusive)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "\"holder\" is the writer on main; wait for it, archive it, or pass --force-writer after the user approves two writers"
+        );
+        let ServerEvent::Snapshot { agents, .. } = daemon.snapshot().unwrap() else {
+            unreachable!()
+        };
+        assert!(
+            agents.iter().all(|a| a.name != "second"),
+            "a refused spawn leaves no row"
+        );
+        daemon.kill_all();
+    }
+
+    #[tokio::test]
+    async fn a_forced_writer_spawns_beside_the_live_holder() {
+        let (_tmp, _script, daemon, checkout, _holder) = checkout_with_live_writer().await;
+        let second = spawn_writer(&daemon, &checkout, "second", WriterClaim::Forced)
+            .await
+            .unwrap();
+        assert!(agent_row(&daemon, &second).writer);
+        daemon.kill_all();
+    }
+
+    #[tokio::test]
+    async fn archiving_the_holder_frees_the_writer_slot() {
+        let (_tmp, _script, daemon, checkout, holder) = checkout_with_live_writer().await;
+        daemon.archive_agent(&holder).unwrap();
+        spawn_writer(&daemon, &checkout, "next", WriterClaim::Exclusive)
+            .await
+            .unwrap();
+        daemon.kill_all();
+    }
+
+    #[tokio::test]
+    async fn an_unarchived_holder_comes_back_without_the_writer_mark() {
+        let (_tmp, _script, daemon, checkout, holder) = checkout_with_live_writer().await;
+        daemon.archive_agent(&holder).unwrap();
+        let next = spawn_writer(&daemon, &checkout, "next", WriterClaim::Exclusive)
+            .await
+            .unwrap();
+        daemon.unarchive_agent(&holder).unwrap();
+        assert!(!agent_row(&daemon, &holder).writer);
+        assert!(agent_row(&daemon, &next).writer);
+        daemon.kill_all();
+    }
+
+    #[tokio::test]
+    async fn a_spawn_without_writer_ignores_the_holder() {
+        let (_tmp, _script, daemon, checkout, _holder) = checkout_with_live_writer().await;
+        let reviewer = spawn_writer(&daemon, &checkout, "reviewer", WriterClaim::Off)
+            .await
+            .unwrap();
+        assert!(!agent_row(&daemon, &reviewer).writer);
+        daemon.kill_all();
+    }
+
+    #[tokio::test]
+    async fn a_holder_mid_turn_keeps_the_slot_across_a_daemon_restart() {
+        for (turn, status) in [
+            (HookEvent::UserPromptSubmit, AgentStatus::Running),
+            (HookEvent::PermissionRequest, AgentStatus::NeedsFeedback),
+        ] {
+            let (_tmp, _script, daemon, checkout, holder) = checkout_with_live_writer().await;
+            daemon.apply_hook_event(&holder, turn, None);
+            assert_eq!(agent_row(&daemon, &holder).status, status);
+            daemon.kill_all();
+            daemon.store.sweep_disconnected().unwrap();
+            let restarted = Daemon::with_overrides(
+                daemon.store.clone(),
+                HookEnv {
+                    port: 0,
+                    token: String::new(),
+                },
+                DaemonOverrides::default(),
+            );
+            assert_eq!(
+                agent_row(&restarted, &holder).status,
+                AgentStatus::Disconnected
+            );
+            let err = spawn_writer(&restarted, &checkout, "second", WriterClaim::Exclusive)
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("\"holder\" is the writer on main"),
+                "{status:?}: {err}"
+            );
+            restarted.kill_all();
+        }
     }
 
     #[tokio::test]
@@ -6403,6 +6595,7 @@ exec sleep 60
                 None,
                 false,
                 None,
+                WriterClaim::Off,
             )
             .await
             .unwrap_err();
@@ -6726,6 +6919,7 @@ exec sleep 60
                     status_changed_at: stamp,
                     alive: false,
                     branch: None,
+                    writer: false,
                 })
                 .unwrap();
         }

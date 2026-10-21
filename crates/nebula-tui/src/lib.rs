@@ -184,9 +184,16 @@ pub fn run_switch(
     runtime()?.block_on(ipc::switch(branch, from, worktree, project, stop_busy))
 }
 
-/// `nebula agent new` — spawn a session.
+/// `nebula agent new` — spawn a session. Exits 2 when another live session
+/// is the checkout's writer and `--writer` was passed without `--force-writer`.
 pub fn run_agent_new(opts: NewAgentOpts) -> Result<()> {
-    runtime()?.block_on(ipc::agent_new(opts))
+    match runtime()?.block_on(ipc::agent_new(opts)) {
+        Err(why) if why.to_string().contains(nebula_core::WRITER_HELD_REFUSAL) => {
+            eprintln!("{why:#}");
+            std::process::exit(2);
+        }
+        done => done,
+    }
 }
 
 /// `nebula worktree list` — JSON map of the checkouts and who lives on them.

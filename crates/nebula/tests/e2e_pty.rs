@@ -4,7 +4,8 @@
 
 use nebula_core::codec::{read_frame, write_frame};
 use nebula_core::{
-    AgentKind, ClientRequest, Entity, EntityId, ServerEvent, SessionRef, PROTOCOL_VERSION,
+    AgentKind, ClientRequest, Entity, EntityId, ServerEvent, SessionRef, WriterClaim,
+    PROTOCOL_VERSION,
 };
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -380,6 +381,7 @@ async fn full_crud_attach_and_restart_persistence() {
             effort: None,
             auto_title: false,
             prompt: None,
+            writer: WriterClaim::Off,
         },
     )
     .await
@@ -769,6 +771,7 @@ async fn hook_post_from_agent_pty_drives_status() {
             effort: None,
             auto_title: false,
             prompt: None,
+            writer: WriterClaim::Off,
         },
     )
     .await
@@ -1774,6 +1777,7 @@ async fn hook_cwd_rehomes_agent_to_other_worktree() {
             effort: None,
             auto_title: false,
             prompt: None,
+            writer: WriterClaim::Off,
         },
     )
     .await
@@ -1937,6 +1941,7 @@ async fn move_agent_respawns_live_session_in_target_worktree() {
             effort: None,
             auto_title: false,
             prompt: None,
+            writer: WriterClaim::Off,
         },
     )
     .await
@@ -2120,6 +2125,7 @@ async fn codex_hooks_install_and_drive_status() {
             effort: None,
             auto_title: false,
             prompt: None,
+            writer: WriterClaim::Off,
         },
     )
     .await
@@ -2765,6 +2771,7 @@ async fn prewarmed_session_is_adopted_by_create_agent() {
             effort: None,
             auto_title: false,
             prompt: None,
+            writer: WriterClaim::Off,
         },
     )
     .await
@@ -2895,6 +2902,7 @@ async fn dead_prewarm_falls_back_to_cold_spawn() {
             effort: None,
             auto_title: false,
             prompt: None,
+            writer: WriterClaim::Off,
         },
     )
     .await
@@ -2954,6 +2962,7 @@ async fn create_agent_refuses_when_the_cli_is_not_installed() {
                 effort: None,
                 auto_title: false,
                 prompt: None,
+                writer: WriterClaim::Off,
             },
         )
         .await
@@ -3047,6 +3056,7 @@ async fn create_agent_succeeds_when_the_cli_is_on_the_login_shell_path() {
             effort: None,
             auto_title: false,
             prompt: None,
+            writer: WriterClaim::Off,
         },
     )
     .await
@@ -3117,6 +3127,7 @@ async fn create_agent_get_id(
             effort: None,
             auto_title: false,
             prompt: None,
+            writer: WriterClaim::Off,
         },
     )
     .await
@@ -3295,6 +3306,7 @@ async fn archive_sigkills_an_agent_that_ignores_sighup() {
             effort: None,
             auto_title: false,
             prompt: None,
+            writer: WriterClaim::Off,
         },
     )
     .await
@@ -3457,6 +3469,7 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
             effort: None,
             auto_title: false,
             prompt: None,
+            writer: WriterClaim::Off,
         },
     )
     .await
@@ -3513,6 +3526,7 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
             effort: None,
             auto_title: false,
             prompt: None,
+            writer: WriterClaim::Off,
         },
     )
     .await
@@ -3682,6 +3696,7 @@ async fn idle_reaper_kills_unattached_sibling_on_viewed_worktree() {
                 effort: None,
                 auto_title: false,
                 prompt: None,
+                writer: WriterClaim::Off,
             },
         )
         .await
@@ -4173,6 +4188,7 @@ async fn auto_title_instruction_and_rename_flow() {
             effort: None,
             auto_title: true,
             prompt: None,
+            writer: WriterClaim::Off,
         },
     )
     .await
@@ -5979,6 +5995,7 @@ async fn a_parked_agent_resumes_its_conversation_once_primary_is_back_on_its_bra
             effort: None,
             auto_title: false,
             prompt: None,
+            writer: WriterClaim::Off,
         },
     )
     .await
@@ -6618,7 +6635,7 @@ async fn mobile_safe_removal_preserves_dirty_unmerged_occupied_and_protected_che
 
 /// Use literal peer versions so a simultaneous client/server constant change cannot mask a mismatch.
 #[tokio::test]
-async fn protocol29_handshake_accepts_repeated_probes_and_rejects_protocol28() {
+async fn protocol30_handshake_accepts_repeated_probes_and_rejects_protocol29() {
     let env = TestEnv::new();
     let _daemon = env.spawn_daemon();
     let mut c = connect(&env.sock()).await;
@@ -6626,7 +6643,7 @@ async fn protocol29_handshake_accepts_repeated_probes_and_rejects_protocol28() {
         write_frame(
             &mut c,
             &ClientRequest::Hello {
-                protocol_version: 29,
+                protocol_version: 30,
             },
         )
         .await
@@ -6640,7 +6657,7 @@ async fn protocol29_handshake_accepts_repeated_probes_and_rejects_protocol28() {
             matches!(
                 reply,
                 Some(ServerEvent::HelloOk {
-                    protocol_version: 29,
+                    protocol_version: 30,
                     ..
                 })
             ),
@@ -6651,7 +6668,7 @@ async fn protocol29_handshake_accepts_repeated_probes_and_rejects_protocol28() {
     write_frame(
         &mut old,
         &ClientRequest::Hello {
-            protocol_version: 28,
+            protocol_version: 29,
         },
     )
     .await
@@ -6667,7 +6684,7 @@ async fn protocol29_handshake_accepts_repeated_probes_and_rejects_protocol28() {
         matches!(
             reply,
             Some(ServerEvent::Incompatible {
-                daemon_protocol_version: 29
+                daemon_protocol_version: 30
             })
         ),
         "{reply:?}"
@@ -6830,6 +6847,191 @@ async fn agent_send_refuses_paste_sized_text_and_sends_a_file_as_a_one_line_poin
     );
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
     wait_for_exit(&mut daemon.0);
+}
+
+#[tokio::test]
+async fn agent_new_writer_exits_2_naming_the_live_holder_unless_forced() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let script = env.tmp.path().join("idle-agent");
+    write_executable(&script, "#!/bin/sh\nexec sleep 60\n");
+    let mut daemon = env.spawn_daemon_with_agent_cmd(script.to_str().unwrap());
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    add_project_get_main_worktree(&mut c, &repo).await;
+    let cli = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+            .args(args)
+            .args(["--project", "repo"])
+            .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
+            .output()
+            .unwrap()
+    };
+    let spawn = |name: &str, flags: &[&str]| {
+        let mut args = vec!["agent", "new", "--worktree", "main", "--name", name];
+        args.extend_from_slice(flags);
+        cli(&args)
+    };
+
+    let holder = spawn("holder", &["--writer"]);
+    assert!(holder.status.success(), "{holder:?}");
+    let show = cli(&["agent", "show", "holder"]);
+    let shown: serde_json::Value = serde_json::from_slice(&show.stdout).unwrap();
+    assert_eq!(shown["writer"], true, "{show:?}");
+
+    let second = spawn("second", &["--writer"]);
+    assert_eq!(second.status.code(), Some(2), "{second:?}");
+    assert_eq!(String::from_utf8_lossy(&second.stdout), "");
+    assert!(
+        String::from_utf8_lossy(&second.stderr).contains(
+            "\"holder\" is the writer on main; wait for it, archive it, or pass --force-writer after the user approves two writers"
+        ),
+        "{second:?}"
+    );
+
+    for (name, flags, writer) in [
+        ("forced", &["--writer", "--force-writer"][..], true),
+        ("forced-alone", &["--force-writer"], true),
+        ("reviewer", &[], false),
+    ] {
+        let out = spawn(name, flags);
+        assert!(out.status.success(), "{name}: {out:?}");
+        let show = cli(&["agent", "show", name]);
+        let shown: serde_json::Value = serde_json::from_slice(&show.stdout).unwrap();
+        assert_eq!(shown["writer"], writer, "{name}: {show:?}");
+    }
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon.0);
+}
+
+#[tokio::test]
+async fn agent_new_writer_on_a_host_applies_the_rule_there() {
+    let host_env = TestEnv::new();
+    let repo = host_env.make_repo();
+    let idle = host_env.tmp.path().join("idle-agent");
+    write_executable(&idle, "#!/bin/sh\nexec sleep 60\n");
+    let mut host_daemon = host_env.spawn_daemon_with_agent_cmd(idle.to_str().unwrap());
+    let host_vars = format!(
+        "NEBULA_RUNTIME_DIR='{}' NEBULA_DATA_DIR='{}'",
+        host_env.runtime_dir.display(),
+        host_env.tmp.path().join("data").display(),
+    );
+    let proxy = format!("{host_vars} '{}' proxy", env!("CARGO_BIN_EXE_nebula"));
+
+    let env = TestEnv::new();
+    let mut daemon = env.spawn_daemon_with("/bin/sh", &[("NEBULA_RELAY_CMD", proxy.as_str())]);
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    write_frame(
+        &mut c,
+        &ClientRequest::AddProject {
+            req_id: 1,
+            path: repo.clone(),
+            name: None,
+            create_missing: false,
+            host: Some("testhost".into()),
+        },
+    )
+    .await
+    .unwrap();
+    write_frame(&mut c, &ClientRequest::Subscribe)
+        .await
+        .unwrap();
+    read_events_until(&mut c, Duration::from_secs(15), |evs| {
+        find_ack(evs, 1).is_some()
+            && evs.iter().any(|e| {
+                matches!(e, ServerEvent::EntityUpserted { entity: Entity::Worktree(w) } if w.is_main)
+            })
+    })
+    .await;
+
+    let cli = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+            .args(args)
+            .args(["--project", "repo@testhost"])
+            .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
+            .output()
+            .unwrap()
+    };
+    let spawn = |name: &str| {
+        cli(&[
+            "agent",
+            "new",
+            "--worktree",
+            "main",
+            "--name",
+            name,
+            "--writer",
+        ])
+    };
+    let writer_of = |name: &str| {
+        let show = cli(&["agent", "show", name]);
+        serde_json::from_slice::<serde_json::Value>(&show.stdout).unwrap()["writer"].clone()
+    };
+
+    let holder = spawn("holder");
+    assert!(holder.status.success(), "{holder:?}");
+    assert_eq!(String::from_utf8_lossy(&holder.stderr), "");
+    assert_eq!(writer_of("holder"), true);
+    let second = spawn("second");
+    assert_eq!(second.status.code(), Some(2), "{second:?}");
+    assert!(
+        String::from_utf8_lossy(&second.stderr).contains("\"holder\" is the writer on main;"),
+        "{second:?}"
+    );
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon.0);
+    let mut h = connect(&host_env.sock()).await;
+    handshake(&mut h).await;
+    write_frame(&mut h, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut host_daemon.0);
+}
+
+/// A daemon from before the writer claim speaks protocol 29: it answers
+/// any other Hello with `Incompatible` and closes, as server.rs does.
+#[tokio::test]
+async fn agent_new_writer_against_a_protocol29_daemon_stops_at_the_handshake() {
+    let env = TestEnv::new();
+    std::fs::create_dir_all(&env.runtime_dir).unwrap();
+    let listener = tokio::net::UnixListener::bind(env.sock()).unwrap();
+    let old_daemon = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let Some(ClientRequest::Hello { protocol_version }) =
+            read_frame::<ClientRequest, _>(&mut stream).await.unwrap()
+        else {
+            panic!("the client must open with Hello");
+        };
+        let reply = if protocol_version == 29 {
+            ServerEvent::HelloOk {
+                protocol_version: 29,
+                daemon_pid: std::process::id(),
+            }
+        } else {
+            ServerEvent::Incompatible {
+                daemon_protocol_version: 29,
+            }
+        };
+        write_frame(&mut stream, &reply).await.unwrap();
+    });
+    let runtime_dir = env.runtime_dir.clone();
+    let out = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+            .args(["agent", "new", "--worktree", "main", "--writer"])
+            .env("NEBULA_RUNTIME_DIR", runtime_dir)
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    old_daemon.await.unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(&format!(
+            "daemon speaks protocol v29, this client v{PROTOCOL_VERSION} — run `nebula kill` and relaunch"
+        )),
+        "{out:?}"
+    );
 }
 
 /// A tty still in line mode silently drops whatever does not fit its input
