@@ -27,6 +27,8 @@ test("outgoing messages and composer are white/black; terminal scrolling has no 
 });
 
 test("chat tabs navigate without losing drafts; working session names are yellow", async ({ page }) => {
+  // With motion allowed the yellow comes from an animated text gradient and `color` is transparent.
+  await page.emulateMedia({ reducedMotion: "reduce" });
   await login(page, "/p/alpha/s/pi-1");
   const nav = page.getByRole("navigation", { name: "Sesiuni în alpha" });
   await expect(nav.getByText("A doua sesiune Pi", { exact: true })).toHaveCSS("color", "rgb(250, 204, 21)");
