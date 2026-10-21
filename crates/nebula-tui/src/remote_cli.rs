@@ -148,6 +148,19 @@ const HOST_STATUS: &str = "v=$(nebula --version 2>/dev/null) || v='nebula: not i
     case \"$v\" in *'('*) b=$(nebula _daemon-build 2>/dev/null);; esac; \
     echo \"daemon: running${b:+ (build $b)}\"; else echo 'daemon: not running'; fi";
 
+/// Succeeds when the host's binary knows `--force-writer` and its daemon
+/// runs that build. A daemon without `CreateAgent.writer` cannot decode a
+/// request carrying it and drops the relay link, so the claim must not reach
+/// it. `--help` goes first: a binary without `_daemon-build` would take it
+/// for `nebula <dir>` and add a project.
+const WRITER_PROBE: &str = "nebula agent new --help 2>/dev/null | grep -q -- --force-writer && \
+    v=$(nebula --version) && d=$(nebula _daemon-build) && case \"$v\" in *\"($d)\") ;; *) exit 1;; esac";
+
+/// Whether `host`'s daemon takes a `--writer` claim; false when unreachable.
+pub(crate) fn host_daemon_knows_writer(host: &str) -> bool {
+    ssh(host, WRITER_PROBE, false).is_ok()
+}
+
 /// The build id in a `nebula --version` line: `nebula 0.6.0 (abc1234)`.
 fn version_build_id(line: &str) -> Option<&str> {
     let rest = line.strip_prefix("nebula ")?;

@@ -1770,6 +1770,15 @@ pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
     let mut conn = handshake(stream).await?;
     let (projects, worktrees, agents) = subscribe_snapshot(&mut conn).await?;
     let project = resolve_project(&projects, &worktrees, &agents, opts.project.as_deref())?;
+    let mut writer = opts.writer;
+    if let (false, Some(host)) = (writer.is_off(), project.host.as_deref()) {
+        if !crate::remote_cli::host_daemon_knows_writer(host) {
+            eprintln!(
+                "warning: the daemon on {host} does not know --writer; spawning without the writer mark"
+            );
+            writer = nebula_core::WriterClaim::Off;
+        }
+    }
     let of_project: Vec<&nebula_core::Worktree> = worktrees
         .iter()
         .filter(|w| w.project_id == project.id)
@@ -1842,7 +1851,7 @@ pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
             effort: opts.effort,
             auto_title,
             prompt: opts.prompt,
-            writer: opts.writer,
+            writer,
         },
     )
     .await?;
