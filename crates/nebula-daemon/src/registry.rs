@@ -703,8 +703,9 @@ impl Daemon {
     /// sessions get their stamps refreshed instead, and detach stamps too,
     /// so the full timeout starts only when the user leaves the tab.
     /// Spared regardless of age: pinned agents (the user's "never kill
-    /// this" mark — a running schedule or background job is invisible to
-    /// the status machine), agents that are running or waiting on feedback,
+    /// this" mark — a schedule or loop is invisible to the status machine),
+    /// agents that are running, waiting on feedback, or still have a command
+    /// running (a background job outlives the turn that started it),
     /// terminals with a command running, and prewarm-pool sessions
     /// (`reap_prewarmed` owns those). A reaped session revives on the next
     /// attach or prewarm; agents resume their conversation.
@@ -742,13 +743,14 @@ impl Daemon {
             let spared = match &sref {
                 SessionRef::Agent(id) => match self.store.get_agent(id).ok().flatten() {
                     // Pinned = the user marked it worth keeping (schedules,
-                    // loops, long jobs the status can't see) — never reap.
+                    // loops the status can't see) — never reap.
                     Some(agent) => {
                         agent.pinned
                             || matches!(
                                 agent.status,
                                 AgentStatus::Running | AgentStatus::NeedsFeedback
                             )
+                            || agent_has_command_child(&session)
                     }
                     // Row vanished mid-sweep: its delete kills the PTY anyway.
                     None => true,
@@ -3866,6 +3868,46 @@ fn shell_has_children(session: &PtySession) -> bool {
     )
 }
 
+/// Is this agent CLI running a command, a background one included? Agent
+/// CLIs run every command as a `<shell> -c` child (Claude's Bash and Monitor
+/// tools, Codex's exec), while their permanent helpers — stdio MCP servers,
+/// caffeinate — are never shells, so only a shell child counts. An unknown
+/// child pid or a failed probe counts as busy, as in `shell_has_children`.
+fn agent_has_command_child(session: &PtySession) -> bool {
+    let Some(pid) = session.child_pid else {
+        return true;
+    };
+    let Ok(out) = std::process::Command::new("ps")
+        .args(["-A", "-o", "ppid=", "-o", "args="])
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return true;
+    };
+    if !out.status.success() {
+        return true;
+    }
+    String::from_utf8_lossy(&out.stdout).lines().any(|line| {
+        let mut words = line.split_whitespace();
+        words.next().and_then(|ppid| ppid.parse::<u32>().ok()) == Some(pid)
+            && is_shell_command(words)
+    })
+}
+
+/// `argv` is a POSIX-ish shell running a command string: `zsh -c …`,
+/// `bash -lc …`.
+fn is_shell_command<'a>(mut argv: impl Iterator<Item = &'a str>) -> bool {
+    let shell = argv
+        .next()
+        .and_then(|arg0| arg0.rsplit('/').next())
+        .unwrap_or_default()
+        .trim_start_matches('-');
+    matches!(shell, "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish")
+        && argv.next().is_some_and(|flag| {
+            flag.starts_with('-') && !flag.starts_with("--") && flag.contains('c')
+        })
+}
+
 /// Canonical form of a user-typed link. Pasting a URL out of a browser is
 /// the common case, but people also type `github.com/o/r/pull/7`, so a
 /// scheme-less value gets https://. Anything else — another scheme, or no
@@ -6756,6 +6798,31 @@ exec sleep 60
             true,
         );
         assert_eq!(agent_worktree(&daemon, "a1"), "feat");
+    }
+
+    #[test]
+    fn agent_command_children_are_shells_and_helpers_are_not() {
+        // Command lines seen under live agents (`ps -o args=`), 2026-10-22.
+        for command in [
+            "/bin/zsh -c source /Users/u/.claude/shell-snapshots/snapshot-zsh-1792669510354-vg2mom.sh 2>/dev/null || true",
+            "/bin/zsh -c sleep 40 && echo probe-ok",
+            "/bin/bash -lc cargo test",
+            "sh -c sleep 30; true",
+        ] {
+            assert!(is_shell_command(command.split_whitespace()), "{command}");
+        }
+        for helper in [
+            "caffeinate -i -t 300",
+            "npm exec mcp-remote https://mcp.exa.ai/mcp",
+            "node /Users/u/.nvm/versions/node/v22.23.2/bin/rea mcp",
+            "/Applications/ChatGPT.app/Contents/Resources/cua_node/bin/node_repl",
+            "/opt/homebrew/Caskroom/codex/0.162.1/bin/codex-code-mode-host",
+            "/bin/zsh -l",
+            "bash --login",
+            "sleep 30",
+        ] {
+            assert!(!is_shell_command(helper.split_whitespace()), "{helper}");
+        }
     }
 
     #[test]
