@@ -104,7 +104,12 @@ async fn serve() -> Result<()> {
     {
         let daemon = daemon.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            let period = std::env::var("NEBULA_STATUS_TICK_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(30_000)
+                .max(50);
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(period));
             loop {
                 tokio::select! {
                     _ = daemon.shutdown.cancelled() => break,

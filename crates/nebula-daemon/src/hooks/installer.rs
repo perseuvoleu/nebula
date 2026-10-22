@@ -86,7 +86,7 @@ const CURSOR_EVENTS: &[(&str, &str)] = &[
     ("subagentStop", "SubagentStop"),
 ];
 
-fn hook_command(endpoint: &str, event: &str) -> String {
+pub(crate) fn hook_command(endpoint: &str, event: &str) -> String {
     // UserPromptSubmit passes the daemon's response body through to stdout:
     // Claude Code (and Codex, same dialect) add a hook's stdout to the
     // model's context, which is how the session auto-title instruction
@@ -132,8 +132,11 @@ fn cursor_hook_command(event: &str) -> String {
 
 fn is_nebula_command(cmd: Option<&Value>) -> bool {
     cmd.and_then(Value::as_str)
-        .map(|c| c.contains("/api/hooks/") && c.contains("NEBULA_AGENT_ID"))
-        .unwrap_or(false)
+        .is_some_and(is_nebula_hook_command)
+}
+
+pub(crate) fn is_nebula_hook_command(cmd: &str) -> bool {
+    cmd.contains("/api/hooks/") && cmd.contains("NEBULA_AGENT_ID")
 }
 
 fn is_nebula_group(group: &Value) -> bool {

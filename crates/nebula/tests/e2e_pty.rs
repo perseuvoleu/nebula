@@ -3770,6 +3770,7 @@ async fn idle_reaper_spares_finished_agent_with_background_command() {
     ] {
         attach_agent(&mut c, id).await;
         emit_progress(&mut c, id, "3", nebula_core::AgentStatus::Running).await;
+        emit_progress(&mut c, id, "0", nebula_core::AgentStatus::Finished).await;
         write_frame(
             &mut c,
             &ClientRequest::Input {
@@ -3779,7 +3780,6 @@ async fn idle_reaper_spares_finished_agent_with_background_command() {
         )
         .await
         .unwrap();
-        emit_progress(&mut c, id, "0", nebula_core::AgentStatus::Finished).await;
         write_frame(
             &mut c,
             &ClientRequest::Detach {
@@ -3824,6 +3824,47 @@ async fn idle_reaper_spares_finished_agent_with_background_command() {
     assert!(
         !reaped(&events, &waiting_id),
         "agent with a background command spared: {events:#?}"
+    );
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
+#[tokio::test]
+async fn claude_agent_stays_running_while_its_background_command_runs() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let mut daemon = env.spawn_daemon_with("/bin/sh", &[("NEBULA_STATUS_TICK_MS", "200")]);
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let id = create_agent_get_id(&mut c, &worktree.id, "waiting", 2).await;
+    attach_agent(&mut c, &id).await;
+    emit_progress(&mut c, &id, "3", nebula_core::AgentStatus::Running).await;
+    for line in ["sh -c 'sleep 4; true' &\n", "printf '\\033]9;4;0;\\007'\n"] {
+        write_frame(
+            &mut c,
+            &ClientRequest::Input {
+                session: SessionRef::Agent(id.clone()),
+                data: line.as_bytes().to_vec(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let turn_ended = std::time::Instant::now();
+
+    let finished = |evs: &[ServerEvent]| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::StatusChanged { agent, status, .. }
+                if agent == &id && *status == nebula_core::AgentStatus::Finished)
+        })
+    };
+    let events = read_events_until(&mut c, Duration::from_secs(40), finished).await;
+    assert!(
+        turn_ended.elapsed() >= Duration::from_secs(4) + Duration::from_secs(15),
+        "finished only after the command exited plus the grace, got {:?}: {events:#?}",
+        turn_ended.elapsed()
     );
 
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();

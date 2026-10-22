@@ -287,6 +287,14 @@ impl Daemon {
             self.apply_terminal_hook_event(&TerminalId(tid.to_string()), event, session_id);
             return;
         }
+        let (probe, turn) = match self.status_machines.lock().unwrap().get(agent_id) {
+            Some(m) => (m.wants_command_probe(&event), m.turn()),
+            None => (
+                matches!(event, HookEvent::Stop | HookEvent::Progress { busy: false }),
+                0,
+            ),
+        };
+        let command_running = probe.then(|| self.agent_command_running(agent_id));
         let _delivery = self.status_delivery.lock().unwrap();
         let submitted = matches!(event, HookEvent::UserPromptSubmit);
         enum Outcome {
@@ -295,29 +303,32 @@ impl Daemon {
         }
         let outcome = {
             let mut machines = self.status_machines.lock().unwrap();
-            match machines.entry(agent_id.clone()) {
-                std::collections::hash_map::Entry::Occupied(e) => Outcome::Effects(
-                    e.into_mut()
-                        .handle(event, session_id.as_deref(), Instant::now()),
-                ),
+            let machine = match machines.entry(agent_id.clone()) {
+                std::collections::hash_map::Entry::Occupied(e) => Some(e.into_mut()),
                 std::collections::hash_map::Entry::Vacant(slot) => {
                     // Lazily seed from the persisted row.
                     match self.store.get_agent(agent_id) {
-                        Ok(Some(agent)) => Outcome::Effects(
-                            slot.insert(AgentStatusMachine::for_kind(
-                                agent.status,
-                                agent.session_id,
-                                agent.kind,
-                            ))
-                            .handle(
-                                event,
-                                session_id.as_deref(),
-                                Instant::now(),
-                            ),
-                        ),
-                        _ => Outcome::UnknownAgent(event, session_id),
+                        Ok(Some(agent)) => Some(slot.insert(AgentStatusMachine::for_kind(
+                            agent.status,
+                            agent.session_id,
+                            agent.kind,
+                        ))),
+                        _ => None,
                     }
                 }
+            };
+            match machine {
+                Some(m) => {
+                    let now = Instant::now();
+                    let sid = session_id.as_deref();
+                    Outcome::Effects(
+                        match command_running.filter(|_| m.wants_command_probe(&event)) {
+                            Some(running) => m.handle_probed(event, sid, running, turn, now),
+                            None => m.handle(event, sid, now),
+                        },
+                    )
+                }
+                None => Outcome::UnknownAgent(event, session_id),
             }
         };
         match outcome {
@@ -340,6 +351,36 @@ impl Daemon {
         }
     }
 
+    fn agent_command_running(&self, id: &AgentId) -> bool {
+        self.agents_command_running(vec![id.clone()])
+            .pop()
+            .is_some_and(|(_, running)| running)
+    }
+
+    fn agents_command_running(&self, ids: Vec<AgentId>) -> Vec<(AgentId, bool)> {
+        let pids: Vec<(AgentId, Option<Option<u32>>)> = {
+            let sessions = self.sessions.lock().unwrap();
+            ids.into_iter()
+                .map(|id| {
+                    let pid = sessions
+                        .get(&SessionRef::Agent(id.clone()))
+                        .map(|session| session.child_pid);
+                    (id, pid)
+                })
+                .collect()
+        };
+        if pids.iter().all(|(_, pid)| pid.is_none()) {
+            return pids.into_iter().map(|(id, _)| (id, false)).collect();
+        }
+        let parents = command_parents();
+        pids.into_iter()
+            .map(|(id, pid)| {
+                let running = pid.is_some_and(|pid| has_command_child(pid, parents.as_ref()));
+                (id, running)
+            })
+            .collect()
+    }
+
     fn buffer_prewarm_hook(
         &self,
         agent_id: &AgentId,
@@ -357,10 +398,24 @@ impl Daemon {
 
     /// Deferred-finish recheck across all machines (runs on a timer).
     pub fn tick_status_machines(&self) {
+        let held: Vec<AgentId> = {
+            let machines = self.status_machines.lock().unwrap();
+            machines
+                .iter()
+                .filter(|(_, m)| m.command_held())
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        let probes = self.agents_command_running(held);
         let _delivery = self.status_delivery.lock().unwrap();
         let now = Instant::now();
         let ticked: Vec<(AgentId, Vec<Effect>)> = {
             let mut machines = self.status_machines.lock().unwrap();
+            for (id, running) in probes {
+                if let Some(m) = machines.get_mut(&id) {
+                    m.handle(HookEvent::CommandProbe { running }, None, now);
+                }
+            }
             machines
                 .iter_mut()
                 .map(|(id, m)| (id.clone(), m.tick(now)))
@@ -3874,24 +3929,42 @@ fn shell_has_children(session: &PtySession) -> bool {
 /// caffeinate — are never shells, so only a shell child counts. An unknown
 /// child pid or a failed probe counts as busy, as in `shell_has_children`.
 fn agent_has_command_child(session: &PtySession) -> bool {
-    let Some(pid) = session.child_pid else {
-        return true;
-    };
-    let Ok(out) = std::process::Command::new("ps")
+    has_command_child(session.child_pid, command_parents().as_ref())
+}
+
+fn has_command_child(pid: Option<u32>, command_parents: Option<&HashSet<u32>>) -> bool {
+    match (pid, command_parents) {
+        (Some(pid), Some(parents)) => parents.contains(&pid),
+        _ => true,
+    }
+}
+
+/// One `ps` scan: the pids that have a background command child, or `None`
+/// when the probe failed.
+fn command_parents() -> Option<HashSet<u32>> {
+    let out = std::process::Command::new("ps")
         .args(["-A", "-o", "ppid=", "-o", "args="])
         .stderr(std::process::Stdio::null())
         .output()
-    else {
-        return true;
-    };
-    if !out.status.success() {
-        return true;
-    }
-    String::from_utf8_lossy(&out.stdout).lines().any(|line| {
-        let mut words = line.split_whitespace();
-        words.next().and_then(|ppid| ppid.parse::<u32>().ok()) == Some(pid)
-            && is_shell_command(words)
-    })
+        .ok()
+        .filter(|out| out.status.success())?;
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| {
+                let (ppid, args) = line.trim_start().split_once(char::is_whitespace)?;
+                is_background_command(args)
+                    .then(|| ppid.parse().ok())
+                    .flatten()
+            })
+            .collect(),
+    )
+}
+
+/// Claude runs nebula's own hooks as `<shell> -c` children too.
+fn is_background_command(args: &str) -> bool {
+    is_shell_command(args.split_whitespace())
+        && !crate::hooks::installer::is_nebula_hook_command(args)
 }
 
 /// `argv` is a POSIX-ish shell running a command string: `zsh -c …`,
@@ -6823,6 +6896,18 @@ exec sleep 60
         ] {
             assert!(!is_shell_command(helper.split_whitespace()), "{helper}");
         }
+    }
+
+    #[test]
+    fn nebula_hook_delivery_is_not_a_background_command() {
+        for shell in ["/bin/sh", "/bin/bash", "/bin/zsh"] {
+            let hook = crate::hooks::installer::hook_command("claude", "Stop");
+            let args = format!("{shell} -c {hook}");
+            assert!(!is_background_command(&args), "{args}");
+        }
+        assert!(is_background_command(
+            "/bin/zsh -c sleep 40 && echo probe-ok"
+        ));
     }
 
     #[test]

@@ -25,6 +25,10 @@
 //!   neither `idle_prompt` nor OSC 9;4, so a held `Stop` had nothing to
 //!   release it short of the 2h subagent TTL. For those CLIs `Stop` is the
 //!   only end-of-turn signal there is, so it is authoritative.
+//! - A Claude `Stop` while the agent still runs a command (Bash
+//!   `run_in_background`, Monitor) is held the same way: the command's
+//!   completion starts the turn that reports it. The registry probes for the
+//!   command child and feeds the answer in as `CommandProbe`.
 
 use nebula_core::{AgentKind, AgentStatus};
 use std::collections::HashMap;
@@ -32,6 +36,9 @@ use std::time::{Duration, Instant};
 
 pub const RECENT_FINISH_WINDOW: Duration = Duration::from_secs(30);
 pub const DRAIN_GRACE: Duration = Duration::from_secs(180);
+/// Covers the gap between a background command exiting and Claude's turn reporting it.
+pub const COMMAND_GRACE: Duration = Duration::from_secs(15);
+pub const BACKGROUND_HOLD_CAP: Duration = Duration::from_secs(60 * 60);
 pub const SUBAGENT_TTL: Duration = Duration::from_secs(2 * 60 * 60);
 pub const MAX_TRACKED_SUBAGENTS: usize = 512;
 
@@ -71,6 +78,10 @@ pub enum HookEvent {
     Parked,
     /// Synthetic: a new PTY was spawned for the agent.
     PtySpawned,
+    /// Synthetic: whether the agent CLI has a command child right now.
+    CommandProbe {
+        running: bool,
+    },
 }
 
 impl HookEvent {
@@ -87,6 +98,28 @@ impl HookEvent {
 pub enum Effect {
     SetStatus(AgentStatus),
     SaveSessionId(String),
+}
+
+#[derive(Clone, Copy)]
+enum CommandHold {
+    Waiting {
+        since: Instant,
+        gone_since: Option<Instant>,
+    },
+    /// The command released, but the held Stop still waits on subagents.
+    Released,
+}
+
+impl CommandHold {
+    fn released(&self, now: Instant) -> bool {
+        match self {
+            CommandHold::Waiting { since, gone_since } => {
+                now.duration_since(*since) >= BACKGROUND_HOLD_CAP
+                    || gone_since.is_some_and(|gone| now.duration_since(gone) >= COMMAND_GRACE)
+            }
+            CommandHold::Released => false,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -158,6 +191,9 @@ pub struct AgentStatusMachine {
     /// Whether subagent events are tracked at all. Off, `Stop` finishes the
     /// turn regardless of children and SubagentStart never heals.
     track_subagents: bool,
+    command_running: bool,
+    command_hold: Option<CommandHold>,
+    turn: u64,
 }
 
 impl AgentStatusMachine {
@@ -170,6 +206,9 @@ impl AgentStatusMachine {
             stop_held: false,
             drain_idle_since: None,
             track_subagents: true,
+            command_running: false,
+            command_hold: None,
+            turn: 0,
         }
     }
 
@@ -184,6 +223,44 @@ impl AgentStatusMachine {
 
     pub fn status(&self) -> AgentStatus {
         self.status
+    }
+
+    /// Whether `event` ends a turn that a running command would hold open,
+    /// so the caller should send a `CommandProbe` first.
+    pub fn wants_command_probe(&self, event: &HookEvent) -> bool {
+        self.track_subagents
+            && matches!(event, HookEvent::Stop | HookEvent::Progress { busy: false })
+    }
+
+    /// Whether a Stop is held open for a background command, the
+    /// post-exit `COMMAND_GRACE` included: the agent wants probing on the
+    /// next tick, not proof that a command still runs.
+    pub fn command_held(&self) -> bool {
+        matches!(self.command_hold, Some(CommandHold::Waiting { .. }))
+    }
+
+    /// Counts turn starts, so a caller that probed outside the delivery lock
+    /// can tell whether a newer turn started meanwhile.
+    pub fn turn(&self) -> u64 {
+        self.turn
+    }
+
+    /// `event` preceded by its `CommandProbe`, both taken while the machine
+    /// was at `turn`. Dropped when a newer turn started in between: that turn
+    /// ends with its own Stop.
+    pub fn handle_probed(
+        &mut self,
+        event: HookEvent,
+        payload_session_id: Option<&str>,
+        running: bool,
+        turn: u64,
+        now: Instant,
+    ) -> Vec<Effect> {
+        if turn != self.turn {
+            return Vec::new();
+        }
+        self.handle(HookEvent::CommandProbe { running }, None, now);
+        self.handle(event, payload_session_id, now)
     }
 
     pub fn handle(
@@ -207,6 +284,7 @@ impl AgentStatusMachine {
                     self.subagents.clear();
                     self.stop_held = false;
                     self.drain_idle_since = None;
+                    self.command_hold = None;
                     effects.push(Effect::SaveSessionId(sid.to_string()));
                 }
             }
@@ -220,17 +298,19 @@ impl AgentStatusMachine {
 
         match event {
             HookEvent::UserPromptSubmit => {
+                self.turn += 1;
                 self.stop_held = false;
                 self.drain_idle_since = None;
+                self.command_hold = None;
                 self.finished_at = None;
                 self.set_status(AgentStatus::Running, &mut effects);
             }
             HookEvent::Stop => {
                 self.subagents.prune_expired(now);
+                self.hold_for_command(now);
                 if self.subagents.is_empty() {
                     self.stop_held = false;
-                    self.finished_at = Some(now);
-                    self.set_status(AgentStatus::Finished, &mut effects);
+                    self.settle(now, &mut effects);
                 } else {
                     // Foreground turn ended but subagents are still working.
                     self.stop_held = true;
@@ -297,6 +377,11 @@ impl AgentStatusMachine {
             }
             HookEvent::Progress { busy } => {
                 if busy {
+                    self.turn += 1;
+                    if self.command_hold.take().is_some() {
+                        self.stop_held = false;
+                        self.drain_idle_since = None;
+                    }
                     // A turn started. Normally `UserPromptSubmit` already
                     // said so; this also catches turns nebula never saw a
                     // prompt for (a resumed session, a scheduled wake-up).
@@ -318,10 +403,10 @@ impl AgentStatusMachine {
                     // real Stop arriving either side of this is a no-op and
                     // the subagent drain hold still applies.
                     self.subagents.prune_expired(now);
+                    self.hold_for_command(now);
                     if self.subagents.is_empty() {
                         self.stop_held = false;
-                        self.finished_at = Some(now);
-                        self.set_status(AgentStatus::Finished, &mut effects);
+                        self.settle(now, &mut effects);
                     } else {
                         self.stop_held = true;
                         self.drain_idle_since = None;
@@ -337,6 +422,7 @@ impl AgentStatusMachine {
                 self.subagents.clear();
                 self.stop_held = false;
                 self.drain_idle_since = None;
+                self.command_hold = None;
                 self.finished_at = None;
                 if matches!(
                     self.status,
@@ -354,6 +440,7 @@ impl AgentStatusMachine {
                 self.subagents.clear();
                 self.stop_held = false;
                 self.drain_idle_since = None;
+                self.command_hold = None;
                 self.finished_at = None;
                 self.set_status(AgentStatus::Disconnected, &mut effects);
             }
@@ -362,16 +449,38 @@ impl AgentStatusMachine {
                     self.set_status(AgentStatus::Fresh, &mut effects);
                 }
             }
+            HookEvent::CommandProbe { running } => {
+                self.command_running = running;
+                if let Some(CommandHold::Waiting { gone_since, .. }) = &mut self.command_hold {
+                    *gone_since = if running {
+                        None
+                    } else {
+                        gone_since.or(Some(now))
+                    };
+                }
+            }
         }
         effects
     }
 
     /// Periodic tick (the deferred-finish recheck): while a Stop is held open,
     /// promote to finished once the subagent set has drained and stayed empty
-    /// for the grace period.
+    /// for the grace period, and the command hold has released.
     pub fn tick(&mut self, now: Instant) -> Vec<Effect> {
         let mut effects = Vec::new();
-        if !self.stop_held || self.status != AgentStatus::Running {
+        if self.status != AgentStatus::Running {
+            return effects;
+        }
+        if self.command_hold.is_some_and(|hold| hold.released(now)) {
+            self.command_hold = Some(CommandHold::Released);
+            self.subagents.prune_expired(now);
+            if self.stop_held || !self.subagents.is_empty() {
+                self.stop_held = true;
+            } else {
+                self.settle(now, &mut effects);
+            }
+        }
+        if !self.stop_held {
             return effects;
         }
         self.subagents.prune_expired(now);
@@ -381,8 +490,7 @@ impl AgentStatusMachine {
                 Some(idle_since) if now.duration_since(idle_since) >= DRAIN_GRACE => {
                     self.stop_held = false;
                     self.drain_idle_since = None;
-                    self.finished_at = Some(now);
-                    self.set_status(AgentStatus::Finished, &mut effects);
+                    self.settle(now, &mut effects);
                 }
                 Some(_) => {}
             }
@@ -418,7 +526,32 @@ impl AgentStatusMachine {
         // SubagentStart is a post-turn helper, never a Stop that raced its
         // own POST, so it must not heal back to running.
         self.finished_at = None;
+        // Claude sits idle at the input box while its background command
+        // runs; that hold releases on its own.
+        if self.command_held() {
+            return;
+        }
+        self.command_hold = None;
         self.set_status(AgentStatus::Finished, effects);
+    }
+
+    fn hold_for_command(&mut self, now: Instant) {
+        if self.track_subagents && self.command_running && self.command_hold.is_none() {
+            self.command_hold = Some(CommandHold::Waiting {
+                since: now,
+                gone_since: None,
+            });
+        }
+    }
+
+    fn settle(&mut self, now: Instant, effects: &mut Vec<Effect>) {
+        if self.command_held() {
+            self.set_status(AgentStatus::Running, effects);
+        } else {
+            self.command_hold = None;
+            self.finished_at = Some(now);
+            self.set_status(AgentStatus::Finished, effects);
+        }
     }
 
     fn set_status(&mut self, status: AgentStatus, effects: &mut Vec<Effect>) {
@@ -999,5 +1132,178 @@ mod tests {
         );
         let fx = m.handle(HookEvent::Stop, Some("s1"), now + Duration::from_secs(1));
         assert_eq!(status_of(&fx), Some(AgentStatus::Finished));
+    }
+
+    fn probe(m: &mut AgentStatusMachine, running: bool, now: Instant) {
+        let fx = m.handle(HookEvent::CommandProbe { running }, None, now);
+        assert!(fx.is_empty(), "a probe never moves status: {fx:?}");
+    }
+
+    fn subagent_start(id: &str) -> HookEvent {
+        HookEvent::SubagentStart {
+            subagent_id: Some(id.into()),
+        }
+    }
+
+    fn subagent_stop(id: &str) -> HookEvent {
+        HookEvent::SubagentStop {
+            subagent_id: Some(id.into()),
+        }
+    }
+
+    fn held_on_command(kind: AgentKind, now: Instant) -> AgentStatusMachine {
+        let mut m = AgentStatusMachine::for_kind(AgentStatus::Fresh, None, kind);
+        m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
+        probe(&mut m, true, now);
+        m.handle(HookEvent::Stop, Some("s1"), now);
+        m
+    }
+
+    #[test]
+    fn claude_stop_with_a_running_command_stays_running() {
+        let now = t0();
+        let mut m = held_on_command(AgentKind::Claude, now);
+        assert_eq!(m.status(), AgentStatus::Running);
+        probe(&mut m, true, now + Duration::from_secs(600));
+        let fx = m.tick(now + Duration::from_secs(600));
+        assert!(fx.is_empty(), "command still running: {fx:?}");
+        let fx = idle(&mut m, now + Duration::from_secs(660));
+        assert!(
+            fx.is_empty(),
+            "idle at the prompt while the command runs: {fx:?}"
+        );
+        assert_eq!(m.status(), AgentStatus::Running);
+    }
+
+    #[test]
+    fn command_hold_finishes_once_the_command_is_gone_for_the_grace() {
+        let now = t0();
+        let mut m = held_on_command(AgentKind::Claude, now);
+        let gone = now + Duration::from_secs(120);
+        probe(&mut m, false, gone);
+        assert!(m.tick(gone).is_empty(), "grace not elapsed yet");
+        probe(&mut m, false, gone + COMMAND_GRACE);
+        let fx = m.tick(gone + COMMAND_GRACE);
+        assert_eq!(status_of(&fx), Some(AgentStatus::Finished));
+    }
+
+    #[test]
+    fn new_turn_within_the_command_grace_cancels_the_release() {
+        let now = t0();
+        let mut m = held_on_command(AgentKind::Claude, now);
+        let gone = now + Duration::from_secs(120);
+        probe(&mut m, false, gone);
+        m.tick(gone);
+        let fx = progress(&mut m, true, gone + Duration::from_secs(2));
+        assert!(fx.is_empty(), "already running: {fx:?}");
+        probe(&mut m, false, gone + COMMAND_GRACE);
+        let fx = m.tick(gone + COMMAND_GRACE);
+        assert!(fx.is_empty(), "the reporting turn is still going: {fx:?}");
+        assert_eq!(m.status(), AgentStatus::Running);
+        probe(&mut m, false, gone + COMMAND_GRACE + Duration::from_secs(5));
+        let fx = m.handle(
+            HookEvent::Stop,
+            Some("s1"),
+            gone + COMMAND_GRACE + Duration::from_secs(5),
+        );
+        assert_eq!(status_of(&fx), Some(AgentStatus::Finished));
+    }
+
+    #[test]
+    fn command_hold_releases_at_the_cap() {
+        let now = t0();
+        let mut m = held_on_command(AgentKind::Claude, now);
+        let almost = now + BACKGROUND_HOLD_CAP - Duration::from_secs(1);
+        probe(&mut m, true, almost);
+        assert!(m.tick(almost).is_empty(), "under the cap");
+        probe(&mut m, true, now + BACKGROUND_HOLD_CAP);
+        let fx = m.tick(now + BACKGROUND_HOLD_CAP);
+        assert_eq!(status_of(&fx), Some(AgentStatus::Finished));
+    }
+
+    #[test]
+    fn new_turn_within_the_command_grace_cancels_a_pending_subagent_release() {
+        let now = t0();
+        let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
+        m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
+        m.handle(subagent_start("a"), Some("s1"), now);
+        probe(&mut m, true, now);
+        m.handle(HookEvent::Stop, Some("s1"), now);
+        m.handle(subagent_stop("a"), Some("s1"), now + Duration::from_secs(1));
+        probe(&mut m, false, now + Duration::from_secs(30));
+        m.tick(now + Duration::from_secs(30));
+        progress(&mut m, true, now + Duration::from_secs(32));
+        let later = now + Duration::from_secs(210);
+        let fx = m.tick(later);
+        assert!(fx.is_empty(), "the reporting turn has no Stop yet: {fx:?}");
+        assert_eq!(m.status(), AgentStatus::Running);
+    }
+
+    #[test]
+    fn command_release_waits_for_a_subagent_started_during_the_hold() {
+        let now = t0();
+        let mut m = held_on_command(AgentKind::Claude, now);
+        m.handle(
+            subagent_start("a"),
+            Some("s1"),
+            now + Duration::from_secs(1),
+        );
+        probe(&mut m, false, now + Duration::from_secs(30));
+        m.tick(now + Duration::from_secs(30));
+        let fx = m.tick(now + Duration::from_secs(60));
+        assert!(fx.is_empty(), "subagent a never stopped: {fx:?}");
+        assert_eq!(m.status(), AgentStatus::Running);
+        m.handle(
+            subagent_stop("a"),
+            Some("s1"),
+            now + Duration::from_secs(90),
+        );
+        m.tick(now + Duration::from_secs(90));
+        let fx = m.tick(now + Duration::from_secs(90) + DRAIN_GRACE);
+        assert_eq!(status_of(&fx), Some(AgentStatus::Finished));
+    }
+
+    #[test]
+    fn a_stop_probed_before_the_next_turn_started_does_not_finish_it() {
+        let now = t0();
+        let mut m = AgentStatusMachine::new(AgentStatus::Fresh, None);
+        m.handle(HookEvent::UserPromptSubmit, Some("s1"), now);
+        let probed_at = m.turn();
+        progress(&mut m, true, now + Duration::from_secs(1));
+        let fx = m.handle_probed(
+            HookEvent::Stop,
+            Some("s1"),
+            false,
+            probed_at,
+            now + Duration::from_secs(1),
+        );
+        assert!(fx.is_empty(), "the newer turn has no Stop yet: {fx:?}");
+        assert_eq!(m.status(), AgentStatus::Running);
+    }
+
+    #[test]
+    fn new_turn_cancels_the_release_after_the_command_handed_over_to_a_subagent() {
+        let now = t0();
+        let at = |s| now + Duration::from_secs(s);
+        let mut m = held_on_command(AgentKind::Claude, now);
+        m.handle(subagent_start("a"), Some("s1"), at(1));
+        probe(&mut m, false, at(30));
+        m.tick(at(30));
+        m.tick(at(60));
+        m.handle(subagent_stop("a"), Some("s1"), at(90));
+        m.tick(at(90));
+        progress(&mut m, true, at(92));
+        let fx = m.tick(at(270));
+        assert!(fx.is_empty(), "the reporting turn has no Stop yet: {fx:?}");
+        assert_eq!(m.status(), AgentStatus::Running);
+        probe(&mut m, false, at(300));
+        let fx = m.handle(HookEvent::Stop, Some("s1"), at(300));
+        assert_eq!(status_of(&fx), Some(AgentStatus::Finished));
+    }
+
+    #[test]
+    fn codex_stop_is_authoritative_despite_a_running_command() {
+        let m = held_on_command(AgentKind::Codex, t0());
+        assert_eq!(m.status(), AgentStatus::Finished);
     }
 }
