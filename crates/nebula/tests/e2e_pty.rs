@@ -3512,7 +3512,7 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
     let term_id = term_id.clone();
 
     // A pinned agent: idle and unwatched like the idler, but marked "never
-    // kill" (schedules and background jobs are invisible to the status
+    // kill" (schedules and loops are invisible to the status
     // machine, so pinning is the user's protection).
     write_frame(
         &mut c,
@@ -3741,6 +3741,89 @@ async fn idle_reaper_kills_unattached_sibling_on_viewed_worktree() {
     assert!(
         !reaped(&events, &watched_id),
         "attached agent never reaped: {events:#?}"
+    );
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+}
+
+/// A finished agent waiting on a background command keeps its PTY: agent
+/// CLIs run each command as a `<shell> -c` child (Claude's Bash and Monitor
+/// tools, Codex's exec), and reaping would kill the command with it. A
+/// finished agent whose only children are permanent helpers (MCP servers,
+/// caffeinate) is still reaped.
+#[tokio::test]
+async fn idle_reaper_spares_finished_agent_with_background_command() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    env.write_config(r#"{"session_idle_timeout": "2s"}"#);
+    let mut daemon = env.spawn_daemon_with("/bin/sh", &[("NEBULA_IDLE_REAP_MS", "200")]);
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let waiting_id = create_agent_get_id(&mut c, &worktree.id, "waiting", 2).await;
+    let helpers_id = create_agent_get_id(&mut c, &worktree.id, "helpers", 3).await;
+
+    for (id, child) in [
+        (&waiting_id, "sh -c 'sleep 30; true' &\n"),
+        (&helpers_id, "sleep 30 &\n"),
+    ] {
+        attach_agent(&mut c, id).await;
+        emit_progress(&mut c, id, "3", nebula_core::AgentStatus::Running).await;
+        write_frame(
+            &mut c,
+            &ClientRequest::Input {
+                session: SessionRef::Agent(id.clone()),
+                data: child.as_bytes().to_vec(),
+            },
+        )
+        .await
+        .unwrap();
+        emit_progress(&mut c, id, "0", nebula_core::AgentStatus::Finished).await;
+        write_frame(
+            &mut c,
+            &ClientRequest::Detach {
+                session: SessionRef::Agent(id.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let reaped = |evs: &[ServerEvent], id: &nebula_core::AgentId| {
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
+                if &a.id == id && !a.alive)
+        })
+    };
+    let mut events = read_events_until(&mut c, Duration::from_secs(10), |evs| {
+        reaped(evs, &helpers_id)
+    })
+    .await;
+    assert!(
+        reaped(&events, &helpers_id),
+        "agent with only a helper child reaped: {events:#?}"
+    );
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    write_frame(
+        &mut c,
+        &ClientRequest::RenameAgent {
+            req_id: 4,
+            id: waiting_id.clone(),
+            name: "still-waiting".into(),
+        },
+    )
+    .await
+    .unwrap();
+    events.extend(
+        read_events_until(&mut c, Duration::from_secs(5), |evs| {
+            find_ack(evs, 4).is_some()
+        })
+        .await,
+    );
+    assert!(
+        !reaped(&events, &waiting_id),
+        "agent with a background command spared: {events:#?}"
     );
 
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
