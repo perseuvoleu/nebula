@@ -7013,6 +7013,19 @@ async fn agent_new_writer_exits_2_naming_the_live_holder_unless_forced() {
         cli(&args)
     };
 
+    let no_holder_warning = "warning: --force-writer: no live writer on main; it is only for a second writer the user approved";
+    let lone = spawn("lone", &["--writer", "--force-writer"]);
+    assert!(lone.status.success(), "{lone:?}");
+    assert!(
+        String::from_utf8_lossy(&lone.stderr).contains(no_holder_warning),
+        "{lone:?}"
+    );
+    let show = cli(&["agent", "show", "lone"]);
+    let shown: serde_json::Value = serde_json::from_slice(&show.stdout).unwrap();
+    assert_eq!(shown["writer"], true, "{show:?}");
+    let archived = cli(&["agent", "archive", "lone"]);
+    assert!(archived.status.success(), "{archived:?}");
+
     let holder = spawn("holder", &["--writer"]);
     assert!(holder.status.success(), "{holder:?}");
     let show = cli(&["agent", "show", "holder"]);
@@ -7036,6 +7049,10 @@ async fn agent_new_writer_exits_2_naming_the_live_holder_unless_forced() {
     ] {
         let out = spawn(name, flags);
         assert!(out.status.success(), "{name}: {out:?}");
+        assert!(
+            !String::from_utf8_lossy(&out.stderr).contains("no live writer"),
+            "{name}: {out:?}"
+        );
         let show = cli(&["agent", "show", name]);
         let shown: serde_json::Value = serde_json::from_slice(&show.stdout).unwrap();
         assert_eq!(shown["writer"], writer, "{name}: {show:?}");

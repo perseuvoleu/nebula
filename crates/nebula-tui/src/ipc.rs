@@ -1841,6 +1841,26 @@ pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
             .collect();
         default_agent_name(opts.prompt.as_deref(), &taken)
     });
+    if opts.writer == nebula_core::WriterClaim::Forced
+        && !agents.iter().any(|a| {
+            a.writer
+                && !a.archived
+                && a.worktree_id == target.id
+                && (a.alive
+                    || matches!(
+                        a.status,
+                        nebula_core::AgentStatus::Running
+                            | nebula_core::AgentStatus::NeedsFeedback
+                            | nebula_core::AgentStatus::Finished
+                            | nebula_core::AgentStatus::Disconnected
+                    ))
+        })
+    {
+        eprintln!(
+            "warning: --force-writer: no live writer on {}; it is only for a second writer the user approved",
+            target.branch
+        );
+    }
     let req_id = 1u64;
     write_frame(
         &mut conn.stream,
