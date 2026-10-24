@@ -37,6 +37,9 @@ They live in `.agents/skills/`, the project directory Codex and Pi read; `.claud
   `[nebula] This project has a twin on <host>` prompt line, or a `nebula sync` refusal.
 - `.agents/skills/recall/SKILL.md` — Mission Control sessions only (MC_* env vars present):
   saving a durable project fact, or code questions via the graph_* MCP tools.
+- `.agents/skills/verify-nebula/SKILL.md` — trigger: proving a daemon, CLI or TUI change works
+  before reporting it done, or driving `ng` / the sidebar from a script. Runs its own daemon beside
+  the user's, so a check needs no `nebula kill` or `make install`.
 - `.agents/skills/diagram/SKILL.md` — trigger: any diagram request, or a choice the user should
   make by clicking an option. `nebula diagram new` → edit the HTML in `.scratch/diagrams/` →
   `nebula diagram open` (⌘X viewer); Mission Control sessions (MC_* env vars) use Mermaid instead.

@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+# vn: an isolated nebula (own daemon, data, socket, agent-CLI config) for verification.
+# Usage: vn build | up | doctor | tui [nebula args] | keys <tmux keys>... | wait <text> [secs]
+#        | shot <name> | nebula <args>... | down
+# Env: NV_STATE (default /tmp/nv-<checkout hash>), NV_EVIDENCE (default <checkout>/.scratch/verify-nebula),
+#      NV_BIN (default <checkout>/target/verify-nebula/debug/nebula)
+set -euo pipefail
+
+checkout=$(cd "$(dirname "$0")/../../.." && pwd -P)
+key=$(printf '%s' "$checkout" | shasum | cut -c1-8)
+# Unix socket paths stop at ~104 bytes, so the state dir stays short and under /tmp.
+state=${NV_STATE:-/tmp/nv-$key}
+evidence=${NV_EVIDENCE:-$checkout/.scratch/verify-nebula}
+target=$checkout/target/verify-nebula
+bin=${NV_BIN:-$target/debug/nebula}
+marker=$state/.vn-state
+tmux_sock=$state/tmux.sock
+
+die() { echo "vn: $*" >&2; exit 1; }
+
+refuse_link() {
+  if [ -L "$state" ]; then die "$state is a link; refusing to use it as state"; fi
+}
+
+refuse_unowned() {
+  if [ -e "$state" ] && [ ! -f "$marker" ]; then die "$state was not made by vn up; refusing to use or delete it"; fi
+}
+
+isolated_env=(env -u NEBULA_AGENT_ID -u NEBULA_API_URL -u NEBULA_API_TOKEN -u TMUX -u NO_COLOR -u FORCE_COLOR
+  NEBULA_RUNTIME_DIR="$state/rt"
+  NEBULA_DATA_DIR="$state/data"
+  NEBULA_AGENT_CMD=/bin/sh
+  SHELL=/bin/sh
+  CODEX_HOME="$state/codex"
+  PI_CODING_AGENT_DIR="$state/pi"
+  PATH="$(dirname "$bin"):$PATH"
+  TERM=xterm-256color)
+
+isolated() { "${isolated_env[@]}" "$@"; }
+
+answers() { isolated perl -e 'alarm 2; exec @ARGV' "$bin" agent list --all >/dev/null 2>&1; }
+
+daemon_pid() {
+  local pid
+  pid=$(cat "$state/daemon.pid" 2>/dev/null) || return 1
+  [ -n "$pid" ] || return 1
+  printf '%s ' "$(ps -E -ww -p "$pid" -o command= 2>/dev/null)" | grep -F "$bin daemon" | grep -qF " NEBULA_RUNTIME_DIR=$state/rt " || return 1
+  echo "$pid"
+}
+
+fingerprint() { shasum -a 256 "$bin" | cut -d' ' -f1; }
+
+stop_tree() {
+  local pid=$1 procs i p
+  procs="$pid $(descendants "$pid" | tr '\n' ' ')"
+  kill -TERM "$pid" 2>/dev/null || true
+  for i in $(seq 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+  for p in $procs; do kill -KILL "$p" 2>/dev/null || true; done
+}
+
+descendants() {
+  local child
+  for child in $(pgrep -P "$1"); do
+    echo "$child"
+    descendants "$child"
+  done
+}
+
+screen() { tmux -S "$tmux_sock" capture-pane -p -t nv; }
+
+cmd_build() {
+  cd "$checkout"
+  PATH=/opt/homebrew/opt/zig@0.15/bin:$PATH CARGO_TARGET_DIR=$target cargo build -p nebula
+}
+
+cmd_up() {
+  refuse_link
+  refuse_unowned
+  [ -x "$bin" ] || die "no binary at $bin; run vn build first"
+  if [ -d "$state" ]; then
+    if daemon_pid >/dev/null; then
+      if [ "$(cat "$state/daemon.sha256")" = "$(fingerprint)" ]; then echo "vn: already up at $state"; return; fi
+      echo "vn: $bin changed since up; restarting"
+    fi
+    cmd_down >/dev/null
+  fi
+  mkdir -p "$state"
+  touch "$marker"
+  mkdir -p "$state"/{rt,data,codex,pi,repo}
+  chmod 700 "$state/rt"
+  git -C "$state/repo" init -q -b main
+  git -C "$state/repo" -c user.email=verify@nebula.dev -c user.name=verify-nebula \
+    commit -q --allow-empty -m init
+  fingerprint >"$state/daemon.sha256"
+  (cd "$state/repo" && exec "${isolated_env[@]}" nohup "$bin" daemon --foreground >"$state/daemon.log" 2>&1) &
+  launched=$!
+  echo "$launched" >"$state/daemon.pid"
+  trap 'stop_tree "$launched"; rm -rf "$state"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  local deadline=$((SECONDS + 10))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if [ -S "$state/rt/daemon.sock" ] && answers; then
+      (cd "$state/repo" && isolated "$bin" add . >/dev/null)
+      trap - EXIT INT TERM
+      echo "vn: up at $state (daemon $(cat "$state/daemon.pid"), project repo)"
+      return
+    fi
+    sleep 0.1
+  done
+  die "daemon never answered; see $state/daemon.log"
+}
+
+cmd_doctor() {
+  local bad=0 pid build daemon_build
+  line() { echo "$1 $2"; [ "$1" = ok ] || bad=1; }
+  if [ -L "$state" ]; then line FAIL "state: $state is a link"
+  elif [ -d "$state" ]; then line ok "state: $state"
+  else line FAIL "state: $state missing (run vn up)"; fi
+  if [ -x "$bin" ]; then
+    build=$("$bin" --version)
+    line ok "binary: $bin ($build)"
+  else line FAIL "binary: $bin missing (run vn build)"; fi
+  if pid=$(daemon_pid); then line ok "daemon: pid $pid"
+  else line FAIL "daemon: not running"; fi
+  if [ -x "$bin" ] && [ "$(cat "$state/daemon.sha256" 2>/dev/null)" = "$(fingerprint)" ]; then line ok "daemon binary: same sha256 as $bin"
+  else line FAIL "daemon binary: started from another build of $bin (run vn up to restart)"; fi
+  if [ -S "$state/rt/daemon.sock" ]; then line ok "socket: $state/rt/daemon.sock"
+  else line FAIL "socket: $state/rt/daemon.sock missing"; fi
+  daemon_build=$(cat "$state/rt/daemon.build-id" 2>/dev/null || true)
+  if [ -n "${build:-}" ] && [ -n "$daemon_build" ] && [[ "$build" == *"($daemon_build)"* ]]; then
+    line ok "daemon build: $daemon_build"
+  else line FAIL "daemon build: '${daemon_build}' does not match the binary"; fi
+  if answers; then line ok "answers: agent list"
+  else line FAIL "answers: agent list failed"; fi
+  if tmux -S "$tmux_sock" has-session -t nv 2>/dev/null; then echo "info tui: running (vn shot <name>)"
+  else echo "info tui: not running (vn tui)"; fi
+  return "$bad"
+}
+
+cmd_tui() {
+  daemon_pid >/dev/null || die "not up; run vn up"
+  tmux -S "$tmux_sock" kill-session -t nv 2>/dev/null || true
+  local args=("$@")
+  [ ${#args[@]} -gt 0 ] || args=(open "$state/repo")
+  (cd "$state/repo" && isolated tmux -S "$tmux_sock" -f /dev/null new-session -d -s nv -x 160 -y 45 \
+    env -u TMUX TERM=xterm-256color "$bin" "${args[@]}")
+  cmd_wait repo 20 >/dev/null
+}
+
+cmd_keys() { tmux -S "$tmux_sock" send-keys -t nv "$@"; }
+
+cmd_wait() {
+  local text=$1 secs=${2:-10} i
+  for i in $(seq $((secs * 10))); do
+    if screen 2>/dev/null | grep -qF -- "$text"; then return; fi
+    sleep 0.1
+  done
+  screen >&2 || true
+  die "'$text' never appeared within ${secs}s"
+}
+
+cmd_shot() {
+  mkdir -p "$evidence"
+  screen >"$evidence/$1.txt"
+  cat "$evidence/$1.txt"
+  echo "vn: saved $evidence/$1.txt" >&2
+}
+
+cmd_down() {
+  refuse_link
+  [ -e "$state" ] || { echo "vn: nothing to stop at $state"; return; }
+  refuse_unowned
+  tmux -S "$tmux_sock" kill-server 2>/dev/null || true
+  local pid
+  if pid=$(daemon_pid); then stop_tree "$pid"; fi
+  rm -rf "$state"
+  echo "vn: down; evidence kept in $evidence"
+}
+
+sub=${1:-}
+[ $# -gt 0 ] && shift
+case "$sub" in
+  build) cmd_build ;;
+  up) cmd_up ;;
+  doctor) cmd_doctor ;;
+  tui) cmd_tui "$@" ;;
+  keys) cmd_keys "$@" ;;
+  wait) cmd_wait "$@" ;;
+  shot) cmd_shot "$@" ;;
+  nebula) cd "$state/repo" && isolated "$bin" "$@" ;;
+  down) cmd_down ;;
+  *) sed -n '2,6p' "$0" >&2; exit 64 ;;
+esac
