@@ -60,3 +60,26 @@ fn protocol29_requests_preserve_findl_wire_fields() {
         assert_eq!(rmp_serde::to_vec(&request).unwrap(), *wire);
     }
 }
+
+#[test]
+fn create_agent_keeps_its_spawner_without_a_writer_claim() {
+    let request = ClientRequest::CreateAgent {
+        req_id: 7,
+        worktree: nebula_core::WorktreeId("w".into()),
+        expected_branch: None,
+        name: "worker".into(),
+        kind: nebula_core::AgentKind::Codex,
+        model: None,
+        effort: None,
+        auto_title: true,
+        prompt: None,
+        writer: nebula_core::WriterClaim::Off,
+        spawned_by: Some(nebula_core::AgentId("lead".into())),
+    };
+    let wire = rmp_serde::to_vec(&request).unwrap();
+    let decoded: ClientRequest = rmp_serde::from_slice(&wire).unwrap();
+    assert_eq!(
+        serde_json::to_value(&decoded).unwrap(),
+        serde_json::to_value(&request).unwrap()
+    );
+}

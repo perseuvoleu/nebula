@@ -1326,6 +1326,7 @@ mod tests {
             status_changed_at: 0,
             alive: true,
             branch: None,
+            spawned_by: None,
             writer: false,
         };
         let mut viewer = HtmlViewer::open(tmp.path().to_path_buf(), None, None);

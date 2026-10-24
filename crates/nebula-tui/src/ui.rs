@@ -3803,7 +3803,10 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .enumerate()
         .map(|(i, row)| {
-            let mut h = PILL_H as usize + usize::from(row.sub.is_some()) + row.sessions.len();
+            let mut h = PILL_H as usize
+                + usize::from(row.sub.is_some())
+                + row.sessions.len()
+                + usize::from(agents_header_at(&row.sessions).is_some());
             if grouped && (i == primary_count || i == primary_count + pinned_count) {
                 h += 1;
             }
@@ -3839,7 +3842,8 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             header(f, "UNPINNED".into(), &mut screen_row);
         }
         let row_height = PILL_H as usize + usize::from(row.sub.is_some());
-        let entry_height = row_height + row.sessions.len();
+        let agents_at = agents_header_at(&row.sessions);
+        let entry_height = row_height + row.sessions.len() + usize::from(agents_at.is_some());
         if row_rect(inner, screen_row + row_height - 1).is_none() {
             break;
         }
@@ -4009,7 +4013,9 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             app.hits.push((hit, target));
         }
         for (session_index, session) in row.sessions.iter().enumerate() {
-            let Some(r) = row_rect(inner, screen_row + row_height + session_index) else {
+            let below_header = agents_at.is_some_and(|at| session_index >= at);
+            let line = screen_row + row_height + session_index + usize::from(below_header);
+            let Some(r) = row_rect(inner, line) else {
                 break;
             };
             let unseen =
@@ -4038,7 +4044,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                 .is_some_and(|t| session.sref().as_ref() == Some(&t.sref));
             let rail = if attached {
                 Span::styled("▌", Style::default().fg(th.text))
-            } else if selected && session_index == 0 {
+            } else if selected && session_index == 0 && agents_at != Some(0) {
                 Span::styled(
                     PILL_RAIL_CAPS.1.to_string(),
                     Style::default().fg(if worktrees_focused { th.accent } else { th.dim }),
@@ -4060,6 +4066,26 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                 });
                 if l <= depth {
                     guides.push(' ');
+                }
+            }
+            if agents_at == Some(session_index) {
+                if let Some(r) = row_rect(inner, line - 1) {
+                    let rail = if selected && session_index == 0 {
+                        Span::styled(
+                            PILL_RAIL_CAPS.1.to_string(),
+                            Style::default().fg(if worktrees_focused { th.accent } else { th.dim }),
+                        )
+                    } else {
+                        Span::raw(" ")
+                    };
+                    f.render_widget(
+                        Paragraph::new(Line::from(vec![
+                            rail,
+                            Span::styled(guides.clone(), guide),
+                            Span::styled("AGENTS", dim),
+                        ])),
+                        r,
+                    );
                 }
             }
             let detail = detail.map(|label| format!("{label} "));
@@ -4810,6 +4836,12 @@ fn draw_quick_terminal(f: &mut Frame, app: &mut App) {
         app.term_links.clear();
         app.term_file_links.clear();
     }
+}
+
+fn agents_header_at(sessions: &[SessionRow]) -> Option<usize> {
+    sessions.iter().position(|session| {
+        matches!(session, SessionRow::Agent(a) if a.spawned_by.is_some() && !a.pinned && !a.archived)
+    })
 }
 
 fn branch_mismatch<'a>(app: &App, session: &'a SessionRow) -> Option<&'a str> {

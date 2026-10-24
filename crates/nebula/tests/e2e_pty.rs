@@ -382,6 +382,7 @@ async fn full_crud_attach_and_restart_persistence() {
             auto_title: false,
             prompt: None,
             writer: WriterClaim::Off,
+            spawned_by: None,
         },
     )
     .await
@@ -772,6 +773,7 @@ async fn hook_post_from_agent_pty_drives_status() {
             auto_title: false,
             prompt: None,
             writer: WriterClaim::Off,
+            spawned_by: None,
         },
     )
     .await
@@ -1778,6 +1780,7 @@ async fn hook_cwd_rehomes_agent_to_other_worktree() {
             auto_title: false,
             prompt: None,
             writer: WriterClaim::Off,
+            spawned_by: None,
         },
     )
     .await
@@ -1942,6 +1945,7 @@ async fn move_agent_respawns_live_session_in_target_worktree() {
             auto_title: false,
             prompt: None,
             writer: WriterClaim::Off,
+            spawned_by: None,
         },
     )
     .await
@@ -2126,6 +2130,7 @@ async fn codex_hooks_install_and_drive_status() {
             auto_title: false,
             prompt: None,
             writer: WriterClaim::Off,
+            spawned_by: None,
         },
     )
     .await
@@ -2772,6 +2777,7 @@ async fn prewarmed_session_is_adopted_by_create_agent() {
             auto_title: false,
             prompt: None,
             writer: WriterClaim::Off,
+            spawned_by: None,
         },
     )
     .await
@@ -2903,6 +2909,7 @@ async fn dead_prewarm_falls_back_to_cold_spawn() {
             auto_title: false,
             prompt: None,
             writer: WriterClaim::Off,
+            spawned_by: None,
         },
     )
     .await
@@ -2963,6 +2970,7 @@ async fn create_agent_refuses_when_the_cli_is_not_installed() {
                 auto_title: false,
                 prompt: None,
                 writer: WriterClaim::Off,
+                spawned_by: None,
             },
         )
         .await
@@ -3057,6 +3065,7 @@ async fn create_agent_succeeds_when_the_cli_is_on_the_login_shell_path() {
             auto_title: false,
             prompt: None,
             writer: WriterClaim::Off,
+            spawned_by: None,
         },
     )
     .await
@@ -3128,6 +3137,7 @@ async fn create_agent_get_id(
             auto_title: false,
             prompt: None,
             writer: WriterClaim::Off,
+            spawned_by: None,
         },
     )
     .await
@@ -3307,6 +3317,7 @@ async fn archive_sigkills_an_agent_that_ignores_sighup() {
             auto_title: false,
             prompt: None,
             writer: WriterClaim::Off,
+            spawned_by: None,
         },
     )
     .await
@@ -3470,6 +3481,7 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
             auto_title: false,
             prompt: None,
             writer: WriterClaim::Off,
+            spawned_by: None,
         },
     )
     .await
@@ -3527,6 +3539,7 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
             auto_title: false,
             prompt: None,
             writer: WriterClaim::Off,
+            spawned_by: None,
         },
     )
     .await
@@ -3697,6 +3710,7 @@ async fn idle_reaper_kills_unattached_sibling_on_viewed_worktree() {
                 auto_title: false,
                 prompt: None,
                 writer: WriterClaim::Off,
+                spawned_by: None,
             },
         )
         .await
@@ -4313,6 +4327,7 @@ async fn auto_title_instruction_and_rename_flow() {
             auto_title: true,
             prompt: None,
             writer: WriterClaim::Off,
+            spawned_by: None,
         },
     )
     .await
@@ -6120,6 +6135,7 @@ async fn a_parked_agent_resumes_its_conversation_once_primary_is_back_on_its_bra
             auto_title: false,
             prompt: None,
             writer: WriterClaim::Off,
+            spawned_by: None,
         },
     )
     .await
@@ -6759,7 +6775,7 @@ async fn mobile_safe_removal_preserves_dirty_unmerged_occupied_and_protected_che
 
 /// Use literal peer versions so a simultaneous client/server constant change cannot mask a mismatch.
 #[tokio::test]
-async fn protocol30_handshake_accepts_repeated_probes_and_rejects_protocol29() {
+async fn protocol31_handshake_accepts_repeated_probes_and_rejects_protocol30() {
     let env = TestEnv::new();
     let _daemon = env.spawn_daemon();
     let mut c = connect(&env.sock()).await;
@@ -6767,7 +6783,7 @@ async fn protocol30_handshake_accepts_repeated_probes_and_rejects_protocol29() {
         write_frame(
             &mut c,
             &ClientRequest::Hello {
-                protocol_version: 30,
+                protocol_version: 31,
             },
         )
         .await
@@ -6781,7 +6797,7 @@ async fn protocol30_handshake_accepts_repeated_probes_and_rejects_protocol29() {
             matches!(
                 reply,
                 Some(ServerEvent::HelloOk {
-                    protocol_version: 30,
+                    protocol_version: 31,
                     ..
                 })
             ),
@@ -6792,7 +6808,7 @@ async fn protocol30_handshake_accepts_repeated_probes_and_rejects_protocol29() {
     write_frame(
         &mut old,
         &ClientRequest::Hello {
-            protocol_version: 29,
+            protocol_version: 30,
         },
     )
     .await
@@ -6808,7 +6824,7 @@ async fn protocol30_handshake_accepts_repeated_probes_and_rejects_protocol29() {
         matches!(
             reply,
             Some(ServerEvent::Incompatible {
-                daemon_protocol_version: 30
+                daemon_protocol_version: 31
             })
         ),
         "{reply:?}"
@@ -7024,6 +7040,66 @@ async fn agent_new_writer_exits_2_naming_the_live_holder_unless_forced() {
         let shown: serde_json::Value = serde_json::from_slice(&show.stdout).unwrap();
         assert_eq!(shown["writer"], writer, "{name}: {show:?}");
     }
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon.0);
+}
+
+#[tokio::test]
+async fn agent_new_records_the_session_that_spawned_it() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let script = env.tmp.path().join("idle-agent");
+    write_executable(&script, "#!/bin/sh\nexec sleep 60\n");
+    let mut daemon = env.spawn_daemon_with_agent_cmd(script.to_str().unwrap());
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    add_project_get_main_worktree(&mut c, &repo).await;
+    let cli = |args: &[&str], agent_id: Option<&str>| {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"));
+        cmd.args(args)
+            .args(["--project", "repo"])
+            .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
+            .env_remove("NEBULA_AGENT_ID");
+        if let Some(id) = agent_id {
+            cmd.env("NEBULA_AGENT_ID", id);
+        }
+        cmd.output().unwrap()
+    };
+    let spawn = |name: &str, agent_id: Option<&str>| {
+        let out = cli(
+            &["agent", "new", "--worktree", "main", "--name", name],
+            agent_id,
+        );
+        assert!(out.status.success(), "{name}: {out:?}");
+        let show = cli(&["agent", "show", name], None);
+        serde_json::from_slice::<serde_json::Value>(&show.stdout).unwrap()
+    };
+
+    let lead = spawn("lead", None);
+    assert_eq!(lead["spawned_by"], serde_json::Value::Null, "{lead}");
+    let lead_id = lead["id"].as_str().unwrap();
+    let worker = spawn("worker", Some(lead_id));
+    assert_eq!(worker["spawned_by"], lead_id, "{worker}");
+    let from_shell = spawn("from-shell", Some("term:tab"));
+    assert_eq!(
+        from_shell["spawned_by"],
+        serde_json::Value::Null,
+        "{from_shell}"
+    );
+
+    let list = cli(&["agent", "list"], None);
+    let listed: serde_json::Value = serde_json::from_slice(&list.stdout).unwrap();
+    let spawner_of = |name: &str| {
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["name"] == name)
+            .unwrap()["spawned_by"]
+            .clone()
+    };
+    assert_eq!(spawner_of("worker"), lead_id, "{listed}");
+    assert_eq!(spawner_of("lead"), serde_json::Value::Null, "{listed}");
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
     wait_for_exit(&mut daemon.0);
 }

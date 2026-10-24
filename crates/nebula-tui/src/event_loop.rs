@@ -7576,6 +7576,7 @@ fn create_default_agent(
         auto_title: true,
         prompt: None,
         writer: WriterClaim::Off,
+        spawned_by: None,
     });
     // Same warm-slot refill as `create_agent`.
     if kind == AgentKind::Claude {
@@ -7937,6 +7938,7 @@ fn create_agent(
         auto_title,
         prompt: None,
         writer: WriterClaim::Off,
+        spawned_by: None,
     });
     // The create consumes (or, off-spec, discards) the worktree's warm
     // Claude slot; refill it so the next create is instant too.
@@ -11304,6 +11306,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: false,
                     branch: None,
+                    spawned_by: None,
                     writer: false,
                 }),
             },
@@ -11467,6 +11470,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: false,
                     branch: None,
+                    spawned_by: None,
                     writer: false,
                 }),
             },
@@ -11546,6 +11550,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: true,
                     branch: Some("feature-x".into()),
+                    spawned_by: None,
                     writer: false,
                 }),
             },
@@ -11801,6 +11806,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: true,
                     branch: None,
+                    spawned_by: None,
                     writer: false,
                 }),
             },
@@ -13724,6 +13730,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: true,
                     branch: None,
+                    spawned_by: None,
                     writer: false,
                 }),
             },
@@ -13810,6 +13817,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: true,
                     branch: None,
+                    spawned_by: None,
                     writer: false,
                 }),
             },
@@ -13918,6 +13926,7 @@ mod tests {
                     status_changed_at: at,
                     alive: true,
                     branch: None,
+                    spawned_by: None,
                     writer: false,
                 }),
             };
@@ -14012,6 +14021,7 @@ mod tests {
                         status_changed_at: 0,
                         alive: true,
                         branch: None,
+                        spawned_by: None,
                         writer: false,
                     }),
                 },
@@ -14097,6 +14107,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: true,
                     branch: None,
+                    spawned_by: None,
                     writer: false,
                 }),
             },
@@ -14112,6 +14123,80 @@ mod tests {
                 status: AgentStatus::Finished,
                 changed_at: crate::app::now_ms(),
             },
+        );
+    }
+
+    #[test]
+    fn agent_spawned_sessions_list_under_an_agents_header() {
+        use nebula_core::{AgentStatus, Entity};
+        let mut app = App::new();
+        seed_tree(&mut app);
+        seed_agent(&mut app, "a2", "w1");
+        let draw = |app: &mut App| {
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            terminal.draw(|f| ui::draw(f, app)).unwrap();
+            buffer_text(&terminal)
+        };
+        let text = draw(&mut app);
+        assert!(
+            !text.contains("AGENTS"),
+            "no spawned session, no header:\n{text}"
+        );
+
+        seed_agent(&mut app, "worker", "w1");
+        let mut worker = app
+            .tree
+            .agents
+            .iter()
+            .find(|a| a.id.as_str() == "worker")
+            .unwrap()
+            .clone();
+        worker.spawned_by = Some(AgentId("a1".into()));
+        worker.status = AgentStatus::Running;
+        worker.status_changed_at = crate::app::now_ms();
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: Entity::Agent(worker),
+            },
+        );
+        let names: Vec<String> = app.visible_sessions().into_iter().map(|a| a.name).collect();
+        assert_eq!(
+            names.last().map(String::as_str),
+            Some("worker"),
+            "{names:?}"
+        );
+
+        let text = draw(&mut app);
+        let lines: Vec<&str> = text.lines().collect();
+        let header = lines
+            .iter()
+            .position(|l| l.contains("AGENTS"))
+            .unwrap_or_else(|| panic!("AGENTS header rendered:\n{text}"));
+        assert!(
+            lines[header - 1].contains("a2") || lines[header - 1].contains("agent-1"),
+            "the user's sessions sit above the header:\n{text}"
+        );
+        let row = lines[header + 1];
+        let at = row
+            .find("worker")
+            .unwrap_or_else(|| panic!("worker sits right under the header:\n{text}"));
+        let col = row[..at].chars().count() as u16;
+
+        let mut out = Vec::new();
+        handle_mouse(
+            &mut app,
+            mev(
+                MouseEventKind::Down(MouseButton::Left),
+                col,
+                (header + 1) as u16,
+            ),
+            &mut out,
+        );
+        let expected = SessionRef::Agent(AgentId("worker".into()));
+        assert!(
+            matches!(out.last(), Some(ClientRequest::Attach { session, .. }) if *session == expected),
+            "a click below the header attaches that session: {out:?}"
         );
     }
 
@@ -14342,6 +14427,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: true,
                     branch: None,
+                    spawned_by: None,
                     writer: false,
                 }),
             },
@@ -15988,6 +16074,7 @@ mod tests {
                 status_changed_at: 0,
                 alive: true,
                 branch: None,
+                spawned_by: None,
                 writer: false,
             })
         };
@@ -16060,6 +16147,7 @@ mod tests {
             status_changed_at: 0,
             alive: false,
             branch: None,
+            spawned_by: None,
             writer: false,
         })
     }
@@ -17101,6 +17189,7 @@ mod tests {
                     status_changed_at: crate::app::now_ms() - 2 * 60_000,
                     alive: true,
                     branch: None,
+                    spawned_by: None,
                     writer: false,
                 }),
             },
@@ -17780,6 +17869,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: true,
                     branch: None,
+                    spawned_by: None,
                     writer: false,
                 }),
             },
@@ -18438,6 +18528,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: true,
                     branch: None,
+                    spawned_by: None,
                     writer: false,
                 }),
             },
@@ -18533,6 +18624,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: false,
                     branch: None,
+                    spawned_by: None,
                     writer: false,
                 }),
             },
@@ -18614,6 +18706,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: true,
                     branch: None,
+                    spawned_by: None,
                     writer: false,
                 }),
             },
@@ -18809,6 +18902,7 @@ mod tests {
                         status_changed_at: 0,
                         alive: true,
                         branch: None,
+                        spawned_by: None,
                         writer: false,
                     }),
                 },
@@ -18932,6 +19026,7 @@ mod tests {
                         status_changed_at: 0,
                         alive: true,
                         branch: None,
+                        spawned_by: None,
                         writer: false,
                     }),
                 },
@@ -20938,6 +21033,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: true,
                     branch: None,
+                    spawned_by: None,
                     writer: false,
                 }),
             },
@@ -22481,6 +22577,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: true,
                     branch: None,
+                    spawned_by: None,
                     writer: false,
                 }),
             },
@@ -22504,6 +22601,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: false,
                     branch: None,
+                    spawned_by: None,
                     writer: false,
                 }),
             },
@@ -22868,6 +22966,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: true,
                     branch: None,
+                    spawned_by: None,
                     writer: false,
                 }),
             },
@@ -24468,6 +24567,7 @@ mod tests {
                         status_changed_at: 0,
                         alive: true,
                         branch: None,
+                        spawned_by: None,
                         writer: false,
                     }),
                 },
@@ -24542,6 +24642,7 @@ mod tests {
             status_changed_at: 0,
             alive: true,
             branch: None,
+            spawned_by: None,
             writer: false,
         })
     }

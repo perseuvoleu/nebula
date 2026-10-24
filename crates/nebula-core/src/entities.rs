@@ -197,9 +197,13 @@ pub struct Agent {
     /// validated against their checkout row.
     #[serde(default)]
     pub branch: Option<String>,
+    /// The session whose `nebula agent new` spawned this one; None for the
+    /// user's own. Spawned sessions list under the panel's AGENTS group.
+    #[serde(default)]
+    pub spawned_by: Option<AgentId>,
     /// Spawned with `agent new --writer`: the checkout's one writer while
-    /// the session lives. Skipped when false, so a row without the mark
-    /// keeps its protocol-29 bytes.
+    /// the session lives. Skipped when false, so it stays the last field:
+    /// fields are positional on the wire.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub writer: bool,
 }

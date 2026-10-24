@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 30;
+pub const PROTOCOL_VERSION: u32 = 31;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -44,6 +44,48 @@ impl WriterClaim {
     pub fn is_off(&self) -> bool {
         *self == WriterClaim::Off
     }
+}
+
+/// `CreateAgent`'s fields are positional on the wire, so its optional tail
+/// is cut from the end only: `writer` stays while `spawned_by` follows it.
+#[allow(clippy::too_many_arguments)]
+fn create_agent_wire<S: serde::Serializer>(
+    req_id: &u64,
+    worktree: &WorktreeId,
+    expected_branch: &Option<String>,
+    name: &String,
+    kind: &AgentKind,
+    model: &Option<String>,
+    effort: &Option<String>,
+    auto_title: &bool,
+    prompt: &Option<String>,
+    writer: &WriterClaim,
+    spawned_by: &Option<AgentId>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeStruct;
+    let tail = match (writer.is_off(), spawned_by.is_some()) {
+        (_, true) => 2,
+        (false, false) => 1,
+        (true, false) => 0,
+    };
+    let mut fields = serializer.serialize_struct("CreateAgent", 9 + tail)?;
+    fields.serialize_field("req_id", req_id)?;
+    fields.serialize_field("worktree", worktree)?;
+    fields.serialize_field("expected_branch", expected_branch)?;
+    fields.serialize_field("name", name)?;
+    fields.serialize_field("kind", kind)?;
+    fields.serialize_field("model", model)?;
+    fields.serialize_field("effort", effort)?;
+    fields.serialize_field("auto_title", auto_title)?;
+    fields.serialize_field("prompt", prompt)?;
+    if tail > 0 {
+        fields.serialize_field("writer", writer)?;
+    }
+    if tail > 1 {
+        fields.serialize_field("spawned_by", spawned_by)?;
+    }
+    fields.end()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -212,6 +254,7 @@ pub enum ClientRequest {
         id: WorktreeId,
         pinned: bool,
     },
+    #[serde(serialize_with = "create_agent_wire")]
     CreateAgent {
         req_id: u64,
         worktree: WorktreeId,
@@ -234,8 +277,12 @@ pub enum ClientRequest {
         prompt: Option<String>,
         /// Skipped when `Off`, so a request without a claim keeps its
         /// protocol-29 bytes (tests/protocol29.rs).
-        #[serde(default, skip_serializing_if = "WriterClaim::is_off")]
+        #[serde(default)]
         writer: WriterClaim,
+        /// The session whose `nebula agent new` sent this (its
+        /// `NEBULA_AGENT_ID`); None for a spawn by the user.
+        #[serde(default)]
+        spawned_by: Option<AgentId>,
     },
     /// Fire-and-forget: pre-spawn an agent CLI for this (worktree, kind) so
     /// the next CreateAgent adopts an already-booted session. Sent the

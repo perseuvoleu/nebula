@@ -1427,6 +1427,7 @@ pub async fn agent_show(name: String, project_flag: Option<String>) -> Result<()
             "archived": a.archived,
             "pinned": a.pinned,
             "writer": a.writer,
+            "spawned_by": a.spawned_by,
             "alive": a.alive,
             // Native CLI session id (claude/codex/cursor/pi) the daemon stored for
             // resume; read-only consumers (the web gateway) map it to native history.
@@ -1846,6 +1847,7 @@ pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
             auto_title,
             prompt: opts.prompt,
             writer: opts.writer,
+            spawned_by: env_agent_id().map(AgentId),
         },
     )
     .await?;
@@ -1922,6 +1924,7 @@ pub async fn agent_list(
                 "path": worktree.path.display().to_string(),
                 "archived": a.archived,
                 "writer": a.writer,
+                "spawned_by": a.spawned_by,
                 "session_id": a.session_id,
             }))
         })
@@ -2121,6 +2124,7 @@ pub async fn agent_wait(
                 "path": worktree.path.display().to_string(),
                 "archived": a.archived,
                 "writer": a.writer,
+                "spawned_by": a.spawned_by,
                 "session_id": a.session_id,
             }))
         })

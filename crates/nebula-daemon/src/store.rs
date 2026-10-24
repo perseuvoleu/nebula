@@ -280,6 +280,10 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE agents ADD COLUMN writer INTEGER NOT NULL DEFAULT 0;
     ",
+    // 27: the session whose `nebula agent new` spawned this one
+    "
+    ALTER TABLE agents ADD COLUMN spawned_by TEXT;
+    ",
 ];
 
 /// A project's twin on a host, as the hook pointer needs it: the host, the
@@ -611,8 +615,8 @@ impl Store {
     /// clients never see it, they only observe the eventual rename.
     pub fn insert_agent_with_auto_title(&self, a: &Agent, auto_title: bool) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO agents (id, worktree_id, name, status, archived, archived_at, pinned, kind, claude_session_id, sort_order, created_at, status_changed_at, model, effort, auto_title_pending, branch, writer)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            "INSERT INTO agents (id, worktree_id, name, status, archived, archived_at, pinned, kind, claude_session_id, sort_order, created_at, status_changed_at, model, effort, auto_title_pending, branch, writer, spawned_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             params![
                 a.id.as_str(),
                 a.worktree_id.as_str(),
@@ -630,7 +634,8 @@ impl Store {
                 a.effort,
                 auto_title as i64,
                 a.branch,
-                a.writer as i64
+                a.writer as i64,
+                a.spawned_by.as_ref().map(AgentId::as_str)
             ],
         )?;
         Ok(())
@@ -1288,7 +1293,7 @@ impl Store {
     pub fn get_agent(&self, id: &AgentId) -> Result<Option<Agent>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, worktree_id, name, status, archived, pinned, kind, claude_session_id, sort_order, status_changed_at, model, effort, archived_at, branch, writer FROM agents WHERE id = ?1",
+            "SELECT id, worktree_id, name, status, archived, pinned, kind, claude_session_id, sort_order, status_changed_at, model, effort, archived_at, branch, writer, spawned_by FROM agents WHERE id = ?1",
         )?;
         let mut rows = stmt.query(params![id.as_str()])?;
         Ok(rows.next()?.map(|r| Agent {
@@ -1309,6 +1314,7 @@ impl Store {
             alive: false,
             branch: r.get(13).unwrap(),
             writer: r.get::<_, i64>(14).unwrap() != 0,
+            spawned_by: r.get::<_, Option<String>>(15).unwrap().map(AgentId),
         }))
     }
 
@@ -1405,7 +1411,7 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let agents = conn
-            .prepare("SELECT id, worktree_id, name, status, archived, pinned, kind, claude_session_id, sort_order, status_changed_at, model, effort, archived_at, branch, writer FROM agents ORDER BY sort_order, created_at")?
+            .prepare("SELECT id, worktree_id, name, status, archived, pinned, kind, claude_session_id, sort_order, status_changed_at, model, effort, archived_at, branch, writer, spawned_by FROM agents ORDER BY sort_order, created_at")?
             .query_map([], |r| {
                 Ok(Agent {
                     id: AgentId(r.get(0)?),
@@ -1424,6 +1430,7 @@ impl Store {
                     alive: false,
                     branch: r.get(13)?,
                     writer: r.get::<_, i64>(14)? != 0,
+                    spawned_by: r.get::<_, Option<String>>(15)?.map(AgentId),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1515,6 +1522,7 @@ mod tests {
             status_changed_at: 0,
             alive: false,
             branch: None,
+            spawned_by: Some(AgentId("lead".into())),
             writer: true,
         };
         store.insert_agent(&agent).unwrap();
@@ -1534,6 +1542,7 @@ mod tests {
             status_changed_at: 0,
             alive: false,
             branch: None,
+            spawned_by: None,
             writer: false,
         };
         store.insert_agent(&codex_agent).unwrap();
@@ -1553,6 +1562,7 @@ mod tests {
             status_changed_at: 0,
             alive: false,
             branch: None,
+            spawned_by: None,
             writer: false,
         };
         store.insert_agent(&cursor_agent).unwrap();
@@ -1569,6 +1579,8 @@ mod tests {
         assert_eq!(agents[0].effort.as_deref(), Some("high"));
         assert!(agents[0].writer);
         assert!(!agents[1].writer);
+        assert_eq!(agents[0].spawned_by, Some(AgentId("lead".into())));
+        assert_eq!(agents[1].spawned_by, None);
         assert_eq!(agents[1].kind, AgentKind::Codex);
         assert_eq!(agents[1].model, None);
         assert_eq!(agents[2].kind, AgentKind::Cursor);
@@ -1798,6 +1810,7 @@ mod tests {
                 status_changed_at: 0,
                 alive: false,
                 branch: None,
+                spawned_by: None,
                 writer: false,
             })
             .unwrap();
@@ -2047,6 +2060,7 @@ mod tests {
         let store = Store::open(&path).unwrap();
         let (_, _, agents, terminals) = store.load_tree().unwrap();
         assert_eq!(agents[0].branch.as_deref(), Some("main"));
+        assert_eq!(agents[0].spawned_by, None);
         assert_eq!(terminals[0].branch.as_deref(), Some("main"));
         drop(store);
         for suffix in ["", "-wal", "-shm"] {
@@ -2289,6 +2303,7 @@ mod tests {
             status_changed_at: 0,
             alive: false,
             branch: None,
+            spawned_by: None,
             writer: false,
         };
 
@@ -2533,6 +2548,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: false,
                     branch: None,
+                    spawned_by: None,
                     writer: false,
                 })
                 .unwrap();

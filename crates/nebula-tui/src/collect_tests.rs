@@ -173,6 +173,7 @@ impl Fixture {
             sort_order: 0,
             alive: true,
             branch: Some("feature".into()),
+            spawned_by: None,
             writer: false,
         });
     }

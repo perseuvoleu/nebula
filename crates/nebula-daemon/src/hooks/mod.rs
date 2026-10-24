@@ -350,6 +350,7 @@ mod tests {
             status_changed_at: 0,
             alive: false,
             branch: None,
+            spawned_by: None,
             writer: false,
         };
         store
@@ -655,6 +656,7 @@ mod tests {
             status_changed_at: 0,
             alive: true,
             branch: None,
+            spawned_by: None,
             writer: false,
         };
         store

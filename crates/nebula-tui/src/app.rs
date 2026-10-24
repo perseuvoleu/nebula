@@ -4490,7 +4490,7 @@ impl App {
         self.sessions_for_home(&home, self.show_archived)
     }
 
-    /// A row's sessions: pinned agents, then the rest, then (when shown)
+    /// A row's sessions: pinned, the user's, the AGENTS group, then (when shown)
     /// archived agents. Most recent activity first within each live group:
     /// working sessions lead, then whichever finished last. Never-run
     /// sessions keep tree order at the bottom (stable sort).
@@ -4508,7 +4508,7 @@ impl App {
         let mut rows = collect(&|a| !a.archived && a.pinned);
         rows.sort_by_key(|a| recency_key(a, now));
         let mut unpinned = collect(&|a| !a.archived && !a.pinned);
-        unpinned.sort_by_key(|a| recency_key(a, now));
+        unpinned.sort_by_key(|a| (a.spawned_by.is_some(), recency_key(a, now)));
         rows.extend(unpinned);
         if show_archived {
             let mut archived = collect(&|a| a.archived);
@@ -4882,6 +4882,7 @@ mod tests {
             sort_order: 0,
             alive: true,
             branch: None,
+            spawned_by: None,
             writer: false,
         });
         let template = app.tree.agents[0].clone();
@@ -4937,6 +4938,7 @@ mod tests {
                 sort_order: 0,
                 alive: true,
                 branch: None,
+                spawned_by: None,
                 writer: false,
             });
         }
@@ -5066,6 +5068,7 @@ mod tests {
                 sort_order: 0,
                 alive: true,
                 branch: None,
+                spawned_by: None,
                 writer: false,
             });
         }
@@ -5250,6 +5253,7 @@ mod tests {
             status_changed_at: 0,
             alive: false,
             branch: branch.map(str::to_owned),
+            spawned_by: None,
             writer: false,
         }
     }
@@ -5982,6 +5986,7 @@ mod tests {
             sort_order: 0,
             alive: true,
             branch: None,
+            spawned_by: None,
             writer: false,
         });
 

@@ -2386,6 +2386,7 @@ impl Daemon {
         auto_title: bool,
         prompt: Option<String>,
         writer: WriterClaim,
+        spawned_by: Option<AgentId>,
     ) -> Result<EntityId> {
         let _execution = self.checkout_execution.read().await;
         let worktree = self
@@ -2444,6 +2445,7 @@ impl Daemon {
             status_changed_at: epoch_ms(),
             alive: false,
             branch: Some(worktree.branch.clone()),
+            spawned_by,
             writer: !writer.is_off(),
         };
         self.store
@@ -2550,6 +2552,7 @@ impl Daemon {
             status_changed_at: 0,
             alive: false,
             branch: None,
+            spawned_by: None,
             writer: false,
         };
         self.spawn_agent_session(&agent, &worktree, 80, 24)?;
@@ -4711,6 +4714,7 @@ mod tests {
                 status_changed_at: 0,
                 alive: false,
                 branch: None,
+                spawned_by: None,
                 writer: false,
             })
             .unwrap();
@@ -4810,6 +4814,7 @@ mod tests {
                     status_changed_at: 0,
                     alive: false,
                     branch: None,
+                    spawned_by: None,
                     writer: false,
                 },
                 true,
@@ -5709,6 +5714,7 @@ exec sleep 60
                 false,
                 None,
                 WriterClaim::Off,
+                None,
             )
             .await
             .unwrap()
@@ -5735,6 +5741,7 @@ exec sleep 60
                 false,
                 None,
                 writer,
+                None,
             )
             .await?;
         let EntityId::Agent(id) = id else { panic!() };
@@ -6711,6 +6718,7 @@ exec sleep 60
                 false,
                 None,
                 WriterClaim::Off,
+                None,
             )
             .await
             .unwrap_err();
@@ -7071,6 +7079,7 @@ exec sleep 60
                     status_changed_at: stamp,
                     alive: false,
                     branch: None,
+                    spawned_by: None,
                     writer: false,
                 })
                 .unwrap();
