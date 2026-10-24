@@ -1774,6 +1774,14 @@ pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
     let mut conn = handshake(stream).await?;
     let (projects, worktrees, agents) = subscribe_snapshot(&mut conn).await?;
     let project = resolve_project(&projects, &worktrees, &agents, opts.project.as_deref())?;
+    if let Some(host) = &project.host {
+        let cache = paths::log_dir().join("skills-check");
+        if let Some(warning) =
+            crate::remote_cli::skills_warning(host, &cache, crate::remote_cli::check_skills)
+        {
+            eprintln!("{warning}");
+        }
+    }
     let of_project: Vec<&nebula_core::Worktree> = worktrees
         .iter()
         .filter(|w| w.project_id == project.id)

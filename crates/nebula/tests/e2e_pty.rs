@@ -7145,14 +7145,26 @@ async fn agent_new_writer_on_a_host_applies_the_rule_there() {
     })
     .await;
 
-    let cli = |args: &[&str]| {
+    let checker_bin = |name: &str, body: &str| {
+        let bin = env.tmp.path().join(name);
+        write_executable(&bin.join("nebula-sync-skills"), body);
+        bin
+    };
+    let in_sync = checker_bin("in-sync", "#!/bin/sh\necho 'differ: 0'\n");
+    let cli_with = |args: &[&str], checker: &Path, data: &str| {
         std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
             .args(args)
             .args(["--project", "repo@testhost"])
             .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
+            .env("NEBULA_DATA_DIR", env.tmp.path().join(data))
+            .env(
+                "PATH",
+                format!("{}:{}", checker.display(), std::env::var("PATH").unwrap()),
+            )
             .output()
             .unwrap()
     };
+    let cli = |args: &[&str]| cli_with(args, &in_sync, "data");
     let spawn = |name: &str| {
         cli(&[
             "agent",
@@ -7178,6 +7190,42 @@ async fn agent_new_writer_on_a_host_applies_the_rule_there() {
     assert!(
         String::from_utf8_lossy(&second.stderr).contains("\"holder\" is the writer on main;"),
         "{second:?}"
+    );
+
+    let spawn_checked = |name: &str, checker: &Path, data: &str| {
+        let out = cli_with(
+            &["agent", "new", "--worktree", "main", "--name", name],
+            checker,
+            data,
+        );
+        assert!(out.status.success(), "{out:?}");
+        let show = cli(&["agent", "show", name]);
+        assert!(show.status.success(), "{name} was not created: {show:?}");
+        String::from_utf8(out.stderr).unwrap()
+    };
+    let drift = checker_bin("drift", "#!/bin/sh\necho 'differ: 2'\n");
+    assert_eq!(
+        spawn_checked("drifted", &drift, "data-drift"),
+        "warning: skills on testhost differ from this machine (2 files); run scripts/sync-skills.sh testhost\n"
+    );
+    let broken = checker_bin("broken", "#!/bin/sh\necho 'ssh: no route' >&2\nexit 255\n");
+    assert_eq!(
+        spawn_checked("unchecked", &broken, "data-broken"),
+        "warning: could not check skills on testhost (check failed — ssh: no route); going ahead\n"
+    );
+    assert_eq!(spawn_checked("unchecked-again", &broken, "data-broken"), "");
+    let hung = checker_bin("hung", "#!/bin/sh\nsleep 120\n");
+    let started = std::time::Instant::now();
+    let stderr = spawn_checked("past-a-hang", &hung, "data-hung");
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "a hung check held the spawn for {:?}",
+        started.elapsed()
+    );
+    assert!(
+        stderr.starts_with("warning: could not check skills on testhost (")
+            && stderr.ends_with("); going ahead\n"),
+        "{stderr}"
     );
 
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();

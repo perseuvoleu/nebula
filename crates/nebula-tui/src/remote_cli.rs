@@ -187,15 +187,36 @@ fn build_drift(theirs: &str, ours: &str) -> Drift {
     }
 }
 
+fn skills_drift(host: &str) -> String {
+    match check_skills(host) {
+        SkillsCheck::InSync => "in sync".into(),
+        SkillsCheck::Differ(1) => "1 file differs".into(),
+        SkillsCheck::Differ(n) => format!("{n} files differ"),
+        SkillsCheck::Failed(why) => why,
+    }
+}
+
+pub(crate) enum SkillsCheck {
+    InSync,
+    Differ(usize),
+    Failed(String),
+}
+
 /// `nebula-sync-skills --check`: what a skills sync would change on the
 /// host, by content checksum over the same entries the sync mirrors.
-fn skills_drift(host: &str) -> String {
+pub(crate) fn check_skills(host: &str) -> SkillsCheck {
     let Some(script) = which("nebula-sync-skills") else {
-        return "unknown — `nebula-sync-skills` not on PATH (see the sync-skills skill)".into();
+        return SkillsCheck::Failed(
+            "unknown — `nebula-sync-skills` not on PATH (see the sync-skills skill)".into(),
+        );
     };
-    let out = match Command::new(script).args(["--check", host]).output() {
+    let check = output_within(
+        Command::new(script).args(["--check", host]),
+        SKILLS_CHECK_BOUND,
+    );
+    let out = match check {
         Ok(out) => out,
-        Err(e) => return format!("check failed — {e}"),
+        Err(e) => return SkillsCheck::Failed(format!("check failed — {e}")),
     };
     let stdout = String::from_utf8_lossy(&out.stdout);
     let differ = stdout
@@ -204,14 +225,152 @@ fn skills_drift(host: &str) -> String {
         .find_map(|l| l.strip_prefix("differ: "))
         .and_then(|n| n.trim().parse::<usize>().ok());
     match differ {
-        Some(0) if out.status.success() => "in sync".into(),
-        Some(1) if out.status.success() => "1 file differs".into(),
-        Some(n) if out.status.success() => format!("{n} files differ"),
-        _ => format!(
+        Some(0) if out.status.success() => SkillsCheck::InSync,
+        Some(n) if out.status.success() => SkillsCheck::Differ(n),
+        _ => SkillsCheck::Failed(format!(
             "check failed — {}",
             String::from_utf8_lossy(&out.stderr).trim()
-        ),
+        )),
     }
+}
+
+const SKILLS_CHECK_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The checker's ssh can hang on a dead link or a password prompt; it runs
+/// in its own process group so a timeout kills ssh too. The group is
+/// signalled only while `try_wait` still sees the leader unreaped, so its id
+/// cannot belong to a recycled process.
+fn output_within(
+    cmd: &mut Command,
+    bound: std::time::Duration,
+) -> std::io::Result<std::process::Output> {
+    extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    const SIGKILL: i32 = 9;
+    output_signalling(cmd, bound, |pgid| {
+        match unsafe { kill(-(pgid as i32), SIGKILL) } {
+            0 => Ok(()),
+            _ => Err(std::io::Error::last_os_error()),
+        }
+    })
+}
+
+fn output_signalling(
+    cmd: &mut Command,
+    bound: std::time::Duration,
+    kill_group: impl Fn(u32) -> std::io::Result<()>,
+) -> std::io::Result<std::process::Output> {
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()?;
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        if let Some(mut pipe) = pipe {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = pipe.read_to_end(&mut buf);
+                let _ = tx.send(buf);
+            });
+        }
+        rx
+    };
+    let stdout = drain(child.stdout.take().map(|p| Box::new(p) as _));
+    let stderr = drain(child.stderr.take().map(|p| Box::new(p) as _));
+    let deadline = std::time::Instant::now() + bound;
+    let timed_out = || {
+        std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("no answer in {}s", bound.as_secs()),
+        )
+    };
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(match kill_group(child.id()) {
+                Ok(()) => {
+                    let _ = child.wait();
+                    timed_out()
+                }
+                Err(e) => {
+                    let _ = child.try_wait();
+                    std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!("{}; could not stop it: {e}", timed_out()),
+                    )
+                }
+            });
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let rest = || deadline.saturating_duration_since(std::time::Instant::now());
+    let stdout = stdout.recv_timeout(rest()).map_err(|_| timed_out())?;
+    let stderr = stderr.recv_timeout(rest()).map_err(|_| timed_out())?;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+const SKILLS_CHECK_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
+/// Cached per host for a day so a burst of `nebula agent new` pays the ssh
+/// round trip once.
+pub(crate) fn skills_warning(
+    host: &str,
+    cache_dir: &std::path::Path,
+    check: impl FnOnce(&str) -> SkillsCheck,
+) -> Option<String> {
+    let differ_warning = |n: usize| {
+        format!(
+            "warning: skills on {host} differ from this machine ({n} file{}); run scripts/sync-skills.sh {host}",
+            if n == 1 { "" } else { "s" }
+        )
+    };
+    let cache = cache_dir.join(host);
+    let fresh = std::fs::metadata(&cache)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age < SKILLS_CHECK_TTL);
+    let entry = fresh
+        .then(|| std::fs::read_to_string(&cache).ok())
+        .flatten();
+    let cached = entry.as_deref().and_then(|e| match e {
+        "ok" | "failed" => Some(None),
+        e => e
+            .strip_prefix("differ ")
+            .and_then(|n| n.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .map(|n| Some(differ_warning(n))),
+    });
+    if let Some(warning) = cached {
+        return warning;
+    }
+    let (entry, warning) = match check(host) {
+        SkillsCheck::InSync => ("ok".to_string(), None),
+        SkillsCheck::Differ(n) => (format!("differ {n}"), Some(differ_warning(n))),
+        SkillsCheck::Failed(why) => (
+            "failed".to_string(),
+            Some(format!(
+                "warning: could not check skills on {host} ({why}); going ahead"
+            )),
+        ),
+    };
+    let tmp = cache_dir.join(format!(".{host}.{}", std::process::id()));
+    let _ = std::fs::create_dir_all(cache_dir)
+        .and_then(|_| std::fs::write(&tmp, entry))
+        .and_then(|_| std::fs::rename(&tmp, &cache));
+    warning
 }
 
 async fn print_sessions(host: &str, snap: &Snapshot, everything: bool) -> Result<()> {
@@ -398,5 +557,126 @@ fn truncate(s: &str, max: usize) -> String {
         s.to_string()
     } else {
         s.chars().take(max - 1).collect::<String>() + "…"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FINDL_DIFFERS_3: &str = "warning: skills on findl differ from this machine (3 files); run scripts/sync-skills.sh findl";
+
+    #[test]
+    fn spawn_on_a_host_whose_skills_differ_warns_with_the_sync_command() {
+        let cache = tempfile::tempdir().unwrap();
+        let warning = skills_warning("findl", cache.path(), |_| SkillsCheck::Differ(3));
+        assert_eq!(warning.as_deref(), Some(FINDL_DIFFERS_3));
+    }
+
+    #[test]
+    fn spawn_on_a_host_in_sync_prints_no_warning() {
+        let cache = tempfile::tempdir().unwrap();
+        assert_eq!(
+            skills_warning("findl", cache.path(), |_| SkillsCheck::InSync),
+            None
+        );
+    }
+
+    #[test]
+    fn a_second_spawn_within_a_day_reuses_the_first_check() {
+        let cache = tempfile::tempdir().unwrap();
+        skills_warning("findl", cache.path(), |_| SkillsCheck::Differ(3));
+        let warning = skills_warning("findl", cache.path(), |_| panic!("checked twice"));
+        assert_eq!(warning.as_deref(), Some(FINDL_DIFFERS_3));
+    }
+
+    #[test]
+    fn a_check_older_than_a_day_runs_again() {
+        let cache = tempfile::tempdir().unwrap();
+        skills_warning("findl", cache.path(), |_| SkillsCheck::Differ(3));
+        let day_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(25 * 3600);
+        std::fs::File::options()
+            .write(true)
+            .open(cache.path().join("findl"))
+            .unwrap()
+            .set_modified(day_ago)
+            .unwrap();
+        assert_eq!(
+            skills_warning("findl", cache.path(), |_| SkillsCheck::InSync),
+            None
+        );
+    }
+
+    #[test]
+    fn a_corrupt_cache_entry_is_checked_again() {
+        let cache = tempfile::tempdir().unwrap();
+        for corrupt in ["", "differ", "differ x", "3", "okay"] {
+            std::fs::write(cache.path().join("findl"), corrupt).unwrap();
+            let warning = skills_warning("findl", cache.path(), |_| SkillsCheck::Differ(3));
+            assert_eq!(warning.as_deref(), Some(FINDL_DIFFERS_3), "{corrupt:?}");
+        }
+    }
+
+    #[test]
+    fn a_timed_out_check_is_reaped_before_it_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let script = format!(
+            "echo $$ > {}; perl -MPOSIX -e 'fork and exit; POSIX::setsid(); sleep 5'; exec sleep 30",
+            pid_file.display()
+        );
+        let out = output_within(
+            Command::new("sh").args(["-c", &script]),
+            std::time::Duration::from_millis(500),
+        );
+        assert_eq!(out.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let still_there = Command::new("kill")
+            .args(["-0", pid.trim()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(!still_there, "checker {} left unreaped", pid.trim());
+    }
+
+    #[test]
+    fn a_check_that_cannot_be_killed_still_times_out_within_the_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let script = format!("echo $$ > {}; exec sleep 30", pid_file.display());
+        let started = std::time::Instant::now();
+        let out = output_signalling(
+            Command::new("sh").args(["-c", &script]),
+            std::time::Duration::from_millis(500),
+            |_| Err(std::io::Error::from_raw_os_error(1)),
+        );
+        let elapsed = started.elapsed();
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        Command::new("kill")
+            .args(["-KILL", pid.trim()])
+            .status()
+            .unwrap();
+        assert_eq!(out.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "returned after {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_check_warns_only_once() {
+        let cache = tempfile::tempdir().unwrap();
+        let first = skills_warning("findl", cache.path(), |_| {
+            SkillsCheck::Failed("ssh: connect to host findl: timed out".into())
+        });
+        assert_eq!(
+            first.as_deref(),
+            Some("warning: could not check skills on findl (ssh: connect to host findl: timed out); going ahead")
+        );
+        assert_eq!(
+            skills_warning("findl", cache.path(), |_| panic!("checked twice")),
+            None
+        );
     }
 }
