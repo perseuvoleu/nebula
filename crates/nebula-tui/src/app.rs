@@ -2310,6 +2310,19 @@ fn nest_by_parent<T>(rows: Vec<T>, mut parent: Vec<Option<usize>>) -> Vec<(T, us
     out
 }
 
+fn nest_by_spawner(rows: Vec<Agent>) -> Vec<(Agent, usize)> {
+    let parent: Vec<Option<usize>> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            a.spawned_by
+                .as_ref()
+                .and_then(|by| rows.iter().position(|p| &p.id == by).filter(|&p| p != i))
+        })
+        .collect();
+    nest_by_parent(rows, parent)
+}
+
 /// Epoch ms of the last interaction with a session — the stamp the sessions
 /// list sorts on and renders as "23m ago". A working session counts as
 /// interacting *now*: it is producing output as you look at it, so it holds
@@ -3730,6 +3743,9 @@ impl App {
             return vec![];
         };
         self.session_rows_for_home(&home, self.show_archived)
+            .into_iter()
+            .map(|(row, _)| row)
+            .collect()
     }
 
     /// The compact session sub-list for a worktree row. It uses the same
@@ -3737,24 +3753,41 @@ impl App {
     /// includes archived agents.
     pub fn worktree_session_rows(&self, worktree: &WorktreeId) -> Vec<SessionRow> {
         self.session_rows_for_home(&SessionHome::Worktree(worktree.clone()), false)
+            .into_iter()
+            .map(|(row, _)| row)
+            .collect()
     }
 
-    fn session_rows_for_home(&self, home: &SessionHome, show_archived: bool) -> Vec<SessionRow> {
+    /// Each row with its spawn-nest depth; terminals and links sit at 0.
+    fn session_rows_for_home(
+        &self,
+        home: &SessionHome,
+        show_archived: bool,
+    ) -> Vec<(SessionRow, usize)> {
         let agents = self.sessions_for_home(home, show_archived);
         let (pinned, unpinned, _) = self.session_group_counts_for_home(home);
         let active = (pinned + unpinned).min(agents.len());
-        let mut rows: Vec<SessionRow> = agents[..active]
+        let mut rows: Vec<(SessionRow, usize)> = agents[..active]
             .iter()
             .cloned()
-            .map(SessionRow::Agent)
+            .map(|(a, depth)| (SessionRow::Agent(a), depth))
             .collect();
         rows.extend(
             self.terminals_for_home(home)
                 .into_iter()
-                .map(SessionRow::Terminal),
+                .map(|t| (SessionRow::Terminal(t), 0)),
         );
-        rows.extend(self.links_for_home(home).into_iter().map(SessionRow::Link));
-        rows.extend(agents[active..].iter().cloned().map(SessionRow::Agent));
+        rows.extend(
+            self.links_for_home(home)
+                .into_iter()
+                .map(|l| (SessionRow::Link(l), 0)),
+        );
+        rows.extend(
+            agents[active..]
+                .iter()
+                .cloned()
+                .map(|(a, depth)| (SessionRow::Agent(a), depth)),
+        );
         // The ⌘D split's session is a normal row/tab like any other — it's
         // an independent session that happens to render in the right pane.
         // `attach` guards the one hazard: selecting its row focuses the
@@ -4431,16 +4464,22 @@ impl App {
     /// Rendering already holds the projected rows; don't rebuild the entire
     /// tree just to recover the identity of each row again.
     pub fn sessions_for_panel_row(&self, row: &PanelRow) -> Vec<SessionRow> {
+        self.nested_sessions_for_panel_row(row)
+            .into_iter()
+            .map(|(row, _)| row)
+            .collect()
+    }
+
+    /// [`Self::sessions_for_panel_row`] with each row's spawn-nest depth.
+    pub fn nested_sessions_for_panel_row(&self, row: &PanelRow) -> Vec<(SessionRow, usize)> {
         let Some(project) = self.selected_project() else {
             return vec![];
         };
-        match row {
-            PanelRow::Worktree(id) => self.worktree_session_rows(id),
-            PanelRow::Branch(name) => self.session_rows_for_home(
-                &SessionHome::Branch(project.id.clone(), name.clone()),
-                false,
-            ),
-        }
+        let home = match row {
+            PanelRow::Worktree(id) => SessionHome::Worktree(id.clone()),
+            PanelRow::Branch(name) => SessionHome::Branch(project.id.clone(), name.clone()),
+        };
+        self.session_rows_for_home(&home, false)
     }
 
     /// (pinned, unpinned) worktree counts for the selected project.
@@ -4488,13 +4527,16 @@ impl App {
             return vec![];
         };
         self.sessions_for_home(&home, self.show_archived)
+            .into_iter()
+            .map(|(a, _)| a)
+            .collect()
     }
 
-    /// A row's sessions: pinned, the user's, the AGENTS group, then (when shown)
+    /// A row's sessions: pinned agents, then the rest, then (when shown)
     /// archived agents. Most recent activity first within each live group:
     /// working sessions lead, then whichever finished last. Never-run
     /// sessions keep tree order at the bottom (stable sort).
-    fn sessions_for_home(&self, home: &SessionHome, show_archived: bool) -> Vec<Agent> {
+    fn sessions_for_home(&self, home: &SessionHome, show_archived: bool) -> Vec<(Agent, usize)> {
         let projection = self.projection();
         let listed = self.agents_listed(&projection.homes, home);
         let collect = |keep: &dyn Fn(&Agent) -> bool| -> Vec<Agent> {
@@ -4507,15 +4549,16 @@ impl App {
         let now = now_ms();
         let mut rows = collect(&|a| !a.archived && a.pinned);
         rows.sort_by_key(|a| recency_key(a, now));
+        let mut rows = nest_by_spawner(rows);
         let mut unpinned = collect(&|a| !a.archived && !a.pinned);
-        unpinned.sort_by_key(|a| (a.spawned_by.is_some(), recency_key(a, now)));
-        rows.extend(unpinned);
+        unpinned.sort_by_key(|a| recency_key(a, now));
+        rows.extend(nest_by_spawner(unpinned));
         if show_archived {
             let mut archived = collect(&|a| a.archived);
             // Most recently archived first; pre-`archived_at` rows (stamp 0)
             // keep tree order at the bottom (stable sort).
             archived.sort_by_key(|a| std::cmp::Reverse(a.archived_at));
-            rows.extend(archived);
+            rows.extend(archived.into_iter().map(|a| (a, 0)));
         }
         rows
     }

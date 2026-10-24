@@ -3526,6 +3526,28 @@ fn nest_level_continues(depths: &[usize], i: usize, level: usize) -> bool {
         .is_some_and(|&d| d == level)
 }
 
+/// Row `i`'s tree guides: `│` continuations for ancestors that still have
+/// siblings coming, then its own `├`/`└` connector, 2 cells per level.
+fn nest_guides(depths: &[usize], i: usize, depth: usize) -> String {
+    if depth == 0 {
+        return String::new();
+    }
+    let mut guides = String::new();
+    for l in 1..depth {
+        guides.push_str(if nest_level_continues(depths, i, l) {
+            "│ "
+        } else {
+            "  "
+        });
+    }
+    guides.push_str(if nest_level_continues(depths, i, depth) {
+        "├ "
+    } else {
+        "└ "
+    });
+    guides
+}
+
 /// Keep the controls outside the scrolling rows, including when both hosts
 /// are hidden. Stack on narrow columns so neither checkbox becomes unreachable.
 /// Dark green for the branch the primary checkout is on: the `⎇` control
@@ -3674,7 +3696,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         sub: Option<String>,
         roll: Option<AgentStatus>,
         notes: (usize, usize),
-        sessions: Vec<SessionRow>,
+        sessions: Vec<(SessionRow, usize)>,
         depth: usize,
         host: Option<String>,
         /// The row's hit target, minus the index.
@@ -3698,7 +3720,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                         sub,
                         roll: app.worktree_rollup(id),
                         notes: app.note_stats(&nebula_core::NoteOwner::Worktree(id.clone())),
-                        sessions: app.sessions_for_panel_row(&entry.row),
+                        sessions: app.nested_sessions_for_panel_row(&entry.row),
                         depth: entry.depth,
                         host: app.worktree_host(id).map(str::to_owned).or_else(|| {
                             w.filter(|w| app.tree.project_family(&w.project_id).len() > 1)
@@ -3713,7 +3735,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                     sub,
                     roll: app.branch_rollup(name),
                     notes: (0, 0),
-                    sessions: app.sessions_for_panel_row(&entry.row),
+                    sessions: app.nested_sessions_for_panel_row(&entry.row),
                     depth: entry.depth,
                     host: app.selected_project().and_then(|project| {
                         // Parked branch rows can still aggregate sessions from twins.
@@ -3803,10 +3825,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .enumerate()
         .map(|(i, row)| {
-            let mut h = PILL_H as usize
-                + usize::from(row.sub.is_some())
-                + row.sessions.len()
-                + usize::from(agents_header_at(&row.sessions).is_some());
+            let mut h = PILL_H as usize + usize::from(row.sub.is_some()) + row.sessions.len();
             if grouped && (i == primary_count || i == primary_count + pinned_count) {
                 h += 1;
             }
@@ -3842,8 +3861,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             header(f, "UNPINNED".into(), &mut screen_row);
         }
         let row_height = PILL_H as usize + usize::from(row.sub.is_some());
-        let agents_at = agents_header_at(&row.sessions);
-        let entry_height = row_height + row.sessions.len() + usize::from(agents_at.is_some());
+        let entry_height = row_height + row.sessions.len();
         if row_rect(inner, screen_row + row_height - 1).is_none() {
             break;
         }
@@ -3856,20 +3874,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             // ancestors that still have siblings coming, then this row's
             // own `├`/`└` connector. Same 2-cell-per-level width as the
             // plain indent, so truncation math is untouched.
-            let mut guides = String::new();
-            for l in 1..depth {
-                guides.push_str(if nest_level_continues(&depths, i, l) {
-                    "│ "
-                } else {
-                    "  "
-                });
-            }
-            guides.push_str(if nest_level_continues(&depths, i, depth) {
-                "├ "
-            } else {
-                "└ "
-            });
-            spans.push(Span::styled(guides, guide));
+            spans.push(Span::styled(nest_guides(&depths, i, depth), guide));
         }
         // Remote checkouts carry the pink host badge after their tag.
         let remote = remote_badge(row.host.as_deref(), th);
@@ -4012,10 +4017,9 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             };
             app.hits.push((hit, target));
         }
-        for (session_index, session) in row.sessions.iter().enumerate() {
-            let below_header = agents_at.is_some_and(|at| session_index >= at);
-            let line = screen_row + row_height + session_index + usize::from(below_header);
-            let Some(r) = row_rect(inner, line) else {
+        let session_depths: Vec<usize> = row.sessions.iter().map(|(_, d)| *d).collect();
+        for (session_index, (session, spawn_depth)) in row.sessions.iter().enumerate() {
+            let Some(r) = row_rect(inner, screen_row + row_height + session_index) else {
                 break;
             };
             let unseen =
@@ -4044,7 +4048,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                 .is_some_and(|t| session.sref().as_ref() == Some(&t.sref));
             let rail = if attached {
                 Span::styled("▌", Style::default().fg(th.text))
-            } else if selected && session_index == 0 && agents_at != Some(0) {
+            } else if selected && session_index == 0 {
                 Span::styled(
                     PILL_RAIL_CAPS.1.to_string(),
                     Style::default().fg(if worktrees_focused { th.accent } else { th.dim }),
@@ -4068,26 +4072,8 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                     guides.push(' ');
                 }
             }
-            if agents_at == Some(session_index) {
-                if let Some(r) = row_rect(inner, line - 1) {
-                    let rail = if selected && session_index == 0 {
-                        Span::styled(
-                            PILL_RAIL_CAPS.1.to_string(),
-                            Style::default().fg(if worktrees_focused { th.accent } else { th.dim }),
-                        )
-                    } else {
-                        Span::raw(" ")
-                    };
-                    f.render_widget(
-                        Paragraph::new(Line::from(vec![
-                            rail,
-                            Span::styled(guides.clone(), guide),
-                            Span::styled("AGENTS", dim),
-                        ])),
-                        r,
-                    );
-                }
-            }
+            let spawn_depth = *spawn_depth;
+            guides.push_str(&nest_guides(&session_depths, session_index, spawn_depth));
             let detail = detail.map(|label| format!("{label} "));
             let remote = remote_badge(app.session_host(session), th);
             let name = match branch_mismatch(app, session) {
@@ -4098,6 +4084,7 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                 &name,
                 (inner.width as usize).saturating_sub(
                     4 + nest
+                        + 2 * spawn_depth
                         + detail.as_ref().map_or(0, |label| label.chars().count())
                         + remote.as_ref().map_or(0, |s| s.content.chars().count())
                         + usize::from(attached),
@@ -4836,12 +4823,6 @@ fn draw_quick_terminal(f: &mut Frame, app: &mut App) {
         app.term_links.clear();
         app.term_file_links.clear();
     }
-}
-
-fn agents_header_at(sessions: &[SessionRow]) -> Option<usize> {
-    sessions.iter().position(|session| {
-        matches!(session, SessionRow::Agent(a) if a.spawned_by.is_some() && !a.pinned && !a.archived)
-    })
 }
 
 fn branch_mismatch<'a>(app: &App, session: &'a SessionRow) -> Option<&'a str> {

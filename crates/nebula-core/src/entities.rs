@@ -198,7 +198,7 @@ pub struct Agent {
     #[serde(default)]
     pub branch: Option<String>,
     /// The session whose `nebula agent new` spawned this one; None for the
-    /// user's own. Spawned sessions list under the panel's AGENTS group.
+    /// user's own. Spawned sessions nest under it in the sidebar.
     #[serde(default)]
     pub spawned_by: Option<AgentId>,
     /// Spawned with `agent new --writer`: the checkout's one writer while

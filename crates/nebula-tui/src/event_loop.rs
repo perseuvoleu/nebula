@@ -14127,76 +14127,95 @@ mod tests {
     }
 
     #[test]
-    fn agent_spawned_sessions_list_under_an_agents_header() {
-        use nebula_core::{AgentStatus, Entity};
+    fn agent_spawned_sessions_nest_under_their_parent() {
+        use nebula_core::Entity;
         let mut app = App::new();
         seed_tree(&mut app);
-        seed_agent(&mut app, "a2", "w1");
-        let draw = |app: &mut App| {
-            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
-            terminal.draw(|f| ui::draw(f, app)).unwrap();
-            buffer_text(&terminal)
+        let spawn = |app: &mut App, id: &str, by: Option<&str>, archived: bool| {
+            seed_agent(app, id, "w1");
+            let mut agent = app
+                .tree
+                .agents
+                .iter()
+                .find(|a| a.id.as_str() == id)
+                .unwrap()
+                .clone();
+            agent.spawned_by = by.map(|by| AgentId(by.into()));
+            agent.archived = archived;
+            hse(
+                app,
+                ServerEvent::EntityUpserted {
+                    entity: Entity::Agent(agent),
+                },
+            );
         };
-        let text = draw(&mut app);
-        assert!(
-            !text.contains("AGENTS"),
-            "no spawned session, no header:\n{text}"
-        );
+        spawn(&mut app, "parent", None, false);
+        spawn(&mut app, "child-1", Some("parent"), false);
+        spawn(&mut app, "child-2", Some("parent"), false);
+        spawn(&mut app, "grand", Some("child-1"), false);
+        spawn(&mut app, "gone", None, true);
+        spawn(&mut app, "orphan", Some("gone"), false);
+        spawn(&mut app, "cyc-a", Some("cyc-b"), false);
+        spawn(&mut app, "cyc-b", Some("cyc-a"), false);
 
-        seed_agent(&mut app, "worker", "w1");
-        let mut worker = app
-            .tree
-            .agents
-            .iter()
-            .find(|a| a.id.as_str() == "worker")
-            .unwrap()
-            .clone();
-        worker.spawned_by = Some(AgentId("a1".into()));
-        worker.status = AgentStatus::Running;
-        worker.status_changed_at = crate::app::now_ms();
-        hse(
-            &mut app,
-            ServerEvent::EntityUpserted {
-                entity: Entity::Agent(worker),
-            },
-        );
-        let names: Vec<String> = app.visible_sessions().into_iter().map(|a| a.name).collect();
-        assert_eq!(
-            names.last().map(String::as_str),
-            Some("worker"),
-            "{names:?}"
-        );
-
-        let text = draw(&mut app);
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(!text.contains("AGENTS"), "no AGENTS header:\n{text}");
         let lines: Vec<&str> = text.lines().collect();
-        let header = lines
-            .iter()
-            .position(|l| l.contains("AGENTS"))
-            .unwrap_or_else(|| panic!("AGENTS header rendered:\n{text}"));
-        assert!(
-            lines[header - 1].contains("a2") || lines[header - 1].contains("agent-1"),
-            "the user's sessions sit above the header:\n{text}"
+        let row_of = |name: &str| {
+            lines
+                .iter()
+                .position(|l| l.contains(&format!(" claude {name}")))
+                .unwrap_or_else(|| panic!("{name} renders:\n{text}"))
+        };
+        let col_of = |name: &str| {
+            let line = lines[row_of(name)];
+            line[..line.find(&format!(" claude {name}")).unwrap()]
+                .chars()
+                .count()
+        };
+        let guide_of = |name: &str| {
+            let line = lines[row_of(name)];
+            let col = col_of(name);
+            line.chars().skip(col - 5).take(4).collect::<String>()
+        };
+        let p = row_of("parent");
+        assert_eq!(
+            [row_of("child-1"), row_of("grand"), row_of("child-2")],
+            [p + 1, p + 2, p + 3],
+            "children follow their parent, grandchild under its own:\n{text}"
         );
-        let row = lines[header + 1];
-        let at = row
-            .find("worker")
-            .unwrap_or_else(|| panic!("worker sits right under the header:\n{text}"));
-        let col = row[..at].chars().count() as u16;
+        let root = col_of("parent");
+        assert_eq!(col_of("child-1"), root + 2, "{text}");
+        assert_eq!(col_of("grand"), root + 4, "{text}");
+        assert_eq!(col_of("child-2"), root + 2, "{text}");
+        assert!(guide_of("child-1").ends_with("├ "), "{text}");
+        assert!(guide_of("grand").ends_with("│ └ "), "{text}");
+        assert!(guide_of("child-2").ends_with("└ "), "{text}");
+        assert_eq!(
+            col_of("orphan"),
+            root,
+            "an archived parent leaves its child a root:\n{text}"
+        );
+        let mut cycle = [col_of("cyc-a"), col_of("cyc-b")];
+        cycle.sort();
+        assert_eq!(cycle, [root, root + 2], "a spawn cycle lists both:\n{text}");
 
         let mut out = Vec::new();
         handle_mouse(
             &mut app,
             mev(
                 MouseEventKind::Down(MouseButton::Left),
-                col,
-                (header + 1) as u16,
+                col_of("grand") as u16 + 1,
+                row_of("grand") as u16,
             ),
             &mut out,
         );
-        let expected = SessionRef::Agent(AgentId("worker".into()));
+        let expected = SessionRef::Agent(AgentId("grand".into()));
         assert!(
             matches!(out.last(), Some(ClientRequest::Attach { session, .. }) if *session == expected),
-            "a click below the header attaches that session: {out:?}"
+            "a click on a nested row attaches that session: {out:?}"
         );
     }
 
