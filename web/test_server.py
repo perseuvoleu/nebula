@@ -13,6 +13,7 @@ from server import Gateway, Handler, Problem, PushService, StaticFiles, Threadin
 from test_pi_history import SID_A, SID_B, assistant, user, write_session
 
 TOKEN = "test-token-" * 5
+NOTIFY_TOKEN = "notify-token-" * 4
 ROWS = [{"id": "one", "name": "An agent", "kind": "pi", "status": "finished", "archived": False,
          "worktree": "main", "path": "/srv/project"}]
 TREES = [{"path": "/srv/project", "branch": "main", "is_main": True, "sessions": []}]
@@ -55,6 +56,10 @@ class GatewayTests(unittest.TestCase):
                                         (TOKEN, "https://example.com", [])]:
             with self.assertRaises(ValueError):
                 Gateway(token, origin, projects)
+
+    def test_notify_token_equal_to_main_token_is_refused(self):
+        with self.assertRaises(ValueError):
+            Gateway(TOKEN, "https://example.com", ["p"], notify_token=TOKEN)
 
     def test_push_subscriptions_persist_and_notify_only_on_lifecycle_transitions(self):
         sent = []
@@ -446,6 +451,94 @@ class HTTPTests(unittest.TestCase):
     def test_missing_and_disallowed_routes(self):
         self.assertEqual(self.request("/api/sessions?project=secret", headers=self.auth())[0], 403)
         self.assertEqual(self.request("/api/nothing?project=project", headers=self.auth())[0], 404)
+
+
+
+class NotifyTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.sent = []
+        self.push = PushService(None, "https://example.com", Path(self.tmp.name) / "push.json",
+                                sender=lambda subscription, data: self.sent.append((subscription["endpoint"], data)),
+                                public_key="B" * 87)
+        for endpoint in ["https://web.push.apple.com/one", "https://fcm.googleapis.com/two"]:
+            self.push.subscribe({"endpoint": endpoint, "keys": {"p256dh": "A" * 40, "auth": "b" * 8}})
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.origin = f"http://127.0.0.1:{self.server.server_port}"
+        self.server.gateway = Gateway(TOKEN, self.origin, ["project"], static=StaticFiles(make_static(self.tmp.name)),
+                                      push=self.push, notify_token=NOTIFY_TOKEN)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown(); self.server.server_close(); self.thread.join(); self.tmp.cleanup()
+
+    def notify(self, body, token=NOTIFY_TOKEN, path="/api/notify", **headers):
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)
+        data = body if isinstance(body, str) else json.dumps(body)
+        connection.request("POST", path, body=data, headers={"Authorization": "Bearer " + token,
+                                                             "Content-Type": "application/json", **headers})
+        response = connection.getresponse()
+        result = response.status, json.loads(response.read())
+        connection.close()
+        return result
+
+    def test_server_caller_reaches_every_subscribed_device(self):
+        self.assertEqual(self.notify({"title": "Teclo", "body": "Descărcare nouă", "tag": "teclo-download"}),
+                         (200, {"sent": 2}))
+        payload = {"title": "Teclo", "body": "Descărcare nouă", "url": "/", "tag": "teclo-download"}
+        self.assertEqual(self.sent, [("https://web.push.apple.com/one", payload),
+                                     ("https://fcm.googleapis.com/two", payload)])
+
+    def test_tag_defaults_and_expired_devices_are_not_counted(self):
+        class Gone(Exception):
+            response = SimpleNamespace(status_code=410)
+        def sender(subscription, data):
+            if subscription["endpoint"].endswith("/two"):
+                raise Gone()
+            self.sent.append(data)
+        self.push.sender = sender
+        self.assertEqual(self.notify({"title": "Teclo", "body": "Descărcare nouă"}), (200, {"sent": 1}))
+        self.assertEqual(self.sent, [{"title": "Teclo", "body": "Descărcare nouă", "url": "/", "tag": "nebula-notify"}])
+        self.assertEqual([s["endpoint"] for s in self.push.subscriptions()], ["https://web.push.apple.com/one"])
+
+    def test_notify_token_and_main_token_do_not_cross(self):
+        valid = {"title": "Teclo", "body": "Descărcare nouă"}
+        self.assertEqual(self.notify(valid, token=TOKEN)[0], 401)
+        self.assertEqual(self.notify(valid, token=TOKEN, Origin=self.origin)[0], 401)
+        for path in ["/api/projects", "/api/push/subscribe", "/api/send"]:
+            self.assertEqual(self.notify(valid, path=path)[0], 401, path)
+            self.assertEqual(self.notify(valid, path=path, Origin=self.origin)[0], 401, path)
+        self.assertEqual(self.sent, [])
+
+    def test_unset_notify_token_refuses_every_caller(self):
+        for configured in [None, ""]:
+            self.server.gateway.notify_token = configured
+            for token in ["", TOKEN, NOTIFY_TOKEN]:
+                self.assertEqual(self.notify({"title": "Teclo", "body": "x"}, token=token)[0], 401)
+        self.assertEqual(self.sent, [])
+
+    def test_unconfigured_push_is_unavailable(self):
+        self.server.gateway.push = None
+        self.assertEqual(self.notify({"title": "Teclo", "body": "Descărcare nouă"})[0], 503)
+
+    def test_invalid_payloads_send_nothing(self):
+        for body in [{"body": "x"}, {"title": "x"}, {"title": 1, "body": "x"}, {"title": "x", "body": None},
+                     {"title": "", "body": "x"}, {"title": "x", "body": ""}, {"title": "t" * 101, "body": "x"},
+                     {"title": "x", "body": "b" * 301}, {"title": "x", "body": "y", "tag": 3},
+                     {"title": "x", "body": "y", "tag": "g" * 65}, [], "{"]:
+            with self.subTest(body=body):
+                self.assertEqual(self.notify(body)[0], 400)
+        self.assertEqual(self.notify({"title": "x", "body": "y"}, **{"Content-Type": "text/plain"})[0], 415)
+        self.assertEqual(self.notify({"title": "x", "body": "y" * 100001})[0], 413)
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.notify({"title": "t" * 100, "body": "b" * 300, "tag": "g" * 64}), (200, {"sent": 2}))
+
+    def test_host_and_browser_origin_still_apply(self):
+        valid = {"title": "Teclo", "body": "Descărcare nouă"}
+        self.assertEqual(self.notify(valid, Host="evil.example")[0], 403)
+        self.assertEqual(self.notify(valid, Origin="https://evil.example")[0], 403)
+        self.assertEqual(self.sent, [])
 
 
 if __name__ == "__main__":

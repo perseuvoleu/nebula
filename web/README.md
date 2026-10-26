@@ -92,6 +92,13 @@ Supported destinations are `web.push.apple.com`, `fcm.googleapis.com`, and
 proxy/netrc credentials are disabled. Other push providers require a reviewed allowlist update.
 The gateway polls enabled projects every five seconds only while at least one device is subscribed.
 
+`NEBULA_WEB_NOTIFY_TOKEN` (optional) lets a server-to-server caller notify every subscribed
+device: `POST /api/notify` with `Authorization: Bearer <NEBULA_WEB_NOTIFY_TOKEN>`,
+`Content-Type: application/json` and `{"title": "1–100 chars", "body": "1–300 chars", "tag":
+"optional, 1–64 chars"}` replies `{"sent": <devices delivered to>}`, or 503 without a VAPID key.
+That token opens only this endpoint and the main token does not open it; no `Origin` is needed,
+but a browser `Origin` other than `NEBULA_WEB_ORIGIN` is refused. Unset or empty, the endpoint is 401.
+
 Open `http://127.0.0.1:8765` and enter the token. The gateway listens **only on 127.0.0.1**
 and refuses to start without a built app. `NEBULA_WEB_PORT`, `NEBULA_WEB_BINARY` (absolute
 Nebula binary) and `NEBULA_WEB_PI_AGENT_DIR` (default `~/.pi/agent`) are optional.
