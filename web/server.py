@@ -160,12 +160,17 @@ class PushService:
             "url": f"/p/{quote(project, safe='')}/s/{quote(row['id'], safe='')}",
             "tag": f"nebula-{row['id']}",
         }
+        self.deliver(data)
+
+    def deliver(self, data):
+        """Send to every stored subscription, prune expired ones; returns how many accepted it."""
         with self.lock:
             subscriptions = self.subscriptions()
-        expired = set()
+        expired, sent = set(), 0
         for subscription in subscriptions:
             try:
                 self.sender(subscription, data)
+                sent += 1
             except Exception as error:
                 response = getattr(error, "response", None)
                 if getattr(response, "status_code", None) in {404, 410}:
@@ -175,6 +180,7 @@ class PushService:
         if expired:
             with self.lock:
                 self.save([s for s in self.subscriptions() if s.get("endpoint") not in expired])
+        return sent
 
     def poll(self, gateway):
         if not self.subscriptions():
@@ -223,9 +229,11 @@ class StaticFiles:
 
 
 class Gateway:
-    def __init__(self, token, origin, projects, binary="nebula", static=None, pi_agent_dir=None, db_path=None, *, preview_binary=None, push=None, usage_service, claude_config_dir=None, serverless_runs=None):
+    def __init__(self, token, origin, projects, binary="nebula", static=None, pi_agent_dir=None, db_path=None, *, preview_binary=None, push=None, usage_service, claude_config_dir=None, serverless_runs=None, notify_token=None):
         if len(token) < 8:
             raise ValueError("NEBULA_WEB_TOKEN must contain at least 8 characters")
+        if notify_token and notify_token == token:
+            raise ValueError("NEBULA_WEB_NOTIFY_TOKEN must differ from NEBULA_WEB_TOKEN")
         parsed = urlsplit(origin)
         if (parsed.scheme not in {"http", "https"} or not parsed.netloc
                 or parsed.path or parsed.query or parsed.fragment or parsed.username):
@@ -254,6 +262,7 @@ class Gateway:
         # None explicitly disables provider reads (e.g. synthetic previews).
         self.usage = usage_service
         self.serverless = serverless_runs
+        self.notify_token = notify_token
 
     def run(self, *args, json_output=True, binary=None):
         if not self.slots.acquire(blocking=False):
@@ -487,6 +496,14 @@ class Gateway:
             self.checkout_lock.release()
 
     def post(self, path, body):
+        if path == "/api/notify":
+            title, text, tag = body.get("title"), body.get("body"), body.get("tag", "nebula-notify")
+            if not all(isinstance(value, str) and 0 < len(value) <= limit
+                       for value, limit in ((title, 100), (text, 300), (tag, 64))):
+                raise Problem(400, "Expected title (1–100), body (1–300) and optional tag (1–64) strings")
+            if not self.push:
+                raise Problem(503, "Push notifications are not configured")
+            return {"sent": self.push.deliver({"title": title, "body": text, "url": "/", "tag": tag})}
         if path == "/api/push/subscribe":
             if not self.push:
                 raise Problem(503, "Push notifications are not configured")
@@ -613,8 +630,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(200, file, mime, cache)
             if not path.startswith("/api/"):
                 raise Problem(404, "Not found")
-            if not hmac.compare_digest(self.headers.get("Authorization", "").encode(),
-                                       ("Bearer " + gateway.token).encode()):
+            notify = path == "/api/notify"
+            token = gateway.notify_token if notify else gateway.token
+            if not token or not hmac.compare_digest(self.headers.get("Authorization", "").encode(),
+                                                    ("Bearer " + token).encode()):
                 raise Problem(401, "Authentication required")
             origin = self.headers.get("Origin")
             if origin is not None and origin != gateway.origin:
@@ -622,7 +641,7 @@ class Handler(BaseHTTPRequestHandler):
             if method == "GET":
                 result = gateway.get(path, parse_qs(urlsplit(self.path).query))
             else:
-                if origin != gateway.origin:
+                if origin != gateway.origin and not notify:
                     raise Problem(403, "Origin required")
                 if self.headers.get("Content-Type") != "application/json":
                     raise Problem(415, "Expected application/json")
@@ -664,7 +683,8 @@ def main():
                       claude_config_dir=os.environ.get("NEBULA_WEB_CLAUDE_DIR") or os.environ.get("CLAUDE_CONFIG_DIR"),
                       preview_binary=os.environ.get("NEBULA_WEB_PREVIEW_BINARY"), push=push,
                       usage_service=usage.from_environment() if os.environ.get("NEBULA_WEB_USAGE", "1") != "0" else None,
-                      serverless_runs=serverless.from_environment())
+                      serverless_runs=serverless.from_environment(),
+                      notify_token=os.environ.get("NEBULA_WEB_NOTIFY_TOKEN"))
     if not gateway.static.files.get("/index.html"):
         raise SystemExit(f"No built app in {gateway.static.root}; run `pnpm --dir web/app build` first")
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
