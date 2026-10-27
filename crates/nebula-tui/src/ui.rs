@@ -3691,8 +3691,9 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
     struct Row {
         kind: RowKind,
         label: String,
-        /// The `from <base>` sub-line: only flat rows print it — nested
-        /// rows sit right under their parent, which would restate it.
+        /// The `from <base>` sub-line: a row right under its base would
+        /// restate it, so only the others print it — flat rows, and rows
+        /// past the nest cap that line up under a sibling.
         sub: Option<String>,
         roll: Option<AgentStatus>,
         notes: (usize, usize),
@@ -3702,10 +3703,10 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         /// The row's hit target, minus the index.
         is_branch: bool,
     }
-    let rows: Vec<Row> = entries
+    let mut rows: Vec<Row> = entries
         .iter()
         .map(|entry| {
-            let sub = entry.base.clone().filter(|_| entry.depth == 0);
+            let sub = entry.base.clone();
             match &entry.row {
                 PanelRow::Worktree(id) => {
                     let w = app.tree.worktrees.iter().find(|w| &w.id == id);
@@ -3761,6 +3762,16 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             }
         })
         .collect();
+    for i in 0..rows.len() {
+        let parent = rows[..i]
+            .iter()
+            .rev()
+            .find(|r| r.depth < rows[i].depth)
+            .filter(|r| r.depth + 1 == rows[i].depth);
+        if parent.is_some_and(|p| rows[i].sub.as_deref() == Some(p.label.as_str())) {
+            rows[i].sub = None;
+        }
+    }
     if rows.is_empty() && (app.hide_local || app.hide_remote || app.hide_empty || app.active_only) {
         f.render_widget(
             Paragraph::new("No matching rows\nEnable Local / Remote / All or clear Active")
@@ -3981,10 +3992,11 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                 };
                 f.render_widget(
                     Paragraph::new(format!(
-                        "{ROW_GUTTER}{}",
+                        "{ROW_GUTTER}{}{}",
+                        "  ".repeat(depth),
                         truncate(
                             &format!("from {base}"),
-                            (inner.width as usize).saturating_sub(ROW_GUTTER.len()),
+                            (inner.width as usize).saturating_sub(ROW_GUTTER.len() + 2 * depth),
                         )
                     ))
                     .style(style),
@@ -5551,6 +5563,48 @@ mod tests {
         }
         let expected = vec![app.theme.info, app.theme.remote];
         assert_eq!(rendered_project_hosts(&mut app, 22), expected);
+    }
+
+    /// Past the indent cap a row lines up as its parent's sibling, so it
+    /// names its base; a row right under its base stays quiet.
+    #[test]
+    fn a_row_past_the_nest_cap_names_its_base() {
+        let mut app = host_project_app(&[None]);
+        let project_id = app.tree.projects[0].id.clone();
+        for (i, (branch, base)) in [
+            ("main", None),
+            ("a", Some("main")),
+            ("b", Some("a")),
+            ("c", Some("b")),
+            ("d", Some("c")),
+            ("e", Some("d")),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            app.tree.worktrees.push(nebula_core::Worktree {
+                id: nebula_core::WorktreeId(branch.into()),
+                project_id: project_id.clone(),
+                path: format!("/sample-project/{branch}").into(),
+                branch: branch.into(),
+                is_main: i == 0,
+                created_from: base.map(str::to_owned),
+                pinned: false,
+                for_branch: false,
+                sort_order: i as i64,
+            });
+        }
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 40)).unwrap();
+        terminal
+            .draw(|f| draw_worktrees(f, &mut app, f.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen: String = (0..40)
+            .map(|y| (0..40).map(|x| buffer[(x, y)].symbol()).collect::<String>() + "\n")
+            .collect();
+        assert!(screen.contains("from d"), "e sits at d's indent: {screen}");
+        assert!(!screen.contains("from c"), "d sits right under c: {screen}");
     }
 
     #[test]

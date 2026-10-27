@@ -4374,11 +4374,33 @@ fn open_checkout_picker(app: &mut App, project: nebula_core::ProjectId, at: Opti
 /// newest commit first. The pick runs `git branch <name> <base>` in the
 /// primary checkout and then checks the branch out there, the
 /// `nebula switch` shape.
+/// The base the panel's cursor picks: the selected worktree's branch, not
+/// the project's root checkout. Detached worktrees expose their HEAD as
+/// `detached @ <hash>`; Git accepts that hash as the base ref.
+fn selected_base(app: &App, project: &nebula_core::ProjectId) -> Option<String> {
+    app.selected_worktree()
+        .filter(|worktree| &worktree.project_id == project)
+        .and_then(|worktree| {
+            worktree
+                .branch
+                .strip_prefix("detached @ ")
+                .map(str::to_owned)
+                .or_else(|| (worktree.branch != "(detached)").then(|| worktree.branch.clone()))
+        })
+        // A checkout-less branch row under the cursor is just as
+        // deliberate a base choice as a selected worktree.
+        .or_else(|| app.selected_branch_row())
+}
+
 fn open_new_branch_base_picker(app: &mut App, project: nebula_core::ProjectId, name: String) {
+    let base = selected_base(app, &project);
     let Some((branches, root_branch)) = project_local_branches(app, &project) else {
         app.flash = Some("no local branches found".into());
         return;
     };
+    let hover = base
+        .and_then(|base| branches.iter().position(|b| b == &base))
+        .unwrap_or(0);
     let items: Vec<MenuItem> = branches
         .into_iter()
         .map(|base| MenuItem {
@@ -4396,7 +4418,7 @@ fn open_new_branch_base_picker(app: &mut App, project: nebula_core::ProjectId, n
             title: Some(format!("Base for {name}")),
             items,
             at: None,
-            hover: 0,
+            hover,
             area: ratatui::layout::Rect::default(),
             parent: None,
             filter: None,
@@ -6196,24 +6218,7 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
             } else {
                 branch
             };
-            // Branch from the worktree the user selected, not from the
-            // project's root checkout. Detached worktrees expose their HEAD
-            // as `detached @ <hash>`; Git accepts that hash as the base ref.
-            let base = app
-                .selected_worktree()
-                .filter(|worktree| worktree.project_id == project)
-                .and_then(|worktree| {
-                    worktree
-                        .branch
-                        .strip_prefix("detached @ ")
-                        .map(str::to_owned)
-                        .or_else(|| {
-                            (worktree.branch != "(detached)").then(|| worktree.branch.clone())
-                        })
-                })
-                // A checkout-less branch row under the cursor is just as
-                // deliberate a base choice as a selected worktree.
-                .or_else(|| app.selected_branch_row());
+            let base = selected_base(app, &project);
             // The name step chains into the base-branch picker: Enter on
             // the hovered default row recreates the old implicit choice,
             // typing fuzzy-picks any other local branch.
@@ -12558,6 +12563,58 @@ mod tests {
                     if branch == "my-feat" && base.as_deref() == Some("feature")
             ),
             "{out:?}"
+        );
+    }
+
+    /// `n` → Branch on a selected worktree hovers that worktree's branch,
+    /// like the worktree flow, so Enter-Enter branches from the row the
+    /// user picked rather than from the primary.
+    #[test]
+    fn branch_base_picker_hovers_the_selected_worktree() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo(&dir);
+        run_git(&repo, &["branch", "feature"]);
+        let mut app = App::new();
+        seed_repo_tree(&mut app, &repo);
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: nebula_core::Entity::Worktree(nebula_core::Worktree {
+                    id: nebula_core::WorktreeId("w2".into()),
+                    project_id: nebula_core::ProjectId("p1".into()),
+                    path: dir.path().join("feature"),
+                    branch: "feature".into(),
+                    is_main: false,
+                    created_from: Some("main".into()),
+                    pinned: false,
+                    for_branch: false,
+                    sort_order: 1,
+                }),
+            },
+        );
+        app.focus = Focus::Worktrees;
+        app.sel_worktree = app
+            .worktree_row_index(&nebula_core::WorktreeId("w2".into()))
+            .unwrap();
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        for c in "topic".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        {
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("expected the base picker, got {:?}", app.overlay);
+            };
+            assert_eq!(menu.title.as_deref(), Some("Base for topic"));
+            assert_eq!(menu.items[menu.hover].label, "feature (wt)");
+        }
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert_eq!(
+            app.flash.as_deref(),
+            Some("branch topic created from feature")
         );
     }
 
