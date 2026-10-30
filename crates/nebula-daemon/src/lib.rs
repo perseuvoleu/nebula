@@ -1,3 +1,4 @@
+mod checkout_lock;
 mod collect;
 pub mod config;
 pub mod git;

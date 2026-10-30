@@ -1,6 +1,7 @@
 //! The daemon's world: persisted entity tree + live PTY sessions, and the
 //! operations the IPC surface exposes over them.
 
+use crate::checkout_lock::CheckoutLocks;
 use crate::git;
 use crate::hooks::{self, HookEnv};
 use crate::pty::{PtyEvent, PtySession, SpawnSpec};
@@ -90,7 +91,7 @@ pub struct Daemon {
     /// a checkout is never adopted twice while its row is mid-insert.
     worktree_ops: tokio::sync::Mutex<()>,
     /// Orders physical checkout changes against session creation/resume.
-    checkout_execution: tokio::sync::RwLock<()>,
+    checkout_locks: CheckoutLocks,
     /// Makes a writer spawn's holder check and its row insert one step.
     writer_claims: tokio::sync::Mutex<()>,
     stop_deadline: Duration,
@@ -150,7 +151,7 @@ impl Daemon {
             events,
             shutdown: tokio_util::sync::CancellationToken::new(),
             worktree_ops: tokio::sync::Mutex::new(()),
-            checkout_execution: tokio::sync::RwLock::new(()),
+            checkout_locks: CheckoutLocks::default(),
             writer_claims: tokio::sync::Mutex::new(()),
             stop_deadline: overrides.stop_deadline,
             agent_cmd_override: overrides.agent_cmd,
@@ -1691,7 +1692,10 @@ impl Daemon {
         with_archived: bool,
     ) -> Result<RemovalReport> {
         let _ops = self.worktree_ops.lock().await;
-        let _execution = self.checkout_execution.write().await;
+        let _execution = self
+            .checkout_locks
+            .change(id, format!("removing checkout \"{branch}\""))
+            .await;
         let w = self
             .store
             .get_worktree(id)?
@@ -1754,7 +1758,6 @@ impl Daemon {
         with_archived: bool,
     ) -> Result<RemovalReport> {
         let _ops = self.worktree_ops.lock().await;
-        let _execution = self.checkout_execution.write().await;
         let project = self
             .store
             .get_project(project_id)?
@@ -1763,7 +1766,7 @@ impl Daemon {
             bail!("prune runs on the host that owns the checkouts; use the remote project's own nebula");
         }
         let entries = git::list_worktrees(&project.repo_path).await?;
-        let (_, worktrees, agents, terminals) = self.store.load_tree()?;
+        let (_, worktrees, _, _) = self.store.load_tree()?;
         let mut report = RemovalReport::default();
         for w in worktrees
             .iter()
@@ -1778,6 +1781,11 @@ impl Daemon {
                     git::Verdict::Refuse("checkout directory is gone but git still lists it; run `git worktree prune` first".into()));
                 continue;
             }
+            let _execution = self
+                .checkout_locks
+                .change(&w.id, format!("pruning checkout \"{}\"", w.branch))
+                .await;
+            let (_, _, agents, terminals) = self.store.load_tree()?;
             let (verdict, leftovers) =
                 self.removal_sessions(&w.id, &agents, &terminals, with_archived);
             let removable = matches!(verdict, git::Verdict::Pass(_));
@@ -1800,7 +1808,11 @@ impl Daemon {
 
     pub async fn delete_worktree(self: &Arc<Self>, id: &WorktreeId, force: bool) -> Result<()> {
         let _ops = self.worktree_ops.lock().await;
-        let _execution = self.checkout_execution.write().await;
+        let label = match self.store.get_worktree(id)? {
+            Some(w) => format!("removing checkout \"{}\"", w.branch),
+            None => "removing a checkout".to_owned(),
+        };
+        let _execution = self.checkout_locks.change(id, label).await;
         let worktree = self.store.get_worktree(id)?.context("worktree not found")?;
         if worktree.is_main {
             bail!("cannot delete the main checkout — remove the project instead");
@@ -1925,7 +1937,18 @@ impl Daemon {
         if branch.is_empty() {
             bail!("branch name is empty");
         }
-        let _execution = self.checkout_execution.write().await;
+        let primary_id = self
+            .store
+            .load_tree()?
+            .1
+            .into_iter()
+            .find(|w| w.project_id == *project_id && w.is_main)
+            .map(|w| w.id)
+            .context("primary checkout not found")?;
+        let _execution = self
+            .checkout_locks
+            .change(&primary_id, format!("switching primary to \"{branch}\""))
+            .await;
         let project = self
             .store
             .get_project(project_id)?
@@ -2078,8 +2101,19 @@ impl Daemon {
         removed
     }
 
-    async fn wait_for_checkout_switch(&self) {
-        drop(self.checkout_execution.read().await);
+    async fn wait_for_checkout_change(&self, sref: &SessionRef) {
+        let worktree = self.session_worktree(sref).or_else(|| {
+            let SessionRef::Agent(agent) = sref else {
+                return None;
+            };
+            let pool = self.prewarmed.lock().unwrap();
+            pool.iter()
+                .find(|(_, e)| &e.agent_id == agent)
+                .map(|((worktree, _), _)| worktree.clone())
+        });
+        if let Some(id) = worktree {
+            drop(self.checkout_locks.session(&id).await);
+        }
     }
 
     fn primary_occupants(
@@ -2388,7 +2422,7 @@ impl Daemon {
         writer: WriterClaim,
         spawned_by: Option<AgentId>,
     ) -> Result<EntityId> {
-        let _execution = self.checkout_execution.read().await;
+        let _execution = self.checkout_locks.session(worktree_id).await;
         let worktree = self
             .store
             .get_worktree(worktree_id)?
@@ -2504,7 +2538,7 @@ impl Daemon {
         model: Option<String>,
         effort: Option<String>,
     ) -> Result<()> {
-        let _execution = self.checkout_execution.read().await;
+        let _execution = self.checkout_locks.session(worktree_id).await;
         if !crate::config::Config::load().prewarm_agents {
             return Ok(());
         }
@@ -2786,9 +2820,8 @@ impl Daemon {
     /// `ensure_session`.
     pub fn move_agent(self: &Arc<Self>, id: &AgentId, worktree_id: &WorktreeId) -> Result<()> {
         let _execution = self
-            .checkout_execution
-            .try_read()
-            .map_err(|_| anyhow::anyhow!("checkout operation in progress; retry session action"))?;
+            .checkout_locks
+            .try_session(worktree_id, "retry session action")?;
         let agent = self.store.get_agent(id)?.context("agent not found")?;
         if &agent.worktree_id == worktree_id {
             return Ok(());
@@ -2835,9 +2868,8 @@ impl Daemon {
     /// interrupt a live conversation for nothing.
     fn move_agent_row(self: &Arc<Self>, id: &AgentId, worktree_id: &WorktreeId) -> Result<()> {
         let _execution = self
-            .checkout_execution
-            .try_read()
-            .map_err(|_| anyhow::anyhow!("checkout operation in progress; retry session action"))?;
+            .checkout_locks
+            .try_session(worktree_id, "retry session action")?;
         self.store.set_agent_worktree(id, worktree_id)?;
         // The process moved into another checkout: its chat now belongs
         // to that checkout's branch.
@@ -2883,10 +2915,6 @@ impl Daemon {
     /// a different worktree of the same project. `cwd` must already be
     /// canonicalized. The PTY is untouched — only the row moves.
     fn reparent_terminal_to_cwd(self: &Arc<Self>, id: &TerminalId, cwd: &Path) -> Result<()> {
-        let _execution = self
-            .checkout_execution
-            .try_read()
-            .map_err(|_| anyhow::anyhow!("checkout operation in progress; retry session action"))?;
         let Some(terminal) = self.store.get_terminal(id)? else {
             return Ok(());
         };
@@ -2897,6 +2925,12 @@ impl Daemon {
             return Ok(());
         };
         if target.id == terminal.worktree_id {
+            return Ok(());
+        }
+        let _execution = self
+            .checkout_locks
+            .try_session(&target.id, "retry session action")?;
+        if self.store.get_worktree(&target.id)?.is_none() {
             return Ok(());
         }
         tracing::info!(
@@ -3135,11 +3169,10 @@ impl Daemon {
     }
 
     pub fn restart_agent(self: &Arc<Self>, id: &AgentId) -> Result<()> {
-        let _execution = self
-            .checkout_execution
-            .try_read()
-            .map_err(|_| anyhow::anyhow!("checkout operation in progress; retry session action"))?;
         let agent = self.store.get_agent(id)?.context("agent not found")?;
+        let _execution = self
+            .checkout_locks
+            .try_session(&agent.worktree_id, "retry session action")?;
         if agent.archived {
             bail!("agent is archived — unarchive it first");
         }
@@ -3166,9 +3199,8 @@ impl Daemon {
         name: Option<String>,
     ) -> Result<EntityId> {
         let _execution = self
-            .checkout_execution
-            .try_read()
-            .map_err(|_| anyhow::anyhow!("checkout operation in progress; retry session action"))?;
+            .checkout_locks
+            .try_session(worktree_id, "retry session action")?;
         let worktree = self
             .store
             .get_worktree(worktree_id)?
@@ -3396,13 +3428,12 @@ impl Daemon {
         if let Some(s) = self.session(sref) {
             return Ok(s);
         }
-        let _execution = self
-            .checkout_execution
-            .try_read()
-            .map_err(|_| anyhow::anyhow!("checkout operation in progress; retry resume"))?;
         match sref {
             SessionRef::Agent(id) => {
                 let agent = self.store.get_agent(id)?.context("agent not found")?;
+                let _execution = self
+                    .checkout_locks
+                    .try_session(&agent.worktree_id, "retry resume")?;
                 if agent.archived {
                     bail!("agent is archived — unarchive it first");
                 }
@@ -3418,6 +3449,9 @@ impl Daemon {
             }
             SessionRef::Terminal(id) => {
                 let term = self.store.get_terminal(id)?.context("terminal not found")?;
+                let _execution = self
+                    .checkout_locks
+                    .try_session(&term.worktree_id, "retry resume")?;
                 let worktree = self
                     .store
                     .get_worktree(&term.worktree_id)?
@@ -3537,7 +3571,7 @@ impl Daemon {
                 Ok(Some(current)) if !current.archived => {}
                 _ => return,
             }
-            let Ok(_execution) = daemon.checkout_execution.try_read() else {
+            let Ok(_execution) = daemon.checkout_locks.try_session(&worktree.id, "") else {
                 return;
             };
             if daemon
@@ -3631,7 +3665,7 @@ impl Daemon {
                 match rx.recv().await {
                     Ok(PtyEvent::Exited { exit_code }) => {
                         if session.was_killed() {
-                            daemon.wait_for_checkout_switch().await;
+                            daemon.wait_for_checkout_change(&sref).await;
                         }
                         if !daemon.unregister_if_current(&sref, &session) {
                             break;
@@ -6288,6 +6322,97 @@ exec sleep 60
         assert!(
             !wt.path.join("node_modules").exists(),
             "dependency dirs stay out"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_worktree_delete_in_flight_blocks_only_its_own_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo = root.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-b", "main"]);
+        git_in(&repo, &["commit", "--allow-empty", "-q", "-m", "init"]);
+        let daemon = test_daemon();
+        let EntityId::Project(project) =
+            daemon.add_project(&repo, None, false, None).await.unwrap()
+        else {
+            panic!()
+        };
+        let EntityId::Worktree(primary) = daemon
+            .resolve_branch_checkout(&project, "main")
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        let EntityId::Worktree(doomed) = daemon
+            .create_worktree(&project, "doomed", None)
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        let doomed_path = daemon.store.get_worktree(&doomed).unwrap().unwrap().path;
+        // `git status` inside the doomed checkout parks on this fsmonitor hook
+        // until the test releases it: a slow delete, held mid-flight.
+        let started = root.join("started");
+        let release = root.join("release");
+        let hook = root.join("fsmonitor.sh");
+        std::fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\ntouch '{}'\nwhile [ ! -e '{}' ]; do sleep 0.05; done\nexit 1\n",
+                started.display(),
+                release.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        git_in(&repo, &["config", "extensions.worktreeConfig", "true"]);
+        git_in(
+            &doomed_path,
+            &[
+                "config",
+                "--worktree",
+                "core.fsmonitor",
+                &hook.to_string_lossy(),
+            ],
+        );
+        let deleting = {
+            let daemon = daemon.clone();
+            let (id, path) = (doomed.clone(), doomed_path.clone());
+            tokio::spawn(async move {
+                daemon
+                    .check_worktree_removal(&id, "doomed", &path, true, false)
+                    .await
+            })
+        };
+        let wait = Instant::now();
+        while !started.exists() {
+            assert!(
+                wait.elapsed() < Duration::from_secs(10),
+                "delete never reached git status"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let opened = daemon.create_terminal(&primary, Some("main"), None);
+        let refused = daemon.create_terminal(&doomed, None, None);
+        std::fs::write(&release, "").unwrap();
+        deleting.await.unwrap().unwrap();
+
+        let EntityId::Terminal(shell) =
+            opened.expect("a delete of another checkout must not block primary")
+        else {
+            panic!()
+        };
+        daemon.close_terminal(&shell).unwrap();
+        let err = refused.expect_err("the checkout being deleted takes no new session");
+        assert!(
+            err.to_string().contains("removing checkout \"doomed\""),
+            "the refusal names the operation: {err}"
         );
     }
 
