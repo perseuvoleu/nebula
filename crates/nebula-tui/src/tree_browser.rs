@@ -395,6 +395,40 @@ impl TreeBrowser {
     }
 }
 
+/// A capped, binary-guarded window of `path` that holds `line`: up to half
+/// the caps before it, the rest after. `Ok` carries the window's first line
+/// number; `Err` is the placeholder/error message to display.
+pub(crate) fn read_source_window(
+    source: &crate::git_diff::Source,
+    path: &str,
+    line: u64,
+) -> Result<(u64, String), String> {
+    use std::io::{BufRead, Read};
+    let err = |e: std::io::Error| format!("couldn't read file: {e}");
+    let mut reader = std::io::BufReader::new(source.open(path)?);
+    let mut before: std::collections::VecDeque<Vec<u8>> = Default::default();
+    let mut before_bytes = 0;
+    let mut first = 1;
+    for _ in 1..line {
+        let mut buf = Vec::new();
+        if reader.read_until(b'\n', &mut buf).map_err(err)? == 0 {
+            break;
+        }
+        before_bytes += buf.len();
+        before.push_back(buf);
+        while before.len() > MAX_PREVIEW_LINES / 2 || before_bytes > MAX_PREVIEW_BYTES / 2 {
+            before_bytes -= before.pop_front().map_or(0, |l| l.len());
+            first += 1;
+        }
+    }
+    let mut bytes: Vec<u8> = before.into_iter().flatten().collect();
+    reader
+        .take((MAX_PREVIEW_BYTES + 1 - bytes.len()) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(err)?;
+    preview_text(&bytes).map(|text| (first, text))
+}
+
 /// File contents for the preview pane, capped and binary-guarded. `Err` is
 /// the placeholder/error message to display (unhighlighted).
 pub(crate) fn read_preview(path: &std::path::Path) -> Result<String, String> {

@@ -4,16 +4,17 @@
 //! by the event loop when the setting changes.
 //!
 //! Presets stick to ANSI-16 and 256-color indexed values so they render
-//! everywhere. One exception: `focus_tint` needs a ~10%-opacity accent
+//! everywhere. Exceptions: `focus_tint` needs a ~10%-opacity accent
 //! shade that the 256 palette simply doesn't have (its darkest chromatic
-//! steps start around 40%), so it's truecolor RGB — supported by modern
+//! steps start around 40%), and `sumi` is a whole truecolor palette whose
+//! ink tones sit between 256-color grays. Truecolor is supported by modern
 //! terminals including Terminal.app since macOS Tahoe.
 
 use ratatui::style::Color;
 
 /// Names the settings overlay cycles through; `by_name` accepts them
 /// case-insensitively and falls back to the first entry.
-pub const THEMES: &[&str] = &["default", "ocean", "forest", "rose", "amber"];
+pub const THEMES: &[&str] = &["default", "ocean", "forest", "rose", "amber", "sumi"];
 
 /// Semantic color roles for the whole TUI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +66,14 @@ pub struct Theme {
     /// glance regardless of the accent — it is a fact about the session,
     /// not a look.
     pub remote: Color,
+    /// Backgrounds for the projects column, the worktrees column and the
+    /// terminal pane (plus footer). `Some` swaps the column rules for these
+    /// tones, so the panels separate by surface instead of by line.
+    pub surfaces: Option<[Color; 3]>,
+    /// Selection rows and the focused header chip get rounded Nerd Font
+    /// caps (U+E0B6/U+E0B4, bundled by Ghostty) instead of the `▌` rail
+    /// and half-block pads.
+    pub rounded: bool,
 }
 
 impl Default for Theme {
@@ -88,6 +97,8 @@ impl Default for Theme {
             err_sweep: [Color::Red, Color::Indexed(203), Color::Indexed(217)],
             focus_tint: Color::Rgb(4, 15, 16),
             remote: Color::Indexed(205), // hot pink
+            surfaces: None,
+            rounded: false,
         }
     }
 }
@@ -119,6 +130,41 @@ impl Theme {
                 special: Color::Indexed(173), // copper
                 focus_tint: Color::Rgb(19, 14, 4),
                 ..base
+            },
+            // kanagawa-paper ink tones (github.com/thesimonho/kanagawa-paper),
+            // picked from the prototype on branch prototype/tui-restyle.
+            "sumi" => Self {
+                accent: Color::Rgb(0x7a, 0xa8, 0x9f),     // waveAqua2
+                on_accent: Color::Rgb(0x16, 0x16, 0x1d),  // sumiInk0
+                text: Color::Rgb(0xdc, 0xd7, 0xba),       // fujiWhite
+                muted: Color::Rgb(0x9e, 0x9b, 0x93),      // dragonGray2
+                dim: Color::Rgb(0x54, 0x54, 0x6d),        // sumiInk6
+                ok: Color::Rgb(0x98, 0xbb, 0x6c),         // springGreen
+                warn: Color::Rgb(0xe6, 0xc3, 0x84),       // carpYellow
+                err: Color::Rgb(0xe4, 0x68, 0x76),        // waveRed
+                info: Color::Rgb(0x7f, 0xb4, 0xca),       // springBlue
+                special: Color::Rgb(0x95, 0x7f, 0xb8),    // oniViolet
+                sel_bg: Color::Rgb(0x2d, 0x4f, 0x67),     // waveBlue2
+                sel_bg_dim: Color::Rgb(0x22, 0x32, 0x49), // waveBlue1
+                edge: Color::Rgb(0x2a, 0x2a, 0x37),       // sumiInk4
+                warn_sweep: [
+                    Color::Rgb(0xe6, 0xc3, 0x84),
+                    Color::Rgb(0xef, 0xd3, 0x9f),
+                    Color::Rgb(0xf6, 0xe6, 0xc4),
+                ],
+                err_sweep: [
+                    Color::Rgb(0xe4, 0x68, 0x76),
+                    Color::Rgb(0xec, 0x8a, 0x95),
+                    Color::Rgb(0xf4, 0xb5, 0xbd),
+                ],
+                focus_tint: Color::Rgb(0x21, 0x26, 0x2b),
+                remote: Color::Rgb(0xd2, 0x7e, 0x99), // sakuraPink
+                surfaces: Some([
+                    Color::Rgb(0x16, 0x16, 0x1d), // sumiInk0
+                    Color::Rgb(0x1a, 0x1a, 0x22), // sumiInk2
+                    Color::Rgb(0x1f, 0x1f, 0x28), // sumiInk3
+                ]),
+                rounded: true,
             },
             _ => base,
         }

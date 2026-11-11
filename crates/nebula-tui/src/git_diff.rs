@@ -76,6 +76,20 @@ impl Source {
         Ok(bytes)
     }
 
+    /// A stream of `path`'s bytes; a revision's `git cat-file` is killed
+    /// when the stream drops.
+    pub fn open(&self, path: &str) -> Result<Box<dyn std::io::Read>, String> {
+        match self {
+            Source::Checkout(root) => std::fs::File::open(root.join(path))
+                .map(|f| Box::new(f) as Box<dyn std::io::Read>)
+                .map_err(|e| format!("couldn't read file: {e}")),
+            Source::Revision { repo, commit, .. } => Ok(Box::new(BlobStream(cat_blob(
+                repo,
+                &format!("{commit}:{path}"),
+            )?))),
+        }
+    }
+
     /// `(cwd, file)` for the editor. A checkout hands back its own
     /// directory, so the real file is edited. A revision streams the pinned
     /// blob into a fresh 0700 directory under `$TMPDIR/nebula-rev` that
@@ -157,6 +171,24 @@ fn cat_blob(root: &Path, object: &str) -> Result<std::process::Child, String> {
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("failed to run git: {e}"))
+}
+
+struct BlobStream(std::process::Child);
+
+impl std::io::Read for BlobStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self.0.stdout.as_mut() {
+            Some(out) => out.read(buf),
+            None => Ok(0),
+        }
+    }
+}
+
+impl Drop for BlobStream {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 fn read_blob(root: &Path, object: &str, max: usize) -> Result<Vec<u8>, String> {

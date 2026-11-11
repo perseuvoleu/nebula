@@ -262,6 +262,8 @@ pub enum PaletteCommand {
     /// Quit and re-exec the binary on disk in the same window — picks up
     /// a freshly `make install`ed build without closing anything.
     ReloadUi,
+    /// Select the project and focus its worktrees, as `/` does on a project.
+    GoToProject(ProjectId),
     SearchSessions,
     SearchEverything,
     GitDiff,
@@ -1455,6 +1457,23 @@ pub struct GrepView {
     /// Screen rect of the result rows (query row excluded), written back
     /// during draw so clicks can hit-test rows.
     pub list_area: Rect,
+    /// `query` parsed at the last search, for highlighting and the title.
+    pub parsed: crate::grep_search::GrepQuery,
+    /// The selected hit's file, syntax-highlighted, or one plain
+    /// placeholder line.
+    pub preview_lines: Vec<Vec<(crate::syntax::TokenKind, String)>>,
+    /// File line number of `preview_lines[0]`.
+    pub preview_first: u64,
+    /// Whether `preview_lines` is real file contents (earns the gutter).
+    pub preview_is_file: bool,
+    /// Top preview line once Shift+↑/↓ or Ctrl+d/u scrolled; `None` keeps
+    /// the hit a third of the way down.
+    pub scroll: Option<u16>,
+    /// Preview rows, written back during draw.
+    pub view_height: u16,
+    /// Inner rect of the preview pane, written back during draw; empty
+    /// when the overlay is too narrow for one.
+    pub preview_area: Rect,
 }
 
 impl GrepView {
@@ -1470,6 +1489,13 @@ impl GrepView {
             selected: 0,
             area: Rect::default(),
             list_area: Rect::default(),
+            parsed: Default::default(),
+            preview_lines: Vec::new(),
+            preview_first: 1,
+            preview_is_file: false,
+            scroll: None,
+            view_height: 0,
+            preview_area: Rect::default(),
         }
     }
 
@@ -1478,9 +1504,11 @@ impl GrepView {
     pub fn run_search(&mut self) {
         self.selected = 0;
         self.error = None;
+        self.parsed = crate::grep_search::GrepQuery::parse(&self.query);
         if self.query.chars().count() < crate::grep_search::MIN_QUERY_LEN {
             self.hits.clear();
             self.truncated = false;
+            self.load_preview();
             return;
         }
         match crate::grep_search::search(&self.source, &self.query) {
@@ -1494,6 +1522,51 @@ impl GrepView {
                 self.error = Some(msg);
             }
         }
+        self.load_preview();
+    }
+
+    fn load_preview(&mut self) {
+        self.scroll = None;
+        let Some((path, line)) = self.selected_hit().map(|h| (h.path.clone(), h.line)) else {
+            self.preview_lines.clear();
+            return;
+        };
+        let (first, text, is_file) =
+            match crate::tree_browser::read_source_window(&self.source, &path, line) {
+                Ok((first, text)) => (first, text, true),
+                Err(msg) => (1, msg, false),
+            };
+        let mut hl = if is_file {
+            crate::syntax::Highlighter::for_path(&path)
+        } else {
+            crate::syntax::Highlighter::plain()
+        };
+        self.preview_lines = text.lines().map(|l| hl.line(l)).collect();
+        self.preview_first = first;
+        self.preview_is_file = is_file;
+    }
+
+    /// Top visible preview line in a pane `height` rows tall: the scrolled
+    /// position, or the hit line a third of the way down.
+    pub fn preview_top(&self, height: u16) -> u16 {
+        let height = height.max(1);
+        let max = (self.preview_lines.len() as u16).saturating_sub(height);
+        let follow = || {
+            self.selected_hit().map_or(0, |h| {
+                let line = h
+                    .line
+                    .saturating_sub(self.preview_first)
+                    .min(u16::MAX as u64) as u16;
+                line.saturating_sub(height / 3)
+            })
+        };
+        self.scroll.unwrap_or_else(follow).min(max)
+    }
+
+    pub fn scroll_preview(&mut self, delta: i32) {
+        let max = (self.preview_lines.len() as i32 - self.view_height.max(1) as i32).max(0);
+        self.scroll =
+            Some((self.preview_top(self.view_height) as i32 + delta).clamp(0, max) as u16);
     }
 
     /// First visible row of the result list's stateless follow-window for a
@@ -1506,6 +1579,7 @@ impl GrepView {
     pub fn select(&mut self, index: i64) {
         let max = self.hits.len().saturating_sub(1) as i64;
         self.selected = index.clamp(0, max) as usize;
+        self.load_preview();
     }
 
     /// The hit behind the current selection, if any row is visible.

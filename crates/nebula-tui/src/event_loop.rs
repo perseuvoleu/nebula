@@ -1345,6 +1345,14 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                     select_session_tab(app, action.tab_index().unwrap(), out);
                     return;
                 }
+                Some(crate::keymap::Action::PrevTab) => {
+                    step_session_tab(app, false, out);
+                    return;
+                }
+                Some(crate::keymap::Action::NextTab) => {
+                    step_session_tab(app, true, out);
+                    return;
+                }
                 Some(crate::keymap::Action::ToggleTerminalFullscreen) => {
                     toggle_terminal_fullscreen(app);
                     return;
@@ -1508,6 +1516,8 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
             let idx = action.tab_index().expect("SelectTabN carries an index");
             select_session_tab(app, idx, out);
         }
+        Action::PrevTab => step_session_tab(app, false, out),
+        Action::NextTab => step_session_tab(app, true, out),
         Action::FocusNext => {
             app.focus = match app.focus {
                 Focus::Projects => Focus::Worktrees,
@@ -3123,6 +3133,25 @@ fn select_session_tab(app: &mut App, idx: usize, out: &mut Vec<ClientRequest>) {
     }
 }
 
+/// ⌘← / ⌘→: the neighbouring tab of the attached session (or of the
+/// selection when nothing is attached), wrapping round the tab bar.
+fn step_session_tab(app: &mut App, forward: bool, out: &mut Vec<ClientRequest>) {
+    let rows = app.visible_session_rows();
+    if rows.is_empty() {
+        return;
+    }
+    let attached = app.term.as_ref().map(|t| &t.sref);
+    let current = attached
+        .and_then(|sref| rows.iter().position(|r| r.sref().as_ref() == Some(sref)))
+        .unwrap_or(app.sel_session.min(rows.len() - 1));
+    let idx = if forward {
+        (current + 1) % rows.len()
+    } else {
+        (current + rows.len() - 1) % rows.len()
+    };
+    select_session_tab(app, idx, out);
+}
+
 /// ⌘T: ask what the new tab runs — Claude, Codex, Pi or a plain shell —
 /// and create it in the current worktree. The shell row starts hovered, so
 /// ⌘T-Enter is still "give me a terminal", and no row stops for a name
@@ -4011,6 +4040,16 @@ fn open_command_palette(app: &mut App) {
         "r · Reload nebula",
         MenuAction::Command(PaletteCommand::ReloadUi),
     ));
+    // The name is the alias, so typing it exactly pins the row on top.
+    for r in app.project_rows() {
+        if let ProjectRow::Project(i) = r {
+            let p = &app.tree.projects[i];
+            items.push(row(
+                &format!("{} · Go to project", p.name),
+                MenuAction::Command(PaletteCommand::GoToProject(p.id.clone())),
+            ));
+        }
+    }
     app.overlay = Some(Overlay::Menu(
         ContextMenu {
             title: Some("Commands".into()),
@@ -5363,6 +5402,8 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
         }
         Overlay::Grep(view) => {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+            let half = (view.view_height / 2).max(1) as i32;
             match key.code {
                 // Two-stage escape: an active query is cleared before the
                 // second Esc closes the overlay.
@@ -5371,6 +5412,10 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                     view.run_search();
                 }
                 KeyCode::Esc => app.overlay = None,
+                KeyCode::Down if shift => view.scroll_preview(1),
+                KeyCode::Up if shift => view.scroll_preview(-1),
+                KeyCode::Char('d') if ctrl => view.scroll_preview(half),
+                KeyCode::Char('u') if ctrl && !view.hits.is_empty() => view.scroll_preview(-half),
                 // j/k stay typeable in the query; Ctrl+n/p mirror ↑/↓.
                 KeyCode::Down => view.select(view.selected as i64 + 1),
                 KeyCode::Up => view.select(view.selected as i64 - 1),
@@ -6781,6 +6826,9 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                         &app.tree,
                         app.show_archived,
                     )));
+                }
+                PaletteCommand::GoToProject(id) => {
+                    jump_to_target(app, PaletteTarget::Project(id), false, out)
                 }
                 PaletteCommand::SearchEverything => {
                     app.overlay = Some(Overlay::Palette(Palette::new(
@@ -17215,6 +17263,54 @@ mod tests {
         assert_eq!(app.focus, Focus::Terminal);
     }
 
+    #[test]
+    fn cmd_arrows_step_through_session_tabs() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        hse(
+            &mut app,
+            ServerEvent::EntityUpserted {
+                entity: nebula_core::Entity::Terminal(nebula_core::TerminalTab {
+                    id: nebula_core::TerminalId("t1".into()),
+                    worktree_id: nebula_core::WorktreeId("w1".into()),
+                    name: "term-1".into(),
+                    sort_order: 0,
+                    alive: true,
+                    branch: None,
+                    busy: false,
+                    status: None,
+                    status_changed_at: 0,
+                }),
+            },
+        );
+        let mut out = Vec::new();
+        assert_eq!(app.visible_session_rows().len(), 2);
+
+        attach(&mut app, SessionRef::Agent(AgentId("a1".into())), &mut out);
+        app.focus = Focus::Terminal;
+        app.term_locked = true;
+        press(&mut app, KeyCode::Right, KeyModifiers::SUPER, &mut out);
+        assert_eq!(app.sel_session, 1, "⌘→ moves to the next tab");
+        assert_eq!(app.focus, Focus::Terminal, "⌘→ stays in the pane");
+        assert!(app.term_locked, "⌘→ keeps the input lock");
+
+        press(&mut app, KeyCode::Right, KeyModifiers::SUPER, &mut out);
+        assert_eq!(app.sel_session, 0, "⌘→ on the last tab wraps to the first");
+
+        press(&mut app, KeyCode::Left, KeyModifiers::SUPER, &mut out);
+        assert_eq!(app.sel_session, 1, "⌘← on the first tab wraps to the last");
+        assert!(app.term_locked);
+
+        app.term_locked = false;
+        app.focus = Focus::Worktrees;
+        press(&mut app, KeyCode::Left, KeyModifiers::SUPER, &mut out);
+        assert_eq!(
+            app.sel_session, 0,
+            "⌘← from the panels selects the previous tab"
+        );
+        assert_eq!(app.focus, Focus::Sessions);
+    }
+
     /// The Projects column's bottom half lists every project's live
     /// sessions (workspace-scoped), working rows first, each with
     /// `project · how long ago` under it; clicking a row jumps to that
@@ -19751,6 +19847,29 @@ mod tests {
             app.overlay
         );
         assert!(out.is_empty(), "opening the palette sends nothing");
+    }
+
+    #[test]
+    fn command_palette_jumps_to_a_project_by_name() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        let mut out = Vec::new();
+        app.focus = Focus::Sessions;
+        press(&mut app, KeyCode::Char('k'), KeyModifiers::SUPER, &mut out);
+        for c in "demo".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        let Some(Overlay::Menu(menu)) = &app.overlay else {
+            panic!("expected the command palette, got {:?}", app.overlay);
+        };
+        assert_eq!(menu.items[menu.hover].label, "demo · Go to project");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(app.overlay.is_none(), "{:?}", app.overlay);
+        assert_eq!(
+            app.selected_project().map(|p| p.name.as_str()),
+            Some("demo")
+        );
+        assert_eq!(app.focus, Focus::Worktrees);
     }
 
     #[test]
@@ -24365,6 +24484,260 @@ mod tests {
         );
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
         assert!(app.overlay.is_none(), "second Esc closes the overlay");
+    }
+
+    fn grep_preview_app(dir: &tempfile::TempDir) -> App {
+        let repo = test_repo(dir);
+        let long: String = (1..=100)
+            .map(|i| {
+                if i == 30 {
+                    "line 30 beta alpha\n".to_string()
+                } else {
+                    format!("line {i:02}\n")
+                }
+            })
+            .collect();
+        std::fs::write(repo.join("long.rs"), long).unwrap();
+        std::fs::write(repo.join("short.txt"), "zero\nalpha and beta\n").unwrap();
+        let mut app = App::new();
+        seed_repo_tree(&mut app, &repo);
+        app
+    }
+
+    fn type_grep_query(app: &mut App, terminal: &mut Terminal<TestBackend>, query: &str) {
+        let mut out = Vec::new();
+        press(app, KeyCode::Char('F'), KeyModifiers::SHIFT, &mut out);
+        terminal.draw(|f| ui::draw(f, app)).unwrap();
+        for c in query.chars() {
+            press(app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
+        }
+        terminal.draw(|f| ui::draw(f, app)).unwrap();
+    }
+
+    fn preview_top_line(terminal: &Terminal<TestBackend>, app: &App) -> u64 {
+        let area = grep_view(app).preview_area;
+        let buffer = terminal.backend().buffer();
+        let row: String = (area.x..area.x + area.width)
+            .map(|x| buffer[(x, area.y)].symbol())
+            .collect();
+        row.split_whitespace()
+            .next()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("no gutter on the preview's top row: {row:?}"))
+    }
+
+    #[test]
+    fn grep_preview_shows_the_selected_hit_and_follows_the_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = grep_preview_app(&dir);
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        type_grep_query(&mut app, &mut terminal, "alpha beta");
+        let hits: Vec<(String, u64)> = grep_view(&app)
+            .hits
+            .iter()
+            .map(|h| (h.path.clone(), h.line))
+            .collect();
+        assert_eq!(
+            hits,
+            vec![("long.rs".to_string(), 30), ("short.txt".to_string(), 2)]
+        );
+
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("30 line 30 beta alpha"),
+            "hit line in preview:\n{text}"
+        );
+        assert!(
+            !text.contains("line 01"),
+            "preview scrolled to the hit:\n{text}"
+        );
+        let (hit_x, hit_y) = find_cell(&terminal, "30 line 30 beta alpha");
+        let area = grep_view(&app).preview_area;
+        assert!(
+            hit_y > area.y && hit_y - area.y <= area.height / 2,
+            "hit line sits in the upper part of the preview: y={hit_y} area={area:?}"
+        );
+        let buffer = terminal.backend().buffer();
+        let th = app.theme;
+        assert_eq!(
+            buffer[(hit_x + 3, hit_y)].bg,
+            th.sel_bg_dim,
+            "the hit line is marked"
+        );
+        let alpha_x = hit_x + 3 + "line 30 beta ".len() as u16;
+        assert_eq!(buffer[(alpha_x, hit_y)].symbol(), "a");
+        assert!(
+            buffer[(alpha_x, hit_y)]
+                .modifier
+                .contains(ratatui::style::Modifier::BOLD),
+            "query words are lit inside the preview"
+        );
+
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains(" 1 zero"),
+            "preview follows to short.txt:\n{text}"
+        );
+        assert!(text.contains(" 2 alpha and beta"), "{text}");
+        assert!(!text.contains("30 line 30 beta alpha"), "{text}");
+    }
+
+    #[test]
+    fn grep_preview_scrolls_without_moving_the_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = grep_preview_app(&dir);
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        type_grep_query(&mut app, &mut terminal, "alpha beta");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.vim_tx = Some(tx);
+        if let Some(Overlay::Grep(v)) = &mut app.overlay {
+            v.editor = "/bin/sh".into();
+        }
+        let mut out = Vec::new();
+        let top = preview_top_line(&terminal, &app);
+
+        press(&mut app, KeyCode::Down, KeyModifiers::SHIFT, &mut out);
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert_eq!(
+            preview_top_line(&terminal, &app),
+            top + 1,
+            "Shift+↓ scrolls one line"
+        );
+        assert_eq!(grep_view(&app).selected, 0, "selection stays");
+
+        press(&mut app, KeyCode::Up, KeyModifiers::SHIFT, &mut out);
+        press(&mut app, KeyCode::Up, KeyModifiers::SHIFT, &mut out);
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert_eq!(
+            preview_top_line(&terminal, &app),
+            top - 1,
+            "Shift+↑ scrolls back"
+        );
+
+        press(
+            &mut app,
+            KeyCode::Char('u'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(
+            preview_top_line(&terminal, &app) < top - 1,
+            "Ctrl+u pages up"
+        );
+        assert_eq!(
+            grep_view(&app).query,
+            "alpha beta",
+            "Ctrl+u keeps the query"
+        );
+        let paged_up = preview_top_line(&terminal, &app);
+        press(
+            &mut app,
+            KeyCode::Char('d'),
+            KeyModifiers::CONTROL,
+            &mut out,
+        );
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert!(
+            preview_top_line(&terminal, &app) > paged_up,
+            "Ctrl+d pages down"
+        );
+        assert_eq!(grep_view(&app).selected, 0, "selection stays");
+
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        let vim = app.vim.as_ref().expect("Enter spawns the editor");
+        assert_eq!(vim.title, "long.rs:30", "the editor opens at the hit line");
+    }
+
+    #[test]
+    fn grep_preview_reaches_a_hit_past_the_preview_caps() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo(&dir);
+        let filler = "x".repeat(200);
+        let big: String = (1..=12_000)
+            .map(|i| {
+                if i == 11_500 {
+                    "needle here\n".to_string()
+                } else {
+                    format!("{filler}\n")
+                }
+            })
+            .collect();
+        assert!(big.len() > 2 * 1024 * 1024);
+        std::fs::write(repo.join("big.rs"), big).unwrap();
+        let mut app = App::new();
+        seed_repo_tree(&mut app, &repo);
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        type_grep_query(&mut app, &mut terminal, "needle");
+        assert_eq!(grep_view(&app).selected_hit().map(|h| h.line), Some(11_500));
+
+        let (hit_x, hit_y) = find_cell(&terminal, "11500 needle here");
+        assert_eq!(
+            terminal.backend().buffer()[(hit_x + 6, hit_y)].bg,
+            app.theme.sel_bg_dim,
+            "the hit line is marked"
+        );
+        let top = preview_top_line(&terminal, &app);
+        assert!(
+            (11_480..11_500).contains(&top),
+            "gutter keeps absolute line numbers: top={top}"
+        );
+    }
+
+    #[test]
+    fn grep_preview_follows_a_hit_past_the_first_window_of_the_same_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = test_repo(&dir);
+        let big: String = (1..=12_000)
+            .map(|i| {
+                if i == 1 || i == 10_001 {
+                    format!("needle {i}\n")
+                } else {
+                    format!("line {i}\n")
+                }
+            })
+            .collect();
+        std::fs::write(repo.join("big.rs"), big).unwrap();
+        let mut app = App::new();
+        seed_repo_tree(&mut app, &repo);
+        let mut terminal = Terminal::new(TestBackend::new(160, 40)).unwrap();
+        type_grep_query(&mut app, &mut terminal, "needle");
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE, &mut out);
+        terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
+        assert_eq!(grep_view(&app).selected_hit().map(|h| h.line), Some(10_001));
+
+        let text = buffer_text(&terminal);
+        assert!(
+            !text.contains("(truncated)"),
+            "the truncation marker is not shown as the hit:\n{text}"
+        );
+        let (hit_x, hit_y) = find_cell(&terminal, "10001 needle 10001");
+        assert_eq!(
+            terminal.backend().buffer()[(hit_x + 6, hit_y)].bg,
+            app.theme.sel_bg_dim,
+            "the hit line is marked"
+        );
+    }
+
+    #[test]
+    fn narrow_grep_overlay_drops_the_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = grep_preview_app(&dir);
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        type_grep_query(&mut app, &mut terminal, "alpha beta");
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("long.rs:30"),
+            "the list still renders:\n{text}"
+        );
+        assert!(!text.contains("30 line 30"), "no preview pane:\n{text}");
+
+        let mut tiny = Terminal::new(TestBackend::new(12, 5)).unwrap();
+        tiny.draw(|f| ui::draw(f, &mut app)).unwrap();
     }
 
     #[test]

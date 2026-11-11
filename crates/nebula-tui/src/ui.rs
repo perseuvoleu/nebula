@@ -64,6 +64,7 @@ pub const VIM_MODAL_PCT: (u16, u16) = (94, 92);
 /// Columns the tree-browser preview must keep for the file text itself
 /// before a line-number gutter is worth drawing.
 const MIN_PREVIEW_TEXT_W: usize = 16;
+const GREP_PREVIEW_MIN_W: u16 = 100;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     app.hits.clear();
@@ -79,6 +80,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             draw_focus_tint(f.buffer_mut(), body, app.theme);
         }
         draw_footer(f, app, footer);
+        if let Some([s1, _, s3]) = app.theme.surfaces {
+            fill_unpainted(f.buffer_mut(), body, s3);
+            fill_unpainted(f.buffer_mut(), footer, s1);
+        }
         draw_quick_terminal(f, app);
         draw_overlay(f, app);
         draw_vim(f, app);
@@ -139,6 +144,14 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_focus_tint(f.buffer_mut(), tinted, app.theme);
     }
     draw_footer(f, app, footer);
+    // Overlays come later and keep the terminal's own background.
+    if let Some([s1, s2, s3]) = app.theme.surfaces {
+        let buf = f.buffer_mut();
+        fill_unpainted(buf, projects_a, s1);
+        fill_unpainted(buf, worktrees_a, s2);
+        fill_unpainted(buf, term_a, s3);
+        fill_unpainted(buf, footer, s1);
+    }
     // The ⌘T floating terminal sits above the panels but below overlays
     // (a confirm or palette opened from inside it must stay visible) and
     // below the editor modal.
@@ -1744,6 +1757,11 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     view.hits.len()
                 )
             };
+            let title = if view.parsed.paths.is_empty() {
+                title
+            } else {
+                format!("{title}in {} ", view.parsed.paths.join(" "))
+            };
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
@@ -1760,10 +1778,18 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 let line = search_line(&view.query, "type to search…", query_area, th);
                 f.render_widget(Paragraph::new(line), query_area);
             }
-            let list_inner = Rect {
+            let body = Rect {
                 y: inner.y + 1,
                 height: inner.height.saturating_sub(1),
                 ..inner
+            };
+            let (list_inner, preview_outer) = if body.width >= GREP_PREVIEW_MIN_W {
+                let [list, preview] =
+                    Layout::horizontal([Constraint::Percentage(40), Constraint::Min(0)])
+                        .areas(body);
+                (list, Some(preview))
+            } else {
+                (body, None)
             };
 
             // Placeholder row: error, too-short query, or an empty result.
@@ -1803,9 +1829,77 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 } else {
                     spans.push(Span::styled(loc, Style::default().fg(th.accent)));
                     spans.push(Span::raw("  "));
-                    spans.push(Span::raw(truncate(&hit.text, budget - loc_len - 2)));
+                    let shown = truncate(&hit.text, budget - loc_len - 2);
+                    let shown_len = shown.chars().count();
+                    let clipped = shown_len < hit.text.chars().count();
+                    let positions: Vec<usize> = view
+                        .parsed
+                        .match_positions(&hit.text)
+                        .into_iter()
+                        .filter(|&p| !clipped || p + 1 < shown_len)
+                        .collect();
+                    spans.extend(fuzzy_highlight_spans(&shown, &positions, th));
                 }
                 render_row(f, row_area, spans, i == view.selected, true, th);
+            }
+
+            let mut preview_inner = Rect::default();
+            if let Some(outer) = preview_outer {
+                let block = Block::default()
+                    .borders(Borders::LEFT)
+                    .border_style(Style::default().fg(th.edge));
+                preview_inner = block.inner(outer);
+                f.render_widget(block, outer);
+                let top = view.preview_top(preview_inner.height);
+                let first = view.preview_first as usize;
+                let hit_line = view.selected_hit().map(|h| h.line as usize);
+                let num_w = (first + view.preview_lines.len()).to_string().len().max(2);
+                let lit = Style::default().fg(th.accent).add_modifier(Modifier::BOLD);
+                let lines: Vec<Line> = view
+                    .preview_lines
+                    .iter()
+                    .enumerate()
+                    .skip(top as usize)
+                    .take(preview_inner.height as usize)
+                    .map(|(i, runs)| {
+                        let mut spans = Vec::with_capacity(runs.len() + 1);
+                        if view.preview_is_file {
+                            spans.push(Span::styled(
+                                format!("{:>num_w$} ", first + i),
+                                Style::default().fg(th.edge),
+                            ));
+                        }
+                        let text: String = runs.iter().map(|(_, t)| t.as_str()).collect();
+                        let positions = view.parsed.match_positions(&text);
+                        let chars = runs
+                            .iter()
+                            .flat_map(|(kind, run)| run.chars().map(move |c| (*kind, c)));
+                        let mut cur = (Style::default(), String::new());
+                        for (at, (kind, c)) in chars.enumerate() {
+                            let style = if positions.binary_search(&at).is_ok() {
+                                lit
+                            } else {
+                                token_style(kind, th)
+                            };
+                            if style != cur.0 && !cur.1.is_empty() {
+                                let (style, text) = std::mem::take(&mut cur);
+                                spans.push(Span::styled(text, style));
+                            }
+                            cur.0 = style;
+                            cur.1.push(c);
+                        }
+                        if !cur.1.is_empty() {
+                            spans.push(Span::styled(cur.1, cur.0));
+                        }
+                        let line = Line::from(spans);
+                        if view.preview_is_file && hit_line == Some(first + i) {
+                            line.style(Style::default().bg(th.sel_bg_dim))
+                        } else {
+                            line
+                        }
+                    })
+                    .collect();
+                f.render_widget(Paragraph::new(lines), preview_inner);
             }
 
             // Write-back (draw works on a clone): rects for mouse
@@ -1813,6 +1907,8 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             if let Some(Overlay::Grep(v)) = &mut app.overlay {
                 v.area = area;
                 v.list_area = list_inner;
+                v.preview_area = preview_inner;
+                v.view_height = preview_inner.height;
             }
         }
         Overlay::Hosts(view) => {
@@ -2714,15 +2810,68 @@ fn draw_splitter_grips(buf: &mut ratatui::buffer::Buffer, app: &App, body: Rect)
 }
 
 fn draw_focus_tint(buf: &mut ratatui::buffer::Buffer, area: Rect, th: Theme) {
+    fill_unpainted(buf, area, th.focus_tint);
+}
+
+/// Give every cell of `area` still on the terminal's default background
+/// the color `bg`; cells something already painted keep their fill.
+fn fill_unpainted(buf: &mut ratatui::buffer::Buffer, area: Rect, bg: Color) {
     for y in area.y..area.y + area.height {
         for x in area.x..area.x + area.width {
             if let Some(cell) = buf.cell_mut((x, y)) {
                 if cell.bg == Color::Reset {
-                    cell.bg = th.focus_tint;
+                    cell.bg = bg;
                 }
             }
         }
     }
+}
+
+/// A one-row selection with `ROUND_CAPS` at both ends: the caps take the
+/// fill as foreground over the column's background, the cells between
+/// carry `style` (whose background is the fill).
+fn render_rounded_row(f: &mut Frame, area: Rect, spans: Vec<Span>, style: Style, fill: Color) {
+    if area.width < 2 {
+        return;
+    }
+    let cap = |sym: &'static str| Paragraph::new(Span::styled(sym, Style::default().fg(fill)));
+    f.render_widget(cap(ROUND_CAPS.0), Rect { width: 1, ..area });
+    f.render_widget(
+        cap(ROUND_CAPS.1),
+        Rect {
+            x: area.x + area.width - 1,
+            width: 1,
+            ..area
+        },
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).style(style),
+        Rect {
+            x: area.x + 1,
+            width: area.width - 2,
+            ..area
+        },
+    );
+}
+
+/// The focused panel's header: an accent chip with rounded caps under
+/// `Theme::rounded`, otherwise plain `style` text.
+fn header_spans(title: String, focused: bool, style: Style, th: Theme) -> Vec<Span<'static>> {
+    if !(focused && th.rounded) {
+        return vec![Span::styled(title, style)];
+    }
+    let cap = |sym: &'static str| Span::styled(sym, Style::default().fg(th.accent));
+    vec![
+        cap(ROUND_CAPS.0),
+        Span::styled(
+            title,
+            Style::default()
+                .fg(th.on_accent)
+                .bg(th.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        cap(ROUND_CAPS.1),
+    ]
 }
 
 /// Bordered panel frame: rounded corners everywhere for a softer, modern
@@ -2943,6 +3092,11 @@ fn render_button(
             }
         }
     }
+    if selected && th.rounded && area.height == 1 {
+        let fill = if focused { th.sel_bg } else { th.sel_bg_dim };
+        render_rounded_row(f, area, spans, row_bar(selected, focused, th), fill);
+        return;
+    }
     let marker = || {
         if selected && focused {
             Span::styled("▌", Style::default().fg(th.accent))
@@ -2982,9 +3136,12 @@ fn draw_column(
     focused: bool,
     th: Theme,
 ) -> Rect {
-    let block = Block::default()
+    let mut block = Block::default()
         .borders(Borders::RIGHT)
         .border_style(Style::default().fg(th.edge));
+    if th.surfaces.is_some() {
+        block = block.border_set(ratatui::symbols::border::EMPTY);
+    }
     let inner = block.inner(area);
     f.render_widget(block, area);
     let header_style = if focused {
@@ -3005,7 +3162,14 @@ fn draw_column(
         while !gutter.is_empty() && gutter.len() + title.len() > r.width as usize {
             gutter = &gutter[..gutter.len() - 1];
         }
-        let mut spans = vec![Span::styled(format!("{gutter}{title}"), header_style)];
+        let mut spans = if focused && th.rounded && !gutter.is_empty() {
+            let lead = Span::raw(gutter[1..].to_string());
+            let mut chip = header_spans(title.to_string(), true, header_style, th);
+            chip.insert(0, lead);
+            chip
+        } else {
+            vec![Span::styled(format!("{gutter}{title}"), header_style)]
+        };
         if let Some(n) = count {
             let label = format!(" · {n}");
             if gutter.len() + title.len() + label.chars().count() <= r.width as usize {
@@ -3017,7 +3181,7 @@ fn draw_column(
     // The thin rule under the header — the terminal pane's `terminal_rule`
     // on the same screen row, so the three sections share one continuous
     // frame line and the focused one lights up in accent.
-    if let Some(r) = row_rect(inner, 3) {
+    if let Some(r) = row_rect(inner, 3).filter(|_| th.surfaces.is_none()) {
         let rule_style = if focused {
             Style::default().fg(th.accent)
         } else {
@@ -3056,6 +3220,9 @@ const PILL_HALF: (char, char) = ('▄', '▀');
 /// of each `PILL_HALF` glyph — so the rail runs the pill's full visual
 /// height instead of stopping at the text row.
 const PILL_RAIL_CAPS: (char, char) = ('▖', '▘');
+/// Nerd Font half-circle caps for `Theme::rounded`: drawn in the fill
+/// color on the column's own background, they round off a selection row.
+const ROUND_CAPS: (&str, &str) = ("\u{e0b6}", "\u{e0b4}");
 
 /// First list entry to render so the selected one stays fully visible:
 /// skip leading entries while the heights from the first rendered entry
@@ -3104,6 +3271,10 @@ fn render_pill(
             }
         }
         let fill = if focused { th.sel_bg } else { th.sel_bg_dim };
+        if th.rounded {
+            render_rounded_row(f, text_area, spans, row_bar(selected, focused, th), fill);
+            return;
+        }
         let rail = if focused { th.accent } else { th.dim };
         let mut pad = |glyph: char, cap: char, row: isize| {
             if let Some(r) = row_rect_at(inner, row) {
@@ -4155,7 +4326,13 @@ fn terminal_frame(
     // Row 0 is a blank spacer so the header sits on the same screen row
     // as the sidebar column titles (`draw_column` does the same).
     if let Some(r) = row_rect(area, 1) {
-        let mut spans = vec![Span::styled("  TERMINAL".to_string(), header_style)];
+        let mut spans = if focused && th.rounded {
+            let mut chip = header_spans("TERMINAL".into(), true, header_style, th);
+            chip.insert(0, Span::raw(" "));
+            chip
+        } else {
+            vec![Span::styled("  TERMINAL".to_string(), header_style)]
+        };
         spans.extend(left);
         f.render_widget(Paragraph::new(Line::from(spans)), r);
         if let Some(tag) = right {
@@ -4957,7 +5134,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     } else if let Some(Overlay::Grep(view)) = &app.overlay {
         Span::styled(
             format!(
-                "type: search  ↑/↓: move  Enter: edit in {}  Ctrl+u: clear  Esc: clear/close",
+                "word word  path  ↑/↓: move  ⇧↑/↓ Ctrl+d/u: preview  Enter: {}  Esc: clear/close",
                 editor_name(&view.editor)
             ),
             Style::default().fg(th.dim),
@@ -5799,6 +5976,37 @@ mod tests {
         assert_eq!(bg(4, 1), Color::Reset, "right of the panel");
         assert_eq!(bg(1, 0), Color::Reset, "above the panel");
         assert_eq!(bg(1, 5), Color::Reset, "below the panel");
+    }
+
+    /// A theme with surfaces separates the three panels by tone: no rule
+    /// glyph between them, each panel on its own background, and the
+    /// selected project row wrapped in rounded caps.
+    #[test]
+    fn surface_theme_paints_panels_and_rounds_the_selection() {
+        let mut app = host_project_app(&[None]);
+        app.theme = Theme::by_name("sumi");
+        let [s1, s2, s3] = app.theme.surfaces.unwrap();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 35)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let (r1, r2) = (app.splitter_x(0) - 1, app.splitter_x(1) - 1);
+        let row = 20;
+        assert_eq!(buf.cell((1, row)).unwrap().bg, s1, "projects column");
+        assert_eq!(buf.cell((r1 + 2, row)).unwrap().bg, s2, "worktrees column");
+        assert_eq!(buf.cell((r2 + 3, row)).unwrap().bg, s3, "terminal pane");
+        for x in [r1, r2] {
+            assert_eq!(buf.cell((x, 5)).unwrap().symbol(), " ", "rule at x={x}");
+        }
+        let caps = (0..35)
+            .find(|&y| buf.cell((0, y)).unwrap().symbol() == ROUND_CAPS.0)
+            .expect("a left cap on the selected project row");
+        let right = (1..r1)
+            .map(|x| buf.cell((x, caps)).unwrap())
+            .find(|c| c.symbol() == ROUND_CAPS.1)
+            .expect("a right cap on the same row");
+        assert_eq!(right.fg, app.theme.sel_bg, "focused panel fill");
+        assert_eq!(right.bg, s1, "the cap's corner shows the column tone");
     }
 
     /// Each grip sits on its rule column (one left of the boundary), three
