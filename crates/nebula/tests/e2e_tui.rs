@@ -1188,7 +1188,11 @@ fn open_session_attaches_it_in_the_running_tui() {
 fn open_session_fails_when_the_attach_fails() {
     let bin = tempfile::tempdir().unwrap();
     let agent_cmd = bin.path().join("agent");
-    std::fs::write(&agent_cmd, "#!/bin/sh\nexec /bin/sh \"$@\"\n").unwrap();
+    std::fs::write(
+        &agent_cmd,
+        "#!/bin/sh\necho stand-in started\nexec /bin/sh \"$@\"\n",
+    )
+    .unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&agent_cmd, std::fs::Permissions::from_mode(0o755)).unwrap();
     let mut tui =
@@ -1210,16 +1214,27 @@ fn open_session_fails_when_the_attach_fails() {
     );
     assert!(new.status.success(), "{new:?}");
     tui.wait_for_text("broken");
+    let deadline = Instant::now() + WAIT;
+    loop {
+        let read = nebula_cli(
+            &tui,
+            &["agent", "read", "broken", "--project", "alpha-proj"],
+        );
+        if String::from_utf8_lossy(&read.stdout).contains("stand-in started") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "stand-in never started: {read:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
     std::fs::remove_file(&agent_cmd).unwrap();
     let exit = nebula_cli(
         &tui,
         &["agent", "send", "broken", "exit", "--project", "alpha-proj"],
     );
-    assert!(
-        exit.status.success()
-            || String::from_utf8_lossy(&exit.stderr).contains("Session has no live PTY"),
-        "{exit:?}"
-    );
+    assert!(exit.status.success(), "{exit:?}");
     let deadline = Instant::now() + WAIT;
     loop {
         let show = nebula_cli(

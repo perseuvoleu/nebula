@@ -244,6 +244,11 @@ pub async fn delete_branch(repo: &Path, branch: &str) -> Result<()> {
 pub struct WorktreeEntry {
     pub path: PathBuf,
     pub branch: String,
+    /// Git lists a detached all-zero HEAD for a checkout whose admin dir lost
+    /// its HEAD file, as it does mid-`git worktree prune`; `branch` means
+    /// nothing then. An unborn branch also has a zero HEAD but keeps its
+    /// `branch` line, so it is not settling.
+    pub settling: bool,
 }
 
 /// Parse `git worktree list --porcelain`. The first entry is the main
@@ -259,6 +264,7 @@ pub async fn list_worktrees(repo: &Path) -> Result<Vec<WorktreeEntry>> {
             if let Some(done_path) = path.take() {
                 entries.push(WorktreeEntry {
                     path: done_path,
+                    settling: branch.is_none() && is_null_oid(head.as_deref()),
                     branch: branch
                         .take()
                         .unwrap_or_else(|| detached_label(head.as_deref())),
@@ -275,10 +281,15 @@ pub async fn list_worktrees(repo: &Path) -> Result<Vec<WorktreeEntry>> {
     if let Some(done_path) = path {
         entries.push(WorktreeEntry {
             path: done_path,
+            settling: branch.is_none() && is_null_oid(head.as_deref()),
             branch: branch.unwrap_or_else(|| detached_label(head.as_deref())),
         });
     }
     Ok(entries)
+}
+
+fn is_null_oid(head: Option<&str>) -> bool {
+    head.is_some_and(|sha| sha.bytes().all(|b| b == b'0'))
 }
 
 /// Display name for a checkout with no branch (detached HEAD).

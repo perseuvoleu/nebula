@@ -629,8 +629,10 @@ async fn kitty_keyboard_negotiation_passthrough() {
 
     // The child queries support and reads the daemon's reply off its own
     // stdin — the same detection recipe Claude Code uses. `tr` makes the
-    // reply greppable in plain text.
-    let probe = "stty -icanon -echo min 0 time 20; printf '\\033[?u'; sleep 1; \
+    // reply greppable in plain text. `set +m`: with job control on, bash 3.2
+    // under load can print `child setpgid ... Operation not permitted`
+    // between `REPLY:` and the reply.
+    let probe = "set +m; stty -icanon -echo min 0 time 20; printf '\\033[?u'; sleep 1; \
                  printf 'REPLY:'; dd bs=64 count=1 2>/dev/null | tr '\\033' 'E'; echo; stty sane\n";
     write_frame(
         &mut c,

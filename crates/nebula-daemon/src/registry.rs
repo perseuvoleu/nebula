@@ -2304,7 +2304,7 @@ impl Daemon {
             .iter()
             .filter(|w| w.project_id == project.id)
             .collect();
-        for entry in &entries {
+        for entry in entries.iter().filter(|e| !e.settling) {
             if let Some(known) = ours.iter().find(|w| w.path == entry.path) {
                 // Branch switched in place (checkout on the root or inside a
                 // linked worktree): refresh the stored name so the row tracks
@@ -5148,6 +5148,101 @@ mod tests {
         let (_, worktrees, _, _) = daemon.store.load_tree().unwrap();
         let row = worktrees.iter().find(|w| w.branch == "kid").unwrap();
         assert_eq!(row.created_from.as_deref(), Some("dad"));
+    }
+
+    /// `git worktree prune` deletes a checkout's admin dir file by file, and
+    /// a listing taken in between reports `HEAD 0000…` on a detached HEAD.
+    /// A sync that lands there must not rename the row after that half-gone
+    /// state.
+    #[tokio::test]
+    async fn worktree_sync_keeps_the_branch_of_a_checkout_git_is_half_way_through_pruning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo = root.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-b", "main"]);
+        git_in(&repo, &["commit", "--allow-empty", "-m", "init"]);
+        let ghost = root.join("repo-worktrees").join("ghost");
+        git_in(
+            &repo,
+            &["worktree", "add", &ghost.to_string_lossy(), "-b", "ghost"],
+        );
+
+        let daemon = test_daemon();
+        let project = Project {
+            workspace_id: Default::default(),
+            id: ProjectId("p".into()),
+            name: "p".into(),
+            repo_path: repo.clone(),
+            sort_order: 0,
+            divider_after: false,
+            divider_label: None,
+            divider_before: false,
+            divider_before_label: None,
+            host: None,
+        };
+        daemon.store.insert_project(&project).unwrap();
+        seed_worktree(&daemon, "p", "root", &repo.to_string_lossy(), true);
+        daemon.sync_project_worktrees(&project).await.unwrap();
+
+        std::fs::remove_dir_all(&ghost).unwrap();
+        std::fs::remove_file(repo.join(".git/worktrees/ghost/HEAD")).unwrap();
+        daemon.sync_project_worktrees(&project).await.unwrap();
+
+        let (_, worktrees, _, _) = daemon.store.load_tree().unwrap();
+        let row = worktrees.iter().find(|w| w.path == ghost).unwrap();
+        assert_eq!(row.branch, "ghost");
+        assert!(!row.for_branch);
+
+        git_in(&repo, &["worktree", "prune"]);
+        daemon.sync_project_worktrees(&project).await.unwrap();
+        let (_, worktrees, _, _) = daemon.store.load_tree().unwrap();
+        assert!(worktrees.iter().all(|w| w.path != ghost));
+    }
+
+    #[tokio::test]
+    async fn worktree_sync_adopts_an_orphan_worktree_with_its_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo = root.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git_in(&repo, &["init", "-b", "main"]);
+        git_in(&repo, &["commit", "--allow-empty", "-m", "init"]);
+
+        let daemon = test_daemon();
+        let project = Project {
+            workspace_id: Default::default(),
+            id: ProjectId("p".into()),
+            name: "p".into(),
+            repo_path: repo.clone(),
+            sort_order: 0,
+            divider_after: false,
+            divider_label: None,
+            divider_before: false,
+            divider_before_label: None,
+            host: None,
+        };
+        daemon.store.insert_project(&project).unwrap();
+        seed_worktree(&daemon, "p", "root", &repo.to_string_lossy(), true);
+        daemon.sync_project_worktrees(&project).await.unwrap();
+
+        let orph = root.join("repo-worktrees").join("orph");
+        git_in(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "--orphan",
+                "-b",
+                "orph",
+                &orph.to_string_lossy(),
+            ],
+        );
+        daemon.sync_project_worktrees(&project).await.unwrap();
+
+        let (_, worktrees, _, _) = daemon.store.load_tree().unwrap();
+        let row = worktrees.iter().find(|w| w.path == orph).unwrap();
+        assert_eq!(row.branch, "orph");
     }
 
     /// `create_worktree` records lineage even without an explicit base: an
