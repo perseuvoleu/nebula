@@ -4,7 +4,7 @@
 PREFIX ?= $(HOME)/.cargo/bin
 BIN := target/release/nebula
 
-.PHONY: build install kill build-novt install-novt
+.PHONY: build install kill build-novt install-novt hooks
 
 # The default build includes the Ghostty pane engine, whose libghostty-vt is
 # compiled from ghostty sources by zig 0.15.2 (`brew install zig@0.15`); the
@@ -24,7 +24,7 @@ build-novt:
 # binary in place reuses its inode, and the kernel's cached code signature
 # for that inode no longer matches the new contents — every exec then dies
 # with SIGKILL (exit 137). A fresh inode forces signature re-validation.
-install: build
+install: hooks build
 	cp $(BIN) $(PREFIX)/nebula.new
 	mv $(PREFIX)/nebula.new $(PREFIX)/nebula
 	@$(PREFIX)/nebula --version
@@ -34,6 +34,9 @@ install-novt: build-novt
 	cp $(BIN) $(PREFIX)/nebula.new
 	mv $(PREFIX)/nebula.new $(PREFIX)/nebula
 	@$(PREFIX)/nebula --version
+
+hooks:
+	git config core.hooksPath .githooks
 
 # Stops every active session — run only when you're ready to cut over.
 kill:

@@ -143,7 +143,8 @@ async fn status(host: &str) -> Result<()> {
 /// The host's nebula build and its daemon's. Only a binary whose version
 /// shows a build id has `_daemon-build`; an older one would take it for
 /// `nebula <dir>` and add a project.
-const HOST_STATUS: &str = "v=$(nebula --version 2>/dev/null) || v='nebula: not installed'; echo \"$v\"; \
+const HOST_STATUS: &str =
+    "v=$(nebula --version 2>/dev/null) || v='nebula: not installed'; echo \"$v\"; \
     if nebula agent list --all >/dev/null 2>&1; then \
     case \"$v\" in *'('*) b=$(nebula _daemon-build 2>/dev/null);; esac; \
     echo \"daemon: running${b:+ (build $b)}\"; else echo 'daemon: not running'; fi";

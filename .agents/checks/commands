@@ -1,4 +1,5 @@
 PATH=/opt/homebrew/opt/zig@0.15/bin:$PATH cargo build --tests # build
 PATH=/opt/homebrew/opt/zig@0.15/bin:$PATH cargo test --workspace
 cargo fmt --check
+[.githooks/**] sh .githooks/pre-commit.test.sh
 [web/**] PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s web -v

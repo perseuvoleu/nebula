@@ -1,0 +1,42 @@
+#!/bin/sh
+# Reads the staged blob, not the working tree: other sessions keep unstaged edits in the same files.
+# rustfmt --check exits 0 on stdin input even when it prints a diff, so compare its output instead.
+# Stdin input also keeps rustfmt from following `mod x;` into files outside the commit.
+set -eu
+
+files="$(git -c core.quotePath=false diff --cached --name-only --diff-filter=ACMR -- '*.rs' ':!vendor/')"
+[ -n "$files" ] || exit 0
+
+if ! command -v rustfmt > /dev/null; then
+  echo "pre-commit: rustfmt not found on PATH; install it with: rustup component add rustfmt" >&2
+  exit 1
+fi
+
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+bad=""
+broken=""
+while IFS= read -r file; do
+  git show ":$file" > "$tmp/staged"
+  if ! rustfmt < "$tmp/staged" > "$tmp/formatted" 2> "$tmp/err"; then
+    broken="${broken}pre-commit: rustfmt cannot parse $file:
+$(cat "$tmp/err")
+"
+  elif cmp -s "$tmp/staged" "$tmp/formatted"; then
+    :
+  elif [ "${1:-}" = fix ]; then
+    mode="$(git ls-files -s -- "$file" | cut -d' ' -f1)"
+    git update-index --cacheinfo "$mode,$(git hash-object -w "$tmp/formatted"),$file"
+    if cmp -s "$tmp/staged" "$file"; then cp "$tmp/formatted" "$file"; fi
+  else
+    bad="$bad  $file
+"
+  fi
+done <<EOF
+$files
+EOF
+
+[ -n "$bad$broken" ] || exit 0
+printf '%s' "$broken" >&2
+[ -z "$bad" ] || printf 'pre-commit: staged .rs files are not rustfmt-formatted:\n%sformat them in the index from the repo root with: sh .githooks/pre-commit fix\n' "$bad" >&2
+exit 1

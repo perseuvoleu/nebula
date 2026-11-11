@@ -1,4 +1,5 @@
 /target
+/.scratch/
 
 # nebula-managed agent hook files installed at agent spawn
 /.codex/
