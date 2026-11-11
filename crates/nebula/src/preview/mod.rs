@@ -244,8 +244,9 @@ pub fn run(args: Args) -> Result<()> {
         );
         return ingress::publish(name, operation, generation);
     }
+    let observing = matches!(args.command, Action::Status);
     ensure!(
-        cfg!(target_os = "linux"),
+        cfg!(target_os = "linux") || (args.offline && observing),
         "preview runtime currently requires Linux"
     );
     ensure!(
@@ -329,7 +330,6 @@ pub fn run(args: Args) -> Result<()> {
         Action::Down { ownership } => authorize(&state, ownership, None)?,
         _ => (),
     }
-    let observing = matches!(args.command, Action::Status);
     let promoted_checkout = match args.command {
         Action::Up {
             ownership,

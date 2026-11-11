@@ -25,7 +25,7 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        let root = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir_in(fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
         let dir = root.path().to_str().unwrap();
         let policy = json!({
             "namespace": "test", "state_dir": format!("{dir}/state"),
@@ -118,4 +118,27 @@ fn unknown_policy_fields_do_not_become_proxy_configuration() {
     let mut fixture = Fixture::new();
     fixture.policy["routers"] = json!({"injected": {"auth": false}});
     assert!(!fixture.run(&["status"]).status.success());
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn preview_commands_that_drive_containers_require_linux() {
+    let fixture = Fixture::new();
+    let result = fixture.run(&["down", "--owner", "agent"]);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr)
+        .contains("preview runtime currently requires Linux"));
+    assert!(!fixture.root.path().join("state").exists());
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn live_preview_status_requires_linux() {
+    let result = Command::new(env!("CARGO_BIN_EXE_nebula"))
+        .args(["preview", "--project", "demo", "status"])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr)
+        .contains("preview runtime currently requires Linux"));
 }
