@@ -1334,8 +1334,8 @@ mod tests {
         viewer.handle_line(&decision_line(&owned, "pg"));
         assert!(viewer.has_decisions() && viewer.needs_frame);
         let out = viewer.deliver(
-            &[project.clone()],
-            &[worktree.clone()],
+            std::slice::from_ref(&project),
+            std::slice::from_ref(&worktree),
             &[agent.clone()],
             42,
         );
@@ -1357,8 +1357,8 @@ mod tests {
             viewer.last_decision = None;
             viewer.handle_line(&decision_line(path, "sqlite"));
             let out = viewer.deliver(
-                &[project.clone()],
-                &[worktree.clone()],
+                std::slice::from_ref(&project),
+                std::slice::from_ref(&worktree),
                 &[agent.clone()],
                 43,
             );

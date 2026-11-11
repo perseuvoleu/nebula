@@ -283,7 +283,7 @@ fn screen_to_text(screen: &vt100::Screen) -> String {
                     if contents.is_empty() {
                         out.push(' ');
                     } else {
-                        out.push_str(&contents);
+                        out.push_str(contents);
                     }
                 }
                 None => out.push(' '),
@@ -312,7 +312,7 @@ fn sessions_panel_contains(screen: &vt100::Screen, needle: &str) -> bool {
             if contents.is_empty() {
                 line.push(' ');
             } else {
-                line.push_str(&contents);
+                line.push_str(contents);
             }
         }
         if line.contains(needle) {
@@ -334,7 +334,7 @@ fn row_is_selected(screen: &vt100::Screen, needle: &str) -> bool {
             if contents.is_empty() {
                 line.push(' ');
             } else {
-                line.push_str(&contents);
+                line.push_str(contents);
             }
         }
         // Selection paints the row with the raised fill: indexed 237 in

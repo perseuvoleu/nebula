@@ -26,9 +26,6 @@ use ratatui::Terminal;
 use std::io::{BufWriter, Stdout};
 use std::time::Duration;
 
-/// Rows the Sessions column scrolls per wheel notch — one pill's stride,
-/// so the list steps by whole rows instead of drifting half a pill.
-
 /// Redraw cap (~60fps). Output bursts coalesce into one frame; input events
 /// are still handled immediately between frames.
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
@@ -48,10 +45,6 @@ const AGO_REFRESH: Duration = Duration::from_secs(30);
 /// doesn't boot a CLI per worktree passed, short enough that it is booting
 /// well before the user creates a session.
 const PREWARM_DEBOUNCE: Duration = Duration::from_millis(250);
-
-/// How long the session selection must rest on a Claude row before its
-/// transcript tail is read for the last-message sub-line — walking the
-/// list with j/k must not read a file per row passed.
 
 /// How often the standing keep-warm request for the selected worktree's
 /// default-spec Claude session is re-sent. Must stay comfortably under the
@@ -17382,13 +17375,12 @@ mod tests {
         let a1_row = lines
             .iter()
             .position(|l| l.contains("SESSIONS"))
-            .map(|h| {
+            .and_then(|h| {
                 lines[h..]
                     .iter()
                     .position(|l| l.contains("agent-1"))
                     .map(|i| h + i)
             })
-            .flatten()
             .expect("agent-1 in the global section");
         assert!(a1_row > ry as usize, "working session leads the list");
 

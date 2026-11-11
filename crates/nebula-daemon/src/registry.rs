@@ -6008,7 +6008,6 @@ exec sleep 60
             primary_with_feat_on(test_daemon_with(DaemonOverrides {
                 stop_deadline: Duration::from_millis(1500),
                 agent_cmd: agent,
-                ..DaemonOverrides::default()
             }))
             .await;
 

@@ -275,6 +275,129 @@ fn generate_token() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Claude/Codex route: the UserPromptSubmit hook command pipes this
+/// response's body to stdout, so it must be empty or the injected
+/// instruction — never diagnostic JSON.
+async fn receive_injectable_hook(
+    State(state): State<Arc<HookServerState>>,
+    Query(query): Query<HookQuery>,
+    headers: HeaderMap,
+    body: String,
+) -> (StatusCode, String) {
+    receive_hook(true, state, query, headers, body).await
+}
+
+/// Cursor route: every hook command answers cursor with its own gating JSON
+/// and discards this body, so the `{"ok": ...}` diagnostics stay.
+async fn receive_plain_hook(
+    State(state): State<Arc<HookServerState>>,
+    Query(query): Query<HookQuery>,
+    headers: HeaderMap,
+    body: String,
+) -> (StatusCode, String) {
+    receive_hook(false, state, query, headers, body).await
+}
+
+async fn receive_hook(
+    inject_capable: bool,
+    state: Arc<HookServerState>,
+    query: HookQuery,
+    headers: HeaderMap,
+    body: String,
+) -> (StatusCode, String) {
+    // On this path the response body reaches the model's context, so every
+    // outcome (auth failure included) must answer with empty-or-instruction.
+    let injectable = inject_capable && query.hook_event == "UserPromptSubmit";
+    let quiet_or = |status: StatusCode, diag: &str| {
+        let body = if injectable {
+            String::new()
+        } else {
+            diag.to_string()
+        };
+        (status, body)
+    };
+
+    let authorized = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|presented| presented.as_bytes().ct_eq(state.token.as_bytes()).into())
+        .unwrap_or(false);
+    if !authorized {
+        return quiet_or(StatusCode::UNAUTHORIZED, r#"{"ok": false}"#);
+    }
+
+    // Parse failures still 200 — never fault a hook.
+    let payload: HookPayload = serde_json::from_str(&body).unwrap_or_default();
+    let Some(event) = parse_event(&query.hook_event, &payload) else {
+        return quiet_or(StatusCode::OK, r#"{"ok": false}"#);
+    };
+    let agent_id = AgentId(query.agent_id.clone());
+    tracing::debug!(agent = %agent_id, event = ?event, "hook received");
+    // A subagent's tool traffic reports the payload's cwd too, but that is
+    // the Task's position, not the session's — an isolated subagent working
+    // in a scratch checkout must never drag the row out from under the
+    // conversation. Only foreground payloads carry a cwd onward.
+    let cwd = payload.cwd().filter(|_| payload.subagent_id().is_none());
+    let _ = state
+        .tx
+        .send(HookDelivery {
+            agent_id: agent_id.clone(),
+            event,
+            session_id: payload.session_id(),
+            cwd,
+        })
+        .await;
+
+    if injectable {
+        // Titling instruction while the session is untitled, the notes and
+        // todos pointers while the project/worktree has undone entries, the
+        // shared-checkout pointer while sibling sessions have run on the
+        // same worktree, and the twin pointer while the project has a
+        // checkout on a host. Unknown ids (prewarm, stale env) and store
+        // errors degrade to no injection.
+        let mut parts = Vec::new();
+        if state
+            .store
+            .agent_auto_title_pending(&agent_id)
+            .unwrap_or(false)
+        {
+            parts.push(AUTO_TITLE_INSTRUCTION.to_string());
+        }
+        let open = state
+            .store
+            .open_note_count_for_agent(&agent_id)
+            .unwrap_or(0);
+        if open > 0 {
+            parts.push(notes_instruction(open));
+        }
+        let open_todos = state
+            .store
+            .open_todo_count_for_agent(&agent_id)
+            .unwrap_or(0);
+        if open_todos > 0 {
+            parts.push(todos_instruction(open_todos));
+        }
+        let siblings = state
+            .store
+            .active_sibling_count_for_agent(&agent_id)
+            .unwrap_or(0);
+        if siblings > 0 {
+            parts.push(siblings_instruction(siblings));
+        }
+        if let Ok(Some(twin)) = state.store.twin_for_agent(&agent_id) {
+            parts.push(twin_instruction(&twin.host, &twin.name, &twin.checkouts));
+        }
+        let body = if parts.is_empty() {
+            String::new()
+        } else {
+            context_injection(&parts)
+        };
+        return (StatusCode::OK, body);
+    }
+    (StatusCode::OK, r#"{"ok": true}"#.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -800,127 +923,4 @@ mod tests {
             other => panic!("unexpected event: {other:?}"),
         }
     }
-}
-
-/// Claude/Codex route: the UserPromptSubmit hook command pipes this
-/// response's body to stdout, so it must be empty or the injected
-/// instruction — never diagnostic JSON.
-async fn receive_injectable_hook(
-    State(state): State<Arc<HookServerState>>,
-    Query(query): Query<HookQuery>,
-    headers: HeaderMap,
-    body: String,
-) -> (StatusCode, String) {
-    receive_hook(true, state, query, headers, body).await
-}
-
-/// Cursor route: every hook command answers cursor with its own gating JSON
-/// and discards this body, so the `{"ok": ...}` diagnostics stay.
-async fn receive_plain_hook(
-    State(state): State<Arc<HookServerState>>,
-    Query(query): Query<HookQuery>,
-    headers: HeaderMap,
-    body: String,
-) -> (StatusCode, String) {
-    receive_hook(false, state, query, headers, body).await
-}
-
-async fn receive_hook(
-    inject_capable: bool,
-    state: Arc<HookServerState>,
-    query: HookQuery,
-    headers: HeaderMap,
-    body: String,
-) -> (StatusCode, String) {
-    // On this path the response body reaches the model's context, so every
-    // outcome (auth failure included) must answer with empty-or-instruction.
-    let injectable = inject_capable && query.hook_event == "UserPromptSubmit";
-    let quiet_or = |status: StatusCode, diag: &str| {
-        let body = if injectable {
-            String::new()
-        } else {
-            diag.to_string()
-        };
-        (status, body)
-    };
-
-    let authorized = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(|presented| presented.as_bytes().ct_eq(state.token.as_bytes()).into())
-        .unwrap_or(false);
-    if !authorized {
-        return quiet_or(StatusCode::UNAUTHORIZED, r#"{"ok": false}"#);
-    }
-
-    // Parse failures still 200 — never fault a hook.
-    let payload: HookPayload = serde_json::from_str(&body).unwrap_or_default();
-    let Some(event) = parse_event(&query.hook_event, &payload) else {
-        return quiet_or(StatusCode::OK, r#"{"ok": false}"#);
-    };
-    let agent_id = AgentId(query.agent_id.clone());
-    tracing::debug!(agent = %agent_id, event = ?event, "hook received");
-    // A subagent's tool traffic reports the payload's cwd too, but that is
-    // the Task's position, not the session's — an isolated subagent working
-    // in a scratch checkout must never drag the row out from under the
-    // conversation. Only foreground payloads carry a cwd onward.
-    let cwd = payload.cwd().filter(|_| payload.subagent_id().is_none());
-    let _ = state
-        .tx
-        .send(HookDelivery {
-            agent_id: agent_id.clone(),
-            event,
-            session_id: payload.session_id(),
-            cwd,
-        })
-        .await;
-
-    if injectable {
-        // Titling instruction while the session is untitled, the notes and
-        // todos pointers while the project/worktree has undone entries, the
-        // shared-checkout pointer while sibling sessions have run on the
-        // same worktree, and the twin pointer while the project has a
-        // checkout on a host. Unknown ids (prewarm, stale env) and store
-        // errors degrade to no injection.
-        let mut parts = Vec::new();
-        if state
-            .store
-            .agent_auto_title_pending(&agent_id)
-            .unwrap_or(false)
-        {
-            parts.push(AUTO_TITLE_INSTRUCTION.to_string());
-        }
-        let open = state
-            .store
-            .open_note_count_for_agent(&agent_id)
-            .unwrap_or(0);
-        if open > 0 {
-            parts.push(notes_instruction(open));
-        }
-        let open_todos = state
-            .store
-            .open_todo_count_for_agent(&agent_id)
-            .unwrap_or(0);
-        if open_todos > 0 {
-            parts.push(todos_instruction(open_todos));
-        }
-        let siblings = state
-            .store
-            .active_sibling_count_for_agent(&agent_id)
-            .unwrap_or(0);
-        if siblings > 0 {
-            parts.push(siblings_instruction(siblings));
-        }
-        if let Ok(Some(twin)) = state.store.twin_for_agent(&agent_id) {
-            parts.push(twin_instruction(&twin.host, &twin.name, &twin.checkouts));
-        }
-        let body = if parts.is_empty() {
-            String::new()
-        } else {
-            context_injection(&parts)
-        };
-        return (StatusCode::OK, body);
-    }
-    (StatusCode::OK, r#"{"ok": true}"#.to_string())
 }

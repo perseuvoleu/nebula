@@ -836,6 +836,9 @@ mod tests {
         // Names work as the owner key when no id was recorded.
         let named = owned("ask", Some("worker"), None, 100);
         let after = vec![owned("next", Some("worker"), None, 1), named.clone()];
-        assert_eq!(auto_focus(&named, &[named.clone()], &after), Some(0));
+        assert_eq!(
+            auto_focus(&named, std::slice::from_ref(&named), &after),
+            Some(0)
+        );
     }
 }

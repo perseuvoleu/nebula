@@ -949,9 +949,11 @@ mod tests {
     fn save_persists_model_effort_keys() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
-        let mut cfg = Config::default();
-        cfg.claude_model = "sonnet".into();
-        cfg.codex_effort = "xhigh".into();
+        let cfg = Config {
+            claude_model: "sonnet".into(),
+            codex_effort: "xhigh".into(),
+            ..Config::default()
+        };
         cfg.save_to(&path).unwrap();
         let reread = load_from(&path);
         assert_eq!(reread.claude_model, "sonnet");

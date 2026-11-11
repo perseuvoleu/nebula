@@ -947,6 +947,7 @@ mod tests {
         use Step::*;
         let ok = |s: &[Step]| Ok::<Vec<Step>, &str>(s.to_vec());
         // Expected refusals are named by a substring of the reason.
+        #[allow(clippy::type_complexity)]
         let table: Vec<(
             (bool, bool, bool, usize, usize, Direction, bool),
             Result<Vec<Step>, &str>,

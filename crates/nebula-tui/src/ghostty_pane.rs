@@ -178,7 +178,7 @@ fn color(c: StyleColor) -> Option<Color> {
     match c {
         StyleColor::None => None,
         StyleColor::Rgb(c) => Some(rgb(c)),
-        StyleColor::Palette(idx) => Some(Color::Indexed(idx.0 as u8)),
+        StyleColor::Palette(idx) => Some(Color::Indexed(idx.0)),
     }
 }
 

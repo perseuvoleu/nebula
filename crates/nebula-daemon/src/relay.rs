@@ -101,6 +101,7 @@ pub struct Relay {
     admission: Mutex<()>,
     pub mirror: Mutex<Mirror>,
     /// Clients watching a mirrored session's PTY, by session.
+    #[allow(clippy::type_complexity)]
     attached: Mutex<HashMap<SessionRef, Vec<(RelayClient, (u16, u16))>>>,
     /// Relay req_id → (asking client, its own req_id, admission time).
     pending: Mutex<HashMap<u64, (RelayClient, u64, tokio::time::Instant)>>,
@@ -892,9 +893,7 @@ async fn handle_event(
                 a.status_changed_at = changed_at;
             }
             let mut mirror = relay.mirror.lock().unwrap();
-            let Some(a) = mirror.agents.iter_mut().find(|a| a.id == agent) else {
-                return None;
-            };
+            let a = mirror.agents.iter_mut().find(|a| a.id == agent)?;
             a.status = status;
             a.status_changed_at = changed_at;
             drop(mirror);
