@@ -81,4 +81,4 @@ fi
 # Absolute symlinks into this Mac's home would dangle on Linux.
 ssh "$host" 'for l in $(find ~/.claude/skills ~/.codex/skills ~/.pi/agent/skills -maxdepth 1 -type l 2>/dev/null); do
   t=$(readlink "$l"); case "$t" in /Users/*/.agents/*) ln -sfn "$HOME/.agents/${t#/Users/*/.agents/}" "$l";; esac; done
-echo "skills on $(hostname): $(ls ~/.claude/skills | wc -l) claude, $(ls ~/.codex/skills | wc -l) codex, $(find ~/.claude/skills ~/.codex/skills -maxdepth 1 -xtype l | wc -l) broken links"'
+echo "skills on $(hostname): $(ls ~/.claude/skills | wc -l) claude, $(ls ~/.codex/skills | wc -l) codex, $(find ~/.claude/skills ~/.codex/skills -maxdepth 1 -type l ! -exec test -e {} \; -print | wc -l) broken links"'

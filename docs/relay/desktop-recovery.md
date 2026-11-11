@@ -165,7 +165,7 @@ cargo build --release -p nebula --target-dir target/relay-protocol29-candidate
 ```
 
 Candidate absolute path:
-`/Users/andrei/Desktop/nebula-worktrees/relay-auto-recovery/target/relay-protocol29-candidate/release/nebula`
+`~/Projects/nebula-worktrees/relay-auto-recovery/target/relay-protocol29-candidate/release/nebula`
 
 SHA-256: `195a36762320a3f63e3f919ac74536dac042f9626f3337e6b65369d44fda356b`.
 The release executable also passed repeated literal Hello 29 and rejected Hello

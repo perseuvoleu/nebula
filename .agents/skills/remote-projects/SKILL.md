@@ -1,6 +1,6 @@
 ---
 name: remote-projects
-description: "Working on a remote host (findl or any ssh destination) through nebula: adding a remote checkout, starting sessions there from the local TUI or CLI, what the pink @host badge means, how the relay keeps sessions alive on the host with the laptop closed, `nebula remote <host>` for status/sync/upgrade/restart. Trigger: \"remote\", \"pe server\", \"findl\", \"@findl\", `nebula remote`, a session or checkout that lives on another machine, or remote rows missing/stale."
+description: "Working on a remote host (findl, the other laptop, or any ssh destination) through nebula: adding a remote checkout, starting sessions there from the local TUI or CLI, what the pink @host badge means, how the relay keeps sessions alive on the host with the laptop closed, `nebula remote <host>` for status/sync/upgrade/restart. Trigger: \"remote\", \"pe server\", \"findl\", \"@findl\", `nebula remote`, a session or checkout that lives on another machine, or remote rows missing/stale."
 user-invocable: true
 ---
 
@@ -50,15 +50,28 @@ checkout; transfer needed recipes as ignored files, not commits or recipe-only m
 Tell delegated remote workers the same rule. The runbook covers safe untracking and
 preserving each host's copy when synchronizing a cleanup commit.
 
-## The host is findl. Always.
+## Hosts: three machines on one tailnet
 
-Remote work goes to **findl** (ssh alias in `~/.ssh/config`, key on disk, no touch needed). Do not
-install nebula on, or anchor projects to, any other server unless the user names it explicitly for
-that purpose — other hosts in `~/.ssh/config` (vela, hetzner, …) are production or client machines.
-A project that should also run remotely is **cloned on findl under the same directory name as the
-local checkout** (so the rows merge into one), with its own read-write deploy key there
-(`gh repo deploy-key add … --allow-write`; one key per repo, aliased in findl's `~/.ssh/config`),
-then anchored with `nebula add findl:~/<name>`. Existing on findl: `nebula`, `vela-hub-fork`.
+Nebula hosts are exactly these three, joined by Tailscale (tailnet `perseuvoleu.github`). Each
+ssh alias resolves to the tailnet IP, so nothing here needs a public port:
+
+| ssh alias | machine | user, checkouts | role |
+|---|---|---|---|
+| `findl` | Debian server, always on | `andrei`, `~/<repo>` | unattended and long work; survives every laptop lid |
+| `apples-macbook-pro` | second laptop, macOS | `andrei`, `~/Desktop/<repo>` | extra laptop capacity; asleep when its lid is closed |
+| `gaitanarus-macbook-pro` | first laptop, macOS | `perseu`, `~/Projects/<repo>` | the host the second laptop adds to see this one's sessions |
+
+The machine you run on is the one whose `hostname` matches; the other two are your remote hosts.
+Other hosts in `~/.ssh/config` (vela, hetzner, …) are production or client machines: nebula stays
+off them unless the user names one for that purpose. Findl's public port 22 is closed; if
+Tailscale breaks there, the way back in is the provider's web console.
+
+A project that should also run on another host is **cloned there under the same directory name as
+the local checkout** (so the rows merge into one), then anchored from the local side with
+`nebula add <alias>:<path>`. On findl it gets its own read-write deploy key
+(`gh repo deploy-key add … --allow-write`; one key per repo, aliased in findl's `~/.ssh/config`);
+the two laptops already hold the user's own GitHub access. `nebula remote <alias> status` lists
+what each host has anchored.
 
 ## The model (why it behaves the way it does)
 
@@ -125,7 +138,7 @@ hybrid-work skill is its runbook. For remote → local handoff, use `nebula coll
 with `--branch` for the primary or `--worktree` for a separate directory; consult `nebula collect
 --help` for current flags. Collection preserves both rows and all remote sessions, and refuses
 unsafe ownership/history rather than replacing a checkout. The canonical local runbook is
-`/Users/andrei/Desktop/nebula/.claude/skills/hybrid-work/SKILL.md`, reachable from other projects.
+`~/Projects/nebula/.claude/skills/hybrid-work/SKILL.md`, reachable from other projects.
 
 ## What does not work remotely, on purpose
 

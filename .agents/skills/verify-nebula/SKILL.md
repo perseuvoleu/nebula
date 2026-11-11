@@ -7,7 +7,7 @@ description: "Drive a real, isolated nebula (own daemon, socket, data dir) and i
 
 `vn` (this folder) runs a nebula of its own: a daemon built from this checkout, on its own socket and data dir, driven through the real CLI and the real TUI in a tmux pty. The user's daemon and sessions stay untouched, so `nebula kill` and `make install` are never part of a verification run.
 
-Run it from the checkout root as `.agents/skills/verify-nebula/vn <command>`, every build and test command through `heavy` (`~/Desktop/perseu-stack/bin/heavy`). A step with a `Done:` line is finished when that line holds.
+Run it from the checkout root as `.agents/skills/verify-nebula/vn <command>`, every build and test command through `heavy` (`~/Projects/perseu-stack/bin/heavy`). A step with a `Done:` line is finished when that line holds.
 
 ## 1. Build
 

@@ -28,8 +28,9 @@ They live in `.agents/skills/`, the project directory Codex and Pi read; `.claud
 - `.agents/skills/release/SKILL.md` — trigger: "release", "ship it", a new version, or questions
   about the release process.
 - `.agents/skills/remote-projects/SKILL.md` — trigger: "remote", "pe server", findl / `@host`,
-  `nebula remote`, sessions or checkouts on another machine, remote rows missing. The remote host
-  is always findl; never set up another server for this without being told to.
+  `nebula remote`, sessions or checkouts on another machine, remote rows missing, the other
+  laptop. Its Hosts table lists the three machines (findl and two laptops); nebula goes on no
+  other server unless the user names it.
 - `.agents/skills/sync-skills/SKILL.md` — trigger: "sync skills", updating skills on the server /
   findl, `nss`, or a remote agent missing a skill.
 - `.agents/skills/hybrid-work/SKILL.md` — trigger: "remote worker", "findl worker", "handoff",

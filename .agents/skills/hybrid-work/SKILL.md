@@ -21,7 +21,7 @@ Pass the resolved destination and approval scope (or its absence) to delegated w
 
 `nebula sync --help` and `nebula collect --help` are the source of truth for flags.
 This tracked file is the canonical runbook; from any local project read
-`/Users/andrei/Desktop/nebula/.claude/skills/hybrid-work/SKILL.md`.
+`~/Projects/nebula/.claude/skills/hybrid-work/SKILL.md`.
 
 ## 1. Placement rule
 
