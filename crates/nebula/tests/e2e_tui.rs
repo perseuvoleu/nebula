@@ -173,8 +173,9 @@ impl TuiHarness {
         });
     }
 
-    /// Wait until the row containing `needle` renders with the selection
-    /// fill (the raised `sel_bg` / `sel_bg_dim` background bar).
+    /// Wait until `needle`'s own cells render with the selection fill (the
+    /// raised `sel_bg` / `sel_bg_dim` background bar); fill elsewhere on the
+    /// row does not count.
     fn wait_for_selected(&self, needle: &str) {
         self.wait_for(&format!("row {needle:?} selected (filled)"), |s| {
             row_is_selected(s, needle)
@@ -336,22 +337,34 @@ fn row_is_selected(screen: &vt100::Screen, needle: &str) -> bool {
                 line.push_str(&contents);
             }
         }
-        if line.contains(needle) {
-            // Selection paints the row with the raised fill: indexed 237 in
-            // the focused panel, 235 in unfocused ones (theme sel_bg /
-            // sel_bg_dim).
-            let filled = (0..cols).any(|col| {
+        // Selection paints the row with the raised fill: indexed 237 in
+        // the focused panel, 235 in unfocused ones (theme sel_bg /
+        // sel_bg_dim). Only the needle's own cells count: a popup row
+        // shares its screen line with whatever panel row lies beneath.
+        let filled = line.match_indices(needle).any(|(at, _)| {
+            let start = line[..at].chars().count() as u16;
+            let end = start + needle.chars().count() as u16;
+            (start..end).any(|col| {
                 matches!(
                     screen.cell(row, col).map(|c| c.bgcolor()),
                     Some(vt100::Color::Idx(237)) | Some(vt100::Color::Idx(235))
                 )
-            });
-            if filled {
-                return true;
-            }
+            })
+        });
+        if filled {
+            return true;
         }
     }
     false
+}
+
+#[test]
+fn row_is_selected_accepts_a_filled_needle_after_an_unfilled_copy() {
+    let mut parser = vt100::Parser::new(2, 40, 0);
+    parser.process(b"Hide \x1b[48;5;237mHide\x1b[0m");
+    assert!(row_is_selected(parser.screen(), "Hide"));
+    parser.process(b"\r\x1b[48;5;237m\x1b[2K\x1b[0mHide");
+    assert!(!row_is_selected(parser.screen(), "Hide"));
 }
 
 fn add_project(tui: &mut TuiHarness, path: &Path, expect_name: &str) {
