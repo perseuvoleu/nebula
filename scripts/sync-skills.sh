@@ -11,8 +11,10 @@
 #   ~/.claude/{skills,commands,agents,rules,shared,CLAUDE.md}
 #   ~/.codex/{skills,agents,AGENTS.md}
 #   ~/.pi/agent/skills
-# Never touches auth/credential/settings files. Symlinks copied as-is; the
-# few that point at /Users/<me>/… are rewritten to the remote $HOME.
+# Never touches auth/credential files. Settings change only through the remote's
+# perseu-stack/bin/install-hooks, run after the mirrors, which writes only the
+# entries marked _perseuManaged; --check runs its --check and prints `hooks: …`.
+# Symlinks copied as-is; the few that point at /Users/<me>/… are rewritten to the remote $HOME.
 set -eu
 check=
 if [ "${1:-}" = "--check" ]; then check=1; shift; fi
@@ -75,6 +77,10 @@ if [ -n "$check" ]; then
   LC_ALL=C sort -o "$there" "$there"
   n=$( { LC_ALL=C comm -23 "$here" "$there"; LC_ALL=C comm -13 "$here" "$there"; } | cut -f1 | sort -u | wc -l)
   echo "differ: $(echo $n)"
+  rc=0
+  printf '%s\n' 'h=~/Projects/perseu-stack/bin/install-hooks; [ -x "$h" ] || exit 3; "$h" --check >/dev/null' \
+    | ssh "$host" sh -s || rc=$?
+  case $rc in 0) echo "hooks: current" ;; 1) echo "hooks: stale" ;; *) echo "hooks: unknown" ;; esac
   exit 0
 fi
 
@@ -82,3 +88,9 @@ fi
 ssh "$host" 'for l in $(find ~/.claude/skills ~/.codex/skills ~/.pi/agent/skills -maxdepth 1 -type l 2>/dev/null); do
   t=$(readlink "$l"); case "$t" in /Users/*/.agents/*) ln -sfn "$HOME/.agents/${t#/Users/*/.agents/}" "$l";; esac; done
 echo "skills on $(hostname): $(ls ~/.claude/skills | wc -l) claude, $(ls ~/.codex/skills | wc -l) codex, $(find ~/.claude/skills ~/.codex/skills -maxdepth 1 -type l ! -exec test -e {} \; -print | wc -l) broken links"'
+
+if ! hooks=$(printf '%s\n' '~/Projects/perseu-stack/bin/install-hooks' | ssh "$host" sh -s 2>&1); then
+  printf 'hooks on %s: install-hooks failed:\n%s\n' "$host" "$hooks" >&2
+  exit 1
+fi
+echo "hooks on $host: $(printf '%s\n' "$hooks" | cut -d' ' -f1 | LC_ALL=C sort | uniq -c | awk '{printf "%s%s %s", s, $1, $2; s = ", "}')"

@@ -19,7 +19,12 @@ scripts/sync-skills.sh <host>     # any ssh destination / ~/.ssh/config alias
 files whose content (cksum) or link target differs, or that exist on one side only — what
 `nebula remote <host> status` reports as `skills: …`.
 
-A sync prints one line from the remote at the end: `skills on <host>: N claude, M codex, K broken links`.
+After the mirrors, a sync runs the remote's `~/Projects/perseu-stack/bin/install-hooks`, which
+writes only the `_perseuManaged` hook entries in `settings.json` and `hooks.json`, prints
+`hooks on <host>: …` and fails the sync when it fails; `--check` adds `hooks: current`, `stale`,
+or `unknown` (no install-hooks there, or it could not decide: run it there for the reason).
+
+A sync ends with two lines: `skills on <host>: N claude, M codex, K broken links`, then `hooks on <host>: …`.
 Compare N/M with the laptop (`ls ~/.claude/skills | wc -l`, `ls ~/.codex/skills | wc -l`); `broken
 links` should match the laptop's own dangling symlinks (check with
 `find ~/.claude/skills ~/.codex/skills -maxdepth 1 -type l ! -exec test -e {} \; -print`), and
@@ -42,7 +47,8 @@ Directories sync with `--delete` (a skill removed locally disappears remotely) a
 ## What it must never touch
 
 `auth.json`, `.credentials.json`, `settings.json`, `config.toml`, session/history databases — these
-hold credentials or machine-local paths. The script only names the entries in the table above; do
+hold credentials or machine-local paths. The one exception is install-hooks, which edits only the
+`_perseuManaged` entries in `settings.json` and `hooks.json`. The script only names the entries in the table above; do
 not widen it to whole `~/.claude` or `~/.codex` directories.
 
 ## Adding an entry
