@@ -1,0 +1,15 @@
+# A turn that stops on a question (red) and continues after the answer.
+# Claude asks through its AskUserQuestion tool; a PermissionRequest would go
+# red → green without the yellow after the answer.
+wait
+hook UserPromptSubmit
+say Looking at the change… (Enter to go on)
+wait
+hook PreToolUse "tool_name":"AskUserQuestion"
+say Apply the change? (answer, then Enter)
+wait
+hook PostToolUse "tool_name":"AskUserQuestion"
+say Applying… (Enter to go on)
+wait
+say Done.
+hook Stop

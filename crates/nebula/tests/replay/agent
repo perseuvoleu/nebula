@@ -1,0 +1,38 @@
+#!/bin/sh
+# Replay agent: a stand-in for the claude CLI that plays a fixture on its PTY.
+# Run as NEBULA_AGENT_CMD="<this file> <fixture>". Fixture steps, one a line:
+#   wait            read one line of input (the prompt, an answer)
+#   say <text>      print a line of output
+#   pause <secs>    sleep
+#   hook <Event> [json fields]   POST the hook a real claude session fires
+# The fixture plays again from the top after its last step: one turn per prompt.
+fixture=$1
+grep -qx wait "$fixture" 2>/dev/null || { echo "replay agent: fixture '$fixture' missing or has no wait step" >&2; exit 2; }
+session="replay-$$"
+cwd=$(pwd | sed 's/[\\"]/\\&/g')
+
+hook() {
+  event=${1%% *}
+  fields=
+  case $1 in *' '*) fields=",${1#* }" ;; esac
+  if [ -z "$NEBULA_AGENT_ID" ] || [ -z "$NEBULA_API_URL" ]; then
+    echo "replay agent: hook $event: NEBULA_AGENT_ID or NEBULA_API_URL unset" >&2; exit 1
+  fi
+  printf '{"session_id":"%s","hook_event_name":"%s","cwd":"%s"%s}' "$session" "$event" "$cwd" "$fields" |
+    curl -fsS -m 3 -X POST -H "Authorization: Bearer $NEBULA_API_TOKEN" \
+      -H "Content-Type: application/json" --data-binary @- \
+      "$NEBULA_API_URL/api/hooks/claude?agentId=$NEBULA_AGENT_ID&hookEvent=$event" >/dev/null || { echo "replay agent: hook $event failed" >&2; exit 1; }
+}
+
+while :; do
+  while IFS= read -r step <&3 || [ -n "$step" ]; do
+    case $step in
+      '' | '#'*) ;;
+      wait) IFS= read -r _ || exit 0 ;;
+      'say '*) printf '%s\n' "${step#say }" ;;
+      'pause '*) sleep "${step#pause }" ;;
+      'hook '*) hook "${step#hook }" ;;
+      *) echo "replay agent: unknown step: $step" >&2; exit 2 ;;
+    esac
+  done 3<"$fixture"
+done

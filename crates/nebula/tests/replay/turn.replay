@@ -1,0 +1,7 @@
+# A plain turn: the prompt, streamed output, then Stop (green).
+wait
+hook UserPromptSubmit
+say Reading the code…
+pause 1
+say Done.
+hook Stop

@@ -44,6 +44,7 @@ Every process `vn` starts gets this environment, which is what keeps it off the 
 - `vn keys <tmux keys>` types into the TUI (`vn keys j`, `vn keys Enter`, `vn keys C-q`).
 - `vn wait <text> [secs]` blocks until the text is on screen (default 10 s) and fails with the screen dump otherwise. Wait on text, never on a sleep.
 - A session's PTY runs `/bin/sh`, so `vn nebula agent send <name> --project repo '<command>'` runs a shell command inside that session, with its own `NEBULA_AGENT_ID`. That is how a lead session spawns a worker the way a real agent does.
+- To make a session act like Claude without a model, run from the checkout root `vn nebula agent send <name> --project repo "exec $PWD/crates/nebula/tests/replay/agent $PWD/crates/nebula/tests/replay/ask.replay"`; the double quotes let your shell expand `$PWD`, which inside the session is `<state>/repo`. It then plays one turn per prompt you send and fires the real status hooks; a failed hook prints `replay agent: hook <Event> failed` and ends it. With `ask.replay` the turn goes yellow and holds until you send a line, stops red on a question until you send the answer, goes yellow and holds until the next line, then ends green; `turn.replay` is a plain turn that ends green.
 
 The maintained recipes live in [`features/README.md`](features/README.md): read the index, then the feature file the change touches. A proof covers every entry point its feature file lists.
 

@@ -192,6 +192,12 @@ impl TuiHarness {
         });
     }
 
+    fn wait_for_dot(&self, needle: &str, color: vt100::Color) {
+        self.wait_for(&format!("sessions dot of {needle:?} = {color:?}"), |s| {
+            sessions_dot(s, needle) == Some(color)
+        });
+    }
+
     /// Wait until `needle` no longer appears inside the Sessions panel's
     /// column band. Screen-wide checks would false-positive on the terminal
     /// pane title, which keeps naming the attached session while browsing
@@ -352,6 +358,25 @@ fn sessions_panel_contains(screen: &vt100::Screen, needle: &str) -> bool {
         }
     }
     false
+}
+
+/// The colour of the status dot on the Sessions row that names `needle`.
+fn sessions_dot(screen: &vt100::Screen, needle: &str) -> Option<vt100::Color> {
+    const SESSIONS_X: u16 = 20 + 22;
+    const SESSIONS_W: u16 = 32;
+    let (rows, cols) = screen.size();
+    let right = SESSIONS_X.saturating_add(SESSIONS_W).min(cols);
+    (0..rows).find_map(|row| {
+        let cells: Vec<_> = (SESSIONS_X..right)
+            .filter_map(|col| screen.cell(row, col))
+            .collect();
+        let line: String = cells.iter().map(|c| c.contents()).collect();
+        if !line.contains(needle) {
+            return None;
+        }
+        let dot = cells.iter().find(|c| matches!(c.contents(), "●" | "○"))?;
+        Some(dot.fgcolor())
+    })
 }
 
 fn row_is_selected(screen: &vt100::Screen, needle: &str) -> bool {
@@ -629,6 +654,47 @@ fn tui_slow_agent_shows_starting_until_first_output() {
     std::fs::write(gate, "ready").unwrap();
     tui.wait_for_text("ATTACH_READY_MARKER");
     tui.wait_for_gone("Starting claude…");
+}
+
+/// The replay agent plays a Claude turn that stops on a question through the
+/// hooks a real session fires; the Sessions dot follows it the whole way.
+#[test]
+fn tui_sessions_dot_follows_a_replayed_turn_through_a_question() {
+    const YELLOW: vt100::Color = vt100::Color::Idx(3);
+    const RED: vt100::Color = vt100::Color::Idx(1);
+    const GREEN: vt100::Color = vt100::Color::Idx(2);
+    let replay = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/replay");
+    let agent = format!(
+        "{} {}",
+        replay.join("agent").display(),
+        replay.join("ask.replay").display()
+    );
+    let mut tui = TuiHarness::spawn_with_env(&[("NEBULA_AGENT_CMD", agent)]);
+    let repo = tui.make_repo("replay");
+    tui.wait_for_text("no projects yet");
+    add_project(&mut tui, &repo, "replay");
+    tui.send(b"\t");
+    tui.wait_for_text(FOOTER_WORKTREES);
+    tui.send(b"\r");
+    tui.wait_for_text(FOOTER_SESSIONS);
+    tui.send(b"n");
+    tui.wait_for_text("New session");
+    tui.send(b"\r");
+    tui.wait_for_text("New agent");
+    tui.send(b"\r");
+    tui.wait_for_gone("New agent");
+    tui.wait_for_text(FOOTER_TERMINAL_LOCKED);
+
+    tui.type_str("tidy the readme\r");
+    tui.wait_for_dot("agent-1", YELLOW);
+    tui.type_str("\r");
+    tui.wait_for_dot("agent-1", RED);
+    tui.wait_for_text("Apply the change?");
+    tui.type_str("yes\r");
+    tui.wait_for_dot("agent-1", YELLOW);
+    tui.type_str("\r");
+    tui.wait_for_dot("agent-1", GREEN);
+    tui.wait_for_text("Done.");
 }
 
 /// A silent preview service must never prevent the real attach. The only
