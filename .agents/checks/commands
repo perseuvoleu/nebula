@@ -13,3 +13,4 @@ PATH=/opt/homebrew/opt/zig@0.15/bin:$PATH cargo clippy --workspace --all-targets
 [web/**] PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s web -v
 [scripts/**] sh scripts/sync-skills.test.sh
 [.agents/skills/verify-nebula/*] bash .agents/skills/verify-nebula/test-vn.sh
+[AGENTS.md,.agents/context-budget.json,.agents/skills/**,crates/nebula-daemon/src/hooks/**,crates/nebula-daemon/examples/hook_lines.rs] $HOME/Projects/perseu-stack/bin/context-budget check

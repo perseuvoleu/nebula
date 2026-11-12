@@ -1,0 +1,34 @@
+{
+  "AGENTS.md": {
+    "file": "AGENTS.md",
+    "bytes": 2816
+  },
+  "project skill descriptions": {
+    "descriptions": ".agents/skills/*/SKILL.md",
+    "bytes": 1744
+  },
+  "siblings_instruction (9 others)": {
+    "command": "PATH=/opt/homebrew/opt/zig@0.15/bin:$PATH cargo run -q -p nebula-daemon --example hook_lines siblings",
+    "bytes": 327
+  },
+  "twin_instruction (3 checkouts)": {
+    "command": "PATH=/opt/homebrew/opt/zig@0.15/bin:$PATH cargo run -q -p nebula-daemon --example hook_lines twin",
+    "bytes": 460
+  },
+  "twin_instruction (no checkouts)": {
+    "command": "PATH=/opt/homebrew/opt/zig@0.15/bin:$PATH cargo run -q -p nebula-daemon --example hook_lines twin-empty",
+    "bytes": 381
+  },
+  "notes_instruction (12 open)": {
+    "command": "PATH=/opt/homebrew/opt/zig@0.15/bin:$PATH cargo run -q -p nebula-daemon --example hook_lines notes",
+    "bytes": 280
+  },
+  "todos_instruction (12 open)": {
+    "command": "PATH=/opt/homebrew/opt/zig@0.15/bin:$PATH cargo run -q -p nebula-daemon --example hook_lines todos",
+    "bytes": 424
+  },
+  "AUTO_TITLE_INSTRUCTION": {
+    "command": "PATH=/opt/homebrew/opt/zig@0.15/bin:$PATH cargo run -q -p nebula-daemon --example hook_lines auto-title",
+    "bytes": 376
+  }
+}
