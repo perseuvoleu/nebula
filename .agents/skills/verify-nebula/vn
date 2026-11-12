@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # vn: an isolated nebula (own daemon, data, socket, agent-CLI config) for verification.
-# Usage: vn build | up | doctor | tui [nebula args] | keys <tmux keys>... | wait <text> [secs]
+# Usage: vn build | up [--seed [db]] | doctor | tui [nebula args] | keys <tmux keys>... | wait <text> [secs]
 #        | shot <name> | nebula <args>... | down
 # Env: NV_STATE (default /tmp/nv-<checkout hash>), NV_EVIDENCE (default <checkout>/.scratch/verify-nebula),
 #      NV_BIN (default <checkout>/target/verify-nebula/debug/nebula)
@@ -73,13 +73,62 @@ cmd_build() {
   PATH=/opt/homebrew/opt/zig@0.15/bin:$PATH CARGO_TARGET_DIR=$target cargo build -p nebula
 }
 
+sql_quote() { printf "'%s'" "${1//\'/\'\'}"; }
+
+seed_db() {
+  local db=$state/data/nebula.db rows=$state/seed-rows repos path branch name dest repo n=0 bad
+  [ -f "$1" ] || die "no db to seed from at $1"
+  sqlite3 -readonly "$1" ".backup '$db'"
+  bad=$(sqlite3 "$db" "SELECT count(*) FROM (SELECT repo_path AS v FROM projects UNION ALL SELECT path FROM worktrees
+    UNION ALL SELECT branch FROM worktrees) WHERE instr(v, char(10)) OR instr(v, char(13)) OR instr(v, char(31))")
+  [ "$bad" = 0 ] || die "$bad path or branch value(s) hold a newline, carriage return or unit separator; seed aborted"
+  sqlite3 "$db" "PRAGMA foreign_keys = ON;
+    DELETE FROM projects WHERE host IS NOT NULL;
+    DELETE FROM ui_state;
+    DELETE FROM links;
+    UPDATE agents SET claude_session_id = NULL,
+      status = CASE WHEN status IN ('running', 'needs_feedback') THEN 'disconnected' ELSE status END;"
+  echo '{"auto_archive_after": "off"}' >"$state/data/config.json"
+  repos=$(cd "$state" && pwd -P)/repos
+  mkdir -p "$repos"
+  sqlite3 -separator $'\x1f' "$db" "SELECT repo_path,
+      COALESCE((SELECT w.branch FROM worktrees w JOIN projects q ON q.id = w.project_id
+        WHERE q.repo_path = p.repo_path AND w.is_main LIMIT 1), 'main'), MIN(name)
+    FROM projects p GROUP BY repo_path" >"$rows"
+  while IFS=$'\x1f' read -r path branch name; do
+    name=$(printf '%s' "$name" | tr -c 'A-Za-z0-9._-' _)
+    dest=$repos/$name
+    while [ -e "$dest" ]; do n=$((n + 1)); dest=$repos/$name-$n; done
+    git init -q -b "$branch" "$dest" 2>/dev/null || git init -q -b main "$dest"
+    git -C "$dest" -c user.email=verify@nebula.dev -c user.name=verify-nebula commit -q --allow-empty -m seed
+    sqlite3 "$db" "UPDATE worktrees SET path = $(sql_quote "$dest") WHERE path = $(sql_quote "$path");
+      UPDATE projects SET repo_path = $(sql_quote "$dest") WHERE repo_path = $(sql_quote "$path");"
+  done <"$rows"
+  sqlite3 -separator $'\x1f' "$db" "SELECT w.path, MIN(w.branch), MIN(p.repo_path)
+    FROM worktrees w JOIN projects p ON p.id = w.project_id
+    WHERE substr(w.path, 1, $((${#repos} + 1))) != $(sql_quote "$repos/") GROUP BY w.path" >"$rows"
+  while IFS=$'\x1f' read -r path branch repo; do
+    n=$((n + 1))
+    dest=$repo.wt/$n
+    git -C "$repo" branch "$branch" 2>/dev/null || true
+    git -C "$repo" worktree add -q -f "$dest" "$branch" 2>/dev/null || git -C "$repo" worktree add -q -f "$dest" HEAD
+    sqlite3 "$db" "UPDATE worktrees SET path = $(sql_quote "$dest") WHERE path = $(sql_quote "$path")"
+  done <"$rows"
+  rm "$rows"
+  bad=$(sqlite3 "$db" "SELECT count(*) FROM (SELECT repo_path AS v FROM projects UNION ALL SELECT path FROM worktrees)
+    WHERE substr(v, 1, $((${#repos} + 1))) != $(sql_quote "$repos/")")
+  [ "$bad" = 0 ] || die "$bad project or worktree path(s) still outside $repos; seed aborted"
+}
+
 cmd_up() {
+  local seed=
+  if [ "${1:-}" = --seed ]; then seed=${2:-$HOME/Library/Application Support/dev.nebula.nebula/nebula.db}; fi
   refuse_link
   refuse_unowned
   [ -x "$bin" ] || die "no binary at $bin; run vn build first"
   if [ -d "$state" ]; then
     if daemon_pid >/dev/null; then
-      if [ "$(cat "$state/daemon.sha256")" = "$(fingerprint)" ]; then echo "vn: already up at $state"; return; fi
+      if [ -z "$seed" ] && [ "$(cat "$state/daemon.sha256")" = "$(fingerprint)" ]; then echo "vn: already up at $state"; return; fi
       echo "vn: $bin changed since up; restarting"
     fi
     cmd_down >/dev/null
@@ -91,6 +140,10 @@ cmd_up() {
   git -C "$state/repo" init -q -b main
   git -C "$state/repo" -c user.email=verify@nebula.dev -c user.name=verify-nebula \
     commit -q --allow-empty -m init
+  if [ -n "$seed" ]; then
+    trap 'rm -rf "$state"' EXIT
+    seed_db "$seed"
+  fi
   fingerprint >"$state/daemon.sha256"
   (cd "$state/repo" && exec "${isolated_env[@]}" nohup "$bin" daemon --foreground >"$state/daemon.log" 2>&1) &
   launched=$!
@@ -182,7 +235,7 @@ sub=${1:-}
 [ $# -gt 0 ] && shift
 case "$sub" in
   build) cmd_build ;;
-  up) cmd_up ;;
+  up) cmd_up "$@" ;;
   doctor) cmd_doctor ;;
   tui) cmd_tui "$@" ;;
   keys) cmd_keys "$@" ;;

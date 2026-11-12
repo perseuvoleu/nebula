@@ -17,6 +17,8 @@ Run it from the checkout root as `.agents/skills/verify-nebula/vn <command>`, ev
 
 `vn up` makes the state dir (`/tmp/nv-<checkout hash>`), a committed git repo at `<state>/repo`, starts the daemon from the scratch binary, and adds the repo as project `repo`. Ready means `nebula agent list` answers through the new socket within 2 s, not just that the socket exists; `up` gives up after 10 s. `up` on a live instance is a no-op unless the binary's sha256 changed since that `up`, which restarts it; on a dead one it starts over from an empty state dir. A launch that fails or is interrupted stops its daemon and removes the state dir. `up` and `down` refuse a state dir without the `.vn-state` marker `up` writes. Done: `vn: up at <state> (daemon <pid>, project repo)`.
 
+`vn up --seed [db]` starts from a copy of the real `nebula.db` (default `~/Library/Application Support/dev.nebula.nebula/nebula.db`) when a bug needs volume: many projects, worktrees, sessions, archived rows, notes. The copy comes from a read-only `.backup`; nothing is written back. Before the daemon starts, `up` drops remote projects, saved links (they open real URLs) and the TUI's `ui_state`, repoints every project and worktree to an empty git repo under `<state>/repos/` on the same branch, clears resume ids, turns `running` and `needs_feedback` into `disconnected`, and turns auto-archive off, so sessions keep their names, status and archived flag and never run a model or ssh. If a path or branch holds a line break, or any project or worktree path is still outside `<state>/repos/` after the rewrite, `up` aborts and removes the state dir. `--seed` always starts a fresh instance. Shots of a seeded instance carry real project and session names and stay in the evidence dir after `down`. `vn tui open <state>/repos/<name>` opens a seeded project.
+
 Every process `vn` starts gets this environment, which is what keeps it off the user's nebula:
 
 | Variable | Value | Why (source) |
@@ -62,4 +64,4 @@ The maintained recipes live in [`features/README.md`](features/README.md): read 
 
 ## Helper check
 
-`heavy .agents/skills/verify-nebula/test-vn.sh` drives `vn` through up, doctor, spawns, the TUI, a shot and down, and asserts the isolation and the cleanup. Run it after changing `vn`; it needs a built binary.
+`heavy .agents/skills/verify-nebula/test-vn.sh` drives `vn` through up, doctor, spawns, the TUI, a shot and down, and asserts the isolation and the cleanup, plus the `--seed` rewrite on a fixture db built from `store.rs`'s migrations. Run it after changing `vn`; it needs a built binary.
