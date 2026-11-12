@@ -33,6 +33,7 @@ const FOOTER_TERMINAL_LOCKED: &str = "^q: panels";
 struct TuiHarness {
     writer: Box<dyn Write + Send>,
     parser: Arc<Mutex<vt100::Parser>>,
+    output: Arc<Mutex<Vec<u8>>>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
     runtime_dir: PathBuf,
     data_dir: PathBuf,
@@ -61,10 +62,12 @@ impl TuiHarness {
         let _ = std::fs::remove_dir_all(&runtime_dir);
         let _ = std::fs::remove_dir_all(&data_dir);
         let repos = tempfile::tempdir().unwrap();
-        let (writer, parser, child) = launch(&runtime_dir, &data_dir, repos.path(), &[], extra_env);
+        let (writer, parser, output, child) =
+            launch(&runtime_dir, &data_dir, repos.path(), &[], extra_env);
         Self {
             writer,
             parser,
+            output,
             child,
             runtime_dir,
             data_dir,
@@ -77,7 +80,7 @@ impl TuiHarness {
     fn relaunch(&mut self, args: &[&str]) {
         let _ = self.child.kill();
         let _ = self.child.wait();
-        let (writer, parser, child) = launch(
+        let (writer, parser, output, child) = launch(
             &self.runtime_dir,
             &self.data_dir,
             self._repos.path(),
@@ -86,6 +89,7 @@ impl TuiHarness {
         );
         self.writer = writer;
         self.parser = parser;
+        self.output = output;
         self.child = child;
     }
 
@@ -132,33 +136,39 @@ impl TuiHarness {
     /// Poll the rendered screen until `pred` holds; panic with a full screen
     /// dump on timeout.
     fn wait_for(&self, what: &str, pred: impl Fn(&vt100::Screen) -> bool) {
-        let deadline = Instant::now() + WAIT;
-        loop {
-            {
-                let parser = self.parser.lock().unwrap();
-                if pred(parser.screen()) {
-                    return;
-                }
-            }
-            if Instant::now() > deadline {
-                let tui_log = std::fs::read_to_string(self.data_dir.join("state/tui.log"))
-                    .unwrap_or_default();
-                let tail: String = tui_log
-                    .lines()
-                    .rev()
-                    .take(60)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                panic!(
-                    "timed out waiting for: {what}\n--- screen ---\n{}\n--- tui.log tail ---\n{tail}",
-                    self.screen_text()
-                );
-            }
-            std::thread::sleep(Duration::from_millis(50));
+        if poll_until(WAIT, || {
+            pred(self.parser.lock().unwrap().screen()).then_some(())
+        })
+        .is_some()
+        {
+            return;
         }
+        let tui_log =
+            std::fs::read_to_string(self.data_dir.join("state/tui.log")).unwrap_or_default();
+        let tail: String = tui_log
+            .lines()
+            .rev()
+            .take(60)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+        panic!(
+            "timed out waiting for: {what}\n--- screen ---\n{}\n--- tui.log tail ---\n{tail}",
+            self.screen_text()
+        );
+    }
+
+    /// Wait until the raw PTY output, every byte since launch, contains
+    /// `needle` — for text the screen shows only for an instant.
+    fn wait_for_output(&self, needle: &str) {
+        let written = poll_until(WAIT, || {
+            String::from_utf8_lossy(&self.output.lock().unwrap())
+                .contains(needle)
+                .then_some(())
+        });
+        assert!(written.is_some(), "the TUI never wrote {needle:?}");
     }
 
     fn wait_for_text(&self, needle: &str) {
@@ -203,6 +213,7 @@ fn launch(
 ) -> (
     Box<dyn Write + Send>,
     Arc<Mutex<vt100::Parser>>,
+    Arc<Mutex<Vec<u8>>>,
     Box<dyn portable_pty::Child + Send + Sync>,
 ) {
     let pty = native_pty_system()
@@ -240,8 +251,10 @@ fn launch(
     std::mem::forget(pty.master);
 
     let parser = Arc::new(Mutex::new(vt100::Parser::new(ROWS, COLS, 0)));
+    let output = Arc::new(Mutex::new(Vec::new()));
     {
         let parser = parser.clone();
+        let output = output.clone();
         std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
             while let Ok(n) = reader.read(&mut buf) {
@@ -249,11 +262,30 @@ fn launch(
                     break;
                 }
                 parser.lock().unwrap().process(&buf[..n]);
+                output.lock().unwrap().extend_from_slice(&buf[..n]);
             }
         });
     }
 
-    (writer, parser, child)
+    (writer, parser, output, child)
+}
+
+/// Polls `probe` every 50ms until it yields a value; `None` once `timeout` passes.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the one poll loop: every wait in this file goes through it"
+)]
+fn poll_until<T>(timeout: Duration, mut probe: impl FnMut() -> Option<T>) -> Option<T> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(value) = probe() {
+            return Some(value);
+        }
+        if Instant::now() > deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 impl Drop for TuiHarness {
@@ -560,17 +592,12 @@ fn tui_projects_worktrees_agents_navigation() {
 
     // ---- clean quit ----
     tui.send(b"q");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        match tui.child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
-            _ => panic!(
-                "TUI did not exit after q\n--- screen ---\n{}",
-                tui.screen_text()
-            ),
-        }
-    }
+    let exited = poll_until(Duration::from_secs(5), || tui.child.try_wait().unwrap());
+    assert!(
+        exited.is_some(),
+        "TUI did not exit after q\n--- screen ---\n{}",
+        tui.screen_text()
+    );
 }
 
 #[test]
@@ -642,7 +669,9 @@ fn tui_remote_preview_deadline_attaches_when_the_reply_never_arrives() {
                             write_frame(&mut stream, &snapshot).await.unwrap();
                         }
                         ClientRequest::ReadSession {req_id, ..} => {
-                            requested = Some((req_id, Instant::now())); // deliberately no reply
+                            #[expect(clippy::disallowed_methods, reason = "the elapsed time to the fallback attach is the asserted preview deadline")]
+                            let asked_at = Instant::now();
+                            requested = Some((req_id, asked_at)); // deliberately no reply
                         }
                         ClientRequest::Attach {session, ..} => {
                             assert!(!attached, "preview deadline must issue only one attach");
@@ -1010,9 +1039,9 @@ fn tui_reloads_in_place_from_the_palette() {
     tui.type_str("r");
     tui.send(b"\r");
 
-    // exec() keeps the pid; give the fresh image a moment to boot, then
-    // prove the reloaded UI is alive by opening the help modal.
-    std::thread::sleep(Duration::from_millis(2000));
+    // exec() keeps the pid; the old image prints this on its way out, so the
+    // tree drawn after it is the fresh image's. Its help modal proves it is alive.
+    tui.wait_for_output("nebula: reloading…");
     tui.wait_for_text("proj");
     tui.send(b"?");
     tui.wait_for_text("NAVIGATE & SEARCH");
@@ -1147,12 +1176,10 @@ fn open_session_attaches_it_in_the_running_tui() {
     tui.wait_for_text(FOOTER_PROJECTS);
     tui.send(b"m");
     tui.wait_for_text("Remove from list");
-    let deadline = Instant::now() + WAIT;
-    while !row_is_selected(&tui.parser.lock().unwrap().screen().clone(), "Hide") {
-        assert!(Instant::now() < deadline, "menu never reached Hide");
-        tui.send(b"\x1b[B");
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    tui.send(&b"\x1b[B".repeat(20));
+    tui.wait_for_selected("Remove from list");
+    tui.send(b"\x1b[A");
+    tui.wait_for_selected("Hide");
     tui.send(b"\r");
     tui.wait_for_text("PROJECTS    ▾ 1");
     let hidden = nebula_cli(&tui, &["open", "--session", "first", "--no-focus"]);
@@ -1214,40 +1241,33 @@ fn open_session_fails_when_the_attach_fails() {
     );
     assert!(new.status.success(), "{new:?}");
     tui.wait_for_text("broken");
-    let deadline = Instant::now() + WAIT;
-    loop {
-        let read = nebula_cli(
+    let mut read = None;
+    let started = poll_until(WAIT, || {
+        let out = nebula_cli(
             &tui,
             &["agent", "read", "broken", "--project", "alpha-proj"],
         );
-        if String::from_utf8_lossy(&read.stdout).contains("stand-in started") {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "stand-in never started: {read:?}"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
+        let started = String::from_utf8_lossy(&out.stdout).contains("stand-in started");
+        read = Some(out);
+        started.then_some(())
+    });
+    assert!(started.is_some(), "stand-in never started: {read:?}");
     std::fs::remove_file(&agent_cmd).unwrap();
     let exit = nebula_cli(
         &tui,
         &["agent", "send", "broken", "exit", "--project", "alpha-proj"],
     );
     assert!(exit.status.success(), "{exit:?}");
-    let deadline = Instant::now() + WAIT;
-    loop {
+    let mut row = serde_json::Value::Null;
+    let exited = poll_until(WAIT, || {
         let show = nebula_cli(
             &tui,
             &["agent", "show", "broken", "--project", "alpha-proj"],
         );
-        let row: serde_json::Value = serde_json::from_slice(&show.stdout).unwrap();
-        if row["alive"] == false {
-            break;
-        }
-        assert!(Instant::now() < deadline, "PTY never exited: {row}");
-        std::thread::sleep(Duration::from_millis(100));
-    }
+        row = serde_json::from_slice(&show.stdout).unwrap();
+        (row["alive"] == false).then_some(())
+    });
+    assert!(exited.is_some(), "PTY never exited: {row}");
 
     let out = nebula_cli(&tui, &["open", "--session", "broken", "--no-focus"]);
     assert_eq!(out.status.code(), Some(1), "{out:?}");

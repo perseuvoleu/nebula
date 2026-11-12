@@ -1,0 +1,6 @@
+disallowed-methods = [
+    { path = "std::thread::sleep", reason = "a test waits on the state it needs through poll_until, TuiHarness::wait_for or wait_for_exit (crates/nebula/tests)" },
+    { path = "tokio::time::sleep", reason = "a test waits on the state it needs through poll_until, read_events_until or client_subscribed (crates/nebula/tests/e2e_pty.rs)" },
+    { path = "std::time::Instant::now", reason = "a test reads no wall clock: the deadline lives in poll_until and wait_for_exit (crates/nebula/tests)" },
+    { path = "tokio::time::Instant::now", reason = "a test reads no wall clock: bound a wait with poll_until or tokio::time::timeout (crates/nebula/tests/e2e_pty.rs)" },
+]

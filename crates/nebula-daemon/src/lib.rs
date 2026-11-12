@@ -1,3 +1,8 @@
+#![allow(
+    clippy::disallowed_methods,
+    reason = "clippy.toml bans sleeps and wall clock in integration tests only; product code waits and times by design"
+)]
+
 mod checkout_lock;
 mod collect;
 pub mod config;

@@ -57,6 +57,10 @@ impl TestEnv {
         self.runtime_dir.join("daemon.sock")
     }
 
+    fn daemon_log(&self) -> PathBuf {
+        self.tmp.path().join("daemon.log")
+    }
+
     fn spawn_daemon(&self) -> DaemonChild {
         self.spawn_daemon_with_agent_cmd("/bin/sh") // no real claude in tests
     }
@@ -73,7 +77,13 @@ impl TestEnv {
             .env("SHELL", "/bin/sh")
             .env("NEBULA_AGENT_CMD", agent_cmd)
             .env("NEBULA_WORKTREE_SYNC_MS", "100") // fast external-worktree pickup
-            .stdout(std::process::Stdio::null())
+            .stdout(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(self.daemon_log())
+                    .unwrap(),
+            )
             .stderr(std::process::Stdio::null());
         for k in LIVE_SESSION_ENV {
             cmd.env_remove(k);
@@ -172,16 +182,29 @@ fn commit_file(repo: &Path, path: &str, contents: &str) {
 }
 
 async fn connect(sock: &Path) -> UnixStream {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        match UnixStream::connect(sock).await {
-            Ok(s) => return s,
-            Err(_) if tokio::time::Instant::now() < deadline => {
-                tokio::time::sleep(Duration::from_millis(50)).await
+    poll_until(Duration::from_secs(5), async || {
+        UnixStream::connect(sock).await.ok()
+    })
+    .await
+    .expect("daemon socket never appeared")
+}
+
+/// Polls `probe` every 50ms until it yields a value; `None` once `timeout` passes.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the one async poll loop: every async wait in this file goes through it"
+)]
+async fn poll_until<T>(timeout: Duration, mut probe: impl AsyncFnMut() -> Option<T>) -> Option<T> {
+    tokio::time::timeout(timeout, async {
+        loop {
+            if let Some(value) = probe().await {
+                return value;
             }
-            Err(e) => panic!("daemon socket never appeared: {e}"),
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
-    }
+    })
+    .await
+    .ok()
 }
 
 async fn handshake(stream: &mut UnixStream) {
@@ -1185,8 +1208,9 @@ async fn agent_wait_cli_blocks_until_worker_settles() {
     );
 
     // Now block for real, and settle the worker while the CLI is waiting.
+    let (gate, real) = install_socket_gate(&env);
     let mut waiting = wait_cmd("30").spawn().unwrap();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    client_subscribed(gate, real).await;
     write_frame(
         &mut c,
         &ClientRequest::Input {
@@ -1251,6 +1275,7 @@ async fn agent_wait_any_returns_first_settled_worker() {
         emit_progress(&mut c, id, "3", nebula_core::AgentStatus::Running).await;
     }
 
+    let (gate, real) = install_socket_gate(&env);
     let waiting = agent_cli(
         &env,
         &[
@@ -1267,7 +1292,7 @@ async fn agent_wait_any_returns_first_settled_worker() {
     )
     .spawn()
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    client_subscribed(gate, real).await;
     emit_progress(&mut c, &w1, "0", nebula_core::AgentStatus::Finished).await;
 
     let out = tokio::task::spawn_blocking(move || waiting.wait_with_output().unwrap())
@@ -1326,6 +1351,7 @@ async fn agent_wait_returns_early_when_the_caller_gets_a_message() {
     attach_agent(&mut c, &worker).await;
     emit_progress(&mut c, &worker, "3", nebula_core::AgentStatus::Running).await;
 
+    let (gate, real) = install_socket_gate(&env);
     let waiting = agent_cli(
         &env,
         &["wait", "worker", "--timeout", "30", "--project", "repo"],
@@ -1333,29 +1359,27 @@ async fn agent_wait_returns_early_when_the_caller_gets_a_message() {
     )
     .spawn()
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let sent_at = std::time::Instant::now();
-    let send = agent_cli(
+    client_subscribed(gate, real).await;
+    let mut send = agent_cli(
         &env,
         &["send", "lead", "status?", "--project", "repo"],
         None,
-    )
-    .output()
-    .unwrap();
-    assert!(send.status.success(), "send failed: {send:?}");
-
-    let out = tokio::task::spawn_blocking(move || waiting.wait_with_output().unwrap())
-        .await
-        .unwrap();
+    );
+    let out = tokio::time::timeout(Duration::from_secs(5), async {
+        let send = tokio::task::spawn_blocking(move || send.output().unwrap())
+            .await
+            .unwrap();
+        assert!(send.status.success(), "send failed: {send:?}");
+        tokio::task::spawn_blocking(move || waiting.wait_with_output().unwrap())
+            .await
+            .unwrap()
+    })
+    .await
+    .expect("the wait should notice the message within seconds");
     assert_eq!(
         out.status.code(),
         Some(3),
         "a queued message ends the wait with 3: {out:?}"
-    );
-    assert!(
-        sent_at.elapsed() < Duration::from_secs(5),
-        "the wait should notice the message within seconds, took {:?}",
-        sent_at.elapsed()
     );
     let rows: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(rows, serde_json::json!([]), "the worker is still running");
@@ -1527,6 +1551,7 @@ async fn agent_wait_on_a_host_returns_early_for_a_relayed_send() {
     })
     .await;
 
+    let (gate, real) = install_socket_gate(&host_env);
     let waiting = agent_cli(
         &host_env,
         &["wait", "worker", "--timeout", "30", "--project", "repo"],
@@ -1534,7 +1559,7 @@ async fn agent_wait_on_a_host_returns_early_for_a_relayed_send() {
     )
     .spawn()
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    client_subscribed(gate, real).await;
     let send = agent_cli(
         &env,
         &["send", "lead", "status?", "--project", "repo@testhost"],
@@ -1622,6 +1647,65 @@ fn forward(mut client: UnixStream, real: PathBuf) {
     tokio::spawn(async move {
         let mut daemon = UnixStream::connect(&real).await.unwrap();
         let _ = tokio::io::copy_bidirectional(&mut client, &mut daemon).await;
+    });
+}
+
+/// Forwards the next client through the gate and returns once the daemon's
+/// Snapshot has reached it, so the client is subscribed. Every later client
+/// goes straight through. The gate runs on its own thread: a test that then
+/// blocks on a CLI call would otherwise starve it on the test's runtime.
+async fn client_subscribed(gate: tokio::net::UnixListener, real: PathBuf) {
+    let gate = gate.into_std().unwrap();
+    let (subscribed_tx, subscribed) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                gate.set_nonblocking(true).unwrap();
+                let gate = tokio::net::UnixListener::from_std(gate).unwrap();
+                let client = hold_next(&gate).await;
+                pass_through(gate, real.clone());
+                proxy_until_snapshot(client, &real, subscribed_tx).await;
+                std::future::pending::<()>().await;
+            });
+    });
+    tokio::time::timeout(Duration::from_secs(10), subscribed)
+        .await
+        .expect("the client never received its Snapshot")
+        .unwrap();
+}
+
+async fn proxy_until_snapshot(
+    client: UnixStream,
+    real: &Path,
+    subscribed_tx: tokio::sync::oneshot::Sender<()>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let daemon = UnixStream::connect(real).await.unwrap();
+    let (mut client_rx, mut client_tx) = client.into_split();
+    let (mut daemon_rx, mut daemon_tx) = daemon.into_split();
+    tokio::spawn(async move {
+        let _ = tokio::io::copy(&mut client_rx, &mut daemon_tx).await;
+    });
+    tokio::spawn(async move {
+        let mut subscribed_tx = Some(subscribed_tx);
+        let mut len = [0u8; 4];
+        while daemon_rx.read_exact(&mut len).await.is_ok() {
+            let mut frame = len.to_vec();
+            frame.resize(4 + u32::from_le_bytes(len) as usize, 0);
+            if daemon_rx.read_exact(&mut frame[4..]).await.is_err()
+                || client_tx.write_all(&frame).await.is_err()
+            {
+                break;
+            }
+            if let Ok(Some(ServerEvent::Snapshot { .. })) = read_frame(&mut &frame[..]).await {
+                if let Some(tx) = subscribed_tx.take() {
+                    let _ = tx.send(());
+                }
+            }
+        }
     });
 }
 
@@ -2696,6 +2780,7 @@ async fn prewarmed_session_is_adopted_by_create_agent() {
             "  >/dev/null 2>&1\n",
             "sleep 3\n",
             "echo PREWARM_READY\n",
+            "echo $$ >> \"$(dirname \"$0\")/warm-ready\"\n",
             "exec /bin/sh\n",
         ),
     )
@@ -2719,8 +2804,7 @@ async fn prewarmed_session_is_adopted_by_create_agent() {
     };
     // Kind picked — warm the CLI. No reply expected.
     write_frame(&mut c, &prewarm).await.unwrap();
-    // "User types the name": long enough for the warm boot to finish.
-    tokio::time::sleep(Duration::from_millis(4500)).await;
+    warm_boots_finished(&env, 1).await;
     let branch = std::process::Command::new("git")
         .arg("-C")
         .arg(&repo)
@@ -2764,7 +2848,7 @@ async fn prewarmed_session_is_adopted_by_create_agent() {
     assert!(!alive.success(), "the switch stopped the warm PTY");
 
     write_frame(&mut c, &prewarm).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(4500)).await;
+    warm_boots_finished(&env, 2).await;
 
     write_frame(
         &mut c,
@@ -2872,7 +2956,11 @@ async fn dead_prewarm_falls_back_to_cold_spawn() {
     let env = TestEnv::new();
     let repo = env.make_repo();
     let script = env.tmp.path().join("dying-agent.sh");
-    std::fs::write(&script, "#!/bin/sh\nexit 127\n").unwrap();
+    std::fs::write(
+        &script,
+        "#!/bin/sh\necho $$ > \"$(dirname \"$0\")/dying-pid\"\nexit 127\n",
+    )
+    .unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -2895,8 +2983,19 @@ async fn dead_prewarm_falls_back_to_cold_spawn() {
     )
     .await
     .unwrap();
-    // Give the warm spawn time to die.
-    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let pidfile = env.tmp.path().join("dying-pid");
+    let warm = read_pidfile(&pidfile).await;
+    let unregistered = poll_until(Duration::from_secs(5), async || {
+        std::fs::read_to_string(env.daemon_log())
+            .ok()?
+            .contains("session exited")
+            .then_some(())
+    })
+    .await;
+    assert!(
+        unregistered.is_some(),
+        "the daemon never dropped the warm spawn"
+    );
 
     write_frame(
         &mut c,
@@ -2929,6 +3028,19 @@ async fn dead_prewarm_falls_back_to_cold_spawn() {
             })
         ),
         "CreateAgent must survive a dead prewarm: {events:#?}"
+    );
+    let cold = poll_until(Duration::from_secs(5), async || {
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        (pid != warm).then_some(pid)
+    })
+    .await;
+    assert!(
+        cold.is_some(),
+        "CreateAgent adopted the dead warm spawn instead of spawning cold"
     );
 
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
@@ -3110,14 +3222,54 @@ fn pid_alive(pid: i32) -> bool {
 }
 
 async fn wait_pid_dead(pid: i32, timeout: Duration, what: &str) {
-    let deadline = tokio::time::Instant::now() + timeout;
-    while pid_alive(pid) {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "{what} (pid {pid}) still running after {timeout:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    let dead = poll_until(timeout, async || (!pid_alive(pid)).then_some(())).await;
+    assert!(
+        dead.is_some(),
+        "{what} (pid {pid}) still running after {timeout:?}"
+    );
+}
+
+/// Events up to the idle reap of an unwatched agent created now. Its stamp
+/// postdates every sweep that already ran, so its reap comes from a later
+/// sweep, and the broadcast keeps order: whatever those sweeps reaped arrives
+/// before it.
+async fn read_events_until_a_later_sweep(
+    c: &mut UnixStream,
+    worktree: &nebula_core::WorktreeId,
+    req_id: u64,
+) -> Vec<ServerEvent> {
+    write_frame(
+        c,
+        &ClientRequest::CreateAgent {
+            expected_branch: None,
+            req_id,
+            worktree: worktree.clone(),
+            name: format!("sentinel-{req_id}"),
+            kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            auto_title: false,
+            prompt: None,
+            writer: WriterClaim::Off,
+            spawned_by: None,
+        },
+    )
+    .await
+    .unwrap();
+    read_events_until(c, Duration::from_secs(10), |evs| {
+        let Some(ServerEvent::Ack {
+            created: Some(EntityId::Agent(sentinel)),
+            ..
+        }) = find_ack(evs, req_id)
+        else {
+            return false;
+        };
+        evs.iter().any(|e| {
+            matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
+                if &a.id == sentinel && !a.alive)
+        })
+    })
+    .await
 }
 
 async fn create_agent_get_id(
@@ -3160,19 +3312,25 @@ async fn create_agent_get_id(
 
 /// Poll a pidfile the fake agent writes on boot.
 async fn read_pidfile(path: &Path) -> i32 {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Ok(s) = std::fs::read_to_string(path) {
-            if let Ok(pid) = s.trim().parse() {
-                return pid;
-            }
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "pidfile {path:?} never appeared"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    poll_until(Duration::from_secs(5), async || {
+        std::fs::read_to_string(path).ok()?.trim().parse().ok()
+    })
+    .await
+    .unwrap_or_else(|| panic!("pidfile {path:?} never appeared"))
+}
+
+/// The slow fake agent appends a line to `warm-ready` once its boot is done.
+async fn warm_boots_finished(env: &TestEnv, boots: usize) {
+    let ready = env.tmp.path().join("warm-ready");
+    let finished = poll_until(Duration::from_secs(10), async || {
+        let lines = std::fs::read_to_string(&ready)
+            .unwrap_or_default()
+            .lines()
+            .count();
+        (lines >= boots).then_some(())
+    })
+    .await;
+    assert!(finished.is_some(), "warm boot {boots} never finished");
 }
 
 /// Archiving or deleting an agent must kill its CLI process — sessions must
@@ -3648,22 +3806,8 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
         })
     })
     .await;
-    // Well past the 2s timeout with sweeps every 200ms.
-    tokio::time::sleep(Duration::from_secs(4)).await;
-    write_frame(
-        &mut c,
-        &ClientRequest::RenameAgent {
-            req_id: 6,
-            id: agent_id.clone(),
-            name: "still-here".into(),
-        },
-    )
-    .await
-    .unwrap();
-    let events = read_events_until(&mut c, Duration::from_secs(5), |evs| {
-        find_ack(evs, 6).is_some()
-    })
-    .await;
+    let mut events = read_events_until_a_later_sweep(&mut c, &worktree.id, 6).await;
+    events.extend(read_events_until_a_later_sweep(&mut c, &worktree.id, 7).await);
     assert!(
         !events.iter().any(|e| {
             matches!(e, ServerEvent::EntityUpserted { entity: Entity::Agent(a) }
@@ -3820,23 +3964,7 @@ async fn idle_reaper_spares_finished_agent_with_background_command() {
         reaped(&events, &helpers_id),
         "agent with only a helper child reaped: {events:#?}"
     );
-    tokio::time::sleep(Duration::from_secs(3)).await;
-    write_frame(
-        &mut c,
-        &ClientRequest::RenameAgent {
-            req_id: 4,
-            id: waiting_id.clone(),
-            name: "still-waiting".into(),
-        },
-    )
-    .await
-    .unwrap();
-    events.extend(
-        read_events_until(&mut c, Duration::from_secs(5), |evs| {
-            find_ack(evs, 4).is_some()
-        })
-        .await,
-    );
+    events.extend(read_events_until_a_later_sweep(&mut c, &worktree.id, 4).await);
     assert!(
         !reaped(&events, &waiting_id),
         "agent with a background command spared: {events:#?}"
@@ -3868,6 +3996,10 @@ async fn claude_agent_stays_running_while_its_background_command_runs() {
         .await
         .unwrap();
     }
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the asserted value is a lower bound: no Finished before the command's 4s plus the 15s grace"
+    )]
     let turn_ended = std::time::Instant::now();
 
     let finished = |evs: &[ServerEvent]| {
@@ -4215,6 +4347,10 @@ async fn read_session_returns_screen_text() {
     wait_for_exit(&mut daemon);
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the blocking wait on the daemon's exit; tests call it instead of sleeping"
+)]
 fn wait_for_exit(daemon: &mut std::process::Child) {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
@@ -4237,24 +4373,17 @@ fn wait_for_exit(daemon: &mut std::process::Child) {
 /// Poll the env dump the fake agent CLI writes on boot, returning the
 /// NEBULA_* variables the real CLI's hooks (and `nebula rename`) would see.
 async fn read_env_file(path: &Path) -> std::collections::HashMap<String, String> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Ok(s) = std::fs::read_to_string(path) {
-            let map: std::collections::HashMap<String, String> = s
-                .lines()
-                .filter_map(|l| l.split_once('='))
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect();
-            if map.contains_key("NEBULA_API_URL") && map.contains_key("NEBULA_API_TOKEN") {
-                return map;
-            }
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "agent env dump {path:?} never appeared"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    poll_until(Duration::from_secs(5), async || {
+        let map: std::collections::HashMap<String, String> = std::fs::read_to_string(path)
+            .ok()?
+            .lines()
+            .filter_map(|l| l.split_once('='))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        (map.contains_key("NEBULA_API_URL") && map.contains_key("NEBULA_API_TOKEN")).then_some(map)
+    })
+    .await
+    .unwrap_or_else(|| panic!("agent env dump {path:?} never appeared"))
 }
 
 /// Raw HTTP POST to the daemon's hook receiver, standing in for the curl
@@ -4499,10 +4628,10 @@ async fn worktree_new_seeds_node_modules_when_lockfile_matches() {
         .parent()
         .unwrap()
         .join("repo-worktrees/seeded/node_modules/seeded-package");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while !seeded.exists() && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    poll_until(Duration::from_secs(5), async || {
+        seeded.exists().then_some(())
+    })
+    .await;
     assert_eq!(std::fs::read_to_string(&seeded).unwrap(), "from primary\n");
 
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
@@ -5178,27 +5307,21 @@ done
         handshake(&mut c).await;
         let wt = add_project_get_main_worktree(&mut c, &repo).await;
         let id = create_agent_get_id(&mut c, &wt.id, "collect-owner", 2).await;
-        let owner = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                write_frame(&mut c, &ClientRequest::Subscribe)
-                    .await
-                    .unwrap();
-                let events = read_events_until(&mut c, Duration::from_secs(2), |evs| {
-                    evs.iter()
-                        .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
-                })
-                .await;
-                let found = events.into_iter().find_map(|e| match e {
-                    ServerEvent::Snapshot { agents, .. } => agents
-                        .into_iter()
-                        .find(|a| a.id == id && a.status == AgentStatus::Finished),
-                    _ => None,
-                });
-                if let Some(a) = found {
-                    break a;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
+        let owner = poll_until(Duration::from_secs(5), async || {
+            write_frame(&mut c, &ClientRequest::Subscribe)
+                .await
+                .unwrap();
+            let events = read_events_until(&mut c, Duration::from_secs(2), |evs| {
+                evs.iter()
+                    .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
+            })
+            .await;
+            events.into_iter().find_map(|e| match e {
+                ServerEvent::Snapshot { agents, .. } => agents
+                    .into_iter()
+                    .find(|a| a.id == id && a.status == AgentStatus::Finished),
+                _ => None,
+            })
         })
         .await
         .expect("fake source owner never settled");
@@ -6162,8 +6285,7 @@ async fn a_parked_agent_resumes_its_conversation_once_primary_is_back_on_its_bra
             _ => None,
         })
     };
-    let mut stored = None;
-    for _ in 0..50 {
+    let stored = poll_until(Duration::from_secs(5), async || {
         let mut snap = connect(&env.sock()).await;
         handshake(&mut snap).await;
         write_frame(&mut snap, &ClientRequest::Subscribe)
@@ -6174,18 +6296,15 @@ async fn a_parked_agent_resumes_its_conversation_once_primary_is_back_on_its_bra
                 .any(|e| matches!(e, ServerEvent::Snapshot { .. }))
         })
         .await;
-        stored = evs.iter().find_map(|e| match e {
+        evs.iter().find_map(|e| match e {
             ServerEvent::Snapshot { agents, .. } => agents
                 .iter()
                 .find(|a| a.id == agent_id)
                 .and_then(|a| a.session_id.clone()),
             _ => None,
-        });
-        if stored.is_some() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+        })
+    })
+    .await;
     assert_eq!(stored.as_deref(), Some("sid-parked"));
 
     let mut req_id = 10;
@@ -6246,14 +6365,11 @@ async fn a_parked_agent_resumes_its_conversation_once_primary_is_back_on_its_bra
     })
     .await;
     assert_eq!(agent_row(&resumed).unwrap().worktree_id, primary.id);
-    let mut spawned = String::new();
-    for _ in 0..50 {
-        spawned = std::fs::read_to_string(&spawns).unwrap();
-        if spawned.lines().count() == 2 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    poll_until(Duration::from_secs(5), async || {
+        (std::fs::read_to_string(&spawns).unwrap().lines().count() == 2).then_some(())
+    })
+    .await;
+    let spawned = std::fs::read_to_string(&spawns).unwrap();
     assert_eq!(
         spawned.lines().collect::<Vec<_>>(),
         [
@@ -6532,12 +6648,10 @@ async fn mobile_keys_and_id_deletion_use_the_exact_pty() {
             .output()
             .unwrap()
     };
-    for _ in 0..100 {
-        if ready.exists() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    poll_until(Duration::from_secs(10), async || {
+        ready.exists().then_some(())
+    })
+    .await;
     assert!(ready.exists());
     let result = cli(&[
         "agent",
@@ -6554,12 +6668,10 @@ async fn mobile_keys_and_id_deletion_use_the_exact_pty() {
         assert!(result.status.success(), "key {key}: {result:?}");
     }
     let expected = b"\x1b[A\x1b[B\x1b[D\x1b[C\r\x1b\t";
-    for _ in 0..100 {
-        if std::fs::read(&capture).unwrap_or_default().len() >= expected.len() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    poll_until(Duration::from_secs(2), async || {
+        (std::fs::read(&capture).unwrap_or_default().len() >= expected.len()).then_some(())
+    })
+    .await;
     assert_eq!(std::fs::read(&capture).unwrap(), expected);
     // A caller cannot use a valid ID to delete a session in another project.
     write_frame(
@@ -6874,12 +6986,10 @@ async fn agent_send_delivers_a_long_line_as_one_bracketed_paste() {
     handshake(&mut c).await;
     let main = add_project_get_main_worktree(&mut c, &repo).await;
     create_agent_get_id(&mut c, &main.id, "fixture", 90).await;
-    for _ in 0..100 {
-        if ready.exists() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    poll_until(Duration::from_secs(10), async || {
+        ready.exists().then_some(())
+    })
+    .await;
     assert!(ready.exists());
 
     let long = long_single_line_message();
@@ -6906,12 +7016,10 @@ async fn agent_send_delivers_a_long_line_as_one_bracketed_paste() {
             .unwrap();
         assert!(result.status.success(), "{result:?}");
         expected.extend_from_slice(on_the_wire.as_bytes());
-        for _ in 0..100 {
-            if std::fs::read(&capture).unwrap_or_default().len() >= expected.len() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        poll_until(Duration::from_secs(2), async || {
+            (std::fs::read(&capture).unwrap_or_default().len() >= expected.len()).then_some(())
+        })
+        .await;
         assert_eq!(
             String::from_utf8_lossy(&std::fs::read(&capture).unwrap_or_default()),
             String::from_utf8_lossy(&expected)
@@ -6933,12 +7041,10 @@ async fn agent_send_refuses_paste_sized_text_and_sends_a_file_as_a_one_line_poin
     handshake(&mut c).await;
     let main = add_project_get_main_worktree(&mut c, &repo).await;
     create_agent_get_id(&mut c, &main.id, "fixture", 90).await;
-    for _ in 0..100 {
-        if ready.exists() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    poll_until(Duration::from_secs(10), async || {
+        ready.exists().then_some(())
+    })
+    .await;
     assert!(ready.exists());
     let send = |args: &[&str]| {
         std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
@@ -6977,12 +7083,10 @@ async fn agent_send_refuses_paste_sized_text_and_sends_a_file_as_a_one_line_poin
         "Read {} and act on it.\r",
         std::fs::canonicalize(&message).unwrap().display()
     );
-    for _ in 0..100 {
-        if std::fs::read(&capture).unwrap_or_default().len() >= expected.len() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    poll_until(Duration::from_secs(2), async || {
+        (std::fs::read(&capture).unwrap_or_default().len() >= expected.len()).then_some(())
+    })
+    .await;
     assert_eq!(
         String::from_utf8_lossy(&std::fs::read(&capture).unwrap_or_default()),
         expected
@@ -7234,13 +7338,12 @@ async fn agent_new_writer_on_a_host_applies_the_rule_there() {
     );
     assert_eq!(spawn_checked("unchecked-again", &broken, "data-broken"), "");
     let hung = checker_bin("hung", "#!/bin/sh\nsleep 120\n");
-    let started = std::time::Instant::now();
-    let stderr = spawn_checked("past-a-hang", &hung, "data-hung");
-    assert!(
-        started.elapsed() < Duration::from_secs(15),
-        "a hung check held the spawn for {:?}",
-        started.elapsed()
-    );
+    let (done_tx, done) = std::sync::mpsc::channel();
+    let stderr = std::thread::scope(|scope| {
+        scope.spawn(|| done_tx.send(spawn_checked("past-a-hang", &hung, "data-hung")));
+        done.recv_timeout(Duration::from_secs(15))
+            .expect("a hung check held the spawn for 15s")
+    });
     assert!(
         stderr.starts_with("warning: could not check skills on testhost (")
             && stderr.ends_with("); going ahead\n"),
@@ -7313,12 +7416,10 @@ async fn agent_send_refuses_a_long_message_the_tty_would_drop() {
     handshake(&mut c).await;
     let main = add_project_get_main_worktree(&mut c, &repo).await;
     create_agent_get_id(&mut c, &main.id, "fixture", 90).await;
-    for _ in 0..100 {
-        if ready.exists() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    poll_until(Duration::from_secs(10), async || {
+        ready.exists().then_some(())
+    })
+    .await;
     assert!(ready.exists());
 
     let result = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
@@ -7540,6 +7641,7 @@ async fn prune_drops_ghost_rows_but_never_one_with_a_live_session() {
     };
     let (ghost, ghost_path) = new_worktree(&cli, "ghost");
     let (busy, busy_path) = new_worktree(&cli, "busy");
+    let (plain, plain_path) = new_worktree(&cli, "plain");
     let agent = create_agent_get_id(
         &mut c,
         &nebula_core::WorktreeId(ghost.clone()),
@@ -7549,7 +7651,7 @@ async fn prune_drops_ghost_rows_but_never_one_with_a_live_session() {
     .await;
     archive_agent(&mut c, &agent, 3).await;
     create_terminal_get_id(&mut c, &nebula_core::WorktreeId(busy.clone()), 4).await;
-    for path in [&ghost_path, &busy_path] {
+    for path in [&ghost_path, &busy_path, &plain_path] {
         std::fs::remove_dir_all(path).unwrap();
     }
     assert!(std::process::Command::new("git")
@@ -7559,7 +7661,14 @@ async fn prune_drops_ghost_rows_but_never_one_with_a_live_session() {
         .status()
         .unwrap()
         .success());
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let synced = poll_until(Duration::from_secs(5), async || {
+        (!worktree_ids(&cli).contains(&plain)).then_some(())
+    })
+    .await;
+    assert!(
+        synced.is_some(),
+        "the sync drops a pruned row no session points at"
+    );
     assert!(
         worktree_ids(&cli).contains(&ghost),
         "the sync keeps a ghost row that sessions point at"
