@@ -399,6 +399,11 @@ enum AgentCommand {
         /// two writers on the checkout; implies --writer.
         #[arg(long)]
         force_writer: bool,
+        /// Launch claude with Code Mode off (`CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=0`)
+        /// on every spawn and resume, e.g. for Claude in Chrome or computer
+        /// use; other kinds ignore it.
+        #[arg(long)]
+        no_code_mode: bool,
     },
     /// Block until workers settle out of running (finished, needs_feedback,
     /// terminated…), then print the settled ones as JSON — `agent list`'s
@@ -815,6 +820,7 @@ fn main() -> Result<()> {
                 prompt,
                 writer,
                 force_writer,
+                no_code_mode,
             } => nebula_tui::run_agent_new(nebula_tui::NewAgentOpts {
                 worktree,
                 project,
@@ -828,6 +834,7 @@ fn main() -> Result<()> {
                     (true, false) => nebula_core::WriterClaim::Exclusive,
                     (false, false) => nebula_core::WriterClaim::Off,
                 },
+                code_mode_off: no_code_mode,
             }),
             AgentCommand::Wait {
                 names,

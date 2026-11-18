@@ -18,7 +18,12 @@ struct TestEnv {
 
 /// Session identity a test run inherits when started from inside a live
 /// nebula session; a test daemon must not carry it.
-const LIVE_SESSION_ENV: [&str; 3] = ["NEBULA_AGENT_ID", "NEBULA_API_URL", "NEBULA_API_TOKEN"];
+const LIVE_SESSION_ENV: [&str; 4] = [
+    "NEBULA_AGENT_ID",
+    "NEBULA_API_URL",
+    "NEBULA_API_TOKEN",
+    "CLAUDE_CODE_EXPERIMENTAL_CODE_MODE",
+];
 
 /// A test daemon that is killed when dropped, so a test that panics before
 /// its Shutdown cannot leave the daemon (and the fds it inherited) behind.
@@ -406,6 +411,7 @@ async fn full_crud_attach_and_restart_persistence() {
             prompt: None,
             writer: WriterClaim::Off,
             spawned_by: None,
+            code_mode_off: false,
         },
     )
     .await
@@ -799,6 +805,7 @@ async fn hook_post_from_agent_pty_drives_status() {
             prompt: None,
             writer: WriterClaim::Off,
             spawned_by: None,
+            code_mode_off: false,
         },
     )
     .await
@@ -1867,6 +1874,7 @@ async fn hook_cwd_rehomes_agent_to_other_worktree() {
             prompt: None,
             writer: WriterClaim::Off,
             spawned_by: None,
+            code_mode_off: false,
         },
     )
     .await
@@ -2032,6 +2040,7 @@ async fn move_agent_respawns_live_session_in_target_worktree() {
             prompt: None,
             writer: WriterClaim::Off,
             spawned_by: None,
+            code_mode_off: false,
         },
     )
     .await
@@ -2217,6 +2226,7 @@ async fn codex_hooks_install_and_drive_status() {
             prompt: None,
             writer: WriterClaim::Off,
             spawned_by: None,
+            code_mode_off: false,
         },
     )
     .await
@@ -2864,6 +2874,7 @@ async fn prewarmed_session_is_adopted_by_create_agent() {
             prompt: None,
             writer: WriterClaim::Off,
             spawned_by: None,
+            code_mode_off: false,
         },
     )
     .await
@@ -3011,6 +3022,7 @@ async fn dead_prewarm_falls_back_to_cold_spawn() {
             prompt: None,
             writer: WriterClaim::Off,
             spawned_by: None,
+            code_mode_off: false,
         },
     )
     .await
@@ -3085,6 +3097,7 @@ async fn create_agent_refuses_when_the_cli_is_not_installed() {
                 prompt: None,
                 writer: WriterClaim::Off,
                 spawned_by: None,
+                code_mode_off: false,
             },
         )
         .await
@@ -3180,6 +3193,7 @@ async fn create_agent_succeeds_when_the_cli_is_on_the_login_shell_path() {
             prompt: None,
             writer: WriterClaim::Off,
             spawned_by: None,
+            code_mode_off: false,
         },
     )
     .await
@@ -3252,6 +3266,7 @@ async fn read_events_until_a_later_sweep(
             prompt: None,
             writer: WriterClaim::Off,
             spawned_by: None,
+            code_mode_off: false,
         },
     )
     .await
@@ -3292,6 +3307,7 @@ async fn create_agent_get_id(
             prompt: None,
             writer: WriterClaim::Off,
             spawned_by: None,
+            code_mode_off: false,
         },
     )
     .await
@@ -3478,6 +3494,7 @@ async fn archive_sigkills_an_agent_that_ignores_sighup() {
             prompt: None,
             writer: WriterClaim::Off,
             spawned_by: None,
+            code_mode_off: false,
         },
     )
     .await
@@ -3642,6 +3659,7 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
             prompt: None,
             writer: WriterClaim::Off,
             spawned_by: None,
+            code_mode_off: false,
         },
     )
     .await
@@ -3700,6 +3718,7 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
             prompt: None,
             writer: WriterClaim::Off,
             spawned_by: None,
+            code_mode_off: false,
         },
     )
     .await
@@ -3857,6 +3876,7 @@ async fn idle_reaper_kills_unattached_sibling_on_viewed_worktree() {
                 prompt: None,
                 writer: WriterClaim::Off,
                 spawned_by: None,
+                code_mode_off: false,
             },
         )
         .await
@@ -4459,6 +4479,7 @@ async fn auto_title_instruction_and_rename_flow() {
             prompt: None,
             writer: WriterClaim::Off,
             spawned_by: None,
+            code_mode_off: false,
         },
     )
     .await
@@ -6261,6 +6282,7 @@ async fn a_parked_agent_resumes_its_conversation_once_primary_is_back_on_its_bra
             prompt: None,
             writer: WriterClaim::Off,
             spawned_by: None,
+            code_mode_off: false,
         },
     )
     .await
@@ -7163,6 +7185,95 @@ async fn agent_new_writer_exits_2_naming_the_live_holder_unless_forced() {
         let shown: serde_json::Value = serde_json::from_slice(&show.stdout).unwrap();
         assert_eq!(shown["writer"], writer, "{name}: {show:?}");
     }
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon.0);
+}
+
+/// `agent new --no-code-mode` launches claude with Code Mode forced off on
+/// its first spawn and again on `agent restart` after a daemon restart; a
+/// plain spawn leaves the variable to the user's own settings, even when the
+/// daemon itself was started with it set.
+#[tokio::test]
+async fn agent_new_no_code_mode_forces_code_mode_off_on_every_spawn() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let env_dir = env.tmp.path().join("agent-env");
+    let script = env.tmp.path().join("env-agent");
+    write_executable(
+        &script,
+        &format!(
+            "#!/bin/sh\nenv | grep -e '^NEBULA_' -e '^CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=' > '{}'/$NEBULA_AGENT_ID.env\nexec sleep 600\n",
+            env_dir.display()
+        ),
+    );
+    std::fs::create_dir_all(&env_dir).unwrap();
+    let mut daemon = env.spawn_daemon_with(
+        script.to_str().unwrap(),
+        &[("CLAUDE_CODE_EXPERIMENTAL_CODE_MODE", "0")],
+    );
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    add_project_get_main_worktree(&mut c, &repo).await;
+    let cli = |args: &[&str]| {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"));
+        cmd.args(args)
+            .args(["--project", "repo"])
+            .env("NEBULA_RUNTIME_DIR", &env.runtime_dir);
+        for k in LIVE_SESSION_ENV {
+            cmd.env_remove(k);
+        }
+        let out = cmd.output().unwrap();
+        assert!(out.status.success(), "{args:?}: {out:?}");
+        out
+    };
+    let show = |name: &str| {
+        serde_json::from_slice::<serde_json::Value>(&cli(&["agent", "show", name]).stdout).unwrap()
+    };
+    let env_file =
+        |shown: &serde_json::Value| env_dir.join(format!("{}.env", shown["id"].as_str().unwrap()));
+
+    cli(&[
+        "agent",
+        "new",
+        "--worktree",
+        "main",
+        "--name",
+        "browser",
+        "--no-code-mode",
+    ]);
+    cli(&["agent", "new", "--worktree", "main", "--name", "plain"]);
+    let browser = show("browser");
+    let plain = show("plain");
+    assert_eq!(browser["code_mode_off"], true, "{browser}");
+    assert_eq!(plain["code_mode_off"], false, "{plain}");
+    let browser_env = read_env_file(&env_file(&browser)).await;
+    assert_eq!(
+        browser_env
+            .get("CLAUDE_CODE_EXPERIMENTAL_CODE_MODE")
+            .map(String::as_str),
+        Some("0")
+    );
+    let plain_env = read_env_file(&env_file(&plain)).await;
+    assert_eq!(plain_env.get("CLAUDE_CODE_EXPERIMENTAL_CODE_MODE"), None);
+
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon.0);
+    std::fs::remove_file(env_file(&browser)).unwrap();
+    let mut daemon = env.spawn_daemon_with(
+        script.to_str().unwrap(),
+        &[("CLAUDE_CODE_EXPERIMENTAL_CODE_MODE", "1")],
+    );
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    assert_eq!(show("browser")["code_mode_off"], true);
+    cli(&["agent", "restart", "browser"]);
+    let restarted_env = read_env_file(&env_file(&browser)).await;
+    assert_eq!(
+        restarted_env
+            .get("CLAUDE_CODE_EXPERIMENTAL_CODE_MODE")
+            .map(String::as_str),
+        Some("0")
+    );
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
     wait_for_exit(&mut daemon.0);
 }

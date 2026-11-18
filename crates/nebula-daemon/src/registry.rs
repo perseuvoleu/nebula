@@ -2421,6 +2421,7 @@ impl Daemon {
         prompt: Option<String>,
         writer: WriterClaim,
         spawned_by: Option<AgentId>,
+        code_mode_off: bool,
     ) -> Result<EntityId> {
         let _execution = self.checkout_locks.session(worktree_id).await;
         let worktree = self
@@ -2443,8 +2444,10 @@ impl Daemon {
         // A warm session for this (worktree, kind) hands over its PTY and
         // its pre-generated id — the CLI booted while the user typed the
         // name, so the create feels instant. An initial prompt forces the
-        // cold path: it rides the CLI's argv, which a booted CLI can't take.
-        let adopted = if prompt.is_some() {
+        // cold path: it rides the CLI's argv, which a booted CLI can't take;
+        // so does Code Mode off, which rides the CLI's env.
+        let code_mode_off = code_mode_off && kind == AgentKind::Claude;
+        let adopted = if prompt.is_some() || code_mode_off {
             None
         } else {
             self.take_prewarmed(worktree_id, kind, &model, &effort)
@@ -2481,6 +2484,7 @@ impl Daemon {
             branch: Some(worktree.branch.clone()),
             spawned_by,
             writer: !writer.is_off(),
+            code_mode_off,
         };
         self.store
             .insert_agent_with_auto_title(&agent, auto_title)?;
@@ -2588,6 +2592,7 @@ impl Daemon {
             branch: None,
             spawned_by: None,
             writer: false,
+            code_mode_off: false,
         };
         self.spawn_agent_session(&agent, &worktree, 80, 24)?;
         tracing::info!(agent = %agent.id, kind = kind.as_str(), worktree = %worktree.branch, "prewarmed agent session");
@@ -3509,7 +3514,10 @@ impl Daemon {
             cmd_override,
             initial_prompt,
         );
-        let hook_env = self.hook_env_pairs(&agent.id.to_string());
+        let mut env = self.hook_env_pairs(&agent.id.to_string());
+        if agent.code_mode_off {
+            env.push(("CLAUDE_CODE_EXPERIMENTAL_CODE_MODE".into(), "0".into()));
+        }
         // Run the agent through the user's login+interactive shell so it sees
         // the same env as a Terminal.app tab (~/.zprofile, ~/.zshrc,
         // path_helper) instead of the daemon's inherited-at-boot env.
@@ -3524,7 +3532,7 @@ impl Daemon {
             program,
             args,
             cwd: worktree.path.clone(),
-            env: hook_env,
+            env,
             scrub_env: scrubbed_env_names(),
             cols,
             rows,
@@ -4087,12 +4095,15 @@ fn login_shell_wrap(shell: &str, program: &str, args: &[String]) -> (String, Vec
 }
 
 /// Env vars that must never leak into plain terminals (and are re-set
-/// explicitly for agent PTYs).
+/// explicitly for agent PTYs). The Code Mode switch is inherited from
+/// whichever session auto-started the daemon, so nebula sets it only for
+/// `--no-code-mode` agents.
 pub fn scrubbed_env_names() -> Vec<String> {
     vec![
         "NEBULA_AGENT_ID".into(),
         "NEBULA_API_URL".into(),
         "NEBULA_API_TOKEN".into(),
+        "CLAUDE_CODE_EXPERIMENTAL_CODE_MODE".into(),
     ]
 }
 
@@ -4750,6 +4761,7 @@ mod tests {
                 branch: None,
                 spawned_by: None,
                 writer: false,
+                code_mode_off: false,
             })
             .unwrap();
     }
@@ -4850,6 +4862,7 @@ mod tests {
                     branch: None,
                     spawned_by: None,
                     writer: false,
+                    code_mode_off: false,
                 },
                 true,
             )
@@ -5844,6 +5857,7 @@ exec sleep 60
                 None,
                 WriterClaim::Off,
                 None,
+                false,
             )
             .await
             .unwrap()
@@ -5871,6 +5885,7 @@ exec sleep 60
                 None,
                 writer,
                 None,
+                false,
             )
             .await?;
         let EntityId::Agent(id) = id else { panic!() };
@@ -6938,6 +6953,7 @@ exec sleep 60
                 None,
                 WriterClaim::Off,
                 None,
+                false,
             )
             .await
             .unwrap_err();
@@ -7300,6 +7316,7 @@ exec sleep 60
                     branch: None,
                     spawned_by: None,
                     writer: false,
+                    code_mode_off: false,
                 })
                 .unwrap();
         }

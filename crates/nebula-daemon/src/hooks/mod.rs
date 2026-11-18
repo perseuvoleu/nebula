@@ -480,6 +480,7 @@ mod tests {
             branch: None,
             spawned_by: None,
             writer: false,
+            code_mode_off: false,
         };
         store
             .insert_agent_with_auto_title(&agent("pending"), true)
@@ -821,6 +822,7 @@ mod tests {
             branch: None,
             spawned_by: None,
             writer: false,
+            code_mode_off: false,
         };
         store
             .insert_agent(&remote_agent("r1", "tw1", false))

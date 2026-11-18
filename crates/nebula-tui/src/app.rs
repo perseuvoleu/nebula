@@ -5001,6 +5001,7 @@ mod tests {
             branch: None,
             spawned_by: None,
             writer: false,
+            code_mode_off: false,
         });
         let template = app.tree.agents[0].clone();
         app.tree.agents.push(Agent {
@@ -5057,6 +5058,7 @@ mod tests {
                 branch: None,
                 spawned_by: None,
                 writer: false,
+                code_mode_off: false,
             });
         }
         app.tree.terminals.push(TerminalTab {
@@ -5187,6 +5189,7 @@ mod tests {
                 branch: None,
                 spawned_by: None,
                 writer: false,
+                code_mode_off: false,
             });
         }
         assert_eq!(branches(&app), fixed, "running sessions move no row");
@@ -5372,6 +5375,7 @@ mod tests {
             branch: branch.map(str::to_owned),
             spawned_by: None,
             writer: false,
+            code_mode_off: false,
         }
     }
 
@@ -6105,6 +6109,7 @@ mod tests {
             branch: None,
             spawned_by: None,
             writer: false,
+            code_mode_off: false,
         });
 
         assert_eq!(

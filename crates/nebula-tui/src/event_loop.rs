@@ -7623,6 +7623,7 @@ fn create_default_agent(
         prompt: None,
         writer: WriterClaim::Off,
         spawned_by: None,
+        code_mode_off: false,
     });
     // Same warm-slot refill as `create_agent`.
     if kind == AgentKind::Claude {
@@ -7985,6 +7986,7 @@ fn create_agent(
         prompt: None,
         writer: WriterClaim::Off,
         spawned_by: None,
+        code_mode_off: false,
     });
     // The create consumes (or, off-spec, discards) the worktree's warm
     // Claude slot; refill it so the next create is instant too.
@@ -11354,6 +11356,7 @@ mod tests {
                     branch: None,
                     spawned_by: None,
                     writer: false,
+                    code_mode_off: false,
                 }),
             },
         );
@@ -11518,6 +11521,7 @@ mod tests {
                     branch: None,
                     spawned_by: None,
                     writer: false,
+                    code_mode_off: false,
                 }),
             },
         );
@@ -11598,6 +11602,7 @@ mod tests {
                     branch: Some("feature-x".into()),
                     spawned_by: None,
                     writer: false,
+                    code_mode_off: false,
                 }),
             },
         );
@@ -11854,6 +11859,7 @@ mod tests {
                     branch: None,
                     spawned_by: None,
                     writer: false,
+                    code_mode_off: false,
                 }),
             },
         );
@@ -13830,6 +13836,7 @@ mod tests {
                     branch: None,
                     spawned_by: None,
                     writer: false,
+                    code_mode_off: false,
                 }),
             },
         );
@@ -13917,6 +13924,7 @@ mod tests {
                     branch: None,
                     spawned_by: None,
                     writer: false,
+                    code_mode_off: false,
                 }),
             },
         );
@@ -14026,6 +14034,7 @@ mod tests {
                     branch: None,
                     spawned_by: None,
                     writer: false,
+                    code_mode_off: false,
                 }),
             };
         hse(
@@ -14121,6 +14130,7 @@ mod tests {
                         branch: None,
                         spawned_by: None,
                         writer: false,
+                        code_mode_off: false,
                     }),
                 },
             );
@@ -14207,6 +14217,7 @@ mod tests {
                     branch: None,
                     spawned_by: None,
                     writer: false,
+                    code_mode_off: false,
                 }),
             },
         );
@@ -14546,6 +14557,7 @@ mod tests {
                     branch: None,
                     spawned_by: None,
                     writer: false,
+                    code_mode_off: false,
                 }),
             },
         );
@@ -16193,6 +16205,7 @@ mod tests {
                 branch: None,
                 spawned_by: None,
                 writer: false,
+                code_mode_off: false,
             })
         };
         hse(
@@ -16266,6 +16279,7 @@ mod tests {
             branch: None,
             spawned_by: None,
             writer: false,
+            code_mode_off: false,
         })
     }
 
@@ -17356,6 +17370,7 @@ mod tests {
                     branch: None,
                     spawned_by: None,
                     writer: false,
+                    code_mode_off: false,
                 }),
             },
         );
@@ -18035,6 +18050,7 @@ mod tests {
                     branch: None,
                     spawned_by: None,
                     writer: false,
+                    code_mode_off: false,
                 }),
             },
         );
@@ -18694,6 +18710,7 @@ mod tests {
                     branch: None,
                     spawned_by: None,
                     writer: false,
+                    code_mode_off: false,
                 }),
             },
         );
@@ -18790,6 +18807,7 @@ mod tests {
                     branch: None,
                     spawned_by: None,
                     writer: false,
+                    code_mode_off: false,
                 }),
             },
         );
@@ -18872,6 +18890,7 @@ mod tests {
                     branch: None,
                     spawned_by: None,
                     writer: false,
+                    code_mode_off: false,
                 }),
             },
         );
@@ -19068,6 +19087,7 @@ mod tests {
                         branch: None,
                         spawned_by: None,
                         writer: false,
+                        code_mode_off: false,
                     }),
                 },
             );
@@ -19192,6 +19212,7 @@ mod tests {
                         branch: None,
                         spawned_by: None,
                         writer: false,
+                        code_mode_off: false,
                     }),
                 },
             );
@@ -21222,6 +21243,7 @@ mod tests {
                     branch: None,
                     spawned_by: None,
                     writer: false,
+                    code_mode_off: false,
                 }),
             },
         );
@@ -22766,6 +22788,7 @@ mod tests {
                     branch: None,
                     spawned_by: None,
                     writer: false,
+                    code_mode_off: false,
                 }),
             },
         );
@@ -22790,6 +22813,7 @@ mod tests {
                     branch: None,
                     spawned_by: None,
                     writer: false,
+                    code_mode_off: false,
                 }),
             },
         );
@@ -23155,6 +23179,7 @@ mod tests {
                     branch: None,
                     spawned_by: None,
                     writer: false,
+                    code_mode_off: false,
                 }),
             },
         );
@@ -25010,6 +25035,7 @@ mod tests {
                         branch: None,
                         spawned_by: None,
                         writer: false,
+                        code_mode_off: false,
                     }),
                 },
             );
@@ -25085,6 +25111,7 @@ mod tests {
             branch: None,
             spawned_by: None,
             writer: false,
+            code_mode_off: false,
         })
     }
 

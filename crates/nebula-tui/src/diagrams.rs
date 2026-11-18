@@ -727,6 +727,7 @@ mod tests {
             branch: None,
             spawned_by: None,
             writer: false,
+            code_mode_off: false,
         }
     }
 

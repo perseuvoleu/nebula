@@ -175,6 +175,7 @@ impl Fixture {
             branch: Some("feature".into()),
             spawned_by: None,
             writer: false,
+            code_mode_off: false,
         });
     }
 }

@@ -1427,6 +1427,7 @@ pub async fn agent_show(name: String, project_flag: Option<String>) -> Result<()
             "archived": a.archived,
             "pinned": a.pinned,
             "writer": a.writer,
+            "code_mode_off": a.code_mode_off,
             "spawned_by": a.spawned_by,
             "alive": a.alive,
             // Native CLI session id (claude/codex/cursor/pi) the daemon stored for
@@ -1738,6 +1739,8 @@ pub struct NewAgentOpts {
     /// writer slot; the owning daemon refuses an `Exclusive` claim while a
     /// live writer holds it.
     pub writer: nebula_core::WriterClaim,
+    /// `--no-code-mode`: claude spawns get `CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=0`.
+    pub code_mode_off: bool,
 }
 
 /// Session name when the caller passed no `--name`: derived from the
@@ -1876,6 +1879,7 @@ pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
             prompt: opts.prompt,
             writer: opts.writer,
             spawned_by: env_agent_id().map(AgentId),
+            code_mode_off: opts.code_mode_off,
         },
     )
     .await?;
@@ -1952,6 +1956,7 @@ pub async fn agent_list(
                 "path": worktree.path.display().to_string(),
                 "archived": a.archived,
                 "writer": a.writer,
+                "code_mode_off": a.code_mode_off,
                 "spawned_by": a.spawned_by,
                 "session_id": a.session_id,
             }))
@@ -2152,6 +2157,7 @@ pub async fn agent_wait(
                 "path": worktree.path.display().to_string(),
                 "archived": a.archived,
                 "writer": a.writer,
+                "code_mode_off": a.code_mode_off,
                 "spawned_by": a.spawned_by,
                 "session_id": a.session_id,
             }))

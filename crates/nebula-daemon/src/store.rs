@@ -284,6 +284,10 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE agents ADD COLUMN spawned_by TEXT;
     ",
+    // 28: the session spawned with Code Mode off (`agent new --no-code-mode`)
+    "
+    ALTER TABLE agents ADD COLUMN code_mode_off INTEGER NOT NULL DEFAULT 0;
+    ",
 ];
 
 /// A project's twin on a host, as the hook pointer needs it: the host, the
@@ -615,8 +619,8 @@ impl Store {
     /// clients never see it, they only observe the eventual rename.
     pub fn insert_agent_with_auto_title(&self, a: &Agent, auto_title: bool) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO agents (id, worktree_id, name, status, archived, archived_at, pinned, kind, claude_session_id, sort_order, created_at, status_changed_at, model, effort, auto_title_pending, branch, writer, spawned_by)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+            "INSERT INTO agents (id, worktree_id, name, status, archived, archived_at, pinned, kind, claude_session_id, sort_order, created_at, status_changed_at, model, effort, auto_title_pending, branch, writer, spawned_by, code_mode_off)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 a.id.as_str(),
                 a.worktree_id.as_str(),
@@ -635,7 +639,8 @@ impl Store {
                 auto_title as i64,
                 a.branch,
                 a.writer as i64,
-                a.spawned_by.as_ref().map(AgentId::as_str)
+                a.spawned_by.as_ref().map(AgentId::as_str),
+                a.code_mode_off as i64
             ],
         )?;
         Ok(())
@@ -1293,7 +1298,7 @@ impl Store {
     pub fn get_agent(&self, id: &AgentId) -> Result<Option<Agent>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, worktree_id, name, status, archived, pinned, kind, claude_session_id, sort_order, status_changed_at, model, effort, archived_at, branch, writer, spawned_by FROM agents WHERE id = ?1",
+            "SELECT id, worktree_id, name, status, archived, pinned, kind, claude_session_id, sort_order, status_changed_at, model, effort, archived_at, branch, writer, spawned_by, code_mode_off FROM agents WHERE id = ?1",
         )?;
         let mut rows = stmt.query(params![id.as_str()])?;
         Ok(rows.next()?.map(|r| Agent {
@@ -1315,6 +1320,7 @@ impl Store {
             branch: r.get(13).unwrap(),
             writer: r.get::<_, i64>(14).unwrap() != 0,
             spawned_by: r.get::<_, Option<String>>(15).unwrap().map(AgentId),
+            code_mode_off: r.get::<_, i64>(16).unwrap() != 0,
         }))
     }
 
@@ -1411,7 +1417,7 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let agents = conn
-            .prepare("SELECT id, worktree_id, name, status, archived, pinned, kind, claude_session_id, sort_order, status_changed_at, model, effort, archived_at, branch, writer, spawned_by FROM agents ORDER BY sort_order, created_at")?
+            .prepare("SELECT id, worktree_id, name, status, archived, pinned, kind, claude_session_id, sort_order, status_changed_at, model, effort, archived_at, branch, writer, spawned_by, code_mode_off FROM agents ORDER BY sort_order, created_at")?
             .query_map([], |r| {
                 Ok(Agent {
                     id: AgentId(r.get(0)?),
@@ -1431,6 +1437,7 @@ impl Store {
                     branch: r.get(13)?,
                     writer: r.get::<_, i64>(14)? != 0,
                     spawned_by: r.get::<_, Option<String>>(15)?.map(AgentId),
+                    code_mode_off: r.get::<_, i64>(16)? != 0,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1524,6 +1531,7 @@ mod tests {
             branch: None,
             spawned_by: Some(AgentId("lead".into())),
             writer: true,
+            code_mode_off: false,
         };
         store.insert_agent(&agent).unwrap();
         let codex_agent = Agent {
@@ -1544,6 +1552,7 @@ mod tests {
             branch: None,
             spawned_by: None,
             writer: false,
+            code_mode_off: false,
         };
         store.insert_agent(&codex_agent).unwrap();
         let cursor_agent = Agent {
@@ -1564,6 +1573,7 @@ mod tests {
             branch: None,
             spawned_by: None,
             writer: false,
+            code_mode_off: false,
         };
         store.insert_agent(&cursor_agent).unwrap();
 
@@ -1812,6 +1822,7 @@ mod tests {
                 branch: None,
                 spawned_by: None,
                 writer: false,
+                code_mode_off: false,
             })
             .unwrap();
 
@@ -2068,6 +2079,62 @@ mod tests {
         }
     }
 
+    /// Real upgrade path: sessions from before `agent new --no-code-mode`
+    /// keep Code Mode as the user's settings have it, and a flagged session
+    /// reads back flagged.
+    #[test]
+    fn migration_28_leaves_existing_sessions_in_code_mode_and_keeps_the_flag() {
+        let path =
+            std::env::temp_dir().join(format!("nebula-mig28-test-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+            for (i, migration) in MIGRATIONS.iter().take(27).enumerate() {
+                conn.execute_batch(&format!(
+                    "BEGIN; {migration}; PRAGMA user_version = {}; COMMIT;",
+                    i + 1
+                ))
+                .unwrap();
+            }
+            conn.execute_batch(
+                "INSERT INTO projects (id, workspace_id, name, repo_path, sort_order, created_at) VALUES ('p1', 'default', 'p', '/tmp/p', 0, 0);
+                 INSERT INTO worktrees (id, project_id, path, branch, is_main, created_at) VALUES ('w1', 'p1', '/tmp/p', 'main', 1, 0);
+                 INSERT INTO agents (id, worktree_id, name, created_at) VALUES ('a1', 'w1', 'legacy', 0);",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let mut flagged = store.get_agent(&AgentId("a1".into())).unwrap().unwrap();
+        assert!(!flagged.code_mode_off);
+        flagged.id = AgentId("a2".into());
+        flagged.name = "browser".into();
+        flagged.code_mode_off = true;
+        store.insert_agent(&flagged).unwrap();
+        let (_, _, agents, _) = store.load_tree().unwrap();
+        let by_name = |name: &str| {
+            agents
+                .iter()
+                .find(|a| a.name == name)
+                .unwrap()
+                .code_mode_off
+        };
+        assert!(!by_name("legacy"));
+        assert!(by_name("browser"));
+        assert!(
+            store
+                .get_agent(&AgentId("a2".into()))
+                .unwrap()
+                .unwrap()
+                .code_mode_off
+        );
+        drop(store);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
+        }
+    }
+
     #[test]
     fn migration_13_moves_existing_projects_into_default_workspace() {
         let path =
@@ -2305,6 +2372,7 @@ mod tests {
             branch: None,
             spawned_by: None,
             writer: false,
+            code_mode_off: false,
         };
 
         // Default-named session: pending until the agent titles it, and the
@@ -2550,6 +2618,7 @@ mod tests {
                     branch: None,
                     spawned_by: None,
                     writer: false,
+                    code_mode_off: false,
                 })
                 .unwrap();
         }

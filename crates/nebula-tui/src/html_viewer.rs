@@ -1328,6 +1328,7 @@ mod tests {
             branch: None,
             spawned_by: None,
             writer: false,
+            code_mode_off: false,
         };
         let mut viewer = HtmlViewer::open(tmp.path().to_path_buf(), None, None);
 

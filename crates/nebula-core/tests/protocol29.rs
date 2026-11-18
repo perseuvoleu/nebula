@@ -75,6 +75,7 @@ fn create_agent_keeps_its_spawner_without_a_writer_claim() {
         prompt: None,
         writer: nebula_core::WriterClaim::Off,
         spawned_by: Some(nebula_core::AgentId("lead".into())),
+        code_mode_off: false,
     };
     let wire = rmp_serde::to_vec(&request).unwrap();
     let decoded: ClientRequest = rmp_serde::from_slice(&wire).unwrap();

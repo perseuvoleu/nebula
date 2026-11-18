@@ -47,7 +47,7 @@ impl WriterClaim {
 }
 
 /// `CreateAgent`'s fields are positional on the wire, so its optional tail
-/// is cut from the end only: `writer` stays while `spawned_by` follows it.
+/// is cut from the end only: `writer` stays while a later field follows it.
 #[allow(clippy::too_many_arguments)]
 fn create_agent_wire<S: serde::Serializer>(
     req_id: &u64,
@@ -61,13 +61,15 @@ fn create_agent_wire<S: serde::Serializer>(
     prompt: &Option<String>,
     writer: &WriterClaim,
     spawned_by: &Option<AgentId>,
+    code_mode_off: &bool,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
     use serde::ser::SerializeStruct;
-    let tail = match (writer.is_off(), spawned_by.is_some()) {
-        (_, true) => 2,
-        (false, false) => 1,
-        (true, false) => 0,
+    let tail = match (writer.is_off(), spawned_by.is_some(), *code_mode_off) {
+        (_, _, true) => 3,
+        (_, true, false) => 2,
+        (false, false, false) => 1,
+        (true, false, false) => 0,
     };
     let mut fields = serializer.serialize_struct("CreateAgent", 9 + tail)?;
     fields.serialize_field("req_id", req_id)?;
@@ -84,6 +86,9 @@ fn create_agent_wire<S: serde::Serializer>(
     }
     if tail > 1 {
         fields.serialize_field("spawned_by", spawned_by)?;
+    }
+    if tail > 2 {
+        fields.serialize_field("code_mode_off", code_mode_off)?;
     }
     fields.end()
 }
@@ -283,6 +288,10 @@ pub enum ClientRequest {
         /// `NEBULA_AGENT_ID`); None for a spawn by the user.
         #[serde(default)]
         spawned_by: Option<AgentId>,
+        /// `agent new --no-code-mode`: claude spawns get
+        /// `CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=0`.
+        #[serde(default)]
+        code_mode_off: bool,
     },
     /// Fire-and-forget: pre-spawn an agent CLI for this (worktree, kind) so
     /// the next CreateAgent adopts an already-booted session. Sent the

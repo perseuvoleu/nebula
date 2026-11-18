@@ -202,10 +202,15 @@ pub struct Agent {
     #[serde(default)]
     pub spawned_by: Option<AgentId>,
     /// Spawned with `agent new --writer`: the checkout's one writer while
-    /// the session lives. Skipped when false, so it stays the last field:
-    /// fields are positional on the wire.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    /// the session lives.
+    #[serde(default)]
     pub writer: bool,
+    /// Spawned with `agent new --no-code-mode`: every spawn of this claude
+    /// session gets `CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=0`, since a Code
+    /// Mode conversation resumes only with Code Mode on. Skipped when false,
+    /// so it stays the last field: fields are positional on the wire.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub code_mode_off: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
