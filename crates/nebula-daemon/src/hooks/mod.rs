@@ -329,6 +329,11 @@ async fn receive_hook(
 
     // Parse failures still 200 — never fault a hook.
     let payload: HookPayload = serde_json::from_str(&body).unwrap_or_default();
+    // Code Mode fires UserPromptSubmit on background code output; it is no
+    // user prompt, and the PTY's progress signal already shows the turn busy.
+    if query.hook_event == "UserPromptSubmit" && payload.source.as_deref() == Some("poll_event") {
+        return (StatusCode::OK, String::new());
+    }
     let Some(event) = parse_event(&query.hook_event, &payload) else {
         return quiet_or(StatusCode::OK, r#"{"ok": false}"#);
     };
@@ -569,6 +574,41 @@ mod tests {
         )
         .await;
         assert_eq!((status, body.as_str()), (401, ""));
+    }
+
+    #[tokio::test]
+    async fn code_mode_poll_event_prompt_is_answered_empty_and_not_delivered() {
+        let store = seeded_store();
+        let (env, mut rx) = start_hook_server(store.clone()).await.unwrap();
+
+        let (status, body) = http_post(
+            env.port,
+            "/api/hooks/claude?agentId=pending&hookEvent=UserPromptSubmit",
+            &env.token,
+            r#"{"session_id":"s1","source":"poll_event"}"#,
+        )
+        .await;
+        assert_eq!((status, body.as_str()), (200, ""));
+
+        http_post(
+            env.port,
+            "/api/hooks/claude?agentId=pending&hookEvent=Stop",
+            &env.token,
+            r#"{"session_id":"s1"}"#,
+        )
+        .await;
+        let first = rx.recv().await.unwrap();
+        assert_eq!(first.event, HookEvent::Stop, "poll_event was delivered");
+
+        let (_, body) = http_post(
+            env.port,
+            "/api/hooks/claude?agentId=pending&hookEvent=UserPromptSubmit",
+            &env.token,
+            r#"{"session_id":"s1","source":"user"}"#,
+        )
+        .await;
+        assert_eq!(body, auto_title_injection());
+        assert_eq!(rx.recv().await.unwrap().event, HookEvent::UserPromptSubmit);
     }
 
     /// The todos pointer rides UserPromptSubmit while the agent's project
