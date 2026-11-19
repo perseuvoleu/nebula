@@ -1308,7 +1308,8 @@ pub async fn worktree_checkout(
 }
 
 /// Resolve one agent of `project` by session name (the name shown in the
-/// panels) — the shared lookup behind read/send/show/archive/delete/restart.
+/// panels) or by the id `agent new` printed — the shared lookup behind
+/// read/send/show/archive/delete/restart.
 fn resolve_agent<'a>(
     agents: &'a [nebula_core::Agent],
     worktrees: &'a [nebula_core::Worktree],
@@ -1324,7 +1325,7 @@ fn resolve_agent<'a>(
     agents
         .iter()
         .find_map(|a| {
-            if a.name != name {
+            if a.name != name && a.id.as_str() != name {
                 return None;
             }
             in_project(a).map(|w| (a, w))
@@ -1739,6 +1740,9 @@ pub struct NewAgentOpts {
     /// writer slot; the owning daemon refuses an `Exclusive` claim while a
     /// live writer holds it.
     pub writer: nebula_core::WriterClaim,
+    /// `--writer-wait`: how long a refused `Exclusive` claim keeps retrying
+    /// until the owning daemon accepts it.
+    pub writer_wait: Duration,
     /// `--no-code-mode`: claude spawns get `CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=0`.
     pub code_mode_off: bool,
 }
@@ -1864,27 +1868,55 @@ pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
             target.branch
         );
     }
-    let req_id = 1u64;
-    write_frame(
-        &mut conn.stream,
-        &ClientRequest::CreateAgent {
-            req_id,
-            worktree: target.id.clone(),
-            expected_branch,
-            name: name.clone(),
-            kind,
-            model: opts.model,
-            effort: opts.effort,
-            auto_title,
-            prompt: opts.prompt,
-            writer: opts.writer,
-            spawned_by: env_agent_id().map(AgentId),
-            code_mode_off: opts.code_mode_off,
-        },
-    )
-    .await?;
-    let mut upserts = Vec::new();
-    let created = await_ack(&mut conn, req_id, &mut upserts).await?;
+    // The owning daemon stays the judge of the writer mark: a refused claim
+    // is retried until it is accepted or --writer-wait runs out, so the
+    // protocol, the remote path and older daemons are unchanged.
+    let wait_until = tokio::time::Instant::now() + opts.writer_wait;
+    let mut req_id = 10u64;
+    let mut announced = false;
+    let created = loop {
+        req_id += 1;
+        write_frame(
+            &mut conn.stream,
+            &ClientRequest::CreateAgent {
+                req_id,
+                worktree: target.id.clone(),
+                expected_branch: expected_branch.clone(),
+                name: name.clone(),
+                kind,
+                model: opts.model.clone(),
+                effort: opts.effort.clone(),
+                auto_title,
+                prompt: opts.prompt.clone(),
+                writer: opts.writer,
+                spawned_by: env_agent_id().map(AgentId),
+                code_mode_off: opts.code_mode_off,
+            },
+        )
+        .await?;
+        let mut upserts = Vec::new();
+        match await_ack(&mut conn, req_id, &mut upserts).await {
+            Err(why)
+                if why.to_string().contains(nebula_core::WRITER_HELD_REFUSAL)
+                    && tokio::time::Instant::now() < wait_until =>
+            {
+                if !announced {
+                    announced = true;
+                    let held = why.to_string();
+                    eprintln!(
+                        "{}; waiting up to {}s for it to exit or be archived (--writer-wait)",
+                        held.split(';').next().unwrap_or(&held),
+                        opts.writer_wait.as_secs()
+                    );
+                }
+                tokio::time::sleep_until(
+                    wait_until.min(tokio::time::Instant::now() + Duration::from_secs(1)),
+                )
+                .await;
+            }
+            done => break done?,
+        }
+    };
     let id = match created {
         Some(nebula_core::EntityId::Agent(id)) => id.to_string(),
         _ => String::new(),
@@ -2044,7 +2076,9 @@ pub async fn agent_wait(
             .map(|name| {
                 agents
                     .iter()
-                    .find(|a| a.name == *name && in_project(a, &worktrees))
+                    .find(|a| {
+                        (a.name == *name || a.id.as_str() == name) && in_project(a, &worktrees)
+                    })
                     .map(|a| a.id.clone())
                     .with_context(|| {
                         format!(

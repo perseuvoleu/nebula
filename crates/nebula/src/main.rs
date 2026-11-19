@@ -391,10 +391,16 @@ enum AgentCommand {
         /// Initial task, submitted as the CLI's first prompt.
         #[arg(long)]
         prompt: Option<String>,
-        /// Mark the session as the checkout's one writer; refused (exit 2)
-        /// while another live session holds that mark.
+        /// Mark the session as the checkout's one writer. While another
+        /// unarchived session holds that mark (live PTY, or running,
+        /// needs_feedback, finished or disconnected), wait for it to exit or
+        /// be archived, then spawn; exit 2 if it still holds the mark after
+        /// --writer-wait.
         #[arg(long)]
         writer: bool,
+        /// Seconds --writer waits for the current writer; 0 refuses at once.
+        #[arg(long, default_value_t = 600)]
+        writer_wait: u64,
         /// Spawn as the writer alongside a live one, after the user approved
         /// two writers on the checkout; implies --writer.
         #[arg(long)]
@@ -819,6 +825,7 @@ fn main() -> Result<()> {
                 name,
                 prompt,
                 writer,
+                writer_wait,
                 force_writer,
                 no_code_mode,
             } => nebula_tui::run_agent_new(nebula_tui::NewAgentOpts {
@@ -834,6 +841,7 @@ fn main() -> Result<()> {
                     (true, false) => nebula_core::WriterClaim::Exclusive,
                     (false, false) => nebula_core::WriterClaim::Off,
                 },
+                writer_wait: std::time::Duration::from_secs(writer_wait),
                 code_mode_off: no_code_mode,
             }),
             AgentCommand::Wait {

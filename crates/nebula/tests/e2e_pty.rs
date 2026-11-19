@@ -7160,15 +7160,21 @@ async fn agent_new_writer_exits_2_naming_the_live_holder_unless_forced() {
     let shown: serde_json::Value = serde_json::from_slice(&show.stdout).unwrap();
     assert_eq!(shown["writer"], true, "{show:?}");
 
-    let second = spawn("second", &["--writer"]);
-    assert_eq!(second.status.code(), Some(2), "{second:?}");
-    assert_eq!(String::from_utf8_lossy(&second.stdout), "");
-    assert!(
-        String::from_utf8_lossy(&second.stderr).contains(
-            "\"holder\" is the writer on main; wait for it, archive it, or pass --force-writer after the user approves two writers"
-        ),
-        "{second:?}"
-    );
+    for wait in ["0", "1"] {
+        let second = spawn("second", &["--writer", "--writer-wait", wait]);
+        assert_eq!(
+            second.status.code(),
+            Some(2),
+            "--writer-wait {wait}: {second:?}"
+        );
+        assert_eq!(String::from_utf8_lossy(&second.stdout), "");
+        assert!(
+            String::from_utf8_lossy(&second.stderr).contains(
+                "\"holder\" is the writer on main; wait for it, archive it, or pass --force-writer after the user approves two writers"
+            ),
+            "--writer-wait {wait}: {second:?}"
+        );
+    }
 
     for (name, flags, writer) in [
         ("forced", &["--writer", "--force-writer"][..], true),
@@ -7185,6 +7191,71 @@ async fn agent_new_writer_exits_2_naming_the_live_holder_unless_forced() {
         let shown: serde_json::Value = serde_json::from_slice(&show.stdout).unwrap();
         assert_eq!(shown["writer"], writer, "{name}: {show:?}");
     }
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon.0);
+}
+
+/// A second `agent new --writer` waits for the holder's PTY to end, then
+/// spawns as the writer; the id it prints names the session wherever a
+/// session name does.
+#[tokio::test]
+async fn agent_new_writer_waits_for_the_holder_then_spawns_and_its_id_resolves() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let script = env.tmp.path().join("short-agent");
+    write_executable(&script, "#!/bin/sh\nexec sleep 3\n");
+    let mut daemon = env.spawn_daemon_with_agent_cmd(script.to_str().unwrap());
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    add_project_get_main_worktree(&mut c, &repo).await;
+    let cli = |args: &[&str]| {
+        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"));
+        cmd.args(args)
+            .args(["--project", "repo"])
+            .env("NEBULA_RUNTIME_DIR", &env.runtime_dir);
+        for k in LIVE_SESSION_ENV {
+            cmd.env_remove(k);
+        }
+        cmd.output().unwrap()
+    };
+    let spawn = |name: &str| {
+        cli(&[
+            "agent",
+            "new",
+            "--worktree",
+            "main",
+            "--name",
+            name,
+            "--writer",
+        ])
+    };
+
+    let holder = spawn("holder");
+    assert!(holder.status.success(), "{holder:?}");
+    let second = spawn("second");
+    assert!(second.status.success(), "{second:?}");
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert_eq!(
+        stderr.lines().filter(|l| l.contains("\"holder\"")).count(),
+        1,
+        "{second:?}"
+    );
+    let created: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+    let id = created["id"].as_str().unwrap();
+    assert!(!id.is_empty(), "{second:?}");
+
+    let show = cli(&["agent", "show", id]);
+    assert!(show.status.success(), "{show:?}");
+    let shown: serde_json::Value = serde_json::from_slice(&show.stdout).unwrap();
+    assert_eq!(shown["name"], "second", "{show:?}");
+    assert_eq!(shown["writer"], true, "{show:?}");
+    for verb in ["read", "archive"] {
+        let out = cli(&["agent", verb, id]);
+        assert!(out.status.success(), "{verb}: {out:?}");
+    }
+    let show = cli(&["agent", "show", "second"]);
+    let shown: serde_json::Value = serde_json::from_slice(&show.stdout).unwrap();
+    assert_eq!(shown["archived"], true, "{show:?}");
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
     wait_for_exit(&mut daemon.0);
 }
@@ -7419,7 +7490,17 @@ async fn agent_new_writer_on_a_host_applies_the_rule_there() {
     assert!(holder.status.success(), "{holder:?}");
     assert_eq!(String::from_utf8_lossy(&holder.stderr), "");
     assert_eq!(writer_of("holder"), true);
-    let second = spawn("second");
+    let second = cli(&[
+        "agent",
+        "new",
+        "--worktree",
+        "main",
+        "--name",
+        "second",
+        "--writer",
+        "--writer-wait",
+        "1",
+    ]);
     assert_eq!(second.status.code(), Some(2), "{second:?}");
     assert!(
         String::from_utf8_lossy(&second.stderr).contains("\"holder\" is the writer on main;"),
