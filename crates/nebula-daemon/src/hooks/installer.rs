@@ -192,6 +192,7 @@ pub fn install_for_kind(kind: AgentKind, cwd: &Path) -> Result<()> {
         // Pi has no hooks — a managed extension in its global extensions
         // dir phones the same endpoints home.
         AgentKind::Pi => install_pi_extension(&pi_agent_dir()),
+        AgentKind::Antigravity => Ok(()),
     }
 }
 
@@ -203,7 +204,7 @@ pub fn trust_for_kind(kind: AgentKind, cwd: &Path) -> Result<()> {
     match kind {
         AgentKind::Claude => trust_claude_project(&claude_config_file(), cwd),
         AgentKind::Codex => trust_codex_project(&codex_home(), cwd),
-        AgentKind::Cursor | AgentKind::Pi => Ok(()),
+        AgentKind::Cursor | AgentKind::Pi | AgentKind::Antigravity => Ok(()),
     }
 }
 
