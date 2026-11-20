@@ -4416,7 +4416,7 @@ fn session_tab(
                     (Some(m), Some(e)) => format!("{m} · {e}"),
                     (Some(m), None) => m.to_string(),
                     (None, Some(e)) => format!("default · {e}"),
-                    (None, None) => "default".to_string(),
+                    (None, None) => a.kind.default_model().unwrap_or("default").to_string(),
                 };
             }
             let unseen = app.unseen_finished.contains(&a.id);
