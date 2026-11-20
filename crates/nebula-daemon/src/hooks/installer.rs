@@ -206,7 +206,8 @@ pub fn trust_for_kind(kind: AgentKind, cwd: &Path) -> Result<()> {
     match kind {
         AgentKind::Claude => trust_claude_project(&claude_config_file(), cwd),
         AgentKind::Codex => trust_codex_project(&codex_home(), cwd),
-        AgentKind::Cursor | AgentKind::Pi | AgentKind::Antigravity => Ok(()),
+        AgentKind::Antigravity => trust_antigravity_workspace(&antigravity_settings_file(), cwd),
+        AgentKind::Cursor | AgentKind::Pi => Ok(()),
     }
 }
 
@@ -333,6 +334,52 @@ pub fn trust_codex_project(codex_home: &Path, cwd: &Path) -> Result<()> {
     }
     out.push_str(&format!("{header}\ntrust_level = \"trusted\"\n"));
     write_text_atomic(codex_home, "config.toml", &out)
+}
+
+/// agy's CLI state file, which holds its folder-trust list.
+pub fn antigravity_settings_file() -> PathBuf {
+    PathBuf::from(std::env::var("HOME").unwrap_or_default())
+        .join(".gemini")
+        .join("antigravity-cli")
+        .join("settings.json")
+}
+
+/// Pre-accept agy's "Do you trust the contents of this project?" prompt for
+/// `cwd`: until a checkout is in `trustedWorkspaces`, agy stops on it and
+/// never runs the prompt it was started with. An already-trusted path is
+/// left alone, since agy rewrites this file itself.
+pub fn trust_antigravity_workspace(settings: &Path, cwd: &Path) -> Result<()> {
+    let mut root = load_hooks_root(settings)?;
+    let key = cwd.to_string_lossy();
+    let Some(root_obj) = root.as_object_mut() else {
+        bail!(
+            "{} is not a JSON object — refusing to modify it",
+            settings.display()
+        );
+    };
+    let Some(trusted) = root_obj
+        .entry("trustedWorkspaces")
+        .or_insert_with(|| json!([]))
+        .as_array_mut()
+    else {
+        bail!(
+            "trustedWorkspaces in {} is not an array — refusing to modify it",
+            settings.display()
+        );
+    };
+    if trusted.iter().any(|v| v.as_str() == Some(key.as_ref())) {
+        return Ok(());
+    }
+    trusted.push(json!(key));
+    let name = settings
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    write_text_atomic(
+        settings.parent().unwrap_or(Path::new(".")),
+        &name,
+        &serde_json::to_string_pretty(&root)?,
+    )
 }
 
 /// Codex's home (`$CODEX_HOME`, else `~/.codex`) — where its hooks live so
@@ -858,6 +905,38 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&config).unwrap(),
             "model = \"gpt\"\n\n[projects.\"/no\"]\ntrust_level = \"untrusted\"\n\n[projects.\"/work/wt-1\"]\ntrust_level = \"trusted\"\n"
+        );
+    }
+
+    #[test]
+    fn antigravity_trust_adds_the_checkout_once_and_keeps_other_settings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = tmp.path().join("settings.json");
+        std::fs::write(
+            &settings,
+            r#"{"model":"gemini-4-neon-medium","trustedWorkspaces":["/old"]}"#,
+        )
+        .unwrap();
+        trust_antigravity_workspace(&settings, Path::new("/work/wt-1")).unwrap();
+        trust_antigravity_workspace(&settings, Path::new("/work/wt-1")).unwrap();
+        trust_antigravity_workspace(&settings, Path::new("/old")).unwrap();
+        assert_eq!(
+            read_json(tmp.path(), "settings.json"),
+            json!({
+                "model": "gemini-4-neon-medium",
+                "trustedWorkspaces": ["/old", "/work/wt-1"],
+            })
+        );
+    }
+
+    #[test]
+    fn antigravity_trust_creates_missing_settings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let settings = tmp.path().join("antigravity-cli").join("settings.json");
+        trust_antigravity_workspace(&settings, Path::new("/w")).unwrap();
+        assert_eq!(
+            read_json(&tmp.path().join("antigravity-cli"), "settings.json"),
+            json!({"trustedWorkspaces": ["/w"]})
         );
     }
 
