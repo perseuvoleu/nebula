@@ -1,7 +1,9 @@
 //! Managed-hook installation into the agent CLI's config:
 //! `<worktree>/.claude/settings.local.json` (Claude Code),
-//! `~/.codex/hooks.json` (Codex CLI), or `<worktree>/.cursor/hooks.json`
-//! (Cursor CLI).
+//! `~/.codex/hooks.json` (Codex CLI), `<worktree>/.cursor/hooks.json`
+//! (Cursor CLI), or `~/.gemini/config/hooks.json` (Antigravity CLI, `agy`,
+//! whose dialect names each hook and answers in JSON; see
+//! `install_antigravity_hooks`).
 //!
 //! Claude and Codex share one hooks dialect (PascalCase event names, groups
 //! of `{"hooks": [{"type": "command", ...}]}`). Cursor speaks its own
@@ -192,7 +194,7 @@ pub fn install_for_kind(kind: AgentKind, cwd: &Path) -> Result<()> {
         // Pi has no hooks — a managed extension in its global extensions
         // dir phones the same endpoints home.
         AgentKind::Pi => install_pi_extension(&pi_agent_dir()),
-        AgentKind::Antigravity => Ok(()),
+        AgentKind::Antigravity => install_antigravity_hooks(&gemini_config_dir()),
     }
 }
 
@@ -556,6 +558,76 @@ On the first user message of a new conversation:
 ",
         super::AUTO_TITLE_INSTRUCTION
     )
+}
+
+pub fn gemini_config_dir() -> PathBuf {
+    PathBuf::from(std::env::var("HOME").unwrap_or_default())
+        .join(".gemini")
+        .join("config")
+}
+
+/// (agy hooks.json event, nebula hookEvent query value). agy's hooks.json
+/// has no UserPromptSubmit or permission event (measured on agy 1.5.13):
+/// PreInvocation fires before every model call of a turn, and the daemon
+/// keeps only the turn's first (`invocationNum` 0) as the prompt. agy runs
+/// with --dangerously-skip-permissions, so waiting-on-user is not
+/// detectable, as with cursor.
+const ANTIGRAVITY_EVENTS: &[(&str, &str)] = &[
+    ("SessionStart", "SessionStart"),
+    ("PreInvocation", "UserPromptSubmit"),
+    ("Stop", "Stop"),
+];
+
+/// The top-level key of agy's hooks.json is a hook name owning a set of
+/// events, so nebula's entries live under one name it owns outright.
+const ANTIGRAVITY_HOOK_NAME: &str = "nebula";
+
+/// agy reads every hook's stdout as JSON, so each command answers `{}`
+/// when it has nothing to say. The prompt hook passes the daemon's
+/// injectSteps body through instead when there is one.
+fn antigravity_hook_command(event: &str) -> String {
+    let post = format!(
+        "curl -sS -m 3 -X POST -H \"Authorization: Bearer $NEBULA_API_TOKEN\" \
+         -H \"Content-Type: application/json\" --data-binary @- \
+         \"$NEBULA_API_URL/api/hooks/antigravity?agentId=$NEBULA_AGENT_ID&hookEvent={event}\""
+    );
+    let answer = if event == "UserPromptSubmit" {
+        format!(
+            "out=$({post} 2>/dev/null); \
+             if [ -n \"$out\" ]; then printf '%s' \"$out\"; else printf '{{}}'; fi"
+        )
+    } else {
+        format!("{post} >/dev/null 2>&1; printf '{{}}'")
+    };
+    format!(
+        "if [ -z \"$NEBULA_AGENT_ID\" ] || [ -z \"$NEBULA_API_URL\" ]; then \
+         printf '{{}}'; exit 0; fi; {answer}"
+    )
+}
+
+/// Write nebula's named hook into `<config_dir>/hooks.json`, agy's global
+/// hooks file (shared by its TUI and backend), replacing only the
+/// `nebula` entry so every other named hook survives.
+pub fn install_antigravity_hooks(config_dir: &Path) -> Result<()> {
+    let path = config_dir.join("hooks.json");
+    let mut root = load_hooks_root(&path)?;
+    let Some(root_obj) = root.as_object_mut() else {
+        bail!(
+            "{} is not a JSON object — refusing to modify it",
+            path.display()
+        );
+    };
+    let spec: Map<String, Value> = ANTIGRAVITY_EVENTS
+        .iter()
+        .map(|(agy_event, event)| {
+            (
+                agy_event.to_string(),
+                json!([{ "type": "command", "command": antigravity_hook_command(event) }]),
+            )
+        })
+        .collect();
+    root_obj.insert(ANTIGRAVITY_HOOK_NAME.into(), Value::Object(spec));
+    write_hooks_root(config_dir, "hooks.json", &root)
 }
 
 /// Pi speaks neither hooks dialect — it has a TypeScript extension API
@@ -1161,6 +1233,73 @@ mod tests {
         assert!(install_cursor_hooks(tmp.path()).is_err());
         let after = std::fs::read_to_string(dir.join("hooks.json")).unwrap();
         assert_eq!(after, original, "corrupt file must be left untouched");
+    }
+
+    #[test]
+    fn antigravity_hook_sits_beside_the_users_and_reinstalls_idempotently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lint = json!({
+            "PostToolUse": [{
+                "matcher": "run_command",
+                "hooks": [{ "type": "command", "command": "./lint.sh" }]
+            }]
+        });
+        std::fs::write(
+            tmp.path().join("hooks.json"),
+            serde_json::to_string(&json!({
+                "lint": lint,
+                "nebula": { "Stop": [{ "type": "command", "command": "stale" }] }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        install_antigravity_hooks(tmp.path()).unwrap();
+        let first = std::fs::read_to_string(tmp.path().join("hooks.json")).unwrap();
+        install_antigravity_hooks(tmp.path()).unwrap();
+        let second = std::fs::read_to_string(tmp.path().join("hooks.json")).unwrap();
+        assert_eq!(first, second, "a reinstall changed the file");
+
+        let root: Value = serde_json::from_str(&second).unwrap();
+        assert_eq!(root["lint"], lint);
+        let nebula = root["nebula"].as_object().unwrap();
+        let mut events: Vec<&str> = nebula.keys().map(String::as_str).collect();
+        events.sort();
+        assert_eq!(events, vec!["PreInvocation", "SessionStart", "Stop"]);
+        let command = |event: &str| nebula[event][0]["command"].as_str().unwrap().to_string();
+        assert!(command("Stop")
+            .contains("/api/hooks/antigravity?agentId=$NEBULA_AGENT_ID&hookEvent=Stop"));
+        assert!(command("PreInvocation").contains("hookEvent=UserPromptSubmit"));
+        assert!(command("SessionStart").contains("hookEvent=SessionStart"));
+    }
+
+    #[test]
+    fn antigravity_hooks_answer_agy_with_json_outside_nebula() {
+        let tmp = tempfile::tempdir().unwrap();
+        install_antigravity_hooks(tmp.path()).unwrap();
+        let root = read_json(tmp.path(), "hooks.json");
+        for event in ["SessionStart", "PreInvocation", "Stop"] {
+            let command = root["nebula"][event][0]["command"].as_str().unwrap();
+            let out = std::process::Command::new("sh")
+                .args(["-c", command])
+                .env_remove("NEBULA_AGENT_ID")
+                .env_remove("NEBULA_API_URL")
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            assert_eq!(String::from_utf8_lossy(&out.stdout), "{}", "{event}");
+        }
+    }
+
+    #[test]
+    fn antigravity_corrupt_file_aborts_without_clobbering() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("hooks.json"), "{ not json").unwrap();
+        assert!(install_antigravity_hooks(tmp.path()).is_err());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("hooks.json")).unwrap(),
+            "{ not json"
+        );
     }
 
     #[test]
