@@ -64,6 +64,8 @@ pub const ANTIGRAVITY_MODELS: &[&str] = &[
     "gemini-4-hydrogen-medium",
     "gemini-4-hydrogen-high",
     "gemini-4-hydrogen-xhigh",
+    "gemini-pro-orchestrator-neon",
+    "gemini-pro-orchestrator-g1-pro",
     "gemini-3.8-flash-low",
     "gemini-3.8-flash-medium",
     "gemini-3.8-flash-high",
