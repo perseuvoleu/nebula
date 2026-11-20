@@ -2987,11 +2987,12 @@ fn branch_session_menu(app: &mut App, split: bool) -> bool {
         }),
         destructive: false,
     });
+    let hover = if split { 0 } else { items.len() - 1 };
     app.overlay = Some(Overlay::Menu(ContextMenu {
         title: Some(if split { "Split pane" } else { "New session" }.into()),
         items,
         at: None,
-        hover: if split { 0 } else { 4 },
+        hover,
         area: Default::default(),
         parent: None,
         filter: None,
@@ -21162,6 +21163,31 @@ mod tests {
                 Some(ClientRequest::ResolveBranchCheckout { branch, .. }) if branch == "feature-x"
             ),
             "{out:?}"
+        );
+    }
+
+    #[test]
+    fn quick_terminal_on_a_branch_row_starts_on_the_shell_row() {
+        let mut app = App::new();
+        seed_tree(&mut app);
+        app.branch_list = Some((
+            nebula_core::ProjectId("p1".into()),
+            vec!["main".into(), "feature-x".into()],
+        ));
+        app.focus = Focus::Worktrees;
+        app.sel_worktree = app.visible_worktrees().len();
+        let mut out = Vec::new();
+        quick_terminal_shortcut(&mut app, &mut out);
+        let Some(Overlay::Menu(menu)) = &app.overlay else {
+            panic!("expected the ⌘T picker, got {:?}", app.overlay);
+        };
+        assert_eq!(
+            menu.items[menu.hover].action,
+            MenuAction::CheckoutThen {
+                project: nebula_core::ProjectId("p1".into()),
+                branch: "feature-x".into(),
+                next: AfterCheckout::Terminal,
+            }
         );
     }
 
