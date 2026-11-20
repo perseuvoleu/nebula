@@ -1,6 +1,6 @@
 //! Agent-CLI hook receiver: a loopback-only HTTP endpoint the shell hook
 //! one-liners POST to (`/api/hooks/claude`, `/api/hooks/codex`, and
-//! `/api/hooks/cursor`). Codex mirrors Claude's hook events and payload
+//! `/api/hooks/cursor`, `/api/hooks/antigravity`). Codex mirrors Claude's hook events and payload
 //! shape; cursor speaks its own dialect, but its installer translates event
 //! names into the `hookEvent` query param and the payload fields are aliased
 //! here (`conversation_id`, `subagent_id`, `workspace_roots`), so one
@@ -123,6 +123,15 @@ pub fn context_injection(parts: &[String]) -> String {
     .to_string()
 }
 
+/// The same instructions in agy's dialect: a PreInvocation hook's stdout
+/// injects steps, and a system message is the step the model reads.
+pub fn inject_steps(parts: &[String]) -> String {
+    serde_json::json!({
+        "injectSteps": [{ "systemMessage": { "systemMessage": parts.join("\n\n") } }]
+    })
+    .to_string()
+}
+
 pub fn auto_title_injection() -> String {
     context_injection(&[AUTO_TITLE_INSTRUCTION.to_string()])
 }
@@ -162,8 +171,13 @@ pub struct HookPayload {
     pub hook_event_name: Option<String>,
     pub session_id: Option<String>,
     /// Cursor names the resumable chat id `conversation_id` (== its
-    /// `session_id`, but only the alias is guaranteed on every event).
+    /// `session_id`, but only the alias is guaranteed on every event);
+    /// agy spells it `conversationId`.
+    #[serde(alias = "conversationId")]
     pub conversation_id: Option<String>,
+    /// agy's model-call counter within a turn; only call 0 is the prompt.
+    #[serde(alias = "invocationNum")]
+    pub invocation_num: Option<u64>,
     pub notification_type: Option<String>,
     pub tool_name: Option<String>,
     pub agent_id: Option<String>,
@@ -257,6 +271,7 @@ pub async fn start_hook_server(
         // UserPromptSubmit POST and re-injects it as a custom context
         // message, so it takes the injectable route like claude/codex.
         .route("/api/hooks/pi", post(receive_injectable_hook))
+        .route("/api/hooks/antigravity", post(receive_antigravity_hook))
         .with_state(state);
 
     tokio::spawn(async move {
@@ -284,7 +299,17 @@ async fn receive_injectable_hook(
     headers: HeaderMap,
     body: String,
 ) -> (StatusCode, String) {
-    receive_hook(true, state, query, headers, body).await
+    receive_hook(Some(context_injection), state, query, headers, body).await
+}
+
+/// agy route: injectable like claude/codex, in agy's injectSteps envelope.
+async fn receive_antigravity_hook(
+    State(state): State<Arc<HookServerState>>,
+    Query(query): Query<HookQuery>,
+    headers: HeaderMap,
+    body: String,
+) -> (StatusCode, String) {
+    receive_hook(Some(inject_steps), state, query, headers, body).await
 }
 
 /// Cursor route: every hook command answers cursor with its own gating JSON
@@ -295,11 +320,11 @@ async fn receive_plain_hook(
     headers: HeaderMap,
     body: String,
 ) -> (StatusCode, String) {
-    receive_hook(false, state, query, headers, body).await
+    receive_hook(None, state, query, headers, body).await
 }
 
 async fn receive_hook(
-    inject_capable: bool,
+    inject: Option<fn(&[String]) -> String>,
     state: Arc<HookServerState>,
     query: HookQuery,
     headers: HeaderMap,
@@ -307,7 +332,7 @@ async fn receive_hook(
 ) -> (StatusCode, String) {
     // On this path the response body reaches the model's context, so every
     // outcome (auth failure included) must answer with empty-or-instruction.
-    let injectable = inject_capable && query.hook_event == "UserPromptSubmit";
+    let injectable = inject.is_some() && query.hook_event == "UserPromptSubmit";
     let quiet_or = |status: StatusCode, diag: &str| {
         let body = if injectable {
             String::new()
@@ -334,6 +359,9 @@ async fn receive_hook(
     if query.hook_event == "UserPromptSubmit" && payload.source.as_deref() == Some("poll_event") {
         return (StatusCode::OK, String::new());
     }
+    if query.hook_event == "UserPromptSubmit" && payload.invocation_num.is_some_and(|n| n > 0) {
+        return (StatusCode::OK, String::new());
+    }
     let Some(event) = parse_event(&query.hook_event, &payload) else {
         return quiet_or(StatusCode::OK, r#"{"ok": false}"#);
     };
@@ -354,7 +382,7 @@ async fn receive_hook(
         })
         .await;
 
-    if injectable {
+    if let Some(inject) = inject.filter(|_| injectable) {
         // Titling instruction while the session is untitled, the notes and
         // todos pointers while the project/worktree has undone entries, the
         // shared-checkout pointer while sibling sessions have run on the
@@ -396,7 +424,7 @@ async fn receive_hook(
         let body = if parts.is_empty() {
             String::new()
         } else {
-            context_injection(&parts)
+            inject(&parts)
         };
         return (StatusCode::OK, body);
     }
@@ -575,6 +603,82 @@ mod tests {
         )
         .await;
         assert_eq!((status, body.as_str()), (401, ""));
+    }
+
+    #[tokio::test]
+    async fn antigravity_payloads_drive_a_turn_and_carry_injected_steps() {
+        use crate::status::{AgentStatusMachine, Effect};
+        let store = seeded_store();
+        let (env, mut rx) = start_hook_server(store.clone()).await.unwrap();
+        let post = |event: &'static str, body: &'static str| {
+            let token = env.token.clone();
+            async move {
+                http_post(
+                    env.port,
+                    &format!("/api/hooks/antigravity?agentId=pending&hookEvent={event}"),
+                    &token,
+                    body,
+                )
+                .await
+            }
+        };
+        let conversation = "f10f4382-10cb-4663-abfc-d3bfc069a0cf";
+
+        post(
+            "SessionStart",
+            include_str!("fixtures/agy_session_start.json"),
+        )
+        .await;
+        let (status, body) = post(
+            "UserPromptSubmit",
+            include_str!("fixtures/agy_pre_invocation_first.json"),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            body["injectSteps"][0]["systemMessage"]["systemMessage"],
+            AUTO_TITLE_INSTRUCTION
+        );
+        let (status, body) = post(
+            "UserPromptSubmit",
+            include_str!("fixtures/agy_pre_invocation_later.json"),
+        )
+        .await;
+        assert_eq!((status, body.as_str()), (200, ""));
+        post("Stop", include_str!("fixtures/agy_stop.json")).await;
+
+        let mut machine =
+            AgentStatusMachine::for_kind(AgentStatus::Fresh, None, AgentKind::Antigravity);
+        let mut effects = Vec::new();
+        let mut events = Vec::new();
+        for _ in 0..3 {
+            let d = rx.recv().await.unwrap();
+            assert_eq!(d.session_id.as_deref(), Some(conversation));
+            assert_eq!(d.cwd.as_deref(), Some("/work/repo"));
+            events.push(d.event.clone());
+            effects.extend(machine.handle(
+                d.event,
+                d.session_id.as_deref(),
+                std::time::Instant::now(),
+            ));
+        }
+        assert_eq!(
+            events,
+            vec![
+                HookEvent::SessionStart { source: None },
+                HookEvent::UserPromptSubmit,
+                HookEvent::Stop
+            ]
+        );
+        assert_eq!(
+            effects,
+            vec![
+                Effect::SaveSessionId(conversation.into()),
+                Effect::SetStatus(AgentStatus::Running),
+                Effect::SetStatus(AgentStatus::Finished),
+            ]
+        );
     }
 
     #[tokio::test]
