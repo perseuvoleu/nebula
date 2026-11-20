@@ -375,10 +375,11 @@ enum AgentCommand {
         /// calling session's project).
         #[arg(long)]
         project: Option<String>,
-        /// claude | codex | cursor | pi.
+        /// claude | codex | cursor | pi | antigravity.
         #[arg(long, default_value = "claude")]
         kind: String,
-        /// Model the CLI launches with (default: the CLI's own).
+        /// Model the CLI launches with (default: the CLI's own; antigravity:
+        /// gemini-4-neon-medium).
         #[arg(long)]
         model: Option<String>,
         /// Reasoning effort the CLI launches with (default: the CLI's own).
@@ -686,7 +687,7 @@ enum RemoteCommand {
 
 #[derive(Subcommand)]
 enum HooksCommand {
-    /// Install `kind`'s hooks (claude, codex, cursor, pi) for `dir`.
+    /// Install `kind`'s hooks (claude, codex, cursor, pi, antigravity) for `dir`.
     Install {
         kind: String,
         /// The checkout the CLI will run in (default: the current directory).
