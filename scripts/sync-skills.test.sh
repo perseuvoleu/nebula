@@ -100,5 +100,19 @@ for case in "0 current" "1 stale" "missing unknown"; do
   ! grep -q '^ssh .*install-hooks' "$CALLS" || fail "--check ($want) handed install-hooks to the remote login shell, not sh -s: $(grep '^ssh .*install-hooks' "$CALLS")"
 done
 
+setup
+mkdir -p "$tmp/local/.gemini/config/skills/agy-skill"
+echo s >"$tmp/local/.gemini/config/skills/agy-skill/SKILL.md"
+echo g >"$tmp/local/.gemini/GEMINI.md"
+HOOKS_OUT='' HOOKS_EXIT=0
+if run testhost; then
+  grep -q "^rsync .* $tmp/local/.gemini/config/skills/ testhost:.gemini/config/skills/$" "$CALLS" \
+    || fail "a sync does not mirror ~/.gemini/config/skills: $(grep '^rsync' "$CALLS")"
+  grep -q "^rsync .* $tmp/local/.gemini/GEMINI.md testhost:.gemini/GEMINI.md$" "$CALLS" \
+    || fail "a sync does not mirror ~/.gemini/GEMINI.md: $(grep '^rsync' "$CALLS")"
+else
+  fail "a sync with gemini entries exited non-zero: $(cat "$tmp/out")"
+fi
+
 [ "$failures" -eq 0 ] || exit 1
 echo "sync-skills.test.sh: ok"
