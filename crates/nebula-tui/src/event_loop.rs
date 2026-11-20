@@ -3147,9 +3147,10 @@ fn step_session_tab(app: &mut App, forward: bool, out: &mut Vec<ClientRequest>) 
     select_session_tab(app, idx, out);
 }
 
-/// ⌘T: ask what the new tab runs — Claude, Codex, Pi or a plain shell —
-/// and create it in the current worktree. The shell row starts hovered, so
-/// ⌘T-Enter is still "give me a terminal", and no row stops for a name
+/// ⌘T: ask what the new tab runs — Claude, Codex, Pi, Antigravity or a
+/// plain shell — and create it in the current worktree. The shell row
+/// starts hovered, so ⌘T-Enter is still "give me a terminal", and no row
+/// stops for a name
 /// prompt (the daemon names it, and the Ack attaches it). The full picker
 /// with Cursor, model and effort submenus stays on `t`. The floating
 /// quick terminal lives on the palette's `t` alias; when that window is up,
@@ -3180,6 +3181,7 @@ fn quick_terminal_shortcut(app: &mut App, out: &mut Vec<ClientRequest>) {
         kind_row("Claude", AgentKind::Claude),
         kind_row("Codex", AgentKind::Codex),
         kind_row("Pi", AgentKind::Pi),
+        kind_row("Antigravity", AgentKind::Antigravity),
         MenuItem {
             label: "Terminal (shell)".into(),
             action: MenuAction::NewTerminal(worktree.clone()),
@@ -17485,7 +17487,10 @@ mod tests {
                 Some(Overlay::Menu(m)) => {
                     assert_eq!(m.title.as_deref(), Some("New tab"));
                     let labels: Vec<_> = m.items.iter().map(|i| i.label.clone()).collect();
-                    assert_eq!(labels, ["Claude", "Codex", "Pi", "Terminal (shell)"]);
+                    assert_eq!(
+                        labels,
+                        ["Claude", "Codex", "Pi", "Antigravity", "Terminal (shell)"]
+                    );
                     assert!(
                         matches!(m.items[m.hover].action, MenuAction::NewTerminal(_)),
                         "{focus:?}: the shell row starts hovered"
@@ -17514,7 +17519,7 @@ mod tests {
         app.focus = Focus::Worktrees;
         let mut out = Vec::new();
         press(&mut app, KeyCode::Char('t'), KeyModifiers::SUPER, &mut out);
-        for _ in 0..3 {
+        for _ in 0..4 {
             press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
         }
         out.clear();
@@ -17529,6 +17534,25 @@ mod tests {
                 })
             ),
             "the Claude row creates an agent tab: {out:?}"
+        );
+
+        // The row just above the shell starts agy on its default model.
+        let mut out = Vec::new();
+        press(&mut app, KeyCode::Char('t'), KeyModifiers::SUPER, &mut out);
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE, &mut out);
+        out.clear();
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+        assert!(
+            matches!(
+                out.first(),
+                Some(ClientRequest::CreateAgent {
+                    kind: nebula_core::AgentKind::Antigravity,
+                    model: Some(m),
+                    auto_title: true,
+                    ..
+                }) if m == "gemini-4-neon-medium"
+            ),
+            "the Antigravity row creates an agy tab: {out:?}"
         );
 
         // With the floating window up, ⌘T is the close.
