@@ -2965,6 +2965,7 @@ fn branch_session_menu(app: &mut App, split: bool) -> bool {
         AgentKind::Codex,
         AgentKind::Cursor,
         AgentKind::Pi,
+        AgentKind::Antigravity,
     ]
     .into_iter()
     .map(|kind| MenuItem {
@@ -3259,7 +3260,7 @@ fn toggle_quick_terminal(app: &mut App, out: &mut Vec<ClientRequest>) {
 
 /// ⌘D: toggle the split pane. Opening keeps the current attachment in the
 /// left pane and asks what the right pane should run — the same kinds the
-/// new-session picker offers (Claude/Codex/Cursor/Pi or a shell), created
+/// new-session picker offers (Claude/Codex/Cursor/Pi/Antigravity or a shell), created
 /// in the same worktree context as what's attached (or selected). The row
 /// matching the current attachment starts hovered, so Enter-Enter still
 /// means "another one of these". The pick creates the session immediately
@@ -3294,6 +3295,7 @@ fn toggle_split_terminal(app: &mut App, out: &mut Vec<ClientRequest>) {
         kind_row("Codex", AgentKind::Codex),
         kind_row("Cursor", AgentKind::Cursor),
         kind_row("Pi", AgentKind::Pi),
+        kind_row("Antigravity", AgentKind::Antigravity),
         MenuItem {
             label: "Terminal (shell)".into(),
             action: MenuAction::SplitShell(worktree.clone()),
@@ -3335,6 +3337,7 @@ fn toggle_split_terminal(app: &mut App, out: &mut Vec<ClientRequest>) {
                 AgentKind::Codex => 1,
                 AgentKind::Cursor => 2,
                 AgentKind::Pi => 3,
+                AgentKind::Antigravity => 4,
             })
             .unwrap_or(0),
         Some(SessionRef::Terminal(_)) => shell_row,
@@ -3979,6 +3982,7 @@ fn open_command_palette(app: &mut App) {
             items.push(kind_row("ac", "Codex", AgentKind::Codex));
             items.push(kind_row("acu", "Cursor", AgentKind::Cursor));
             items.push(kind_row("ap", "Pi", AgentKind::Pi));
+            items.push(kind_row("aag", "Antigravity", AgentKind::Antigravity));
         }
         items.push(row(
             "ab · New agent on branch…",
@@ -4115,6 +4119,7 @@ fn open_agent_picker(app: &mut App, worktree: WorktreeId) {
         kind_row("Codex", AgentKind::Codex),
         kind_row("Cursor", AgentKind::Cursor),
         kind_row("Pi", AgentKind::Pi),
+        kind_row("Antigravity", AgentKind::Antigravity),
     ];
     items.push(MenuItem {
         label: "Terminal (shell)".into(),
@@ -4671,6 +4676,7 @@ fn kind_label(kind: AgentKind) -> &'static str {
         AgentKind::Codex => "Codex",
         AgentKind::Cursor => "Cursor",
         AgentKind::Pi => "Pi",
+        AgentKind::Antigravity => "Antigravity",
     }
 }
 
@@ -15272,12 +15278,13 @@ mod tests {
                 panic!("expected agent-type picker, got {:?}", app.overlay);
             };
             assert_eq!(menu.title.as_deref(), Some("New session"));
-            assert_eq!(menu.items.len(), 5);
+            assert_eq!(menu.items.len(), 6);
             assert_eq!(menu.items[0].label, "Claude");
             assert_eq!(menu.items[1].label, "Codex");
             assert_eq!(menu.items[2].label, "Cursor");
             assert_eq!(menu.items[3].label, "Pi");
-            assert_eq!(menu.items[4].label, "Terminal (shell)");
+            assert_eq!(menu.items[4].label, "Antigravity");
+            assert_eq!(menu.items[5].label, "Terminal (shell)");
             assert_eq!(menu.hover, 0, "Claude is the default");
 
             // Enter on the default chains into the name prompt with
@@ -15439,13 +15446,14 @@ mod tests {
             let Some(Overlay::Menu(menu)) = &app.overlay else {
                 panic!("expected picker, got {:?}", app.overlay);
             };
-            // Claude/Codex/Pi rows advertise a submenu (the ▸ affordance);
-            // Cursor and Terminal don't.
+            // Claude/Codex/Pi/Antigravity rows advertise a submenu (the ▸
+            // affordance); Cursor and Terminal don't.
             assert_eq!(menu.items[0].action.submenu(), Some(SubmenuKind::Models));
             assert_eq!(menu.items[1].action.submenu(), Some(SubmenuKind::Models));
             assert_eq!(menu.items[2].action.submenu(), None);
             assert_eq!(menu.items[3].action.submenu(), Some(SubmenuKind::Models));
-            assert_eq!(menu.items[4].action.submenu(), None);
+            assert_eq!(menu.items[4].action.submenu(), Some(SubmenuKind::Models));
+            assert_eq!(menu.items[5].action.submenu(), None);
 
             // → opens the model list; nothing configured, so the "default"
             // row is checked and highlighted, and the parent is kept for ←.
@@ -15700,6 +15708,48 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn picker_fifth_row_creates_antigravity_agent_on_its_pinned_model() {
+        with_default_config(|| {
+            let mut app = App::new();
+            seed_tree(&mut app);
+            app.focus = Focus::Sessions;
+            let mut out = Vec::new();
+
+            press(&mut app, KeyCode::Char('n'), KeyModifiers::NONE, &mut out);
+            for _ in 0..4 {
+                press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
+            }
+            press(&mut app, KeyCode::Right, KeyModifiers::NONE, &mut out);
+            let Some(Overlay::Menu(menu)) = &app.overlay else {
+                panic!("expected antigravity model submenu, got {:?}", app.overlay);
+            };
+            assert_eq!(menu.title.as_deref(), Some("Antigravity model"));
+            assert_eq!(menu.items[menu.hover].label, "gemini-4-neon-medium ✓");
+            assert!(menu
+                .items
+                .iter()
+                .any(|i| i.label == "claude-opus-5-5-medium"));
+            assert_eq!(menu.items[menu.hover].action.submenu(), None);
+            press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
+
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
+            assert!(
+                matches!(
+                    out.last(),
+                    Some(ClientRequest::CreateAgent {
+                        kind: AgentKind::Antigravity,
+                        model: Some(m),
+                        effort: None,
+                        ..
+                    }) if m == "gemini-4-neon-medium"
+                ),
+                "{out:?}"
+            );
+        })
     }
 
     #[test]

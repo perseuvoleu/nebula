@@ -50,6 +50,32 @@ pub const PI_EFFORTS: &[&str] = &[
     "default", "off", "minimal", "low", "medium", "high", "xhigh", "max",
 ];
 
+/// `agy models` (1.5.13). The effort is part of each id, so agy has no
+/// effort list; `AgentKind::default_model` is the preselected row.
+pub const ANTIGRAVITY_MODELS: &[&str] = &[
+    "gemini-4-neon-medium",
+    "gemini-4-neon-low",
+    "gemini-4-neon-high",
+    "gemini-4-neon-xhigh",
+    "gemini-4-argon-low",
+    "gemini-4-argon-medium",
+    "gemini-4-argon-high",
+    "gemini-4-hydrogen-low",
+    "gemini-4-hydrogen-medium",
+    "gemini-4-hydrogen-high",
+    "gemini-4-hydrogen-xhigh",
+    "gemini-3.8-flash-low",
+    "gemini-3.8-flash-medium",
+    "gemini-3.8-flash-high",
+    "claude-opus-5-5-low",
+    "claude-opus-5-5-medium",
+    "claude-opus-5-5-high",
+    "claude-sonnet-5-5-low",
+    "claude-sonnet-5-5-medium",
+    "claude-sonnet-5-5-high",
+    "gpt-oss-120b-medium",
+];
+
 /// Model choices for a session kind; empty = no model submenu (Cursor).
 pub fn model_choices(kind: AgentKind) -> &'static [&'static str] {
     match kind {
@@ -57,6 +83,7 @@ pub fn model_choices(kind: AgentKind) -> &'static [&'static str] {
         AgentKind::Codex => CODEX_MODELS,
         AgentKind::Cursor => &[],
         AgentKind::Pi => PI_MODELS,
+        AgentKind::Antigravity => ANTIGRAVITY_MODELS,
     }
 }
 
@@ -67,6 +94,7 @@ pub fn effort_choices(kind: AgentKind) -> &'static [&'static str] {
         AgentKind::Codex => CODEX_EFFORTS,
         AgentKind::Cursor => &[],
         AgentKind::Pi => PI_EFFORTS,
+        AgentKind::Antigravity => &[],
     }
 }
 
@@ -525,6 +553,7 @@ impl Config {
             AgentKind::Codex => &self.codex_model,
             AgentKind::Cursor => return None,
             AgentKind::Pi => &self.pi_model,
+            AgentKind::Antigravity => return kind.default_model().map(String::from),
         };
         non_default(value)
     }
@@ -535,7 +564,7 @@ impl Config {
         let value = match kind {
             AgentKind::Claude => &self.claude_effort,
             AgentKind::Codex => &self.codex_effort,
-            AgentKind::Cursor => return None,
+            AgentKind::Cursor | AgentKind::Antigravity => return None,
             AgentKind::Pi => &self.pi_effort,
         };
         non_default(value)
