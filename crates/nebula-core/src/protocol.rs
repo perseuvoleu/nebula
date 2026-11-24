@@ -68,6 +68,7 @@ fn create_agent_wire<S: serde::Serializer>(
     card: &Option<TodoId>,
     role: &Option<Role>,
     dispatch: &Option<DispatchId>,
+    spawned_by_host: &Option<String>,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
     use serde::ser::SerializeStruct;
@@ -78,6 +79,7 @@ fn create_agent_wire<S: serde::Serializer>(
         card.is_some(),
         role.is_some(),
         dispatch.is_some(),
+        spawned_by_host.is_some(),
     ];
     let tail = set.iter().rposition(|s| *s).map_or(0, |last| last + 1);
     let mut fields = serializer.serialize_struct("CreateAgent", 9 + tail)?;
@@ -107,6 +109,9 @@ fn create_agent_wire<S: serde::Serializer>(
     }
     if tail > 5 {
         fields.serialize_field("dispatch", dispatch)?;
+    }
+    if tail > 6 {
+        fields.serialize_field("spawned_by_host", spawned_by_host)?;
     }
     fields.end()
 }
@@ -318,6 +323,10 @@ pub enum ClientRequest {
         /// The `todo run` dispatch this spawn fulfils.
         #[serde(default)]
         dispatch: Option<DispatchId>,
+        /// The host `spawned_by` runs on, so a host that spawns for
+        /// another one records the parent's host, not its own.
+        #[serde(default)]
+        spawned_by_host: Option<String>,
     },
     /// Fire-and-forget: pre-spawn an agent CLI for this (worktree, kind) so
     /// the next CreateAgent adopts an already-booted session. Sent the

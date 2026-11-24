@@ -19,6 +19,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, Notify};
+use tokio_util::sync::CancellationToken;
 
 const DEBOUNCE: Duration = Duration::from_secs(1);
 
@@ -31,25 +32,56 @@ pub fn resend() {
 }
 
 pub fn spawn(daemon: Arc<Daemon>) {
-    tokio::spawn(async move {
-        let mut events = daemon.events.subscribe();
-        let mut sent: Option<HostReport> = None;
-        loop {
-            if let Err(e) = send_if_changed(&daemon, &mut sent).await {
-                tracing::warn!(error = %e, "board report failed");
-            }
-            tokio::select! {
-                _ = daemon.shutdown.cancelled() => break,
-                _ = RESEND.notified() => sent = None,
-                changed = next_change(&mut events) => if !changed { break },
-            }
-            tokio::select! {
-                _ = daemon.shutdown.cancelled() => break,
-                _ = tokio::time::sleep(DEBOUNCE) => {}
-            }
-            while events.try_recv().is_ok() {}
+    let events = daemon.events.subscribe();
+    let shutdown = daemon.shutdown.clone();
+    tokio::spawn(run(
+        HostReporter { daemon, sent: None },
+        events,
+        shutdown,
+        DEBOUNCE,
+    ));
+}
+
+trait Reporter {
+    async fn send(&mut self, full: bool) -> Result<()>;
+}
+
+struct HostReporter {
+    daemon: Arc<Daemon>,
+    sent: Option<HostReport>,
+}
+
+impl Reporter for HostReporter {
+    async fn send(&mut self, full: bool) -> Result<()> {
+        if full {
+            self.sent = None;
         }
-    });
+        send_if_changed(&self.daemon, &mut self.sent).await
+    }
+}
+
+async fn run(
+    mut reporter: impl Reporter,
+    mut events: broadcast::Receiver<ServerEvent>,
+    shutdown: CancellationToken,
+    debounce: Duration,
+) {
+    let mut full = false;
+    loop {
+        match reporter.send(std::mem::take(&mut full)).await {
+            Err(e) => tracing::warn!(error = %e, "board report failed; retrying"),
+            Ok(()) => tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = RESEND.notified() => full = true,
+                changed = next_change(&mut events) => if !changed { break },
+            },
+        }
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            _ = tokio::time::sleep(debounce) => {}
+        }
+        while events.try_recv().is_ok() {}
+    }
 }
 
 async fn next_change(events: &mut broadcast::Receiver<ServerEvent>) -> bool {
@@ -87,6 +119,7 @@ async fn send_if_changed(daemon: &Arc<Daemon>, sent: &mut Option<HostReport>) ->
 fn host_report(daemon: &Daemon, writer_slots: Option<u32>) -> Result<HostReport> {
     let host = nebula_core::host::hostname();
     let (projects, worktrees, agents, _) = daemon.store.load_tree()?;
+    let origins = daemon.store.agent_origins()?;
     let local: HashMap<_, _> = projects
         .iter()
         .filter(|p| p.host.is_none())
@@ -110,7 +143,10 @@ fn host_report(daemon: &Daemon, writer_slots: Option<u32>) -> Result<HostReport>
                 kind: a.kind,
                 name: a.name.clone(),
                 parent: a.spawned_by.clone().map(|id| SessionAt {
-                    host: host.clone(),
+                    host: origins
+                        .get(&a.id)
+                        .and_then(|(_, parent_host)| parent_host.clone())
+                        .unwrap_or_else(|| host.clone()),
                     id,
                 }),
                 status: a.status,
@@ -125,7 +161,10 @@ fn host_report(daemon: &Daemon, writer_slots: Option<u32>) -> Result<HostReport>
         .collect();
     sessions.sort_by(|a, b| a.agent_id.as_str().cmp(b.agent_id.as_str()));
     Ok(HostReport {
-        writers: agents.iter().filter(|a| daemon.holds_writer(a)).count() as u32,
+        writers: agents
+            .iter()
+            .filter(|a| daemon.holds_writer(a) && daemon.is_alive(&SessionRef::Agent(a.id.clone())))
+            .count() as u32,
         writer_slots,
         checkouts: worktrees
             .iter()
@@ -342,4 +381,172 @@ pub fn card_pointer(store: &Store, agent: &AgentId) -> Result<Option<(String, Op
         Some((number, title)) => (card_label(number as u64, None), Some(title)),
         None => (card.0.clone(), None),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hooks::HookEnv;
+    use crate::registry::DaemonOverrides;
+    use nebula_core::{Agent, Project, ProjectId, Worktree, WorktreeId};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn daemon() -> Arc<Daemon> {
+        let daemon = Daemon::with_overrides(
+            Arc::new(Store::open_in_memory().unwrap()),
+            HookEnv {
+                port: 0,
+                token: String::new(),
+            },
+            DaemonOverrides::default(),
+        );
+        daemon
+            .store
+            .insert_project(&Project {
+                workspace_id: Default::default(),
+                id: ProjectId("p1".into()),
+                name: "p".into(),
+                repo_path: "/tmp/p".into(),
+                sort_order: 0,
+                divider_after: false,
+                divider_label: None,
+                divider_before: false,
+                divider_before_label: None,
+                host: None,
+            })
+            .unwrap();
+        daemon
+            .store
+            .insert_worktree(&Worktree {
+                id: WorktreeId("w1".into()),
+                project_id: ProjectId("p1".into()),
+                path: "/tmp/p".into(),
+                branch: "main".into(),
+                is_main: true,
+                created_from: None,
+                pinned: false,
+                for_branch: false,
+                sort_order: 0,
+            })
+            .unwrap();
+        daemon
+    }
+
+    fn agent(id: &str) -> Agent {
+        Agent {
+            id: AgentId(id.into()),
+            worktree_id: WorktreeId("w1".into()),
+            name: id.into(),
+            status: AgentStatus::Running,
+            archived: false,
+            archived_at: 0,
+            pinned: false,
+            kind: AgentKind::Claude,
+            model: None,
+            effort: None,
+            session_id: None,
+            sort_order: 0,
+            status_changed_at: 0,
+            alive: false,
+            branch: Some("main".into()),
+            spawned_by: None,
+            writer: false,
+            card_id: Some(TodoId("card".into())),
+            role: Some(Role::Worker),
+            dispatch_id: None,
+            code_mode_off: false,
+        }
+    }
+
+    #[test]
+    fn report_counts_only_live_writers() {
+        let daemon = daemon();
+        daemon
+            .store
+            .insert_agent(&Agent {
+                writer: true,
+                status: AgentStatus::Finished,
+                ..agent("exited")
+            })
+            .unwrap();
+        let report = host_report(&daemon, None).unwrap();
+        assert_eq!(report.sessions[0].alive, false);
+        assert_eq!(report.writers, 0, "an exited writer is no live writer");
+    }
+
+    #[test]
+    fn report_names_the_parents_host() {
+        let daemon = daemon();
+        let parent = |id: &str| Some(AgentId(id.into()));
+        for (id, spawned_by) in [
+            ("far-child", parent("far-parent")),
+            ("near-child", parent("far-child")),
+        ] {
+            daemon
+                .store
+                .insert_agent(&Agent {
+                    spawned_by,
+                    ..agent(id)
+                })
+                .unwrap();
+        }
+        daemon
+            .store
+            .set_spawned_by_host(&AgentId("far-child".into()), "host-a")
+            .unwrap();
+        let report = host_report(&daemon, None).unwrap();
+        let parents: Vec<(&str, Option<&SessionAt>)> = report
+            .sessions
+            .iter()
+            .map(|s| (s.agent_id.as_str(), s.parent.as_ref()))
+            .collect();
+        let here = nebula_core::host::hostname();
+        assert_eq!(
+            parents,
+            [
+                (
+                    "far-child",
+                    Some(&SessionAt {
+                        host: "host-a".into(),
+                        id: AgentId("far-parent".into()),
+                    })
+                ),
+                (
+                    "near-child",
+                    Some(&SessionAt {
+                        host: here,
+                        id: AgentId("far-child".into()),
+                    })
+                ),
+            ]
+        );
+    }
+
+    struct Flaky(Arc<AtomicUsize>);
+
+    impl Reporter for Flaky {
+        async fn send(&mut self, _full: bool) -> Result<()> {
+            if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                anyhow::bail!("database is locked");
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_report_is_retried_after_the_debounce() {
+        let (_events, rx) = broadcast::channel(16);
+        let shutdown = CancellationToken::new();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let debounce = Duration::from_millis(20);
+        let task = tokio::spawn(run(Flaky(attempts.clone()), rx, shutdown.clone(), debounce));
+        tokio::time::sleep(debounce * 25).await;
+        shutdown.cancel();
+        task.await.unwrap();
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "no event came, yet the report retried once"
+        );
+    }
 }

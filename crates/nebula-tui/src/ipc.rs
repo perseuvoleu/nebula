@@ -1912,6 +1912,7 @@ pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
                 card: card.clone(),
                 role: opts.role,
                 dispatch: None,
+                spawned_by_host: env_agent_id().map(|_| nebula_core::host::hostname()),
             },
         )
         .await?;

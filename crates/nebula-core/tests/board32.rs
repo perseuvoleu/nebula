@@ -28,6 +28,7 @@ fn create_agent(card: Option<&str>, role: Option<Role>, dispatch: Option<&str>) 
         card: card.map(|c| TodoId(c.into())),
         role,
         dispatch: dispatch.map(|d| DispatchId(d.into())),
+        spawned_by_host: None,
     }
 }
 

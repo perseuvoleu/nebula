@@ -74,6 +74,8 @@ pub struct CardLink {
     pub card: Option<TodoId>,
     pub role: Option<nebula_core::board::Role>,
     pub dispatch: Option<nebula_core::DispatchId>,
+    /// The spawner's host when it is not this one.
+    pub parent_host: Option<String>,
 }
 
 pub struct Daemon {
@@ -2500,6 +2502,9 @@ impl Daemon {
         };
         self.store
             .insert_agent_with_auto_title(&agent, auto_title)?;
+        if let Some(host) = &link.parent_host {
+            self.store.set_spawned_by_host(&agent.id, host)?;
+        }
         if adopted.is_none() {
             // Cold path: boot the CLI right away.
             self.spawn_agent_session_with_prompt(&agent, &worktree, 80, 24, prompt.as_deref())?;

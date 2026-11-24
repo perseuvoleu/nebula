@@ -414,6 +414,15 @@ const MIGRATIONS: &[&str] = &[
     CREATE TRIGGER dispatches_board_update AFTER UPDATE ON dispatches BEGIN UPDATE board_meta SET version = version + 1; END;
     CREATE TRIGGER dispatches_board_delete AFTER DELETE ON dispatches BEGIN UPDATE board_meta SET version = version + 1; END;
     ",
+    // 30: what a host report needs beyond the agent row: the host of the
+    // session that spawned an agent on another host, and per board session
+    // its created time and the project and checkout kind it runs in.
+    "
+    ALTER TABLE agents ADD COLUMN spawned_by_host TEXT;
+    ALTER TABLE board_sessions ADD COLUMN created_at INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE board_sessions ADD COLUMN project TEXT;
+    ALTER TABLE board_sessions ADD COLUMN worktree INTEGER NOT NULL DEFAULT 0;
+    ",
 ];
 
 /// A project's twin on a host, as the hook pointer needs it: the host, the
@@ -515,6 +524,28 @@ impl Store {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             ),
         )?)
+    }
+
+    /// The host of the session that spawned `id` on another host.
+    pub fn set_spawned_by_host(&self, id: &AgentId, host: &str) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE agents SET spawned_by_host = ?2 WHERE id = ?1",
+            params![id.as_str(), host],
+        )?;
+        Ok(())
+    }
+
+    /// Per agent, when it was created and the host of the session that
+    /// spawned it, when that host is another one.
+    pub fn agent_origins(
+        &self,
+    ) -> Result<std::collections::HashMap<AgentId, (i64, Option<String>)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id, created_at, spawned_by_host FROM agents")?;
+        let rows = stmt
+            .query_map([], |r| Ok((AgentId(r.get(0)?), (r.get(1)?, r.get(2)?))))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
     }
 
     // ---- workspaces ----
@@ -2366,9 +2397,12 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 29);
+        assert_eq!(version, 30);
         let expected: &[(&str, &[&str])] = &[
-            ("agents", &["card_id", "role", "dispatch_id"]),
+            (
+                "agents",
+                &["card_id", "role", "dispatch_id", "spawned_by_host"],
+            ),
             (
                 "todos",
                 &[
@@ -2427,6 +2461,9 @@ mod tests {
                     "branch",
                     "dispatch_id",
                     "reported_at",
+                    "created_at",
+                    "project",
+                    "worktree",
                 ],
             ),
             (
