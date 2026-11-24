@@ -24,7 +24,10 @@
         },
         "blocked_by": [
           "#11@leaseweb"
-        ]
+        ],
+        "cleared_blockers": [],
+        "created_at": 1764000000000,
+        "updated_at": 1764000150000
       }
     ],
     "hosts": [
@@ -51,7 +54,9 @@
       "needs_you": [
         {
           "host": "leaseweb",
-          "id": "01JF0000000000000000000002"
+          "id": "01JF0000000000000000000002",
+          "card": "01JD0000000000000000000012",
+          "status_changed_at": 1764000200000
         }
       ],
       "decisions": [

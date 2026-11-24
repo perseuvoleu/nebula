@@ -302,6 +302,35 @@ fn card_block_refuses_cycles() {
 }
 
 #[test]
+fn board_marks_cleared_blockers_and_card_ages() {
+    let env = board_env();
+    for title in ["Blocked", "Finished", "Shelved", "Open"] {
+        add(&env, &["--project", "nebula"], title);
+    }
+    for by in ["#2", "#3", "#4"] {
+        env.json(&["todo", "block", "#1", "--by", by, "--json"]);
+    }
+    let start = now_ms();
+    env.json(&["todo", "move", "#2", "done", "--json"]);
+    env.json(&["todo", "archive", "#3", "--json"]);
+    let board = env.json(&["todo", "board", "--all", "--json"]);
+    let blocked = board["board"]["cards"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["ref"] == "#1")
+        .unwrap()
+        .clone();
+    assert_eq!(blocked["blocked_by"], serde_json::json!(["#2", "#3", "#4"]));
+    assert_eq!(blocked["cleared_blockers"], serde_json::json!(["#2", "#3"]));
+    let created = blocked["created_at"].as_i64().unwrap();
+    assert!(created > 0 && created <= start, "{blocked}");
+    let moved = env.json(&["todo", "show", "#2", "--json"]);
+    assert!(moved["updated_at"].as_i64().unwrap() >= start, "{moved}");
+    assert!(moved["created_at"].as_i64().unwrap() <= start, "{moved}");
+}
+
+#[test]
 fn card_note_log_order() {
     let env = board_env();
     add(&env, &["--project", "nebula"], "Logged");
@@ -1009,7 +1038,7 @@ fn away_digest_sessions() {
     assert_eq!(away["finished"], serde_json::json!([work["id"]]), "{away}");
     assert_eq!(
         away["needs_you"],
-        serde_json::json!([{"host": FAR_HOST, "id": "n2"}]),
+        serde_json::json!([{"host": FAR_HOST, "id": "n2", "card": ask["id"], "status_changed_at": after + 1}]),
         "{away}"
     );
     assert_ne!(old["id"], work["id"]);
@@ -1110,7 +1139,7 @@ fn omitted_session_stops_needing_the_user() {
     };
     assert_eq!(
         away(&env),
-        serde_json::json!([{"host": FAR_HOST, "id": "n1"}])
+        serde_json::json!([{"host": FAR_HOST, "id": "n1", "card": card["id"], "status_changed_at": since + 1}])
     );
     far_report(&env, Vec::new());
     assert_eq!(away(&env), serde_json::json!([]), "n1 is no longer live");
