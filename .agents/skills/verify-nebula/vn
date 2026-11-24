@@ -82,6 +82,11 @@ seed_db() {
   bad=$(sqlite3 "$db" "SELECT count(*) FROM (SELECT repo_path AS v FROM projects UNION ALL SELECT path FROM worktrees
     UNION ALL SELECT branch FROM worktrees) WHERE instr(v, char(10)) OR instr(v, char(13)) OR instr(v, char(31))")
   [ "$bad" = 0 ] || die "$bad path or branch value(s) hold a newline, carriage return or unit separator; seed aborted"
+  if [ "$(sqlite3 "$db" "PRAGMA user_version")" -lt 29 ]; then
+    sqlite3 "$db" "DELETE FROM links"
+  else
+    sqlite3 "$db" "DELETE FROM artifacts WHERE kind = 'link'"
+  fi
   sqlite3 "$db" "PRAGMA foreign_keys = ON;
     DELETE FROM projects WHERE host IS NOT NULL;
     DELETE FROM ui_state;

@@ -147,12 +147,16 @@ unset NV_BIN
 
 fixtures=$(mktemp -d)
 fixture=$fixtures/nebula.db
-perl -0777 -ne '/const MIGRATIONS: &\[&str\] = &\[(.*?)\n\];/s or die "no MIGRATIONS";
-  my $block = $1; $block =~ s{^\s*//.*$}{}mg; my @m = $block =~ /"([^"]*)"/g;
-  print "CREATE TEMP TABLE migration_env (host TEXT NOT NULL, user TEXT NOT NULL);\n",
-    "INSERT INTO temp.migration_env VALUES (\x27fixture\x27, \x27fixture\x27);\n";
-  print "$_;\n" for @m; print "PRAGMA user_version = ", scalar(@m), ";\n"' \
-  "$here/../../../crates/nebula-daemon/src/store.rs" | sqlite3 "$fixtures/schema.db"
+schema_db() {
+  UPTO=${2:-} perl -0777 -ne '/const MIGRATIONS: &\[&str\] = &\[(.*?)\n\];/s or die "no MIGRATIONS";
+    my $block = $1; $block =~ s{^\s*//.*$}{}mg; my @m = $block =~ /"([^"]*)"/g;
+    splice @m, $ENV{UPTO} if $ENV{UPTO};
+    print "CREATE TEMP TABLE migration_env (host TEXT NOT NULL, user TEXT NOT NULL);\n",
+      "INSERT INTO temp.migration_env VALUES (\x27fixture\x27, \x27fixture\x27);\n";
+    print "$_;\n" for @m; print "PRAGMA user_version = ", scalar(@m), ";\n"' \
+    "$here/../../../crates/nebula-daemon/src/store.rs" | sqlite3 "$1"
+}
+schema_db "$fixtures/schema.db"
 cp "$fixtures/schema.db" "$fixture"
 sqlite3 "$fixture" "PRAGMA journal_mode = WAL" >/dev/null
 sqlite3 "$fixture" ".dbconfig no_ckpt_on_close on" "
@@ -166,7 +170,8 @@ sqlite3 "$fixture" ".dbconfig no_ckpt_on_close on" "
     ('a-run', 'w-main', 'Runner', 'running', 0, 'sid-run', 1),
     ('a-ask', 'w-feat', 'Asker', 'needs_feedback', 0, 'sid-ask', 1),
     ('a-old', 'w-main', 'Shelved', 'finished', 1, 'sid-old', 1);
-  INSERT INTO terminals (id, worktree_id, name, created_at, status) VALUES ('t-1', 'w-feat', 'shell', 1, 'running');" >/dev/null
+  INSERT INTO terminals (id, worktree_id, name, created_at, status) VALUES ('t-1', 'w-feat', 'shell', 1, 'running');
+  INSERT INTO artifacts (id, kind, title, url, project, created_at) VALUES ('l-1', 'link', 'pr', 'https://example.invalid/pr?token=real', 'alpha', 1);" >/dev/null
 cp "$fixture" "$fixtures/main-only.db"
 check "the fixture's rows live only in its WAL" test "$(sqlite3 "$fixtures/main-only.db" "SELECT count(*) FROM agents")" = 0
 fixture_sum=$(shasum -a 256 "$fixture")
@@ -191,7 +196,17 @@ check "the linked worktree is a scratch checkout of its branch" \
 check "sessions keep name and archived flag, lose resume ids and live statuses" \
   test "$(q "SELECT group_concat(name || ' ' || status || ' ' || archived || ' ' || ifnull(claude_session_id, '-'), ', ') FROM (SELECT * FROM agents ORDER BY name)")" \
   = "Asker disconnected 0 -, Runner disconnected 0 -, Shelved finished 1 -"
+check "copied link artifacts are dropped" test "$(q "SELECT count(*) FROM artifacts WHERE kind = 'link'")" = 0
 check "down removes the seeded instance" "$vn" down
+
+schema_db "$fixtures/v28.db" 28
+sqlite3 "$fixtures/v28.db" "
+  INSERT INTO projects (id, name, repo_path, created_at, workspace_id) VALUES ('p-alpha', 'alpha', '/nonexistent/real/alpha', 1, 'default');
+  INSERT INTO worktrees (id, project_id, path, branch, is_main, created_at) VALUES ('w-main', 'p-alpha', '/nonexistent/real/alpha', 'trunk', 1, 1);
+  INSERT INTO links (id, worktree_id, url, created_at) VALUES ('l-1', 'w-main', 'https://example.invalid/pr?token=real', 1);"
+check "up --seed starts an instance from a v28 db" "$vn" up --seed "$fixtures/v28.db"
+check "copied links are dropped" test "$(q "SELECT count(*) FROM artifacts WHERE kind = 'link'")" = 0
+check "down removes the v28 seeded instance" "$vn" down
 
 seed_refused() {
   ! "$vn" up --seed "$1" >/dev/null 2>&1 && test ! -e "$NV_STATE"
