@@ -186,7 +186,7 @@ pub fn card_ref(text: &str) -> Result<CardRef> {
         .with_context(|| format!("{text:?} is not a card ref (#12, 12, 12@host or a ULID)"))
 }
 
-fn client_id(id: Option<String>) -> Result<String> {
+pub(crate) fn client_id(id: Option<String>) -> Result<String> {
     match id {
         None => Ok(TodoId::generate().0),
         Some(id) => match parse_card_ref(&id) {
@@ -216,10 +216,12 @@ pub async fn request(conn: &mut Connection, op: BoardOp) -> Result<BoardResult> 
                 message,
             }) if r == req_id => bail!("{message}"),
             Some(_) => continue,
-            None => bail!("daemon closed the connection before replying"),
+            None => bail!(CLOSED),
         }
     }
 }
+
+pub(crate) const CLOSED: &str = "daemon closed the connection before replying";
 
 /// Reads the card `text` names, so a spawn linking it is refused before
 /// anything starts.

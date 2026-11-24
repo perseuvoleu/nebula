@@ -2,11 +2,13 @@
 //! artifact store, then published to the board with the caller's card,
 //! session and checkout; a URL is published as kind link.
 
-use crate::board_cli::{card_ref, check_card, connect, request, Caller, ScopeFlags};
+use crate::board_cli::{
+    card_ref, check_card, client_id, connect, request, Caller, ScopeFlags, CLOSED,
+};
 use crate::ipc::{self, Connection};
 use anyhow::{bail, Context, Result};
 use nebula_core::board::{
-    parse_card_ref, Artifact, ArtifactContent, BoardOp, BoardRead, BoardResult, CardRef,
+    parse_card_ref, Artifact, ArtifactContent, BoardOp, BoardRead, BoardResult, CardRef, Refusal,
     SessionLink,
 };
 use nebula_core::codec::{read_frame, write_frame};
@@ -21,14 +23,17 @@ pub enum CardChoice {
     None,
 }
 
+pub struct AddArgs {
+    pub source: String,
+    pub kind: Option<String>,
+    pub title: Option<String>,
+    pub project: Option<String>,
+    pub card: CardChoice,
+    pub id: Option<String>,
+}
+
 pub enum ArtifactVerb {
-    Add {
-        source: String,
-        kind: Option<String>,
-        title: Option<String>,
-        project: Option<String>,
-        card: CardChoice,
-    },
+    Add(AddArgs),
     List {
         scope: ScopeFlags,
         card: Option<String>,
@@ -77,50 +82,86 @@ fn url(text: &str) -> Result<Option<String>> {
     Ok(Some(text.to_string()))
 }
 
+async fn exchange(conn: &mut Connection, req: ClientRequest) -> Result<ServerEvent> {
+    write_frame(&mut conn.stream, &req).await?;
+    loop {
+        match read_frame::<ServerEvent, _>(&mut conn.stream).await? {
+            Some(ServerEvent::Error {
+                req_id: Some(1),
+                message,
+            }) => bail!("{message}"),
+            Some(
+                reply @ (ServerEvent::ArtifactStored { req_id: 1, .. }
+                | ServerEvent::Ack { req_id: 1, .. }),
+            ) => return Ok(reply),
+            Some(_) => continue,
+            None => bail!(CLOSED),
+        }
+    }
+}
+
 async fn store(
     conn: &mut Connection,
     id: &ArtifactId,
     kind: &str,
     source: PathBuf,
 ) -> Result<ArtifactContent> {
-    let req_id = 1;
     let req = ClientRequest::StoreArtifact {
-        req_id,
+        req_id: 1,
         id: id.clone(),
         kind: kind.to_string(),
         source,
     };
-    write_frame(&mut conn.stream, &req).await?;
-    loop {
-        match read_frame::<ServerEvent, _>(&mut conn.stream).await? {
-            Some(ServerEvent::ArtifactStored { req_id: r, content }) if r == req_id => {
-                return Ok(content)
-            }
-            Some(ServerEvent::Error {
-                req_id: Some(r),
-                message,
-            }) if r == req_id => bail!("{message}"),
-            Some(_) => continue,
-            None => bail!("daemon closed the connection before replying"),
-        }
+    match exchange(conn, req).await? {
+        ServerEvent::ArtifactStored { content, .. } => Ok(content),
+        other => bail!("the daemon answered a store with {other:?}"),
     }
 }
 
-async fn add(
+fn outcome_known(why: &anyhow::Error) -> bool {
+    why.downcast_ref::<std::io::Error>().is_none()
+        && why.to_string() != CLOSED
+        && Refusal::of(&why.to_string()) != Some(Refusal::Unknown)
+}
+
+async fn unpublished(
     conn: &mut Connection,
-    caller: Caller,
-    source: String,
-    kind: Option<String>,
-    title: Option<String>,
-    project: Option<String>,
-    card: CardChoice,
-) -> Result<BoardOp> {
+    id: &ArtifactId,
+    stored: bool,
+    why: anyhow::Error,
+) -> anyhow::Error {
+    if !outcome_known(&why) {
+        return anyhow::anyhow!(Refusal::Unknown.message(format!(
+            "artifact {id} may have been published ({why:#}); rerun with --id {id}"
+        )));
+    }
+    if stored {
+        let req = ClientRequest::DiscardArtifact {
+            req_id: 1,
+            id: id.clone(),
+        };
+        if let Err(e) = exchange(conn, req).await {
+            eprintln!("nebula: the stored copy of artifact {id} stays: {e:#}");
+        }
+    }
+    why
+}
+
+async fn add(conn: &mut Connection, caller: Caller, args: AddArgs) -> Result<BoardOp> {
+    let AddArgs {
+        source,
+        kind,
+        title,
+        project,
+        card,
+        id,
+    } = args;
     let card = match card {
         CardChoice::Caller => caller.card.clone(),
         CardChoice::Card(text) => Some(check_card(conn, &text).await?),
         CardChoice::None => None,
     };
-    let id = ArtifactId::generate();
+    let id = ArtifactId(client_id(id)?);
     let (kind, content, default_title) = if let Some(url) = url(&source)? {
         let content = ArtifactContent::Url { url };
         ("link".to_string(), content, source)
@@ -165,13 +206,7 @@ pub async fn run(verb: ArtifactVerb, json: bool) -> Result<()> {
     let caller = Caller::resolve(&projects, &worktrees, &agents)?;
     let mut opening = false;
     let mut op = match verb {
-        ArtifactVerb::Add {
-            source,
-            kind,
-            title,
-            project,
-            card,
-        } => add(&mut conn, caller, source, kind, title, project, card).await?,
+        ArtifactVerb::Add(args) => add(&mut conn, caller, args).await?,
         ArtifactVerb::List {
             scope,
             card,
@@ -194,7 +229,13 @@ pub async fn run(verb: ArtifactVerb, json: bool) -> Result<()> {
         },
     };
     loop {
-        let result = request(&mut conn, op.clone()).await?;
+        let result = match (&op, request(&mut conn, op.clone()).await) {
+            (BoardOp::Publish(artifact), Err(why)) => {
+                let stored = matches!(artifact.content, ArtifactContent::Files { .. });
+                return Err(unpublished(&mut conn, &artifact.id, stored, why).await);
+            }
+            (_, result) => result?,
+        };
         if opening {
             let BoardResult::Artifact(artifact) = result else {
                 bail!("the board answered an artifact read with {result:?}");
@@ -282,4 +323,23 @@ fn open(a: &Artifact) -> Result<()> {
     }
     println!("{target}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_an_answer_settles_a_publish() {
+        assert!(outcome_known(&anyhow::anyhow!(
+            Refusal::Conflict.message("taken")
+        )));
+        assert!(outcome_known(&anyhow::anyhow!("no board configured")));
+        let lost = std::io::Error::from(std::io::ErrorKind::BrokenPipe);
+        assert!(!outcome_known(&anyhow::Error::from(lost)));
+        assert!(!outcome_known(&anyhow::anyhow!(CLOSED)));
+        assert!(!outcome_known(&anyhow::anyhow!(
+            Refusal::Unknown.message("link dropped")
+        )));
+    }
 }

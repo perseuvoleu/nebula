@@ -823,6 +823,9 @@ enum ArtifactCommand {
         /// Its project when no card is linked (default: the caller's).
         #[arg(long, conflicts_with = "card")]
         project: Option<String>,
+        /// The artifact's ULID, so a rerun stores and publishes nothing twice.
+        #[arg(long)]
+        id: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -1305,7 +1308,7 @@ fn main() -> Result<()> {
             nebula_tui::run_board(verb, json)
         }
         Some(Command::Artifact { command }) => {
-            use nebula_tui::artifact_cli::{ArtifactVerb, CardChoice};
+            use nebula_tui::artifact_cli::{AddArgs, ArtifactVerb, CardChoice};
             let (verb, json) = match command {
                 ArtifactCommand::Add {
                     source,
@@ -1314,19 +1317,21 @@ fn main() -> Result<()> {
                     card,
                     no_card,
                     project,
+                    id,
                     json,
                 } => (
-                    ArtifactVerb::Add {
+                    ArtifactVerb::Add(AddArgs {
                         source,
                         kind,
                         title,
                         project,
+                        id,
                         card: match (card, no_card) {
                             (Some(card), _) => CardChoice::Card(card),
                             (None, true) => CardChoice::None,
                             (None, false) => CardChoice::Caller,
                         },
-                    },
+                    }),
                     json,
                 ),
                 ArtifactCommand::List {

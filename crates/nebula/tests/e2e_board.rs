@@ -900,6 +900,55 @@ fn refused(out: &Output, why: &str) {
     assert!(stderr(out).contains(why), "{why:?} not in {}", stderr(out));
 }
 
+fn store_entries(env: &Env) -> Vec<std::ffi::OsString> {
+    std::fs::read_dir(env.data_dir().join("artifacts"))
+        .map(|dir| dir.map(|e| e.unwrap().file_name()).collect())
+        .unwrap_or_default()
+}
+
+#[test]
+fn artifact_add_rerun_with_id() {
+    let env = board_env();
+    let page = tree(&env.tmp.path().join("page"), &[("index.html", b"one")]);
+    let id = nebula_core::ArtifactId::generate().0;
+    let args = [page.to_str().unwrap(), "--kind", "recap", "--id", &id];
+    let first = publish(&env, None, &args);
+    assert_eq!(first["id"], id.as_str());
+    assert_eq!(publish(&env, None, &args), first);
+    assert_eq!(artifact_ids(&env), [id.as_str()]);
+
+    std::fs::write(page.join("index.html"), b"two").unwrap();
+    let mut argv = vec!["artifact", "add"];
+    argv.extend_from_slice(&args);
+    let changed = env.cli(&argv, None);
+    assert_eq!(changed.status.code(), Some(6), "{}", stderr(&changed));
+    assert_eq!(
+        std::fs::read(env.stored(&id).join("index.html")).unwrap(),
+        b"one"
+    );
+}
+
+#[test]
+fn artifact_add_refused_publish_drops_the_tree() {
+    let env = Env::new().start(&[]);
+    let page = tree(&env.tmp.path().join("page"), &[("index.html", b"x")]);
+    let id = nebula_core::ArtifactId::generate().0;
+    let out = env.cli(
+        &[
+            "artifact",
+            "add",
+            page.to_str().unwrap(),
+            "--kind",
+            "recap",
+            "--id",
+            &id,
+        ],
+        None,
+    );
+    refused(&out, "no board configured");
+    assert!(store_entries(&env).is_empty(), "{:?}", store_entries(&env));
+}
+
 #[test]
 fn artifact_add_url_forms() {
     let env = board_env();

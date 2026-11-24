@@ -552,6 +552,13 @@ pub enum ClientRequest {
         source: PathBuf,
     },
 
+    /// Removes the tree `StoreArtifact` stored under `id`, after the board
+    /// definitely refused its row. Answered by Ack or Error.
+    DiscardArtifact {
+        req_id: u64,
+        id: ArtifactId,
+    },
+
     Shutdown,
 }
 

@@ -461,15 +461,17 @@ pub enum BoardOp {
 pub enum Refusal {
     NotFound,
     Conflict,
+    Unknown,
 }
 
 impl Refusal {
-    const ALL: [Refusal; 2] = [Refusal::NotFound, Refusal::Conflict];
+    const ALL: [Refusal; 3] = [Refusal::NotFound, Refusal::Conflict, Refusal::Unknown];
 
     fn tag(self) -> &'static str {
         match self {
             Refusal::NotFound => "not found: ",
             Refusal::Conflict => "conflict: ",
+            Refusal::Unknown => "outcome unknown: ",
         }
     }
 
@@ -485,6 +487,7 @@ impl Refusal {
         match self {
             Refusal::NotFound => 5,
             Refusal::Conflict => 6,
+            Refusal::Unknown => 4,
         }
     }
 }

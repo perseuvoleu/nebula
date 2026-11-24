@@ -33,22 +33,47 @@ pub fn store(id: &ArtifactId, kind: &str, source: &Path) -> Result<ArtifactConte
     }
     let root = store_dir();
     let dest = root.join(id.as_str());
-    if !dest.exists() {
-        std::fs::create_dir_all(&root)?;
-        let tmp = root.join(format!(".tmp-{id}"));
-        let _ = std::fs::remove_dir_all(&tmp);
-        let copied = copy_tree(source, &tmp).and_then(|files| entry_of(kind, &tmp, &files));
-        if let Err(why) = copied {
-            let _ = std::fs::remove_dir_all(&tmp);
-            return Err(why);
+    std::fs::create_dir_all(&root)?;
+    let tmp = root.join(format!(".tmp-{id}"));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let entry = copy_tree(source, &tmp).and_then(|files| {
+        let entry = entry_of(kind, &tmp, &files)?;
+        if !dest.exists() {
+            std::fs::rename(&tmp, &dest)?;
+        } else if !same_tree(&tmp, &dest, &files)? {
+            bail!(Refusal::Conflict.message(format!(
+                "artifact {id} is already stored with other content"
+            )));
         }
-        std::fs::rename(&tmp, &dest)?;
-    }
-    let files = stored_files(&dest)?;
+        Ok(entry)
+    });
+    let _ = std::fs::remove_dir_all(&tmp);
     Ok(ArtifactContent::Files {
         host: nebula_core::host::hostname(),
-        entry: entry_of(kind, &dest, &files)?,
+        entry: entry?,
     })
+}
+
+pub fn discard(id: &ArtifactId) -> Result<()> {
+    if ulid::Ulid::from_string(id.as_str()).is_err() {
+        bail!("artifact id {id} is not a ULID");
+    }
+    match std::fs::remove_dir_all(store_dir().join(id.as_str())) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+        _ => Ok(()),
+    }
+}
+
+fn same_tree(staged: &Path, stored: &Path, files: &BTreeSet<String>) -> Result<bool> {
+    if stored_files(stored)? != *files {
+        return Ok(false);
+    }
+    for file in files {
+        if std::fs::read(staged.join(file))? != std::fs::read(stored.join(file))? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn entry_of(kind: &str, dir: &Path, files: &BTreeSet<String>) -> Result<String> {

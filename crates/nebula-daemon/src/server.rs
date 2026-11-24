@@ -34,6 +34,23 @@ pub async fn accept_loop(daemon: Arc<Daemon>, listener: UnixListener) {
     }
 }
 
+fn answer_blocking(
+    out_tx: mpsc::Sender<ServerEvent>,
+    req_id: u64,
+    work: impl FnOnce() -> Result<ServerEvent> + Send + 'static,
+) {
+    tokio::spawn(async move {
+        let answered = tokio::task::spawn_blocking(work)
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("request panicked: {e}")));
+        let event = answered.unwrap_or_else(|e| ServerEvent::Error {
+            req_id: Some(req_id),
+            message: format!("{e:#}"),
+        });
+        let _ = out_tx.send(event).await;
+    });
+}
+
 async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
     let (read_half, write_half) = stream.into_split();
     let mut reader = tokio::io::BufReader::new(read_half);
@@ -315,23 +332,17 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     id,
                     kind,
                     source,
-                } => {
-                    let out_tx = out_tx.clone();
-                    tokio::spawn(async move {
-                        let stored = tokio::task::spawn_blocking(move || {
-                            crate::artifacts::store(&id, &kind, &source)
+                } => answer_blocking(out_tx.clone(), req_id, move || {
+                    crate::artifacts::store(&id, &kind, &source)
+                        .map(|content| ServerEvent::ArtifactStored { req_id, content })
+                }),
+                ClientRequest::DiscardArtifact { req_id, id } => {
+                    answer_blocking(out_tx.clone(), req_id, move || {
+                        crate::artifacts::discard(&id).map(|()| ServerEvent::Ack {
+                            req_id,
+                            created: None,
                         })
-                        .await
-                        .unwrap_or_else(|e| Err(anyhow::anyhow!("artifact store panicked: {e}")));
-                        let event = match stored {
-                            Ok(content) => ServerEvent::ArtifactStored { req_id, content },
-                            Err(e) => ServerEvent::Error {
-                                req_id: Some(req_id),
-                                message: format!("{e:#}"),
-                            },
-                        };
-                        let _ = out_tx.send(event).await;
-                    });
+                    })
                 }
                 ClientRequest::GetMetrics { req_id } => {
                     // A machine-wide `ps` sweep takes tens of ms; keep it off
