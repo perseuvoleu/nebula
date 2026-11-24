@@ -21,7 +21,13 @@ pub(crate) fn page_budget() -> usize {
 }
 
 pub fn serve(store: &Store, op: BoardOp) -> Result<BoardResult> {
-    store.board_transaction(|tx| apply(tx, op))
+    let result = store.board_transaction(|tx| apply(tx, op))?;
+    if let BoardResult::Artifact(artifact) = &result {
+        if artifact.kind == "decision" && !artifact.meta.contains_key("rag_note") {
+            crate::rag_copy::kick();
+        }
+    }
+    Ok(result)
 }
 
 fn apply(tx: &Transaction, op: BoardOp) -> Result<BoardResult> {

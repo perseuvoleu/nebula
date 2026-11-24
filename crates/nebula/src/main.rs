@@ -160,6 +160,12 @@ enum Command {
         #[command(subcommand)]
         command: ArtifactCommand,
     },
+    /// Record why a choice was made, on the caller's card: an artifact of
+    /// kind decision that the board host also copies to RAG.
+    Decision {
+        #[command(subcommand)]
+        command: DecisionCommand,
+    },
     /// Install an agent CLI's nebula status hooks into a checkout — what
     /// the daemon does before every spawn; run on the far host by a remote
     /// session's ssh spawn, where this daemon's installer can't reach.
@@ -882,6 +888,52 @@ enum ArtifactCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum DecisionCommand {
+    /// Record a decision, linked to the caller's card, session and checkout.
+    Add {
+        /// What was decided.
+        what: String,
+        /// Why.
+        #[arg(long)]
+        why: Option<String>,
+        /// Link this card instead of the caller's (#12, 12 or a ULID).
+        #[arg(long, conflicts_with = "project")]
+        card: Option<String>,
+        /// Record it on this project with no card.
+        #[arg(long)]
+        project: Option<String>,
+        /// Record it in no project and on no card, wherever it runs.
+        #[arg(long, conflicts_with_all = ["card", "project"])]
+        home: bool,
+        /// The decision's ULID, so a rerun records nothing twice.
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List decisions (default: the caller's project, else all).
+    List {
+        #[command(flatten)]
+        scope: ScopeArgs,
+        /// Only those whose what or why holds this text.
+        #[arg(long)]
+        query: Option<String>,
+        /// Continue from a previous reply's `next`.
+        #[arg(long)]
+        page: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// One decision, with meta.rag_note once RAG holds it. Exits 5 when
+    /// there is none.
+    Show {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[derive(clap::Args)]
 struct ScopeArgs {
     /// Only these projects (repeat for more).
@@ -1438,6 +1490,45 @@ fn main() -> Result<()> {
                 ArtifactCommand::Rm { id, json } => (ArtifactVerb::Rm { id }, json),
             };
             nebula_tui::run_artifact(verb, json)
+        }
+        Some(Command::Decision { command }) => {
+            use nebula_tui::decision_cli::DecisionVerb;
+            let (verb, json) = match command {
+                DecisionCommand::Add {
+                    what,
+                    why,
+                    card,
+                    project,
+                    home,
+                    id,
+                    json,
+                } => (
+                    DecisionVerb::Add {
+                        what,
+                        why,
+                        card,
+                        project,
+                        home,
+                        id,
+                    },
+                    json,
+                ),
+                DecisionCommand::List {
+                    scope,
+                    query,
+                    page,
+                    json,
+                } => (
+                    DecisionVerb::List {
+                        scope: scope.into(),
+                        query,
+                        page,
+                    },
+                    json,
+                ),
+                DecisionCommand::Show { id, json } => (DecisionVerb::Show { id }, json),
+            };
+            nebula_tui::run_decision(verb, json)
         }
         Some(Command::Kill) => nebula_tui::run_kill(),
         Some(Command::Rename { title, force }) => nebula_tui::run_rename(title.join(" "), force),

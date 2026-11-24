@@ -11,6 +11,7 @@ pub mod branches;
 pub mod collect_cli;
 pub mod completion;
 pub mod config;
+pub mod decision_cli;
 pub mod diagram_cli;
 pub mod diagrams;
 pub mod event_loop;
@@ -173,6 +174,11 @@ pub fn run_board(verb: board_cli::TodoVerb, json: bool) -> Result<()> {
 /// `nebula artifact`: exits 5 for an unknown artifact or card.
 pub fn run_artifact(verb: artifact_cli::ArtifactVerb, json: bool) -> Result<()> {
     board_cli::exit_on_refusal(runtime()?.block_on(artifact_cli::run(verb, json)))
+}
+
+/// `nebula decision`: exits 5 for an unknown decision or card.
+pub fn run_decision(verb: decision_cli::DecisionVerb, json: bool) -> Result<()> {
+    board_cli::exit_on_refusal(runtime()?.block_on(decision_cli::run(verb, json)))
 }
 
 /// `nebula worktree new` — agent-facing orchestration verb.
