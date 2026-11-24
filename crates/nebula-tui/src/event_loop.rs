@@ -1613,7 +1613,11 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 Some(SessionRow::Terminal(t)) => {
                     open_prompt(app, PromptKind::RenameTerminal { id: t.id })
                 }
-                Some(SessionRow::Link(_)) | None => {}
+                Some(SessionRow::Link(_)) => {
+                    app.flash =
+                        Some("the pull request link can't be renamed — it comes from git".into())
+                }
+                None => {}
             },
             Focus::Projects => {
                 if let Some(ProjectRow::Divider { project, before }) = app.selected_project_row() {
@@ -3449,7 +3453,11 @@ fn open_delete_confirm(app: &mut App) {
                     action: PendingAction::CloseTerminal(t.id),
                 }));
             }
-            Some(SessionRow::Link(_)) | None => {}
+            Some(SessionRow::Link(_)) => {
+                app.flash =
+                    Some("the pull request link can't be deleted — it comes from git".into())
+            }
+            None => {}
         },
         Focus::Terminal => {}
     }
@@ -11921,9 +11929,17 @@ mod tests {
 
         press(&mut app, KeyCode::Char('d'), KeyModifiers::NONE, &mut out);
         assert!(app.overlay.is_none(), "no confirm for a row we don't own");
+        assert_eq!(
+            app.flash.as_deref(),
+            Some("the pull request link can't be deleted — it comes from git")
+        );
 
         press(&mut app, KeyCode::Char('r'), KeyModifiers::NONE, &mut out);
         assert!(app.overlay.is_none(), "nothing stored to edit");
+        assert_eq!(
+            app.flash.as_deref(),
+            Some("the pull request link can't be renamed — it comes from git")
+        );
         assert!(out.is_empty(), "nothing goes to the daemon: {out:?}");
         // Enter still opens it — reading the PR is the whole point.
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
