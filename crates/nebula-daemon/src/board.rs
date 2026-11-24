@@ -155,25 +155,49 @@ fn apply(tx: &Transaction, op: BoardOp) -> Result<BoardResult> {
 
 fn begin_run(tx: &Transaction, dispatch: Dispatch) -> Result<RunReceipt> {
     let card = resolve(tx, &dispatch.card)?;
-    if let Some(known) = receipt(tx, &dispatch.id)? {
+    let known = receipt(tx, &dispatch.id)?;
+    if let Some(known) = &known {
         if known.card != card {
             bail!(Refusal::Conflict.message(format!(
                 "dispatch {} runs another card",
                 dispatch.id.as_str()
             )));
         }
-        return Ok(known);
+        let (host, role, kind, worktree): (String, String, String, String) = tx.query_row(
+            "SELECT host, role, kind, worktree FROM dispatches WHERE id = ?1",
+            params![dispatch.id.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?;
+        if (
+            host.as_str(),
+            role.as_str(),
+            kind.as_str(),
+            worktree.as_str(),
+        ) != (
+            dispatch.host.as_str(),
+            dispatch.role.as_str(),
+            dispatch.kind.as_str(),
+            dispatch.worktree.as_str(),
+        ) {
+            bail!(Refusal::Conflict.message(format!(
+                "dispatch {} runs with --host {host} --role {role} --kind {kind} --worktree {worktree}; rerun it with those",
+                dispatch.id.as_str()
+            )));
+        }
+        if known.state != DispatchState::Pending {
+            return Ok(known.clone());
+        }
     }
     let found = card_by_id(tx, &card)?;
     if found.archived {
         bail!(Refusal::Conflict.message(format!("{} is archived", found.label)));
     }
-    if found.project.is_none() {
+    let Some(project) = found.project else {
         bail!(Refusal::Conflict.message(format!(
             "{} is a home card; give it a project to run it",
             found.label
         )));
-    }
+    };
     let open: Vec<String> = tx
         .prepare(
             "SELECT t.number FROM card_blocks b JOIN todos t ON t.id = b.by_id
@@ -189,9 +213,12 @@ fn begin_run(tx: &Transaction, dispatch: Dispatch) -> Result<RunReceipt> {
             open.join(", ")
         )));
     }
+    if let Some(known) = known {
+        return Ok(known);
+    }
     tx.execute(
-        "INSERT INTO dispatches (id, card_id, host, role, kind, worktree, state, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7)",
+        "INSERT INTO dispatches (id, card_id, host, role, kind, worktree, state, created_at, project)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8)",
         params![
             dispatch.id.as_str(),
             card.as_str(),
@@ -199,7 +226,8 @@ fn begin_run(tx: &Transaction, dispatch: Dispatch) -> Result<RunReceipt> {
             dispatch.role.as_str(),
             dispatch.kind.as_str(),
             dispatch.worktree,
-            now_ms()
+            now_ms(),
+            project
         ],
     )?;
     receipt(tx, &dispatch.id)?.ok_or_else(|| anyhow::anyhow!("the dispatch vanished"))
@@ -234,7 +262,7 @@ fn end_run(
 fn receipt(tx: &Transaction, id: &DispatchId) -> Result<Option<RunReceipt>> {
     Ok(tx
         .query_row(
-            "SELECT card_id, host, state, agent_id FROM dispatches WHERE id = ?1",
+            "SELECT card_id, host, state, agent_id, project FROM dispatches WHERE id = ?1",
             params![id.as_str()],
             |r| {
                 let host: String = r.get(1)?;
@@ -251,6 +279,7 @@ fn receipt(tx: &Transaction, id: &DispatchId) -> Result<Option<RunReceipt>> {
                         id: AgentId(agent),
                     }),
                     card: TodoId(r.get(0)?),
+                    project: r.get(4)?,
                 })
             },
         )

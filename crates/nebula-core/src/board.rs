@@ -307,6 +307,10 @@ pub struct RunReceipt {
     pub state: DispatchState,
     pub session: Option<SessionAt>,
     pub card: TodoId,
+    /// The card's project when the board admitted the run; a rerun spawns
+    /// there even if the card has moved since.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

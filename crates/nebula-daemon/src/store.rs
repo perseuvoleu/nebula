@@ -423,6 +423,10 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE board_sessions ADD COLUMN project TEXT;
     ALTER TABLE board_sessions ADD COLUMN worktree INTEGER NOT NULL DEFAULT 0;
     ",
+    // 31: the project a dispatch was admitted into, so a rerun spawns there.
+    "
+    ALTER TABLE dispatches ADD COLUMN project TEXT;
+    ",
 ];
 
 /// A project's twin on a host, as the hook pointer needs it: the host, the
@@ -2397,7 +2401,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 30);
+        assert_eq!(version, 31);
         let expected: &[(&str, &[&str])] = &[
             (
                 "agents",

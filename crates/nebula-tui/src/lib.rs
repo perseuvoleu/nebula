@@ -108,9 +108,18 @@ pub fn run_open_on_host(
     project: Option<&str>,
     focus: bool,
 ) -> Result<i32> {
+    run_on_host(
+        host,
+        session_open::open_on_argv(host, reference, project, focus)?,
+    )
+}
+
+/// Runs an ssh argv from [`session_open::ssh_argv`] and passes the remote
+/// command's output through. The exit code to leave with: 3 when HOST is
+/// unreachable, else the remote command's.
+pub(crate) fn run_on_host(host: &str, argv: Vec<String>) -> Result<i32> {
     use anyhow::Context;
     use std::io::Write;
-    let argv = session_open::open_on_argv(host, reference, project, focus)?;
     let out = std::process::Command::new("ssh")
         .args(&argv)
         .stdin(std::process::Stdio::null())
