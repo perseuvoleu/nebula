@@ -179,6 +179,20 @@ Build and validate a new committed release before promotion. Preserve existing u
 and environment entries; change only deployment paths and necessary push configuration.
 Restart only `nebula-web.service`; never restart the Nebula daemon, bridge or proxy.
 
+## Deploy on leaseweb
+
+leaseweb serves code.possu.dev from the same per-SHA release layout under
+`~/.local/share/nebula/web-releases/<sha>`, run by the venv `~/.local/share/nebula/web-venv`
+(`web/requirements.txt`) and the `nebula-web.service` user unit with a
+`nebula-web.service.d/90-durable-release.conf` override naming the release. The gateway listens
+on 127.0.0.1:8765 only; the `cloudflared-leaseweb` tunnel carries code.possu.dev to it behind
+Cloudflare Access, and no inbound port opens. `NEBULA_WEB_PROJECTS` lists only projects
+leaseweb's daemon knows. `NEBULA_WEB_BINARY` points at `web-releases/client-<sha>/bin/nebula`,
+built from the same commit.
+
+**Rollback:** repoint the code.possu.dev public hostname in Cloudflare back to findl, whose
+`nebula-web.service` keeps running release 3b6189c until the leaseweb service is confirmed.
+
 **The token grants agent control as the server's OS user.** Project allowlisting is an API
 scope, not an OS sandbox. Rotate a leaked token in the env file and restart only `nebula-web`.
 
