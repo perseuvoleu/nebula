@@ -1757,6 +1757,8 @@ pub struct NewAgentOpts {
     /// `--card REF`: the board card the session works on, checked on the
     /// board before anything spawns.
     pub card: Option<String>,
+    /// `--no-card`: the session joins no card, not even its spawner's.
+    pub no_card: bool,
     pub role: Option<nebula_core::board::Role>,
 }
 
@@ -1794,12 +1796,13 @@ pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
     let mut conn = handshake(stream).await?;
     let (projects, worktrees, agents) = subscribe_snapshot(&mut conn).await?;
     let project = resolve_project(&projects, &worktrees, &agents, opts.project.as_deref())?;
-    let card = match opts.card.as_deref() {
-        Some(text) => {
-            crate::board_cli::Caller::resolve(&projects, &worktrees, &agents)?;
-            Some(crate::board_cli::check_card(&mut conn, text).await?)
-        }
-        None => None,
+    let caller = (env_agent_id().is_some() || opts.card.is_some())
+        .then(|| crate::board_cli::Caller::resolve(&projects, &worktrees, &agents))
+        .transpose()?;
+    let card = match (opts.card.as_deref(), opts.no_card) {
+        (Some(text), _) => Some(crate::board_cli::check_card(&mut conn, text).await?),
+        (None, true) => None,
+        (None, false) => caller.and_then(|spawner| spawner.card),
     };
     if let Some(host) = &project.host {
         let cache = paths::log_dir().join("skills-check");
@@ -1914,6 +1917,7 @@ pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
                 card: card.clone(),
                 role: opts.role,
                 dispatch: None,
+                spawned_by_host: env_agent_id().map(|_| nebula_core::host::hostname()),
             },
         )
         .await?;

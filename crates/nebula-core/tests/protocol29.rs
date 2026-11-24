@@ -79,6 +79,7 @@ fn create_agent_keeps_its_spawner_without_a_writer_claim() {
         card: None,
         role: None,
         dispatch: None,
+        spawned_by_host: None,
     };
     let wire = rmp_serde::to_vec(&request).unwrap();
     let decoded: ClientRequest = rmp_serde::from_slice(&wire).unwrap();

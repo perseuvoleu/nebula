@@ -415,6 +415,7 @@ async fn full_crud_attach_and_restart_persistence() {
             card: None,
             role: None,
             dispatch: None,
+            spawned_by_host: None,
         },
     )
     .await
@@ -812,6 +813,7 @@ async fn hook_post_from_agent_pty_drives_status() {
             card: None,
             role: None,
             dispatch: None,
+            spawned_by_host: None,
         },
     )
     .await
@@ -1884,6 +1886,7 @@ async fn hook_cwd_rehomes_agent_to_other_worktree() {
             card: None,
             role: None,
             dispatch: None,
+            spawned_by_host: None,
         },
     )
     .await
@@ -2053,6 +2056,7 @@ async fn move_agent_respawns_live_session_in_target_worktree() {
             card: None,
             role: None,
             dispatch: None,
+            spawned_by_host: None,
         },
     )
     .await
@@ -2242,6 +2246,7 @@ async fn codex_hooks_install_and_drive_status() {
             card: None,
             role: None,
             dispatch: None,
+            spawned_by_host: None,
         },
     )
     .await
@@ -2893,6 +2898,7 @@ async fn prewarmed_session_is_adopted_by_create_agent() {
             card: None,
             role: None,
             dispatch: None,
+            spawned_by_host: None,
         },
     )
     .await
@@ -3044,6 +3050,7 @@ async fn dead_prewarm_falls_back_to_cold_spawn() {
             card: None,
             role: None,
             dispatch: None,
+            spawned_by_host: None,
         },
     )
     .await
@@ -3122,6 +3129,7 @@ async fn create_agent_refuses_when_the_cli_is_not_installed() {
                 card: None,
                 role: None,
                 dispatch: None,
+                spawned_by_host: None,
             },
         )
         .await
@@ -3221,6 +3229,7 @@ async fn create_agent_succeeds_when_the_cli_is_on_the_login_shell_path() {
             card: None,
             role: None,
             dispatch: None,
+            spawned_by_host: None,
         },
     )
     .await
@@ -3297,6 +3306,7 @@ async fn read_events_until_a_later_sweep(
             card: None,
             role: None,
             dispatch: None,
+            spawned_by_host: None,
         },
     )
     .await
@@ -3341,6 +3351,7 @@ async fn create_agent_get_id(
             card: None,
             role: None,
             dispatch: None,
+            spawned_by_host: None,
         },
     )
     .await
@@ -3531,6 +3542,7 @@ async fn archive_sigkills_an_agent_that_ignores_sighup() {
             card: None,
             role: None,
             dispatch: None,
+            spawned_by_host: None,
         },
     )
     .await
@@ -3699,6 +3711,7 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
             card: None,
             role: None,
             dispatch: None,
+            spawned_by_host: None,
         },
     )
     .await
@@ -3761,6 +3774,7 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
             card: None,
             role: None,
             dispatch: None,
+            spawned_by_host: None,
         },
     )
     .await
@@ -3922,6 +3936,7 @@ async fn idle_reaper_kills_unattached_sibling_on_viewed_worktree() {
                 card: None,
                 role: None,
                 dispatch: None,
+                spawned_by_host: None,
             },
         )
         .await
@@ -4528,6 +4543,7 @@ async fn auto_title_instruction_and_rename_flow() {
             card: None,
             role: None,
             dispatch: None,
+            spawned_by_host: None,
         },
     )
     .await
@@ -6334,6 +6350,7 @@ async fn a_parked_agent_resumes_its_conversation_once_primary_is_back_on_its_bra
             card: None,
             role: None,
             dispatch: None,
+            spawned_by_host: None,
         },
     )
     .await

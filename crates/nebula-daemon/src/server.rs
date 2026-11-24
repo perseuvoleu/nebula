@@ -606,6 +606,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     card,
                     role,
                     dispatch,
+                    spawned_by_host,
                 } => {
                     reply(
                         &out_tx,
@@ -627,6 +628,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                                     card,
                                     role,
                                     dispatch,
+                                    parent_host: spawned_by_host,
                                 },
                             )
                             .await

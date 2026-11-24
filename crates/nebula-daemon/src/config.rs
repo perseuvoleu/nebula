@@ -36,6 +36,9 @@ pub struct Config {
     /// name sends every board verb to that host's daemon over the board
     /// link; unset refuses every board verb with "no board configured".
     pub board: Option<String>,
+    /// How many writers this host should run at once; unset reports only
+    /// the live count.
+    pub writer_slots: Option<u32>,
 }
 
 impl Default for Config {
@@ -47,6 +50,7 @@ impl Default for Config {
             session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT.into(),
             auto_archive_after: DEFAULT_AUTO_ARCHIVE_AFTER.into(),
             board: None,
+            writer_slots: None,
         }
     }
 }

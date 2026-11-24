@@ -28,6 +28,7 @@ fn create_agent(card: Option<&str>, role: Option<Role>, dispatch: Option<&str>) 
         card: card.map(|c| TodoId(c.into())),
         role,
         dispatch: dispatch.map(|d| DispatchId(d.into())),
+        spawned_by_host: None,
     }
 }
 
@@ -185,6 +186,9 @@ fn row(id: &str, role: Option<Role>, status: AgentStatus, alive: bool) -> Sessio
         archived: false,
         branch: None,
         dispatch_id: None,
+        created_at: 0,
+        project: None,
+        worktree: false,
     }
 }
 
@@ -356,6 +360,30 @@ fn auto_stage_transitions() {
             None,
             worker(Finished),
             vec![],
+            Some(Review),
+        ),
+        (
+            "worker appears finished and dead on next",
+            Next,
+            None,
+            dead_worker(Finished),
+            vec![],
+            Some(Review),
+        ),
+        (
+            "worker appears finished on backlog beside a live running worker",
+            Backlog,
+            None,
+            worker(Finished),
+            vec![other_worker(Running, true)],
+            None,
+        ),
+        (
+            "archived worker appears finished on backlog",
+            Backlog,
+            None,
+            archived_worker(Finished),
+            vec![],
             None,
         ),
         (
@@ -411,6 +439,30 @@ fn auto_stage_transitions() {
             Doing,
             Some(dead_worker(Running)),
             dead_worker(Finished),
+            vec![],
+            None,
+        ),
+        (
+            "worker finishes and exits in one report on doing",
+            Doing,
+            Some(worker(Running)),
+            dead_worker(Finished),
+            vec![],
+            Some(Review),
+        ),
+        (
+            "worker appears finished and dead on doing",
+            Doing,
+            None,
+            dead_worker(Finished),
+            vec![],
+            Some(Review),
+        ),
+        (
+            "archived worker appears finished on doing",
+            Doing,
+            None,
+            archived_worker(Finished),
             vec![],
             None,
         ),
