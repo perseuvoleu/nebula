@@ -258,6 +258,49 @@ fn app_ancestor(pid: u32, parent_of: impl Fn(u32) -> Option<(u32, String)>) -> O
     None
 }
 
+/// The `ssh` argv that runs `nebula open --session …  --json` on `host`.
+pub fn open_on_argv(
+    host: &str,
+    session: &str,
+    project: Option<&str>,
+    focus: bool,
+) -> Result<Vec<String>> {
+    for (what, value) in [
+        ("host", Some(host)),
+        ("session", Some(session)),
+        ("project", project),
+    ] {
+        if let Some(value) = value.filter(|v| !is_ssh_token(v)) {
+            bail!("{what} {value:?} is not a plain name (letters, digits, . _ @ -)");
+        }
+    }
+    let mut words = vec!["nebula", "open", "--session", session, "--json"];
+    if let Some(project) = project {
+        words.extend(["--project", project]);
+    }
+    if !focus {
+        words.push("--no-focus");
+    }
+    let mut argv: Vec<String> = nebula_core::remote::SSH_BATCH_OPTS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    argv.extend([
+        "--".to_owned(),
+        host.to_owned(),
+        crate::remote_cli::with_remote_path(&nebula_core::remote::join_quoted(words)),
+    ]);
+    Ok(argv)
+}
+
+/// Safe as an ssh destination and inside the remote command line.
+fn is_ssh_token(s: &str) -> bool {
+    !s.is_empty()
+        && !s.starts_with('-')
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '@' | '-'))
+}
+
 /// Write-then-rename: the reader never sees half a file.
 fn write_atomically(path: &Path, text: &str) -> Result<()> {
     let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
@@ -286,5 +329,43 @@ mod tests {
         assert_eq!(app_ancestor(29808, tree), Some(29805));
         assert_eq!(app_ancestor(1, tree), None);
         assert_eq!(app_ancestor(4242, tree), None);
+    }
+
+    #[test]
+    fn open_on_refuses_bad_host_token() {
+        assert_eq!(
+            open_on_argv("me@mbp.tail.ts.net", "a1b2", Some("alpha@findl"), false).unwrap(),
+            [
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "--",
+                "me@mbp.tail.ts.net",
+                "export PATH=\"$HOME/.local/bin:$HOME/.cargo/bin:$PATH\"; 'nebula' 'open' '--session' 'a1b2' '--json' '--project' 'alpha@findl' '--no-focus'",
+            ]
+        );
+        for host in [
+            "",
+            "-oProxyCommand=sh",
+            "a b",
+            "a;b",
+            "$(id)",
+            "a`id`",
+            "a\nb",
+            "a'b",
+        ] {
+            assert!(
+                open_on_argv(host, "a1b2", None, true).is_err(),
+                "host {host:?}"
+            );
+        }
+        for session in ["", "-x", "a b", "a;rm", "$(id)", "a'b"] {
+            assert!(
+                open_on_argv("findl", session, None, true).is_err(),
+                "session {session:?}"
+            );
+        }
+        assert!(open_on_argv("findl", "a1b2", Some("p;q"), true).is_err());
     }
 }

@@ -19,6 +19,13 @@ pub fn is_remote_session() -> bool {
     )
 }
 
+/// Whether an ssh destination (`user@name`, a FQDN, `localhost`) names
+/// this machine.
+pub fn names_this_machine(destination: &str) -> bool {
+    let name = destination.rsplit('@').next().unwrap_or(destination);
+    name.eq_ignore_ascii_case("localhost") || short_name(name).eq_ignore_ascii_case(&hostname())
+}
+
 fn short_name(full: &str) -> &str {
     full.split('.').next().unwrap_or(full)
 }

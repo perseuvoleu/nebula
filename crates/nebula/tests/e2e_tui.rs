@@ -1274,6 +1274,92 @@ fn open_session_attaches_it_in_the_running_tui() {
     assert_typing_reaches(&mut tui, "t3", &ids[1]);
 }
 
+/// `--on HOST` runs the open on HOST over ssh: a stub ssh (the relay tests'
+/// PATH override) runs the remote command line on this machine, where the
+/// remote `~/.local/bin/nebula` is this build talking to the same TUI.
+#[test]
+fn open_on_host_returns_landed_focused() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut tui = TuiHarness::spawn();
+    let repo = tui.make_repo("alpha-proj");
+    add_project(&mut tui, &repo, "alpha-proj");
+    let new = nebula_cli(
+        &tui,
+        &[
+            "agent",
+            "new",
+            "--project",
+            "alpha-proj",
+            "--worktree",
+            "main",
+            "--name",
+            "far",
+        ],
+    );
+    assert!(new.status.success(), "{new:?}");
+    let id = serde_json::from_slice::<serde_json::Value>(&new.stdout).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    tui.wait_for_text("far");
+
+    let home = tempfile::tempdir().unwrap();
+    let bin = home.path().join(".local/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_nebula"), bin.join("nebula")).unwrap();
+    let hops = home.path().join("ssh-argv");
+    std::fs::write(
+        bin.join("ssh"),
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\nfor arg do script=$arg; done\nexec /bin/sh -c \"$script\"\n",
+            hops.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(bin.join("ssh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        .args([
+            "open",
+            "--session",
+            &id,
+            "--on",
+            "laptop-b",
+            "--no-focus",
+            "--json",
+        ])
+        .env("NEBULA_RUNTIME_DIR", &tui.runtime_dir)
+        .env("NEBULA_DATA_DIR", &tui.data_dir)
+        .env("HOME", home.path())
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let argv = std::fs::read_to_string(&hops).unwrap_or_default();
+    assert!(
+        argv.lines().any(|l| l == "BatchMode=yes") && argv.lines().any(|l| l == "laptop-b"),
+        "ssh argv: {argv:?}"
+    );
+    let landed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        landed,
+        serde_json::json!({
+            "landed": "tui",
+            "tui_pid": tui.child.process_id().unwrap(),
+            "id": id,
+            "name": "far",
+            "project": "alpha-proj",
+            "host": null,
+            "focused": false,
+        })
+    );
+    tui.wait_for_selected("far");
+    assert_typing_reaches(&mut tui, "on1", &id);
+}
+
 /// An attach the daemon cannot complete (the agent CLI vanished, so the
 /// respawn fails) is a failure, not a landing: the command waits for the
 /// attach itself.

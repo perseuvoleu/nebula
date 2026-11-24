@@ -83,9 +83,7 @@ pub(crate) fn ssh(host: &str, script: &str, tty: bool) -> Result<String> {
     }
     cmd.args(nebula_core::remote::SSH_BATCH_OPTS);
     cmd.args(["--", host]);
-    cmd.arg(format!(
-        "export PATH=\"$HOME/.local/bin:$HOME/.cargo/bin:$PATH\"; {script}"
-    ));
+    cmd.arg(with_remote_path(script));
     if tty {
         // The remote command draws on our terminal (nebula upgrade's
         // progress); nothing to capture.
@@ -103,6 +101,11 @@ pub(crate) fn ssh(host: &str, script: &str, tty: bool) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// `script` with the remote `~/.local/bin` and `~/.cargo/bin` on PATH.
+pub(crate) fn with_remote_path(script: &str) -> String {
+    format!("export PATH=\"$HOME/.local/bin:$HOME/.cargo/bin:$PATH\"; {script}")
 }
 
 async fn status(host: &str) -> Result<()> {
