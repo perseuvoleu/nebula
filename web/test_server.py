@@ -586,6 +586,8 @@ class BoardTests(unittest.TestCase):
         (self.artifacts / ARTIFACT_ID / "index.html").write_text("<script>parent.document</script>")
         (self.artifacts / ARTIFACT_ID / "shots" / "drag.png").write_bytes(b"\x89PNG fake")
         (self.artifacts / ARTIFACT_ID / "notes.xyz").write_text("plain")
+        (self.artifacts / ARTIFACT_ID / "page.htm").write_text("<p>htm</p>")
+        (self.artifacts / ARTIFACT_ID / "page.xhtml").write_text("<p>xhtml</p>")
         (self.artifacts / OTHER_ID).mkdir()
         (self.artifacts / OTHER_ID / "result.json").write_text("{}")
         (root / "secret.txt").write_text("OUTSIDE-SECRET")
@@ -712,7 +714,8 @@ class BoardTests(unittest.TestCase):
         grant = self.card_src().split("/")[2]
         with patch("server.subprocess.run") as run:
             for entry, mime in [("index.html", "text/html"), ("shots/drag.png", "image/png"),
-                                ("result.json", "application/json"), ("notes.xyz", "application/octet-stream")]:
+                                ("result.json", "application/json"), ("notes.xyz", "application/octet-stream"),
+                                ("page.htm", "text/html"), ("page.xhtml", "application/xhtml+xml")]:
                 with self.subTest(entry=entry):
                     status, headers, body = self.request(f"/a/{grant}/{ARTIFACT_ID}/{entry}")
                     self.assertEqual(status, 200)

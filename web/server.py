@@ -53,7 +53,7 @@ BOARD_EXITS = {3: (503, "Board host unreachable; nothing was sent"),
                4: (504, "Outcome unknown; repeat the same action to finish it"),
                5: (404, "Card not found"), 6: (409, "The card changed; refresh and try again")}
 GRANT_TTL, GRANT_STEP = 3600, 1800
-ARTIFACT_TYPES = {**ASSET_TYPES, ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+ARTIFACT_TYPES = {**ASSET_TYPES, ".htm": "text/html", ".xhtml": "application/xhtml+xml", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
                   ".webp": "image/webp", ".md": "text/markdown", ".pdf": "application/pdf", ".csv": "text/csv",
                   ".log": "text/plain", ".mp4": "video/mp4", ".webm": "video/webm"}
 CSP = ("default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; "
