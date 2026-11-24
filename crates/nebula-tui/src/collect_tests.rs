@@ -175,6 +175,9 @@ impl Fixture {
             branch: Some("feature".into()),
             spawned_by: None,
             writer: false,
+            card_id: None,
+            role: None,
+            dispatch_id: None,
             code_mode_off: false,
         });
     }

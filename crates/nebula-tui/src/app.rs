@@ -5001,6 +5001,9 @@ mod tests {
             branch: None,
             spawned_by: None,
             writer: false,
+            card_id: None,
+            role: None,
+            dispatch_id: None,
             code_mode_off: false,
         });
         let template = app.tree.agents[0].clone();
@@ -5058,6 +5061,9 @@ mod tests {
                 branch: None,
                 spawned_by: None,
                 writer: false,
+                card_id: None,
+                role: None,
+                dispatch_id: None,
                 code_mode_off: false,
             });
         }
@@ -5189,6 +5195,9 @@ mod tests {
                 branch: None,
                 spawned_by: None,
                 writer: false,
+                card_id: None,
+                role: None,
+                dispatch_id: None,
                 code_mode_off: false,
             });
         }
@@ -5375,6 +5384,9 @@ mod tests {
             branch: branch.map(str::to_owned),
             spawned_by: None,
             writer: false,
+            card_id: None,
+            role: None,
+            dispatch_id: None,
             code_mode_off: false,
         }
     }
@@ -6109,6 +6121,9 @@ mod tests {
             branch: None,
             spawned_by: None,
             writer: false,
+            card_id: None,
+            role: None,
+            dispatch_id: None,
             code_mode_off: false,
         });
 

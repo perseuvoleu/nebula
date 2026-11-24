@@ -1891,6 +1891,9 @@ pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
                 writer: opts.writer,
                 spawned_by: env_agent_id().map(AgentId),
                 code_mode_off: opts.code_mode_off,
+                card: None,
+                role: None,
+                dispatch: None,
             },
         )
         .await?;

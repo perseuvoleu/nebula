@@ -1,0 +1,21 @@
+{
+  "title": "board.spec",
+  "status": "failed",
+  "started_at": 1764000000000,
+  "duration_ms": 4200,
+  "steps": [
+    {
+      "name": "drag a card to doing",
+      "status": "passed",
+      "duration_ms": 1200,
+      "screenshot": "shots/drag.png"
+    },
+    {
+      "name": "run a worker",
+      "status": "failed",
+      "duration_ms": 3000,
+      "screenshot": "shots/run.png",
+      "error": "timed out waiting for the session row"
+    }
+  ]
+}

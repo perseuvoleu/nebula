@@ -412,6 +412,9 @@ async fn full_crud_attach_and_restart_persistence() {
             writer: WriterClaim::Off,
             spawned_by: None,
             code_mode_off: false,
+            card: None,
+            role: None,
+            dispatch: None,
         },
     )
     .await
@@ -806,6 +809,9 @@ async fn hook_post_from_agent_pty_drives_status() {
             writer: WriterClaim::Off,
             spawned_by: None,
             code_mode_off: false,
+            card: None,
+            role: None,
+            dispatch: None,
         },
     )
     .await
@@ -1875,6 +1881,9 @@ async fn hook_cwd_rehomes_agent_to_other_worktree() {
             writer: WriterClaim::Off,
             spawned_by: None,
             code_mode_off: false,
+            card: None,
+            role: None,
+            dispatch: None,
         },
     )
     .await
@@ -2041,6 +2050,9 @@ async fn move_agent_respawns_live_session_in_target_worktree() {
             writer: WriterClaim::Off,
             spawned_by: None,
             code_mode_off: false,
+            card: None,
+            role: None,
+            dispatch: None,
         },
     )
     .await
@@ -2227,6 +2239,9 @@ async fn codex_hooks_install_and_drive_status() {
             writer: WriterClaim::Off,
             spawned_by: None,
             code_mode_off: false,
+            card: None,
+            role: None,
+            dispatch: None,
         },
     )
     .await
@@ -2875,6 +2890,9 @@ async fn prewarmed_session_is_adopted_by_create_agent() {
             writer: WriterClaim::Off,
             spawned_by: None,
             code_mode_off: false,
+            card: None,
+            role: None,
+            dispatch: None,
         },
     )
     .await
@@ -3023,6 +3041,9 @@ async fn dead_prewarm_falls_back_to_cold_spawn() {
             writer: WriterClaim::Off,
             spawned_by: None,
             code_mode_off: false,
+            card: None,
+            role: None,
+            dispatch: None,
         },
     )
     .await
@@ -3098,6 +3119,9 @@ async fn create_agent_refuses_when_the_cli_is_not_installed() {
                 writer: WriterClaim::Off,
                 spawned_by: None,
                 code_mode_off: false,
+                card: None,
+                role: None,
+                dispatch: None,
             },
         )
         .await
@@ -3194,6 +3218,9 @@ async fn create_agent_succeeds_when_the_cli_is_on_the_login_shell_path() {
             writer: WriterClaim::Off,
             spawned_by: None,
             code_mode_off: false,
+            card: None,
+            role: None,
+            dispatch: None,
         },
     )
     .await
@@ -3267,6 +3294,9 @@ async fn read_events_until_a_later_sweep(
             writer: WriterClaim::Off,
             spawned_by: None,
             code_mode_off: false,
+            card: None,
+            role: None,
+            dispatch: None,
         },
     )
     .await
@@ -3308,6 +3338,9 @@ async fn create_agent_get_id(
             writer: WriterClaim::Off,
             spawned_by: None,
             code_mode_off: false,
+            card: None,
+            role: None,
+            dispatch: None,
         },
     )
     .await
@@ -3495,6 +3528,9 @@ async fn archive_sigkills_an_agent_that_ignores_sighup() {
             writer: WriterClaim::Off,
             spawned_by: None,
             code_mode_off: false,
+            card: None,
+            role: None,
+            dispatch: None,
         },
     )
     .await
@@ -3660,6 +3696,9 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
             writer: WriterClaim::Off,
             spawned_by: None,
             code_mode_off: false,
+            card: None,
+            role: None,
+            dispatch: None,
         },
     )
     .await
@@ -3719,6 +3758,9 @@ async fn idle_sessions_reap_unwatched_but_spare_busy_and_attached() {
             writer: WriterClaim::Off,
             spawned_by: None,
             code_mode_off: false,
+            card: None,
+            role: None,
+            dispatch: None,
         },
     )
     .await
@@ -3877,6 +3919,9 @@ async fn idle_reaper_kills_unattached_sibling_on_viewed_worktree() {
                 writer: WriterClaim::Off,
                 spawned_by: None,
                 code_mode_off: false,
+                card: None,
+                role: None,
+                dispatch: None,
             },
         )
         .await
@@ -4480,6 +4525,9 @@ async fn auto_title_instruction_and_rename_flow() {
             writer: WriterClaim::Off,
             spawned_by: None,
             code_mode_off: false,
+            card: None,
+            role: None,
+            dispatch: None,
         },
     )
     .await
@@ -6283,6 +6331,9 @@ async fn a_parked_agent_resumes_its_conversation_once_primary_is_back_on_its_bra
             writer: WriterClaim::Off,
             spawned_by: None,
             code_mode_off: false,
+            card: None,
+            role: None,
+            dispatch: None,
         },
     )
     .await
@@ -6911,7 +6962,7 @@ async fn mobile_safe_removal_preserves_dirty_unmerged_occupied_and_protected_che
 
 /// Use literal peer versions so a simultaneous client/server constant change cannot mask a mismatch.
 #[tokio::test]
-async fn protocol31_handshake_accepts_repeated_probes_and_rejects_protocol30() {
+async fn protocol32_handshake_accepts_repeated_probes_and_rejects_protocol31() {
     let env = TestEnv::new();
     let _daemon = env.spawn_daemon();
     let mut c = connect(&env.sock()).await;
@@ -6919,7 +6970,7 @@ async fn protocol31_handshake_accepts_repeated_probes_and_rejects_protocol30() {
         write_frame(
             &mut c,
             &ClientRequest::Hello {
-                protocol_version: 31,
+                protocol_version: 32,
             },
         )
         .await
@@ -6933,7 +6984,7 @@ async fn protocol31_handshake_accepts_repeated_probes_and_rejects_protocol30() {
             matches!(
                 reply,
                 Some(ServerEvent::HelloOk {
-                    protocol_version: 31,
+                    protocol_version: 32,
                     ..
                 })
             ),
@@ -6944,7 +6995,7 @@ async fn protocol31_handshake_accepts_repeated_probes_and_rejects_protocol30() {
     write_frame(
         &mut old,
         &ClientRequest::Hello {
-            protocol_version: 30,
+            protocol_version: 31,
         },
     )
     .await
@@ -6960,7 +7011,7 @@ async fn protocol31_handshake_accepts_repeated_probes_and_rejects_protocol30() {
         matches!(
             reply,
             Some(ServerEvent::Incompatible {
-                daemon_protocol_version: 31
+                daemon_protocol_version: 32
             })
         ),
         "{reply:?}"

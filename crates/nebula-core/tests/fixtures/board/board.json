@@ -1,0 +1,62 @@
+{
+  "version": "01JB0000000000000000000000.53",
+  "board": {
+    "cards": [
+      {
+        "id": "01JD0000000000000000000012",
+        "number": 12,
+        "ref": "#12@leaseweb",
+        "title": "Keep verification results",
+        "stage": "doing",
+        "project": "nebula",
+        "proposed": false,
+        "archived": false,
+        "created_by": {
+          "host": "perseu-mbp",
+          "agent": "01JF0000000000000000000001",
+          "name": "AH 02 Contract Worker"
+        },
+        "checkout": {
+          "host": "leaseweb",
+          "branch": "agent-home-02",
+          "path": "/home/perseu/nebula-worktrees/agent-home-02",
+          "worktree": true
+        },
+        "blocked_by": [
+          "#11@leaseweb"
+        ]
+      }
+    ],
+    "hosts": [
+      {
+        "host": "leaseweb",
+        "writers": 1,
+        "writer_slots": null,
+        "checkouts": [
+          {
+            "project": "nebula",
+            "branch": "main",
+            "path": "/home/perseu/nebula",
+            "worktree": false
+          }
+        ],
+        "needs_you": 0,
+        "stale": false
+      }
+    ],
+    "away": {
+      "finished": [
+        "01JD0000000000000000000012"
+      ],
+      "needs_you": [
+        {
+          "host": "leaseweb",
+          "id": "01JF0000000000000000000002"
+        }
+      ],
+      "decisions": [
+        "01JG0000000000000000000002"
+      ]
+    }
+  }
+}

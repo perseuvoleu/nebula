@@ -1320,6 +1320,9 @@ impl Store {
             branch: r.get(13).unwrap(),
             writer: r.get::<_, i64>(14).unwrap() != 0,
             spawned_by: r.get::<_, Option<String>>(15).unwrap().map(AgentId),
+            card_id: None,
+            role: None,
+            dispatch_id: None,
             code_mode_off: r.get::<_, i64>(16).unwrap() != 0,
         }))
     }
@@ -1437,6 +1440,9 @@ impl Store {
                     branch: r.get(13)?,
                     writer: r.get::<_, i64>(14)? != 0,
                     spawned_by: r.get::<_, Option<String>>(15)?.map(AgentId),
+                    card_id: None,
+                    role: None,
+                    dispatch_id: None,
                     code_mode_off: r.get::<_, i64>(16)? != 0,
                 })
             })?
@@ -1531,6 +1537,9 @@ mod tests {
             branch: None,
             spawned_by: Some(AgentId("lead".into())),
             writer: true,
+            card_id: None,
+            role: None,
+            dispatch_id: None,
             code_mode_off: false,
         };
         store.insert_agent(&agent).unwrap();
@@ -1552,6 +1561,9 @@ mod tests {
             branch: None,
             spawned_by: None,
             writer: false,
+            card_id: None,
+            role: None,
+            dispatch_id: None,
             code_mode_off: false,
         };
         store.insert_agent(&codex_agent).unwrap();
@@ -1573,6 +1585,9 @@ mod tests {
             branch: None,
             spawned_by: None,
             writer: false,
+            card_id: None,
+            role: None,
+            dispatch_id: None,
             code_mode_off: false,
         };
         store.insert_agent(&cursor_agent).unwrap();
@@ -1822,6 +1837,9 @@ mod tests {
                 branch: None,
                 spawned_by: None,
                 writer: false,
+                card_id: None,
+                role: None,
+                dispatch_id: None,
                 code_mode_off: false,
             })
             .unwrap();
@@ -2372,6 +2390,9 @@ mod tests {
             branch: None,
             spawned_by: None,
             writer: false,
+            card_id: None,
+            role: None,
+            dispatch_id: None,
             code_mode_off: false,
         };
 
@@ -2618,6 +2639,9 @@ mod tests {
                     branch: None,
                     spawned_by: None,
                     writer: false,
+                    card_id: None,
+                    role: None,
+                    dispatch_id: None,
                     code_mode_off: false,
                 })
                 .unwrap();

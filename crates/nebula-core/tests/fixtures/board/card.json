@@ -1,0 +1,24 @@
+{
+  "id": "01JD0000000000000000000012",
+  "number": 12,
+  "ref": "#12@leaseweb",
+  "title": "Keep verification results",
+  "stage": "doing",
+  "project": "nebula",
+  "proposed": false,
+  "archived": false,
+  "created_by": {
+    "host": "perseu-mbp",
+    "agent": "01JF0000000000000000000001",
+    "name": "AH 02 Contract Worker"
+  },
+  "checkout": {
+    "host": "leaseweb",
+    "branch": "agent-home-02",
+    "path": "/home/perseu/nebula-worktrees/agent-home-02",
+    "worktree": true
+  },
+  "blocked_by": [
+    "#11@leaseweb"
+  ]
+}

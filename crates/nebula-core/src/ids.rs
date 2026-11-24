@@ -39,6 +39,8 @@ id_newtype!(TerminalId);
 id_newtype!(NoteId);
 id_newtype!(TodoId);
 id_newtype!(LinkId);
+id_newtype!(ArtifactId);
+id_newtype!(DispatchId);
 
 /// Id of the built-in workspace every install starts with (and the home of
 /// projects that predate workspaces). A fixed literal, not a ULID, so the

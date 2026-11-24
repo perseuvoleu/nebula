@@ -1328,6 +1328,9 @@ mod tests {
             branch: None,
             spawned_by: None,
             writer: false,
+            card_id: None,
+            role: None,
+            dispatch_id: None,
             code_mode_off: false,
         };
         let mut viewer = HtmlViewer::open(tmp.path().to_path_buf(), None, None);
