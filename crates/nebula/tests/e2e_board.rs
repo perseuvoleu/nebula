@@ -906,6 +906,31 @@ fn store_entries(env: &Env) -> Vec<std::ffi::OsString> {
         .unwrap_or_default()
 }
 
+fn wire(env: &Env, request: nebula_core::ClientRequest) -> nebula_core::ServerEvent {
+    use nebula_core::codec::{read_frame, write_frame};
+    use nebula_core::{ClientRequest, ServerEvent, PROTOCOL_VERSION};
+    let sock = env.runtime_dir().join("daemon.sock");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let mut stream = tokio::net::UnixStream::connect(sock).await.unwrap();
+        let hello = ClientRequest::Hello {
+            protocol_version: PROTOCOL_VERSION,
+        };
+        write_frame(&mut stream, &hello).await.unwrap();
+        write_frame(&mut stream, &request).await.unwrap();
+        loop {
+            match read_frame::<ServerEvent, _>(&mut stream).await.unwrap() {
+                Some(ServerEvent::HelloOk { .. }) => continue,
+                Some(reply) => return reply,
+                None => panic!("daemon closed the connection"),
+            }
+        }
+    })
+}
+
 #[test]
 fn artifact_add_rerun_with_id() {
     let env = board_env();
@@ -947,6 +972,56 @@ fn artifact_add_refused_publish_drops_the_tree() {
     );
     refused(&out, "no board configured");
     assert!(store_entries(&env).is_empty(), "{:?}", store_entries(&env));
+}
+
+#[test]
+fn artifact_entry_stays_inside_its_tree() {
+    use nebula_core::board::{Artifact, ArtifactContent, BoardOp};
+    use nebula_core::{ArtifactId, ClientRequest, ServerEvent};
+    let env = board_env();
+    for entry in ["../secret.png", "/etc/passwd", "a/../../b", ""] {
+        let artifact = Artifact {
+            id: ArtifactId::generate(),
+            kind: "recap".into(),
+            title: "escape".into(),
+            card: None,
+            project: None,
+            session: None,
+            checkout: None,
+            content: ArtifactContent::Files {
+                host: nebula_core::host::hostname(),
+                entry: entry.into(),
+            },
+            meta: Default::default(),
+            created_at: 1,
+            removed_at: None,
+        };
+        let reply = wire(
+            &env,
+            ClientRequest::Board {
+                req_id: 1,
+                op: BoardOp::Publish(artifact),
+            },
+        );
+        assert!(
+            matches!(reply, ServerEvent::Error { .. }),
+            "{entry:?}: {reply:?}"
+        );
+    }
+    assert!(artifact_ids(&env).is_empty());
+
+    let page = tree(&env.tmp.path().join("page"), &[("index.html", b"x")]);
+    std::fs::write(env.tmp.path().join("secret.png"), b"secret").unwrap();
+    let added = publish(&env, None, &[page.to_str().unwrap(), "--kind", "recap"]);
+    let reply = wire(
+        &env,
+        ClientRequest::LocateArtifact {
+            req_id: 1,
+            id: ArtifactId(added["id"].as_str().unwrap().into()),
+            entry: "../../../secret.png".into(),
+        },
+    );
+    assert!(matches!(reply, ServerEvent::Error { .. }), "{reply:?}");
 }
 
 #[test]

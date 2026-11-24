@@ -5,7 +5,9 @@ use crate::board::{
     cursor, in_scope, json_column, now_ms, optional_json, page_offset, paged, resolve,
 };
 use anyhow::{bail, Context, Result};
-use nebula_core::board::{Artifact, ArtifactContent, BoardScope, CardRef, Page, Refusal};
+use nebula_core::board::{
+    entry_inside, Artifact, ArtifactContent, BoardScope, CardRef, Page, Refusal,
+};
 use nebula_core::{paths, ArtifactId, TodoId};
 use nix::dir::Dir;
 use nix::errno::Errno;
@@ -63,6 +65,9 @@ pub fn store(id: &ArtifactId, kind: &str, source: &Path) -> Result<ArtifactConte
 pub fn locate(id: &ArtifactId, entry: &str) -> Result<PathBuf> {
     if ulid::Ulid::from_string(id.as_str()).is_err() {
         bail!("artifact id {id} is not a ULID");
+    }
+    if !entry_inside(entry) {
+        bail!("entry {entry:?} is not a relative path inside the stored tree");
     }
     let tree = store_dir()
         .join(id.as_str())
@@ -319,6 +324,11 @@ pub(crate) fn publish(tx: &Transaction, artifact: Artifact) -> Result<Artifact> 
     }
     if let Some(card) = &artifact.card {
         resolve(tx, &CardRef::Id(card.clone()))?;
+    }
+    if let ArtifactContent::Files { entry, .. } = &artifact.content {
+        if !entry_inside(entry) {
+            bail!("entry {entry:?} is not a relative path inside the stored tree");
+        }
     }
     let (host, entry, url, body) = match &artifact.content {
         ArtifactContent::Files { host, entry } => (Some(host), Some(entry), None, None),
