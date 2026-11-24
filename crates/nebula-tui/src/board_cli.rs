@@ -5,10 +5,14 @@ use crate::ipc::{self, Connection};
 use anyhow::{bail, Context, Result};
 use nebula_core::board::{
     parse_card_ref, Author, BoardOp, BoardPoll, BoardRead, BoardResult, BoardScope, Card,
-    CardDraft, CardRef, Checkout, Placement, ProjectScope, Refusal, Role, Stage,
+    CardDraft, CardRef, Checkout, Dispatch, DispatchState, Placement, ProjectScope, Refusal, Role,
+    RunReceipt, Stage,
 };
 use nebula_core::codec::{read_frame, write_frame};
-use nebula_core::{paths, Agent, ClientRequest, NoteId, Project, ServerEvent, TodoId, Worktree};
+use nebula_core::{
+    paths, Agent, AgentId, AgentKind, ClientRequest, DispatchId, NoteId, Project, ServerEvent,
+    TodoId, Worktree,
+};
 
 /// Who runs a board verb: the session NEBULA_AGENT_ID names, else the user
 /// in the checkout holding the cwd.
@@ -202,6 +206,21 @@ pub enum TodoVerb {
         away_since: Option<i64>,
         page: Option<String>,
     },
+    Run {
+        card: String,
+        role: Role,
+        kind: String,
+        host: String,
+        worktree: String,
+        dispatch: Option<String>,
+        scope: ScopeFlags,
+    },
+    Approve {
+        card: String,
+        session: String,
+        expected_status_at: i64,
+        scope: ScopeFlags,
+    },
 }
 
 pub fn card_ref(text: &str) -> Result<CardRef> {
@@ -265,6 +284,33 @@ pub async fn run(verb: TodoVerb, json: bool) -> Result<()> {
     let caller = Caller::resolve(&projects, &worktrees, &agents)?;
     let mut minted = None;
     let mut op = match verb {
+        TodoVerb::Run {
+            card,
+            role,
+            kind,
+            host,
+            worktree,
+            dispatch,
+            scope,
+        } => {
+            let dispatch = Dispatch {
+                id: DispatchId(client_id(dispatch, &mut minted)?),
+                card: card_ref(&card)?,
+                host,
+                role,
+                kind: AgentKind::parse(&kind).with_context(|| {
+                    format!("unknown agent kind {kind:?} (claude|codex|cursor|pi|antigravity)")
+                })?,
+                worktree,
+            };
+            return run_dispatch(&mut conn, dispatch, scope, json).await;
+        }
+        TodoVerb::Approve {
+            card,
+            session,
+            expected_status_at,
+            scope,
+        } => return approve(&mut conn, &card, &session, expected_status_at, scope, json).await,
         TodoVerb::Add {
             title,
             project,
@@ -382,6 +428,231 @@ pub async fn run(verb: TodoVerb, json: bool) -> Result<()> {
             return Ok(());
         }
     }
+}
+
+/// `todo run`: BeginRun on the board, the ordinary spawn on the target host
+/// with the dispatch id, then EndRun. A dispatch left pending by a lost
+/// EndRun spawns again; the target daemon answers that with the session the
+/// dispatch already started.
+async fn run_dispatch(
+    conn: &mut Connection,
+    dispatch: Dispatch,
+    scope: ScopeFlags,
+    json: bool,
+) -> Result<()> {
+    let id = dispatch.id.clone();
+    let rerun = |why: anyhow::Error| match Refusal::of(&why.to_string()) {
+        Some(Refusal::OutcomeUnknown) => anyhow::anyhow!("{why} with --dispatch {}", id.as_str()),
+        _ => why,
+    };
+    let (host, role, kind, worktree) = (
+        dispatch.host.clone(),
+        dispatch.role,
+        dispatch.kind,
+        dispatch.worktree.clone(),
+    );
+    let begun = request(conn, scope.guard(BoardOp::BeginRun(dispatch)))
+        .await
+        .map_err(rerun)?;
+    let receipt = run_receipt(begun)?;
+    match receipt.state {
+        DispatchState::Started => return print_receipt(&receipt, json),
+        DispatchState::Failed => {
+            print_receipt(&receipt, json)?;
+            bail!(Refusal::Conflict.message(format!(
+                "dispatch {} already failed; a new run needs a new dispatch id",
+                id.as_str()
+            )));
+        }
+        DispatchState::Pending => {}
+    }
+    let card = match request(
+        conn,
+        BoardOp::Read(BoardRead::Card {
+            scope: ScopeFlags::default().scope(None),
+            card: CardRef::Id(receipt.card.clone()),
+        }),
+    )
+    .await?
+    {
+        BoardResult::Show(show) => show.card,
+        other => bail!("the board answered a card read with {other:?}"),
+    };
+    let project = card
+        .project
+        .with_context(|| format!("{} has no project to run in", card.label))?;
+    let project = match host == nebula_core::host::hostname() {
+        true => project,
+        false => format!("{project}@{host}"),
+    };
+    let worktree = match worktree.as_str() {
+        "new" => fresh_worktree(conn, &project, card.number, &id).await?,
+        _ => worktree,
+    };
+    let spawned = crate::ipc::spawn_agent(crate::ipc::NewAgentOpts {
+        worktree: Some(worktree),
+        project: Some(project),
+        kind: kind.as_str().to_string(),
+        model: None,
+        effort: None,
+        name: None,
+        prompt: None,
+        writer: match role {
+            Role::Worker | Role::Fix => nebula_core::WriterClaim::Exclusive,
+            _ => nebula_core::WriterClaim::Off,
+        },
+        writer_wait: std::time::Duration::ZERO,
+        code_mode_off: false,
+        card: Some(receipt.card.0.clone()),
+        no_card: false,
+        role: Some(role),
+        dispatch: Some(id.clone()),
+    })
+    .await;
+    let (agent, error) = match spawned {
+        Ok(created) => (
+            Some(AgentId(
+                created["id"]
+                    .as_str()
+                    .context("the spawn named no session")?
+                    .to_string(),
+            )),
+            None,
+        ),
+        Err(why) if why.to_string().contains(nebula_core::WRITER_HELD_REFUSAL) => {
+            (None, Some(why.to_string()))
+        }
+        Err(why) => bail!(
+            "{why:#}; dispatch {} stays pending, rerun with --dispatch {}",
+            id.as_str(),
+            id.as_str()
+        ),
+    };
+    let ended = request(
+        conn,
+        BoardOp::EndRun {
+            dispatch: id.clone(),
+            agent,
+            error: error.clone(),
+        },
+    )
+    .await
+    .map_err(rerun)?;
+    let receipt = run_receipt(ended)?;
+    print_receipt(&receipt, json)?;
+    match (receipt.state, error) {
+        (DispatchState::Failed, Some(error)) => bail!(Refusal::Conflict.message(error)),
+        _ => Ok(()),
+    }
+}
+
+/// The worktree `--worktree new` runs in: a branch named for the card and
+/// the dispatch, so a rerun finds the one the first attempt created.
+async fn fresh_worktree(
+    conn: &mut Connection,
+    project: &str,
+    number: u64,
+    dispatch: &DispatchId,
+) -> Result<String> {
+    let suffix = dispatch.as_str();
+    let branch = format!(
+        "card-{number}-{}",
+        suffix[suffix.len().saturating_sub(6)..].to_lowercase()
+    );
+    let (projects, worktrees, agents) = ipc::subscribe_snapshot(conn).await?;
+    let project = ipc::resolve_project(&projects, &worktrees, &agents, Some(project))?;
+    if !worktrees
+        .iter()
+        .any(|w| w.project_id == project.id && w.branch == branch)
+    {
+        ipc::create_worktree_path(conn, &project.id, &branch, None).await?;
+    }
+    Ok(branch)
+}
+
+fn run_receipt(result: BoardResult) -> Result<RunReceipt> {
+    match result {
+        BoardResult::Run(receipt) => Ok(receipt),
+        other => bail!("the board answered a run with {other:?}"),
+    }
+}
+
+fn print_receipt(receipt: &RunReceipt, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_value(receipt)?);
+        return Ok(());
+    }
+    let state = serde_json::to_value(receipt.state)?;
+    match &receipt.session {
+        Some(session) => println!(
+            "dispatch {} {}: session {} on {}",
+            receipt.dispatch.as_str(),
+            state.as_str().unwrap_or_default(),
+            session.id,
+            session.host
+        ),
+        None => println!(
+            "dispatch {} {}",
+            receipt.dispatch.as_str(),
+            state.as_str().unwrap_or_default()
+        ),
+    }
+    Ok(())
+}
+
+/// `todo approve`: the session must be one of the card's; its own daemon
+/// sends the key only if the status is still the one the caller saw.
+async fn approve(
+    conn: &mut Connection,
+    card: &str,
+    session: &str,
+    expected_status_at: i64,
+    scope: ScopeFlags,
+    json: bool,
+) -> Result<()> {
+    let show = match request(
+        conn,
+        BoardOp::Read(BoardRead::Card {
+            scope: scope.scope(None),
+            card: card_ref(card)?,
+        }),
+    )
+    .await?
+    {
+        BoardResult::Show(show) => show,
+        other => bail!("the board answered a card read with {other:?}"),
+    };
+    let found = show
+        .sessions
+        .iter()
+        .find(|s| s.id.as_str() == session)
+        .with_context(|| {
+            Refusal::NotFound.message(format!("{} has no session {session}", show.card.label))
+        })?;
+    let req_id = 2;
+    write_frame(
+        &mut conn.stream,
+        &ClientRequest::ApproveSession {
+            req_id,
+            id: found.id.clone(),
+            expected_status_at,
+        },
+    )
+    .await?;
+    ipc::await_ack(conn, req_id, &mut Vec::new()).await?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "card": show.card.id,
+                "session": {"host": found.host, "id": found.id},
+                "approved": true,
+            })
+        );
+    } else {
+        println!("approved {} on {}", found.name, found.host);
+    }
+    Ok(())
 }
 
 fn with_rerun_id(why: anyhow::Error, minted: Option<&str>) -> anyhow::Error {

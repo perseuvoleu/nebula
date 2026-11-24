@@ -660,6 +660,10 @@ fn board_json_golden() {
                 writer: true,
                 alive: true,
                 stale: false,
+                parent: Some(SessionAt {
+                    host: "perseu-mbp".into(),
+                    id: AgentId("01JF0000000000000000000001".into()),
+                }),
             }],
             artifacts: vec![artifact()],
             log: vec![CardNote {

@@ -695,7 +695,7 @@ pub(crate) fn resolve_project(
 
 /// Await the Ack (or Error) for `req_id`, collecting entity upserts seen on
 /// the way; the daemon broadcasts the created row just before the Ack.
-async fn await_ack(
+pub(crate) async fn await_ack(
     conn: &mut Connection,
     req_id: u64,
     upserts: &mut Vec<nebula_core::Entity>,
@@ -751,7 +751,7 @@ pub async fn worktree_new(
 
 /// Ask the daemon for a worktree on `branch` (created from `base`, or the
 /// primary's HEAD) and return the checkout's path once its row lands.
-async fn create_worktree_path(
+pub(crate) async fn create_worktree_path(
     conn: &mut Connection,
     project: &nebula_core::ProjectId,
     branch: &str,
@@ -1760,6 +1760,9 @@ pub struct NewAgentOpts {
     /// `--no-card`: the session joins no card, not even its spawner's.
     pub no_card: bool,
     pub role: Option<nebula_core::board::Role>,
+    /// `--dispatch ID`: the `todo run` dispatch this spawn fulfils; the
+    /// owning daemon answers a repeat with the session it already started.
+    pub dispatch: Option<nebula_core::DispatchId>,
 }
 
 /// Session name when the caller passed no `--name`: derived from the
@@ -1783,6 +1786,12 @@ fn default_agent_name(prompt: Option<&str>, taken: &[String]) -> String {
 
 /// `nebula agent new`: spawn a session on the given worktree.
 pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
+    println!("{}", spawn_agent(opts).await?);
+    Ok(())
+}
+
+/// Spawns as `agent new` does and returns the JSON it prints.
+pub async fn spawn_agent(opts: NewAgentOpts) -> Result<serde_json::Value> {
     let kind = nebula_core::AgentKind::parse(&opts.kind).with_context(|| {
         format!(
             "unknown agent kind {:?} (claude|codex|cursor|pi|antigravity)",
@@ -1916,7 +1925,7 @@ pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
                 code_mode_off: opts.code_mode_off,
                 card: card.clone(),
                 role: opts.role,
-                dispatch: None,
+                dispatch: opts.dispatch.clone(),
                 spawned_by_host: env_agent_id().map(|_| nebula_core::host::hostname()),
             },
         )
@@ -1948,19 +1957,15 @@ pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
         Some(nebula_core::EntityId::Agent(id)) => id.to_string(),
         _ => String::new(),
     };
-    println!(
-        "{}",
-        serde_json::json!({
-            "id": id,
-            "name": name,
-            "kind": opts.kind,
-            "project": project.name,
-            "worktree": target.branch,
-            "card": card,
-            "role": opts.role,
-        })
-    );
-    Ok(())
+    Ok(serde_json::json!({
+        "id": id,
+        "name": name,
+        "kind": opts.kind,
+        "project": project.name,
+        "worktree": target.branch,
+        "card": card,
+        "role": opts.role,
+    }))
 }
 
 /// `nebula agent list [--project <name>] [--all] [--worktree <branch>]`:

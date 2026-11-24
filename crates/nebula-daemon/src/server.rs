@@ -98,6 +98,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
     // Per-connection attach state: forward-task handles keyed by session.
     let mut attached: HashMap<SessionRef, tokio::task::JoinHandle<()>> = HashMap::new();
     let mut handshaken = false;
+    let mut reporting: Option<String> = None;
 
     let result: Result<()> = tokio::select! {
         _ = closed.cancelled() => Ok(()),
@@ -138,6 +139,10 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         let client = relay_client.clone();
                         tokio::spawn(async move { link.forward(req_id, op, &client).await });
                         continue;
+                    }
+                    if let (Some(_), nebula_core::board::BoardOp::Report(report), None) = (&board, &op, &reporting) {
+                        crate::board::link_opened(&report.host);
+                        reporting = Some(report.host.clone());
                     }
                     let daemon = daemon.clone();
                     let out_tx = out_tx.clone();
@@ -804,11 +809,26 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 ClientRequest::CloseTerminal { req_id, id } => {
                     reply(&out_tx, req_id, daemon.close_terminal(&id).map(|_| None)).await;
                 }
+                ClientRequest::ApproveSession {
+                    req_id,
+                    id,
+                    expected_status_at,
+                } => {
+                    reply(
+                        &out_tx,
+                        req_id,
+                        daemon.approve(&id, expected_status_at).map(|_| None),
+                    )
+                    .await;
+                }
             }
         }
         Ok(())
         } => result,
     };
+    if let Some(host) = reporting {
+        crate::board::link_closed(&host, daemon.store.clone());
+    }
 
     for (sref, h) in attached.drain() {
         h.abort();

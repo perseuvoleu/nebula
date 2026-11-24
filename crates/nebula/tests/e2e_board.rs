@@ -1,8 +1,11 @@
 //! Cards on the board host: the `nebula todo` verbs against a daemon whose
 //! config says `board = "local"`, through the real CLI and its --json.
 
-use nebula_core::board::{BoardOp, BoardResult, HostCheckout, HostReport, Role, SessionRow};
-use nebula_core::{AgentId, AgentKind, AgentStatus, TodoId};
+use nebula_core::board::{
+    BoardOp, BoardResult, CardRef, Dispatch, DispatchState, HostCheckout, HostReport, Role,
+    SessionRow,
+};
+use nebula_core::{AgentId, AgentKind, AgentStatus, DispatchId, TodoId};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -2084,9 +2087,9 @@ fn link_refusal_cleared_by_later_attempt() {
             daemon_protocol_version: 31,
         },
     );
-    let marker = env.tmp.path().join("answered");
+    let marker = env.tmp.path().join("gone");
     let here = viewer(&format!(
-        "[ -e '{m}' ] && exit 0; touch '{m}'; cat '{}'; cat > /dev/null",
+        "[ -e '{m}' ] && exit 0; cat '{}'; cat > /dev/null",
         reply.display(),
         m = marker.display()
     ));
@@ -2100,6 +2103,7 @@ fn link_refusal_cleared_by_later_attempt() {
         stderr(&refused)
     );
 
+    std::fs::write(&marker, "").unwrap();
     let gone = here.cli(&argv, None);
     assert_eq!(gone.status.code(), Some(3), "{}", stderr(&gone));
     assert!(stderr(&gone).contains(UNREACHABLE), "{}", stderr(&gone));
@@ -2163,4 +2167,303 @@ fn link_lost_note_without_id_names_it() {
     let log = board.json(&["todo", "show", "#1", "--json"])["log"].clone();
     assert_eq!(log.as_array().map(Vec::len), Some(1), "{log}");
     assert_eq!(log[0]["id"], id.as_str());
+}
+
+fn run_card(env: &Env, card: &str, extra: &[&str]) -> Output {
+    let host = nebula_core::host::hostname();
+    let mut argv = vec![
+        "todo",
+        "run",
+        card,
+        "--role",
+        "worker",
+        "--kind",
+        "claude",
+        "--host",
+        &host,
+        "--worktree",
+        "main",
+        "--json",
+    ];
+    argv.extend_from_slice(extra);
+    env.cli(&argv, None)
+}
+
+fn receipt(out: Output) -> Value {
+    json_of(out, &["todo", "run"])
+}
+
+fn agents_of(env: &Env) -> Vec<Value> {
+    env.json(&["agent", "list", "--project", "repo"])
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+#[test]
+fn run_moves_card_to_doing() {
+    let env = board_env();
+    env.make_repo();
+    let card = add(&env, &["--project", "repo"], "Run me");
+    let run = receipt(run_card(&env, "#1", &[]));
+    assert_eq!(run["state"], "started");
+    assert_eq!(run["card"], card["id"]);
+    assert_eq!(run["session"]["host"], nebula_core::host::hostname());
+    let session = run["session"]["id"].as_str().unwrap().to_string();
+    let agents = agents_of(&env);
+    assert_eq!(agents.len(), 1);
+    assert_eq!(agents[0]["id"], session.as_str());
+    let sessions = eventually("the worker under the card", || {
+        let sessions = chain(&env, "#1");
+        (!sessions.is_empty()).then_some(sessions)
+    });
+    assert_eq!(sessions[0]["id"], session.as_str());
+    assert_eq!(sessions[0]["role"], "worker");
+    eventually("the card in doing", || {
+        (stage_of(&env, "#1") == "doing").then_some(())
+    });
+}
+
+#[test]
+fn run_same_dispatch_spawns_once() {
+    let env = board_env();
+    env.make_repo();
+    let card = add(&env, &["--project", "repo"], "Once");
+    let dispatch = TodoId::generate().0;
+    let first = receipt(run_card(&env, "#1", &["--dispatch", &dispatch]));
+    let again = receipt(run_card(&env, "#1", &["--dispatch", &dispatch]));
+    assert_eq!(first["state"], "started");
+    assert_eq!(again, first);
+    assert_eq!(agents_of(&env).len(), 1);
+
+    let lost = TodoId::generate().0;
+    let pending = board_op(
+        &env,
+        BoardOp::BeginRun(Dispatch {
+            id: DispatchId(lost.clone()),
+            card: CardRef::Id(TodoId(card["id"].as_str().unwrap().into())),
+            host: nebula_core::host::hostname(),
+            role: Role::Worker,
+            kind: AgentKind::Claude,
+            worktree: "main".into(),
+        }),
+    )
+    .expect("the board begins a run");
+    let BoardResult::Run(pending) = pending else {
+        panic!("BeginRun answered {pending:?}");
+    };
+    assert_eq!(pending.state, DispatchState::Pending);
+    let spawned = json_of(
+        spawn_agent(
+            &env,
+            &[
+                "--card",
+                "#1",
+                "--role",
+                "worker",
+                "--dispatch",
+                &lost,
+                "--name",
+                "lost",
+            ],
+        ),
+        &["agent", "new", "--dispatch"],
+    );
+    let rerun = receipt(run_card(&env, "#1", &["--dispatch", &lost]));
+    assert_eq!(rerun["state"], "started");
+    assert_eq!(rerun["session"]["id"], spawned["id"]);
+    assert_eq!(agents_of(&env).len(), 2);
+}
+
+#[test]
+fn run_refuses_blocked_or_archived() {
+    let env = board_env();
+    env.make_repo();
+    add(&env, &["--project", "repo"], "Blocked");
+    add(&env, &["--project", "repo"], "Blocker");
+    add(&env, &["--project", "repo"], "Shelved");
+    env.json(&["todo", "block", "#1", "--by", "#2", "--json"]);
+    env.json(&["todo", "archive", "#3", "--json"]);
+    for card in ["#1", "#3"] {
+        let refused = run_card(&env, card, &[]);
+        assert_eq!(
+            refused.status.code(),
+            Some(6),
+            "{card}: {}",
+            stderr(&refused)
+        );
+    }
+    assert!(agents_of(&env).is_empty());
+    env.json(&["todo", "move", "#2", "done", "--json"]);
+    assert_eq!(receipt(run_card(&env, "#1", &[]))["state"], "started");
+}
+
+#[test]
+fn run_writer_busy_fails_dispatch() {
+    let env = board_env();
+    env.make_repo();
+    add(&env, &["--project", "repo"], "Busy");
+    json_of(
+        spawn_agent(&env, &["--writer", "--name", "holder"]),
+        &["agent", "new", "--writer"],
+    );
+    let dispatch = TodoId::generate().0;
+    let refused = run_card(&env, "#1", &["--dispatch", &dispatch]);
+    assert_eq!(refused.status.code(), Some(6), "{}", stderr(&refused));
+    assert!(
+        stderr(&refused).contains("\"holder\" is the writer on main"),
+        "{}",
+        stderr(&refused)
+    );
+    let failed: Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(failed["state"], "failed");
+    assert_eq!(failed["session"], Value::Null);
+    let rerun = run_card(&env, "#1", &["--dispatch", &dispatch]);
+    assert_eq!(rerun.status.code(), Some(6), "{}", stderr(&rerun));
+    let names: Vec<Value> = agents_of(&env).iter().map(|a| a["name"].clone()).collect();
+    assert_eq!(names, ["holder"]);
+}
+
+fn session_row(env: &Env, id: &str) -> Value {
+    agents_of(env).into_iter().find(|a| a["id"] == id).unwrap()
+}
+
+#[test]
+fn approve_checks_status_timestamp() {
+    let replay = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/replay");
+    let agent = format!(
+        "{} {}",
+        replay.join("agent").display(),
+        replay.join("ask.replay").display()
+    );
+    let env = Env::new();
+    env.board_local();
+    let env = env.start(&[
+        ("NEBULA_AGENT_CMD", agent.as_str()),
+        ("NEBULA_STATUS_TICK_MS", "100"),
+    ]);
+    env.make_repo();
+    add(&env, &["--project", "repo"], "Ask");
+    let run = receipt(run_card(&env, "#1", &[]));
+    let session = run["session"]["id"].as_str().unwrap().to_string();
+    let name = session_row(&env, &session)["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for text in ["go", "on"] {
+        let sent = env.cli(&["agent", "send", &name, text, "--project", "repo"], None);
+        assert!(sent.status.success(), "{}", stderr(&sent));
+    }
+    let asked = eventually("the session asking", || {
+        let row = session_row(&env, &session);
+        (row["status"] == "needs_feedback").then_some(row)
+    });
+    let at = asked["status_changed_at"].as_i64().unwrap();
+    eventually("the asking session on the card", || {
+        chain(&env, "#1")
+            .iter()
+            .any(|s| s["id"] == session.as_str() && s["status_changed_at"] == at)
+            .then_some(())
+    });
+    let approve = |at: i64| {
+        env.cli(
+            &[
+                "todo",
+                "approve",
+                "#1",
+                "--session",
+                &session,
+                "--expected-status-at",
+                &at.to_string(),
+                "--json",
+            ],
+            None,
+        )
+    };
+    let stale = approve(at - 1);
+    assert_eq!(stale.status.code(), Some(6), "{}", stderr(&stale));
+    let current = approve(at);
+    assert!(current.status.success(), "{}", stderr(&current));
+    eventually("the session moving on", || {
+        let row = session_row(&env, &session);
+        (row["status"] != "needs_feedback" && row["status_changed_at"].as_i64() > Some(at))
+            .then_some(())
+    });
+}
+
+#[test]
+fn cross_host_child_keeps_parent() {
+    let board = board_env();
+    let here = viewer(&proxy_to(&board));
+    here.make_repo();
+    add(&here, &["--project", "repo"], "Far work");
+    let worker = json_of(
+        spawn_agent(
+            &here,
+            &[
+                "--card",
+                "#1@boardhost",
+                "--role",
+                "worker",
+                "--name",
+                "worker",
+            ],
+        ),
+        &["agent", "new", "worker"],
+    );
+    let worker_id = worker["id"].as_str().unwrap();
+    let child = json_of(
+        here.cli(
+            &[
+                "agent",
+                "new",
+                "--project",
+                "repo",
+                "--worktree",
+                "main",
+                "--role",
+                "review",
+                "--name",
+                "child",
+            ],
+            Some(worker_id),
+        ),
+        &["agent", "new", "child"],
+    );
+    let sessions = eventually("both sessions on the board", || {
+        let sessions = chain(&board, "#1");
+        (sessions.len() == 2).then_some(sessions)
+    });
+    let listed = sessions.iter().find(|s| s["id"] == child["id"]).unwrap();
+    assert_eq!(listed["role"], "review");
+    assert_eq!(
+        listed["parent"],
+        serde_json::json!({"host": nebula_core::host::hostname(), "id": worker_id})
+    );
+    eventually("the card in doing", || {
+        (stage_of(&board, "#1") == "doing").then_some(())
+    });
+}
+
+#[test]
+fn cross_host_stale_after_link_down() {
+    let env = Env::new();
+    env.board_local();
+    let env = env.start(&[("NEBULA_BOARD_STALE_MS", "1500")]);
+    let card = add(&env, &["--project", "nebula"], "Far work");
+    let report = || far_report(&env, vec![far_row(&card, "w1", AgentStatus::Running, 10)]);
+    report();
+    let version = env.json(&["todo", "board", "--all", "--json"])["version"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    eventually("the far host reading stale on a poll", || {
+        let polled = env.json(&["todo", "board", "--all", "--since", &version, "--json"]);
+        let hosts = polled["board"]["hosts"].as_array()?.clone();
+        (far_host(&hosts)["stale"] == true).then_some(())
+    });
+    assert_eq!(chain(&env, "#1")[0]["stale"], true);
+    report();
+    assert_eq!(chain(&env, "#1")[0]["stale"], false);
+    assert_eq!(far_host(&hosts_of(&env, &["--all"]))["stale"], false);
 }

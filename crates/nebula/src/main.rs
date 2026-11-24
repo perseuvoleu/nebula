@@ -439,6 +439,10 @@ enum AgentCommand {
         /// worker, review, fix, verify or research.
         #[arg(long, value_parser = parse_role)]
         role: Option<Role>,
+        /// The `todo run` dispatch this spawn fulfils; a repeat answers with
+        /// the session that dispatch already started.
+        #[arg(long, value_name = "ID")]
+        dispatch: Option<String>,
         /// Accepted for symmetry with the board verbs; the output is JSON anyway.
         #[arg(long)]
         json: bool,
@@ -806,6 +810,44 @@ enum TodoCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Start a session on a card: refused (exit 6) for an archived, blocked
+    /// or home card, or when the checkout's writer is taken. A rerun with
+    /// the same --dispatch answers with the session it already started.
+    Run {
+        card: String,
+        #[arg(long, value_parser = parse_role)]
+        role: Role,
+        /// claude | codex | cursor | pi | antigravity.
+        #[arg(long)]
+        kind: String,
+        /// The host to run on.
+        #[arg(long, default_value = "leaseweb")]
+        host: String,
+        /// `new` for a fresh worktree, or a branch.
+        #[arg(long)]
+        worktree: String,
+        /// The dispatch's ULID, so a rerun spawns nothing twice.
+        #[arg(long)]
+        dispatch: Option<String>,
+        #[command(flatten)]
+        scope: WriteScopeArgs,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Answer a card's waiting session with its approval key, only while its
+    /// status is still the one stamped --expected-status-at (else exit 6).
+    Approve {
+        card: String,
+        #[arg(long)]
+        session: String,
+        /// The session's status_changed_at, as `todo show` printed it.
+        #[arg(long)]
+        expected_status_at: i64,
+        #[command(flatten)]
+        scope: WriteScopeArgs,
+        #[arg(long)]
+        json: bool,
+    },
     /// Check a legacy todo off, by its number in the old todo list.
     Done { index: usize },
     /// Bring a checked-off legacy todo back.
@@ -1118,6 +1160,7 @@ fn main() -> Result<()> {
                 card,
                 no_card,
                 role,
+                dispatch,
                 ..
             } => nebula_tui::run_agent_new(nebula_tui::NewAgentOpts {
                 worktree,
@@ -1137,6 +1180,7 @@ fn main() -> Result<()> {
                 card,
                 no_card,
                 role,
+                dispatch: dispatch.map(nebula_core::DispatchId),
             }),
             AgentCommand::Wait {
                 names,
@@ -1363,6 +1407,42 @@ fn main() -> Result<()> {
                         stage,
                         archived,
                         page,
+                    },
+                    json,
+                ),
+                Some(TodoCommand::Run {
+                    card,
+                    role,
+                    kind,
+                    host,
+                    worktree,
+                    dispatch,
+                    scope,
+                    json,
+                }) => (
+                    TodoVerb::Run {
+                        card,
+                        role,
+                        kind,
+                        host,
+                        worktree,
+                        dispatch,
+                        scope: scope.into(),
+                    },
+                    json,
+                ),
+                Some(TodoCommand::Approve {
+                    card,
+                    session,
+                    expected_status_at,
+                    scope,
+                    json,
+                }) => (
+                    TodoVerb::Approve {
+                        card,
+                        session,
+                        expected_status_at,
+                        scope: scope.into(),
                     },
                     json,
                 ),

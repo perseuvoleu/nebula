@@ -198,6 +198,8 @@ pub struct CardSession {
     pub alive: bool,
     /// The host has not reported recently, so the row may be out of date.
     pub stale: bool,
+    /// The session that spawned this one, on whichever host it runs.
+    pub parent: Option<SessionAt>,
 }
 
 /// `todo show`: the card's fields with its sessions, artifacts and log beside them.

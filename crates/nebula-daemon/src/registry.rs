@@ -2440,10 +2440,19 @@ impl Daemon {
             .get_worktree(worktree_id)?
             .context("worktree not found")?;
         self.validate_execution_branch(&worktree, expected_branch.or(Some(&worktree.branch)))?;
-        let _claim = match writer {
-            WriterClaim::Off => None,
+        let _claim = match (writer, &link.dispatch) {
+            (WriterClaim::Off, None) => None,
             _ => Some(self.writer_claims.lock().await),
         };
+        if let Some(dispatch) = &link.dispatch {
+            let (_, _, agents, _) = self.store.load_tree()?;
+            if let Some(known) = agents
+                .into_iter()
+                .find(|a| a.dispatch_id.as_ref() == Some(dispatch))
+            {
+                return Ok(EntityId::Agent(known.id));
+            }
+        }
         if writer == WriterClaim::Exclusive {
             if let Some(holder) = self.live_writer(worktree_id)? {
                 bail!(
@@ -2522,6 +2531,26 @@ impl Daemon {
             }
         }
         Ok(EntityId::Agent(agent.id))
+    }
+
+    /// Writes the approval key while the session still carries the status
+    /// the approver saw; status changes take the same lock, so none slips
+    /// between the check and the write.
+    pub fn approve(&self, id: &AgentId, expected_status_at: i64) -> Result<()> {
+        use nebula_core::board::Refusal;
+        let _delivery = self.status_delivery.lock().unwrap();
+        let agent = self.store.get_agent(id)?.ok_or_else(|| {
+            anyhow::anyhow!(Refusal::NotFound.message(format!("no session {}", id.as_str())))
+        })?;
+        if agent.status_changed_at != expected_status_at {
+            bail!(Refusal::Conflict.message(format!(
+                "\"{}\" changed status at {}, after {expected_status_at}; read it again",
+                agent.name, agent.status_changed_at
+            )));
+        }
+        self.session(&SessionRef::Agent(id.clone()))
+            .ok_or_else(|| anyhow::anyhow!("\"{}\" has no live PTY", agent.name))?
+            .write_input_whole(b"\r")
     }
 
     /// The unarchived writer on this checkout whose turn can still run:
