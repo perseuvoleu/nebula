@@ -2294,6 +2294,51 @@ fn migration_v28_legacy_rows() {
     assert_eq!(orphan["checkout"], Value::Null);
 }
 
+#[test]
+fn bare_notes_is_refused_as_removed() {
+    let env = Env::new().start(&[]);
+    let dir = env.tmp.path().join("notes");
+    std::fs::create_dir_all(&dir).unwrap();
+    for args in [
+        &["init", "-b", "main"][..],
+        &[
+            "-c",
+            "user.email=t@nebula.dev",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "init",
+        ],
+    ] {
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    let refused = env.cli(&["notes"], None);
+    assert!(!refused.status.success());
+    assert!(
+        stderr(&refused).contains("`nebula notes` was removed"),
+        "{}",
+        stderr(&refused)
+    );
+    let listed = env.cli(&["worktree", "list", "--project", "notes"], None);
+    assert!(!listed.status.success(), "the refusal added a project");
+
+    let added = env.cli(&["./notes"], None);
+    assert!(added.status.success(), "{}", stderr(&added));
+    let listed = env.cli(&["worktree", "list", "--project", "notes"], None);
+    assert!(listed.status.success(), "{}", stderr(&listed));
+}
+
 fn migrated_cards(env: &Env) -> Vec<(String, String, Value, Value)> {
     let mut cards: Vec<(String, String, Value, Value)> =
         env.json(&["todo", "list", "--all", "--include-home", "--json"])["items"]

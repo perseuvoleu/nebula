@@ -1569,6 +1569,9 @@ fn main() -> Result<()> {
         },
         Some(Command::RawAttach { name }) => nebula_tui::run_raw_attach(&name),
         None => match cli.dir {
+            Some(dir) if dir == "notes" => anyhow::bail!(
+                "`nebula notes` was removed: notes are board cards now (`nebula todo`); add a directory named notes as `nebula ./notes`"
+            ),
             Some(dir) => nebula_tui::run_add_project(dir),
             None => run_tui_and_handoff(None),
         },
