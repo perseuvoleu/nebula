@@ -1788,7 +1788,10 @@ pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
     let (projects, worktrees, agents) = subscribe_snapshot(&mut conn).await?;
     let project = resolve_project(&projects, &worktrees, &agents, opts.project.as_deref())?;
     let card = match opts.card.as_deref() {
-        Some(text) => Some(crate::board_cli::check_card(&mut conn, text).await?),
+        Some(text) => {
+            crate::board_cli::Caller::resolve(&projects, &worktrees, &agents)?;
+            Some(crate::board_cli::check_card(&mut conn, text).await?)
+        }
         None => None,
     };
     if let Some(host) = &project.host {

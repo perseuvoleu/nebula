@@ -504,6 +504,11 @@ fn caller_from_agent_id() {
     let stranger = nebula_core::AgentId::generate().to_string();
     let refused = env.cli(&["todo", "add", "--json", "Ghost"], Some(&stranger));
     assert!(!refused.status.success());
+    assert!(
+        stderr(&refused).contains(&format!("NEBULA_AGENT_ID {stranger} names no session")),
+        "{}",
+        stderr(&refused)
+    );
     assert_eq!(list(&env, &["--all", "--include-home"]), ["From inside"]);
 }
 
@@ -590,5 +595,38 @@ fn agent_new_refused_card_leaves_checkout() {
     assert_eq!(out.status.code(), Some(5), "{}", stderr(&out));
     assert!(stderr(&out).contains("no card #99"), "{}", stderr(&out));
     assert_eq!(git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]), "main");
+    assert!(agent_names(&env).is_empty());
+}
+
+#[test]
+fn agent_new_card_refuses_unknown_caller() {
+    let env = board_env();
+    env.make_repo();
+    add(&env, &["--project", "repo"], "Work");
+    let stranger = nebula_core::AgentId::generate().to_string();
+    let out = env.cli(
+        &[
+            "agent",
+            "new",
+            "--project",
+            "repo",
+            "--worktree",
+            "main",
+            "--card",
+            "#1",
+            "--name",
+            "orphan",
+        ],
+        Some(&stranger),
+    );
+    assert!(
+        !out.status.success(),
+        "an unknown caller was persisted as parent"
+    );
+    assert!(
+        stderr(&out).contains(&format!("NEBULA_AGENT_ID {stranger} names no session")),
+        "{}",
+        stderr(&out)
+    );
     assert!(agent_names(&env).is_empty());
 }
