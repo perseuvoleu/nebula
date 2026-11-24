@@ -746,7 +746,7 @@ class BoardTests(unittest.TestCase):
 
     def test_card_post_checks_and_publish_limits(self):
         session = {"session": "01JF0000000000000000000002", "host": "leaseweb"}
-        verbs = {"move": {"stage": "review"}, "edit": {"title": "Renamed"}, "note": {"text": "--all; rm -rf /"},
+        verbs = {"move": {"stage": "review"}, "edit": {"title": "Renamed"}, "note": {"text": "--all; rm -rf /", "id": CARD_ID},
                  "archive": {}, "accept": {}, "dismiss": {}, "block": {"by": "#11"}, "unblock": {"by": "#11"},
                  "run": {"role": "worker", "kind": "codex", "host": "leaseweb", "worktree": "new"},
                  "approve": {**session, "expectedStatusAt": 1764000200000}, "open-code": session}
@@ -874,6 +874,11 @@ class BoardTests(unittest.TestCase):
             with self.subTest(branch=branch), patch("server.subprocess.run", return_value=cli(fixture("card_show"))) as run:
                 self.assertEqual(self.request("/api/cards/%2312/run", "POST", {**base, "worktree": branch}, self.auth())[0], 400)
                 self.assertEqual(run.call_count, 1)
+
+    def test_note_without_an_id_is_refused(self):
+        with patch("server.subprocess.run", return_value=cli(fixture("card_show"))) as run:
+            self.assertEqual(self.request("/api/cards/%2312/note", "POST", {"text": "x"}, self.auth())[0], 400)
+        self.assertEqual(run.call_count, 1)
 
     def test_open_code_unreachable_shows_command(self):
         session = {"session": "01JF0000000000000000000002", "host": "leaseweb"}

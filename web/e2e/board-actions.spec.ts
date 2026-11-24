@@ -144,6 +144,30 @@ test("open in code that cannot reach the laptop shows the command to copy", asyn
   await expect(page.getByRole("button", { name: "Copiază comanda" })).toBeVisible();
 });
 
+test("a note typed while the previous one saves stays in the box and saves under a new id", async ({ page }) => {
+  await open(page, "/board/c/12%40leaseweb");
+  let release = () => {};
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  const bodies: { id: string }[] = [];
+  await page.route("**/api/cards/*/note", async (route) => {
+    bodies.push(route.request().postDataJSON());
+    if (bodies.length === 1) await held;
+    await route.continue();
+  });
+  const box = page.getByLabel("Notă nouă");
+  await box.fill("First note");
+  const first = page.waitForResponse((r) => r.url().endsWith("/note"));
+  await page.getByRole("button", { name: "Adaugă nota" }).click();
+  await box.fill("Second draft");
+  release();
+  expect((await first).ok()).toBe(true);
+  await expect(page.getByRole("listitem").filter({ hasText: "First note" })).toBeVisible();
+  await expect(box).toHaveValue("Second draft");
+  await page.getByRole("button", { name: "Adaugă nota" }).click();
+  await expect(page.getByRole("listitem").filter({ hasText: "Second draft" })).toBeVisible();
+  expect(new Set(bodies.map((b) => b.id)).size).toBe(2);
+});
+
 test("blocking from the card page dims the card, and a note appears in its log", async ({ page }) => {
   addCard(13, "Wait for verification");
   await open(page, "/board/c/13%40leaseweb");

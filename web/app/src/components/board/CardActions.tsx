@@ -53,7 +53,10 @@ export function CardActions({ show, board }: { show: CardShow; board: BoardData 
     setOpened({ ok, host: target.host, command });
   };
   const addNote = async () => {
-    if (await act("note", () => cardAction(show.ref, "note", { text: note.text.trim(), id: note.id }))) setNote({ text: "", id: ulid() });
+    const sent = note.text;
+    if (await act("note", () => cardAction(show.ref, "note", { text: sent.trim(), id: note.id }))) {
+      setNote((now) => ({ text: now.text.startsWith(sent) ? now.text.slice(sent.length).trimStart() : now.text, id: ulid() }));
+    }
   };
   const block = async () => {
     if (await act("block", () => cardAction(show.ref, "block", { by: blocker }))) setBlocker("");

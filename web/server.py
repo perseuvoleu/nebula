@@ -797,8 +797,7 @@ def move_card(gateway, card, body):
 
 
 def note_card(gateway, card, body):
-    note = field(body, "id", ULID, optional=True)
-    return ("todo", "note", *([f"--id={note}"] if note else [])), (card["id"], field(body, "text", limit=16000))
+    return ("todo", "note", f"--id={field(body, 'id', ULID)}"), (card["id"], field(body, "text", limit=16000))
 
 
 def plain_card(verb):
