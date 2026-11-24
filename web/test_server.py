@@ -4,6 +4,7 @@ import sqlite3
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -539,6 +540,225 @@ class NotifyTests(unittest.TestCase):
         self.assertEqual(self.notify(valid, Host="evil.example")[0], 403)
         self.assertEqual(self.notify(valid, Origin="https://evil.example")[0], 403)
         self.assertEqual(self.sent, [])
+
+
+FIXTURES = Path(__file__).resolve().parent.parent / "crates" / "nebula-core" / "tests" / "fixtures" / "board"
+CARD_ID = "01JD0000000000000000000012"
+ARTIFACT_ID = "01JG0000000000000000000001"
+OTHER_ID = "01JG0000000000000000000009"
+
+
+def fixture(name):
+    return json.loads((FIXTURES / f"{name}.json").read_text())
+
+
+def cli(data, code=0, stderr=""):
+    return subprocess.CompletedProcess([], code, json.dumps(data) if code == 0 else "", stderr)
+
+
+class BoardTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.artifacts = root / "artifacts"
+        (self.artifacts / ARTIFACT_ID / "shots").mkdir(parents=True)
+        (self.artifacts / ARTIFACT_ID / "result.json").write_text(json.dumps(fixture("e2e_run_result")))
+        (self.artifacts / ARTIFACT_ID / "index.html").write_text("<script>parent.document</script>")
+        (self.artifacts / ARTIFACT_ID / "shots" / "drag.png").write_bytes(b"\x89PNG fake")
+        (self.artifacts / ARTIFACT_ID / "notes.xyz").write_text("plain")
+        (self.artifacts / OTHER_ID).mkdir()
+        (self.artifacts / OTHER_ID / "result.json").write_text("{}")
+        (root / "secret.txt").write_text("OUTSIDE-SECRET")
+        (self.artifacts / ARTIFACT_ID / "link.txt").symlink_to(root / "secret.txt")
+        (root / "elsewhere").mkdir()
+        (root / "elsewhere" / "index.html").write_text("OUTSIDE-SECRET")
+        self.linked_id = "01JG0000000000000000000008"
+        (self.artifacts / self.linked_id).symlink_to(root / "elsewhere")
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.origin = f"http://127.0.0.1:{self.server.server_port}"
+        self.gateway = Gateway(TOKEN, self.origin, ["project"], static=StaticFiles(make_static(root / "static")),
+                               board_projects=["nebula"], artifacts=self.artifacts)
+        self.server.gateway = self.gateway
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown(); self.server.server_close(); self.thread.join(); self.tmp.cleanup()
+
+    def request(self, path, method="GET", body=None, headers=None):
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=5)
+        data = body if body is None or isinstance(body, str) else json.dumps(body)
+        connection.request(method, path, body=data, headers=headers or {})
+        response = connection.getresponse()
+        result = response.status, dict(response.getheaders()), response.read()
+        connection.close()
+        return result
+
+    def auth(self, **extra):
+        return {"Authorization": "Bearer " + TOKEN, "Origin": self.origin,
+                "Content-Type": "application/json", **extra}
+
+    def argv(self, run):
+        return [call.args[0][1:] for call in run.call_args_list]
+
+    def card_src(self):
+        with patch("server.subprocess.run", return_value=cli(fixture("card_show"))):
+            status, _, body = self.request("/api/cards/%2312", headers=self.auth())
+        self.assertEqual(status, 200)
+        return json.loads(body)["artifacts"][0]["src"]
+
+    def test_board_poll_unchanged(self):
+        unchanged = fixture("board_unchanged")
+        with patch("server.subprocess.run", return_value=cli(unchanged)) as run:
+            status, _, body = self.request("/api/board?since=" + unchanged["version"] + "&awaySince=1764000000000",
+                                           headers=self.auth())
+        self.assertEqual((status, json.loads(body)), (200, unchanged))
+        self.assertEqual(run.call_count, 1)
+        argv = self.argv(run)[0]
+        self.assertEqual(argv[:2], ["todo", "board"])
+        self.assertIn("--since=" + unchanged["version"], argv)
+        self.assertIn("--away-since=1764000000000", argv)
+        for query in ["since=--all", "since=a%20b", "awaySince=yesterday"]:
+            with self.subTest(query=query), patch("server.subprocess.run") as run:
+                self.assertEqual(self.request("/api/board?" + query, headers=self.auth())[0], 400)
+                run.assert_not_called()
+
+    def test_board_scope_injected(self):
+        reads = [("/api/board?project=secret&scope=all", fixture("board")),
+                 ("/api/cards/%2312?project=secret&all=1", fixture("card_show")),
+                 ("/api/decisions?query=copy&project=secret", {"items": [fixture("decision")], "next": None})]
+        for configured, scope in [(["nebula"], ["--project=nebula", "--include-home"]),
+                                  (["nebula", "vela"], ["--project=nebula", "--project=vela", "--include-home"]),
+                                  ("*", ["--all", "--include-home"])]:
+            self.gateway.board_projects = configured
+            for path, output in reads:
+                with self.subTest(path=path, configured=configured), \
+                        patch("server.subprocess.run", return_value=cli(output)) as run:
+                    self.assertEqual(self.request(path, headers=self.auth())[0], 200)
+                    argv = self.argv(run)[0]
+                    self.assertEqual([a for a in argv if a.startswith(("--project", "--all", "--include-home"))], scope)
+                    self.assertFalse(any("secret" in a for a in argv))
+        self.gateway.board_projects = ["nebula"]
+        with patch("server.subprocess.run", return_value=cli(None, 5, "no card #99 in scope")) as run:
+            status, _, _ = self.request("/api/cards/%2399/move", "POST", {"stage": "done"}, self.auth())
+        self.assertEqual(status, 404)
+        self.assertEqual([a[:2] for a in self.argv(run)], [["todo", "show"]])
+        with patch("server.subprocess.run") as run:
+            for body in [{"title": "x", "project": "secret"}, {"title": "x"}]:
+                self.assertEqual(self.request("/api/cards", "POST", body, self.auth())[0], 403)
+            run.assert_not_called()
+
+    def test_artifact_grant_expiry_tamper(self):
+        src = self.card_src()
+        _, grant, artifact, entry = src.split("/")[1:]
+        self.assertEqual((artifact, entry), (ARTIFACT_ID, "result.json"))
+        expiry, mac = grant.split(".")
+        self.assertLessEqual(int(expiry) - time.time(), 3600)
+        self.assertGreater(int(expiry) - time.time(), 0)
+        status, _, body = self.request(src)
+        self.assertEqual((status, json.loads(body)), (200, fixture("e2e_run_result")))
+        flipped = mac[:-1] + ("A" if mac[-1] != "A" else "B")
+        for path in [f"/a/{grant}/{OTHER_ID}/result.json", f"/a/{int(expiry) + 1}.{mac}/{ARTIFACT_ID}/result.json",
+                     f"/a/{expiry}.{flipped}/{ARTIFACT_ID}/result.json", f"/a/{expiry}/{ARTIFACT_ID}/result.json",
+                     f"/a/x.{mac}/{ARTIFACT_ID}/result.json"]:
+            with self.subTest(path=path):
+                self.assertEqual(self.request(path)[0], 403)
+        with patch("server.time.time", return_value=int(expiry) + 1):
+            self.assertEqual(self.request(src)[0], 403)
+        with patch("server.time.time", return_value=time.time() - 7200):
+            stale = self.card_src()
+        self.assertEqual(self.request(stale)[0], 403)
+
+    def test_artifact_traversal(self):
+        grant = self.card_src().split("/")[2]
+        linked = self.gateway.grant(self.linked_id)
+        for path in [f"/a/{grant}/{ARTIFACT_ID}/../{OTHER_ID}/result.json",
+                     f"/a/{grant}/{ARTIFACT_ID}/%2e%2e/%2e%2e/secret.txt",
+                     f"/a/{grant}/{ARTIFACT_ID}/%2E%2E%2F%2E%2E%2Fsecret.txt",
+                     f"/a/{grant}/{ARTIFACT_ID}/shots/..%2f..%2f..%2fsecret.txt",
+                     f"/a/{grant}/{ARTIFACT_ID}//etc/passwd",
+                     f"/a/{grant}/{ARTIFACT_ID}/%2Fetc%2Fpasswd",
+                     f"/a/{grant}/{ARTIFACT_ID}/link.txt",
+                     f"/a/{grant}/{ARTIFACT_ID}/shots",
+                     f"/a/{grant}/{ARTIFACT_ID}/",
+                     f"/a/{linked}/{self.linked_id}/index.html"]:
+            with self.subTest(path=path):
+                status, _, body = self.request(path)
+                self.assertEqual(status, 404)
+                self.assertNotIn(b"OUTSIDE-SECRET", body)
+        self.assertEqual(self.request(f"/a/{grant}/{ARTIFACT_ID}/shots/drag.png")[0], 200)
+
+    def test_artifact_headers_no_cli(self):
+        grant = self.card_src().split("/")[2]
+        with patch("server.subprocess.run") as run:
+            for entry, mime in [("index.html", "text/html"), ("shots/drag.png", "image/png"),
+                                ("result.json", "application/json"), ("notes.xyz", "application/octet-stream")]:
+                with self.subTest(entry=entry):
+                    status, headers, body = self.request(f"/a/{grant}/{ARTIFACT_ID}/{entry}")
+                    self.assertEqual(status, 200)
+                    self.assertEqual(headers["Content-Security-Policy"], "sandbox allow-scripts")
+                    self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
+                    self.assertEqual(headers["Content-Type"].split(";")[0], mime)
+                    self.assertEqual(body, (self.artifacts / ARTIFACT_ID / entry).read_bytes())
+            self.assertEqual(self.request(f"/a/{grant}/{ARTIFACT_ID}/index.html", headers={"Host": "evil.example"})[0], 403)
+            run.assert_not_called()
+
+    def test_card_verb_exit_codes(self):
+        leak = "/home/perseu/.local/share/nebula private detail"
+        for code, status in [(3, 503), (4, 504), (5, 404), (6, 409), (1, 502)]:
+            for method, path, body in [("GET", "/api/board", None), ("GET", "/api/cards/%2312", None),
+                                       ("POST", "/api/cards", {"title": "New", "project": "nebula"})]:
+                with self.subTest(code=code, path=path), \
+                        patch("server.subprocess.run", return_value=cli(None, code, leak)):
+                    got, _, raw = self.request(path, method, body, self.auth())
+                    self.assertEqual(got, status)
+                    self.assertNotIn(b"perseu", raw)
+            with self.subTest(code=code, verb="move"), patch("server.subprocess.run", side_effect=[
+                    cli(fixture("card_show")), cli(None, code, leak)]):
+                got, _, raw = self.request("/api/cards/%2312/move", "POST", {"stage": "review", "expect": "doing"},
+                                           self.auth())
+                self.assertEqual(got, status)
+                self.assertNotIn(b"perseu", raw)
+
+    def test_card_post_checks_and_publish_limits(self):
+        session = {"session": "01JF0000000000000000000002", "host": "leaseweb"}
+        verbs = {"move": {"stage": "review"}, "edit": {"title": "Renamed"}, "note": {"text": "--all; rm -rf /"},
+                 "archive": {}, "accept": {}, "dismiss": {}, "block": {"by": "#11"}, "unblock": {"by": "#11"},
+                 "run": {"role": "worker", "kind": "codex", "host": "leaseweb", "worktree": "new"},
+                 "approve": {**session, "expectedStatusAt": 1764000200000}, "open-code": session}
+        posts = [("/api/cards", {"title": "New", "project": "nebula"}), ("/api/decisions", {"what": "Copy files"})]
+        posts += [(f"/api/cards/%2312/{verb}", body) for verb, body in verbs.items()]
+        with patch("server.subprocess.run") as run:
+            for path, body in posts:
+                with self.subTest(path=path):
+                    self.assertEqual(self.request(path, "POST", body)[0], 401)
+                    self.assertEqual(self.request(path, "POST", body, {"Authorization": "Bearer " + TOKEN,
+                                                                       "Content-Type": "application/json"})[0], 403)
+                    self.assertEqual(self.request(path, "POST", body, self.auth(Origin="https://evil.example"))[0], 403)
+                    self.assertEqual(self.request(path, "POST", body, self.auth(**{"Content-Type": "text/plain"}))[0], 415)
+                    self.assertEqual(self.request(path, "POST", "{", self.auth())[0], 400)
+            self.assertIn(self.request("/api/artifacts", "POST", {"path": "/etc/passwd", "kind": "recap"},
+                                       self.auth())[0], {403, 404})
+            run.assert_not_called()
+        for verb, body in verbs.items():
+            with self.subTest(verb=verb), patch("server.subprocess.run", side_effect=[
+                    cli(fixture("card_show")), cli(fixture("card_show")), cli({"ok": True})]) as run:
+                self.assertEqual(self.request(f"/api/cards/%2312/{verb}", "POST", body, self.auth())[0], 200)
+                write = self.argv(run)[-1]
+                self.assertIn(CARD_ID if verb != "open-code" else "--session=" + session["session"], write)
+                self.assertIn("todo" if verb != "open-code" else "open", write[:1])
+        with patch("server.subprocess.run", return_value=cli(fixture("decision"))) as run:
+            status, _, _ = self.request("/api/decisions", "POST", {"what": "/etc/passwd", "why": "x", "path": "/etc/passwd",
+                                                                    "kind": "recap", "url": "https://x"}, self.auth())
+        self.assertEqual(status, 200)
+        argv = self.argv(run)[0]
+        self.assertEqual(argv[:2], ["decision", "add"])
+        self.assertEqual(argv[-2:], ["--", "/etc/passwd"])
+        self.assertFalse(any(a.startswith(("--kind", "--path", "--url")) or a == "https://x" for a in argv))
+        for body in [{**session, "session": "01JF0000000000000000000009"}, {**session, "host": "elsewhere"}]:
+            with self.subTest(body=body), patch("server.subprocess.run", return_value=cli(fixture("card_show"))) as run:
+                self.assertEqual(self.request("/api/cards/%2312/open-code", "POST", body, self.auth())[0], 409)
+                self.assertEqual(run.call_count, 1)
 
 
 if __name__ == "__main__":

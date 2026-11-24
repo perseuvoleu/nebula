@@ -13,15 +13,17 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shutil
 import socket
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
 import tempfile
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, quote, urlsplit
+from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 import pi_history
 
@@ -36,6 +38,21 @@ ASSET_TYPES = {".html": "text/html", ".js": "text/javascript", ".css": "text/css
 IDENTITY_TTL = 5.0
 TRANSIENT = {502, 503, 504}  # gateway/CLI trouble: reported as an error, not as a capability
 PUSH_STATES = {"finished", "needs_feedback"}
+BOARD_REF = re.compile(r"#?[0-9]{1,9}(?:@[A-Za-z0-9._-]{1,64})?|[0-7][0-9A-HJKMNP-TV-Z]{25}")
+ULID = re.compile(r"[0-7][0-9A-HJKMNP-TV-Z]{25}")
+CURSOR = re.compile(r"[A-Za-z0-9]{1,64}\.[0-9]{1,20}")
+NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}")
+BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}")
+STAGES = {"backlog", "next", "doing", "review", "done"}
+ROLES = {"worker", "review", "fix", "verify", "research"}
+# The board CLI's typed exits (02-architecture §CLI); any other failure is a plain 502.
+BOARD_EXITS = {3: (503, "Board host unreachable; nothing was sent"),
+               4: (504, "Outcome unknown; repeat the same action to finish it"),
+               5: (404, "Card not found"), 6: (409, "The card changed; refresh and try again")}
+GRANT_TTL = 3600
+ARTIFACT_TYPES = {**ASSET_TYPES, ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+                  ".webp": "image/webp", ".md": "text/markdown", ".pdf": "application/pdf", ".csv": "text/csv",
+                  ".log": "text/plain", ".mp4": "video/mp4", ".webm": "video/webm"}
 CSP = ("default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; "
        "worker-src 'self'; manifest-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 
@@ -226,7 +243,7 @@ class StaticFiles:
 
 
 class Gateway:
-    def __init__(self, token, origin, projects, binary="nebula", static=None, pi_agent_dir=None, db_path=None, *, preview_binary=None, push=None, notify_token=None):
+    def __init__(self, token, origin, projects, binary="nebula", static=None, pi_agent_dir=None, db_path=None, *, preview_binary=None, push=None, notify_token=None, board_projects=None, artifacts=None):
         if len(token) < 8:
             raise ValueError("NEBULA_WEB_TOKEN must contain at least 8 characters")
         if notify_token and notify_token == token:
@@ -256,8 +273,11 @@ class Gateway:
         self.checkout_lock = threading.Lock()
         self.push = push
         self.notify_token = notify_token
+        self.board_projects = board_projects
+        self.artifacts = Path(artifacts) if artifacts else None
+        self.artifact_key = secrets.token_bytes(32)
 
-    def run(self, *args, json_output=True, binary=None):
+    def run(self, *args, json_output=True, binary=None, exits=None):
         if not self.slots.acquire(blocking=False):
             raise Problem(503, "Gateway busy; try again shortly")
         try:
@@ -272,6 +292,8 @@ class Gateway:
                 executable = self.preview_binary
             result = subprocess.run([executable, *args], capture_output=True, text=True,
                                     errors="replace", timeout=20, env=env)
+            if result.returncode and exits is not None:
+                raise Problem(*exits.get(result.returncode, (502, "Nebula command failed")))
             if result.returncode:
                 raise Problem(502, result.stderr.strip()[:2000] or "Nebula command failed")
             return json.loads(result.stdout) if json_output else result.stdout
@@ -289,6 +311,84 @@ class Gateway:
 
     def sessions(self, project):
         return self.run("agent", "list", "--project", project)
+
+    # --- board -----------------------------------------------------------------------------
+
+    def board(self, *args, positionals=()):
+        return self.run(*args, "--json", *(("--", *positionals) if positionals else ()), exits=BOARD_EXITS)
+
+    def scope(self):
+        if self.board_projects is None:
+            raise Problem(503, "Board is not configured")
+        projects = ("--all",) if self.board_projects == "*" else tuple(f"--project={p}" for p in self.board_projects)
+        return (*projects, "--include-home")
+
+    def board_project(self, value):
+        self.scope()
+        if (not isinstance(value, str) or not NAME.fullmatch(value)
+                or (self.board_projects != "*" and value not in self.board_projects)):
+            raise Problem(403, "Project is not on this board")
+        return value
+
+    def card(self, ref):
+        if not isinstance(ref, str) or not BOARD_REF.fullmatch(ref):
+            raise Problem(400, "Invalid card reference")
+        card = self.board("todo", "show", *self.scope(), positionals=(ref,))
+        for row in card.get("artifacts") or []:
+            entry = (row.get("content") or {}).get("entry")
+            if isinstance(entry, str) and self.artifact_dir(row.get("id")):
+                row["src"] = f"/a/{self.grant(row['id'])}/{row['id']}/{quote(entry)}"
+        return card
+
+    def card_session(self, card, body):
+        session, host = field(body, "session", ULID), field(body, "host", NAME)
+        if not any(s.get("id") == session and s.get("host") == host for s in card.get("sessions") or []):
+            raise Problem(409, "Session is not on this card; refresh the card")
+        return session, host
+
+    # --- artifact grants -------------------------------------------------------------------
+
+    def sign(self, artifact_id, expiry):
+        digest = hmac.new(self.artifact_key, f"{artifact_id}.{expiry}".encode(), "sha256").digest()
+        return base64.urlsafe_b64encode(digest).decode().rstrip("=")
+
+    def grant(self, artifact_id):
+        # Half-hour steps keep a grant's URL stable across polls, so an open iframe never reloads.
+        expiry = (int(time.time()) // 1800 + 2) * 1800
+        return f"{expiry}.{self.sign(artifact_id, expiry)}"
+
+    def artifact_dir(self, artifact_id):
+        if self.artifacts is None or not isinstance(artifact_id, str) or not ULID.fullmatch(artifact_id):
+            return None
+        root = self.artifacts / artifact_id
+        return root if root.is_dir() and not root.is_symlink() else None
+
+    def artifact_file(self, path):
+        """Open /a/<grant>/<id>/<path> as (file, size, mime); never follows a symlink."""
+        parts = path.split("/")
+        if len(parts) < 5:
+            raise Problem(404, "Not found")
+        (expiry, _, mac), artifact_id, names = parts[2].partition("."), parts[3], [unquote(p) for p in parts[4:]]
+        now = time.time()
+        if (not re.fullmatch(r"[0-9]{1,12}", expiry) or not now < int(expiry) <= now + GRANT_TTL
+                or not hmac.compare_digest(mac.encode(), self.sign(artifact_id, int(expiry)).encode())):
+            raise Problem(403, "Artifact link expired; reopen it from the board")
+        current = self.artifact_dir(artifact_id)
+        if current is None or any(n in {"", ".", ".."} or any(c in n for c in "/\\\0") for n in names):
+            raise Problem(404, "Not found")
+        try:
+            for name in names:
+                current = current / name
+                if stat.S_ISLNK(os.lstat(current).st_mode):
+                    raise Problem(404, "Not found")
+            descriptor = os.open(current, os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError:
+            raise Problem(404, "Not found")
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode):
+            os.close(descriptor)
+            raise Problem(404, "Not found")
+        return os.fdopen(descriptor, "rb"), info.st_size, ARTIFACT_TYPES.get(current.suffix.lower(), "application/octet-stream")
 
     def session_row(self, project, session_id, *, by_name=True):
         rows = self.sessions(project)
@@ -385,6 +485,19 @@ class Gateway:
         if path == "/api/push":
             return {"available": self.push is not None,
                     "publicKey": self.push.public_key if self.push else None}
+        if path == "/api/board":
+            since, away = query.get("since", [None])[0], query.get("awaySince", [None])[0]
+            if (since is not None and not CURSOR.fullmatch(since)) or (away is not None and not re.fullmatch(r"[0-9]{1,16}", away)):
+                raise Problem(400, "Invalid board cursor")
+            return self.board("todo", "board", *self.scope(), *([f"--since={since}"] if since else []),
+                              *([f"--away-since={away}"] if away else []))
+        if path.startswith("/api/cards/"):
+            return self.card(unquote(path[len("/api/cards/"):]))
+        if path == "/api/decisions":
+            text = query.get("query", [None])[0]
+            if text is not None and (len(text) > 200 or "\0" in text):
+                raise Problem(400, "Invalid search")
+            return self.board("decision", "list", *self.scope(), *([f"--query={text}"] if text else []))
         project = self.project(query.get("project", [None])[0])
         first = {k: v[0] for k, v in query.items()}
         if path == "/api/sessions":
@@ -493,6 +606,26 @@ class Gateway:
             if self.push:
                 self.push.unsubscribe(body.get("endpoint"))
             return {"ok": True}
+        if path == "/api/cards":
+            stage, card_id = field(body, "stage", choices=STAGES, optional=True), field(body, "id", ULID, optional=True)
+            owner = "--home" if body.get("home") is True else f"--project={self.board_project(body.get('project'))}"
+            return self.board("todo", "add", owner, *([f"--stage={stage}"] if stage else []),
+                              *(["--propose"] if body.get("propose") is True else []),
+                              *([f"--id={card_id}"] if card_id else []), positionals=(field(body, "title"),))
+        if path == "/api/decisions":
+            what, why = field(body, "what", limit=500), field(body, "why", limit=4000, optional=True)
+            card = field(body, "card", BOARD_REF, optional=True)
+            owner = (f"--card={self.card(card)['id']}" if card else
+                     f"--project={self.board_project(body['project'])}" if body.get("project") is not None else None)
+            return self.board("decision", "add", *([f"--why={why}"] if why else []), *([owner] if owner else []),
+                              positionals=(what,))
+        if path.startswith("/api/cards/"):
+            ref, _, verb = path[len("/api/cards/"):].partition("/")
+            if verb not in CARD_VERBS:
+                raise Problem(404, "Unknown endpoint")
+            card = self.card(unquote(ref))
+            args, positionals = CARD_VERBS[verb](self, card, body)
+            return self.board(*args, positionals=positionals)
         project = self.project(body.get("project"))
         if path == "/api/worktrees":
             return self.create_checkout(project, body)
@@ -567,6 +700,66 @@ def public(row):
     return {k: v for k, v in row.items() if k != "session_id"}
 
 
+def field(body, key, pattern=None, *, choices=None, limit=200, optional=False):
+    value = body.get(key)
+    if value is None and optional:
+        return None
+    if (not isinstance(value, str) or not value.strip() or len(value) > limit or "\0" in value
+            or (choices is not None and value not in choices) or (pattern is not None and not pattern.fullmatch(value))):
+        raise Problem(400, f"Invalid {key}")
+    return value
+
+
+def edit_card(gateway, card, body):
+    title = field(body, "title", optional=True)
+    project = gateway.board_project(body["project"]) if body.get("project") is not None else None
+    if title is None and project is None:
+        raise Problem(400, "Nothing to change")
+    return ("todo", "edit", *([f"--title={title}"] if title else []), *([f"--project={project}"] if project else [])), (card["id"],)
+
+
+def run_card(gateway, card, body):
+    dispatch = field(body, "dispatch", ULID, optional=True)
+    return ("todo", "run", f"--role={field(body, 'role', choices=ROLES)}", f"--kind={field(body, 'kind', NAME)}",
+            f"--host={field(body, 'host', NAME)}", f"--worktree={field(body, 'worktree', BRANCH)}",
+            *([f"--dispatch={dispatch}"] if dispatch else [])), (card["id"],)
+
+
+def approve_card(gateway, card, body):
+    session, _ = gateway.card_session(card, body)
+    at = body.get("expectedStatusAt")
+    if not isinstance(at, int) or isinstance(at, bool) or not 0 <= at < 2 ** 53:
+        raise Problem(400, "Invalid expectedStatusAt")
+    return ("todo", "approve", f"--session={session}", f"--expected-status-at={at}"), (card["id"],)
+
+
+def open_code(gateway, card, body):
+    session, host = gateway.card_session(card, body)
+    return ("open", f"--session={session}", f"--on={host}"), ()
+
+
+def block_card(verb):
+    return lambda gateway, card, body: (
+        ("todo", verb, f"--by={gateway.card(field(body, 'by', BOARD_REF))['id']}"), (card["id"],))
+
+
+# Every web write on a card: fixed argv from validated fields, aimed at the id of the scoped card read.
+CARD_VERBS = {
+    "move": lambda gateway, card, body: (
+        ("todo", "move", *([f"--expect={e}"] if (e := field(body, "expect", choices=STAGES, optional=True)) else [])),
+        (card["id"], field(body, "stage", choices=STAGES))),
+    "edit": edit_card,
+    "note": lambda gateway, card, body: (("todo", "note"), (card["id"], field(body, "text", limit=16000))),
+    **{verb: (lambda verb: lambda gateway, card, body: (("todo", verb), (card["id"],)))(verb)
+       for verb in ("archive", "accept", "dismiss")},
+    "block": block_card("block"),
+    "unblock": block_card("unblock"),
+    "run": run_card,
+    "approve": approve_card,
+    "open-code": open_code,
+}
+
+
 def default_pi_agent_dir():
     configured = os.environ.get("NEBULA_WEB_PI_AGENT_DIR") or os.environ.get("PI_CODING_AGENT_DIR")
     return Path(configured) if configured else Path.home() / ".pi" / "agent"
@@ -596,12 +789,27 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def send_artifact(self, file, size, mime):
+        with file:
+            self.send_response(200)
+            self.send_header("Content-Type", mime)
+            self.send_header("Content-Length", str(size))
+            self.send_header("Cache-Control", "private, max-age=600")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+            # An opaque origin: artifact scripts run but cannot act as the app or read its storage.
+            self.send_header("Content-Security-Policy", "sandbox allow-scripts")
+            self.end_headers()
+            shutil.copyfileobj(file, self.wfile)
+
     def handle_request(self, method):
         try:
             gateway = self.server.gateway
             if self.headers.get("Host") != gateway.host:
                 raise Problem(403, "Invalid host")
             path = urlsplit(self.path).path
+            if method == "GET" and path.startswith("/a/"):
+                return self.send_artifact(*gateway.artifact_file(path))
             if method == "GET" and not path.startswith("/api/"):
                 asset = gateway.static.lookup(path)
                 if asset is None:
