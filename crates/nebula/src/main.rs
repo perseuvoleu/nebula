@@ -1232,7 +1232,10 @@ fn main() -> Result<()> {
                 card,
                 no_card,
                 role,
-                dispatch: dispatch.map(nebula_core::DispatchId),
+                dispatch: dispatch
+                    .as_deref()
+                    .map(nebula_tui::board_cli::dispatch_id)
+                    .transpose()?,
             }),
             AgentCommand::Wait {
                 names,

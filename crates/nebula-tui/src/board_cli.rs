@@ -228,6 +228,13 @@ pub fn card_ref(text: &str) -> Result<CardRef> {
         .with_context(|| format!("{text:?} is not a card ref (#12, 12, 12@host or a ULID)"))
 }
 
+pub fn dispatch_id(text: &str) -> Result<DispatchId> {
+    match parse_card_ref(text) {
+        Some(CardRef::Id(canonical)) => Ok(DispatchId(canonical.0)),
+        _ => bail!("--dispatch {text:?} is not a ULID"),
+    }
+}
+
 pub(crate) fn client_id(id: Option<String>, minted: &mut Option<String>) -> Result<String> {
     match id {
         None => Ok(minted.insert(TodoId::generate().0).clone()),
@@ -298,7 +305,10 @@ pub async fn run(verb: TodoVerb, json: bool) -> Result<()> {
             scope,
         } => {
             let dispatch = Dispatch {
-                id: DispatchId(client_id(dispatch, &mut minted)?),
+                id: match dispatch {
+                    Some(text) => dispatch_id(&text)?,
+                    None => DispatchId(TodoId::generate().0),
+                },
                 card: card_ref(&card)?,
                 host,
                 role,
