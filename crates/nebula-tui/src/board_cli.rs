@@ -121,7 +121,7 @@ impl ScopeFlags {
         }
     }
 
-    fn scope(self, fallback: Option<&str>) -> BoardScope {
+    pub(crate) fn scope(self, fallback: Option<&str>) -> BoardScope {
         let projects = match (self.all, self.projects.is_empty(), fallback) {
             (true, _, _) => ProjectScope::All,
             (false, false, _) => ProjectScope::Named(self.projects),
@@ -209,7 +209,7 @@ pub fn card_ref(text: &str) -> Result<CardRef> {
         .with_context(|| format!("{text:?} is not a card ref (#12, 12, 12@host or a ULID)"))
 }
 
-fn client_id(id: Option<String>, minted: &mut Option<String>) -> Result<String> {
+pub(crate) fn client_id(id: Option<String>, minted: &mut Option<String>) -> Result<String> {
     match id {
         None => Ok(minted.insert(TodoId::generate().0).clone()),
         Some(id) => match parse_card_ref(&id) {
@@ -219,7 +219,7 @@ fn client_id(id: Option<String>, minted: &mut Option<String>) -> Result<String> 
     }
 }
 
-async fn connect() -> Result<Connection> {
+pub(crate) async fn connect() -> Result<Connection> {
     let Ok(stream) = ipc::try_connect(&paths::socket_path()).await else {
         bail!("no nebula daemon is running");
     };
@@ -239,10 +239,12 @@ pub async fn request(conn: &mut Connection, op: BoardOp) -> Result<BoardResult> 
                 message,
             }) if r == req_id => bail!("{message}"),
             Some(_) => continue,
-            None => bail!("daemon closed the connection before replying"),
+            None => bail!(CLOSED),
         }
     }
 }
+
+pub(crate) const CLOSED: &str = "daemon closed the connection before replying";
 
 /// Reads the card `text` names, so a spawn linking it is refused before
 /// anything starts.

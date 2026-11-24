@@ -4,6 +4,7 @@
 )]
 
 pub mod app;
+pub mod artifact_cli;
 pub mod board_cli;
 pub mod branch_name;
 pub mod branches;
@@ -167,6 +168,11 @@ pub fn run_todo(op: TodoOp) -> Result<()> {
 /// `nebula todo` card verbs on the board (see `board_cli::run`).
 pub fn run_board(verb: board_cli::TodoVerb, json: bool) -> Result<()> {
     board_cli::exit_on_refusal(runtime()?.block_on(board_cli::run(verb, json)))
+}
+
+/// `nebula artifact`: exits 5 for an unknown artifact or card.
+pub fn run_artifact(verb: artifact_cli::ArtifactVerb, json: bool) -> Result<()> {
+    board_cli::exit_on_refusal(runtime()?.block_on(artifact_cli::run(verb, json)))
 }
 
 /// `nebula worktree new` — agent-facing orchestration verb.

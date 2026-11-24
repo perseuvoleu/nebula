@@ -238,6 +238,9 @@ pub struct Artifact {
     /// `rag_note` holds a decision's RAG note id.
     pub meta: serde_json::Map<String, serde_json::Value>,
     pub created_at: i64,
+    /// Set by `artifact rm`; the stored bytes stay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -628,6 +631,13 @@ pub struct E2eStep {
 
 /// Parses `result.json` and checks every screenshot it names is among
 /// `files`, the artifact's relative paths.
+pub fn entry_inside(entry: &str) -> bool {
+    !entry.is_empty()
+        && std::path::Path::new(entry)
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+}
+
 pub fn validate_e2e_run(result_json: &str, files: &BTreeSet<String>) -> Result<E2eRun, String> {
     let value: serde_json::Value =
         serde_json::from_str(result_json).map_err(|e| format!("result.json: {e}"))?;

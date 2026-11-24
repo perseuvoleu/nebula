@@ -547,6 +547,7 @@ fn artifact() -> Artifact {
         },
         meta: Default::default(),
         created_at: 1764000300000,
+        removed_at: None,
     }
 }
 
@@ -564,6 +565,7 @@ fn decision() -> Artifact {
         },
         meta: json!({"rag_note": 1412}).as_object().unwrap().clone(),
         created_at: 1764000400000,
+        removed_at: None,
     }
 }
 
