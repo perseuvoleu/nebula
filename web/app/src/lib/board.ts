@@ -166,7 +166,7 @@ export const writerSlots = (hosts: BoardHost[]): HostSlots[] =>
   hosts.map((h) => ({ host: h.host, writers: h.writers, slots: h.writer_slots }));
 
 const inProject = (project: string | null, scope: SidebarScope): boolean =>
-  scope.kind === "all" || scope.kind === "needs" || project === scope.project;
+  scope.kind === "all" || scope.kind === "needs" || scope.kind === "all-decisions" || project === scope.project;
 
 export function awayDigest<D extends { id: string; project: string | null }>(board: BoardData, scope: SidebarScope, known: D[]):
   { finished: Card[]; decisions: D[]; empty: boolean } {
@@ -208,7 +208,8 @@ export type SidebarScope =
   | { kind: "needs" }
   | { kind: "project"; project: string | null }
   | { kind: "checkout"; project: string | null; host: string | null; branch: string }
-  | { kind: "decisions"; project: string | null };
+  | { kind: "decisions"; project: string | null }
+  | { kind: "all-decisions" };
 
 export function sidebarProjects(board: BoardData): SidebarProject[] {
   const projects = new Map<string | null, SidebarProject>();
@@ -233,7 +234,8 @@ export function sidebarProjects(board: BoardData): SidebarProject[] {
 
 export function inScope(card: BoardCard, scope: SidebarScope): boolean {
   switch (scope.kind) {
-    case "all": return true;
+    case "all":
+    case "all-decisions": return true;
     case "needs": return card.needsYou;
     case "checkout": return card.project === scope.project && card.checkout?.branch === scope.branch
       && (scope.host === null || card.checkout.host === scope.host);
@@ -255,3 +257,14 @@ export function sortCards(cards: BoardCard[], sort: TableSort): BoardCard[] {
   const value = SORT_VALUE[sort.key];
   return [...cards].sort((a, b) => (value(a) < value(b) ? -1 : value(a) > value(b) ? 1 : 0) * (sort.asc ? 1 : -1));
 }
+
+export type Workspace = { projects: string[]; host: string };
+
+/** The gateway project that lists a session: its bare name on this host, name@host for a remote the gateway anchors. */
+export function sessionProject(project: string, host: string, workspace: Workspace): string | null {
+  const key = host === workspace.host ? project : `${project}@${host}`;
+  return workspace.projects.includes(key) ? key : null;
+}
+
+export const hostProjects = (host: string, workspace: Workspace): string[] =>
+  workspace.projects.filter((p) => host === workspace.host ? !p.includes("@") : p.endsWith(`@${host}`));

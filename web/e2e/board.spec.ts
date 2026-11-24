@@ -111,7 +111,7 @@ test("a project's Decisions route lists only that project's decisions", async ({
   await expect(page.getByText("Copy published files")).toHaveCount(0);
   const sidebar = page.getByRole("navigation", { name: "Proiecte" });
   await sidebar.getByRole("button", { name: "Checkouturi nebula" }).click();
-  await sidebar.getByRole("button", { name: "Decizii" }).click();
+  await sidebar.getByRole("button", { name: "Decizii", exact: true }).click();
   await expect(page).toHaveURL(/\/board\/decisions\/p\/nebula$/);
   await expect(page.getByText("Copy published files")).toBeVisible();
 });

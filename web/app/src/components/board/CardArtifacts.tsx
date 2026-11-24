@@ -5,35 +5,43 @@ import { ArtifactFrame, type ArtifactContent, type ArtifactMeta } from "./Artifa
 
 const MARKDOWN = /\.(?:md|markdown)$/i;
 
-function direct(artifact: Artifact): ArtifactContent | null {
+function direct(artifact: Artifact, src: string | null): ArtifactContent | null {
   const content = artifact.content;
   if ("body" in content) return { view: "decision", why: content.body || null };
   if ("url" in content) return { view: "link", url: content.url };
-  if (!artifact.src) return { view: "remote", host: content.host };
+  if (!src) return { view: "remote", host: content.host };
   if (artifact.kind === "e2e-run" || artifact.kind === "ticket" || MARKDOWN.test(content.entry)) return null;
-  return { view: "html", src: artifact.src };
+  return { view: "html", src };
 }
+
+class Expired extends Error {}
 
 async function fetched(kind: string, entry: string, src: string, signal: AbortSignal): Promise<ArtifactContent> {
   const response = await fetch(src, { signal });
-  if (!response.ok) throw new Error(response.status === 403 ? "Linkul a expirat; reîncarcă pagina." : "Artefactul nu poate fi citit acum.");
+  if (response.status === 403) throw new Expired("Linkul a expirat; reîncarcă pagina.");
+  if (!response.ok) throw new Error("Artefactul nu poate fi citit acum.");
   if (kind !== "e2e-run") return { view: "ticket", markdown: await response.text(), source: entry };
   const root = src.split("/").slice(0, 4).join("/");
   return { view: "e2e-run", run: parseE2eRun(await response.json()),
     assetUrl: (path) => `${root}/${path.split("/").map(encodeURIComponent).join("/")}` };
 }
 
+/** Each card read mints a new grant; the URL first used is kept until it gets a 403, so a frame never reloads under its reader. */
 function ArtifactItem({ artifact }: { artifact: Artifact }) {
-  const immediate = direct(artifact);
-  const src = immediate ? null : artifact.src ?? null;
+  const [held, setHeld] = useState(artifact.src ?? null);
+  const [loaded, setLoaded] = useState<{ src: string; content?: ArtifactContent; error?: string; expired?: boolean } | null>(null);
+  if (loaded?.expired && loaded.src === held && artifact.src && artifact.src !== held) setHeld(artifact.src);
+  const immediate = direct(artifact, held ?? artifact.src ?? null);
+  const src = immediate ? null : held ?? artifact.src ?? null;
   const entry = "entry" in artifact.content ? artifact.content.entry : "";
-  const [loaded, setLoaded] = useState<{ src: string; content?: ArtifactContent; error?: string } | null>(null);
   useEffect(() => {
     if (!src) return;
     const abort = new AbortController();
     fetched(artifact.kind, entry, src, abort.signal)
       .then((content) => setLoaded({ src, content }))
-      .catch((failure) => { if (!abort.signal.aborted) setLoaded({ src, error: failure instanceof Error ? failure.message : String(failure) }); });
+      .catch((failure) => {
+        if (!abort.signal.aborted) setLoaded({ src, error: failure instanceof Error ? failure.message : String(failure), expired: failure instanceof Expired });
+      });
     return () => abort.abort();
   }, [artifact.kind, entry, src]);
   const meta: ArtifactMeta = { id: artifact.id, kind: artifact.kind, title: artifact.title, session: artifact.session?.name ?? null,

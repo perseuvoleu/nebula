@@ -13,7 +13,9 @@ test("home cards keep their own scope through a reload, and a card page keeps it
   await expect(page.getByRole("article").filter({ hasText: "Keep verification results" })).toHaveCount(0);
 
   await page.goto("/board/p/nebula?peek=12%40leaseweb");
-  await page.getByRole("dialog").getByRole("link", { name: "Deschide pagina" }).click();
+  const open = page.getByRole("dialog").getByRole("link", { name: "Deschide pagina" });
+  await expect(open).toHaveAttribute("href", "/board/p/nebula/c/12%40leaseweb");
+  await open.click();
   await expect(page).toHaveURL(/\/board\/p\/nebula\/c\/12%40leaseweb$/);
   await page.reload();
   await expect(page.getByText("/home/perseu/nebula-worktrees/agent-home-02")).toBeVisible();

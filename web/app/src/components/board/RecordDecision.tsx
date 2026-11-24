@@ -31,12 +31,12 @@ export function RecordDecision({ cardRef, onRecorded }: { cardRef: string; onRec
     <form aria-label="Notează o decizie" onSubmit={submit} className="flex flex-col gap-2 rounded-lg border bg-background p-3">
       <label className="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
         Decizia
-        <input value={what} onChange={(e) => setWhat(e.target.value)} maxLength={500} required autoComplete="off"
+        <input value={what} onChange={(e) => setWhat(e.target.value)} maxLength={500} required autoComplete="off" disabled={pending}
           placeholder="Ce ai decis" className={`h-10 ${fieldCls}`} />
       </label>
       <label className="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
         De ce
-        <textarea value={why} onChange={(e) => setWhy(e.target.value)} maxLength={4000} rows={2}
+        <textarea value={why} onChange={(e) => setWhy(e.target.value)} maxLength={4000} rows={2} disabled={pending}
           placeholder="Opțional" className={`resize-y ${fieldCls}`} />
       </label>
       <div className="flex items-center gap-2">

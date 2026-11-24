@@ -110,6 +110,13 @@ export function ProjectSidebar({ projects, total, needsCount, scope, expanded, s
               <span className={count}>{total}</span>
             </button>
           </li>
+          <li>
+            <button type="button" aria-current={scope.kind === "all-decisions" ? "page" : undefined} onClick={() => onSelect?.({ kind: "all-decisions" })}
+              className={cn(item, scope.kind === "all-decisions" ? on : "text-muted-foreground hover:text-foreground")}>
+              <ScaleIcon aria-hidden className="size-3.5 shrink-0" />
+              <span className="flex-1">Toate deciziile</span>
+            </button>
+          </li>
           {needsCount !== undefined && <li>
             <button type="button" aria-current={scope.kind === "needs" ? "page" : undefined} onClick={() => onSelect?.({ kind: "needs" })}
               className={cn(item, scope.kind === "needs" ? on : "text-muted-foreground hover:text-foreground")}>
