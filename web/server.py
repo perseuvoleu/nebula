@@ -389,18 +389,22 @@ class Gateway:
         if current is None or any(n in {"", ".", ".."} or any(c in n for c in "/\\\0") for n in names):
             raise Problem(404, "Not found")
         try:
-            for name in names:
-                current = current / name
-                if stat.S_ISLNK(os.lstat(current).st_mode):
-                    raise Problem(404, "Not found")
-            descriptor = os.open(current, os.O_RDONLY | os.O_NOFOLLOW)
+            descriptor = os.open(current, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         except OSError:
+            raise Problem(404, "Not found")
+        try:
+            for index, name in enumerate(names):
+                directory = os.O_DIRECTORY if index < len(names) - 1 else 0
+                parent, descriptor = descriptor, os.open(name, os.O_RDONLY | os.O_NOFOLLOW | directory, dir_fd=descriptor)
+                os.close(parent)
+        except OSError:
+            os.close(descriptor)
             raise Problem(404, "Not found")
         info = os.fstat(descriptor)
         if not stat.S_ISREG(info.st_mode):
             os.close(descriptor)
             raise Problem(404, "Not found")
-        return os.fdopen(descriptor, "rb"), info.st_size, ARTIFACT_TYPES.get(current.suffix.lower(), "application/octet-stream")
+        return os.fdopen(descriptor, "rb"), info.st_size, ARTIFACT_TYPES.get(Path(names[-1]).suffix.lower(), "application/octet-stream")
 
     def session_row(self, project, session_id, *, by_name=True):
         rows = self.sessions(project)

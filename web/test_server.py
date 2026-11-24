@@ -1,5 +1,6 @@
 import http.client
 import json
+import os
 import sqlite3
 import subprocess
 import tempfile
@@ -800,6 +801,28 @@ class BoardTests(unittest.TestCase):
                 self.assertNotIn(b"Keep verification", raw)
         with patch("server.subprocess.run", return_value=cli({**fixture("card"), "project": None})):
             self.assertEqual(self.request("/api/cards", "POST", {"title": "x", "home": True}, self.auth())[0], 200)
+
+    def test_artifact_parent_swapped_after_check(self):
+        grant = self.card_src().split("/")[2]
+        outside = Path(self.tmp.name) / "outside"
+        outside.mkdir()
+        (outside / "drag.png").write_text("OUTSIDE-SECRET")
+        shots = self.artifacts / ARTIFACT_ID / "shots"
+        swapped = []
+
+        def swap_after(real):
+            def call(path, *args, **kwargs):
+                result = real(path, *args, **kwargs)
+                if str(path).endswith("shots") and not swapped:
+                    swapped.append(True)
+                    shots.rename(shots.with_name("moved"))
+                    shots.symlink_to(outside)
+                return result
+            return call
+        with patch("server.os.lstat", swap_after(os.lstat)), patch("server.os.open", swap_after(os.open)):
+            _, _, body = self.request(f"/a/{grant}/{ARTIFACT_ID}/shots/drag.png")
+        self.assertEqual(swapped, [True])
+        self.assertNotIn(b"OUTSIDE-SECRET", body)
 
 
 if __name__ == "__main__":
