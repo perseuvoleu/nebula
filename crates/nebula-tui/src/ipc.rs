@@ -1958,6 +1958,23 @@ pub async fn spawn_agent(opts: NewAgentOpts) -> Result<serde_json::Value> {
         Some(nebula_core::EntityId::Agent(id)) => id.to_string(),
         _ => String::new(),
     };
+    if opts.dispatch.is_some() {
+        let (_, worktrees, agents) = subscribe_snapshot(&mut conn).await?;
+        if let Some(agent) = agents.into_iter().find(|a| a.id.as_str() == id) {
+            return Ok(serde_json::json!({
+                "id": id,
+                "name": agent.name,
+                "kind": agent.kind.as_str(),
+                "project": project.name,
+                "worktree": worktrees
+                    .iter()
+                    .find(|w| w.id == agent.worktree_id)
+                    .map_or(target.branch, |w| w.branch.clone()),
+                "card": agent.card_id,
+                "role": agent.role,
+            }));
+        }
+    }
     Ok(serde_json::json!({
         "id": id,
         "name": name,
