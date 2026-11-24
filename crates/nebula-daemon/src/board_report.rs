@@ -101,8 +101,6 @@ async fn next_change(events: &mut broadcast::Receiver<ServerEvent>) -> bool {
     }
 }
 
-/// A board behind a link that is down gets nothing now: the link calls
-/// `resend` when it connects, and that report goes out in full.
 async fn send_if_changed(daemon: &Arc<Daemon>, sent: &mut Option<HostReport>) -> Result<()> {
     let config = crate::config::Config::load();
     let Some(board) = config.board else {

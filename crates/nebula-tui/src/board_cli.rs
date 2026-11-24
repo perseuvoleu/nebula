@@ -430,10 +430,6 @@ pub async fn run(verb: TodoVerb, json: bool) -> Result<()> {
     }
 }
 
-/// `todo run`: BeginRun on the board, the ordinary spawn on the target host
-/// with the dispatch id, then EndRun. A dispatch left pending by a lost
-/// EndRun spawns again; the target daemon answers that with the session the
-/// dispatch already started.
 async fn run_dispatch(
     conn: &mut Connection,
     dispatch: Dispatch,
@@ -546,8 +542,6 @@ async fn run_dispatch(
     }
 }
 
-/// The worktree `--worktree new` runs in: a branch named for the card and
-/// the dispatch, so a rerun finds the one the first attempt created.
 async fn fresh_worktree(
     conn: &mut Connection,
     project: &str,
@@ -600,8 +594,6 @@ fn print_receipt(receipt: &RunReceipt, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// `todo approve`: the session must be one of the card's; its own daemon
-/// sends the key only if the status is still the one the caller saw.
 async fn approve(
     conn: &mut Connection,
     card: &str,

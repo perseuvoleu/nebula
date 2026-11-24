@@ -199,7 +199,6 @@ fn begin_run(tx: &Transaction, dispatch: Dispatch) -> Result<RunReceipt> {
     receipt(tx, &dispatch.id)?.ok_or_else(|| anyhow::anyhow!("the dispatch vanished"))
 }
 
-/// The first outcome a dispatch records is the one every rerun reads.
 fn end_run(
     tx: &Transaction,
     id: &DispatchId,
@@ -767,7 +766,6 @@ fn away(tx: &Transaction, scope: &BoardScope, cards: &[Card], since: i64) -> Res
     })
 }
 
-/// How long a host's board link may stay closed before its rows read stale.
 fn stale_after() -> Duration {
     std::env::var("NEBULA_BOARD_STALE_MS")
         .ok()
@@ -785,8 +783,6 @@ struct Links {
 static LINKS: std::sync::LazyLock<Mutex<Links>> = std::sync::LazyLock::new(Default::default);
 static BOOT: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
 
-/// Starts the clock a host that never reconnects after a board restart
-/// goes stale by, and moves the version once it has run out.
 pub(crate) fn boot(store: Arc<Store>) {
     std::sync::LazyLock::force(&BOOT);
     tokio::spawn(async move {
@@ -795,16 +791,12 @@ pub(crate) fn boot(store: Arc<Store>) {
     });
 }
 
-/// A connection reports for `host`.
 pub(crate) fn link_opened(host: &str) {
     let mut links = LINKS.lock().unwrap();
     *links.open.entry(host.to_string()).or_default() += 1;
     links.closed_at.remove(host);
 }
 
-/// The connection that reported for `host` closed. Once no other is open
-/// for `stale_after`, the host and its sessions read stale, and the version
-/// moves so a poll sees it.
 pub(crate) fn link_closed(host: &str, store: Arc<Store>) {
     let closed_at = Instant::now();
     {
@@ -838,8 +830,6 @@ async fn bump(store: Arc<Store>) {
     }
 }
 
-/// Hosts other than the board's own whose link has been closed, or never
-/// opened since the board started, for longer than `stale_after`.
 fn stale_hosts(tx: &Transaction) -> Result<HashSet<String>> {
     let known: Vec<String> = tx
         .prepare("SELECT host FROM board_hosts UNION SELECT host FROM board_sessions")?
