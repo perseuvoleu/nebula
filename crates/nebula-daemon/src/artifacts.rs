@@ -7,11 +7,17 @@ use crate::board::{
 use anyhow::{bail, Context, Result};
 use nebula_core::board::{Artifact, ArtifactContent, BoardScope, CardRef, Page, Refusal};
 use nebula_core::{paths, ArtifactId, TodoId};
+use nix::dir::Dir;
+use nix::errno::Errno;
+use nix::fcntl::{openat, OFlag};
+use nix::sys::stat::{fstat, Mode, SFlag};
 use rusqlite::{params, OptionalExtension, Row, Transaction};
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::io::Read;
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
+use std::os::fd::{AsFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Component, Path, PathBuf};
 
 fn max_bytes() -> u64 {
     std::env::var("NEBULA_ARTIFACT_MAX_BYTES")
@@ -102,71 +108,107 @@ struct Budget {
     cap: u64,
 }
 
+#[derive(PartialEq)]
+enum Node {
+    Dir,
+    File,
+    Other,
+}
+
+fn node(fd: &OwnedFd) -> Result<Node> {
+    let format = SFlag::from_bits_truncate(fstat(fd)?.st_mode) & SFlag::S_IFMT;
+    Ok(match format {
+        SFlag::S_IFDIR => Node::Dir,
+        SFlag::S_IFREG => Node::File,
+        _ => Node::Other,
+    })
+}
+
+fn open_at(dir: impl AsFd, name: &OsStr, shown: &str) -> Result<OwnedFd> {
+    let flags = OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_NONBLOCK | OFlag::O_CLOEXEC;
+    openat(dir, name, flags, Mode::empty()).map_err(|e| match e {
+        Errno::ELOOP => anyhow::anyhow!("{shown} is a symlink; only regular files are published"),
+        e => anyhow::anyhow!("cannot open {shown}: {e}"),
+    })
+}
+
+fn open_source(source: &Path) -> Result<OwnedFd> {
+    let mut fd = OwnedFd::from(std::fs::File::open("/")?);
+    let mut shown = PathBuf::from("/");
+    for part in source.components() {
+        let (Component::Normal(_) | Component::ParentDir) = part else {
+            continue;
+        };
+        shown.push(part);
+        fd = open_at(&fd, part.as_os_str(), &shown.display().to_string())?;
+    }
+    Ok(fd)
+}
+
 fn copy_tree(source: &Path, dest: &Path) -> Result<(BTreeSet<String>, bool)> {
-    let meta = std::fs::symlink_metadata(source)
-        .with_context(|| format!("cannot read {}", source.display()))?;
+    let fd = open_source(source)?;
+    let kind = node(&fd)?;
     std::fs::create_dir(dest)?;
     let mut budget = Budget {
         used: 0,
         cap: max_bytes(),
     };
     let mut files = BTreeSet::new();
-    if meta.is_dir() {
-        copy_dir(source, dest, "", &mut budget, &mut files)?;
-    } else if meta.is_file() {
-        let name = utf8_name(source.file_name().unwrap_or_default(), source)?;
-        copy_file(source, &dest.join(&name), &mut budget)?;
-        files.insert(name);
-    } else {
-        bail!("{} is not a regular file or directory", source.display());
+    match kind {
+        Node::Dir => copy_dir(fd, dest, "", &mut budget, &mut files)?,
+        Node::File => {
+            let name = utf8_name(source.file_name().unwrap_or_default(), source)?;
+            copy_file(fd, &dest.join(&name), &mut budget)?;
+            files.insert(name);
+        }
+        Node::Other => bail!("{} is not a regular file or directory", source.display()),
     }
-    Ok((files, meta.is_dir()))
+    Ok((files, kind == Node::Dir))
 }
 
-fn utf8_name(name: &std::ffi::OsStr, path: &Path) -> Result<String> {
+fn utf8_name(name: &OsStr, path: &Path) -> Result<String> {
     name.to_str()
         .map(str::to_owned)
         .with_context(|| format!("{} is not a UTF-8 name", path.display()))
 }
 
 fn copy_dir(
-    src: &Path,
+    fd: OwnedFd,
     dest: &Path,
     rel: &str,
     budget: &mut Budget,
     files: &mut BTreeSet<String>,
 ) -> Result<()> {
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let path = entry.path();
-        let name = utf8_name(&entry.file_name(), &path)?;
+    let mut dir = Dir::from_fd(fd)?;
+    let names = dir
+        .iter()
+        .map(|entry| entry.map(|e| OsStr::from_bytes(e.file_name().to_bytes()).to_owned()))
+        .collect::<nix::Result<Vec<_>>>()?;
+    for name in names.iter().filter(|n| *n != "." && *n != "..") {
+        let text = utf8_name(name, Path::new(name))?;
         let rel = if rel.is_empty() {
-            name.clone()
+            text.clone()
         } else {
-            format!("{rel}/{name}")
+            format!("{rel}/{text}")
         };
-        let kind = entry.file_type()?;
-        if kind.is_symlink() {
-            bail!("{rel} is a symlink; only regular files are published");
-        } else if kind.is_dir() {
-            std::fs::create_dir(dest.join(&name))?;
-            copy_dir(&path, &dest.join(&name), &rel, budget, files)?;
-        } else if kind.is_file() {
-            copy_file(&path, &dest.join(&name), budget)?;
-            files.insert(rel);
-        } else {
-            bail!("{rel} is not a regular file");
+        let child = open_at(&dir, name, &rel)?;
+        match node(&child)? {
+            Node::Dir => {
+                std::fs::create_dir(dest.join(&text))?;
+                copy_dir(child, &dest.join(&text), &rel, budget, files)?;
+            }
+            Node::File => {
+                copy_file(child, &dest.join(&text), budget)?;
+                files.insert(rel);
+            }
+            Node::Other => bail!("{rel} is not a regular file"),
         }
     }
     Ok(())
 }
 
-fn copy_file(src: &Path, dest: &Path, budget: &mut Budget) -> Result<()> {
-    let input = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_NOFOLLOW)
-        .open(src)
-        .with_context(|| format!("cannot read {}", src.display()))?;
+fn copy_file(fd: OwnedFd, dest: &Path, budget: &mut Budget) -> Result<()> {
+    let input = std::fs::File::from(fd);
     let mut output = std::fs::File::create_new(dest)?;
     let left = budget.cap - budget.used;
     let copied = std::io::copy(&mut input.take(left + 1), &mut output)?;

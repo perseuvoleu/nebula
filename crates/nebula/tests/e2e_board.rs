@@ -652,7 +652,7 @@ fn tree(root: &Path, files: &[(&str, &[u8])]) -> PathBuf {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, bytes).unwrap();
     }
-    root.to_path_buf()
+    root.canonicalize().unwrap()
 }
 
 fn e2e_run(root: &Path, screenshot: &str) -> PathBuf {
@@ -946,6 +946,27 @@ fn artifact_add_refused_publish_drops_the_tree() {
         None,
     );
     refused(&out, "no board configured");
+    assert!(store_entries(&env).is_empty(), "{:?}", store_entries(&env));
+}
+
+#[test]
+fn artifact_add_refuses_symlinked_parent() {
+    let env = board_env();
+    let root = env.tmp.path().canonicalize().unwrap();
+    tree(&root.join("real/recap"), &[("index.html", b"x")]);
+    std::os::unix::fs::symlink(root.join("real"), root.join("alias")).unwrap();
+    let source = root.join("alias/recap");
+    let out = env.cli(
+        &[
+            "artifact",
+            "add",
+            source.to_str().unwrap(),
+            "--kind",
+            "recap",
+        ],
+        None,
+    );
+    refused(&out, "symlink");
     assert!(store_entries(&env).is_empty(), "{:?}", store_entries(&env));
 }
 
