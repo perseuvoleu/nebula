@@ -265,19 +265,13 @@ pub fn open_on_argv(
     project: Option<&str>,
     focus: bool,
 ) -> Result<Vec<String>> {
-    for (what, value) in [
-        ("host", Some(host)),
-        ("session", Some(session)),
-        ("project", project),
-    ] {
-        if let Some(value) = value.filter(|v| !is_ssh_token(v)) {
-            bail!("{what} {value:?} is not a plain name (letters, digits, . _ @ -)");
-        }
+    if !is_ssh_token(host) {
+        bail!("host {host:?} is not a plain name (letters, digits, . _ @ -)");
     }
-    let mut words = vec!["nebula", "open", "--session", session, "--json"];
-    if let Some(project) = project {
-        words.extend(["--project", project]);
-    }
+    let session = format!("--session={session}");
+    let project = project.map(|p| format!("--project={p}"));
+    let mut words = vec!["nebula", "open", &session, "--json"];
+    words.extend(project.as_deref());
     if !focus {
         words.push("--no-focus");
     }
@@ -293,7 +287,7 @@ pub fn open_on_argv(
     Ok(argv)
 }
 
-/// Safe as an ssh destination and inside the remote command line.
+/// Safe as an ssh destination.
 fn is_ssh_token(s: &str) -> bool {
     !s.is_empty()
         && !s.starts_with('-')
@@ -342,7 +336,7 @@ mod tests {
                 "ConnectTimeout=10",
                 "--",
                 "me@mbp.tail.ts.net",
-                "export PATH=\"$HOME/.local/bin:$HOME/.cargo/bin:$PATH\"; 'nebula' 'open' '--session' 'a1b2' '--json' '--project' 'alpha@findl' '--no-focus'",
+                "export PATH=\"$HOME/.local/bin:$HOME/.cargo/bin:$PATH\"; 'nebula' 'open' '--session=a1b2' '--json' '--project=alpha@findl' '--no-focus'",
             ]
         );
         for host in [
@@ -360,12 +354,23 @@ mod tests {
                 "host {host:?}"
             );
         }
-        for session in ["", "-x", "a b", "a;rm", "$(id)", "a'b"] {
-            assert!(
-                open_on_argv("findl", session, None, true).is_err(),
-                "session {session:?}"
-            );
-        }
-        assert!(open_on_argv("findl", "a1b2", Some("p;q"), true).is_err());
+    }
+
+    #[test]
+    fn open_on_carries_any_session_and_project_name_as_one_word() {
+        let argv = open_on_argv("findl", "renamed fixture", Some("My Project"), true).unwrap();
+        assert!(
+            argv.last().unwrap().ends_with(
+                "'nebula' 'open' '--session=renamed fixture' '--json' '--project=My Project'"
+            ),
+            "{argv:?}"
+        );
+        let argv = open_on_argv("findl", "-x", Some("p;q'r"), true).unwrap();
+        assert!(
+            argv.last()
+                .unwrap()
+                .ends_with("'--session=-x' '--json' '--project=p;q'\\''r'"),
+            "{argv:?}"
+        );
     }
 }

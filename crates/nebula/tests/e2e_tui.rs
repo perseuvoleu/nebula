@@ -1281,19 +1281,19 @@ fn open_session_attaches_it_in_the_running_tui() {
 fn open_on_host_returns_landed_focused() {
     use std::os::unix::fs::PermissionsExt;
     let mut tui = TuiHarness::spawn();
-    let repo = tui.make_repo("alpha-proj");
-    add_project(&mut tui, &repo, "alpha-proj");
+    let repo = tui.make_repo("alpha proj");
+    add_project(&mut tui, &repo, "alpha proj");
     let new = nebula_cli(
         &tui,
         &[
             "agent",
             "new",
             "--project",
-            "alpha-proj",
+            "alpha proj",
             "--worktree",
             "main",
             "--name",
-            "far",
+            "far away",
         ],
     );
     assert!(new.status.success(), "{new:?}");
@@ -1301,7 +1301,7 @@ fn open_on_host_returns_landed_focused() {
         .as_str()
         .unwrap()
         .to_owned();
-    tui.wait_for_text("far");
+    tui.wait_for_text("far away");
 
     let home = tempfile::tempdir().unwrap();
     let bin = home.path().join(".local/bin");
@@ -1321,7 +1321,9 @@ fn open_on_host_returns_landed_focused() {
         .args([
             "open",
             "--session",
-            &id,
+            "far away",
+            "--project",
+            "alpha proj",
             "--on",
             "laptop-b",
             "--no-focus",
@@ -1350,13 +1352,13 @@ fn open_on_host_returns_landed_focused() {
             "landed": "tui",
             "tui_pid": tui.child.process_id().unwrap(),
             "id": id,
-            "name": "far",
-            "project": "alpha-proj",
+            "name": "far away",
+            "project": "alpha proj",
             "host": null,
             "focused": false,
         })
     );
-    tui.wait_for_selected("far");
+    tui.wait_for_selected("far away");
     assert_typing_reaches(&mut tui, "on1", &id);
 }
 
