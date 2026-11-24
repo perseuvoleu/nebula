@@ -138,6 +138,10 @@ fn parse_card_ref_forms() {
         ("12@leaseweb", number(12, Some("leaseweb"))),
         ("#12@leaseweb", number(12, Some("leaseweb"))),
         (ulid, CardRef::Id(TodoId(ulid.into()))),
+        (
+            "7ZZZZZZZZZZZZZZZZZZZZZZZZZ",
+            CardRef::Id(TodoId("7ZZZZZZZZZZZZZZZZZZZZZZZZZ".into())),
+        ),
     ];
     for (text, expected) in accepted {
         assert_eq!(parse_card_ref(text), Some(expected), "{text}");
@@ -156,6 +160,8 @@ fn parse_card_ref_forms() {
         "abc",
         "01JD000000000000000000001",
         "#01JD0000000000000000000012",
+        "81JD0000000000000000000012",
+        "ZZZZZZZZZZZZZZZZZZZZZZZZZZ",
     ] {
         assert_eq!(parse_card_ref(text), None, "{text:?} must be refused");
     }
@@ -198,6 +204,15 @@ fn auto_stage_transitions() {
     let worker = |status| row("w1", Some(Role::Worker), status, true);
     let reviewer = |status| row("r1", Some(Role::Review), status, true);
     let other_worker = |status, alive| row("w2", Some(Role::Worker), status, alive);
+    let dead_worker = |status| row("w1", Some(Role::Worker), status, false);
+    let archived_worker = |status| SessionRow {
+        archived: true,
+        ..worker(status)
+    };
+    let at = |row: SessionRow, status_changed_at| SessionRow {
+        status_changed_at,
+        ..row
+    };
     let cases: &[StageCase] = &[
         (
             "worker appears on backlog",
@@ -336,6 +351,70 @@ fn auto_stage_transitions() {
             None,
         ),
         (
+            "worker appears finished on backlog",
+            Backlog,
+            None,
+            worker(Finished),
+            vec![],
+            None,
+        ),
+        (
+            "dead worker appears on next",
+            Next,
+            None,
+            dead_worker(Running),
+            vec![],
+            None,
+        ),
+        (
+            "archived worker appears on backlog",
+            Backlog,
+            None,
+            archived_worker(Running),
+            vec![],
+            None,
+        ),
+        (
+            "worker appears finished on doing",
+            Doing,
+            None,
+            worker(Finished),
+            vec![],
+            Some(Review),
+        ),
+        (
+            "worker appears finished on doing beside a live running worker",
+            Doing,
+            None,
+            worker(Finished),
+            vec![other_worker(Running, true)],
+            None,
+        ),
+        (
+            "late finished replay older than the running row",
+            Doing,
+            Some(at(worker(Running), 10)),
+            at(worker(Finished), 5),
+            vec![],
+            None,
+        ),
+        (
+            "archived worker finishes on doing",
+            Doing,
+            Some(archived_worker(Running)),
+            archived_worker(Finished),
+            vec![],
+            None,
+        ),
+        (
+            "dead worker finishes on doing",
+            Doing,
+            Some(dead_worker(Running)),
+            dead_worker(Finished),
+            vec![],
+            None,
+        ),
+        (
             "worker resumes on next after a manual move",
             Next,
             Some(worker(Finished)),
@@ -344,13 +423,14 @@ fn auto_stage_transitions() {
             None,
         ),
     ];
-    for (name, stage, before, after, others, expected) in cases {
-        assert_eq!(
-            auto_stage(*stage, before.as_ref(), after, others),
-            *expected,
-            "{name}"
-        );
-    }
+    let wrong: Vec<_> = cases
+        .iter()
+        .filter_map(|(name, stage, before, after, others, expected)| {
+            let got = auto_stage(*stage, before.as_ref(), after, others);
+            (got != *expected).then(|| format!("{name}: got {got:?}, want {expected:?}"))
+        })
+        .collect();
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 fn e2e_files(names: &[&str]) -> BTreeSet<String> {
@@ -385,6 +465,21 @@ fn e2e_run_validate() {
         .unwrap()
         .remove("name");
     assert!(validate_e2e_run(&no_step_name.to_string(), &all).is_err());
+
+    let object: Value = serde_json::from_str(result).unwrap();
+    let positional = json!([
+        object["title"],
+        object["status"],
+        object["started_at"],
+        object["duration_ms"],
+        object["steps"],
+    ]);
+    assert!(validate_e2e_run(&positional.to_string(), &all).is_err());
+
+    let mut positional_step = object.clone();
+    let step = &object["steps"][0];
+    positional_step["steps"][0] = json!([step["name"], step["status"], step["duration_ms"]]);
+    assert!(validate_e2e_run(&positional_step.to_string(), &all).is_err());
 }
 
 fn author() -> Author {

@@ -81,7 +81,9 @@ pub enum CardRef {
 /// Accepts `#12`, `12`, `12@leaseweb`, `#12@leaseweb` and a ULID.
 pub fn parse_card_ref(text: &str) -> Option<CardRef> {
     if let Ok(ulid) = ulid::Ulid::from_string(text) {
-        return Some(CardRef::Id(TodoId(ulid.to_string())));
+        return text
+            .starts_with(|c| ('0'..='7').contains(&c))
+            .then(|| CardRef::Id(TodoId(ulid.to_string())));
     }
     let text = text.strip_prefix('#').unwrap_or(text);
     let (number, board) = match text.split_once('@') {
@@ -466,14 +468,19 @@ pub enum BoardResult {
 /// The column a card moves to when one of its session rows changes, or None.
 /// `others` are the card's other rows. Fires only on a transition, so a
 /// duplicate or late report never undoes a manual move, and never leaves
-/// review or done.
+/// review or done. Only a live, unarchived worker moves its card.
 pub fn auto_stage(
     stage: Stage,
     before: Option<&SessionRow>,
     after: &SessionRow,
     others: &[SessionRow],
 ) -> Option<Stage> {
-    if before == Some(after) || after.role != Some(Role::Worker) {
+    if before == Some(after)
+        || before.is_some_and(|b| after.status_changed_at < b.status_changed_at)
+        || after.role != Some(Role::Worker)
+        || !after.alive
+        || after.archived
+    {
         return None;
     }
     let live_unfinished_worker = |row: &SessionRow| {
@@ -484,10 +491,14 @@ pub fn auto_stage(
             && row.status != AgentStatus::Finished
     };
     match stage {
-        Stage::Backlog | Stage::Next if before.is_none() => Some(Stage::Doing),
+        Stage::Backlog | Stage::Next
+            if before.is_none() && after.status != AgentStatus::Finished =>
+        {
+            Some(Stage::Doing)
+        }
         Stage::Doing
             if after.status == AgentStatus::Finished
-                && before.is_some_and(|b| b.status != AgentStatus::Finished)
+                && before.is_none_or(|b| b.status != AgentStatus::Finished)
                 && !others.iter().any(live_unfinished_worker) =>
         {
             Some(Stage::Review)
@@ -529,7 +540,16 @@ pub struct E2eStep {
 /// Parses `result.json` and checks every screenshot it names is among
 /// `files`, the artifact's relative paths.
 pub fn validate_e2e_run(result_json: &str, files: &BTreeSet<String>) -> Result<E2eRun, String> {
-    let run: E2eRun = serde_json::from_str(result_json).map_err(|e| format!("result.json: {e}"))?;
+    let value: serde_json::Value =
+        serde_json::from_str(result_json).map_err(|e| format!("result.json: {e}"))?;
+    let objects = value.is_object()
+        && value["steps"]
+            .as_array()
+            .is_some_and(|steps| steps.iter().all(serde_json::Value::is_object));
+    if !objects {
+        return Err("result.json: the run and each step must be JSON objects".into());
+    }
+    let run: E2eRun = serde_json::from_value(value).map_err(|e| format!("result.json: {e}"))?;
     if let Some(missing) = run
         .steps
         .iter()
