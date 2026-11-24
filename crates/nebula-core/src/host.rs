@@ -4,10 +4,13 @@
 /// Short machine hostname: gethostname(2), then the `HOSTNAME` env var, then
 /// "unknown". Domain suffix is stripped ("mbp.local" -> "mbp").
 pub fn hostname() -> String {
-    let raw = gethostname_syscall()
+    short_name(&full_hostname()).to_string()
+}
+
+fn full_hostname() -> String {
+    gethostname_syscall()
         .or_else(|| std::env::var("HOSTNAME").ok().filter(|h| !h.is_empty()))
-        .unwrap_or_else(|| "unknown".to_string());
-    short_name(&raw).to_string()
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 /// True when running inside an ssh session — sshd sets these for both
@@ -19,11 +22,25 @@ pub fn is_remote_session() -> bool {
     )
 }
 
-/// Whether an ssh destination (`user@name`, a FQDN, `localhost`) names
-/// this machine.
+/// Whether an ssh destination (`user@name`) names this machine: a loopback
+/// name or address, or the whole hostname (`.local` optional). A name on any
+/// other domain is another machine, even when its first label matches.
 pub fn names_this_machine(destination: &str) -> bool {
-    let name = destination.rsplit('@').next().unwrap_or(destination);
-    name.eq_ignore_ascii_case("localhost") || short_name(name).eq_ignore_ascii_case(&hostname())
+    let name = normalized(destination.rsplit('@').next().unwrap_or(destination));
+    let me = normalized(&full_hostname());
+    name == "localhost"
+        || name
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+        || name == me
+        || name == short_name(&me)
+}
+
+fn normalized(name: &str) -> String {
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    name.strip_suffix(".local")
+        .map(str::to_owned)
+        .unwrap_or(name)
 }
 
 fn short_name(full: &str) -> &str {
@@ -67,6 +84,30 @@ mod tests {
         assert!(!is_remote_from(Some(""), Some("")));
         assert!(is_remote_from(Some("1.2.3.4 50000 5.6.7.8 22"), None));
         assert!(is_remote_from(None, Some("/dev/pts/3")));
+    }
+
+    #[test]
+    fn names_this_machine_matches_the_whole_host_identity() {
+        let me = hostname();
+        for local in [
+            "localhost".to_owned(),
+            "me@LOCALHOST".to_owned(),
+            "127.0.0.1".to_owned(),
+            "::1".to_owned(),
+            me.clone(),
+            format!("me@{}", me.to_uppercase()),
+            format!("{me}.local"),
+        ] {
+            assert!(names_this_machine(&local), "{local:?} is this machine");
+        }
+        for other in [
+            format!("{me}.invalid"),
+            format!("me@{me}.other.example.com"),
+            format!("{me}x"),
+            "nohost.invalid".to_owned(),
+        ] {
+            assert!(!names_this_machine(&other), "{other:?} is another machine");
+        }
     }
 
     #[test]
