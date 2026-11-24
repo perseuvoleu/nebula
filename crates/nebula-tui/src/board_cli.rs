@@ -62,14 +62,9 @@ impl Caller {
                 role: agent.role,
             });
         }
-        let cwd = std::env::current_dir().ok();
-        let (project, checkout) = cwd
-            .and_then(|cwd| {
-                worktrees
-                    .iter()
-                    .filter(|w| cwd.starts_with(&w.path))
-                    .max_by_key(|w| w.path.components().count())
-            })
+        let (project, checkout) = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| cwd_checkout(&cwd, projects, worktrees))
             .map(place)
             .unzip();
         Ok(Self {
@@ -84,6 +79,22 @@ impl Caller {
             role: None,
         })
     }
+}
+
+fn cwd_checkout<'a>(
+    cwd: &std::path::Path,
+    projects: &[Project],
+    worktrees: &'a [Worktree],
+) -> Option<&'a Worktree> {
+    let local = |w: &Worktree| {
+        projects
+            .iter()
+            .any(|p| p.id == w.project_id && p.host.is_none())
+    };
+    worktrees
+        .iter()
+        .filter(|w| local(w) && cwd.starts_with(&w.path))
+        .max_by_key(|w| w.path.components().count())
 }
 
 #[derive(Default)]
@@ -397,5 +408,45 @@ pub fn exit_on_refusal(result: Result<()>) -> Result<()> {
             None => Err(why),
         },
         ok => ok,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nebula_core::{ProjectId, WorktreeId};
+    use std::path::Path;
+
+    #[test]
+    fn cwd_matches_only_local_checkouts() {
+        let project = |id: &str, host: Option<&str>| Project {
+            workspace_id: Default::default(),
+            id: ProjectId(id.into()),
+            name: "app".into(),
+            repo_path: "/src/app".into(),
+            sort_order: 0,
+            divider_after: false,
+            divider_before: false,
+            divider_label: None,
+            divider_before_label: None,
+            host: host.map(str::to_owned),
+        };
+        let worktree = |id: &str, project: &str| Worktree {
+            id: WorktreeId(id.into()),
+            project_id: ProjectId(project.into()),
+            path: "/src/app".into(),
+            branch: "main".into(),
+            is_main: true,
+            created_from: None,
+            pinned: false,
+            for_branch: false,
+            sort_order: 0,
+        };
+        let projects = [project("local", None), project("twin", Some("findl"))];
+        let worktrees = [worktree("here", "local"), worktree("there", "twin")];
+        let found = cwd_checkout(Path::new("/src/app/crates"), &projects, &worktrees);
+        assert_eq!(found.map(|w| w.id.0.as_str()), Some("here"));
+        let remote_only = cwd_checkout(Path::new("/src/app"), &projects, &worktrees[1..]);
+        assert!(remote_only.is_none());
     }
 }
