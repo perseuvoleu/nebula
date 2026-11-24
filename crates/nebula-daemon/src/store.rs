@@ -292,17 +292,33 @@ const MIGRATIONS: &[&str] = &[
     // note author for the card log, the board tables, and the agents' card
     // link. The legacy columns and the links table go before 29 is released.
     // Every write to a board table bumps board_meta.version through
-    // a trigger, so no write path can forget the poll counter.
+    // a trigger, so no write path can forget the poll counter. The todos
+    // rebuild lets a card (stage set) have no local owner: a home card or
+    // one in a remote project; legacy todos keep the one-owner CHECK.
     "
-    ALTER TABLE todos ADD COLUMN number INTEGER;
-    ALTER TABLE todos ADD COLUMN title TEXT;
-    ALTER TABLE todos ADD COLUMN stage TEXT CHECK (stage IN ('backlog', 'next', 'doing', 'review', 'done'));
-    ALTER TABLE todos ADD COLUMN project TEXT;
-    ALTER TABLE todos ADD COLUMN checkout TEXT;
-    ALTER TABLE todos ADD COLUMN created_by TEXT;
-    ALTER TABLE todos ADD COLUMN proposed INTEGER NOT NULL DEFAULT 0;
-    ALTER TABLE todos ADD COLUMN stage_changed_at INTEGER;
-    ALTER TABLE todos ADD COLUMN archived_at INTEGER;
+    CREATE TABLE todos_new (
+      id               TEXT PRIMARY KEY,
+      project_id       TEXT REFERENCES projects(id) ON DELETE CASCADE,
+      worktree_id      TEXT REFERENCES worktrees(id) ON DELETE CASCADE,
+      text             TEXT NOT NULL,
+      done             INTEGER NOT NULL DEFAULT 0,
+      sort_order       INTEGER NOT NULL DEFAULT 0,
+      created_at       INTEGER NOT NULL,
+      number           INTEGER,
+      title            TEXT,
+      stage            TEXT CHECK (stage IN ('backlog', 'next', 'doing', 'review', 'done')),
+      project          TEXT,
+      checkout         TEXT,
+      created_by       TEXT,
+      proposed         INTEGER NOT NULL DEFAULT 0,
+      stage_changed_at INTEGER,
+      archived_at      INTEGER,
+      CHECK (stage IS NOT NULL OR ((project_id IS NULL) <> (worktree_id IS NULL)))
+    );
+    INSERT INTO todos_new (id, project_id, worktree_id, text, done, sort_order, created_at)
+      SELECT id, project_id, worktree_id, text, done, sort_order, created_at FROM todos;
+    DROP TABLE todos;
+    ALTER TABLE todos_new RENAME TO todos;
     CREATE UNIQUE INDEX todos_number ON todos (number) WHERE number IS NOT NULL;
     ALTER TABLE notes ADD COLUMN author TEXT;
     ALTER TABLE agents ADD COLUMN card_id TEXT;
@@ -2463,7 +2479,16 @@ mod tests {
                 assert_eq!(board_version(), before + 1, "{table}: {sql}");
             }
         }
+        for card in [
+            "INSERT INTO todos (id, text, created_at, number, title, stage) VALUES ('c1', '', 0, 1, 'home card', 'backlog')",
+            "INSERT INTO todos (id, text, created_at, number, title, stage, project) VALUES ('c2', '', 0, 2, 'remote card', 'next', 'vela')",
+        ] {
+            conn.execute(card, [])
+                .unwrap_or_else(|e| panic!("{card}: {e}"));
+        }
         for refused in [
+            "INSERT INTO todos (id, text, created_at) VALUES ('t8', 'x', 0)",
+            "INSERT INTO todos (id, project_id, worktree_id, text, created_at) VALUES ('t8', 'p1', 'w1', 'x', 0)",
             "INSERT INTO artifacts (id, kind, title, url, body, created_at) VALUES ('a8', 'link', 'x', 'https://x', 'b', 0)",
             "INSERT INTO artifacts (id, kind, title, storage_host, created_at) VALUES ('a8', 'recap', 'x', 'h', 0)",
             "INSERT INTO artifacts (id, kind, title, created_at) VALUES ('a8', 'recap', 'x', 0)",
