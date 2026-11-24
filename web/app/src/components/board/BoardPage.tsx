@@ -7,7 +7,7 @@ import {
   awayDigest, byStage, cardSlug, inScope, projectName, sidebarProjects, sortCards, toBoardCard, writerSlots,
 } from "@/lib/board";
 import type { BoardRoute } from "@/lib/route";
-import { useBoard } from "@/lib/useBoard";
+import { BOARD_POLL_MS, useBoard } from "@/lib/useBoard";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
@@ -37,16 +37,20 @@ function loadLastSeen(): number {
 
 function useCard(slug: string | null, board: BoardData | null) {
   const [state, setState] = useState<{ slug: string; show: CardShow | null; error: string | null } | null>(null);
+  const [attempt, setAttempt] = useState(0);
   useEffect(() => {
     if (!slug) return;
     const abort = new AbortController();
+    let retry: ReturnType<typeof setTimeout> | undefined;
     api<CardShow>(`cards/${encodeURIComponent(slug)}`, {}, undefined, { signal: abort.signal })
       .then((show) => setState({ slug, show, error: null }))
       .catch((failure) => {
-        if (!abort.signal.aborted) setState((old) => ({ slug, show: old?.slug === slug ? old.show : null, error: describeError(failure) }));
+        if (abort.signal.aborted) return;
+        setState((old) => ({ slug, show: old?.slug === slug ? old.show : null, error: describeError(failure) }));
+        retry = setTimeout(() => setAttempt((n) => n + 1), BOARD_POLL_MS);
       });
-    return () => abort.abort();
-  }, [slug, board]);
+    return () => { abort.abort(); clearTimeout(retry); };
+  }, [slug, board, attempt]);
   return state?.slug === slug ? state : null;
 }
 
@@ -69,7 +73,12 @@ function CardPanel({ slug, board, mode, onOpenCard }: { slug: string; board: Boa
   if (!card.show) return <p role="alert" className="text-sm">{card.error}</p>;
   const now = Date.now();
   const log = card.show.log.map((n) => ({ id: n.id, author: n.author.name, text: n.text, age: activityAge(n.created_at, now) }));
-  return <CardDetail card={toBoardCard(card.show, board?.cards ?? [], card.show)} log={log} mode={mode} onOpenCard={onOpenCard} />;
+  return (
+    <>
+      {card.error && <span role="status" className="self-start rounded-md border border-dashed px-1.5 py-0.5 text-xs">Date neactualizate</span>}
+      <CardDetail card={toBoardCard(card.show, board?.cards ?? [], card.show)} log={log} mode={mode} onOpenCard={onOpenCard} />
+    </>
+  );
 }
 
 export function BoardPage({ route, onNavigate, onSessions }: {

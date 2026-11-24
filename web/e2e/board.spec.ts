@@ -116,6 +116,21 @@ test("a project's Decisions route lists only that project's decisions", async ({
   await expect(page.getByText("Copy published files")).toBeVisible();
 });
 
+test("a failed card read is retried on the next poll, and a stale detail is marked stale", async ({ page }) => {
+  let fail = true;
+  await page.route("**/api/cards/**", (route) => fail ? route.fulfill({ status: 503, body: "{}" }) : route.continue());
+  await open(page, "/board?peek=12%40leaseweb");
+  const peek = page.getByRole("dialog", { name: "Keep verification results" });
+  await expect(peek.getByRole("alert")).toBeVisible();
+  fail = false;
+  await expect(peek.getByText("Started on leaseweb")).toBeVisible();
+  await expect(peek.getByRole("status")).toHaveCount(0);
+  fail = true;
+  addCard(14, "Bumps the version", "backlog");
+  await expect(peek.getByRole("status").filter({ hasText: "Date neactualizate" })).toBeVisible();
+  await expect(peek.getByText("Started on leaseweb")).toBeVisible();
+});
+
 test("blocked card dimmed", async ({ page }) => {
   addCard(13, "Wait for verification", "next", ["#12@leaseweb"]);
   await open(page, "/board");

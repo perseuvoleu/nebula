@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { api, ApiError } from "@/lib/api";
 import type { BoardData, BoardReply } from "@/lib/board";
 
-const BOARD_POLL_MS = 3000;
+export const BOARD_POLL_MS = 3000;
 
 async function readBoard(since: string | undefined, awaySince: number | null, signal: AbortSignal) {
   const first = await api<BoardReply>("board", { since, awaySince: awaySince === null ? undefined : String(awaySince) }, undefined, { signal });
