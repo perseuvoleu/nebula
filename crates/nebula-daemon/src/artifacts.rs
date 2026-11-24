@@ -232,17 +232,9 @@ pub(crate) fn publish(tx: &Transaction, artifact: Artifact) -> Result<Artifact> 
     if let Some(known) = by_id(tx, &artifact.id)? {
         return Ok(known);
     }
-    let project = match &artifact.card {
-        Some(card) => {
-            let card = resolve(tx, &CardRef::Id(card.clone()))?;
-            tx.query_row(
-                "SELECT project FROM todos WHERE id = ?1",
-                params![card.as_str()],
-                |r| r.get::<_, Option<String>>(0),
-            )?
-        }
-        None => artifact.project.clone(),
-    };
+    if let Some(card) = &artifact.card {
+        resolve(tx, &CardRef::Id(card.clone()))?;
+    }
     let (host, entry, url, body) = match &artifact.content {
         ArtifactContent::Files { host, entry } => (Some(host), Some(entry), None, None),
         ArtifactContent::Url { url } => (None, None, Some(url), None),
@@ -260,7 +252,7 @@ pub(crate) fn publish(tx: &Transaction, artifact: Artifact) -> Result<Artifact> 
             url,
             body,
             artifact.card.as_ref().map(TodoId::as_str),
-            project,
+            artifact.project,
             artifact.session.as_ref().map(serde_json::to_string).transpose()?,
             artifact.checkout.as_ref().map(serde_json::to_string).transpose()?,
             serde_json::to_string(&artifact.meta)?,

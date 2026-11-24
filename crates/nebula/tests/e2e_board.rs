@@ -919,6 +919,35 @@ fn artifact_add_url_forms() {
 }
 
 #[test]
+fn artifact_project_is_callers() {
+    let env = board_env();
+    env.make_repo();
+    let card = add(&env, &["--project", "beta"], "Elsewhere");
+    let out = env.cli(
+        &[
+            "agent",
+            "new",
+            "--project",
+            "repo",
+            "--worktree",
+            "main",
+            "--name",
+            "publisher",
+            "--json",
+        ],
+        None,
+    );
+    let agent = json_of(out, &["agent", "new"]);
+    let added = publish(
+        &env,
+        agent["id"].as_str(),
+        &["https://example.com", "--card", "#1"],
+    );
+    assert_eq!(added["card"], card["id"]);
+    assert_eq!(added["project"], "repo");
+}
+
+#[test]
 fn artifact_add_project_flag() {
     let env = board_env();
     let added = publish(
