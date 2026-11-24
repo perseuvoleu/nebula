@@ -1,6 +1,8 @@
 import { useMemo, useState } from "react";
 import { PlusIcon, SearchIcon } from "lucide-react";
 import type { SessionRow } from "@/lib/types";
+import { activityAge } from "@/lib/activity-age";
+import { sessionKey } from "@/lib/session-list";
 import { kindLabel, statusLabel } from "@/lib/status";
 import { Button } from "@/components/ui/button";
 
@@ -8,7 +10,7 @@ import { DeleteSessionButton } from "./DeleteSessionButton";
 
 export type ListPhase = "loading" | "ready" | "error" | "offline";
 
-export function SessionList({ sessions, phase, error, selected, unseen, onSelect, onNew, project, onDeleted }: {
+export function SessionList({ sessions, phase, error, selected, unseen, onSelect, onNew, project, showProject, onDeleted }: {
   sessions: SessionRow[];
   phase: ListPhase;
   error: string | null;
@@ -17,12 +19,16 @@ export function SessionList({ sessions, phase, error, selected, unseen, onSelect
   onSelect: (row: SessionRow) => void;
   onNew: () => void;
   project: string;
-  onDeleted: (id: string) => void;
+  /** Show the real project for rows in the aggregate view. */
+  showProject: boolean;
+  onDeleted: (row: SessionRow) => void;
 }) {
   const [filter, setFilter] = useState("");
+  // Existing list refreshes advance relative labels without additional requests or per-row timers.
+  const now = Date.now();
   const visible = useMemo(() => {
     const needle = filter.trim().toLowerCase();
-    const rows = needle ? sessions.filter((r) => `${r.name} ${r.kind} ${r.worktree} ${statusLabel(r.status)}`.toLowerCase().includes(needle)) : sessions;
+    const rows = needle ? sessions.filter((r) => `${r.project} ${r.name} ${r.kind} ${r.worktree} ${statusLabel(r.status)}`.toLowerCase().includes(needle)) : sessions;
     return rows.slice(0, 200);
   }, [sessions, filter]);
 
@@ -45,9 +51,9 @@ export function SessionList({ sessions, phase, error, selected, unseen, onSelect
             {[0, 1, 2].map((i) => <li key={i} className="h-14 animate-pulse rounded-lg bg-muted/60" />)}
           </ul>
         )}
-        {phase === "error" && <p role="alert" className="px-2 py-3 text-sm text-muted-foreground">Nu s-au putut încărca sesiunile: {error}</p>}
+        {error && phase !== "offline" && <p role="alert" className="px-2 py-3 text-sm text-muted-foreground">Nu s-au putut încărca sesiunile: {error}</p>}
         {phase === "offline" && <p role="status" className="px-2 py-3 text-sm text-muted-foreground">Fără conexiune. Lista poate fi veche; agenții continuă pe server.</p>}
-        {phase === "ready" && sessions.length === 0 && (
+        {phase === "ready" && !error && sessions.length === 0 && (
           <div className="px-2 py-6 text-sm text-muted-foreground">
             <p>Nicio sesiune activă în acest proiect.</p>
             <Button type="button" variant="outline" size="sm" className="mt-3" onClick={onNew}>Pornește un agent</Button>
@@ -56,12 +62,14 @@ export function SessionList({ sessions, phase, error, selected, unseen, onSelect
         {phase === "ready" && sessions.length > 0 && visible.length === 0 && <p className="px-2 py-3 text-sm text-muted-foreground">Nicio sesiune nu se potrivește.</p>}
         <ul className="space-y-0.5">
           {visible.map((row) => {
-            const active = row.id === selected;
-            const isUnseen = unseen.has(row.id);
+            const active = sessionKey(row) === selected;
+            const isUnseen = unseen.has(sessionKey(row));
+            const age = activityAge(row.status_changed_at, now);
             return (
-              <li key={row.id} className="flex">
+              <li key={sessionKey(row)} className="flex">
                 <button type="button" onClick={() => onSelect(row)} aria-current={active ? "page" : undefined}
-                  aria-label={isUnseen ? `${row.name}, finalizată și nevizualizată` : undefined}
+                  aria-description={`Ultima schimbare de stare: ${age}`}
+                  aria-label={isUnseen ? `${showProject ? `${row.project}: ` : ""}${row.name}, finalizată și nevizualizată` : undefined}
                   className={`flex min-h-14 min-w-0 flex-1 flex-col gap-0.5 rounded-lg px-3 py-2 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${active ? "bg-secondary" : "hover:bg-muted/60"}`}>
                   <span className="flex items-center gap-2">
                     <span className={`min-w-0 flex-1 truncate text-[15px] font-medium ${isUnseen ? "text-unseen" : row.status === "running" ? "session-working" : ""}`}>{row.name}</span>
@@ -71,12 +79,14 @@ export function SessionList({ sessions, phase, error, selected, unseen, onSelect
                     </span>
                   </span>
                   <span className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
+                    {showProject && <><span className="truncate">{row.project}</span><span aria-hidden>·</span></>}
                     <span>{kindLabel(row.kind)}</span>
                     <span aria-hidden>·</span>
                     <span className="min-w-0 truncate font-mono">{row.worktree}</span>
                   </span>
+                  <span className="text-xs text-muted-foreground" title="Ultima schimbare de stare">{age}</span>
                 </button>
-                <DeleteSessionButton project={project} row={row} onDeleted={onDeleted} />
+                <DeleteSessionButton project={row.project} row={row} onDeleted={() => onDeleted(row)} />
               </li>
             );
           })}

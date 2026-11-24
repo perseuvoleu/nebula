@@ -1986,6 +1986,7 @@ pub async fn agent_list(
                 "name": a.name,
                 "kind": a.kind.as_str(),
                 "status": a.status.as_str(),
+                "status_changed_at": a.status_changed_at,
                 "project": project.name,
                 "worktree": worktree.branch,
                 "path": worktree.path.display().to_string(),
