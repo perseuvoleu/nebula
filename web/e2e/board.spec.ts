@@ -103,6 +103,19 @@ test("at 390 px a long away digest is capped and leaves the board in view", asyn
   await expect(digest.getByRole("button", { name: "Finished 49" })).toBeVisible();
 });
 
+test("a project's Decisions route lists only that project's decisions", async ({ page }) => {
+  const listed = page.waitForResponse((r) => r.url().includes("/api/decisions"));
+  await open(page, "/board/decisions/p/vela");
+  await listed;
+  await expect(page.getByRole("heading", { name: "Decizii" })).toBeVisible();
+  await expect(page.getByText("Copy published files")).toHaveCount(0);
+  const sidebar = page.getByRole("navigation", { name: "Proiecte" });
+  await sidebar.getByRole("button", { name: "Checkouturi nebula" }).click();
+  await sidebar.getByRole("button", { name: "Decizii" }).click();
+  await expect(page).toHaveURL(/\/board\/decisions\/p\/nebula$/);
+  await expect(page.getByText("Copy published files")).toBeVisible();
+});
+
 test("blocked card dimmed", async ({ page }) => {
   addCard(13, "Wait for verification", "next", ["#12@leaseweb"]);
   await open(page, "/board");

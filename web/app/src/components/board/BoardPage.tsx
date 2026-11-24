@@ -129,8 +129,8 @@ export function BoardPage({ route, onNavigate, onSessions }: {
       <CardPanel slug={route.card} board={board} mode="page" onOpenCard={openPage} />
     </div>
   ) : route.decisions ? (
-    <DecisionsPage project={route.project} query={decisionQuery} onQueryChange={setDecisionQuery}
-      decisions={decisions.map((d): DecisionRow => ({ id: d.id, title: d.title, why: d.content.body ?? null, project: d.project,
+    <DecisionsPage project={scope.kind === "decisions" ? projectName(scope.project) : null} query={decisionQuery} onQueryChange={setDecisionQuery}
+      decisions={decisions.filter((d) => scope.kind !== "decisions" || d.project === scope.project).map((d): DecisionRow => ({ id: d.id, title: d.title, why: d.content.body ?? null, project: d.project,
         createdAt: new Date(d.created_at).toISOString(), session: null, card: null }))} />
   ) : !board ? (
     <p role={stale ? "alert" : undefined} aria-busy={!stale} className="p-6 text-sm text-muted-foreground">
