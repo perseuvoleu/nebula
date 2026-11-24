@@ -81,8 +81,10 @@ def away(board, cards, args):
         return {"finished": [], "needs_you": [], "decisions": []}
     after = lambda event: event["at"] > int(since)
     ids = {c["id"] for c in cards}
+    sessions = {(s["host"], s["id"]) for i in ids for s in board["details"].get(i, {}).get("sessions", [])}
     return {"finished": [e["id"] for e in board["away"]["finished"] if after(e) and e["id"] in ids],
-            "needs_you": [{"host": e["host"], "id": e["id"]} for e in board["away"]["needs_you"] if after(e)],
+            "needs_you": [{"host": e["host"], "id": e["id"]} for e in board["away"]["needs_you"]
+                          if after(e) and (e["host"], e["id"]) in sessions],
             "decisions": [d["id"] for d in board["decisions"] if d["created_at"] > int(since) and scoped(d, args)]}
 
 

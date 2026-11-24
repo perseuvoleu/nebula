@@ -47,6 +47,10 @@ class FakeBoardTests(unittest.TestCase):
         self.assertEqual(len(before["needs_you"]), 1)
         self.assertEqual(self.cli("todo", "board", *SCOPE, "--away-since=1764999999999", "--json")["board"]["away"], empty)
 
+    def test_away_needs_you_lists_only_sessions_of_cards_in_scope(self):
+        other = self.cli("todo", "board", "--project=other", "--away-since=1764000000000", "--json")["board"]["away"]
+        self.assertEqual(other["needs_you"], [])
+
     def test_a_title_after_the_delimiter_is_not_a_flag(self):
         card = self.cli("todo", "add", "--project=nebula", "--json", "--", "--propose")
         self.assertEqual((card["title"], card["proposed"]), ("--propose", False))
