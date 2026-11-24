@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { CloudIcon, ExternalLinkIcon, LogOutIcon, MenuIcon } from "lucide-react";
+import { CloudIcon, ExternalLinkIcon, KanbanIcon, LogOutIcon, MenuIcon } from "lucide-react";
 import { api, ApiError, describeError, getToken, onAuthChange, setToken } from "@/lib/api";
 import { useConversation } from "@/lib/conversation";
 import { fetchSessionList } from "@/lib/session-fetch";
@@ -20,6 +20,7 @@ import { InstallApp } from "./components/InstallApp";
 import { UsageNavbar } from "./components/UsageNavbar";
 import { PushNotifications } from "./components/PushNotifications";
 import { ServerlessRuns } from "./components/ServerlessRuns";
+import { BoardPage } from "./components/board/BoardPage";
 
 interface Workspace { projects: string[]; host: string }
 
@@ -143,11 +144,19 @@ export default function App() {
     if (authed) return <main className="flex flex-1 items-center justify-center text-sm text-muted-foreground" aria-busy="true">{notice ?? "Se conectează…"}</main>;
     return <Login onAuthenticated={(projects, host) => setWorkspace({ projects, host })} />;
   }
-  return <><UsageNavbar /><Shell workspace={workspace} /></>;
+  return <><UsageNavbar /><Routes workspace={workspace} /></>;
 }
 
-function Shell({ workspace }: { workspace: Workspace }) {
-  const [selection, navigate] = useSelection();
+function Routes({ workspace }: { workspace: Workspace }) {
+  const route = useSelection();
+  const [selection, navigate] = route;
+  if (!selection.board) return <Shell workspace={workspace} route={route} />;
+  return <BoardPage route={selection.board} onSessions={() => navigate({ project: null, session: null, all: false })}
+    onNavigate={(board, replace) => navigate({ project: null, session: null, all: false, board }, replace)} />;
+}
+
+function Shell({ workspace, route }: { workspace: Workspace; route: ReturnType<typeof useSelection> }) {
+  const [selection, navigate] = route;
   const project = selection.project && workspace.projects.includes(selection.project) ? selection.project : workspace.projects[0];
   const sessionId = selection.project && !workspace.projects.includes(selection.project) ? null : selection.session;
   const listProjects = useMemo(() => selection.all ? workspace.projects : [project], [selection.all, workspace.projects, project]);
@@ -232,6 +241,12 @@ function Shell({ workspace }: { workspace: Workspace }) {
       <CloudIcon aria-hidden className="size-4" />Rulări serverless
     </button>
   );
+  const boardLink = (
+    <button type="button" onClick={() => navigate({ project: null, session: null, all: false, board: { project: null, card: null, decisions: false, table: false, peek: null } })}
+      className="flex min-h-11 items-center gap-2 border-t border-sidebar-border px-3 text-left text-sm hover:bg-muted/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+      <KanbanIcon aria-hidden className="size-4" />Board
+    </button>
+  );
   const targetNotice = chooseProject && <p role="status" className="px-3 py-2 text-sm">Alege un proiect din selector pentru agentul nou.</p>;
 
   const sidebar = (
@@ -253,6 +268,7 @@ function Shell({ workspace }: { workspace: Workspace }) {
       {checkoutPanel}
       {created && <p role="status" className="border-b border-sidebar-border px-3 py-2 text-xs">Agent pornit ca „{created}”. Identitatea nu a putut fi confirmată încă: alege-l din listă.</p>}
       <SessionList sessions={orderedRows} phase={sessions.phase} error={sessions.error} selected={selectedKey} unseen={unseenFinished} onSelect={select} onNew={newAgent} project={selection.all ? "All" : project} showProject={selection.all} onDeleted={onDeleted} />
+      {boardLink}
       {serverlessLink}
       {desktop && <PushNotifications />}
       <InstallApp />
@@ -317,6 +333,7 @@ function Shell({ workspace }: { workspace: Workspace }) {
           {targetNotice}
           {checkoutPanel}
           <SessionList sessions={orderedRows} phase={sessions.phase} error={sessions.error} selected={selectedKey} unseen={unseenFinished} onSelect={select} onNew={newAgent} project={selection.all ? "All" : project} showProject={selection.all} onDeleted={onDeleted} />
+          {boardLink}
           {serverlessLink}
           <PushNotifications />
           <InstallApp />

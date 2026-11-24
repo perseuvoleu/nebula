@@ -1,0 +1,117 @@
+import fs from "node:fs";
+import path from "node:path";
+import { expect, type Locator, type Page } from "@playwright/test";
+import { test, STATE, TOKEN, noHorizontalOverflow, setBehaviour, shot } from "./helpers";
+
+type Board = { version: number; cards: Record<string, unknown>[]; details: Record<string, { sessions: Record<string, unknown>[] }> };
+
+const readBoard = (): Board => JSON.parse(fs.readFileSync(path.join(STATE, "board.json"), "utf8"));
+
+function writeBoard(change: (board: Board) => void) {
+  const board = readBoard();
+  change(board);
+  board.version += 1;
+  const temporary = path.join(STATE, ".board.json.spec");
+  fs.writeFileSync(temporary, JSON.stringify(board));
+  fs.renameSync(temporary, path.join(STATE, "board.json"));
+}
+
+function addCard(number: number, title: string, stage: string, blockedBy: string[] = []) {
+  writeBoard((board) => board.cards.push({ ...board.cards[1], id: `01JD${String(number).padStart(22, "0")}`, number,
+    ref: `#${number}@leaseweb`, title, stage, checkout: null, blocked_by: blockedBy }));
+}
+
+async function open(page: Page, url: string) {
+  await page.goto(url);
+  await page.getByLabel("Token de acces").fill(TOKEN);
+  await page.getByRole("button", { name: "Conectare" }).click();
+  await expect(page.getByLabel("Token de acces")).toHaveCount(0);
+}
+
+const column = (page: Page, name: string) => page.getByRole("region", { name, exact: true });
+const tile = (scope: Page | Locator, title: string) => scope.getByRole("article").filter({ hasText: title });
+
+test("columns and table", async ({ page }) => {
+  await open(page, "/board");
+  await expect(page.getByRole("heading", { name: "Board", level: 1 })).toBeVisible();
+  for (const name of ["Backlog", "Urmează", "În lucru", "Review", "Gata"]) await expect(column(page, name)).toBeVisible();
+  await expect(tile(column(page, "În lucru"), "Keep verification results")).toBeVisible();
+  await expect(tile(column(page, "Gata"), "Pin the board contract")).toBeVisible();
+  await page.getByRole("button", { name: "Tabel" }).click();
+  await expect(page).toHaveURL(/\/board\?view=table$/);
+  const table = page.getByRole("table");
+  await expect(table.getByRole("row").filter({ hasText: "Keep verification results" })).toBeVisible();
+  await expect(table.getByRole("row").filter({ hasText: "Pin the board contract" })).toBeVisible();
+});
+
+test("peek and card page", async ({ page }) => {
+  writeBoard((board) => board.details["01JD0000000000000000000012"].sessions.push(
+    { ...board.details["01JD0000000000000000000012"].sessions[0], id: "01JF0000000000000000000003", name: "reviewer", role: "review", status: "fresh", writer: false }));
+  await open(page, "/board?peek=12%40leaseweb");
+  const peek = page.getByRole("dialog", { name: "Keep verification results" });
+  await expect(peek.getByText("Started on leaseweb")).toBeVisible();
+  await peek.getByRole("link", { name: "Deschide pagina" }).click();
+  await expect(page).toHaveURL(/\/board\/c\/12%40leaseweb$/);
+  await expect(page.getByRole("heading", { name: "Keep verification results" })).toBeVisible();
+  await expect(page.getByRole("list", { name: "Sesiuni" }).getByRole("listitem")).toHaveText([/worker.*worker/, /reviewer.*review/]);
+  await expect(page.getByText("agent-home-02")).toBeVisible();
+  await expect(page.getByText("@leaseweb").first()).toBeVisible();
+});
+
+test("blocked card dimmed", async ({ page }) => {
+  addCard(13, "Wait for verification", "next", ["#12@leaseweb"]);
+  await open(page, "/board");
+  await expect(tile(page, "Wait for verification")).toHaveCSS("opacity", "0.6");
+  await expect(tile(page, "Keep verification results")).toHaveCSS("opacity", "1");
+});
+
+test("sidebar counts and quiet projects", async ({ page }) => {
+  await open(page, "/board");
+  const sidebar = page.getByRole("navigation", { name: "Proiecte" });
+  await expect(sidebar.getByRole("button", { name: /nebula\s*1$/ })).toBeVisible();
+  await expect(sidebar.getByRole("button", { name: /vela/ })).toHaveCount(0);
+  await sidebar.getByRole("button", { name: /Liniștite/ }).click();
+  await expect(sidebar.getByRole("button", { name: /vela\s*0$/ })).toBeVisible();
+  await sidebar.getByRole("button", { name: "Checkouturi nebula" }).click();
+  await expect(sidebar.getByRole("button", { name: /^main/ })).toBeVisible();
+  await expect(sidebar.getByRole("button", { name: /^agent-home-02/ })).toBeVisible();
+  await sidebar.getByRole("button", { name: /nebula\s*1$/ }).click();
+  await expect(page).toHaveURL(/\/board\/p\/nebula$/);
+});
+
+test("poll picks up a new version", async ({ page }) => {
+  await open(page, "/board");
+  await expect(tile(page, "Keep verification results")).toBeVisible();
+  const unchanged = await page.waitForResponse(async (r) => r.url().includes("/api/board?since=") && (await r.json()).unchanged === true);
+  expect(unchanged.ok()).toBe(true);
+  await expect(tile(page, "Keep verification results")).toBeVisible();
+  addCard(14, "Arrived by poll", "backlog");
+  await expect(tile(column(page, "Backlog"), "Arrived by poll")).toBeVisible();
+  setBehaviour("fail");
+  await expect(page.getByRole("status").filter({ hasText: "Date neactualizate" })).toBeVisible();
+  await expect(tile(page, "Arrived by poll")).toBeVisible();
+  setBehaviour("ok");
+  await expect(page.getByRole("status").filter({ hasText: "Date neactualizate" })).toHaveCount(0);
+});
+
+test("board, peek and card page are usable at 390 px", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await open(page, "/board");
+  await expect(column(page, "Backlog")).toBeInViewport();
+  await tile(page, "Keep verification results").scrollIntoViewIfNeeded();
+  await expect(tile(page, "Keep verification results")).toBeInViewport();
+  await noHorizontalOverflow(page);
+  await shot(page, "board-390");
+  await tile(page, "Keep verification results").getByRole("button", { name: "Keep verification results" }).click();
+  await expect(page).toHaveURL(/peek=12%40leaseweb/);
+  const peek = page.getByRole("dialog", { name: "Keep verification results" });
+  await expect(peek.getByText("Started on leaseweb")).toBeInViewport();
+  await noHorizontalOverflow(page);
+  await shot(page, "board-peek-390");
+  await peek.getByRole("link", { name: "Deschide pagina" }).click();
+  await expect(page.getByRole("heading", { name: "Keep verification results" })).toBeInViewport();
+  await noHorizontalOverflow(page);
+  await shot(page, "board-card-390");
+  await page.getByRole("button", { name: "Meniu" }).click();
+  await expect(page.getByRole("navigation", { name: "Proiecte" })).toBeVisible();
+});

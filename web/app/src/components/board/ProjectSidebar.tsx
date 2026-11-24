@@ -1,24 +1,7 @@
-import { ChevronDownIcon, ChevronRightIcon, CircleDotIcon, GitBranchIcon, LayersIcon, SearchIcon } from "lucide-react";
+import { ChevronDownIcon, ChevronRightIcon, CircleDotIcon, GitBranchIcon, LayersIcon, ScaleIcon, SearchIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { type Dot } from "@/lib/board";
+import type { Dot, SidebarProject, SidebarScope } from "@/lib/board";
 import { StatusDot } from "./CardTile";
-
-export type SidebarCheckout = { branch: string; host: string | null; primary: boolean };
-
-export type SidebarProject = {
-  name: string;
-  host: string | null;
-  cards: number;
-  needsYou: boolean;
-  running: boolean;
-  checkouts: SidebarCheckout[];
-};
-
-export type SidebarScope =
-  | { kind: "all" }
-  | { kind: "needs" }
-  | { kind: "project"; project: string }
-  | { kind: "checkout"; project: string; branch: string };
 
 const item = "flex min-h-8 w-full min-w-0 items-center gap-2 rounded-md px-2 text-left text-sm outline-none hover:bg-sidebar-accent focus-visible:ring-2 focus-visible:ring-sidebar-ring";
 const on = "bg-sidebar-accent font-medium text-sidebar-accent-foreground";
@@ -38,6 +21,7 @@ function ProjectNode({ project, scope, expanded, onSelect, onToggle }: {
   onToggle?: (project: string) => void;
 }) {
   const selected = scope.kind === "project" && scope.project === project.name;
+  const decisions = scope.kind === "decisions" && scope.project === project.name;
   const Chevron = expanded ? ChevronDownIcon : ChevronRightIcon;
   return (
     <li>
@@ -54,15 +38,15 @@ function ProjectNode({ project, scope, expanded, onSelect, onToggle }: {
           <span className={count}>{project.cards}</span>
         </button>
       </div>
-      {expanded && project.checkouts.length > 0 && (
+      {expanded && (
         <ul className="mt-0.5 flex flex-col gap-0.5">
           {project.checkouts.map((co) => {
-            const current = scope.kind === "checkout" && scope.project === project.name && scope.branch === co.branch;
+            const current = scope.kind === "checkout" && scope.project === project.name && scope.branch === co.branch && scope.host === co.host;
             const Icon = co.primary ? CircleDotIcon : GitBranchIcon;
             return (
               <li key={`${co.host ?? ""}:${co.branch}`}>
                 <button type="button" aria-current={current ? "page" : undefined}
-                  onClick={() => onSelect?.({ kind: "checkout", project: project.name, branch: co.branch })}
+                  onClick={() => onSelect?.({ kind: "checkout", project: project.name, host: co.host, branch: co.branch })}
                   className={cn(item, "min-h-7 pl-9 font-mono text-xs", current ? on : "text-muted-foreground hover:text-foreground")}>
                   <Icon aria-hidden className="size-3 shrink-0" />
                   <span className="min-w-0 flex-1 truncate">{co.branch}</span>
@@ -72,6 +56,13 @@ function ProjectNode({ project, scope, expanded, onSelect, onToggle }: {
               </li>
             );
           })}
+          <li>
+            <button type="button" aria-current={decisions ? "page" : undefined} onClick={() => onSelect?.({ kind: "decisions", project: project.name })}
+              className={cn(item, "min-h-7 pl-9 text-xs", decisions ? on : "text-muted-foreground hover:text-foreground")}>
+              <ScaleIcon aria-hidden className="size-3 shrink-0" />
+              <span className="min-w-0 flex-1 truncate">Decizii</span>
+            </button>
+          </li>
         </ul>
       )}
     </li>

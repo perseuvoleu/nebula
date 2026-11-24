@@ -25,8 +25,7 @@ export interface RunDraft {
 const slotsFull = (h: RunHost | undefined) => !!h && h.writerSlots !== null && h.writers >= h.writerSlots;
 const slotText = (h: RunHost) => h.writerSlots === null ? `${h.writers} scriu` : `${h.writers}/${h.writerSlots}`;
 
-function runCommand(cardRef: string, draft: RunDraft, branch: string | null): string {
-  const worktree = draft.worktree === "current" && branch ? branch : "new";
+function runCommand(cardRef: string, draft: RunDraft, worktree: string): string {
   return `nebula todo run ${cardRef} --role ${draft.role} --kind ${draft.kind} --host ${draft.host} --worktree ${worktree}`;
 }
 
@@ -69,6 +68,7 @@ export function RunDialog({ open, onOpenChange, cardRef, cardTitle, branch, host
   const target = hosts.find((h) => h.host === draft.host);
   const waits = draft.role === "worker" && slotsFull(target);
   const worktrees = branch ? (["current", "new"] as const) : (["new"] as const);
+  const worktree = branch ? draft.worktree : "new";
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -93,7 +93,7 @@ export function RunDialog({ open, onOpenChange, cardRef, cardTitle, branch, host
                 </>
               );
             }} />
-          <Segmented legend="Checkout" name="run-worktree" options={worktrees} value={draft.worktree} onChange={set("worktree")}
+          <Segmented legend="Checkout" name="run-worktree" options={worktrees} value={worktree} onChange={set("worktree")}
             label={(w) => w === "new" ? "Worktree nou" : <span className="truncate font-mono">{branch}</span>} />
           {waits && target && (
             <p role="status" className="flex gap-2 rounded-lg border border-border px-3 py-2 text-sm">
@@ -105,7 +105,7 @@ export function RunDialog({ open, onOpenChange, cardRef, cardTitle, branch, host
             </p>
           )}
           <pre className="overflow-x-auto rounded-lg border border-border bg-card px-3 py-2 font-mono text-xs leading-relaxed whitespace-pre-wrap wrap-anywhere text-muted-foreground">
-            <span aria-hidden>$ </span>{runCommand(cardRef, draft, branch)}
+            <span aria-hidden>$ </span>{runCommand(cardRef, draft, worktree === "current" && branch ? branch : "new")}
           </pre>
         </div>
         <DialogFooter>

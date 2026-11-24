@@ -155,3 +155,83 @@ export function awayDigest(board: BoardData): { finished: Card[]; needsYou: Sess
   const { needs_you: needsYou, decisions } = board.away;
   return { finished, needsYou, decisions, empty: !finished.length && !needsYou.length && !decisions.length };
 }
+
+export const cardSlug = (ref: string): string => ref.replace(/^#/, "");
+
+export function toBoardCard(card: Card, cards: Card[], show?: CardShow): BoardCard {
+  const sessions = show?.sessions ?? [];
+  return {
+    ref: card.ref, title: card.title, stage: card.stage, project: card.project, proposed: card.proposed,
+    proposedBy: card.proposed ? card.created_by.name : null,
+    needsYou: sessions.some((s) => s.status === "needs_feedback"),
+    blockers: openBlockers(card, cards),
+    checkout: card.checkout && { host: card.checkout.host, branch: card.checkout.branch },
+    sessions: sessions.map((s) => ({ id: s.id, host: s.host, name: s.name, role: s.role ?? "—", kind: s.kind, status: s.status, writer: s.writer })),
+    artifacts: show?.artifacts.length ?? 0,
+    age: "",
+  };
+}
+
+export type SidebarCheckout = { branch: string; host: string | null; primary: boolean };
+
+export type SidebarProject = {
+  name: string;
+  host: string | null;
+  cards: number;
+  needsYou: boolean;
+  running: boolean;
+  checkouts: SidebarCheckout[];
+};
+
+export type SidebarScope =
+  | { kind: "all" }
+  | { kind: "needs" }
+  | { kind: "project"; project: string }
+  | { kind: "checkout"; project: string; host: string | null; branch: string }
+  | { kind: "decisions"; project: string };
+
+export function sidebarProjects(board: BoardData): SidebarProject[] {
+  const projects = new Map<string, SidebarProject>();
+  const project = (name: string) => {
+    if (!projects.has(name)) projects.set(name, { name, host: null, cards: 0, needsYou: false, running: false, checkouts: [] });
+    return projects.get(name)!;
+  };
+  const checkout = (p: SidebarProject, co: SidebarCheckout) => {
+    if (!p.checkouts.some((c) => c.host === co.host && c.branch === co.branch)) p.checkouts.push(co);
+  };
+  for (const host of board.hosts) {
+    for (const co of host.checkouts) checkout(project(co.project), { branch: co.branch, host: host.host, primary: !co.worktree });
+  }
+  for (const card of board.cards) {
+    const p = project(projectName(card.project));
+    if (card.stage !== "done") p.cards += 1;
+    if (card.stage === "doing") p.running = true;
+    if (card.checkout) checkout(p, { branch: card.checkout.branch, host: card.checkout.host, primary: !card.checkout.worktree });
+  }
+  return [...projects.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+export function inScope(card: BoardCard, scope: SidebarScope): boolean {
+  switch (scope.kind) {
+    case "all": return true;
+    case "needs": return card.needsYou;
+    case "checkout": return projectName(card.project) === scope.project && card.checkout?.branch === scope.branch
+      && (scope.host === null || card.checkout.host === scope.host);
+    default: return projectName(card.project) === scope.project;
+  }
+}
+
+export type SortKey = "ref" | "title" | "stage" | "project";
+export type TableSort = { key: SortKey; asc: boolean };
+
+const SORT_VALUE: Record<SortKey, (card: BoardCard) => string | number> = {
+  ref: (c) => Number(c.ref.replace(/^#/, "").split("@")[0]) || 0,
+  title: (c) => c.title.toLowerCase(),
+  stage: (c) => STAGES.indexOf(c.stage),
+  project: (c) => projectName(c.project),
+};
+
+export function sortCards(cards: BoardCard[], sort: TableSort): BoardCard[] {
+  const value = SORT_VALUE[sort.key];
+  return [...cards].sort((a, b) => (value(a) < value(b) ? -1 : value(a) > value(b) ? 1 : 0) * (sort.asc ? 1 : -1));
+}
