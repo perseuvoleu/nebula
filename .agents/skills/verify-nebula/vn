@@ -85,7 +85,6 @@ seed_db() {
   sqlite3 "$db" "PRAGMA foreign_keys = ON;
     DELETE FROM projects WHERE host IS NOT NULL;
     DELETE FROM ui_state;
-    DELETE FROM links;
     UPDATE agents SET claude_session_id = NULL,
       status = CASE WHEN status IN ('running', 'needs_feedback') THEN 'disconnected' ELSE status END;"
   echo '{"auto_archive_after": "off"}' >"$state/data/config.json"

@@ -289,15 +289,11 @@ pub const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE agents ADD COLUMN code_mode_off INTEGER NOT NULL DEFAULT 0;
     ",
-    // 29: the board. Card columns replace the legacy todo owner, notes become
-    // a card's log, and the board tables and the agents' card link appear.
-    // Legacy rows convert in place: todos keep their ids (done → done, else
-    // backlog), project/worktree notes become backlog cards, todo-owned
-    // notes become log entries, and links become kind=link artifacts; then
-    // the owner columns and the links table go. The author of a converted
-    // row is this host's user, read from temp.migration_env (see migrate()).
-    // Every write to a board table bumps board_meta.version through a
-    // trigger, so no write path can forget the poll counter.
+    // 29: the board. Legacy rows convert in place (todos keep their ids, notes
+    // become cards or a card's log, links become link artifacts), then the
+    // legacy owner columns and the links table go. Every write to a board
+    // table bumps board_meta.version through a trigger, so no write path can
+    // forget the poll counter.
     "
     CREATE TABLE todos_new (
       id               TEXT PRIMARY KEY,

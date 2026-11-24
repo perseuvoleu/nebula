@@ -4566,8 +4566,7 @@ fn open_workspace_picker(app: &mut App) {
 }
 
 /// Rebuild an open workspace switcher after the workspace list (or the ✓
-/// marker) changed under it, keeping the cursor row. The notes modal gets
-/// this for free by reading the tree at draw time; the menu's rows are
+/// marker) changed under it, keeping the cursor row. The menu's rows are
 /// snapshots, so refresh them here.
 fn refresh_workspace_picker(app: &mut App) {
     let Some(Overlay::Menu(menu)) = &app.overlay else {
@@ -7106,7 +7105,7 @@ fn attach_on_its_branch(app: &mut App, sref: SessionRef, out: &mut Vec<ClientReq
     app.term_locked = true;
 }
 
-/// Open a saved link in the browser, reporting either way — the browser
+/// Open a link in the browser, reporting either way — the browser
 /// comes up in front of the terminal, so a silent failure would read as
 /// "nebula did nothing". A pull request is marked read on the way out: the
 /// conversation is about to be on screen, so the row's unread count starts

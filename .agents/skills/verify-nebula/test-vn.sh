@@ -149,6 +149,8 @@ fixtures=$(mktemp -d)
 fixture=$fixtures/nebula.db
 perl -0777 -ne '/const MIGRATIONS: &\[&str\] = &\[(.*?)\n\];/s or die "no MIGRATIONS";
   my $block = $1; $block =~ s{^\s*//.*$}{}mg; my @m = $block =~ /"([^"]*)"/g;
+  print "CREATE TEMP TABLE migration_env (host TEXT NOT NULL, user TEXT NOT NULL);\n",
+    "INSERT INTO temp.migration_env VALUES (\x27fixture\x27, \x27fixture\x27);\n";
   print "$_;\n" for @m; print "PRAGMA user_version = ", scalar(@m), ";\n"' \
   "$here/../../../crates/nebula-daemon/src/store.rs" | sqlite3 "$fixtures/schema.db"
 cp "$fixtures/schema.db" "$fixture"
@@ -164,8 +166,7 @@ sqlite3 "$fixture" ".dbconfig no_ckpt_on_close on" "
     ('a-run', 'w-main', 'Runner', 'running', 0, 'sid-run', 1),
     ('a-ask', 'w-feat', 'Asker', 'needs_feedback', 0, 'sid-ask', 1),
     ('a-old', 'w-main', 'Shelved', 'finished', 1, 'sid-old', 1);
-  INSERT INTO terminals (id, worktree_id, name, created_at, status) VALUES ('t-1', 'w-feat', 'shell', 1, 'running');
-  INSERT INTO links (id, worktree_id, url, created_at) VALUES ('l-1', 'w-feat', 'https://example.invalid/pr?token=real', 1);" >/dev/null
+  INSERT INTO terminals (id, worktree_id, name, created_at, status) VALUES ('t-1', 'w-feat', 'shell', 1, 'running');" >/dev/null
 cp "$fixture" "$fixtures/main-only.db"
 check "the fixture's rows live only in its WAL" test "$(sqlite3 "$fixtures/main-only.db" "SELECT count(*) FROM agents")" = 0
 fixture_sum=$(shasum -a 256 "$fixture")
@@ -190,7 +191,6 @@ check "the linked worktree is a scratch checkout of its branch" \
 check "sessions keep name and archived flag, lose resume ids and live statuses" \
   test "$(q "SELECT group_concat(name || ' ' || status || ' ' || archived || ' ' || ifnull(claude_session_id, '-'), ', ') FROM (SELECT * FROM agents ORDER BY name)")" \
   = "Asker disconnected 0 -, Runner disconnected 0 -, Shelved finished 1 -"
-check "copied links are dropped" test "$(q "SELECT count(*) FROM links")" = 0
 check "down removes the seeded instance" "$vn" down
 
 seed_refused() {
