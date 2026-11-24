@@ -65,6 +65,13 @@ enum Command {
         /// macOS Automation permission for it.
         #[arg(long, requires = "session")]
         no_focus: bool,
+        /// Run this open on HOST over ssh (BatchMode) and print its object;
+        /// an unreachable HOST exits 3. This machine's own name opens here.
+        #[arg(long, value_name = "HOST", requires = "session")]
+        on: Option<String>,
+        /// Print the landed object as JSON (what --session prints anyway).
+        #[arg(long, requires = "session")]
+        json: bool,
     },
     /// Run the daemon process (normally auto-spawned by the TUI).
     Daemon {
@@ -737,9 +744,18 @@ fn main() -> Result<()> {
             session: Some(reference),
             project,
             no_focus,
+            on,
             ..
         }) => {
             use std::io::IsTerminal;
+            if let Some(host) = on.filter(|h| !nebula_core::host::names_this_machine(h)) {
+                let code =
+                    nebula_tui::run_open_on_host(&host, &reference, project.as_deref(), !no_focus)?;
+                if code != 0 {
+                    std::process::exit(code);
+                }
+                return Ok(());
+            }
             let Some(id) = nebula_tui::run_open_session(reference, project, !no_focus)? else {
                 return Ok(());
             };

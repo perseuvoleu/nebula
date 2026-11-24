@@ -96,6 +96,37 @@ pub fn run_open_session(
     Ok(None)
 }
 
+/// `nebula open --session --on HOST`: the same open run on HOST over ssh,
+/// its object passed through. The exit code to leave with: 3 when HOST is
+/// unreachable, else the remote command's.
+pub fn run_open_on_host(
+    host: &str,
+    reference: &str,
+    project: Option<&str>,
+    focus: bool,
+) -> Result<i32> {
+    use anyhow::Context;
+    use std::io::Write;
+    let argv = session_open::open_on_argv(host, reference, project, focus)?;
+    let out = std::process::Command::new("ssh")
+        .args(&argv)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .context("run ssh")?;
+    // ssh's own failures (connect, auth) exit 255; nebula never does.
+    if out.status.code() == Some(255) {
+        eprintln!(
+            "nebula: host {host} is unreachable: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        return Ok(3);
+    }
+    std::io::stdout().write_all(&out.stdout)?;
+    std::io::stdout().flush()?;
+    std::io::stderr().write_all(&out.stderr)?;
+    Ok(out.status.code().unwrap_or(1))
+}
+
 /// Phase-2 throwaway raw-mode client (`nebula _raw-attach`).
 pub fn run_raw_attach(name: &str) -> Result<()> {
     runtime()?.block_on(raw_attach::run(name))
