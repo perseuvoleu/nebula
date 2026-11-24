@@ -5,6 +5,7 @@
 
 mod artifacts;
 pub mod board;
+pub mod board_link;
 mod checkout_lock;
 mod collect;
 pub mod config;

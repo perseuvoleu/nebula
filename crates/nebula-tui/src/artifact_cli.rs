@@ -124,7 +124,7 @@ async fn store(
 fn outcome_known(why: &anyhow::Error) -> bool {
     why.downcast_ref::<std::io::Error>().is_none()
         && why.to_string() != CLOSED
-        && Refusal::of(&why.to_string()) != Some(Refusal::Unknown)
+        && Refusal::of(&why.to_string()) != Some(Refusal::OutcomeUnknown)
 }
 
 async fn unpublished(
@@ -134,7 +134,7 @@ async fn unpublished(
     why: anyhow::Error,
 ) -> anyhow::Error {
     if !outcome_known(&why) {
-        return anyhow::anyhow!(Refusal::Unknown.message(format!(
+        return anyhow::anyhow!(Refusal::OutcomeUnknown.message(format!(
             "artifact {id} may have been published ({why:#}); rerun with --id {id}"
         )));
     }
@@ -164,7 +164,7 @@ async fn add(conn: &mut Connection, caller: Caller, args: AddArgs) -> Result<(Bo
         CardChoice::Card(text) => Some(check_card(conn, &text).await?),
         CardChoice::None => None,
     };
-    let id = ArtifactId(client_id(id)?);
+    let id = ArtifactId(client_id(id, &mut None)?);
     let (kind, content, default_title, created) = if let Some(url) = url(&source)? {
         let content = ArtifactContent::Url { url };
         ("link".to_string(), content, source, false)
@@ -352,7 +352,7 @@ mod tests {
         assert!(!outcome_known(&anyhow::Error::from(lost)));
         assert!(!outcome_known(&anyhow::anyhow!(CLOSED)));
         assert!(!outcome_known(&anyhow::anyhow!(
-            Refusal::Unknown.message("link dropped")
+            Refusal::OutcomeUnknown.message("link dropped")
         )));
     }
 }

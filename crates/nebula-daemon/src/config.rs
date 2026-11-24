@@ -32,8 +32,9 @@ pub struct Config {
     /// sessions a client is attached to are never archived. Malformed
     /// values fall back to the default.
     pub auto_archive_after: String,
-    /// Where the board lives: "local" serves it from this daemon; unset
-    /// refuses every board verb with "no board configured".
+    /// Where the board lives: "local" serves it from this daemon, a host
+    /// name sends every board verb to that host's daemon over the board
+    /// link; unset refuses every board verb with "no board configured".
     pub board: Option<String>,
 }
 

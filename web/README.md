@@ -125,6 +125,29 @@ Nebula binary) and `NEBULA_WEB_PI_AGENT_DIR` (default `~/.pi/agent`) are optiona
 The allowlist is configuration, not discovery. On findl use local project names
 (`nebula`, not `nebula@findl`).
 
+### Board
+
+`NEBULA_WEB_BOARD_PROJECTS` turns the board on: comma-separated project names, or `*` for
+every project. Home cards (no project) are always included. The gateway adds this scope to every
+board, card and decision read (`--project=…` or `--all`, plus `--include-home`), whatever the
+client asks, and checks every card write against a scoped read first. Unset, the board endpoints
+answer 503.
+
+Endpoints: `GET /api/board?since&awaySince` (one `nebula todo board` call per poll),
+`GET /api/cards/<ref>`, `GET /api/decisions?query`, `POST /api/cards`,
+`POST /api/cards/<ref>/{move,edit,note,archive,accept,dismiss,block,unblock,run,approve,open-code}`
+and `POST /api/decisions`. The web publishes decisions only, never a host path. The board CLI's
+exit codes map to HTTP: 3 (board host unreachable, nothing sent) → 503, 4 (outcome unknown) → 504,
+5 (not found) → 404, 6 (conflict) → 409, anything else → 502. CLI stderr never reaches the client.
+
+`NEBULA_WEB_ARTIFACTS` (absolute directory, the board daemon's `data_dir/artifacts`) lets the
+gateway serve artifact files. Each artifact row of a card read gets a `src` of the form
+`/a/<expiry>.<HMAC>/<id>/<entry>`: a grant valid for 30–60 minutes, signed with a key that is
+random per gateway process, so a restart ends every open grant. `GET /a/…` needs no bearer
+(a sandboxed iframe cannot send one), runs no CLI call, refuses symlinks and traversal with 404,
+and answers `Content-Security-Policy: sandbox allow-scripts` with nosniff and a MIME type from
+the file extension.
+
 ### Native identity (Pi mapping)
 
 The gateway needs the native Pi session id Nebula stored for an agent. It reads the

@@ -269,8 +269,11 @@ pub fn run_sync(opts: sync_cli::SyncOpts) -> Result<()> {
 pub use sync_cli::{Direction as SyncDirection, SyncOpts};
 
 /// `nebula proxy` — stdin/stdout ↔ the local daemon socket (see `ipc::proxy`).
-pub fn run_proxy() -> Result<()> {
-    runtime()?.block_on(ipc::proxy())
+pub fn run_proxy(connect_only: bool) -> Result<()> {
+    let rt = runtime()?;
+    let done = rt.block_on(ipc::proxy(connect_only));
+    rt.shutdown_background();
+    done
 }
 
 /// `nebula diagram …` — the checkout's `.scratch/diagrams/` folder: create,

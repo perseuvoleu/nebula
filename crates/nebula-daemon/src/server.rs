@@ -131,6 +131,35 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         .await;
                     break;
                 }
+                ClientRequest::Board { req_id, op } => {
+                    let board = crate::config::Config::load().board;
+                    if let Some(host) = board.as_deref().filter(|board| *board != "local") {
+                        let link = crate::board_link::to(host, &daemon.shutdown);
+                        let client = relay_client.clone();
+                        tokio::spawn(async move { link.forward(req_id, op, &client).await });
+                        continue;
+                    }
+                    let daemon = daemon.clone();
+                    let out_tx = out_tx.clone();
+                    tokio::spawn(async move {
+                        let served = tokio::task::spawn_blocking(move || {
+                            match board {
+                                None => Err(anyhow::anyhow!("no board configured")),
+                                Some(_) => crate::board::serve(&daemon.store, op),
+                            }
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(anyhow::anyhow!("board op panicked: {e}")));
+                        let event = match served {
+                            Ok(result) => ServerEvent::BoardReply { req_id, result },
+                            Err(e) => ServerEvent::Error {
+                                req_id: Some(req_id),
+                                message: format!("{e:#}"),
+                            },
+                        };
+                        let _ = out_tx.send(event).await;
+                    });
+                }
                 // A request naming something mirrored from a remote host
                 // belongs to that host's daemon; the relay carries it there
                 // and brings the reply (or the PTY stream) back on out_tx.
@@ -301,31 +330,6 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 }
                 ClientRequest::MarkPrSeen { url, marker } => {
                     let _ = daemon.store.mark_pr_seen(&url, &marker);
-                }
-                ClientRequest::Board { req_id, op } => {
-                    let daemon = daemon.clone();
-                    let out_tx = out_tx.clone();
-                    tokio::spawn(async move {
-                        let served = tokio::task::spawn_blocking(move || {
-                            match crate::config::Config::load().board.as_deref() {
-                                None => Err(anyhow::anyhow!("no board configured")),
-                                Some("local") => crate::board::serve(&daemon.store, op),
-                                Some(host) => Err(anyhow::anyhow!(
-                                    "board = \"{host}\" needs the board link, which this build lacks"
-                                )),
-                            }
-                        })
-                        .await
-                        .unwrap_or_else(|e| Err(anyhow::anyhow!("board op panicked: {e}")));
-                        let event = match served {
-                            Ok(result) => ServerEvent::BoardReply { req_id, result },
-                            Err(e) => ServerEvent::Error {
-                                req_id: Some(req_id),
-                                message: format!("{e:#}"),
-                            },
-                        };
-                        let _ = out_tx.send(event).await;
-                    });
                 }
                 ClientRequest::StoreArtifact {
                     req_id,

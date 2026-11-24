@@ -47,11 +47,14 @@ pub async fn connect_or_spawn() -> Result<Connection> {
 /// framing, no handshake — the peer speaks the protocol itself. It is what
 /// another nebula's relay runs over `ssh host nebula proxy` to reach this
 /// daemon; spawning the daemon when none is listening keeps a fresh host
-/// zero-setup. Exits when either side closes.
-pub async fn proxy() -> Result<()> {
+/// zero-setup. With `connect_only` (the board link) a missing daemon is
+/// an error, so a stopped board host takes no write. Exits when either
+/// side closes.
+pub async fn proxy(connect_only: bool) -> Result<()> {
     let sock = paths::socket_path();
     let mut stream = match try_connect(&sock).await {
         Ok(s) => s,
+        Err(e) if connect_only => return Err(e).context("no nebula daemon is running"),
         Err(_) => {
             spawn_daemon()?;
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -66,8 +69,12 @@ pub async fn proxy() -> Result<()> {
             }
         }
     };
-    let mut stdio = tokio::io::join(tokio::io::stdin(), tokio::io::stdout());
-    let _ = tokio::io::copy_bidirectional(&mut stdio, &mut stream).await;
+    let (mut from_daemon, mut to_daemon) = stream.split();
+    let (mut stdin, mut stdout) = (tokio::io::stdin(), tokio::io::stdout());
+    tokio::select! {
+        _ = tokio::io::copy(&mut stdin, &mut to_daemon) => {}
+        _ = tokio::io::copy(&mut from_daemon, &mut stdout) => {}
+    }
     Ok(())
 }
 

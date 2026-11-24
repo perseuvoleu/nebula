@@ -1,5 +1,5 @@
 // Public app shell only. Hashed /assets/* files are cache-first (immutable); the shell document is
-// network-first with an offline fallback. /api/*, POSTs and cross-origin requests are never touched.
+// network-first with an offline fallback. /api/*, /a/* artifacts, POSTs and cross-origin requests are never touched.
 const CACHE = "nebula-shell-v6";
 
 self.addEventListener("install", (event) => {
@@ -50,7 +50,7 @@ self.addEventListener("notificationclick", (event) => {
 self.addEventListener("fetch", (event) => {
   const request = event.request;
   const url = new URL(request.url);
-  if (request.method !== "GET" || url.origin !== self.location.origin || url.pathname.startsWith("/api/") || url.search) return;
+  if (request.method !== "GET" || url.origin !== self.location.origin || url.pathname.startsWith("/api/") || url.pathname.startsWith("/a/") || url.search) return;
   if (url.pathname.startsWith("/assets/")) {
     event.respondWith(caches.open(CACHE).then(async (cache) => {
       const hit = await cache.match(request);
