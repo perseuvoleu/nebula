@@ -1,10 +1,9 @@
+import { STAGES, type Stage } from "@/lib/board";
 import { Button } from "@/components/ui/button";
 import {
   Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
 } from "@/components/ui/dialog";
 
-const STAGES = ["backlog", "next", "doing", "review", "done"] as const;
-export type Stage = (typeof STAGES)[number];
 const STAGE_LABEL: Record<Stage, string> = {
   backlog: "Backlog", next: "Next", doing: "Doing", review: "Review", done: "Done",
 };

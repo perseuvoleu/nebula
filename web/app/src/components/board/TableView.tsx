@@ -1,22 +1,23 @@
 import type { ReactNode } from "react";
 import { cn } from "@/lib/utils";
 import { statusLabel } from "@/lib/status";
-import { type BoardCard, cardDot, projectName, sessionDot } from "./model";
+import { type BoardCard, type SortKey, type TableSort, cardDot, projectName, sessionDot } from "@/lib/board";
 import { CardRef, StagePill, StatusDot } from "./CardTile";
 
 const Empty = () => <span className="text-muted-foreground">—</span>;
 
-function Row({ card, selected, onOpen, actions }: {
-  card: BoardCard; selected: boolean; onOpen?: (ref: string) => void; actions?: ReactNode;
+function Row({ card, selected, onOpen, hasActions, actions }: {
+  card: BoardCard; selected: boolean; onOpen?: (ref: string) => void; hasActions: boolean; actions?: ReactNode;
 }) {
-  const last = card.sessions.at(-1);
+  const last = card.sessions?.at(-1);
   const blocked = card.blockers.length > 0;
+  const dot = cardDot(card);
   return (
     <tr className={cn("border-b hover:bg-card", selected && "bg-secondary", blocked && "opacity-60")}>
       <td className="px-2 py-1.5"><CardRef cardRef={card.ref} /></td>
       <td className="w-full px-2 py-1.5">
         <span className="flex min-w-48 items-center gap-1.5">
-          <StatusDot dot={cardDot(card)} />
+          {dot && <StatusDot dot={dot} />}
           <button type="button" onClick={() => onOpen?.(card.ref)} aria-current={selected ? "true" : undefined}
             className="min-w-0 truncate rounded-sm text-left font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring">
             {card.title}
@@ -33,17 +34,38 @@ function Row({ card, selected, onOpen, actions }: {
           : <Empty />}
       </td>
       <td className="hidden px-2 py-1.5 font-mono text-xs tabular-nums lg:table-cell">{card.artifacts || <Empty />}</td>
-      {actions !== undefined && <td className="px-2 py-1.5"><span className="flex items-center gap-1">{actions}</span></td>}
+      {hasActions && <td className="px-2 py-1.5"><span className="flex items-center gap-1">{actions}</span></td>}
     </tr>
   );
 }
 
-export function TableView({ cards, groupByProject = false, selected, onOpen, renderActions }: {
+function SortHead({ label, column, sort, onSort, className }: {
+  label: string; column: SortKey; sort?: TableSort; onSort?: (key: SortKey) => void; className?: string;
+}) {
+  const active = sort?.key === column;
+  return (
+    <th scope="col" aria-sort={active ? (sort.asc ? "ascending" : "descending") : undefined} className={className}>
+      {onSort
+        ? (
+          <button type="button" onClick={() => onSort(column)} className="inline-flex items-center gap-1 rounded-sm outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring">
+            {label}{active && <span aria-hidden>{sort.asc ? "↑" : "↓"}</span>}
+          </button>
+        )
+        : label}
+    </th>
+  );
+}
+
+export function TableView({ cards, groupByProject = false, selected, onOpen, renderActions, sort, onSort, collapsed = [], onToggleGroup }: {
   cards: BoardCard[];
   groupByProject?: boolean;
   selected?: string | null;
   onOpen?: (ref: string) => void;
   renderActions?: (card: BoardCard) => ReactNode;
+  sort?: TableSort;
+  onSort?: (key: SortKey) => void;
+  collapsed?: string[];
+  onToggleGroup?: (project: string) => void;
 }) {
   const columns = renderActions ? 8 : 7;
   const groups = groupByProject
@@ -55,10 +77,10 @@ export function TableView({ cards, groupByProject = false, selected, onOpen, ren
       <table className="w-full border-collapse text-sm whitespace-nowrap">
         <thead>
           <tr className="border-b">
-            <th scope="col" className={head}>ID</th>
-            <th scope="col" className={head}>Titlu</th>
-            <th scope="col" className={head}>Etapă</th>
-            <th scope="col" className={cn(head, "hidden md:table-cell")}>Proiect</th>
+            <SortHead label="ID" column="ref" sort={sort} onSort={onSort} className={head} />
+            <SortHead label="Titlu" column="title" sort={sort} onSort={onSort} className={head} />
+            <SortHead label="Etapă" column="stage" sort={sort} onSort={onSort} className={head} />
+            <SortHead label="Proiect" column="project" sort={sort} onSort={onSort} className={cn(head, "hidden md:table-cell")} />
             <th scope="col" className={cn(head, "hidden lg:table-cell")}>Checkout</th>
             <th scope="col" className={cn(head, "hidden lg:table-cell")}>Sesiune</th>
             <th scope="col" className={cn(head, "hidden lg:table-cell")}>Artefacte</th>
@@ -70,12 +92,20 @@ export function TableView({ cards, groupByProject = false, selected, onOpen, ren
             {group.name !== null && (
               <tr className="border-y bg-card">
                 <th scope="colgroup" colSpan={columns} className="px-2 py-1.5 text-left font-mono text-xs font-medium">
-                  {group.name} <span className="text-muted-foreground tabular-nums">{group.cards.length}</span>
+                  {onToggleGroup
+                    ? (
+                      <button type="button" aria-expanded={!collapsed.includes(group.name)} onClick={() => onToggleGroup(group.name!)}
+                        className="inline-flex items-center gap-1.5 rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring">
+                        <span aria-hidden>{collapsed.includes(group.name) ? "▸" : "▾"}</span>
+                        {group.name} <span className="text-muted-foreground tabular-nums">{group.cards.length}</span>
+                      </button>
+                    )
+                    : <>{group.name} <span className="text-muted-foreground tabular-nums">{group.cards.length}</span></>}
                 </th>
               </tr>
             )}
-            {group.cards.map((card) => (
-              <Row key={card.ref} card={card} selected={card.ref === selected} onOpen={onOpen} actions={renderActions?.(card)} />
+            {!(group.name !== null && collapsed.includes(group.name)) && group.cards.map((card) => (
+              <Row key={card.ref} card={card} selected={card.ref === selected} onOpen={onOpen} hasActions={!!renderActions} actions={renderActions?.(card)} />
             ))}
           </tbody>
         ))}

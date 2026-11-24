@@ -1,7 +1,6 @@
 import { Fragment } from "react";
 import { cn } from "@/lib/utils";
-
-export type HostSlots = { host: string; writers: number; slots: number | null };
+import type { HostSlots } from "@/lib/board";
 
 export function WriterSlots({ hosts }: { hosts: HostSlots[] }) {
   return (
