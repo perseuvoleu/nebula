@@ -1994,3 +1994,56 @@ fn decision_in_a_project_rag_cannot_name_still_reaches_rag() {
         "{spaced_ws}"
     );
 }
+
+#[test]
+fn hung_rag_copy_is_killed_at_its_deadline() {
+    let env = rag_board(Some("rag-hang"), &[("NEBULA_RAG_TIMEOUT_MS", "500")]);
+    let decided = decide(
+        &env,
+        None,
+        &[
+            "Copy published files",
+            "--why",
+            "The checkout is disposable",
+            "--project",
+            "repo",
+        ],
+    );
+    let hung = env.tmp.path().join("rag-hung-pid");
+    let pid = poll_until(Duration::from_secs(10), || {
+        std::fs::read_to_string(&hung).ok()
+    })
+    .expect("the board never tried to copy the decision to RAG");
+    std::fs::remove_file(env.tmp.path().join("rag-hang")).unwrap();
+    rag_note(&env, decided["id"].as_str().unwrap());
+    assert!(
+        !pid_alive(pid.trim()),
+        "the hung rag child {pid} outlived its deadline"
+    );
+}
+
+#[test]
+fn kill_stops_a_hung_rag_copy() {
+    let mut env = rag_board(Some("rag-hang"), &[]);
+    decide(&env, None, &["Copy published files", "--project", "repo"]);
+    let hung = env.tmp.path().join("rag-hung-pid");
+    let pid = poll_until(Duration::from_secs(10), || {
+        std::fs::read_to_string(&hung).ok()
+    })
+    .expect("the board never tried to copy the decision to RAG");
+    let killed = env.cli(&["kill"], None);
+    assert!(killed.status.success(), "{}", stderr(&killed));
+    let mut daemon = env.daemon.take().unwrap();
+    let exited = poll_until(Duration::from_secs(5), || daemon.try_wait().unwrap());
+    if exited.is_none() {
+        let _ = daemon.kill();
+        let _ = daemon.wait();
+        panic!("the daemon outlived nebula kill while a rag copy hung");
+    }
+    assert!(
+        poll_until(Duration::from_secs(5), || (!pid_alive(pid.trim()))
+            .then_some(()))
+        .is_some(),
+        "the hung rag child {pid} outlived the daemon"
+    );
+}

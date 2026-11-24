@@ -7,11 +7,15 @@ use crate::artifacts::{artifact_from_row, ARTIFACT_COLUMNS};
 use crate::store::Store;
 use anyhow::{bail, Context, Result};
 use nebula_core::board::{Artifact, ArtifactContent};
+use nix::sys::signal::{killpg, Signal};
+use nix::unistd::Pid;
 use rusqlite::{params, Transaction};
-use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
@@ -28,8 +32,14 @@ pub fn start(store: Arc<Store>, shutdown: CancellationToken) {
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(60_000)
         .max(50);
+    let bound = Duration::from_millis(
+        std::env::var("NEBULA_RAG_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(120_000),
+    );
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(period));
+        let mut interval = tokio::time::interval(Duration::from_millis(period));
         loop {
             tokio::select! {
                 _ = shutdown.cancelled() => break,
@@ -39,13 +49,12 @@ pub fn start(store: Arc<Store>, shutdown: CancellationToken) {
             if crate::config::Config::load().board.as_deref() != Some("local") {
                 continue;
             }
-            let store = store.clone();
-            let _ = tokio::task::spawn_blocking(move || copy_pending(&store)).await;
+            copy_pending(&store, bound, &shutdown).await;
         }
     });
 }
 
-fn copy_pending(store: &Store) {
+async fn copy_pending(store: &Store, bound: Duration, shutdown: &CancellationToken) {
     let pending = match store.board_transaction(pending) {
         Ok(pending) => pending,
         Err(e) => {
@@ -54,16 +63,20 @@ fn copy_pending(store: &Store) {
         }
     };
     for decision in pending {
-        let copied = copy(&decision).and_then(|note| {
-            store.board_transaction(|tx| {
+        if shutdown.is_cancelled() {
+            return;
+        }
+        let copied = match copy(&decision, bound, shutdown).await {
+            Ok(note) => store.board_transaction(|tx| {
                 tx.execute(
                     "UPDATE artifacts SET meta = json_set(meta, '$.rag_note', ?2)
                      WHERE id = ?1 AND json_extract(meta, '$.rag_note') IS NULL",
                     params![decision.id.as_str(), note],
                 )?;
                 Ok(())
-            })
-        });
+            }),
+            Err(e) => Err(e),
+        };
         if let Err(e) = copied {
             tracing::warn!(decision = %decision.id, error = %format!("{e:#}"), "copying a decision to RAG failed; it is retried");
         }
@@ -93,7 +106,7 @@ fn nebula() -> Result<PathBuf> {
     })
 }
 
-fn copy(decision: &Artifact) -> Result<i64> {
+async fn copy(decision: &Artifact, bound: Duration, shutdown: &CancellationToken) -> Result<i64> {
     let ws = match &decision.project {
         Some(project) => format!("apps/{}/notes", workspace_segment(project)),
         None => "shared".to_string(),
@@ -107,7 +120,7 @@ fn copy(decision: &Artifact) -> Result<i64> {
         why => format!("{}\n\n{why}", decision.title),
     };
     if decision.project.is_some() {
-        rag(&["ws", "create", &ws, "--force"], None)?;
+        rag(&["ws", "create", &ws, "--force"], None, bound, shutdown).await?;
     }
     let source = format!("decision:{}", decision.id);
     let title = format!("--title={}", decision.title);
@@ -123,11 +136,23 @@ fn copy(decision: &Artifact) -> Result<i64> {
             "-",
         ],
         Some(&text),
-    )?;
+        bound,
+        shutdown,
+    )
+    .await?;
     note_id(&saved).with_context(|| format!("nebula rag add printed no note id: {saved:?}"))
 }
 
-fn rag(args: &[&str], stdin: Option<&str>) -> Result<String> {
+/// The child runs in its own process group, so a deadline or shutdown
+/// kills an ssh hop and whatever it started too. The group is signalled
+/// while the pending wait still holds the leader unreaped, so its id cannot
+/// belong to a recycled process.
+async fn rag(
+    args: &[&str],
+    stdin: Option<&str>,
+    bound: Duration,
+    shutdown: &CancellationToken,
+) -> Result<String> {
     let mut child = Command::new(nebula()?)
         .arg("rag")
         .args(args)
@@ -138,16 +163,32 @@ fn rag(args: &[&str], stdin: Option<&str>) -> Result<String> {
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
+        .kill_on_drop(true)
         .spawn()
         .context("run nebula rag")?;
-    if let Some(text) = stdin {
-        child
-            .stdin
-            .take()
-            .context("nebula rag stdin")?
-            .write_all(text.as_bytes())?;
-    }
-    let out = child.wait_with_output()?;
+    let group = Pid::from_raw(child.id().context("nebula rag exited before it ran")? as i32);
+    let output = async {
+        if let Some(text) = stdin {
+            let mut pipe = child.stdin.take().context("nebula rag stdin")?;
+            pipe.write_all(text.as_bytes()).await?;
+        }
+        Ok::<_, anyhow::Error>(child.wait_with_output().await?)
+    };
+    tokio::pin!(output);
+    let stopped = tokio::select! {
+        out = &mut output => Ok(out?),
+        _ = tokio::time::sleep(bound) => Err("gave no answer in time"),
+        _ = shutdown.cancelled() => Err("was stopped by daemon shutdown"),
+    };
+    let out = match stopped {
+        Ok(out) => out,
+        Err(why) => {
+            let _ = killpg(group, Signal::SIGKILL);
+            let _ = tokio::time::timeout(Duration::from_secs(1), output).await;
+            bail!("nebula rag {} {why}", args.join(" "));
+        }
+    };
     if !out.status.success() {
         bail!(
             "nebula rag {} exited {}: {}",
