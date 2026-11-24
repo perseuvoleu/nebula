@@ -411,15 +411,28 @@ fn print_human(result: &BoardResult) {
                 };
                 println!("  on {} {} ({kind})", checkout.host, checkout.branch);
             }
+            let now = crate::hosts::now_ms();
             for session in &show.sessions {
                 let role = session.role.map_or("-", |r| r.as_str());
-                let alive = if session.alive { "" } else { ", stopped" };
-                println!(
-                    "  {role} {} on {}: {}{alive}",
+                let mut line = format!(
+                    "  {role} {} on {}: {} {}",
                     session.name,
                     session.host,
+                    session.kind.as_str(),
                     session.status.as_str()
                 );
+                let ago = crate::hosts::ago_label(now - session.status_changed_at);
+                if !ago.is_empty() {
+                    line.push_str(&format!(" {ago}"));
+                }
+                if session.writer {
+                    line.push_str(", writer");
+                }
+                line.push_str(if session.alive { ", live" } else { ", stopped" });
+                if session.stale {
+                    line.push_str(", stale");
+                }
+                println!("{line}");
             }
             for note in &show.log {
                 println!("  {}: {}", note.author.name, note.text);
@@ -451,6 +464,23 @@ fn print_human(result: &BoardResult) {
                     away.finished.len(),
                     away.needs_you.len()
                 );
+            }
+            if !away.finished.is_empty() {
+                let refs: Vec<&str> = away
+                    .finished
+                    .iter()
+                    .map(|id| {
+                        board
+                            .cards
+                            .iter()
+                            .find(|c| &c.id == id)
+                            .map_or(id.as_str(), |c| c.label.as_str())
+                    })
+                    .collect();
+                println!("  finished: {}", refs.join(", "));
+            }
+            for session in &away.needs_you {
+                println!("  needs you: {} on {}", session.id, session.host);
             }
         }
         other => println!("{other:?}"),

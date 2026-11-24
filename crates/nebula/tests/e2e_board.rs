@@ -1116,3 +1116,68 @@ fn omitted_session_stops_needing_the_user() {
     assert_eq!(away(&env), serde_json::json!([]), "n1 is no longer live");
     assert_eq!(far_host(&hosts_of(&env, &["--all"]))["needs_you"], 0);
 }
+
+#[test]
+fn agent_new_refuses_unknown_caller_on_every_path() {
+    let env = board_env();
+    env.make_repo();
+    let stranger = nebula_core::AgentId::generate().to_string();
+    for extra in [&[][..], &["--no-card"]] {
+        let mut argv = vec![
+            "agent",
+            "new",
+            "--project",
+            "repo",
+            "--worktree",
+            "main",
+            "--name",
+            "orphan",
+        ];
+        argv.extend_from_slice(extra);
+        let out = env.cli(&argv, Some(&stranger));
+        assert!(
+            !out.status.success(),
+            "{argv:?} spawned for an unknown caller"
+        );
+        assert!(
+            stderr(&out).contains(&format!("NEBULA_AGENT_ID {stranger} names no session")),
+            "{}",
+            stderr(&out)
+        );
+    }
+    assert!(agent_names(&env).is_empty());
+}
+
+#[test]
+fn human_show_and_away_name_sessions() {
+    let env = board_env();
+    let work = add(&env, &["--project", "nebula"], "Work");
+    let ask = add(&env, &["--project", "nebula"], "Ask");
+    let since = now_ms();
+    let writer = |status, at| SessionRow {
+        writer: true,
+        ..far_row(&work, "w1", status, at)
+    };
+    far_report(&env, vec![writer(AgentStatus::Running, since + 1)]);
+    far_report(
+        &env,
+        vec![
+            writer(AgentStatus::Finished, since + 2),
+            far_row(&ask, "n1", AgentStatus::NeedsFeedback, since + 2),
+        ],
+    );
+    let human = |argv: &[&str]| {
+        let out = env.cli(argv, None);
+        assert!(out.status.success(), "{}", stderr(&out));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let show = human(&["todo", "show", "#1"]);
+    assert!(
+        show.contains("worker w1 on elsewhere: codex finished just now, writer, live"),
+        "{show}"
+    );
+    let away_since = since.to_string();
+    let board = human(&["todo", "board", "--all", "--away-since", &away_since]);
+    assert!(board.contains("finished: #1\n"), "{board}");
+    assert!(board.contains("needs you: n1 on elsewhere\n"), "{board}");
+}

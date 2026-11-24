@@ -1789,15 +1789,13 @@ pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
     let mut conn = handshake(stream).await?;
     let (projects, worktrees, agents) = subscribe_snapshot(&mut conn).await?;
     let project = resolve_project(&projects, &worktrees, &agents, opts.project.as_deref())?;
+    let caller = (env_agent_id().is_some() || opts.card.is_some())
+        .then(|| crate::board_cli::Caller::resolve(&projects, &worktrees, &agents))
+        .transpose()?;
     let card = match (opts.card.as_deref(), opts.no_card) {
-        (Some(text), _) => {
-            crate::board_cli::Caller::resolve(&projects, &worktrees, &agents)?;
-            Some(crate::board_cli::check_card(&mut conn, text).await?)
-        }
+        (Some(text), _) => Some(crate::board_cli::check_card(&mut conn, text).await?),
         (None, true) => None,
-        (None, false) => env_agent_id()
-            .and_then(|id| agents.iter().find(|a| a.id.as_str() == id))
-            .and_then(|spawner| spawner.card_id.clone()),
+        (None, false) => caller.and_then(|spawner| spawner.card),
     };
     if let Some(host) = &project.host {
         let cache = paths::log_dir().join("skills-check");
