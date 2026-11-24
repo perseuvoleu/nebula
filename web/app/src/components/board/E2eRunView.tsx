@@ -13,7 +13,7 @@ export interface E2eStep {
 export interface E2eRun {
   title: string;
   status: E2eStatus;
-  started_at: string;
+  started_at: number;
   duration_ms: number;
   steps: E2eStep[];
 }
