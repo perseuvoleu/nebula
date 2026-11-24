@@ -403,6 +403,24 @@ fn print_human(result: &BoardResult) {
         }
         BoardResult::Show(show) => {
             println!("{}", card_line(&show.card));
+            if let Some(checkout) = &show.card.checkout {
+                let kind = if checkout.worktree {
+                    "worktree"
+                } else {
+                    "primary"
+                };
+                println!("  on {} {} ({kind})", checkout.host, checkout.branch);
+            }
+            for session in &show.sessions {
+                let role = session.role.map_or("-", |r| r.as_str());
+                let alive = if session.alive { "" } else { ", stopped" };
+                println!(
+                    "  {role} {} on {}: {}{alive}",
+                    session.name,
+                    session.host,
+                    session.status.as_str()
+                );
+            }
             for note in &show.log {
                 println!("  {}: {}", note.author.name, note.text);
             }
@@ -412,6 +430,27 @@ fn print_human(result: &BoardResult) {
         BoardResult::Board(BoardPoll::Board { board, .. }) => {
             for card in &board.cards {
                 println!("{}", card_line(card));
+            }
+            for host in &board.hosts {
+                let slots = host
+                    .writer_slots
+                    .map(|s| format!("/{s}"))
+                    .unwrap_or_default();
+                println!(
+                    "{}: {}{slots} writers, {} checkouts, {} need you",
+                    host.host,
+                    host.writers,
+                    host.checkouts.len(),
+                    host.needs_you
+                );
+            }
+            let away = &board.away;
+            if !away.finished.is_empty() || !away.needs_you.is_empty() {
+                println!(
+                    "while you were away: {} cards finished, {} sessions need you",
+                    away.finished.len(),
+                    away.needs_you.len()
+                );
             }
         }
         other => println!("{other:?}"),
