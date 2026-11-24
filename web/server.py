@@ -60,8 +60,8 @@ CSP = ("default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' 
 
 
 class Problem(Exception):
-    def __init__(self, status, message):
-        self.status, self.message = status, message
+    def __init__(self, status, message, extra=None):
+        self.status, self.message, self.extra = status, message, extra or {}
 
 
 class PushService:
@@ -320,8 +320,8 @@ class Gateway:
     def sessions(self, project):
         return self.run("agent", "list", "--project", project)
 
-    def board(self, *args, positionals=()):
-        return self.run(*args, "--json", *(("--", *positionals) if positionals else ()), exits=BOARD_EXITS)
+    def board(self, *args, positionals=(), exits=BOARD_EXITS):
+        return self.run(*args, "--json", *(("--", *positionals) if positionals else ()), exits=exits)
 
     def scope(self):
         if self.board_projects is None:
@@ -658,8 +658,8 @@ class Gateway:
             if verb not in CARD_VERBS:
                 raise Problem(404, "Unknown endpoint")
             card = self.card(unquote(ref))
-            args, positionals = CARD_VERBS[verb](self, card, body)
-            return self.board(*args, positionals=positionals)
+            args, positionals, *exits = CARD_VERBS[verb](self, card, body)
+            return self.board(*args, positionals=positionals, exits=exits[0] if exits else BOARD_EXITS)
         project = self.project(body.get("project"))
         if path == "/api/worktrees":
             return self.create_checkout(project, body)
@@ -779,7 +779,8 @@ def approve_card(gateway, card, body):
 
 def open_code(gateway, card, body):
     session, host = gateway.card_session(card, body)
-    return ("open", f"--session={session}", f"--on={host}"), ()
+    unreachable = (409, f"Nebula not reachable on {host}", {"command": f"nebula open --session={session}"})
+    return ("open", f"--session={session}", f"--on={host}"), (), {3: unreachable}
 
 
 def move_card(gateway, card, body):
@@ -900,7 +901,7 @@ class Handler(BaseHTTPRequestHandler):
                 result = gateway.post(path, body)
             self.reply(200, result)
         except Problem as error:
-            self.reply(error.status, {"error": error.message})
+            self.reply(error.status, {"error": error.message, **error.extra})
         except (BrokenPipeError, ConnectionResetError, TimeoutError):
             pass
         except Exception:

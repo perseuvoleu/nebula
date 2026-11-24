@@ -860,6 +860,13 @@ class BoardTests(unittest.TestCase):
                 self.assertEqual(self.request("/api/cards/%2312/run", "POST", {**base, "worktree": branch}, self.auth())[0], 400)
                 self.assertEqual(run.call_count, 1)
 
+    def test_open_code_unreachable_shows_command(self):
+        session = {"session": "01JF0000000000000000000002", "host": "leaseweb"}
+        with patch("server.subprocess.run", side_effect=[cli(fixture("card_show")), cli(None, 3, "ssh failed /home/perseu")]):
+            status, _, raw = self.request("/api/cards/%2312/open-code", "POST", session, self.auth())
+        self.assertEqual((status, json.loads(raw)), (409, {"error": "Nebula not reachable on leaseweb",
+                                                           "command": "nebula open --session=01JF0000000000000000000002"}))
+
 
 if __name__ == "__main__":
     unittest.main()
