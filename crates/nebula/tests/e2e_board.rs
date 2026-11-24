@@ -245,6 +245,21 @@ fn card_id_canonical() {
 }
 
 #[test]
+fn card_ref_other_host_refused() {
+    let env = board_env();
+    add(&env, &["--project", "nebula"], "Here");
+    let out = env.cli(&["todo", "move", "1@unrelated", "next"], None);
+    assert_eq!(out.status.code(), Some(5), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("no card #1@unrelated"),
+        "{}",
+        stderr(&out)
+    );
+    let shown = env.json(&["todo", "show", "#1", "--json"]);
+    assert_eq!(shown["stage"], "backlog");
+}
+
+#[test]
 fn card_block_refuses_cycles() {
     let env = board_env();
     for title in ["One", "Two", "Three"] {

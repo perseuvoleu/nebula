@@ -136,7 +136,7 @@ fn non_empty<'a>(text: &'a str, what: &str) -> Result<&'a str> {
 
 fn not_found(card: &CardRef) -> anyhow::Error {
     let named = match card {
-        CardRef::Number { number, .. } => format!("#{number}"),
+        CardRef::Number { number, board } => card_label(*number, board.as_deref()),
         CardRef::Id(id) => id.to_string(),
     };
     anyhow::anyhow!(Refusal::NotFound.message(format!("no card {named}")))
@@ -144,6 +144,9 @@ fn not_found(card: &CardRef) -> anyhow::Error {
 
 fn resolve(tx: &Transaction, card: &CardRef) -> Result<TodoId> {
     let id: Option<String> = match card {
+        CardRef::Number {
+            board: Some(host), ..
+        } if *host != nebula_core::host::hostname() => None,
         CardRef::Number { number, .. } => tx
             .query_row(
                 "SELECT id FROM todos WHERE number = ?1 AND stage IS NOT NULL",
