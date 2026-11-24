@@ -778,6 +778,21 @@ fn link_down_exit_3() {
 }
 
 #[test]
+fn link_host_lost_exit_3() {
+    let mut board = board_env();
+    let here = viewer(&proxy_to(&board));
+    add(&here, &["--project", "nebula"], "Before");
+    stop(&mut board);
+
+    let out = here.cli(&["todo", "add", "--project", "nebula", "After"], None);
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+    assert!(stderr(&out).contains(UNREACHABLE), "{}", stderr(&out));
+
+    let board = board.start(&[]);
+    assert_eq!(list(&board, &["--all"]), ["Before"]);
+}
+
+#[test]
 fn link_lost_after_send_exit_4() {
     let board = board_env();
     let marker = board.tmp.path().join("dropped");
@@ -840,22 +855,57 @@ fn link_concurrent_replies() {
     assert_eq!(numbers, [1, 2, 3, 4]);
 }
 
-#[test]
-fn link_refuses_protocol_31() {
-    let env = Env::new();
-    let reply = env.tmp.path().join("incompatible.bin");
+fn frame<T: serde::Serialize>(msg: &T) -> Vec<u8> {
     let mut frame = Vec::new();
     tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap()
-        .block_on(nebula_core::codec::write_frame(
-            &mut frame,
-            &nebula_core::ServerEvent::Incompatible {
-                daemon_protocol_version: 31,
-            },
-        ))
+        .block_on(nebula_core::codec::write_frame(&mut frame, msg))
         .unwrap();
-    std::fs::write(&reply, frame).unwrap();
+    frame
+}
+
+fn reply_file(env: &Env, name: &str, event: &nebula_core::ServerEvent) -> PathBuf {
+    let path = env.tmp.path().join(name);
+    std::fs::write(&path, frame(event)).unwrap();
+    path
+}
+
+#[test]
+fn link_input_closed_before_write_exit_3() {
+    let env = Env::new();
+    let hello = frame(&nebula_core::ClientRequest::Hello {
+        protocol_version: nebula_core::PROTOCOL_VERSION,
+    });
+    let ok = reply_file(
+        &env,
+        "hello_ok.bin",
+        &nebula_core::ServerEvent::HelloOk {
+            protocol_version: nebula_core::PROTOCOL_VERSION,
+            daemon_pid: 1,
+        },
+    );
+    let here = viewer(&format!(
+        "dd bs=1 count={} of=/dev/null 2>/dev/null; exec 0<&-; cat '{}'; exec sleep 30",
+        hello.len(),
+        ok.display()
+    ));
+
+    let out = here.cli(&["todo", "add", "--project", "nebula", "Unsent"], None);
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+    assert!(stderr(&out).contains(UNREACHABLE), "{}", stderr(&out));
+}
+
+#[test]
+fn link_refuses_protocol_31() {
+    let env = Env::new();
+    let reply = reply_file(
+        &env,
+        "incompatible.bin",
+        &nebula_core::ServerEvent::Incompatible {
+            daemon_protocol_version: 31,
+        },
+    );
     let here = viewer(&format!("cat '{}'; cat > /dev/null", reply.display()));
 
     let out = here.cli(&["todo", "add", "--project", "nebula", "Old peer"], None);

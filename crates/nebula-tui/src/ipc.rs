@@ -69,8 +69,12 @@ pub async fn proxy(connect_only: bool) -> Result<()> {
             }
         }
     };
-    let mut stdio = tokio::io::join(tokio::io::stdin(), tokio::io::stdout());
-    let _ = tokio::io::copy_bidirectional(&mut stdio, &mut stream).await;
+    let (mut from_daemon, mut to_daemon) = stream.split();
+    let (mut stdin, mut stdout) = (tokio::io::stdin(), tokio::io::stdout());
+    tokio::select! {
+        _ = tokio::io::copy(&mut stdin, &mut to_daemon) => {}
+        _ = tokio::io::copy(&mut from_daemon, &mut stdout) => {}
+    }
     Ok(())
 }
 

@@ -276,13 +276,13 @@ async fn connect_and_pump(
                         let Some((remote, op)) = queued else {
                             return Ok(());
                         };
-                        if let Some(pending) = link.pending.lock().unwrap().get_mut(&remote) {
-                            pending.sent = true;
-                        }
                         let request = ClientRequest::Board { req_id: remote, op };
                         tokio::time::timeout(HANDSHAKE_TIMEOUT, write_frame(&mut writer, &request))
                             .await
                             .context("board link write timed out")??;
+                        if let Some(pending) = link.pending.lock().unwrap().get_mut(&remote) {
+                            pending.sent = true;
+                        }
                     }
                 }
             }
