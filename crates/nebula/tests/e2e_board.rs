@@ -636,13 +636,17 @@ fn card_write_outside_scope_refused() {
     let env = board_env();
     add(&env, &["--project", "other"], "Elsewhere");
     add(&env, &["--project", "nebula"], "Here");
-    let scope = ["--project", "nebula"];
+    add(&env, &["--home"], "Home");
+    let scope = ["--scope", "nebula"];
 
     for argv in [
         &["todo", "move", "#1", "next"][..],
         &["todo", "archive", "#1"],
         &["todo", "note", "#1", "hidden"],
         &["todo", "block", "#2", "--by", "#1"],
+        &["todo", "edit", "#1", "--title", "Renamed"],
+        &["todo", "edit", "#1", "--project", "nebula"],
+        &["todo", "archive", "#3"],
     ] {
         let out = env.cli(&[argv, &scope[..]].concat(), None);
         assert_eq!(out.status.code(), Some(5), "{argv:?}: {}", stderr(&out));
@@ -656,16 +660,31 @@ fn card_write_outside_scope_refused() {
         serde_json::json!([])
     );
 
-    let moved = env.json(&[
-        "todo",
-        "move",
-        "#2",
-        "next",
-        "--json",
-        "--project",
-        "nebula",
-    ]);
+    let moved = env.json(&["todo", "move", "#2", "next", "--json", "--scope", "nebula"]);
     assert_eq!(moved["stage"], "next");
+    let edited = env.json(&[
+        "todo",
+        "edit",
+        "#2",
+        "--project",
+        "other",
+        "--scope",
+        "nebula",
+        "--json",
+    ]);
+    assert_eq!(edited["project"], "other");
+    let everywhere = env.json(&["todo", "move", "#1", "done", "--scope", "*", "--json"]);
+    assert_eq!(everywhere["stage"], "done");
+    let home = env.json(&[
+        "todo",
+        "archive",
+        "#3",
+        "--scope",
+        "nebula",
+        "--include-home",
+        "--json",
+    ]);
+    assert_eq!(home["archived"], true);
 }
 
 fn board_at(host: &str) -> String {

@@ -106,12 +106,18 @@ pub struct ScopeFlags {
 
 impl ScopeFlags {
     fn guard(self, op: BoardOp) -> BoardOp {
-        match self.all || self.include_home || !self.projects.is_empty() {
-            true => BoardOp::Scoped {
-                scope: self.scope(None),
-                op: Box::new(op),
+        if !self.all && !self.include_home && self.projects.is_empty() {
+            return op;
+        }
+        BoardOp::Scoped {
+            scope: BoardScope {
+                projects: match self.all {
+                    true => ProjectScope::All,
+                    false => ProjectScope::Named(self.projects),
+                },
+                include_home: self.include_home,
             },
-            false => op,
+            op: Box::new(op),
         }
     }
 
@@ -148,6 +154,7 @@ pub enum TodoVerb {
         title: Option<String>,
         project: Option<String>,
         home: bool,
+        scope: ScopeFlags,
     },
     Move {
         card: String,
@@ -281,7 +288,8 @@ pub async fn run(verb: TodoVerb, json: bool) -> Result<()> {
             title,
             project,
             home,
-        } => BoardOp::EditCard {
+            scope,
+        } => scope.guard(BoardOp::EditCard {
             card: card_ref(&card)?,
             title,
             project: match (project, home) {
@@ -289,7 +297,7 @@ pub async fn run(verb: TodoVerb, json: bool) -> Result<()> {
                 (Some(project), false) => Some(Placement::Project(project)),
                 (None, false) => None,
             },
-        },
+        }),
         TodoVerb::Move {
             card,
             stage,

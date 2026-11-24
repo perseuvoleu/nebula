@@ -681,6 +681,8 @@ enum TodoCommand {
         /// Make it a home card.
         #[arg(long)]
         home: bool,
+        #[command(flatten)]
+        scope: WriteScopeArgs,
         #[arg(long)]
         json: bool,
     },
@@ -693,7 +695,7 @@ enum TodoCommand {
         #[arg(long, value_parser = parse_stage)]
         expect: Option<Stage>,
         #[command(flatten)]
-        scope: ScopeArgs,
+        scope: WriteScopeArgs,
         #[arg(long)]
         json: bool,
     },
@@ -701,7 +703,7 @@ enum TodoCommand {
     Archive {
         card: String,
         #[command(flatten)]
-        scope: ScopeArgs,
+        scope: WriteScopeArgs,
         #[arg(long)]
         json: bool,
     },
@@ -709,7 +711,7 @@ enum TodoCommand {
     Accept {
         card: String,
         #[command(flatten)]
-        scope: ScopeArgs,
+        scope: WriteScopeArgs,
         #[arg(long)]
         json: bool,
     },
@@ -717,7 +719,7 @@ enum TodoCommand {
     Dismiss {
         card: String,
         #[command(flatten)]
-        scope: ScopeArgs,
+        scope: WriteScopeArgs,
         #[arg(long)]
         json: bool,
     },
@@ -731,7 +733,7 @@ enum TodoCommand {
         #[arg(long)]
         id: Option<String>,
         #[command(flatten)]
-        scope: ScopeArgs,
+        scope: WriteScopeArgs,
         #[arg(long)]
         json: bool,
     },
@@ -741,7 +743,7 @@ enum TodoCommand {
         #[arg(long)]
         by: String,
         #[command(flatten)]
-        scope: ScopeArgs,
+        scope: WriteScopeArgs,
         #[arg(long)]
         json: bool,
     },
@@ -751,7 +753,7 @@ enum TodoCommand {
         #[arg(long)]
         by: String,
         #[command(flatten)]
-        scope: ScopeArgs,
+        scope: WriteScopeArgs,
         #[arg(long)]
         json: bool,
     },
@@ -828,6 +830,27 @@ impl From<ScopeArgs> for nebula_tui::board_cli::ScopeFlags {
         Self {
             projects: args.project,
             all: args.all,
+            include_home: args.include_home,
+        }
+    }
+}
+
+#[derive(clap::Args)]
+struct WriteScopeArgs {
+    /// Refuse (exit 5) a card outside this project; repeat for more, `*`
+    /// for every project. Unlike --project, it never moves a card.
+    #[arg(long = "scope", value_name = "PROJECT")]
+    scope: Vec<String>,
+    /// Home cards (no project) are in scope too.
+    #[arg(long)]
+    include_home: bool,
+}
+
+impl From<WriteScopeArgs> for nebula_tui::board_cli::ScopeFlags {
+    fn from(args: WriteScopeArgs) -> Self {
+        Self {
+            all: args.scope.iter().any(|p| p == "*"),
+            projects: args.scope.into_iter().filter(|p| p != "*").collect(),
             include_home: args.include_home,
         }
     }
@@ -1165,6 +1188,7 @@ fn main() -> Result<()> {
                     title,
                     project,
                     home,
+                    scope,
                     json,
                 }) => (
                     TodoVerb::Edit {
@@ -1172,6 +1196,7 @@ fn main() -> Result<()> {
                         title,
                         project,
                         home,
+                        scope: scope.into(),
                     },
                     json,
                 ),
