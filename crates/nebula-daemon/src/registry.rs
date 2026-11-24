@@ -2439,7 +2439,6 @@ impl Daemon {
             .store
             .get_worktree(worktree_id)?
             .context("worktree not found")?;
-        self.validate_execution_branch(&worktree, expected_branch.or(Some(&worktree.branch)))?;
         let _claim = match (writer, &link.dispatch) {
             (WriterClaim::Off, None) => None,
             _ => Some(self.writer_claims.lock().await),
@@ -2450,9 +2449,17 @@ impl Daemon {
                 .into_iter()
                 .find(|a| a.dispatch_id.as_ref() == Some(dispatch))
             {
+                if known.card_id != link.card {
+                    bail!(nebula_core::board::Refusal::Conflict.message(format!(
+                        "dispatch {} started \"{}\" on another card",
+                        dispatch.as_str(),
+                        known.name
+                    )));
+                }
                 return Ok(EntityId::Agent(known.id));
             }
         }
+        self.validate_execution_branch(&worktree, expected_branch.or(Some(&worktree.branch)))?;
         if writer == WriterClaim::Exclusive {
             if let Some(holder) = self.live_writer(worktree_id)? {
                 bail!(nebula_core::board::Refusal::WriterHeld.message(format!(
@@ -2516,7 +2523,12 @@ impl Daemon {
         }
         if adopted.is_none() {
             // Cold path: boot the CLI right away.
-            self.spawn_agent_session_with_prompt(&agent, &worktree, 80, 24, prompt.as_deref())?;
+            if let Err(e) =
+                self.spawn_agent_session_with_prompt(&agent, &worktree, 80, 24, prompt.as_deref())
+            {
+                self.store.delete_agent(&agent.id)?;
+                return Err(e);
+            }
         }
         let mut broadcast_agent = agent.clone();
         broadcast_agent.alive = true;
