@@ -231,6 +231,20 @@ fn card_proposal_accept_dismiss() {
 }
 
 #[test]
+fn card_id_canonical() {
+    let env = board_env();
+    let upper = nebula_core::TodoId::generate().0;
+    let lower = upper.to_lowercase();
+    let card = add(&env, &["--project", "nebula", "--id", &lower], "T");
+    assert_eq!(card["id"], upper.as_str());
+    let shown = env.json(&["todo", "show", &lower, "--json"]);
+    assert_eq!(shown["id"], upper.as_str());
+    let again = add(&env, &["--project", "nebula", "--id", &upper], "T");
+    assert_eq!(again, card);
+    assert_eq!(list(&env, &["--all"]), ["T"]);
+}
+
+#[test]
 fn card_block_refuses_cycles() {
     let env = board_env();
     for title in ["One", "Two", "Three"] {

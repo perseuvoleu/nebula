@@ -190,7 +190,7 @@ fn client_id(id: Option<String>) -> Result<String> {
     match id {
         None => Ok(TodoId::generate().0),
         Some(id) => match parse_card_ref(&id) {
-            Some(CardRef::Id(_)) => Ok(id),
+            Some(CardRef::Id(canonical)) => Ok(canonical.0),
             _ => bail!("--id {id:?} is not a ULID"),
         },
     }
