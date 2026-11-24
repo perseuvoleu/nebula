@@ -12,7 +12,7 @@ use nebula_core::board::{
     SessionLink,
 };
 use nebula_core::codec::{read_frame, write_frame};
-use nebula_core::{paths, ArtifactId, ClientRequest, ServerEvent};
+use nebula_core::{ArtifactId, ClientRequest, ServerEvent};
 use std::path::PathBuf;
 
 const FILE_KINDS: [&str; 5] = ["recap", "e2e-run", "diagram", "ticket", "prototype"];
@@ -92,6 +92,7 @@ async fn exchange(conn: &mut Connection, req: ClientRequest) -> Result<ServerEve
             }) => bail!("{message}"),
             Some(
                 reply @ (ServerEvent::ArtifactStored { req_id: 1, .. }
+                | ServerEvent::ArtifactLocated { req_id: 1, .. }
                 | ServerEvent::Ack { req_id: 1, .. }),
             ) => return Ok(reply),
             Some(_) => continue,
@@ -240,7 +241,7 @@ pub async fn run(verb: ArtifactVerb, json: bool) -> Result<()> {
             let BoardResult::Artifact(artifact) = result else {
                 bail!("the board answered an artifact read with {result:?}");
             };
-            return open(&artifact);
+            return open(&mut conn, &artifact).await;
         }
         if json {
             let value = match &result {
@@ -294,18 +295,23 @@ fn line(a: &Artifact) -> String {
     line
 }
 
-fn open(a: &Artifact) -> Result<()> {
+async fn open(conn: &mut Connection, a: &Artifact) -> Result<()> {
     let target = match &a.content {
         ArtifactContent::Files { host, .. } if *host != nebula_core::host::hostname() => {
             println!("on {host}: ssh {host} nebula artifact open {}", a.id);
             return Ok(());
         }
-        ArtifactContent::Files { entry, .. } => paths::data_dir()
-            .join("artifacts")
-            .join(a.id.as_str())
-            .join(entry)
-            .display()
-            .to_string(),
+        ArtifactContent::Files { entry, .. } => {
+            let req = ClientRequest::LocateArtifact {
+                req_id: 1,
+                id: a.id.clone(),
+                entry: entry.clone(),
+            };
+            match exchange(conn, req).await? {
+                ServerEvent::ArtifactLocated { path, .. } => path.display().to_string(),
+                other => bail!("the daemon answered a locate with {other:?}"),
+            }
+        }
         ArtifactContent::Url { url } => url.clone(),
         ArtifactContent::Body { body } => {
             println!("{body}");

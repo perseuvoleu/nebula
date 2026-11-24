@@ -336,6 +336,12 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     crate::artifacts::store(&id, &kind, &source)
                         .map(|content| ServerEvent::ArtifactStored { req_id, content })
                 }),
+                ClientRequest::LocateArtifact { req_id, id, entry } => {
+                    answer_blocking(out_tx.clone(), req_id, move || {
+                        crate::artifacts::locate(&id, &entry)
+                            .map(|path| ServerEvent::ArtifactLocated { req_id, path })
+                    })
+                }
                 ClientRequest::DiscardArtifact { req_id, id } => {
                     answer_blocking(out_tx.clone(), req_id, move || {
                         crate::artifacts::discard(&id).map(|()| ServerEvent::Ack {

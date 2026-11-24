@@ -559,6 +559,15 @@ pub enum ClientRequest {
         id: ArtifactId,
     },
 
+    /// The absolute path of `entry` in this daemon's stored copy of `id`,
+    /// refused unless it is a file inside that tree. Answered by
+    /// `ArtifactLocated` or Error.
+    LocateArtifact {
+        req_id: u64,
+        id: ArtifactId,
+        entry: String,
+    },
+
     Shutdown,
 }
 
@@ -718,5 +727,10 @@ pub enum ServerEvent {
     ArtifactStored {
         req_id: u64,
         content: ArtifactContent,
+    },
+
+    ArtifactLocated {
+        req_id: u64,
+        path: PathBuf,
     },
 }

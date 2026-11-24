@@ -60,6 +60,24 @@ pub fn store(id: &ArtifactId, kind: &str, source: &Path) -> Result<ArtifactConte
     })
 }
 
+pub fn locate(id: &ArtifactId, entry: &str) -> Result<PathBuf> {
+    if ulid::Ulid::from_string(id.as_str()).is_err() {
+        bail!("artifact id {id} is not a ULID");
+    }
+    let tree = store_dir()
+        .join(id.as_str())
+        .canonicalize()
+        .with_context(|| format!("artifact {id} is not stored on this host"))?;
+    let path = tree
+        .join(entry)
+        .canonicalize()
+        .with_context(|| format!("artifact {id} has no {entry}"))?;
+    if !path.starts_with(&tree) || !path.is_file() {
+        bail!("{entry} is not a file inside artifact {id}");
+    }
+    Ok(path)
+}
+
 pub fn discard(id: &ArtifactId) -> Result<()> {
     if ulid::Ulid::from_string(id.as_str()).is_err() {
         bail!("artifact id {id} is not a ULID");

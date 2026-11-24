@@ -1051,3 +1051,38 @@ fn artifact_add_project_flag() {
     assert_eq!(added["project"], "vela-hub-fork");
     assert_eq!(added["card"], Value::Null);
 }
+
+#[test]
+fn artifact_open_uses_the_daemons_store() {
+    let env = board_env();
+    let page = tree(&env.tmp.path().join("page"), &[("index.html", b"x")]);
+    let added = publish(&env, None, &[page.to_str().unwrap(), "--kind", "recap"]);
+    let id = added["id"].as_str().unwrap();
+    let bin = env.tmp.path().join("bin");
+    let opened = env.tmp.path().join("opened");
+    std::fs::create_dir_all(&bin).unwrap();
+    for opener in ["open", "xdg-open"] {
+        let script = bin.join(opener);
+        std::fs::write(&script, "#!/bin/sh\nprintf '%s' \"$1\" > \"$OPENED\"\n").unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+    }
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let out = Command::new(env!("CARGO_BIN_EXE_nebula"))
+        .args(["artifact", "open", id])
+        .env("NEBULA_RUNTIME_DIR", env.runtime_dir())
+        .env("NEBULA_DATA_DIR", env.tmp.path().join("elsewhere"))
+        .env("PATH", path)
+        .env("OPENED", &opened)
+        .env_remove("NEBULA_AGENT_ID")
+        .current_dir(env.tmp.path())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    let expected = env.stored(id).join("index.html").canonicalize().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&opened).unwrap(),
+        expected.to_str().unwrap()
+    );
+}
