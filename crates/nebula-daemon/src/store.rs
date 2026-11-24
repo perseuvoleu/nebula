@@ -2461,7 +2461,10 @@ mod tests {
         let board_id: String = conn
             .query_row("SELECT board_id FROM board_meta", [], |r| r.get(0))
             .unwrap();
-        assert!(!board_id.is_empty());
+        assert!(
+            ulid::Ulid::from_string(&board_id).is_ok(),
+            "board_id {board_id} is not a ULID"
+        );
         let writes: &[(&str, [&str; 3])] = &[
             ("todos", [
                 "INSERT INTO todos (id, project_id, text, created_at) VALUES ('t9', 'p1', 'x', 0)",
