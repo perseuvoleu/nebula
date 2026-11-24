@@ -6962,7 +6962,7 @@ async fn mobile_safe_removal_preserves_dirty_unmerged_occupied_and_protected_che
 
 /// Use literal peer versions so a simultaneous client/server constant change cannot mask a mismatch.
 #[tokio::test]
-async fn protocol32_handshake_accepts_repeated_probes_and_rejects_protocol31() {
+async fn protocol33_handshake_accepts_repeated_probes_and_rejects_protocol32() {
     let env = TestEnv::new();
     let _daemon = env.spawn_daemon();
     let mut c = connect(&env.sock()).await;
@@ -6970,7 +6970,7 @@ async fn protocol32_handshake_accepts_repeated_probes_and_rejects_protocol31() {
         write_frame(
             &mut c,
             &ClientRequest::Hello {
-                protocol_version: 32,
+                protocol_version: 33,
             },
         )
         .await
@@ -6984,7 +6984,7 @@ async fn protocol32_handshake_accepts_repeated_probes_and_rejects_protocol31() {
             matches!(
                 reply,
                 Some(ServerEvent::HelloOk {
-                    protocol_version: 32,
+                    protocol_version: 33,
                     ..
                 })
             ),
@@ -6995,7 +6995,7 @@ async fn protocol32_handshake_accepts_repeated_probes_and_rejects_protocol31() {
     write_frame(
         &mut old,
         &ClientRequest::Hello {
-            protocol_version: 31,
+            protocol_version: 32,
         },
     )
     .await
@@ -7011,7 +7011,7 @@ async fn protocol32_handshake_accepts_repeated_probes_and_rejects_protocol31() {
         matches!(
             reply,
             Some(ServerEvent::Incompatible {
-                daemon_protocol_version: 32
+                daemon_protocol_version: 33
             })
         ),
         "{reply:?}"

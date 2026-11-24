@@ -1,4 +1,4 @@
-//! Protocol-32 board contract: the positional CreateAgent and Agent tails, the
+//! Protocol-33 board contract: the positional CreateAgent and Agent tails, the
 //! pure board rules, and the JSON the CLI prints, pinned to golden fixtures that
 //! web/e2e/fake_nebula.py serves.
 use nebula_core::board::*;
