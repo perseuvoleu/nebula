@@ -377,7 +377,7 @@ class Gateway:
         return root if root.is_dir() and not root.is_symlink() else None
 
     def artifact_file(self, path):
-        """Open /a/<grant>/<id>/<path> as (file, size, mime); never follows a symlink."""
+        """Open /a/<grant>/<id>/<path> as (file, size, mime, max-age within the grant); never follows a symlink."""
         parts = path.split("/")
         if len(parts) < 5:
             raise Problem(404, "Not found")
@@ -405,7 +405,8 @@ class Gateway:
         if not stat.S_ISREG(info.st_mode):
             os.close(descriptor)
             raise Problem(404, "Not found")
-        return os.fdopen(descriptor, "rb"), info.st_size, ARTIFACT_TYPES.get(Path(names[-1]).suffix.lower(), "application/octet-stream")
+        return (os.fdopen(descriptor, "rb"), info.st_size, ARTIFACT_TYPES.get(Path(names[-1]).suffix.lower(), "application/octet-stream"),
+                min(600, int(int(expiry) - now)))
 
     def session_row(self, project, session_id, *, by_name=True):
         rows = self.sessions(project)
@@ -834,12 +835,12 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def send_artifact(self, file, size, mime):
+    def send_artifact(self, file, size, mime, max_age):
         with file:
             self.send_response(200)
             self.send_header("Content-Type", mime)
             self.send_header("Content-Length", str(size))
-            self.send_header("Cache-Control", "private, max-age=600")
+            self.send_header("Cache-Control", f"private, max-age={max_age}")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.send_header("Referrer-Policy", "no-referrer")
             # An opaque origin: artifact scripts run but cannot act as the app or read its storage.

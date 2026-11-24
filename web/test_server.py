@@ -839,6 +839,14 @@ class BoardTests(unittest.TestCase):
                     self.assertEqual(self.request("/api/board?page=" + page, headers=self.auth())[0], 400)
             run.assert_not_called()
 
+    def test_artifact_cache_never_outlives_grant(self):
+        grant = self.card_src().split("/")[2]
+        expiry = int(grant.split(".")[0])
+        for remaining, control in [(100, "private, max-age=100"), (3000, "private, max-age=600")]:
+            with self.subTest(remaining=remaining), patch("server.time.time", return_value=expiry - remaining):
+                status, headers, _ = self.request(f"/a/{grant}/{ARTIFACT_ID}/result.json")
+                self.assertEqual((status, headers["Cache-Control"]), (200, control))
+
 
 if __name__ == "__main__":
     unittest.main()
