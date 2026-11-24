@@ -271,9 +271,9 @@ fn stored_files(dir: &Path) -> Result<BTreeSet<String>> {
     Ok(files)
 }
 
-const ARTIFACT_COLUMNS: &str = "id, kind, title, storage_host, entry, url, body, card_id, project, session, checkout, meta, created_at, removed_at";
+pub(crate) const ARTIFACT_COLUMNS: &str = "id, kind, title, storage_host, entry, url, body, card_id, project, session, checkout, meta, created_at, removed_at";
 
-fn artifact_from_row(r: &Row) -> rusqlite::Result<Artifact> {
+pub(crate) fn artifact_from_row(r: &Row) -> rusqlite::Result<Artifact> {
     let content = match (
         r.get::<_, Option<String>>(3)?,
         r.get::<_, Option<String>>(4)?,

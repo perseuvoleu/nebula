@@ -14,6 +14,7 @@ pub mod hooks;
 pub mod lifecycle;
 pub mod metrics;
 pub mod pty;
+mod rag_copy;
 pub mod registry;
 pub mod relay;
 pub mod server;
@@ -74,6 +75,7 @@ async fn serve() -> Result<()> {
     let daemon = registry::Daemon::new(store, hook_env);
     daemon.refresh_remote_hosts();
     daemon.ensure_relays();
+    rag_copy::start(daemon.store.clone(), daemon.shutdown.clone());
 
     // Drain hook events into the status machines; a payload that reports a
     // cwd inside another worktree of the same project re-homes the agent row.
