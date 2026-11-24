@@ -357,7 +357,7 @@ pub const MIGRATIONS: &[&str] = &[
     );
     INSERT INTO artifacts (id, kind, title, url, project, checkout, created_at)
       SELECT l.id, 'link', l.url, l.url, w.project, w.checkout, l.created_at
-      FROM links l JOIN legacy_checkouts w ON w.id = l.worktree_id;
+      FROM links l LEFT JOIN legacy_checkouts w ON w.id = l.worktree_id;
     DROP VIEW legacy_checkouts;
     DROP VIEW legacy_author;
     DROP TABLE links;
