@@ -2181,16 +2181,24 @@ fn link_lost_note_without_id_names_it() {
 
 const SEEDED_TODO: &str = "01JD0000000000000000000T01";
 
-fn seed_v28(db: &Path) {
+fn seed_at(db: &Path, version: usize, rows: &str) {
     let conn = rusqlite::Connection::open(db).unwrap();
-    for (i, migration) in nebula_daemon::store::MIGRATIONS.iter().take(28).enumerate() {
+    for (i, migration) in nebula_daemon::store::MIGRATIONS
+        .iter()
+        .take(version)
+        .enumerate()
+    {
         conn.execute_batch(&format!(
             "BEGIN; {migration}; PRAGMA user_version = {}; COMMIT;",
             i + 1
         ))
         .unwrap();
     }
-    conn.execute_batch(&format!(
+    conn.execute_batch(rows).unwrap();
+}
+
+fn seed_v28(db: &Path) {
+    seed_at(db, 28, &format!(
         "PRAGMA foreign_keys = OFF;
          INSERT INTO projects (id, workspace_id, name, repo_path, sort_order, created_at) VALUES ('p1', 'default', 'vela', '/tmp/vela', 0, 0);
          INSERT INTO worktrees (id, project_id, path, branch, is_main, created_at) VALUES ('w1', 'p1', '/tmp/vela-feature', 'feature', 0, 0);
@@ -2202,8 +2210,7 @@ fn seed_v28(db: &Path) {
          INSERT INTO notes (id, worktree_id, text, created_at) VALUES ('01JD0000000000000000000N03', 'w1', 'worktree thought', 60);
          INSERT INTO links (id, worktree_id, url, created_at) VALUES ('01JD0000000000000000000L01', 'w1', 'https://vela.possu.dev', 1700000000000);
          INSERT INTO links (id, worktree_id, url, created_at) VALUES ('01JD0000000000000000000L02', 'w-gone', 'https://gone.example/pr/1', 1700000000001);"
-    ))
-    .unwrap();
+    ));
 }
 
 #[test]
@@ -2285,6 +2292,89 @@ fn migration_v28_legacy_rows() {
     assert_eq!(orphan["created_at"], 1700000000001_i64);
     assert_eq!(orphan["project"], Value::Null);
     assert_eq!(orphan["checkout"], Value::Null);
+}
+
+fn migrated_cards(env: &Env) -> Vec<(String, String, Value, Value)> {
+    let mut cards: Vec<(String, String, Value, Value)> =
+        env.json(&["todo", "list", "--all", "--include-home", "--json"])["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                (
+                    c["title"].as_str().unwrap().to_string(),
+                    c["stage"].as_str().unwrap().to_string(),
+                    c["project"].clone(),
+                    c["checkout"].clone(),
+                )
+            })
+            .collect();
+    cards.sort_by(|a, b| a.0.cmp(&b.0));
+    cards
+}
+
+fn main_checkout() -> Value {
+    serde_json::json!({
+        "host": nebula_core::host::hostname(),
+        "branch": "main",
+        "path": "/tmp/p",
+        "worktree": false,
+    })
+}
+
+#[test]
+fn migration_v9_notes_reach_the_board() {
+    let env = Env::new();
+    env.board_local();
+    seed_at(
+        &env.data_dir().join("nebula.db"),
+        9,
+        "INSERT INTO projects (id, name, repo_path, sort_order, created_at) VALUES ('p1', 'p', '/tmp/p', 0, 0);
+         INSERT INTO worktrees (id, project_id, path, branch, is_main, sort_order, created_at) VALUES ('w1', 'p1', '/tmp/p', 'main', 1, 0, 0);
+         INSERT INTO todos (id, worktree_id, text, done, sort_order, created_at) VALUES ('t1', 'w1', 'old note', 1, 3, 0);",
+    );
+    let env = env.start(&[]);
+    assert_eq!(
+        migrated_cards(&env),
+        [(
+            "old note".to_string(),
+            "backlog".to_string(),
+            Value::from("p"),
+            main_checkout()
+        )]
+    );
+}
+
+#[test]
+fn migration_v19_notes_reach_the_board() {
+    let env = Env::new();
+    env.board_local();
+    seed_at(
+        &env.data_dir().join("nebula.db"),
+        19,
+        "INSERT INTO projects (id, name, repo_path, sort_order, created_at) VALUES ('p1', 'p', '/tmp/p', 0, 0);
+         INSERT INTO worktrees (id, project_id, path, branch, is_main, sort_order, created_at) VALUES ('w1', 'p1', '/tmp/p', 'main', 1, 0, 0);
+         INSERT INTO notes (id, project_id, text, done, sort_order, created_at) VALUES ('n1', 'p1', 'project note', 0, 0, 0);
+         INSERT INTO notes (id, worktree_id, text, done, sort_order, created_at) VALUES ('n2', 'w1', 'worktree note', 1, 2, 0);",
+    );
+    let env = env.start(&[]);
+    assert_eq!(
+        migrated_cards(&env),
+        [
+            (
+                "project note".to_string(),
+                "backlog".to_string(),
+                Value::from("p"),
+                Value::Null
+            ),
+            (
+                "worktree note".to_string(),
+                "backlog".to_string(),
+                Value::from("p"),
+                main_checkout()
+            ),
+        ]
+    );
 }
 
 fn decide(env: &Env, agent: Option<&str>, args: &[&str]) -> Value {
