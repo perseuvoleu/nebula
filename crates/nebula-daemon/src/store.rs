@@ -288,6 +288,114 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE agents ADD COLUMN code_mode_off INTEGER NOT NULL DEFAULT 0;
     ",
+    // 29: the board (expand). Card columns beside the legacy todo columns, a
+    // note author for the card log, the board tables, and the agents' card
+    // link. The legacy columns and the links table go before 29 is released.
+    // Every write to a board table bumps board_meta.version through
+    // a trigger, so no write path can forget the poll counter.
+    "
+    ALTER TABLE todos ADD COLUMN number INTEGER;
+    ALTER TABLE todos ADD COLUMN title TEXT;
+    ALTER TABLE todos ADD COLUMN stage TEXT CHECK (stage IN ('backlog', 'next', 'doing', 'review', 'done'));
+    ALTER TABLE todos ADD COLUMN project TEXT;
+    ALTER TABLE todos ADD COLUMN checkout TEXT;
+    ALTER TABLE todos ADD COLUMN created_by TEXT;
+    ALTER TABLE todos ADD COLUMN proposed INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE todos ADD COLUMN stage_changed_at INTEGER;
+    ALTER TABLE todos ADD COLUMN archived_at INTEGER;
+    CREATE UNIQUE INDEX todos_number ON todos (number) WHERE number IS NOT NULL;
+    ALTER TABLE notes ADD COLUMN author TEXT;
+    ALTER TABLE agents ADD COLUMN card_id TEXT;
+    ALTER TABLE agents ADD COLUMN role TEXT;
+    ALTER TABLE agents ADD COLUMN dispatch_id TEXT;
+    CREATE TABLE card_blocks (
+      card_id TEXT NOT NULL REFERENCES todos(id) ON DELETE CASCADE,
+      by_id   TEXT NOT NULL REFERENCES todos(id) ON DELETE CASCADE,
+      PRIMARY KEY (card_id, by_id),
+      CHECK (card_id <> by_id)
+    );
+    CREATE TABLE artifacts (
+      id           TEXT PRIMARY KEY,
+      kind         TEXT NOT NULL,
+      title        TEXT NOT NULL,
+      storage_host TEXT,
+      entry        TEXT,
+      url          TEXT,
+      body         TEXT,
+      card_id      TEXT REFERENCES todos(id) ON DELETE SET NULL,
+      project      TEXT,
+      session      TEXT,
+      checkout     TEXT,
+      meta         TEXT NOT NULL DEFAULT '{}',
+      created_at   INTEGER NOT NULL,
+      removed_at   INTEGER,
+      CHECK ((storage_host IS NULL) = (entry IS NULL)),
+      CHECK ((entry IS NOT NULL) + (url IS NOT NULL) + (body IS NOT NULL) = 1)
+    );
+    CREATE TABLE board_sessions (
+      agent_id          TEXT PRIMARY KEY,
+      host              TEXT NOT NULL,
+      card_id           TEXT NOT NULL,
+      role              TEXT CHECK (role IN ('worker', 'review', 'fix', 'verify', 'research')),
+      kind              TEXT NOT NULL,
+      name              TEXT NOT NULL,
+      parent            TEXT,
+      status            TEXT NOT NULL,
+      status_changed_at INTEGER NOT NULL DEFAULT 0,
+      writer            INTEGER NOT NULL DEFAULT 0,
+      alive             INTEGER NOT NULL DEFAULT 0,
+      archived          INTEGER NOT NULL DEFAULT 0,
+      branch            TEXT,
+      dispatch_id       TEXT,
+      reported_at       INTEGER NOT NULL
+    );
+    CREATE TABLE board_hosts (
+      host         TEXT PRIMARY KEY,
+      writers      INTEGER NOT NULL DEFAULT 0,
+      writer_slots INTEGER,
+      checkouts    TEXT NOT NULL DEFAULT '[]',
+      reported_at  INTEGER NOT NULL
+    );
+    CREATE TABLE dispatches (
+      id         TEXT PRIMARY KEY,
+      card_id    TEXT NOT NULL,
+      host       TEXT NOT NULL,
+      role       TEXT NOT NULL CHECK (role IN ('worker', 'review', 'fix', 'verify', 'research')),
+      kind       TEXT NOT NULL,
+      worktree   TEXT NOT NULL,
+      state      TEXT NOT NULL CHECK (state IN ('pending', 'started', 'failed')),
+      agent_id   TEXT,
+      error      TEXT,
+      created_at INTEGER NOT NULL
+    );
+    CREATE TABLE board_meta (
+      id       INTEGER PRIMARY KEY CHECK (id = 1),
+      board_id TEXT NOT NULL,
+      version  INTEGER NOT NULL DEFAULT 0
+    );
+    INSERT INTO board_meta (id, board_id) VALUES (1, lower(hex(randomblob(16))));
+    CREATE TRIGGER todos_board_insert AFTER INSERT ON todos BEGIN UPDATE board_meta SET version = version + 1; END;
+    CREATE TRIGGER todos_board_update AFTER UPDATE ON todos BEGIN UPDATE board_meta SET version = version + 1; END;
+    CREATE TRIGGER todos_board_delete AFTER DELETE ON todos BEGIN UPDATE board_meta SET version = version + 1; END;
+    CREATE TRIGGER notes_board_insert AFTER INSERT ON notes BEGIN UPDATE board_meta SET version = version + 1; END;
+    CREATE TRIGGER notes_board_update AFTER UPDATE ON notes BEGIN UPDATE board_meta SET version = version + 1; END;
+    CREATE TRIGGER notes_board_delete AFTER DELETE ON notes BEGIN UPDATE board_meta SET version = version + 1; END;
+    CREATE TRIGGER card_blocks_board_insert AFTER INSERT ON card_blocks BEGIN UPDATE board_meta SET version = version + 1; END;
+    CREATE TRIGGER card_blocks_board_update AFTER UPDATE ON card_blocks BEGIN UPDATE board_meta SET version = version + 1; END;
+    CREATE TRIGGER card_blocks_board_delete AFTER DELETE ON card_blocks BEGIN UPDATE board_meta SET version = version + 1; END;
+    CREATE TRIGGER artifacts_board_insert AFTER INSERT ON artifacts BEGIN UPDATE board_meta SET version = version + 1; END;
+    CREATE TRIGGER artifacts_board_update AFTER UPDATE ON artifacts BEGIN UPDATE board_meta SET version = version + 1; END;
+    CREATE TRIGGER artifacts_board_delete AFTER DELETE ON artifacts BEGIN UPDATE board_meta SET version = version + 1; END;
+    CREATE TRIGGER board_sessions_board_insert AFTER INSERT ON board_sessions BEGIN UPDATE board_meta SET version = version + 1; END;
+    CREATE TRIGGER board_sessions_board_update AFTER UPDATE ON board_sessions BEGIN UPDATE board_meta SET version = version + 1; END;
+    CREATE TRIGGER board_sessions_board_delete AFTER DELETE ON board_sessions BEGIN UPDATE board_meta SET version = version + 1; END;
+    CREATE TRIGGER board_hosts_board_insert AFTER INSERT ON board_hosts BEGIN UPDATE board_meta SET version = version + 1; END;
+    CREATE TRIGGER board_hosts_board_update AFTER UPDATE ON board_hosts BEGIN UPDATE board_meta SET version = version + 1; END;
+    CREATE TRIGGER board_hosts_board_delete AFTER DELETE ON board_hosts BEGIN UPDATE board_meta SET version = version + 1; END;
+    CREATE TRIGGER dispatches_board_insert AFTER INSERT ON dispatches BEGIN UPDATE board_meta SET version = version + 1; END;
+    CREATE TRIGGER dispatches_board_update AFTER UPDATE ON dispatches BEGIN UPDATE board_meta SET version = version + 1; END;
+    CREATE TRIGGER dispatches_board_delete AFTER DELETE ON dispatches BEGIN UPDATE board_meta SET version = version + 1; END;
+    ",
 ];
 
 /// A project's twin on a host, as the hook pointer needs it: the host, the
@@ -2147,6 +2255,224 @@ mod tests {
                 .unwrap()
                 .code_mode_off
         );
+        drop(store);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
+        }
+    }
+
+    fn columns(conn: &Connection, table: &str) -> Vec<String> {
+        conn.prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    /// Migration 29 expands only: the board tables and columns appear beside
+    /// the legacy notes, todos and links, which keep reading as before, and
+    /// every write to a board table bumps board_meta.version.
+    #[test]
+    fn migrate_v28_opens_as_v29() {
+        let path =
+            std::env::temp_dir().join(format!("nebula-mig29-test-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+            for (i, migration) in MIGRATIONS.iter().take(28).enumerate() {
+                conn.execute_batch(&format!(
+                    "BEGIN; {migration}; PRAGMA user_version = {}; COMMIT;",
+                    i + 1
+                ))
+                .unwrap();
+            }
+            conn.execute_batch(
+                "INSERT INTO projects (id, workspace_id, name, repo_path, sort_order, created_at) VALUES ('p1', 'default', 'p', '/tmp/p', 0, 0);
+                 INSERT INTO worktrees (id, project_id, path, branch, is_main, created_at) VALUES ('w1', 'p1', '/tmp/p', 'main', 1, 0);
+                 INSERT INTO agents (id, worktree_id, name, created_at) VALUES ('a1', 'w1', 'legacy', 0);
+                 INSERT INTO notes (id, project_id, text, created_at) VALUES ('n1', 'p1', 'Lift utilities done', 0);
+                 INSERT INTO todos (id, project_id, text, created_at) VALUES ('t1', 'p1', 'ship it', 0);
+                 INSERT INTO todos (id, worktree_id, text, created_at) VALUES ('t2', 'w1', 'review it', 0);
+                 INSERT INTO notes (id, todo_id, text, created_at) VALUES ('n2', 't1', 'child', 0);
+                 INSERT INTO links (id, worktree_id, url, created_at) VALUES ('l1', 'w1', 'https://vela.possu.dev', 0);",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.load_notes().unwrap().len(), 2);
+        assert_eq!(store.load_todos().unwrap().len(), 2);
+        assert_eq!(store.load_links().unwrap()[0].url, "https://vela.possu.dev");
+        assert!(store.get_agent(&AgentId("a1".into())).unwrap().is_some());
+
+        let conn = store.conn.lock().unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 29);
+        let expected: &[(&str, &[&str])] = &[
+            ("agents", &["card_id", "role", "dispatch_id"]),
+            (
+                "todos",
+                &[
+                    "number",
+                    "title",
+                    "stage",
+                    "project",
+                    "checkout",
+                    "created_by",
+                    "proposed",
+                    "stage_changed_at",
+                    "archived_at",
+                    "project_id",
+                    "worktree_id",
+                    "text",
+                    "done",
+                ],
+            ),
+            ("notes", &["author", "todo_id", "project_id", "worktree_id"]),
+            ("links", &["url"]),
+            ("card_blocks", &["card_id", "by_id"]),
+            (
+                "artifacts",
+                &[
+                    "id",
+                    "kind",
+                    "title",
+                    "storage_host",
+                    "entry",
+                    "url",
+                    "body",
+                    "card_id",
+                    "project",
+                    "session",
+                    "checkout",
+                    "meta",
+                    "created_at",
+                    "removed_at",
+                ],
+            ),
+            (
+                "board_sessions",
+                &[
+                    "agent_id",
+                    "host",
+                    "card_id",
+                    "role",
+                    "kind",
+                    "name",
+                    "parent",
+                    "status",
+                    "status_changed_at",
+                    "writer",
+                    "alive",
+                    "archived",
+                    "branch",
+                    "dispatch_id",
+                    "reported_at",
+                ],
+            ),
+            (
+                "board_hosts",
+                &[
+                    "host",
+                    "writers",
+                    "writer_slots",
+                    "checkouts",
+                    "reported_at",
+                ],
+            ),
+            (
+                "dispatches",
+                &[
+                    "id",
+                    "card_id",
+                    "host",
+                    "role",
+                    "kind",
+                    "worktree",
+                    "state",
+                    "agent_id",
+                    "error",
+                    "created_at",
+                ],
+            ),
+            ("board_meta", &["board_id", "version"]),
+        ];
+        for (table, wanted) in expected {
+            let have = columns(&conn, table);
+            for column in *wanted {
+                assert!(
+                    have.iter().any(|c| c == column),
+                    "{table}.{column}: {have:?}"
+                );
+            }
+        }
+
+        let board_version = || -> i64 {
+            conn.query_row("SELECT version FROM board_meta", [], |r| r.get(0))
+                .unwrap()
+        };
+        let board_id: String = conn
+            .query_row("SELECT board_id FROM board_meta", [], |r| r.get(0))
+            .unwrap();
+        assert!(!board_id.is_empty());
+        let writes: &[(&str, [&str; 3])] = &[
+            ("todos", [
+                "INSERT INTO todos (id, project_id, text, created_at) VALUES ('t9', 'p1', 'x', 0)",
+                "UPDATE todos SET stage = 'next' WHERE id = 't9'",
+                "DELETE FROM todos WHERE id = 't9'",
+            ]),
+            ("notes", [
+                "INSERT INTO notes (id, todo_id, text, created_at) VALUES ('n9', 't1', 'x', 0)",
+                "UPDATE notes SET author = '{}' WHERE id = 'n9'",
+                "DELETE FROM notes WHERE id = 'n9'",
+            ]),
+            ("card_blocks", [
+                "INSERT INTO card_blocks (card_id, by_id) VALUES ('t1', 't2')",
+                "UPDATE card_blocks SET card_id = 't2', by_id = 't1'",
+                "DELETE FROM card_blocks",
+            ]),
+            ("artifacts", [
+                "INSERT INTO artifacts (id, kind, title, url, created_at) VALUES ('a9', 'link', 'x', 'https://x', 0)",
+                "UPDATE artifacts SET title = 'y' WHERE id = 'a9'",
+                "DELETE FROM artifacts WHERE id = 'a9'",
+            ]),
+            ("board_sessions", [
+                "INSERT INTO board_sessions (agent_id, host, card_id, kind, name, status, reported_at) VALUES ('s9', 'h', 't1', 'codex', 'w', 'running', 0)",
+                "UPDATE board_sessions SET status = 'finished' WHERE agent_id = 's9'",
+                "DELETE FROM board_sessions WHERE agent_id = 's9'",
+            ]),
+            ("board_hosts", [
+                "INSERT INTO board_hosts (host, reported_at) VALUES ('h', 0)",
+                "UPDATE board_hosts SET writers = 1 WHERE host = 'h'",
+                "DELETE FROM board_hosts WHERE host = 'h'",
+            ]),
+            ("dispatches", [
+                "INSERT INTO dispatches (id, card_id, host, role, kind, worktree, state, created_at) VALUES ('d9', 't1', 'h', 'worker', 'codex', 'new', 'pending', 0)",
+                "UPDATE dispatches SET state = 'started' WHERE id = 'd9'",
+                "DELETE FROM dispatches WHERE id = 'd9'",
+            ]),
+        ];
+        for (table, statements) in writes {
+            for sql in statements {
+                let before = board_version();
+                conn.execute(sql, []).unwrap();
+                assert_eq!(board_version(), before + 1, "{table}: {sql}");
+            }
+        }
+        for refused in [
+            "INSERT INTO artifacts (id, kind, title, url, body, created_at) VALUES ('a8', 'link', 'x', 'https://x', 'b', 0)",
+            "INSERT INTO artifacts (id, kind, title, storage_host, created_at) VALUES ('a8', 'recap', 'x', 'h', 0)",
+            "INSERT INTO artifacts (id, kind, title, created_at) VALUES ('a8', 'recap', 'x', 0)",
+            "INSERT INTO card_blocks (card_id, by_id) VALUES ('t1', 't1')",
+            "UPDATE todos SET stage = 'later' WHERE id = 't1'",
+        ] {
+            assert!(conn.execute(refused, []).is_err(), "{refused}");
+        }
+        drop(conn);
         drop(store);
         for suffix in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
