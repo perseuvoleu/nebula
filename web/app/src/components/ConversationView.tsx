@@ -10,7 +10,9 @@ import { formatTime, kindLabel, statusLabel } from "@/lib/status";
 import type { SessionRow } from "@/lib/types";
 import { Composer } from "./Composer";
 import { MessageItem } from "./MessageItem";
+import { TerminalKeys } from "./TerminalKeys";
 import { TerminalView } from "./TerminalView";
+import { sessionKey } from "@/lib/session-list";
 import { SessionTabs } from "./SessionTabs";
 
 const ATTEMPT_LABEL: Record<Attempt["state"], string> = {
@@ -95,7 +97,7 @@ function ConnectionLine({ state }: { state: ConversationState }) {
   );
 }
 
-export function ConversationView({ project, previewUrl, row, state, controller, onBack, showBack, sessions, unseen, onSelect }: {
+export function ConversationView({ project, previewUrl, row, state, controller, onBack, showBack, sessions, unseen, onSelect, showProjects }: {
   project: string;
   /** Running preview published for this session’s project, or null when unavailable. */
   previewUrl: string | null;
@@ -106,6 +108,8 @@ export function ConversationView({ project, previewUrl, row, state, controller, 
   showBack: boolean;
   sessions: SessionRow[];
   unseen: Set<string>;
+  /** Label tabs with their source project in the aggregate view. */
+  showProjects: boolean;
   onSelect: (row: SessionRow) => void;
 }) {
   const session = state.session ?? row;
@@ -123,6 +127,10 @@ export function ConversationView({ project, previewUrl, row, state, controller, 
     const attempt = await controller.send(text);
     if (attempt.state === "failed" && !getDraft(key)) onDraft(text);
   };
+  // Terminal output echoes what was typed, so a delivered bubble would only sit below newer output.
+  const dismissDelivered = useCallback(() => {
+    for (const attempt of state.attempts) if (attempt.state === "accepted") controller.dismissAttempt(attempt.id);
+  }, [state.attempts, controller]);
   const retry = (attempt: Attempt) => { controller.dismissAttempt(attempt.id); void send(attempt.text); };
 
   const title = state.name || session?.name || "Sesiune";
@@ -161,7 +169,7 @@ export function ConversationView({ project, previewUrl, row, state, controller, 
           </Button>
         )}
       </header>
-      <SessionTabs sessions={sessions} selected={sessionId} unseen={unseen} onSelect={onSelect} />
+      <SessionTabs sessions={sessions} selected={sessionKey({ project, id: sessionId })} showProjects={showProjects} unseen={unseen} onSelect={onSelect} />
 
       {state.phase === "loading" && (
         <div className="flex-1 space-y-4 px-4 py-6" aria-busy="true" aria-label="Se încarcă conversația">
@@ -185,7 +193,7 @@ export function ConversationView({ project, previewUrl, row, state, controller, 
       )}
 
       {showTerminal && state.phase !== "loading" && state.phase !== "error" && (
-        <TerminalView project={project} session={sessionId} revealKey={state.attempts.length}>
+        <TerminalView project={project} session={sessionId} revealKey={state.attempts.length} onOutput={dismissDelivered}>
           {state.attempts.length > 0 && (
             <div className="mt-3 space-y-3 border-t border-border pt-3" aria-label="Mesaje trimise din acest browser">
               {state.attempts.map(attempt => <PendingAttempt key={attempt.id} attempt={attempt} snapshotOnly
@@ -200,7 +208,7 @@ export function ConversationView({ project, previewUrl, row, state, controller, 
           <ConversationContent className="mx-auto w-full max-w-[86ch] gap-5 px-4 py-4 sm:px-6">
             {state.hasMore && <LoadOlder controller={controller} loading={state.loadingOlder} />}
             {state.messages.length === 0 && state.attempts.length === 0 && (
-              <p className="py-10 text-center text-sm text-muted-foreground">Sesiunea nu are încă mesaje persistate. Pi scrie istoricul după primul răspuns.</p>
+              <p className="py-10 text-center text-sm text-muted-foreground">Sesiunea nu are încă mesaje persistate. Istoricul apare după primul răspuns.</p>
             )}
             {list}
             {state.attempts.map((attempt) => (
@@ -214,6 +222,7 @@ export function ConversationView({ project, previewUrl, row, state, controller, 
       {state.phase !== "loading" && state.phase !== "error" && (
         <>
           <ConnectionLine state={state} />
+          {state.capabilities?.terminal && <TerminalKeys project={project} session={sessionId} />}
           <Composer draft={draft} onDraft={onDraft} onSend={(text) => void send(text)} busy={sending}
             disabled={!state.capabilities?.send || state.connection === "offline"} autoFocus={!showBack} />
         </>
