@@ -102,10 +102,10 @@ test.describe("selection and structured conversation", () => {
 });
 
 test.describe("capability fallback", () => {
-  test("non-Pi agents get explicit terminal mode; a Pi session without identity is not an empty chat", async ({ page }) => {
+  test("agents without native history get explicit terminal mode instead of an empty chat", async ({ page }) => {
     await login(page, "/p/alpha/s/claude-1");
     await expect(page.getByRole("tablist", { name: "Schimbă sesiunea" })).toBeVisible();
-    await expect(page.getByTitle(/Structured history is only implemented for Pi/)).toContainText("Terminal");
+    await expect(page.getByTitle(/native session identity/)).toContainText("Terminal");
     await expect(page.getByText("Istoric păstrat de terminal")).toBeVisible();
     await expect(page.getByLabel("Output de terminal").getByText("terminal snapshot for Claude pe feature")).toBeVisible();
     await expect(page.getByRole("log")).toHaveCount(0);

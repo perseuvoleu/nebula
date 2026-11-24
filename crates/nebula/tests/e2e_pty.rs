@@ -8141,3 +8141,82 @@ async fn remote_status_reports_binary_and_skills_drift() {
     write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
     wait_for_exit(&mut daemon.0);
 }
+
+/// Mobile lists receive persistent lifecycle activity, never the time of a list request.
+#[tokio::test]
+async fn agent_list_exposes_persistent_status_activity() {
+    let env = TestEnv::new();
+    let repo = env.make_repo();
+    let mut daemon = env.spawn_daemon();
+    let mut c = connect(&env.sock()).await;
+    handshake(&mut c).await;
+    let worktree = add_project_get_main_worktree(&mut c, &repo).await;
+    let agent_id = create_agent_get_id(&mut c, &worktree.id, "activity", 2).await;
+    let session = SessionRef::Agent(agent_id.clone());
+    write_frame(
+        &mut c,
+        &ClientRequest::Attach {
+            session: session.clone(),
+            from_seq: None,
+            cols: 120,
+            rows: 30,
+        },
+    )
+    .await
+    .unwrap();
+    let mut observations = Vec::new();
+    for (progress, expected) in [
+        ("3", nebula_core::AgentStatus::Running),
+        ("0", nebula_core::AgentStatus::Finished),
+    ] {
+        write_frame(
+            &mut c,
+            &ClientRequest::Input {
+                session: session.clone(),
+                data: format!("printf '\\033]9;4;{progress};\\007'\n").into_bytes(),
+            },
+        )
+        .await
+        .unwrap();
+        let events = read_events_until(&mut c, Duration::from_secs(10), |events| {
+            events.iter().any(|event| {
+                matches!(event, ServerEvent::StatusChanged { agent, status, .. }
+                if *agent == agent_id && *status == expected)
+            })
+        })
+        .await;
+        let stamp = events
+            .iter()
+            .find_map(|event| match event {
+                ServerEvent::StatusChanged {
+                    agent,
+                    status,
+                    changed_at,
+                } if *agent == agent_id && *status == expected => Some(*changed_at),
+                _ => None,
+            })
+            .unwrap();
+        for _ in 0..2 {
+            let output = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+                .args(["agent", "list", "--project", "repo"])
+                .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
+                .env("NEBULA_DATA_DIR", env.tmp.path().join("data"))
+                .output()
+                .unwrap();
+            let rows: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            observations.push((stamp, rows[0]["status_changed_at"].as_i64()));
+        }
+    }
+    write_frame(&mut c, &ClientRequest::Shutdown).await.unwrap();
+    wait_for_exit(&mut daemon);
+    assert!(
+        observations
+            .iter()
+            .all(|(stamp, listed)| *stamp > 0 && *listed == Some(*stamp)),
+        "each poll must expose the exact persisted status event timestamp: {observations:?}"
+    );
+    assert!(
+        observations[2].0 > observations[0].0,
+        "completion must advance activity"
+    );
+}

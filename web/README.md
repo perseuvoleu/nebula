@@ -7,6 +7,15 @@ Radix, the AI Elements conversation primitive), Python 3.10+ standard-library ga
 
 ## What works
 
+- Persistent weekly Codex and Claude account quota navbar on every authenticated screen.
+  Tap for reset/freshness/errors; unavailable and stale values are explicit. Sources, caching,
+  limitations and private preview instructions: [Weekly account quotas](USAGE.md).
+- **Rulări serverless** (`/serverless`, link in the sidebar): build/test runs on Cloudflare
+  Containers — repo, ref, status, cache, instance, start, duration (live while running), upper-bound
+  cost; tap a row for its steps. Polled every 5 s while visible. The gateway reads the Worker's
+  `/runs` with `NEBULA_SERVERLESS_URL` and `NEBULA_SERVERLESS_TOKEN` (the token never reaches the
+  browser); without both, the section says it is not configured.
+
 - Explicitly enabled projects (`NEBULA_WEB_PROJECTS`), active sessions with kind, checkout,
   status and feedback requests, existing checkouts, local search.
 - **Pi sessions as real conversations**: user/assistant messages, tool activity (collapsible,
@@ -14,7 +23,17 @@ Radix, the AI Elements conversation primitive), Python 3.10+ standard-library ga
   paging, honest "agent working" state. History comes from Pi's persisted session file mapped
   by the native session id Nebula stored — never from terminal screen text. Details and
   limits: `docs/specs/mobile-chat-redesign-pi-source.md`.
-- Other agent kinds (Claude, Codex, Cursor) and Pi sessions without persisted history show an
+- **Claude sessions use their saved transcript** when Nebula has recorded the native session id.
+  The initial page contains at most 30 user/assistant text messages (120,000 characters per page,
+  40,000 per message). Scrolling upward loads older pages while preserving the reading position;
+  polling reads appended records and retains pages already loaded. This is chronological saved
+  main-session text, including retained history before compaction, not reconstructed model context.
+  Thinking, tool payloads, injected metadata, system records and sidechain/team entries are hidden.
+  Raw records larger than 2 MiB become omission notices without parsing their payloads.
+  Tool activity and interactive controls remain available through **Arată terminalul**. Claude files
+  are resolved only by the stored UUID in the selected checkout under `~/.claude/projects`;
+  `NEBULA_WEB_CLAUDE_DIR` (or `CLAUDE_CONFIG_DIR`) overrides the Claude config directory.
+- Codex/Cursor agents and Pi/Claude sessions without persisted history show an
   explicitly labelled terminal snapshot, not reconstructed chat. The default **Lectură** view
   renders its Markdown with reflowing prose; **Terminal brut** preserves the terminal text for
   logs, diffs and interactive prompts. Snapshot wrapping can already have split words or
@@ -159,6 +178,25 @@ for the earlier baseline and recovery evidence.
 Build and validate a new committed release before promotion. Preserve existing unit hardening
 and environment entries; change only deployment paths and necessary push configuration.
 Restart only `nebula-web.service`; never restart the Nebula daemon, bridge or proxy.
+
+## Deploy on leaseweb
+
+leaseweb serves code.possu.dev from the same per-SHA release layout under
+`~/.local/share/nebula/web-releases/<sha>`, run by the venv `~/.local/share/nebula/web-venv`
+(`web/requirements.txt`) and the `nebula-web.service` user unit with a
+`nebula-web.service.d/90-durable-release.conf` override naming the release. The gateway listens
+on 127.0.0.1:8765 only. Since 2026-11-24 the `cloudflared-leaseweb` tunnel carries
+code.possu.dev to it behind Cloudflare Access, and no inbound port opens. `NEBULA_WEB_PROJECTS` lists only projects
+leaseweb's daemon knows. `NEBULA_WEB_BINARY` points at `web-releases/client-<sha>/bin/nebula`,
+built from the same commit.
+
+**Rollback:** findl's `nebula-web.service` is stopped and disabled, still pinned by its drop-in to
+release 3b6189c. On findl, run `systemctl --user enable --now nebula-web` (enable keeps it up
+across a reboot) and check that
+`curl -s -o /dev/null -w '%{http_code}' -H 'Host: code.possu.dev' http://127.0.0.1:8765/` prints
+200. Only then repoint the code.possu.dev public hostname in Cloudflare back to findl's tunnel:
+service `https://127.0.0.1:443` (Traefik), origin server name `code.possu.dev`, No TLS Verify
+on, HTTP/2 origin on. The leaseweb route it replaces is `http://127.0.0.1:8765`.
 
 **The token grants agent control as the server's OS user.** Project allowlisting is an API
 scope, not an OS sandbox. Rotate a leaked token in the env file and restart only `nebula-web`.

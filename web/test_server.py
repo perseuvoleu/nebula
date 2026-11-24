@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import serverless
 from server import Gateway, Handler, Problem, PushService, StaticFiles, ThreadingHTTPServer
 from test_pi_history import SID_A, SID_B, assistant, user, write_session
 
@@ -37,7 +38,7 @@ class GatewayTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.gateway = Gateway(TOKEN, "http://127.0.0.1:8765", ["project"],
                                static=StaticFiles(make_static(Path(self.tmp.name) / "static")),
-                               pi_agent_dir=Path(self.tmp.name) / "pi")
+                               pi_agent_dir=Path(self.tmp.name) / "pi", usage_service=None)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -49,17 +50,17 @@ class GatewayTests(unittest.TestCase):
         self.assertTrue(static.lookup("/")[0].startswith(b"<!doctype"))
 
     def test_configuration(self):
-        Gateway("12345678", "https://example.com", ["p"])
+        Gateway("12345678", "https://example.com", ["p"], usage_service=None)
         for token, origin, projects in [("1234567", "https://example.com", ["p"]),
                                         (TOKEN, "http://example.com", ["p"]),
                                         (TOKEN, "https://example.com/", ["p"]),
                                         (TOKEN, "https://example.com", [])]:
             with self.assertRaises(ValueError):
-                Gateway(token, origin, projects)
+                Gateway(token, origin, projects, usage_service=None)
 
     def test_notify_token_equal_to_main_token_is_refused(self):
         with self.assertRaises(ValueError):
-            Gateway(TOKEN, "https://example.com", ["p"], notify_token=TOKEN)
+            Gateway(TOKEN, "https://example.com", ["p"], notify_token=TOKEN, usage_service=None)
 
     def test_push_subscriptions_persist_and_notify_only_on_lifecycle_transitions(self):
         sent = []
@@ -103,7 +104,7 @@ class GatewayTests(unittest.TestCase):
         preview.write_text("#!/bin/sh\nexit 0\n")
         preview.chmod(0o700)
         gateway = Gateway(TOKEN, "http://127.0.0.1:8765", ["project"],
-                          binary="/home/andrei/.local/bin/nebula", preview_binary=str(preview))
+                          binary="/home/andrei/.local/bin/nebula", preview_binary=str(preview), usage_service=None)
         with patch("server.subprocess.run", return_value=subprocess.CompletedProcess([], 0,
                    '{"domain":"demo.example.test","phase":"running","credentials":"never expose"}', "")) as run:
             self.assertEqual(gateway.get("/api/preview", {"project": ["project"]}),
@@ -119,10 +120,10 @@ class GatewayTests(unittest.TestCase):
         plain.write_text("not executable")
         for binary in ["", "nebula", "./preview", str(plain), self.tmp.name, str(plain) + "-missing"]:
             with self.subTest(binary=binary), self.assertRaises(ValueError):
-                Gateway(TOKEN, "http://127.0.0.1:8765", ["project"], preview_binary=binary)
+                Gateway(TOKEN, "http://127.0.0.1:8765", ["project"], preview_binary=binary, usage_service=None)
 
     def test_preview_fails_closed_for_bad_status_and_never_exposes_diagnostics(self):
-        gateway = Gateway(TOKEN, "http://127.0.0.1:8765", ["project"], preview_binary="/bin/true")
+        gateway = Gateway(TOKEN, "http://127.0.0.1:8765", ["project"], preview_binary="/bin/true", usage_service=None)
         invalid = [None, [], "running", {}, {"domain": "demo.example.test", "phase": []}]
         invalid += [{"domain": domain, "phase": "running"} for domain in [
             None, [], "", "localhost", "evil.test/path", "user@evil.test", "evil.test:443", "a..test",
@@ -317,7 +318,7 @@ class GatewayTests(unittest.TestCase):
         with patch.object(self.gateway, "run", side_effect=[claude]):
             result = self.gateway.get("/api/conversation", {"project": ["project"], "id": ["one"]})
         self.assertFalse(result["capabilities"]["structured"])
-        self.assertIn("terminal", result["capabilities"]["reason"])
+        self.assertIn("identity", result["capabilities"]["reason"])
 
     def test_conversation_reads_native_history_by_stored_identity(self):
         write_session(self.gateway.pi_agent_dir, "/srv/project", SID_B, [user("x1", None, "other session")])
@@ -384,7 +385,7 @@ class HTTPTests(unittest.TestCase):
         cls.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         cls.port = cls.server.server_port
         cls.origin = f"http://127.0.0.1:{cls.port}"
-        cls.server.gateway = Gateway(TOKEN, cls.origin, ["project"], static=StaticFiles(make_static(cls.tmp.name)))
+        cls.server.gateway = Gateway(TOKEN, cls.origin, ["project"], static=StaticFiles(make_static(cls.tmp.name)), usage_service=None)
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
 
@@ -406,7 +407,7 @@ class HTTPTests(unittest.TestCase):
 
     def test_shell_assets_and_route_fallback(self):
         for path in ["/", "/assets/app-abc123.js", "/manifest.webmanifest", "/icon.svg", "/sw.js",
-                     "/p/project", "/p/project/s/one"]:
+                     "/p/project", "/p/project/s/one", "/serverless"]:
             status, headers, body = self.request(path)
             self.assertEqual(status, 200, path)
             self.assertTrue(body)
@@ -425,6 +426,24 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(json.loads(body)["projects"], ["project"])
         self.assertTrue(json.loads(body)["host"])
         self.assertNotIn("Access-Control-Allow-Origin", headers)
+
+    def test_usage_is_authenticated_global_and_never_cacheable(self):
+        self.assertEqual(self.request("/api/usage")[0], 401)
+        status, headers, body = self.request("/api/usage?project=not-enabled", headers=self.auth())
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertEqual(set(json.loads(body)), {"codex", "claude"})
+        self.assertEqual(self.request("/api/usage", headers=self.auth(Origin="https://evil.example"))[0], 403)
+
+    def test_serverless_runs_are_authenticated_and_explicit_when_unconfigured(self):
+        self.assertEqual(self.request("/api/serverless/runs")[0], 401)
+        status, headers, body = self.request("/api/serverless/runs", headers=self.auth())
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertEqual(json.loads(body), {"configured": False, "runs": []})
+        with patch.object(self.server.gateway, "serverless", serverless.ServerlessRuns("http://127.0.0.1:1", "cf-secret")):
+            status, _, body = self.request("/api/serverless/runs?limit=5", headers=self.auth())
+        self.assertEqual((status, json.loads(body)), (502, {"error": "Worker-ul serverless nu poate fi contactat"}))
 
     def test_wrong_host_and_origin(self):
         self.assertEqual(self.request("/", headers={"Host": "evil.example"})[0], 403)
@@ -466,7 +485,7 @@ class NotifyTests(unittest.TestCase):
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.origin = f"http://127.0.0.1:{self.server.server_port}"
         self.server.gateway = Gateway(TOKEN, self.origin, ["project"], static=StaticFiles(make_static(self.tmp.name)),
-                                      push=self.push, notify_token=NOTIFY_TOKEN)
+                                      push=self.push, notify_token=NOTIFY_TOKEN, usage_service=None)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
 
