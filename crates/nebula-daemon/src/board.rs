@@ -786,6 +786,13 @@ struct Links {
     closed_at: HashMap<String, Instant>,
 }
 
+impl Links {
+    fn down(&self, host: &str, after: Duration) -> bool {
+        self.open.get(host).copied().unwrap_or(0) == 0
+            && self.closed_at.get(host).copied().unwrap_or(*BOOT).elapsed() >= after
+    }
+}
+
 static LINKS: std::sync::LazyLock<Mutex<Links>> = std::sync::LazyLock::new(Default::default);
 static BOOT: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
 
@@ -797,10 +804,14 @@ pub(crate) fn boot(store: Arc<Store>) {
     });
 }
 
-pub(crate) fn link_opened(host: &str) {
+/// True when `host` read stale until this link opened: the caller bumps
+/// the board version so a poll sees it fresh again.
+pub(crate) fn link_opened(host: &str) -> bool {
     let mut links = LINKS.lock().unwrap();
+    let was_stale = links.down(host, stale_after());
     *links.open.entry(host.to_string()).or_default() += 1;
     links.closed_at.remove(host);
+    was_stale
 }
 
 pub(crate) fn link_closed(host: &str, store: Arc<Store>) {
@@ -823,14 +834,15 @@ pub(crate) fn link_closed(host: &str, store: Arc<Store>) {
     });
 }
 
-async fn bump(store: Arc<Store>) {
-    let bumped = tokio::task::spawn_blocking(move || {
-        store.board_transaction(|tx| {
-            tx.execute("UPDATE board_meta SET version = version + 1", [])?;
-            Ok(())
-        })
+pub(crate) fn bump_now(store: &Store) -> Result<()> {
+    store.board_transaction(|tx| {
+        tx.execute("UPDATE board_meta SET version = version + 1", [])?;
+        Ok(())
     })
-    .await;
+}
+
+async fn bump(store: Arc<Store>) {
+    let bumped = tokio::task::spawn_blocking(move || bump_now(&store)).await;
     if let Ok(Err(e)) = bumped {
         tracing::warn!(error = %e, "board version bump failed");
     }
@@ -844,18 +856,8 @@ fn stale_hosts(tx: &Transaction) -> Result<HashSet<String>> {
     let links = LINKS.lock().unwrap();
     let here = nebula_core::host::hostname();
     let after = stale_after();
-    let down = |host: &str| {
-        links.open.get(host).copied().unwrap_or(0) == 0
-            && links
-                .closed_at
-                .get(host)
-                .copied()
-                .unwrap_or(*BOOT)
-                .elapsed()
-                >= after
-    };
     Ok(known
         .into_iter()
-        .filter(|h| *h != here && down(h))
+        .filter(|h| *h != here && links.down(h, after))
         .collect())
 }

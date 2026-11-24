@@ -140,8 +140,9 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         tokio::spawn(async move { link.forward(req_id, op, &client).await });
                         continue;
                     }
+                    let mut refreshed = false;
                     if let (Some(_), nebula_core::board::BoardOp::Report(report), None) = (&board, &op, &reporting) {
-                        crate::board::link_opened(&report.host);
+                        refreshed = crate::board::link_opened(&report.host);
                         reporting = Some(report.host.clone());
                     }
                     let daemon = daemon.clone();
@@ -150,6 +151,8 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         let served = tokio::task::spawn_blocking(move || {
                             match board {
                                 None => Err(anyhow::anyhow!("no board configured")),
+                                Some(_) if refreshed => crate::board::bump_now(&daemon.store)
+                                    .and_then(|()| crate::board::serve(&daemon.store, op)),
                                 Some(_) => crate::board::serve(&daemon.store, op),
                             }
                         })
