@@ -9,6 +9,7 @@ mod upgrade;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use nebula_core::board::{Role, Stage};
 
 #[derive(Parser)]
 #[command(
@@ -146,9 +147,8 @@ enum Command {
         #[command(subcommand)]
         command: Option<NotesCommand>,
     },
-    /// Read or edit the todos for the current project/worktree — a task
-    /// list separate from notes, each todo holding its own notes (agents
-    /// can too — inside a session the target is the session's own project).
+    /// Cards on the board: add, move and work them (--json for agents).
+    /// A daemon without a `board` key refuses every card verb.
     Todo {
         #[command(subcommand)]
         command: Option<TodoCommand>,
@@ -418,6 +418,19 @@ enum AgentCommand {
         /// use; other kinds ignore it.
         #[arg(long)]
         no_code_mode: bool,
+        /// The board card the session works on (#12, 12 or a ULID); a card
+        /// the board does not have refuses before anything spawns.
+        #[arg(long, value_name = "REF", conflicts_with = "no_card")]
+        card: Option<String>,
+        /// Link the session to no card.
+        #[arg(long)]
+        no_card: bool,
+        /// worker, review, fix, verify or research.
+        #[arg(long, value_parser = parse_role)]
+        role: Option<Role>,
+        /// Accepted for symmetry with the board verbs; the output is JSON anyway.
+        #[arg(long)]
+        json: bool,
     },
     /// Block until workers settle out of running (finished, needs_feedback,
     /// terminated…), then print the settled ones as JSON — `agent list`'s
@@ -632,38 +645,184 @@ enum NotesCommand {
 
 #[derive(Subcommand)]
 enum TodoCommand {
-    /// List the project's todos, then the current worktree's (the default).
-    List,
-    /// Add a todo to the project's list (--worktree for the checkout's own).
+    /// Add a card to the board (default project: the caller's own).
     Add {
-        /// The todo; multiple words need no quotes.
+        /// The card's title; multiple words need no quotes.
         #[arg(required = true, num_args = 1..)]
-        text: Vec<String>,
-        /// Add to the current worktree's list instead of the project's.
+        title: Vec<String>,
+        /// Project name.
+        #[arg(long, conflicts_with = "home")]
+        project: Option<String>,
+        /// A home card, in no project.
         #[arg(long)]
-        worktree: bool,
+        home: bool,
+        #[arg(long, default_value = "backlog", value_parser = parse_stage)]
+        stage: Stage,
+        /// Propose it: it waits in the proposal tray until accepted.
+        #[arg(long)]
+        propose: bool,
+        /// The card's ULID, so a rerun of the same add creates nothing twice.
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
-    /// Check a todo off, by its number in `nebula todo list`.
-    Done { index: usize },
-    /// Bring a checked-off todo back.
-    Reopen { index: usize },
-    /// One todo with its notes, by its number in `nebula todo list`.
-    Show { index: usize },
-    /// Add a note under a todo.
+    /// Change a card's title or project.
+    Edit {
+        card: String,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long, conflicts_with = "home")]
+        project: Option<String>,
+        /// Make it a home card.
+        #[arg(long)]
+        home: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Move a card: backlog, next, doing, review or done. Exits 6 when
+    /// --expect is set and the card has left that stage.
+    Move {
+        card: String,
+        #[arg(value_parser = parse_stage)]
+        stage: Stage,
+        #[arg(long, value_parser = parse_stage)]
+        expect: Option<Stage>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Archive a card; its number stays reserved.
+    Archive {
+        card: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Accept a proposed card onto the board.
+    Accept {
+        card: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Dismiss a proposed card (archives it).
+    Dismiss {
+        card: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Append to a card's log, as the caller.
     Note {
-        /// The todo's number in `nebula todo list`.
-        index: usize,
+        card: String,
         /// The note; multiple words need no quotes.
         #[arg(required = true, num_args = 1..)]
         text: Vec<String>,
+        /// The note's ULID, so a rerun adds nothing twice.
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
-    /// Check a todo's note off (numbers from `nebula todo show <n>`).
+    /// Mark a card blocked by another; self-blocks and cycles exit 6.
+    Block {
+        card: String,
+        #[arg(long)]
+        by: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a block.
+    Unblock {
+        card: String,
+        #[arg(long)]
+        by: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List cards (default: the caller's project, else every card).
+    List {
+        #[command(flatten)]
+        scope: ScopeArgs,
+        #[arg(long, value_parser = parse_stage)]
+        stage: Option<Stage>,
+        /// Archived cards too.
+        #[arg(long)]
+        archived: bool,
+        /// Continue from a previous reply's `next`.
+        #[arg(long)]
+        page: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// One card with its sessions, artifacts and log. Exits 5 when no card
+    /// in scope has that ref.
+    Show {
+        card: String,
+        #[command(flatten)]
+        scope: ScopeArgs,
+        #[arg(long)]
+        json: bool,
+    },
+    /// The board: cards, hosts and the away digest. With --since it answers
+    /// {"version","unchanged":true} when nothing changed.
+    Board {
+        #[command(flatten)]
+        scope: ScopeArgs,
+        /// A `version` from an earlier reply.
+        #[arg(long)]
+        since: Option<String>,
+        /// Epoch ms of the viewer's last visit, for the away digest.
+        #[arg(long)]
+        away_since: Option<i64>,
+        /// Continue from a previous reply's `next`; exits 6 once the board
+        /// has changed since that page.
+        #[arg(long)]
+        page: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Check a legacy todo off, by its number in the old todo list.
+    Done { index: usize },
+    /// Bring a checked-off legacy todo back.
+    Reopen { index: usize },
+    /// Check a legacy todo's note off.
     NoteDone {
-        /// The todo's number in `nebula todo list`.
+        /// The todo's number in the old todo list.
         index: usize,
-        /// The note's number in `nebula todo show <index>`.
+        /// The note's number under it.
         note: usize,
     },
+}
+
+#[derive(clap::Args)]
+struct ScopeArgs {
+    /// Only these projects (repeat for more).
+    #[arg(long)]
+    project: Vec<String>,
+    /// Every project.
+    #[arg(long, conflicts_with = "project")]
+    all: bool,
+    /// Home cards (no project) too.
+    #[arg(long)]
+    include_home: bool,
+}
+
+impl From<ScopeArgs> for nebula_tui::board_cli::ScopeFlags {
+    fn from(args: ScopeArgs) -> Self {
+        Self {
+            projects: args.project,
+            all: args.all,
+            include_home: args.include_home,
+        }
+    }
+}
+
+fn parse_stage(text: &str) -> Result<Stage, String> {
+    Stage::parse(text)
+        .ok_or_else(|| format!("{text:?} is not a stage (backlog, next, doing, review, done)"))
+}
+
+fn parse_role(text: &str) -> Result<Role, String> {
+    Role::parse(text)
+        .ok_or_else(|| format!("{text:?} is not a role (worker, review, fix, verify, research)"))
 }
 
 #[derive(Subcommand)]
@@ -845,6 +1004,9 @@ fn main() -> Result<()> {
                 writer_wait,
                 force_writer,
                 no_code_mode,
+                card,
+                role,
+                ..
             } => nebula_tui::run_agent_new(nebula_tui::NewAgentOpts {
                 worktree,
                 project,
@@ -860,6 +1022,8 @@ fn main() -> Result<()> {
                 },
                 writer_wait: std::time::Duration::from_secs(writer_wait),
                 code_mode_off: no_code_mode,
+                card,
+                role,
             }),
             AgentCommand::Wait {
                 names,
@@ -941,23 +1105,137 @@ fn main() -> Result<()> {
             nebula_tui::run_notes(op)
         }
         Some(Command::Todo { command }) => {
+            use nebula_tui::board_cli::TodoVerb;
             use nebula_tui::TodoOp;
-            let op = match command {
-                None | Some(TodoCommand::List) => TodoOp::List,
-                Some(TodoCommand::Add { text, worktree }) => TodoOp::Add {
-                    text: text.join(" "),
-                    worktree,
-                },
-                Some(TodoCommand::Done { index }) => TodoOp::Done { index },
-                Some(TodoCommand::Reopen { index }) => TodoOp::Reopen { index },
-                Some(TodoCommand::Show { index }) => TodoOp::Show { index },
-                Some(TodoCommand::Note { index, text }) => TodoOp::NoteAdd {
-                    index,
-                    text: text.join(" "),
-                },
-                Some(TodoCommand::NoteDone { index, note }) => TodoOp::NoteDone { index, note },
+            let legacy = |op| nebula_tui::run_todo(op);
+            let (verb, json) = match command {
+                Some(TodoCommand::Done { index }) => return legacy(TodoOp::Done { index }),
+                Some(TodoCommand::Reopen { index }) => return legacy(TodoOp::Reopen { index }),
+                Some(TodoCommand::NoteDone { index, note }) => {
+                    return legacy(TodoOp::NoteDone { index, note })
+                }
+                None => (
+                    TodoVerb::List {
+                        scope: Default::default(),
+                        stage: None,
+                        archived: false,
+                        page: None,
+                    },
+                    false,
+                ),
+                Some(TodoCommand::Add {
+                    title,
+                    project,
+                    home,
+                    stage,
+                    propose,
+                    id,
+                    json,
+                }) => (
+                    TodoVerb::Add {
+                        title: title.join(" "),
+                        project,
+                        home,
+                        stage,
+                        propose,
+                        id,
+                    },
+                    json,
+                ),
+                Some(TodoCommand::Edit {
+                    card,
+                    title,
+                    project,
+                    home,
+                    json,
+                }) => (
+                    TodoVerb::Edit {
+                        card,
+                        title,
+                        project,
+                        home,
+                    },
+                    json,
+                ),
+                Some(TodoCommand::Move {
+                    card,
+                    stage,
+                    expect,
+                    json,
+                }) => (
+                    TodoVerb::Move {
+                        card,
+                        stage,
+                        expect,
+                    },
+                    json,
+                ),
+                Some(TodoCommand::Archive { card, json }) => (TodoVerb::Archive { card }, json),
+                Some(TodoCommand::Accept { card, json }) => (TodoVerb::Accept { card }, json),
+                Some(TodoCommand::Dismiss { card, json }) => (TodoVerb::Dismiss { card }, json),
+                Some(TodoCommand::Note {
+                    card,
+                    text,
+                    id,
+                    json,
+                }) => (
+                    TodoVerb::Note {
+                        card,
+                        text: text.join(" "),
+                        id,
+                    },
+                    json,
+                ),
+                Some(TodoCommand::Block { card, by, json }) => {
+                    (TodoVerb::Block { card, by, on: true }, json)
+                }
+                Some(TodoCommand::Unblock { card, by, json }) => (
+                    TodoVerb::Block {
+                        card,
+                        by,
+                        on: false,
+                    },
+                    json,
+                ),
+                Some(TodoCommand::List {
+                    scope,
+                    stage,
+                    archived,
+                    page,
+                    json,
+                }) => (
+                    TodoVerb::List {
+                        scope: scope.into(),
+                        stage,
+                        archived,
+                        page,
+                    },
+                    json,
+                ),
+                Some(TodoCommand::Show { card, scope, json }) => (
+                    TodoVerb::Show {
+                        card,
+                        scope: scope.into(),
+                    },
+                    json,
+                ),
+                Some(TodoCommand::Board {
+                    scope,
+                    since,
+                    away_since,
+                    page,
+                    json,
+                }) => (
+                    TodoVerb::Board {
+                        scope: scope.into(),
+                        since,
+                        away_since,
+                        page,
+                    },
+                    json,
+                ),
             };
-            nebula_tui::run_todo(op)
+            nebula_tui::run_board(verb, json)
         }
         Some(Command::Kill) => nebula_tui::run_kill(),
         Some(Command::Rename { title, force }) => nebula_tui::run_rename(title.join(" "), force),

@@ -3,6 +3,8 @@
 //! connection pool.
 
 use anyhow::{Context, Result};
+use nebula_core::board::Role;
+use nebula_core::DispatchId;
 use nebula_core::{
     Agent, AgentId, AgentKind, AgentStatus, Link, LinkId, Note, NoteId, NoteOwner, PrSeen, Project,
     ProjectId, TerminalId, TerminalTab, Todo, TodoId, TodoOwner, Workspace, WorkspaceId, Worktree,
@@ -481,7 +483,26 @@ impl Store {
             .with_context(|| format!("migration {}", i + 1))?;
         }
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // Migration 29 is static SQL, so it can only mint a hex board id;
+        // the board cursor wants a ULID like every other id.
+        conn.execute(
+            "UPDATE board_meta SET board_id = ?1 WHERE length(board_id) <> 26",
+            params![ulid::Ulid::generate().to_string()],
+        )?;
         Ok(())
+    }
+
+    /// One board op as one immediate transaction: its reads see a single
+    /// version and its writes bump it together.
+    pub fn board_transaction<T>(
+        &self,
+        f: impl FnOnce(&rusqlite::Transaction) -> Result<T>,
+    ) -> Result<T> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let out = f(&tx)?;
+        tx.commit()?;
+        Ok(out)
     }
 
     // ---- workspaces ----
@@ -743,8 +764,8 @@ impl Store {
     /// clients never see it, they only observe the eventual rename.
     pub fn insert_agent_with_auto_title(&self, a: &Agent, auto_title: bool) -> Result<()> {
         self.conn.lock().unwrap().execute(
-            "INSERT INTO agents (id, worktree_id, name, status, archived, archived_at, pinned, kind, claude_session_id, sort_order, created_at, status_changed_at, model, effort, auto_title_pending, branch, writer, spawned_by, code_mode_off)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+            "INSERT INTO agents (id, worktree_id, name, status, archived, archived_at, pinned, kind, claude_session_id, sort_order, created_at, status_changed_at, model, effort, auto_title_pending, branch, writer, spawned_by, code_mode_off, card_id, role, dispatch_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
             params![
                 a.id.as_str(),
                 a.worktree_id.as_str(),
@@ -764,7 +785,10 @@ impl Store {
                 a.branch,
                 a.writer as i64,
                 a.spawned_by.as_ref().map(AgentId::as_str),
-                a.code_mode_off as i64
+                a.code_mode_off as i64,
+                a.card_id.as_ref().map(TodoId::as_str),
+                a.role.map(|r| r.as_str()),
+                a.dispatch_id.as_ref().map(DispatchId::as_str)
             ],
         )?;
         Ok(())
@@ -1136,7 +1160,7 @@ impl Store {
     pub fn load_notes(&self) -> Result<Vec<Note>> {
         let conn = self.conn.lock().unwrap();
         let notes = conn
-            .prepare("SELECT id, project_id, worktree_id, todo_id, text, done, sort_order FROM notes ORDER BY COALESCE(project_id, worktree_id, todo_id), sort_order, created_at")?
+            .prepare("SELECT id, project_id, worktree_id, todo_id, text, done, sort_order FROM notes WHERE author IS NULL ORDER BY COALESCE(project_id, worktree_id, todo_id), sort_order, created_at")?
             .query_map([], |r| {
                 Ok(Note {
                     id: NoteId(r.get(0)?),
@@ -1255,7 +1279,7 @@ impl Store {
     pub fn load_todos(&self) -> Result<Vec<Todo>> {
         let conn = self.conn.lock().unwrap();
         let todos = conn
-            .prepare("SELECT id, project_id, worktree_id, text, done, sort_order FROM todos ORDER BY COALESCE(project_id, worktree_id), sort_order, created_at")?
+            .prepare("SELECT id, project_id, worktree_id, text, done, sort_order FROM todos WHERE stage IS NULL ORDER BY COALESCE(project_id, worktree_id), sort_order, created_at")?
             .query_map([], |r| {
                 Ok(Todo {
                     id: TodoId(r.get(0)?),
@@ -1422,7 +1446,7 @@ impl Store {
     pub fn get_agent(&self, id: &AgentId) -> Result<Option<Agent>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, worktree_id, name, status, archived, pinned, kind, claude_session_id, sort_order, status_changed_at, model, effort, archived_at, branch, writer, spawned_by, code_mode_off FROM agents WHERE id = ?1",
+            "SELECT id, worktree_id, name, status, archived, pinned, kind, claude_session_id, sort_order, status_changed_at, model, effort, archived_at, branch, writer, spawned_by, code_mode_off, card_id, role, dispatch_id FROM agents WHERE id = ?1",
         )?;
         let mut rows = stmt.query(params![id.as_str()])?;
         Ok(rows.next()?.map(|r| Agent {
@@ -1444,9 +1468,12 @@ impl Store {
             branch: r.get(13).unwrap(),
             writer: r.get::<_, i64>(14).unwrap() != 0,
             spawned_by: r.get::<_, Option<String>>(15).unwrap().map(AgentId),
-            card_id: None,
-            role: None,
-            dispatch_id: None,
+            card_id: r.get::<_, Option<String>>(17).unwrap().map(TodoId),
+            role: r
+                .get::<_, Option<String>>(18)
+                .unwrap()
+                .and_then(|r| Role::parse(&r)),
+            dispatch_id: r.get::<_, Option<String>>(19).unwrap().map(DispatchId),
             code_mode_off: r.get::<_, i64>(16).unwrap() != 0,
         }))
     }
@@ -1544,7 +1571,7 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let agents = conn
-            .prepare("SELECT id, worktree_id, name, status, archived, pinned, kind, claude_session_id, sort_order, status_changed_at, model, effort, archived_at, branch, writer, spawned_by, code_mode_off FROM agents ORDER BY sort_order, created_at")?
+            .prepare("SELECT id, worktree_id, name, status, archived, pinned, kind, claude_session_id, sort_order, status_changed_at, model, effort, archived_at, branch, writer, spawned_by, code_mode_off, card_id, role, dispatch_id FROM agents ORDER BY sort_order, created_at")?
             .query_map([], |r| {
                 Ok(Agent {
                     id: AgentId(r.get(0)?),
@@ -1564,9 +1591,9 @@ impl Store {
                     branch: r.get(13)?,
                     writer: r.get::<_, i64>(14)? != 0,
                     spawned_by: r.get::<_, Option<String>>(15)?.map(AgentId),
-                    card_id: None,
-                    role: None,
-                    dispatch_id: None,
+                    card_id: r.get::<_, Option<String>>(17)?.map(TodoId),
+                    role: r.get::<_, Option<String>>(18)?.and_then(|r| Role::parse(&r)),
+                    dispatch_id: r.get::<_, Option<String>>(19)?.map(DispatchId),
                     code_mode_off: r.get::<_, i64>(16)? != 0,
                 })
             })?

@@ -32,6 +32,9 @@ pub struct Config {
     /// sessions a client is attached to are never archived. Malformed
     /// values fall back to the default.
     pub auto_archive_after: String,
+    /// Where the board lives: "local" serves it from this daemon; unset
+    /// refuses every board verb with "no board configured".
+    pub board: Option<String>,
 }
 
 impl Default for Config {
@@ -42,6 +45,7 @@ impl Default for Config {
             seed_node_modules: true,
             session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT.into(),
             auto_archive_after: DEFAULT_AUTO_ARCHIVE_AFTER.into(),
+            board: None,
         }
     }
 }
