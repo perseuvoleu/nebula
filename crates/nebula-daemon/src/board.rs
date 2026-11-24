@@ -187,6 +187,23 @@ fn begin_run(tx: &Transaction, dispatch: Dispatch) -> Result<RunReceipt> {
         if known.state != DispatchState::Pending {
             return Ok(known.clone());
         }
+        let launched: Option<(String, Option<String>, String)> = tx
+            .query_row(
+                "SELECT agent_id, role, kind FROM board_sessions
+                 WHERE dispatch_id = ?1 AND card_id = ?2 AND host = ?3 COLLATE NOCASE",
+                params![dispatch.id.as_str(), card.as_str(), host],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        if let Some((agent, role, kind)) = launched {
+            if role.as_deref() != Some(dispatch.role.as_str()) || kind != dispatch.kind.as_str() {
+                bail!(Refusal::Conflict.message(format!(
+                    "dispatch {} started {agent} with another role or kind",
+                    dispatch.id.as_str()
+                )));
+            }
+            return end_run(tx, &dispatch.id, Some(AgentId(agent)), None);
+        }
     }
     let found = card_by_id(tx, &card)?;
     if found.archived {

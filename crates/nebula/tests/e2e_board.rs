@@ -2487,6 +2487,38 @@ fn run_recovery_matches_role_and_kind() {
     assert_eq!(agents_of(&env).len(), 2);
 }
 
+#[test]
+fn run_lost_end_reconciles_before_card_checks() {
+    let env = board_env();
+    env.make_repo();
+    let shelved = add(&env, &["--project", "repo"], "Shelved");
+    add(&env, &["--project", "repo"], "Blocker");
+    let blocked = add(&env, &["--project", "repo"], "Blocked");
+    let (first, second) = (TodoId::generate().0, TodoId::generate().0);
+    begin_run(&env, &shelved, &first, "main");
+    begin_run(&env, &blocked, &second, "main");
+    let spawned = [
+        lost_spawn(&env, "#1", &first),
+        lost_spawn(&env, "#3", &second),
+    ];
+    for (card, agent) in [("#1", &spawned[0]), ("#3", &spawned[1])] {
+        eventually("the launched session on its card", || {
+            chain(&env, card)
+                .iter()
+                .any(|s| s["id"] == agent["id"])
+                .then_some(())
+        });
+    }
+    env.json(&["todo", "archive", "#1", "--json"]);
+    env.json(&["todo", "block", "#3", "--by", "#2", "--json"]);
+    for (card, dispatch, agent) in [("#1", &first, &spawned[0]), ("#3", &second, &spawned[1])] {
+        let rerun = receipt(run_card(&env, card, &["--dispatch", dispatch]));
+        assert_eq!(rerun["state"], "started", "{card}");
+        assert_eq!(rerun["session"]["id"], agent["id"], "{card}");
+    }
+    assert_eq!(agents_of(&env).len(), 2);
+}
+
 fn session_row(env: &Env, id: &str) -> Value {
     agents_of(env).into_iter().find(|a| a["id"] == id).unwrap()
 }
