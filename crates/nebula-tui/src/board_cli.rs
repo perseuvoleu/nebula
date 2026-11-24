@@ -86,7 +86,6 @@ impl Caller {
     }
 }
 
-/// The scope flags a read takes.
 #[derive(Default)]
 pub struct ScopeFlags {
     pub projects: Vec<String>,
@@ -95,8 +94,6 @@ pub struct ScopeFlags {
 }
 
 impl ScopeFlags {
-    /// With no flags, `fallback` answers: the caller's project for a list,
-    /// everything for a lookup by ref.
     fn scope(self, fallback: Option<&str>) -> BoardScope {
         let projects = match (self.all, self.projects.is_empty(), fallback) {
             (true, _, _) => ProjectScope::All,
@@ -195,7 +192,6 @@ async fn connect() -> Result<Connection> {
     ipc::handshake(stream).await
 }
 
-/// One Board request and its reply on `conn`.
 pub async fn request(conn: &mut Connection, op: BoardOp) -> Result<BoardResult> {
     let req_id = 1;
     write_frame(&mut conn.stream, &ClientRequest::Board { req_id, op }).await?;

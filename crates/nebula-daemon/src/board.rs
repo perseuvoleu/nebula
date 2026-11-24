@@ -340,7 +340,6 @@ fn in_scope(scope: &BoardScope, project: Option<&str>) -> bool {
     }
 }
 
-/// Every card in scope, by number.
 fn scoped_cards(
     tx: &Transaction,
     scope: &BoardScope,
@@ -384,8 +383,6 @@ fn page_offset(page: Option<&str>, version: &str) -> Result<usize> {
     }
 }
 
-/// The cards from `offset` that fit the page budget (at least one), and
-/// the continuation when some are left.
 fn paged<T: serde::Serialize>(
     items: Vec<T>,
     offset: usize,
@@ -554,8 +551,6 @@ fn hosts(tx: &Transaction) -> Result<Vec<BoardHost>> {
         .collect::<rusqlite::Result<_>>()?)
 }
 
-/// What happened on the scoped board after `since`: cards that reached
-/// review or done, sessions waiting on the user, decisions taken.
 fn away(tx: &Transaction, scope: &BoardScope, cards: &[Card], since: i64) -> Result<Away> {
     let changed_after = |id: &TodoId| -> Result<bool> {
         Ok(tx.query_row(
