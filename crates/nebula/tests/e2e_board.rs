@@ -21,6 +21,7 @@ const LIVE_SESSION_ENV: [&str; 4] = [
 struct Env {
     tmp: tempfile::TempDir,
     daemon: Option<Child>,
+    host: Option<String>,
 }
 
 impl Drop for Env {
@@ -37,7 +38,19 @@ impl Env {
         Self {
             tmp: tempfile::tempdir().unwrap(),
             daemon: None,
+            host: None,
         }
+    }
+
+    fn on_host(mut self, host: &str) -> Self {
+        self.host = Some(host.into());
+        self
+    }
+
+    fn host_name(&self) -> String {
+        self.host
+            .clone()
+            .unwrap_or_else(nebula_core::host::hostname)
     }
 
     fn runtime_dir(&self) -> PathBuf {
@@ -73,6 +86,9 @@ impl Env {
             .env("NEBULA_RAG_LOCAL", "1")
             .env("CF_ACCOUNT_ID", "")
             .env("CF_AI_TOKEN", "");
+        if let Some(host) = &self.host {
+            cmd.env("NEBULA_HOSTNAME", host);
+        }
         for (k, v) in envs {
             cmd.env(k, v);
         }
@@ -82,6 +98,10 @@ impl Env {
     }
 
     fn cli(&self, args: &[&str], agent: Option<&str>) -> Output {
+        self.cli_env(args, agent, &[])
+    }
+
+    fn cli_env(&self, args: &[&str], agent: Option<&str>, envs: &[(&str, &str)]) -> Output {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_nebula"));
         cmd.args(args)
             .env("NEBULA_RUNTIME_DIR", self.runtime_dir())
@@ -93,7 +113,27 @@ impl Env {
         if let Some(id) = agent {
             cmd.env("NEBULA_AGENT_ID", id);
         }
+        if let Some(host) = &self.host {
+            cmd.env("NEBULA_HOSTNAME", host);
+        }
+        for (k, v) in envs {
+            cmd.env(k, v);
+        }
         cmd.output().unwrap()
+    }
+
+    fn spawn_cli(&self, args: &[String]) -> Child {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_nebula"));
+        cmd.args(args)
+            .env("NEBULA_RUNTIME_DIR", self.runtime_dir())
+            .env("NEBULA_DATA_DIR", self.data_dir())
+            .current_dir(self.tmp.path())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for k in LIVE_SESSION_ENV {
+            cmd.env_remove(k);
+        }
+        cmd.spawn().unwrap()
     }
 
     fn json(&self, args: &[&str]) -> Value {
@@ -2184,23 +2224,69 @@ fn link_lost_note_without_id_names_it() {
 }
 
 fn run_card(env: &Env, card: &str, extra: &[&str]) -> Output {
-    let host = nebula_core::host::hostname();
-    let mut argv = vec![
-        "todo",
-        "run",
-        card,
-        "--role",
-        "worker",
-        "--kind",
-        "claude",
-        "--host",
-        &host,
-        "--worktree",
-        "main",
-        "--json",
+    run_card_as(env, card, &[], extra)
+}
+
+fn run_argv(env: &Env, card: &str, set: &[(&str, &str)], extra: &[&str]) -> Vec<String> {
+    let host = env.host_name();
+    let mut flags = vec![
+        ("--role", "worker"),
+        ("--kind", "claude"),
+        ("--host", host.as_str()),
+        ("--worktree", "main"),
     ];
-    argv.extend_from_slice(extra);
-    env.cli(&argv, None)
+    for (flag, value) in set {
+        flags.iter_mut().find(|f| f.0 == *flag).unwrap().1 = value;
+    }
+    let mut argv: Vec<String> = ["todo", "run", card, "--json"].map(String::from).to_vec();
+    for (flag, value) in flags {
+        argv.extend([flag.to_string(), value.to_string()]);
+    }
+    argv.extend(extra.iter().map(|s| s.to_string()));
+    argv
+}
+
+fn run_card_as(env: &Env, card: &str, set: &[(&str, &str)], extra: &[&str]) -> Output {
+    let argv = run_argv(env, card, set, extra);
+    env.cli(&argv.iter().map(String::as_str).collect::<Vec<_>>(), None)
+}
+
+fn begin_run(env: &Env, card: &Value, dispatch: &str, worktree: &str) {
+    let begun = board_op(
+        env,
+        BoardOp::BeginRun(Dispatch {
+            id: DispatchId(dispatch.into()),
+            card: CardRef::Id(TodoId(card["id"].as_str().unwrap().into())),
+            host: env.host_name(),
+            role: Role::Worker,
+            kind: AgentKind::Claude,
+            worktree: worktree.into(),
+        }),
+    )
+    .expect("the board begins a run");
+    let BoardResult::Run(begun) = begun else {
+        panic!("BeginRun answered {begun:?}");
+    };
+    assert_eq!(begun.state, DispatchState::Pending);
+}
+
+fn lost_spawn(env: &Env, card: &str, dispatch: &str) -> Value {
+    json_of(
+        spawn_agent(
+            env,
+            &[
+                "--card",
+                card,
+                "--role",
+                "worker",
+                "--dispatch",
+                dispatch,
+                "--name",
+                "lost",
+            ],
+        ),
+        &["agent", "new", "--dispatch", dispatch],
+    )
 }
 
 fn receipt(out: Output) -> Value {
@@ -2352,18 +2438,41 @@ fn approve_checks_status_timestamp() {
     );
     let env = Env::new();
     env.board_local();
+    let input = env.tmp.path().join("input.log");
     let env = env.start(&[
         ("NEBULA_AGENT_CMD", agent.as_str()),
         ("NEBULA_STATUS_TICK_MS", "100"),
+        ("REPLAY_INPUT_LOG", input.to_str().unwrap()),
     ]);
+    let inputs = || {
+        std::fs::read_to_string(&input)
+            .map(|log| log.lines().count())
+            .unwrap_or(0)
+    };
     env.make_repo();
     add(&env, &["--project", "repo"], "Ask");
     let run = receipt(run_card(&env, "#1", &[]));
     let session = run["session"]["id"].as_str().unwrap().to_string();
-    let name = session_row(&env, &session)["name"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let approve = |at: i64, scope: &[&str]| {
+        let at = at.to_string();
+        let mut argv = vec![
+            "todo",
+            "approve",
+            "#1",
+            "--session",
+            &session,
+            "--expected-status-at",
+            &at,
+            "--json",
+        ];
+        argv.extend_from_slice(scope);
+        env.cli(&argv, None)
+    };
+    let fresh = session_row(&env, &session);
+    let not_asking = approve(fresh["status_changed_at"].as_i64().unwrap(), &[]);
+    assert_eq!(not_asking.status.code(), Some(6), "{}", stderr(&not_asking));
+    assert_eq!(inputs(), 0, "a session that asked nothing got the key");
+    let name = fresh["name"].as_str().unwrap().to_string();
     for text in ["go", "on"] {
         let sent = env.cli(&["agent", "send", &name, text, "--project", "repo"], None);
         assert!(sent.status.success(), "{}", stderr(&sent));
@@ -2379,36 +2488,33 @@ fn approve_checks_status_timestamp() {
             .any(|s| s["id"] == session.as_str() && s["status_changed_at"] == at)
             .then_some(())
     });
-    let approve = |at: i64| {
-        env.cli(
-            &[
-                "todo",
-                "approve",
-                "#1",
-                "--session",
-                &session,
-                "--expected-status-at",
-                &at.to_string(),
-                "--json",
-            ],
-            None,
-        )
-    };
-    let stale = approve(at - 1);
-    assert_eq!(stale.status.code(), Some(6), "{}", stderr(&stale));
-    let current = approve(at);
+    let before = eventually("both prompts read", || (inputs() == 2).then_some(2));
+    for (stamp, scope) in [(at - 1, &[][..]), (at, &["--include-home"][..])] {
+        let refused = approve(stamp, scope);
+        assert!(
+            matches!(refused.status.code(), Some(5 | 6)),
+            "{scope:?}: {}",
+            stderr(&refused)
+        );
+        let row = session_row(&env, &session);
+        assert_eq!(row["status"], "needs_feedback", "{scope:?}");
+        assert_eq!(row["status_changed_at"], at, "{scope:?}");
+        assert_eq!(inputs(), before, "{scope:?}: a refused approve sent input");
+    }
+    let current = approve(at, &[]);
     assert!(current.status.success(), "{}", stderr(&current));
     eventually("the session moving on", || {
         let row = session_row(&env, &session);
         (row["status"] != "needs_feedback" && row["status_changed_at"].as_i64() > Some(at))
             .then_some(())
     });
+    assert_eq!(inputs(), before + 1);
 }
 
 #[test]
 fn cross_host_child_keeps_parent() {
     let board = board_env();
-    let here = viewer(&proxy_to(&board));
+    let here = viewer_on(&proxy_to(&board), "laptop", &[]);
     here.make_repo();
     add(&here, &["--project", "repo"], "Far work");
     let worker = json_of(
@@ -2450,9 +2556,10 @@ fn cross_host_child_keeps_parent() {
     });
     let listed = sessions.iter().find(|s| s["id"] == child["id"]).unwrap();
     assert_eq!(listed["role"], "review");
+    assert_eq!(listed["host"], "laptop");
     assert_eq!(
         listed["parent"],
-        serde_json::json!({"host": nebula_core::host::hostname(), "id": worker_id})
+        serde_json::json!({"host": "laptop", "id": worker_id})
     );
     eventually("the card in doing", || {
         (stage_of(&board, "#1") == "doing").then_some(())
@@ -2471,15 +2578,528 @@ fn cross_host_stale_after_link_down() {
         .as_str()
         .unwrap()
         .to_string();
-    eventually("the far host reading stale on a poll", || {
+    let stale_version = eventually("the far host reading stale on a poll", || {
         let polled = env.json(&["todo", "board", "--all", "--since", &version, "--json"]);
         let hosts = polled["board"]["hosts"].as_array()?.clone();
-        (far_host(&hosts)["stale"] == true).then_some(())
+        (far_host(&hosts)["stale"] == true).then(|| polled["version"].as_str().unwrap().to_string())
     });
     assert_eq!(chain(&env, "#1")[0]["stale"], true);
     report();
     assert_eq!(chain(&env, "#1")[0]["stale"], false);
     assert_eq!(far_host(&hosts_of(&env, &["--all"]))["stale"], false);
+    let polled = env.json(&[
+        "todo",
+        "board",
+        "--all",
+        "--since",
+        &stale_version,
+        "--json",
+    ]);
+    let hosts = polled["board"]["hosts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a poll since the stale version saw no change: {polled}"));
+    assert_eq!(far_host(hosts)["stale"], false);
+}
+
+fn viewer_on(relay_cmd: &str, host: &str, envs: &[(&str, &str)]) -> Env {
+    let env = Env::new().on_host(host);
+    env.write_config(&board_at("boardhost"));
+    let mut all = vec![("NEBULA_RELAY_CMD", relay_cmd)];
+    all.extend_from_slice(envs);
+    env.start(&all)
+}
+
+fn ssh_stub(env: &Env, target: &Env) -> (String, PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let home = env.tmp.path().join("ssh-home");
+    let bin = home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let log = env.tmp.path().join("ssh-argv");
+    let down = env.tmp.path().join("ssh-down");
+    let nebula = Path::new(env!("CARGO_BIN_EXE_nebula")).parent().unwrap();
+    std::fs::write(
+        bin.join("ssh"),
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{log}'\n[ -e '{down}' ] && {{ echo 'ssh: connect to host: Connection refused' >&2; exit 255; }}\nfor arg do script=$arg; done\nexport HOME='{home}' NEBULA_RUNTIME_DIR='{rt}' NEBULA_DATA_DIR='{data}' NEBULA_HOSTNAME='{host}' PATH='{nebula}':\"$PATH\"\nexec /bin/sh -c \"$script\"\n",
+            log = log.display(),
+            down = down.display(),
+            home = home.display(),
+            rt = target.runtime_dir().display(),
+            data = target.data_dir().display(),
+            host = target.host_name(),
+            nebula = nebula.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(bin.join("ssh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    (path, log, down)
+}
+
+fn replay_agent(fixture: &str) -> String {
+    let replay = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/replay");
+    format!(
+        "{} {}",
+        replay.join("agent").display(),
+        replay.join(fixture).display()
+    )
+}
+
+#[test]
+fn cross_host_approve_over_ssh() {
+    let board = board_env();
+    let agent = replay_agent("ask.replay");
+    let laptop = viewer_on(
+        &proxy_to(&board),
+        "laptop",
+        &[
+            ("NEBULA_AGENT_CMD", agent.as_str()),
+            ("NEBULA_STATUS_TICK_MS", "100"),
+        ],
+    );
+    laptop.make_repo();
+    add(&laptop, &["--project", "repo"], "Far ask");
+    let run = receipt(run_card(&laptop, "#1@boardhost", &[]));
+    assert_eq!(run["session"]["host"], "laptop");
+    let session = run["session"]["id"].as_str().unwrap().to_string();
+    let name = session_row(&laptop, &session)["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for text in ["go", "on"] {
+        let sent = laptop.cli(&["agent", "send", &name, text, "--project", "repo"], None);
+        assert!(sent.status.success(), "{}", stderr(&sent));
+    }
+    let at = eventually("the laptop session asking on the board", || {
+        chain(&board, "#1")
+            .iter()
+            .find(|s| s["id"] == session.as_str() && s["status"] == "needs_feedback")
+            .and_then(|s| s["status_changed_at"].as_i64())
+    })
+    .to_string();
+    let (path, log, down) = ssh_stub(&board, &laptop);
+    let approve = || {
+        board.cli_env(
+            &[
+                "todo",
+                "approve",
+                "#1",
+                "--session",
+                &session,
+                "--expected-status-at",
+                &at,
+                "--json",
+            ],
+            None,
+            &[("PATH", &path)],
+        )
+    };
+    std::fs::write(&down, "").unwrap();
+    let unreachable = approve();
+    assert_eq!(
+        unreachable.status.code(),
+        Some(3),
+        "{}",
+        stderr(&unreachable)
+    );
+    assert_eq!(session_row(&laptop, &session)["status"], "needs_feedback");
+    std::fs::remove_file(&down).unwrap();
+    let approved = json_of(approve(), &["todo", "approve"]);
+    assert_eq!(approved["approved"], true);
+    assert_eq!(approved["session"]["host"], "laptop");
+    let argv = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        argv.lines().any(|l| l == "BatchMode=yes") && argv.lines().any(|l| l == "laptop"),
+        "ssh argv: {argv:?}"
+    );
+    eventually("the laptop session moving on", || {
+        (session_row(&laptop, &session)["status"] != "needs_feedback").then_some(())
+    });
+}
+
+#[test]
+fn cross_host_run_over_ssh() {
+    let board = board_env();
+    let laptop = viewer_on(&proxy_to(&board), "laptop", &[]);
+    laptop.make_repo();
+    let card = add(&board, &["--project", "repo"], "Far run");
+    let (path, _, _) = ssh_stub(&board, &laptop);
+    let dispatch = TodoId::generate().0;
+    let argv = run_argv(
+        &board,
+        "#1",
+        &[("--host", "laptop")],
+        &["--dispatch", &dispatch],
+    );
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let run = receipt(board.cli_env(&argv, None, &[("PATH", &path)]));
+    assert_eq!(run["state"], "started");
+    assert_eq!(run["card"], card["id"]);
+    assert_eq!(run["session"]["host"], "laptop");
+    let agents = agents_of(&laptop);
+    assert_eq!(agents.len(), 1);
+    assert_eq!(agents[0]["id"], run["session"]["id"]);
+    eventually("the far worker under the card", || {
+        chain(&board, "#1")
+            .iter()
+            .any(|s| s["id"] == run["session"]["id"] && s["host"] == "laptop")
+            .then_some(())
+    });
+    let again = receipt(board.cli_env(&argv, None, &[("PATH", &path)]));
+    assert_eq!(again, run);
+    assert_eq!(agents_of(&laptop).len(), 1);
+}
+
+#[test]
+fn cross_host_report_resent_on_connect() {
+    let mut board = board_env();
+    let here = viewer(&proxy_to(&board));
+    here.make_repo();
+    add(&here, &["--project", "repo"], "Resend");
+    let worker = json_of(
+        spawn_agent(
+            &here,
+            &[
+                "--card",
+                "#1@boardhost",
+                "--role",
+                "worker",
+                "--name",
+                "worker",
+            ],
+        ),
+        &["agent", "new", "worker"],
+    );
+    eventually("the worker on the board", || {
+        (chain(&board, "#1").len() == 1).then_some(())
+    });
+    stop(&mut board);
+    let child = json_of(
+        here.cli(
+            &[
+                "agent",
+                "new",
+                "--project",
+                "repo",
+                "--worktree",
+                "main",
+                "--name",
+                "child",
+            ],
+            worker["id"].as_str(),
+        ),
+        &["agent", "new", "child"],
+    );
+    let board = board.start(&[]);
+    here.json(&["todo", "show", "#1@boardhost", "--json"]);
+    eventually("the child reported once the link is back", || {
+        chain(&board, "#1")
+            .iter()
+            .any(|s| s["id"] == child["id"])
+            .then_some(())
+    });
+}
+
+fn cut_after(board: &Env, needle: &str, count: usize) -> (String, PathBuf) {
+    let script = board.tmp.path().join("cut.py");
+    std::fs::write(
+        &script,
+        r#"import os, socket, sys, threading
+s = socket.socket(socket.AF_UNIX)
+s.connect(sys.argv[1])
+needle, count, down, once = sys.argv[2].encode(), int(sys.argv[3]), sys.argv[4], sys.argv[5]
+armed = not os.path.exists(once)
+def up():
+    while True:
+        b = os.read(0, 65536)
+        if not b:
+            break
+        s.sendall(b)
+    s.shutdown(socket.SHUT_WR)
+threading.Thread(target=up, daemon=True).start()
+def exact(n):
+    buf = b''
+    while len(buf) < n:
+        c = s.recv(n - len(buf))
+        if not c:
+            os._exit(0)
+        buf += c
+    return buf
+seen = 0
+while True:
+    head = exact(4)
+    body = exact(int.from_bytes(head, 'little'))
+    os.write(1, head + body)
+    if armed and needle in body:
+        seen += 1
+        if seen == count:
+            open(once, 'w').close()
+            open(down, 'w').close()
+            os._exit(0)
+"#,
+    )
+    .unwrap();
+    let down = board.tmp.path().join("cut-down");
+    let line = format!(
+        "[ -e '{down}' ] && exit 1; exec python3 '{}' '{}' '{needle}' {count} '{down}' '{}'",
+        script.display(),
+        board.runtime_dir().join("daemon.sock").display(),
+        board.tmp.path().join("cut-once").display(),
+        down = down.display(),
+    );
+    (line, down)
+}
+
+#[test]
+fn run_end_lost_exit_4() {
+    let board = board_env();
+    let (relay, down) = cut_after(&board, "\"Show\"", 2);
+    let here = viewer(&relay);
+    here.make_repo();
+    add(&here, &["--project", "repo"], "Cut");
+    let dispatch = TodoId::generate().0;
+    let lost = run_card(&here, "#1@boardhost", &["--dispatch", &dispatch]);
+    assert_eq!(lost.status.code(), Some(4), "{}", stderr(&lost));
+    assert!(
+        stderr(&lost).contains(&format!("--dispatch {dispatch}")),
+        "{}",
+        stderr(&lost)
+    );
+    let agents = agents_of(&here);
+    assert_eq!(agents.len(), 1);
+    std::fs::remove_file(&down).unwrap();
+    let rerun = receipt(run_card(&here, "#1@boardhost", &["--dispatch", &dispatch]));
+    assert_eq!(rerun["state"], "started");
+    assert_eq!(rerun["session"]["id"], agents[0]["id"]);
+    assert_eq!(agents_of(&here).len(), 1);
+}
+
+#[test]
+fn run_dispatch_id_canonical() {
+    let env = board_env();
+    env.make_repo();
+    let card = add(&env, &["--project", "repo"], "Canonical");
+    let dispatch = TodoId::generate().0;
+    begin_run(&env, &card, &dispatch, "main");
+    let spawned = lost_spawn(&env, "#1", &dispatch.to_lowercase());
+    let rerun = receipt(run_card(&env, "#1", &["--dispatch", &dispatch]));
+    assert_eq!(rerun["session"]["id"], spawned["id"]);
+    assert_eq!(agents_of(&env).len(), 1);
+    let refused = spawn_agent(&env, &["--dispatch", "not-a-ulid", "--name", "odd"]);
+    assert!(!refused.status.success());
+    assert_eq!(agents_of(&env).len(), 1);
+}
+
+#[test]
+fn run_replayed_spawn_names_the_live_agent() {
+    let env = board_env();
+    env.make_repo();
+    add(&env, &["--project", "repo"], "Replay");
+    let dispatch = TodoId::generate().0;
+    let first = lost_spawn(&env, "#1", &dispatch);
+    let again = json_of(
+        spawn_agent(
+            &env,
+            &[
+                "--card",
+                "#1",
+                "--kind",
+                "codex",
+                "--role",
+                "review",
+                "--dispatch",
+                &dispatch,
+                "--name",
+                "second",
+            ],
+        ),
+        &["agent", "new", "second"],
+    );
+    assert_eq!(again, first);
+    assert_eq!(agents_of(&env).len(), 1);
+}
+
+#[test]
+fn run_rerun_bound_to_its_dispatch() {
+    let env = board_env();
+    env.make_repo();
+    let card = add(&env, &["--project", "repo"], "Bound");
+    let dispatch = TodoId::generate().0;
+    begin_run(&env, &card, &dispatch, "main");
+    for set in [
+        ("--kind", "codex"),
+        ("--host", "elsewhere"),
+        ("--role", "review"),
+        ("--worktree", "new"),
+    ] {
+        let refused = run_card_as(&env, "#1", &[set], &["--dispatch", &dispatch]);
+        assert_eq!(
+            refused.status.code(),
+            Some(6),
+            "{set:?}: {}",
+            stderr(&refused)
+        );
+    }
+    assert!(agents_of(&env).is_empty());
+    env.json(&["todo", "edit", "#1", "--project", "web", "--json"]);
+    let run = receipt(run_card(&env, "#1", &["--dispatch", &dispatch]));
+    assert_eq!(run["state"], "started");
+    let agents = agents_of(&env);
+    assert_eq!(agents.len(), 1);
+    assert_eq!(agents[0]["id"], run["session"]["id"]);
+}
+
+#[test]
+fn run_relaunches_after_failed_launch() {
+    use std::os::unix::fs::PermissionsExt;
+    let env = Env::new();
+    env.board_local();
+    let late = env.tmp.path().join("late-agent");
+    let env = env.start(&[("NEBULA_AGENT_CMD", late.to_str().unwrap())]);
+    env.make_repo();
+    add(&env, &["--project", "repo"], "Late");
+    let dispatch = TodoId::generate().0;
+    let failed = run_card(&env, "#1", &["--dispatch", &dispatch]);
+    assert!(!failed.status.success());
+    assert!(
+        stderr(&failed).contains(&format!("rerun with --dispatch {dispatch}")),
+        "{}",
+        stderr(&failed)
+    );
+    std::fs::write(&late, "#!/bin/sh\nexec /bin/sh\n").unwrap();
+    std::fs::set_permissions(&late, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let run = receipt(run_card(&env, "#1", &["--dispatch", &dispatch]));
+    assert_eq!(run["state"], "started");
+    let agents = agents_of(&env);
+    assert_eq!(agents.len(), 1);
+    assert_eq!(agents[0]["id"], run["session"]["id"]);
+    eventually("the relaunched worker alive on the card", || {
+        chain(&env, "#1")
+            .iter()
+            .any(|s| s["id"] == run["session"]["id"] && s["alive"] == true)
+            .then_some(())
+    });
+}
+
+#[test]
+fn run_rerun_finds_agent_after_branch_rename() {
+    let env = board_env();
+    let repo = env.make_repo();
+    let card = add(&env, &["--project", "repo"], "Renamed");
+    let dispatch = TodoId::generate().0;
+    begin_run(&env, &card, &dispatch, "main");
+    let spawned = lost_spawn(&env, "#1", &dispatch);
+    git(&repo, &["branch", "-m", "main", "renamed"]);
+    let rerun = receipt(run_card(&env, "#1", &["--dispatch", &dispatch]));
+    assert_eq!(rerun["state"], "started");
+    assert_eq!(rerun["session"]["id"], spawned["id"]);
+    assert_eq!(agents_of(&env).len(), 1);
+}
+
+#[test]
+fn run_pending_rechecks_card() {
+    let env = board_env();
+    env.make_repo();
+    let shelved = add(&env, &["--project", "repo"], "Shelved");
+    add(&env, &["--project", "repo"], "Blocker");
+    let blocked = add(&env, &["--project", "repo"], "Blocked");
+    let (first, second) = (TodoId::generate().0, TodoId::generate().0);
+    begin_run(&env, &shelved, &first, "main");
+    begin_run(&env, &blocked, &second, "main");
+    env.json(&["todo", "archive", "#1", "--json"]);
+    env.json(&["todo", "block", "#3", "--by", "#2", "--json"]);
+    for (card, dispatch) in [("#1", &first), ("#3", &second)] {
+        let refused = run_card(&env, card, &["--dispatch", dispatch]);
+        assert_eq!(
+            refused.status.code(),
+            Some(6),
+            "{card}: {}",
+            stderr(&refused)
+        );
+    }
+    assert!(agents_of(&env).is_empty());
+}
+
+#[test]
+fn run_dispatch_on_another_card_conflict() {
+    let env = board_env();
+    env.make_repo();
+    add(&env, &["--project", "repo"], "Mine");
+    add(&env, &["--project", "repo"], "Theirs");
+    let dispatch = TodoId::generate().0;
+    lost_spawn(&env, "#2", &dispatch);
+    let refused = run_card(&env, "#1", &["--dispatch", &dispatch]);
+    assert_eq!(refused.status.code(), Some(6), "{}", stderr(&refused));
+    assert_eq!(agents_of(&env).len(), 1);
+    assert!(chain(&env, "#1").is_empty());
+    assert_eq!(stage_of(&env, "#1"), "backlog");
+}
+
+#[test]
+fn run_project_missing_on_target_fails() {
+    let env = board_env();
+    env.make_repo();
+    add(&env, &["--project", "web"], "Nowhere");
+    let dispatch = TodoId::generate().0;
+    let refused = run_card(&env, "#1", &["--dispatch", &dispatch]);
+    assert_eq!(refused.status.code(), Some(6), "{}", stderr(&refused));
+    assert!(stderr(&refused).contains("web"), "{}", stderr(&refused));
+    let failed: Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(failed["state"], "failed");
+    let rerun = run_card(&env, "#1", &["--dispatch", &dispatch]);
+    assert_eq!(rerun.status.code(), Some(6), "{}", stderr(&rerun));
+    assert!(agents_of(&env).is_empty());
+}
+
+#[test]
+fn run_worktree_new() {
+    let env = board_env();
+    env.make_repo();
+    add(&env, &["--project", "repo"], "Fresh");
+    let twin = || format!("{}ABCDEF", &TodoId::generate().0[..20]);
+    let branch_of = |run: &Value| {
+        agents_of(&env)
+            .into_iter()
+            .find(|a| a["id"] == run["session"]["id"])
+            .unwrap()["worktree"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let (first, second) = (twin(), twin());
+    let a = receipt(run_card_as(
+        &env,
+        "#1",
+        &[("--worktree", "new")],
+        &["--dispatch", &first],
+    ));
+    let b = receipt(run_card_as(
+        &env,
+        "#1",
+        &[("--worktree", "new")],
+        &["--dispatch", &second],
+    ));
+    assert_ne!(branch_of(&a), branch_of(&b));
+    assert!(
+        branch_of(&a).ends_with(&first.to_lowercase()),
+        "{}",
+        branch_of(&a)
+    );
+    let third = TodoId::generate().0;
+    let argv = run_argv(
+        &env,
+        "#1",
+        &[("--worktree", "new")],
+        &["--dispatch", &third],
+    );
+    let children: Vec<Child> = (0..2).map(|_| env.spawn_cli(&argv)).collect();
+    let receipts: Vec<Value> = children
+        .into_iter()
+        .map(|c| json_of(c.wait_with_output().unwrap(), &["todo", "run", "new"]))
+        .collect();
+    assert_eq!(receipts[0], receipts[1]);
+    assert_eq!(receipts[0]["state"], "started");
+    assert_eq!(agents_of(&env).len(), 3);
 }
 
 fn decide(env: &Env, agent: Option<&str>, args: &[&str]) -> Value {

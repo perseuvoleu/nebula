@@ -28,7 +28,7 @@ while :; do
   while IFS= read -r step <&3 || [ -n "$step" ]; do
     case $step in
       '' | '#'*) ;;
-      wait) IFS= read -r _ || exit 0 ;;
+      wait) IFS= read -r line || exit 0; [ -z "$REPLAY_INPUT_LOG" ] || printf '%s\n' "$line" >> "$REPLAY_INPUT_LOG" ;;
       'say '*) printf '%s\n' "${step#say }" ;;
       'pause '*) sleep "${step#pause }" ;;
       'hook '*) hook "${step#hook }" ;;
