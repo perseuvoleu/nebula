@@ -19,6 +19,7 @@ export interface E2eRun {
 }
 
 const STATUS_LABEL: Record<E2eStatus, string> = { passed: "trecut", failed: "eșuat", skipped: "sărit" };
+const RUN_LABEL: Record<E2eStatus, string> = { passed: "Rulare trecută", failed: "Rulare eșuată", skipped: "Rulare sărită" };
 const STATUS_ICON = { passed: CheckIcon, failed: XIcon, skipped: MinusIcon };
 
 function formatDuration(ms: number): string {
@@ -42,6 +43,7 @@ export function E2eRunView({ run, assetUrl }: { run: E2eRun; assetUrl: (path: st
   return (
     <div className="flex flex-col gap-3">
       <p className="flex flex-wrap items-baseline gap-x-3 gap-y-1 text-sm">
+        <span className={`font-semibold ${run.status === "failed" ? "" : "text-muted-foreground"}`}>{RUN_LABEL[run.status]}</span>
         <span className="font-medium">{summary(run.steps)}</span>
         <span className="font-mono text-xs text-muted-foreground tabular-nums">
           {formatDuration(run.duration_ms)}
