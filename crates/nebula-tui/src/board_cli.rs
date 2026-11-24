@@ -995,4 +995,33 @@ mod tests {
         let remote_only = cwd_checkout(Path::new("/src/app"), &projects, &worktrees[1..]);
         assert!(remote_only.is_none());
     }
+
+    #[test]
+    fn run_target_never_takes_a_mirror_for_this_host() {
+        let mirror = Project {
+            workspace_id: Default::default(),
+            id: ProjectId("twin".into()),
+            name: "app".into(),
+            repo_path: "/src/app".into(),
+            sort_order: 0,
+            divider_after: false,
+            divider_before: false,
+            divider_label: None,
+            divider_before_label: None,
+            host: Some("findl".into()),
+        };
+        let projects = [mirror];
+        assert!(matches!(
+            run_target(&projects, "mbp", "mbp", "app"),
+            Target::Missing
+        ));
+        assert!(matches!(
+            run_target(&projects, "mbp", "findl", "app"),
+            Target::Here(flag) if flag == "app@findl"
+        ));
+        assert!(matches!(
+            run_target(&projects, "mbp", "laptop", "app"),
+            Target::Over
+        ));
+    }
 }
