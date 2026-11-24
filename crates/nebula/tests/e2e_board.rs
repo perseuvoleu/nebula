@@ -1709,9 +1709,14 @@ fn fake_workers_ai(env: &Env) -> PathBuf {
     std::fs::create_dir_all(&bin).unwrap();
     let vector = vec!["0.03125"; 1024].join(",");
     let down = env.tmp.path().join("rag-down");
+    let hang = env.tmp.path().join("rag-hang");
     let attempted = env.tmp.path().join("rag-attempted");
+    let hung = env.tmp.path().join("rag-hung-pid");
     let script = format!(
-        "#!/bin/sh\ncat >/dev/null\nif [ -e '{}' ]; then touch '{}'; printf '%s\\n400' '{{\"errors\":[{{\"message\":\"down\"}}]}}'; exit 0; fi\nprintf '%s\\n200' '{{\"result\":{{\"data\":[[{vector}]]}}}}'\n",
+        "#!/bin/sh\ncat >/dev/null\nif [ -e '{}' ]; then echo $ > '{}'; touch '{}'; exec sleep 30; fi\nif [ -e '{}' ]; then touch '{}'; printf '%s\\n400' '{{\"errors\":[{{\"message\":\"down\"}}]}}'; exit 0; fi\nprintf '%s\\n200' '{{\"result\":{{\"data\":[[{vector}]]}}}}'\n",
+        hang.display(),
+        hung.display(),
+        attempted.display(),
         down.display(),
         attempted.display()
     );
@@ -1720,6 +1725,58 @@ fn fake_workers_ai(env: &Env) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
     bin
+}
+
+fn rag_board(state: Option<&str>, envs: &[(&str, &str)]) -> Env {
+    let env = Env::new();
+    env.board_local();
+    let bin = fake_workers_ai(&env);
+    if let Some(state) = state {
+        std::fs::write(env.tmp.path().join(state), "").unwrap();
+    }
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let mut all = vec![
+        ("PATH", path.as_str()),
+        ("CF_ACCOUNT_ID", "test"),
+        ("CF_AI_TOKEN", "test"),
+        ("NEBULA_RAG_COPY_MS", "100"),
+    ];
+    all.extend_from_slice(envs);
+    env.start(&all)
+}
+
+fn rag_note(env: &Env, id: &str) -> i64 {
+    poll_until(Duration::from_secs(10), || {
+        env.json(&["decision", "show", id, "--json"])["meta"]["rag_note"].as_i64()
+    })
+    .unwrap_or_else(|| panic!("decision {id} never got its rag_note"))
+}
+
+fn rag_hit(env: &Env, text: &str, note: i64) -> Value {
+    let search = Command::new(env!("CARGO_BIN_EXE_nebula"))
+        .args(["rag", "search", "--exact", "--ws", "/", "--json", text])
+        .env("NEBULA_DATA_DIR", env.data_dir())
+        .env("NEBULA_RAG_LOCAL", "1")
+        .env_remove("NEBULA_RAG_ENV")
+        .current_dir(env.tmp.path())
+        .output()
+        .unwrap();
+    let hits = json_of(search, &["rag", "search", text]);
+    hits.as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["doc_id"].as_i64() == Some(note))
+        .cloned()
+        .unwrap_or_else(|| panic!("note {note} not among the hits for {text:?}: {hits}"))
+}
+
+fn pid_alive(pid: &str) -> bool {
+    Command::new("kill")
+        .args(["-0", pid])
+        .stderr(Stdio::null())
+        .status()
+        .unwrap()
+        .success()
 }
 
 #[test]
@@ -1817,4 +1874,42 @@ fn away_digest_decisions() {
         "{board} (outside the scope: {})",
         elsewhere["id"]
     );
+}
+
+#[test]
+fn similar_decisions_keep_their_own_rag_notes() {
+    let env = rag_board(None, &[]);
+    let first = decide(
+        &env,
+        None,
+        &[
+            "Cache the index",
+            "--why",
+            "Cold starts are slow",
+            "--project",
+            "repo",
+        ],
+    );
+    let first_note = rag_note(&env, first["id"].as_str().unwrap());
+    let second = decide(
+        &env,
+        None,
+        &[
+            "Cache the index",
+            "--why",
+            "Disk reads dominate",
+            "--project",
+            "repo",
+        ],
+    );
+    let second_note = rag_note(&env, second["id"].as_str().unwrap());
+    assert_ne!(first_note, second_note);
+    assert!(rag_hit(&env, "Cold starts are slow", first_note)["text"]
+        .as_str()
+        .unwrap()
+        .contains("Cold starts are slow"));
+    assert!(rag_hit(&env, "Disk reads dominate", second_note)["text"]
+        .as_str()
+        .unwrap()
+        .contains("Disk reads dominate"));
 }

@@ -112,7 +112,16 @@ fn copy(decision: &Artifact) -> Result<i64> {
     let source = format!("decision:{}", decision.id);
     let title = format!("--title={}", decision.title);
     let saved = rag(
-        &["--source", &source, "add", "--ws", &ws, &title, "-"],
+        &[
+            "--source",
+            &source,
+            "add",
+            "--no-dedup",
+            "--ws",
+            &ws,
+            &title,
+            "-",
+        ],
         Some(&text),
     )?;
     note_id(&saved).with_context(|| format!("nebula rag add printed no note id: {saved:?}"))
@@ -150,7 +159,7 @@ fn rag(args: &[&str], stdin: Option<&str>) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// `saved note:12 → …` or `updated note:12 → …`.
+/// `saved note:12 → …`.
 fn note_id(saved: &str) -> Option<i64> {
     let (_, rest) = saved.split_once("note:")?;
     let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
