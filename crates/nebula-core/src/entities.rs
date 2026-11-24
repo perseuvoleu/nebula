@@ -56,16 +56,18 @@ pub enum AgentKind {
     Codex,
     Cursor,
     Pi,
+    Antigravity,
 }
 
 impl AgentKind {
     /// Every kind, for callers that must cover all of them (menus, the
     /// boot-time CLI probe warm) and should fail to compile if one is added.
-    pub const ALL: [AgentKind; 4] = [
+    pub const ALL: [AgentKind; 5] = [
         AgentKind::Claude,
         AgentKind::Codex,
         AgentKind::Cursor,
         AgentKind::Pi,
+        AgentKind::Antigravity,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -74,6 +76,7 @@ impl AgentKind {
             AgentKind::Codex => "codex",
             AgentKind::Cursor => "cursor",
             AgentKind::Pi => "pi",
+            AgentKind::Antigravity => "antigravity",
         }
     }
 
@@ -83,18 +86,31 @@ impl AgentKind {
             "codex" => AgentKind::Codex,
             "cursor" => AgentKind::Cursor,
             "pi" => AgentKind::Pi,
+            "antigravity" => AgentKind::Antigravity,
             _ => return None,
         })
     }
 
-    /// Binary the kind launches. Differs from `as_str` only for Cursor,
-    /// whose agent CLI ships as `cursor-agent` (`cursor` opens the editor).
+    /// Binary the kind launches. Differs from `as_str` for Cursor, whose
+    /// agent CLI ships as `cursor-agent` (`cursor` opens the editor), and
+    /// for Antigravity, whose CLI is `agy`.
     pub fn cli_program(&self) -> &'static str {
         match self {
             AgentKind::Claude => "claude",
             AgentKind::Codex => "codex",
             AgentKind::Cursor => "cursor-agent",
             AgentKind::Pi => "pi",
+            AgentKind::Antigravity => "agy",
+        }
+    }
+
+    /// The model a session of this kind runs when none was chosen. Only
+    /// agy gets one: its model ids carry the effort, and nebula pins a
+    /// known-good pick instead of whatever agy last used.
+    pub fn default_model(&self) -> Option<&'static str> {
+        match self {
+            AgentKind::Antigravity => Some("gemini-4-neon-medium"),
+            AgentKind::Claude | AgentKind::Codex | AgentKind::Cursor | AgentKind::Pi => None,
         }
     }
 }

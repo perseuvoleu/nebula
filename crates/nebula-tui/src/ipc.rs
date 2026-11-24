@@ -1770,7 +1770,7 @@ fn default_agent_name(prompt: Option<&str>, taken: &[String]) -> String {
 pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
     let kind = nebula_core::AgentKind::parse(&opts.kind).with_context(|| {
         format!(
-            "unknown agent kind {:?} (claude|codex|cursor|pi)",
+            "unknown agent kind {:?} (claude|codex|cursor|pi|antigravity)",
             opts.kind
         )
     })?;

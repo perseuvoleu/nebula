@@ -299,7 +299,9 @@ impl MenuAction {
                 }
                 match (model, effort) {
                     (None, None) => Some(SubmenuKind::Models),
-                    (Some(_), None) => Some(SubmenuKind::Efforts),
+                    (Some(_), None) if !crate::config::effort_choices(*kind).is_empty() => {
+                        Some(SubmenuKind::Efforts)
+                    }
                     _ => None,
                 }
             }
