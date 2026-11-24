@@ -3,7 +3,7 @@
 //! copies each one to RAG.
 
 use crate::artifact_cli::{artifact_id, unpublished};
-use crate::board_cli::{check_card, client_id, connect, request, Caller, ScopeFlags};
+use crate::board_cli::{client_id, connect, read_card, request, Caller, ScopeFlags};
 use crate::ipc;
 use anyhow::{bail, Result};
 use nebula_core::board::{
@@ -46,10 +46,13 @@ pub async fn run(verb: DecisionVerb, json: bool) -> Result<()> {
             if what.trim().is_empty() {
                 bail!("a decision needs its WHAT");
             }
-            let card = match (card, &project) {
-                (Some(text), _) => Some(check_card(&mut conn, &text).await?),
-                (None, Some(_)) => None,
-                (None, None) => caller.card.clone(),
+            let (card, project) = match (card, project) {
+                (Some(text), _) => {
+                    let card = read_card(&mut conn, &text).await?;
+                    (Some(card.id), card.project)
+                }
+                (None, Some(project)) => (None, Some(project)),
+                (None, None) => (caller.card.clone(), caller.project),
             };
             let session = caller.author.agent.clone().map(|id| SessionLink {
                 host: caller.author.host.clone(),
@@ -61,7 +64,7 @@ pub async fn run(verb: DecisionVerb, json: bool) -> Result<()> {
                 kind: KIND.into(),
                 title: what,
                 card,
-                project: project.or(caller.project),
+                project,
                 session,
                 checkout: caller.checkout,
                 content: ArtifactContent::Body {

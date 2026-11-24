@@ -1913,3 +1913,21 @@ fn similar_decisions_keep_their_own_rag_notes() {
         .unwrap()
         .contains("Disk reads dominate"));
 }
+
+#[test]
+fn decision_on_a_card_takes_its_project() {
+    let env = board_env();
+    env.make_repo();
+    let card = add(&env, &["--project", "repo"], "Publish");
+    let home = add(&env, &["--home"], "Errands");
+    let on_card = decide(&env, None, &["Copy published files", "--card", "#1"]);
+    assert_eq!(on_card["card"], card["id"]);
+    assert_eq!(on_card["project"], "repo");
+    let on_home = decide(&env, None, &["Batch the errands", "--card", "#2"]);
+    assert_eq!(on_home["card"], home["id"]);
+    assert_eq!(on_home["project"], Value::Null);
+    assert_eq!(
+        decision_titles(&env, &["--project", "repo"]),
+        ["Copy published files"]
+    );
+}
