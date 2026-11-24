@@ -6,6 +6,7 @@
 mod artifacts;
 pub mod board;
 pub mod board_link;
+pub mod board_report;
 mod checkout_lock;
 mod collect;
 pub mod config;
@@ -76,6 +77,7 @@ async fn serve() -> Result<()> {
     daemon.refresh_remote_hosts();
     daemon.ensure_relays();
     let rag_copy = rag_copy::start(daemon.store.clone(), daemon.shutdown.clone());
+    board_report::spawn(daemon.clone());
 
     // Drain hook events into the status machines; a payload that reports a
     // cwd inside another worktree of the same project re-homes the agent row.

@@ -243,6 +243,9 @@ fn launch(
     // reverse/bold attrs wait_for_selected relies on.
     cmd.env_remove("NO_COLOR");
     cmd.env_remove("FORCE_COLOR");
+    for k in LIVE_SESSION_ENV {
+        cmd.env_remove(k);
+    }
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
@@ -298,7 +301,7 @@ impl Drop for TuiHarness {
     fn drop(&mut self) {
         let _ = self.child.kill();
         // Stop the auto-spawned daemon and clean the short-lived dirs.
-        let _ = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        let _ = nebula_cmd()
             .arg("kill")
             .env("NEBULA_RUNTIME_DIR", &self.runtime_dir)
             .env("NEBULA_DATA_DIR", &self.data_dir)
@@ -1073,7 +1076,7 @@ fn tui_reconnects_after_the_daemon_is_killed() {
     let repo = tui.make_repo("proj");
     add_project(&mut tui, &repo, "proj");
 
-    let ok = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+    let ok = nebula_cmd()
         .arg("kill")
         .env("NEBULA_RUNTIME_DIR", &tui.runtime_dir)
         .env("NEBULA_DATA_DIR", &tui.data_dir)
@@ -1113,8 +1116,25 @@ fn tui_reloads_in_place_from_the_palette() {
     tui.wait_for_text("NAVIGATE & SEARCH");
 }
 
+/// Session identity a test run inherits when started from inside a live
+/// nebula session; the isolated TUI, its daemon and CLI calls must not carry it.
+const LIVE_SESSION_ENV: [&str; 4] = [
+    "NEBULA_AGENT_ID",
+    "NEBULA_API_URL",
+    "NEBULA_API_TOKEN",
+    "CLAUDE_CODE_EXPERIMENTAL_CODE_MODE",
+];
+
+fn nebula_cmd() -> std::process::Command {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"));
+    for k in LIVE_SESSION_ENV {
+        cmd.env_remove(k);
+    }
+    cmd
+}
+
 fn nebula_cli(tui: &TuiHarness, args: &[&str]) -> std::process::Output {
-    std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+    nebula_cmd()
         .args(args)
         .env("NEBULA_RUNTIME_DIR", &tui.runtime_dir)
         .env("NEBULA_DATA_DIR", &tui.data_dir)
@@ -1317,7 +1337,7 @@ fn open_on_host_returns_landed_focused() {
     )
     .unwrap();
     std::fs::set_permissions(bin.join("ssh"), std::fs::Permissions::from_mode(0o755)).unwrap();
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+    let out = nebula_cmd()
         .args([
             "open",
             "--session",

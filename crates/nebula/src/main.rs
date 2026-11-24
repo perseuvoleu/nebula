@@ -1168,6 +1168,7 @@ fn main() -> Result<()> {
                 force_writer,
                 no_code_mode,
                 card,
+                no_card,
                 role,
                 ..
             } => nebula_tui::run_agent_new(nebula_tui::NewAgentOpts {
@@ -1186,6 +1187,7 @@ fn main() -> Result<()> {
                 writer_wait: std::time::Duration::from_secs(writer_wait),
                 code_mode_off: no_code_mode,
                 card,
+                no_card,
                 role,
             }),
             AgentCommand::Wait {

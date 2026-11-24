@@ -335,6 +335,11 @@ pub struct SessionRow {
     pub archived: bool,
     pub branch: Option<String>,
     pub dispatch_id: Option<DispatchId>,
+    /// When the session was created on its host; `todo show` lists in this order.
+    pub created_at: i64,
+    /// With `branch`, the checkout the session runs in.
+    pub project: Option<String>,
+    pub worktree: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -560,18 +565,23 @@ pub enum BoardResult {
 /// The column a card moves to when one of its session rows changes, or None.
 /// `others` are the card's other rows. Fires only on a transition, so a
 /// duplicate or late report never undoes a manual move, and never leaves
-/// review or done. Only a live, unarchived worker moves its card.
+/// review or done. Only an unarchived worker that was live before the change
+/// moves its card, so one that finishes and exits in the same report still
+/// sends it to review.
 pub fn auto_stage(
     stage: Stage,
     before: Option<&SessionRow>,
     after: &SessionRow,
     others: &[SessionRow],
 ) -> Option<Stage> {
+    let eligible = match before {
+        Some(b) => b.alive && !b.archived,
+        None => !after.archived,
+    };
     if before == Some(after)
         || before.is_some_and(|b| after.status_changed_at < b.status_changed_at)
         || after.role != Some(Role::Worker)
-        || !after.alive
-        || after.archived
+        || !eligible
     {
         return None;
     }
@@ -584,9 +594,16 @@ pub fn auto_stage(
     };
     match stage {
         Stage::Backlog | Stage::Next
-            if before.is_none() && after.status != AgentStatus::Finished =>
+            if before.is_none() && after.alive && after.status != AgentStatus::Finished =>
         {
             Some(Stage::Doing)
+        }
+        Stage::Backlog | Stage::Next
+            if before.is_none()
+                && after.status == AgentStatus::Finished
+                && !others.iter().any(live_unfinished_worker) =>
+        {
+            Some(Stage::Review)
         }
         Stage::Doing
             if after.status == AgentStatus::Finished

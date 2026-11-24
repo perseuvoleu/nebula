@@ -60,6 +60,22 @@ pub fn todos_instruction(open: usize) -> String {
     )
 }
 
+/// Card pointer, injected on every prompt while the session works on a board
+/// card. `card` is the card's ref, or its id when this host's board does
+/// not hold it; the title comes only from the local board.
+pub fn card_instruction(card: &str, title: Option<&str>) -> String {
+    let named = match title {
+        Some(title) => format!("card {card} \"{title}\""),
+        None => format!("card {card}"),
+    };
+    format!(
+        "[nebula] This session works on {named}. `nebula todo show '{card}'` \
+         reads it with its sessions and log, and `nebula todo note '{card}' <text>` \
+         adds to its log. Sessions you start with `nebula agent new` join it \
+         unless you pass --no-card or --card."
+    )
+}
+
 /// Shared-checkout pointer, injected on every prompt while other unarchived
 /// sessions that have run share the agent's worktree. Foreign modifications
 /// in the diff are likely theirs — the agent should look before assuming
@@ -126,6 +142,17 @@ pub fn context_injection(parts: &[String]) -> String {
 pub fn inject_steps(parts: &[String]) -> String {
     serde_json::json!({
         "injectSteps": [{ "systemMessage": { "systemMessage": parts.join("\n\n") } }]
+    })
+    .to_string()
+}
+
+/// A SessionStart hook's context, in the claude/codex dialect.
+pub fn session_start_injection(context: &str) -> String {
+    serde_json::json!({
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": context,
+        }
     })
     .to_string()
 }
@@ -346,7 +373,11 @@ async fn receive_hook(
 ) -> (StatusCode, String) {
     // On this path the response body reaches the model's context, so every
     // outcome (auth failure included) must answer with empty-or-instruction.
-    let injectable = inject.is_some() && query.hook_event == "UserPromptSubmit";
+    let injectable = inject.is_some()
+        && matches!(
+            query.hook_event.as_str(),
+            "UserPromptSubmit" | "SessionStart"
+        );
     let quiet_or = |status: StatusCode, diag: &str| {
         let body = if injectable {
             String::new()
@@ -406,6 +437,15 @@ async fn receive_hook(
         })
         .await;
 
+    if injectable && query.hook_event == "SessionStart" {
+        let body = match crate::board_report::card_pointer(&state.store, &agent_id) {
+            Ok(Some((card, title))) => {
+                session_start_injection(&card_instruction(&card, title.as_deref()))
+            }
+            _ => String::new(),
+        };
+        return (StatusCode::OK, body);
+    }
     if let Some(inject) = inject.filter(|_| injectable) {
         // Titling instruction while the session is untitled, the notes and
         // todos pointers while the project/worktree has undone entries, the
@@ -420,6 +460,10 @@ async fn receive_hook(
             .unwrap_or(false)
         {
             parts.push(AUTO_TITLE_INSTRUCTION.to_string());
+        }
+        if let Ok(Some((card, title))) = crate::board_report::card_pointer(&state.store, &agent_id)
+        {
+            parts.push(card_instruction(&card, title.as_deref()));
         }
         let open = state
             .store
@@ -486,7 +530,11 @@ mod tests {
     }
 
     fn seeded_store() -> Arc<Store> {
-        let store = Arc::new(Store::open_in_memory().unwrap());
+        seed(Store::open_in_memory().unwrap())
+    }
+
+    fn seed(store: Store) -> Arc<Store> {
+        let store = Arc::new(store);
         store
             .insert_project(&Project {
                 workspace_id: Default::default(),
@@ -952,6 +1000,115 @@ mod tests {
             .unwrap();
         let (_, body) = post(env.port, env.token.clone()).await;
         assert_eq!(body, "");
+    }
+
+    fn add_card(store: &Store, title: &str) -> nebula_core::board::Card {
+        use nebula_core::board::{Author, BoardOp, BoardResult, CardDraft, Stage};
+        let draft = CardDraft {
+            id: nebula_core::TodoId::generate(),
+            title: title.into(),
+            project: Some("p".into()),
+            stage: Stage::Backlog,
+            proposed: false,
+            created_by: Author {
+                host: "here".into(),
+                agent: None,
+                name: "user".into(),
+            },
+            checkout: None,
+        };
+        let Ok(BoardResult::Card(card)) = crate::board::serve(store, BoardOp::AddCard(draft))
+        else {
+            panic!("the local board added no card");
+        };
+        card
+    }
+
+    fn insert_carded(store: &Store, id: &str, card: &nebula_core::TodoId) {
+        let titled = store.get_agent(&AgentId("titled".into())).unwrap().unwrap();
+        store
+            .insert_agent(&Agent {
+                id: AgentId(id.into()),
+                card_id: Some(card.clone()),
+                ..titled
+            })
+            .unwrap();
+    }
+
+    async fn hook(env: &HookEnv, agent: &str, event: &str) -> String {
+        http_post(
+            env.port,
+            &format!("/api/hooks/claude?agentId={agent}&hookEvent={event}"),
+            &env.token,
+            r#"{"session_id":"s1"}"#,
+        )
+        .await
+        .1
+    }
+
+    #[tokio::test]
+    async fn hook_card_pointer() {
+        let store = seeded_store();
+        let (env, _rx) = start_hook_server(store.clone()).await.unwrap();
+        let card = add_card(&store, "Keep verification results");
+        let far_card = nebula_core::TodoId::generate();
+        insert_carded(&store, "carded", &card.id);
+        insert_carded(&store, "far", &far_card);
+
+        let carded = hook(&env, "carded", "UserPromptSubmit").await;
+        assert_eq!(
+            carded,
+            context_injection(&[card_instruction("#1", Some("Keep verification results"))])
+        );
+        assert!(carded.contains("nebula todo show '#1'"), "{carded}");
+        assert!(carded.contains("nebula todo note '#1'"), "{carded}");
+        assert!(carded.contains("Keep verification results"), "{carded}");
+        let far = hook(&env, "far", "UserPromptSubmit").await;
+        assert_eq!(
+            far,
+            context_injection(&[card_instruction(far_card.as_str(), None)])
+        );
+        assert_eq!(
+            hook(&env, "titled", "UserPromptSubmit").await,
+            "",
+            "an uncarded session gets no pointer"
+        );
+
+        let started: serde_json::Value =
+            serde_json::from_str(&hook(&env, "carded", "SessionStart").await).unwrap();
+        assert_eq!(
+            started["hookSpecificOutput"]["hookEventName"],
+            "SessionStart"
+        );
+        let context = started["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap();
+        assert!(
+            context.contains("card #1 \"Keep verification results\""),
+            "{context}"
+        );
+        assert!(context.contains("nebula todo show '#1'"), "{context}");
+        assert_eq!(
+            hook(&env, "titled", "SessionStart").await,
+            "",
+            "an uncarded session starts with no pointer"
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_card_pointer_reads_past_a_held_write_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nebula.db");
+        let store = seed(Store::open(&path).unwrap());
+        let card = add_card(&store, "Keep verification results");
+        insert_carded(&store, "carded", &card.id);
+        let (env, _rx) = start_hook_server(store.clone()).await.unwrap();
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let carded = hook(&env, "carded", "UserPromptSubmit").await;
+        writer.execute_batch("ROLLBACK").unwrap();
+        assert!(carded.contains("nebula todo show '#1'"), "{carded}");
     }
 
     #[test]

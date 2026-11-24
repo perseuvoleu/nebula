@@ -61,11 +61,16 @@ def fixture(name):
 def seed_board():
     board, show, artifact = fixture("board"), fixture("card_show"), fixture("artifact")
     board_id, version = board["version"].split(".")
+    away = board["board"]["away"]
+    hosts = board["board"]["hosts"]
+    hosts[0]["checkouts"].append({"project": "vela", "branch": "main", "path": "/home/perseu/vela", "worktree": False})
     blocker = {**fixture("card"), "id": "01JD0000000000000000000011", "number": 11, "ref": "#11@leaseweb",
                "title": "Pin the board contract", "stage": "done", "checkout": None, "blocked_by": []}
     (STATE / "board.json").write_text(json.dumps({
         "board_id": board_id, "version": int(version), "cards": [blocker, *board["board"]["cards"]],
-        "hosts": board["board"]["hosts"], "away": board["board"]["away"], "decisions": [fixture("decision")],
+        "hosts": hosts, "decisions": [fixture("decision")],
+        "away": {"finished": [{"id": i, "at": 1764000500000} for i in away["finished"]],
+                 "needs_you": [{**s, "at": 1764000500000} for s in away["needs_you"]]},
         "details": {show["id"]: {key: show[key] for key in ("sessions", "artifacts", "log")}},
     }, indent=1))
     run = STATE / "artifacts" / artifact["id"]
@@ -135,7 +140,7 @@ def main():
     seed()
     os.chmod(HERE / "fake_nebula.py", 0o755)
     env = {**os.environ, "NEBULA_WEB_TOKEN": TOKEN, "NEBULA_WEB_PROJECTS": "alpha,beta",
-           "NEBULA_WEB_CLAUDE_DIR": str(STATE / "claude"), "NEBULA_WEB_USAGE": "0", "NEBULA_WEB_PORT": str(PORT), "NEBULA_WEB_BOARD_PROJECTS": "nebula",
+           "NEBULA_WEB_CLAUDE_DIR": str(STATE / "claude"), "NEBULA_WEB_USAGE": "0", "NEBULA_WEB_PORT": str(PORT), "NEBULA_WEB_BOARD_PROJECTS": "nebula,vela",
            "NEBULA_WEB_ARTIFACTS": str(STATE / "artifacts"), "NEBULA_WEB_ORIGIN": f"http://127.0.0.1:{PORT}",
            "NEBULA_WEB_BINARY": str(HERE / "fake_nebula.py"), "NEBULA_WEB_PI_AGENT_DIR": str(STATE / "pi"),
            "FAKE_NEBULA_STATE": str(STATE), "PYTHONDONTWRITEBYTECODE": "1",

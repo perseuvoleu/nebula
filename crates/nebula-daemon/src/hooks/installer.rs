@@ -89,12 +89,13 @@ const CURSOR_EVENTS: &[(&str, &str)] = &[
 ];
 
 pub(crate) fn hook_command(endpoint: &str, event: &str) -> String {
-    // UserPromptSubmit passes the daemon's response body through to stdout:
-    // Claude Code (and Codex, same dialect) add a hook's stdout to the
-    // model's context, which is how the session auto-title instruction
-    // reaches the agent. The daemon keeps that body empty except when an
-    // instruction is due. Every other event stays fully silent.
-    let silence = if event == "UserPromptSubmit" {
+    // UserPromptSubmit and SessionStart pass the daemon's response body
+    // through to stdout: Claude Code (and Codex, same dialect) add a hook's
+    // stdout to the model's context, which is how the session auto-title
+    // instruction and the card pointer reach the agent. The daemon keeps
+    // that body empty except when an instruction is due. Every other event
+    // stays fully silent.
+    let silence = if matches!(event, "UserPromptSubmit" | "SessionStart") {
         "2>/dev/null"
     } else {
         ">/dev/null 2>&1"
@@ -792,6 +793,21 @@ mod tests {
         assert!(
             stop.contains(">/dev/null 2>&1"),
             "stop stays silent: {stop}"
+        );
+    }
+
+    #[test]
+    fn session_start_command_pipes_response_to_stdout() {
+        let tmp = tempfile::tempdir().unwrap();
+        install_claude_hooks(tmp.path()).unwrap();
+        let settings = read_settings(tmp.path());
+        let start = settings["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(start.contains("2>/dev/null"), "stderr silenced: {start}");
+        assert!(
+            !start.contains(">/dev/null 2>&1"),
+            "stdout must pass through: {start}"
         );
     }
 

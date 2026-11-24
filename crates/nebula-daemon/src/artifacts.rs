@@ -409,6 +409,6 @@ pub(crate) fn list(
             })
         })
         .collect();
-    let (items, next) = paged(items, offset, &version)?;
+    let (items, next) = paged(items, offset, &version, crate::board::page_budget())?;
     Ok(Page { items, next })
 }

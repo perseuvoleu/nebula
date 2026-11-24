@@ -1,6 +1,8 @@
 //! Cards on the board host: the `nebula todo` verbs against a daemon whose
 //! config says `board = "local"`, through the real CLI and its --json.
 
+use nebula_core::board::{BoardOp, BoardResult, HostCheckout, HostReport, Role, SessionRow};
+use nebula_core::{AgentId, AgentKind, AgentStatus, TodoId};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -643,6 +645,555 @@ fn agent_new_card_refuses_unknown_caller() {
         stderr(&out)
     );
     assert!(agent_names(&env).is_empty());
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "host reports are debounced by a second, so the board catches up on its own clock"
+)]
+fn eventually<T>(what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
+    for _ in 0..200 {
+        if let Some(found) = probe() {
+            return found;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("{what} never happened");
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+fn board_op(env: &Env, op: BoardOp) -> Result<BoardResult, String> {
+    use nebula_core::codec::{read_frame, write_frame};
+    use nebula_core::{ClientRequest, ServerEvent, PROTOCOL_VERSION};
+    let sock = env.runtime_dir().join("daemon.sock");
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async move {
+            let mut stream = tokio::net::UnixStream::connect(sock).await.unwrap();
+            let hello = ClientRequest::Hello {
+                protocol_version: PROTOCOL_VERSION,
+            };
+            write_frame(&mut stream, &hello).await.unwrap();
+            read_frame::<ServerEvent, _>(&mut stream).await.unwrap();
+            write_frame(&mut stream, &ClientRequest::Board { req_id: 7, op })
+                .await
+                .unwrap();
+            loop {
+                match read_frame::<ServerEvent, _>(&mut stream).await.unwrap() {
+                    Some(ServerEvent::BoardReply { req_id: 7, result }) => return Ok(result),
+                    Some(ServerEvent::Error {
+                        req_id: Some(7),
+                        message,
+                    }) => return Err(message),
+                    Some(_) => continue,
+                    None => return Err("the daemon hung up".into()),
+                }
+            }
+        })
+}
+
+const FAR_HOST: &str = "elsewhere";
+
+fn far_row(card: &Value, agent: &str, status: AgentStatus, changed_at: i64) -> SessionRow {
+    SessionRow {
+        agent_id: AgentId(agent.into()),
+        host: FAR_HOST.into(),
+        card_id: TodoId(card["id"].as_str().unwrap().into()),
+        role: Some(Role::Worker),
+        kind: AgentKind::Codex,
+        name: agent.into(),
+        parent: None,
+        status,
+        status_changed_at: changed_at,
+        writer: false,
+        alive: true,
+        archived: false,
+        branch: Some("main".into()),
+        dispatch_id: None,
+        created_at: changed_at,
+        project: Some("nebula".into()),
+        worktree: false,
+    }
+}
+
+fn far_report(env: &Env, sessions: Vec<SessionRow>) {
+    far_report_holding(env, Vec::new(), sessions);
+}
+
+fn far_report_holding(env: &Env, checkouts: Vec<HostCheckout>, sessions: Vec<SessionRow>) {
+    let report = HostReport {
+        host: FAR_HOST.into(),
+        writers: 0,
+        writer_slots: None,
+        checkouts,
+        sessions,
+    };
+    board_op(env, BoardOp::Report(report)).expect("the board takes a host report");
+}
+
+fn far_host(hosts: &[Value]) -> Value {
+    hosts
+        .iter()
+        .find(|h| h["host"] == FAR_HOST)
+        .cloned()
+        .unwrap()
+}
+
+fn stage_of(env: &Env, card: &str) -> String {
+    env.json(&["todo", "show", card, "--json"])["stage"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+fn hosts_of(env: &Env, scope: &[&str]) -> Vec<Value> {
+    let mut argv = vec!["todo", "board", "--json"];
+    argv.extend_from_slice(scope);
+    env.json(&argv)["board"]["hosts"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+fn this_host(hosts: &[Value]) -> Option<Value> {
+    hosts
+        .iter()
+        .find(|h| h["host"] == nebula_core::host::hostname())
+        .cloned()
+}
+
+fn chain(env: &Env, card: &str) -> Vec<Value> {
+    env.json(&["todo", "show", card, "--json"])["sessions"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+#[test]
+fn child_inherits_card_not_role() {
+    let env = board_env();
+    env.make_repo();
+    let card = add(&env, &["--project", "repo"], "Chain");
+    let parent = json_of(
+        spawn_agent(
+            &env,
+            &["--card", "#1", "--role", "worker", "--name", "parent"],
+        ),
+        &["agent", "new", "parent"],
+    );
+    let parent_id = parent["id"].as_str().unwrap();
+    let child = |extra: &[&str]| {
+        let mut argv = vec!["agent", "new", "--project", "repo", "--worktree", "main"];
+        argv.extend_from_slice(extra);
+        json_of(env.cli(&argv, Some(parent_id)), &argv)
+    };
+    let reviewer = child(&["--role", "review", "--name", "reviewer"]);
+    assert_eq!(reviewer["card"], card["id"]);
+    assert_eq!(reviewer["role"], "review");
+    let roleless = child(&["--name", "roleless"]);
+    assert_eq!(roleless["card"], card["id"]);
+    assert_eq!(roleless["role"], Value::Null, "a child never inherits role");
+    let loose = child(&["--no-card", "--name", "loose"]);
+    assert_eq!(loose["card"], Value::Null);
+    let row = env.json(&["agent", "show", "reviewer", "--project", "repo"]);
+    assert_eq!(row["card"], card["id"]);
+
+    let sessions = eventually("the chain on the card", || {
+        let sessions = chain(&env, "#1");
+        (sessions.len() == 3).then_some(sessions)
+    });
+    let listed: Vec<(&str, &Value)> = sessions
+        .iter()
+        .map(|s| (s["name"].as_str().unwrap(), &s["role"]))
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            ("parent", &serde_json::json!("worker")),
+            ("reviewer", &serde_json::json!("review")),
+            ("roleless", &Value::Null),
+        ]
+    );
+}
+
+#[test]
+fn auto_stage_worker_doing_review() {
+    let replay = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/replay");
+    let agent = format!(
+        "{} {}",
+        replay.join("agent").display(),
+        replay.join("turn.replay").display()
+    );
+    let env = Env::new();
+    env.board_local();
+    let env = env.start(&[
+        ("NEBULA_AGENT_CMD", agent.as_str()),
+        ("NEBULA_STATUS_TICK_MS", "100"),
+    ]);
+    env.make_repo();
+    add(&env, &["--project", "repo"], "Work");
+    json_of(
+        spawn_agent(
+            &env,
+            &["--card", "#1", "--role", "worker", "--name", "worker"],
+        ),
+        &["agent", "new", "worker"],
+    );
+    eventually("the card in doing", || {
+        (stage_of(&env, "#1") == "doing").then_some(())
+    });
+    let sent = env.cli(
+        &["agent", "send", "worker", "go", "--project", "repo"],
+        None,
+    );
+    assert!(sent.status.success(), "{}", stderr(&sent));
+    eventually("the card in review", || {
+        (stage_of(&env, "#1") == "review").then_some(())
+    });
+    let sessions = chain(&env, "#1");
+    assert_eq!(sessions[0]["status"], "finished");
+}
+
+#[test]
+fn auto_stage_ignores_duplicate_report() {
+    let env = board_env();
+    let card = add(&env, &["--project", "nebula"], "Work");
+    let report = vec![far_row(&card, "w1", AgentStatus::Running, 10)];
+    far_report(&env, report.clone());
+    assert_eq!(stage_of(&env, "#1"), "doing");
+    env.json(&["todo", "move", "#1", "next", "--json"]);
+    far_report(&env, report);
+    assert_eq!(stage_of(&env, "#1"), "next");
+}
+
+#[test]
+fn card_show_chain_and_checkout() {
+    let env = board_env();
+    env.make_repo();
+    add(&env, &["--project", "repo"], "Chain");
+    let worker = json_of(
+        spawn_agent(
+            &env,
+            &["--card", "#1", "--role", "worker", "--name", "worker"],
+        ),
+        &["agent", "new", "worker"],
+    );
+    let argv = [
+        "agent",
+        "new",
+        "--project",
+        "repo",
+        "--worktree",
+        "main",
+        "--role",
+        "review",
+        "--name",
+        "reviewer",
+    ];
+    json_of(env.cli(&argv, worker["id"].as_str()), &argv);
+    let archived = env.cli(&["agent", "archive", "reviewer", "--project", "repo"], None);
+    assert!(archived.status.success(), "{}", stderr(&archived));
+
+    let shown = eventually("the archived reviewer reported", || {
+        let shown = env.json(&["todo", "show", "#1", "--json"]);
+        let sessions = shown["sessions"].as_array().unwrap();
+        (sessions.len() == 2 && sessions[1]["alive"] == false).then_some(shown)
+    });
+    let sessions = shown["sessions"].as_array().unwrap();
+    let host = nebula_core::host::hostname();
+    assert_eq!(sessions[0]["name"], "worker");
+    assert_eq!(sessions[0]["id"], worker["id"]);
+    assert_eq!(sessions[0]["role"], "worker");
+    assert_eq!(sessions[0]["alive"], true);
+    assert_eq!(sessions[1]["name"], "reviewer");
+    assert_eq!(sessions[1]["role"], "review");
+    for session in sessions {
+        assert_eq!(session["host"], host.as_str());
+        assert_eq!(session["kind"], "claude");
+        assert_eq!(session["writer"], false);
+        assert_eq!(session["stale"], false);
+        assert!(session["status"].is_string(), "{session}");
+        assert!(session["status_changed_at"].is_i64(), "{session}");
+    }
+    assert_eq!(shown["checkout"]["host"], host.as_str());
+    assert_eq!(shown["checkout"]["branch"], "main");
+    assert_eq!(shown["checkout"]["worktree"], false);
+}
+
+#[test]
+fn board_hosts_writers() {
+    let env = board_env();
+    let repo = env.make_repo();
+    add(&env, &["--project", "repo"], "Write");
+    json_of(
+        spawn_agent(
+            &env,
+            &[
+                "--card", "#1", "--role", "worker", "--writer", "--name", "writer",
+            ],
+        ),
+        &["agent", "new", "--writer"],
+    );
+    let host = eventually("one live writer reported", || {
+        this_host(&hosts_of(&env, &["--all"])).filter(|h| h["writers"] == 1)
+    });
+    assert_eq!(host["writer_slots"], Value::Null);
+    let checkouts = host["checkouts"].as_array().unwrap();
+    assert_eq!(checkouts.len(), 1, "{host}");
+    assert_eq!(checkouts[0]["project"], "repo");
+    assert_eq!(checkouts[0]["branch"], "main");
+    assert_eq!(checkouts[0]["worktree"], false);
+    assert_eq!(
+        Path::new(checkouts[0]["path"].as_str().unwrap())
+            .canonicalize()
+            .unwrap(),
+        repo.canonicalize().unwrap()
+    );
+    let other = this_host(&hosts_of(&env, &["--project", "other"])).unwrap();
+    assert_eq!(other["checkouts"], serde_json::json!([]), "scope applies");
+}
+
+#[test]
+fn report_unchanged_keeps_version() {
+    let env = board_env();
+    eventually("this host's start report", || {
+        this_host(&hosts_of(&env, &["--all"]))
+    });
+    let card = add(&env, &["--project", "nebula"], "Work");
+    let rows = vec![far_row(&card, "w1", AgentStatus::Running, 10)];
+    far_report(&env, rows.clone());
+    let version = env.json(&["todo", "board", "--all", "--json"])["version"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    far_report(&env, rows);
+    let again = env.json(&["todo", "board", "--all", "--since", &version, "--json"]);
+    assert_eq!(again["unchanged"], true, "{again}");
+    far_report(
+        &env,
+        vec![far_row(&card, "w1", AgentStatus::NeedsFeedback, 20)],
+    );
+    let changed = env.json(&["todo", "board", "--all", "--since", &version, "--json"]);
+    assert_ne!(changed["version"], version.as_str());
+}
+
+#[test]
+fn away_digest_sessions() {
+    let env = board_env();
+    let work = add(&env, &["--project", "nebula"], "Work");
+    let old = add(&env, &["--project", "nebula"], "Old");
+    let ask = add(&env, &["--project", "nebula"], "Ask");
+    env.json(&["todo", "move", "#2", "review", "--json"]);
+    let before = now_ms() - 60_000;
+    far_report(
+        &env,
+        vec![far_row(&ask, "n1", AgentStatus::NeedsFeedback, before)],
+    );
+    let since = now_ms();
+    let after = since + 1;
+    far_report(
+        &env,
+        vec![far_row(&work, "w1", AgentStatus::Running, after)],
+    );
+    far_report(
+        &env,
+        vec![
+            far_row(&work, "w1", AgentStatus::Finished, after + 1),
+            far_row(&ask, "n2", AgentStatus::NeedsFeedback, after + 1),
+        ],
+    );
+    let away_since = since.to_string();
+    let board = env.json(&[
+        "todo",
+        "board",
+        "--all",
+        "--away-since",
+        &away_since,
+        "--json",
+    ]);
+    let away = &board["board"]["away"];
+    assert_eq!(away["finished"], serde_json::json!([work["id"]]), "{away}");
+    assert_eq!(
+        away["needs_you"],
+        serde_json::json!([{"host": FAR_HOST, "id": "n2"}]),
+        "{away}"
+    );
+    assert_ne!(old["id"], work["id"]);
+}
+
+#[test]
+fn auto_stage_sees_the_whole_report() {
+    let env = board_env();
+    let card = add(&env, &["--project", "nebula"], "Work");
+    far_report(&env, vec![far_row(&card, "w1", AgentStatus::Running, 10)]);
+    assert_eq!(stage_of(&env, "#1"), "doing");
+    far_report(
+        &env,
+        vec![
+            far_row(&card, "w1", AgentStatus::Finished, 20),
+            far_row(&card, "w2", AgentStatus::Running, 20),
+        ],
+    );
+    assert_eq!(stage_of(&env, "#1"), "doing", "w2 still works on the card");
+}
+
+#[test]
+fn card_show_lists_sessions_in_created_order() {
+    let env = board_env();
+    let card = add(&env, &["--project", "nebula"], "Work");
+    let newer = SessionRow {
+        created_at: 20,
+        ..far_row(&card, "newer", AgentStatus::Running, 5)
+    };
+    let older = SessionRow {
+        created_at: 10,
+        ..far_row(&card, "older", AgentStatus::Running, 5)
+    };
+    far_report(&env, vec![newer.clone()]);
+    far_report(&env, vec![newer, older]);
+    let names: Vec<Value> = chain(&env, "#1")
+        .iter()
+        .map(|s| s["name"].clone())
+        .collect();
+    assert_eq!(names, ["older", "newer"]);
+}
+
+#[test]
+fn card_checkout_matches_project_and_branch() {
+    let env = board_env();
+    let card = add(&env, &["--home"], "Home");
+    let held = |project: &str| HostCheckout {
+        project: project.into(),
+        branch: "main".into(),
+        path: format!("/work/{project}"),
+        worktree: false,
+    };
+    let worker = SessionRow {
+        project: Some("bbb".into()),
+        ..far_row(&card, "w1", AgentStatus::Running, 10)
+    };
+    far_report_holding(&env, vec![held("aaa"), held("bbb")], vec![worker]);
+    let shown = env.json(&["todo", "show", "#1", "--json"]);
+    assert_eq!(shown["checkout"]["path"], "/work/bbb", "{shown}");
+}
+
+#[test]
+fn host_needs_you_follows_the_read_scope() {
+    let env = board_env();
+    let card = add(&env, &["--project", "nebula"], "Ask");
+    far_report(
+        &env,
+        vec![far_row(&card, "n1", AgentStatus::NeedsFeedback, 10)],
+    );
+    assert_eq!(far_host(&hosts_of(&env, &["--all"]))["needs_you"], 1);
+    assert_eq!(
+        far_host(&hosts_of(&env, &["--project", "other"]))["needs_you"],
+        0,
+        "the waiting session's card is out of scope"
+    );
+}
+
+#[test]
+fn omitted_session_stops_needing_the_user() {
+    let env = board_env();
+    let card = add(&env, &["--project", "nebula"], "Ask");
+    let since = now_ms();
+    far_report(
+        &env,
+        vec![far_row(&card, "n1", AgentStatus::NeedsFeedback, since + 1)],
+    );
+    let away_since = since.to_string();
+    let away = |env: &Env| {
+        env.json(&[
+            "todo",
+            "board",
+            "--all",
+            "--away-since",
+            &away_since,
+            "--json",
+        ])["board"]["away"]["needs_you"]
+            .clone()
+    };
+    assert_eq!(
+        away(&env),
+        serde_json::json!([{"host": FAR_HOST, "id": "n1"}])
+    );
+    far_report(&env, Vec::new());
+    assert_eq!(away(&env), serde_json::json!([]), "n1 is no longer live");
+    assert_eq!(far_host(&hosts_of(&env, &["--all"]))["needs_you"], 0);
+}
+
+#[test]
+fn agent_new_refuses_unknown_caller_on_every_path() {
+    let env = board_env();
+    env.make_repo();
+    let stranger = nebula_core::AgentId::generate().to_string();
+    for extra in [&[][..], &["--no-card"]] {
+        let mut argv = vec![
+            "agent",
+            "new",
+            "--project",
+            "repo",
+            "--worktree",
+            "main",
+            "--name",
+            "orphan",
+        ];
+        argv.extend_from_slice(extra);
+        let out = env.cli(&argv, Some(&stranger));
+        assert!(
+            !out.status.success(),
+            "{argv:?} spawned for an unknown caller"
+        );
+        assert!(
+            stderr(&out).contains(&format!("NEBULA_AGENT_ID {stranger} names no session")),
+            "{}",
+            stderr(&out)
+        );
+    }
+    assert!(agent_names(&env).is_empty());
+}
+
+#[test]
+fn human_show_and_away_name_sessions() {
+    let env = board_env();
+    let work = add(&env, &["--project", "nebula"], "Work");
+    let ask = add(&env, &["--project", "nebula"], "Ask");
+    let since = now_ms();
+    let writer = |status, at| SessionRow {
+        writer: true,
+        ..far_row(&work, "w1", status, at)
+    };
+    far_report(&env, vec![writer(AgentStatus::Running, since + 1)]);
+    far_report(
+        &env,
+        vec![
+            writer(AgentStatus::Finished, since + 2),
+            far_row(&ask, "n1", AgentStatus::NeedsFeedback, since + 2),
+        ],
+    );
+    let human = |argv: &[&str]| {
+        let out = env.cli(argv, None);
+        assert!(out.status.success(), "{}", stderr(&out));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let show = human(&["todo", "show", "#1"]);
+    assert!(
+        show.contains("worker w1 on elsewhere: codex finished just now, writer, live"),
+        "{show}"
+    );
+    let away_since = since.to_string();
+    let board = human(&["todo", "board", "--all", "--away-since", &away_since]);
+    assert!(board.contains("finished: #1\n"), "{board}");
+    assert!(board.contains("needs you: n1 on elsewhere\n"), "{board}");
 }
 
 impl Env {

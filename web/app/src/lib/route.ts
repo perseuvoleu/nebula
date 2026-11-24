@@ -9,6 +9,37 @@ export interface Selection {
   all: boolean;
   /** The serverless runs section; overrides project and session in the URL. */
   serverless?: boolean;
+  board?: BoardRoute;
+}
+
+export interface BoardRoute {
+  project: string | null;
+  /** Without the ref's leading "#", which a URL reads as a fragment. */
+  card: string | null;
+  decisions: boolean;
+  table: boolean;
+  peek: string | null;
+}
+
+const NAME = "([A-Za-z0-9._@-]{1,80})";
+const BOARD = new RegExp(`^/board(?:/p/${NAME}|/c/${NAME}|/decisions(?:/p/${NAME})?)?/?$`);
+const REF = /^[A-Za-z0-9._@-]{1,80}$/;
+
+function parseBoard(pathname: string, params: URLSearchParams): BoardRoute | null {
+  const match = BOARD.exec(pathname.replace(/%40/gi, "@"));
+  if (!match) return null;
+  const peek = params.get("peek");
+  return { project: match[1] ?? match[3] ?? null, card: match[2] ?? null, decisions: pathname.startsWith("/board/decisions"),
+    table: params.get("view") === "table", peek: peek && REF.test(peek) ? peek : null };
+}
+
+function boardPath(route: BoardRoute): string {
+  const project = route.project ? `/p/${encodeURIComponent(route.project)}` : "";
+  const path = route.card ? `/board/c/${encodeURIComponent(route.card)}` : route.decisions ? `/board/decisions${project}` : `/board${project}`;
+  const params = new URLSearchParams();
+  if (route.table) params.set("view", "table");
+  if (route.peek) params.set("peek", route.peek);
+  return params.size ? `${path}?${params}` : path;
 }
 
 const PATTERN = /^\/(?:p\/([A-Za-z0-9._@-]{1,80})(?:\/s\/([A-Za-z0-9._-]{1,80}))?)?\/?$/;
@@ -17,6 +48,8 @@ const PATTERN = /^\/(?:p\/([A-Za-z0-9._@-]{1,80})(?:\/s\/([A-Za-z0-9._-]{1,80}))
 export function parseSelection(path: string): Selection {
   const [pathname, query] = path.split("?");
   if (/^\/serverless\/?$/.test(pathname)) return { project: null, session: null, all: false, serverless: true };
+  const board = parseBoard(pathname, new URLSearchParams(query));
+  if (board) return { project: null, session: null, all: false, board };
   const match = PATTERN.exec(pathname);
   return { project: match?.[1] ?? null, session: match?.[2] ?? null,
     all: new URLSearchParams(query).get("view") === "all" };
@@ -25,6 +58,7 @@ export function parseSelection(path: string): Selection {
 /** Encode real session identity separately from the virtual All filter. */
 export function selectionPath(selection: Selection): string {
   if (selection.serverless) return "/serverless";
+  if (selection.board) return boardPath(selection.board);
   if (selection.all && !selection.session) return "/?view=all";
   if (!selection.project) return "/";
   return `/p/${encodeURIComponent(selection.project)}${selection.session ? `/s/${encodeURIComponent(selection.session)}` : ""}${selection.all ? "?view=all" : ""}`;
