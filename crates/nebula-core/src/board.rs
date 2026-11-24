@@ -1,8 +1,3 @@
-//! The board contract every host shares: cards, their log, artifacts, the
-//! session rows hosts report, the `Board` request and its reply, and the pure
-//! rules (card refs, stage automation, the e2e-run format) the CLI, the board
-//! daemon and the gateway all apply the same way.
-
 use crate::entities::{AgentKind, AgentStatus};
 use crate::ids::{AgentId, ArtifactId, DispatchId, NoteId, TodoId};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -640,8 +635,6 @@ enum BoardPollWire {
     },
 }
 
-/// `{"version","unchanged":true}` or `{"version","board"}`, plus `next`
-/// only while more pages follow.
 #[derive(Serialize, Deserialize)]
 struct BoardPollJson {
     version: String,
