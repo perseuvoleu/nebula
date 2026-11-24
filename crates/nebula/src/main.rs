@@ -272,7 +272,11 @@ enum Command {
     /// Pipe stdin/stdout to this machine's daemon socket — what a remote
     /// nebula runs over ssh to reach the daemon here.
     #[command(hide = true)]
-    Proxy,
+    Proxy {
+        /// Fail when no daemon is running instead of starting one.
+        #[arg(long)]
+        connect_only: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1363,7 +1367,7 @@ fn main() -> Result<()> {
         }
         Some(Command::Ssh { host, path }) => ssh::run_ssh(&host, path.as_deref()),
         Some(Command::Upgrade { force }) => upgrade::run_upgrade(force),
-        Some(Command::Proxy) => nebula_tui::run_proxy(),
+        Some(Command::Proxy { connect_only }) => nebula_tui::run_proxy(connect_only),
         Some(Command::StaleDaemonNote) => {
             if nebula_daemon::lifecycle::daemon_is_stale() {
                 println!("note: the running daemon was built from older code.");

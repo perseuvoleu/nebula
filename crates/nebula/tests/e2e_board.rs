@@ -674,7 +674,7 @@ fn board_at(host: &str) -> String {
 
 fn proxy_to(board: &Env) -> String {
     format!(
-        "NEBULA_RUNTIME_DIR='{}' NEBULA_DATA_DIR='{}' '{}' proxy",
+        "NEBULA_RUNTIME_DIR='{}' NEBULA_DATA_DIR='{}' '{}' {{proxy}}",
         board.runtime_dir().display(),
         board.data_dir().display(),
         env!("CARGO_BIN_EXE_nebula")
@@ -761,14 +761,17 @@ fn link_add_shows_on_board() {
     );
 }
 
+const UNREACHABLE: &str = "nebula: board host boardhost is unreachable; nothing was sent";
+
 #[test]
 fn link_down_exit_3() {
     let mut board = board_env();
-    let here = viewer(&pump_to(&board, None));
+    let here = viewer(&proxy_to(&board));
     stop(&mut board);
 
     let out = here.cli(&["todo", "add", "--project", "nebula", "Lost"], None);
     assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+    assert!(stderr(&out).contains(UNREACHABLE), "{}", stderr(&out));
 
     let board = board.start(&[]);
     assert_eq!(list(&board, &["--all"]), Vec::<String>::new());

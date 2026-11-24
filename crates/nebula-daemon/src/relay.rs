@@ -362,16 +362,19 @@ impl Relay {
 }
 
 /// The command whose stdin/stdout reach the host daemon's socket.
-/// `NEBULA_RELAY_CMD` (tests) is a shell line with `{host}` substituted;
-/// otherwise `ssh host nebula proxy`, BatchMode so a daemon never hangs
+/// `NEBULA_RELAY_CMD` (tests) is a shell line with `{host}` and `{proxy}`
+/// (the `nebula` arguments) substituted; otherwise `ssh host nebula
+/// <proxy>`, BatchMode so a daemon never hangs
 /// on a prompt, keepalives so a dead link is noticed within a minute.
-pub(crate) fn relay_command(host: &str) -> tokio::process::Command {
+pub(crate) fn relay_command(host: &str, proxy: &str) -> tokio::process::Command {
     if let Ok(tmpl) = std::env::var("NEBULA_RELAY_CMD") {
-        let line = tmpl.replace("{host}", host);
+        let line = tmpl.replace("{host}", host).replace("{proxy}", proxy);
         let mut cmd = tokio::process::Command::new("sh");
         cmd.args(["-c", &line]);
         return cmd;
     }
+    let remote =
+        format!("export PATH=\"$HOME/.local/bin:$HOME/.cargo/bin:$PATH\"; exec nebula {proxy}");
     let mut cmd = tokio::process::Command::new("ssh");
     cmd.args(nebula_core::remote::SSH_BATCH_OPTS);
     cmd.args([
@@ -383,7 +386,7 @@ pub(crate) fn relay_command(host: &str) -> tokio::process::Command {
         "ControlPath=none",
         "--",
         host,
-        "export PATH=\"$HOME/.local/bin:$HOME/.cargo/bin:$PATH\"; exec nebula proxy",
+        &remote,
     ]);
     cmd
 }
@@ -420,7 +423,7 @@ async fn connect_and_pump(
     daemon: &Arc<Daemon>,
     out_rx: &mut mpsc::Receiver<QueuedRequest>,
 ) -> Result<()> {
-    let mut child = relay_command(&relay.host)
+    let mut child = relay_command(&relay.host, "proxy")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())

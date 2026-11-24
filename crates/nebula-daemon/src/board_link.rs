@@ -237,7 +237,7 @@ async fn connect_and_pump(
     link: &BoardLink,
     out_rx: &mut mpsc::Receiver<(u64, BoardOp)>,
 ) -> Result<()> {
-    let mut child = relay_command(&link.host)
+    let mut child = relay_command(&link.host, "proxy --connect-only")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
