@@ -6,9 +6,7 @@
 
 use crate::relay::{relay_command, RelayClient};
 use anyhow::{bail, Context, Result};
-use nebula_core::board::{
-    card_label, BoardOp, BoardPoll, BoardRead, BoardResult, Card, CardRef, Refusal,
-};
+use nebula_core::board::{card_label, BoardOp, BoardPoll, BoardResult, Card, CardRef, Refusal};
 use nebula_core::codec::{read_frame, write_frame};
 use nebula_core::{ClientRequest, ServerEvent, PROTOCOL_VERSION};
 use std::collections::HashMap;
@@ -333,26 +331,7 @@ async fn handshake<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 
 /// A ref qualified with the board host means the board's own number there.
 fn localize(op: &mut BoardOp, host: &str) {
-    let refs: Vec<&mut CardRef> = match op {
-        BoardOp::Read(BoardRead::Card { card, .. }) => vec![card],
-        BoardOp::Read(BoardRead::Artifacts { card, .. }) => card.iter_mut().collect(),
-        BoardOp::Read(
-            BoardRead::Board { .. } | BoardRead::Cards { .. } | BoardRead::Artifact { .. },
-        ) => vec![],
-        BoardOp::EditCard { card, .. }
-        | BoardOp::Move { card, .. }
-        | BoardOp::Archive { card }
-        | BoardOp::Proposal { card, .. }
-        | BoardOp::AddNote { card, .. } => vec![card],
-        BoardOp::Block { card, by, .. } => vec![card, by],
-        BoardOp::BeginRun(dispatch) => vec![&mut dispatch.card],
-        BoardOp::AddCard(_)
-        | BoardOp::Publish(_)
-        | BoardOp::RemoveArtifact { .. }
-        | BoardOp::EndRun { .. }
-        | BoardOp::Report(_) => vec![],
-    };
-    for card in refs {
+    for card in op.card_refs_mut() {
         if let CardRef::Number { board, .. } = card {
             if board.as_deref() == Some(host) {
                 *board = None;

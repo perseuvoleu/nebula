@@ -449,6 +449,37 @@ pub enum BoardOp {
         error: Option<String>,
     },
     Report(HostReport),
+    /// A write allowed only on cards inside `scope`, checked in the write's
+    /// own transaction.
+    Scoped {
+        scope: BoardScope,
+        op: Box<BoardOp>,
+    },
+}
+
+impl BoardOp {
+    pub fn card_refs_mut(&mut self) -> Vec<&mut CardRef> {
+        match self {
+            BoardOp::Read(BoardRead::Card { card, .. }) => vec![card],
+            BoardOp::Read(BoardRead::Artifacts { card, .. }) => card.iter_mut().collect(),
+            BoardOp::Read(
+                BoardRead::Board { .. } | BoardRead::Cards { .. } | BoardRead::Artifact { .. },
+            ) => vec![],
+            BoardOp::EditCard { card, .. }
+            | BoardOp::Move { card, .. }
+            | BoardOp::Archive { card }
+            | BoardOp::Proposal { card, .. }
+            | BoardOp::AddNote { card, .. } => vec![card],
+            BoardOp::Block { card, by, .. } => vec![card, by],
+            BoardOp::BeginRun(dispatch) => vec![&mut dispatch.card],
+            BoardOp::Scoped { op, .. } => op.card_refs_mut(),
+            BoardOp::AddCard(_)
+            | BoardOp::Publish(_)
+            | BoardOp::RemoveArtifact { .. }
+            | BoardOp::EndRun { .. }
+            | BoardOp::Report(_) => vec![],
+        }
+    }
 }
 
 /// Why the board refused an op. It leads the `Error` message, so it crosses

@@ -127,7 +127,23 @@ fn apply(tx: &Transaction, op: BoardOp) -> Result<BoardResult> {
         | BoardOp::BeginRun(_)
         | BoardOp::EndRun { .. }
         | BoardOp::Report(_) => bail!("this board does not serve that operation yet"),
+        BoardOp::Scoped { scope, op } => {
+            within(tx, &scope, &op)?;
+            apply(tx, *op)
+        }
     }
+}
+
+/// Every card a scoped write names must still be in scope when it runs.
+fn within(tx: &Transaction, scope: &BoardScope, op: &BoardOp) -> Result<()> {
+    let mut named = op.clone();
+    for card in named.card_refs_mut() {
+        let id = resolve(tx, card)?;
+        if !in_scope(scope, card_by_id(tx, &id)?.project.as_deref()) {
+            return Err(not_found(card));
+        }
+    }
+    Ok(())
 }
 
 fn now_ms() -> i64 {

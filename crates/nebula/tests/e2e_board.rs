@@ -631,6 +631,43 @@ fn agent_new_card_refuses_unknown_caller() {
     assert!(agent_names(&env).is_empty());
 }
 
+#[test]
+fn card_write_outside_scope_refused() {
+    let env = board_env();
+    add(&env, &["--project", "other"], "Elsewhere");
+    add(&env, &["--project", "nebula"], "Here");
+    let scope = ["--project", "nebula"];
+
+    for argv in [
+        &["todo", "move", "#1", "next"][..],
+        &["todo", "archive", "#1"],
+        &["todo", "note", "#1", "hidden"],
+        &["todo", "block", "#2", "--by", "#1"],
+    ] {
+        let out = env.cli(&[argv, &scope[..]].concat(), None);
+        assert_eq!(out.status.code(), Some(5), "{argv:?}: {}", stderr(&out));
+    }
+    let untouched = env.json(&["todo", "show", "#1", "--json"]);
+    assert_eq!(untouched["stage"], "backlog");
+    assert_eq!(untouched["archived"], false);
+    assert_eq!(untouched["log"], serde_json::json!([]));
+    assert_eq!(
+        env.json(&["todo", "show", "#2", "--json"])["blocked_by"],
+        serde_json::json!([])
+    );
+
+    let moved = env.json(&[
+        "todo",
+        "move",
+        "#2",
+        "next",
+        "--json",
+        "--project",
+        "nebula",
+    ]);
+    assert_eq!(moved["stage"], "next");
+}
+
 fn board_at(host: &str) -> String {
     format!(r#"{{"board": "{host}"}}"#)
 }

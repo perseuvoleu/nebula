@@ -105,6 +105,17 @@ pub struct ScopeFlags {
 }
 
 impl ScopeFlags {
+    /// A write naming a scope runs only on cards inside it.
+    fn guard(self, op: BoardOp) -> BoardOp {
+        match self.all || self.include_home || !self.projects.is_empty() {
+            true => BoardOp::Scoped {
+                scope: self.scope(None),
+                op: Box::new(op),
+            },
+            false => op,
+        }
+    }
+
     fn scope(self, fallback: Option<&str>) -> BoardScope {
         let projects = match (self.all, self.projects.is_empty(), fallback) {
             (true, _, _) => ProjectScope::All,
@@ -143,25 +154,31 @@ pub enum TodoVerb {
         card: String,
         stage: Stage,
         expect: Option<Stage>,
+        scope: ScopeFlags,
     },
     Archive {
         card: String,
+        scope: ScopeFlags,
     },
     Accept {
         card: String,
+        scope: ScopeFlags,
     },
     Dismiss {
         card: String,
+        scope: ScopeFlags,
     },
     Note {
         card: String,
         text: String,
         id: Option<String>,
+        scope: ScopeFlags,
     },
     Block {
         card: String,
         by: String,
         on: bool,
+        scope: ScopeFlags,
     },
     List {
         scope: ScopeFlags,
@@ -277,33 +294,44 @@ pub async fn run(verb: TodoVerb, json: bool) -> Result<()> {
             card,
             stage,
             expect,
-        } => BoardOp::Move {
+            scope,
+        } => scope.guard(BoardOp::Move {
             card: card_ref(&card)?,
             stage,
             expect,
-        },
-        TodoVerb::Archive { card } => BoardOp::Archive {
+        }),
+        TodoVerb::Archive { card, scope } => scope.guard(BoardOp::Archive {
             card: card_ref(&card)?,
-        },
-        TodoVerb::Accept { card } => BoardOp::Proposal {
+        }),
+        TodoVerb::Accept { card, scope } => scope.guard(BoardOp::Proposal {
             card: card_ref(&card)?,
             accept: true,
-        },
-        TodoVerb::Dismiss { card } => BoardOp::Proposal {
+        }),
+        TodoVerb::Dismiss { card, scope } => scope.guard(BoardOp::Proposal {
             card: card_ref(&card)?,
             accept: false,
-        },
-        TodoVerb::Note { card, text, id } => BoardOp::AddNote {
+        }),
+        TodoVerb::Note {
+            card,
+            text,
+            id,
+            scope,
+        } => scope.guard(BoardOp::AddNote {
             id: NoteId(client_id(id)?),
             card: card_ref(&card)?,
             text,
             author: caller.author.clone(),
-        },
-        TodoVerb::Block { card, by, on } => BoardOp::Block {
+        }),
+        TodoVerb::Block {
+            card,
+            by,
+            on,
+            scope,
+        } => scope.guard(BoardOp::Block {
             card: card_ref(&card)?,
             by: card_ref(&by)?,
             on,
-        },
+        }),
         TodoVerb::List {
             scope,
             stage,

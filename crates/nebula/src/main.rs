@@ -688,24 +688,32 @@ enum TodoCommand {
         stage: Stage,
         #[arg(long, value_parser = parse_stage)]
         expect: Option<Stage>,
+        #[command(flatten)]
+        scope: ScopeArgs,
         #[arg(long)]
         json: bool,
     },
     /// Archive a card; its number stays reserved.
     Archive {
         card: String,
+        #[command(flatten)]
+        scope: ScopeArgs,
         #[arg(long)]
         json: bool,
     },
     /// Accept a proposed card onto the board.
     Accept {
         card: String,
+        #[command(flatten)]
+        scope: ScopeArgs,
         #[arg(long)]
         json: bool,
     },
     /// Dismiss a proposed card (archives it).
     Dismiss {
         card: String,
+        #[command(flatten)]
+        scope: ScopeArgs,
         #[arg(long)]
         json: bool,
     },
@@ -718,6 +726,8 @@ enum TodoCommand {
         /// The note's ULID, so a rerun adds nothing twice.
         #[arg(long)]
         id: Option<String>,
+        #[command(flatten)]
+        scope: ScopeArgs,
         #[arg(long)]
         json: bool,
     },
@@ -726,6 +736,8 @@ enum TodoCommand {
         card: String,
         #[arg(long)]
         by: String,
+        #[command(flatten)]
+        scope: ScopeArgs,
         #[arg(long)]
         json: bool,
     },
@@ -734,6 +746,8 @@ enum TodoCommand {
         card: String,
         #[arg(long)]
         by: String,
+        #[command(flatten)]
+        scope: ScopeArgs,
         #[arg(long)]
         json: bool,
     },
@@ -1161,39 +1175,78 @@ fn main() -> Result<()> {
                     card,
                     stage,
                     expect,
+                    scope,
                     json,
                 }) => (
                     TodoVerb::Move {
                         card,
                         stage,
                         expect,
+                        scope: scope.into(),
                     },
                     json,
                 ),
-                Some(TodoCommand::Archive { card, json }) => (TodoVerb::Archive { card }, json),
-                Some(TodoCommand::Accept { card, json }) => (TodoVerb::Accept { card }, json),
-                Some(TodoCommand::Dismiss { card, json }) => (TodoVerb::Dismiss { card }, json),
+                Some(TodoCommand::Archive { card, scope, json }) => (
+                    TodoVerb::Archive {
+                        card,
+                        scope: scope.into(),
+                    },
+                    json,
+                ),
+                Some(TodoCommand::Accept { card, scope, json }) => (
+                    TodoVerb::Accept {
+                        card,
+                        scope: scope.into(),
+                    },
+                    json,
+                ),
+                Some(TodoCommand::Dismiss { card, scope, json }) => (
+                    TodoVerb::Dismiss {
+                        card,
+                        scope: scope.into(),
+                    },
+                    json,
+                ),
                 Some(TodoCommand::Note {
                     card,
                     text,
                     id,
+                    scope,
                     json,
                 }) => (
                     TodoVerb::Note {
                         card,
                         text: text.join(" "),
                         id,
+                        scope: scope.into(),
                     },
                     json,
                 ),
-                Some(TodoCommand::Block { card, by, json }) => {
-                    (TodoVerb::Block { card, by, on: true }, json)
-                }
-                Some(TodoCommand::Unblock { card, by, json }) => (
+                Some(TodoCommand::Block {
+                    card,
+                    by,
+                    scope,
+                    json,
+                }) => (
+                    TodoVerb::Block {
+                        card,
+                        by,
+                        on: true,
+                        scope: scope.into(),
+                    },
+                    json,
+                ),
+                Some(TodoCommand::Unblock {
+                    card,
+                    by,
+                    scope,
+                    json,
+                }) => (
                     TodoVerb::Block {
                         card,
                         by,
                         on: false,
+                        scope: scope.into(),
                     },
                     json,
                 ),
