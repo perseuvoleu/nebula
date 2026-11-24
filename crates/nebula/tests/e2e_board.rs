@@ -1931,3 +1931,18 @@ fn decision_on_a_card_takes_its_project() {
         ["Copy published files"]
     );
 }
+
+#[test]
+fn decision_add_home_ignores_the_callers_checkout() {
+    let env = board_env();
+    env.make_repo();
+    let (_, agent) = carded_agent(&env, "main");
+    let decided = decide(
+        &env,
+        Some(&agent),
+        &["--why=Nobody owns it yet", "--home", "Keep a shared inbox"],
+    );
+    assert_eq!(decided["card"], Value::Null);
+    assert_eq!(decided["project"], Value::Null);
+    assert_eq!(decided["title"], "Keep a shared inbox");
+}

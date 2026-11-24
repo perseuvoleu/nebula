@@ -19,6 +19,7 @@ pub enum DecisionVerb {
         why: Option<String>,
         card: Option<String>,
         project: Option<String>,
+        home: bool,
         id: Option<String>,
     },
     List {
@@ -41,12 +42,14 @@ pub async fn run(verb: DecisionVerb, json: bool) -> Result<()> {
             why,
             card,
             project,
+            home,
             id,
         } => {
             if what.trim().is_empty() {
                 bail!("a decision needs its WHAT");
             }
             let (card, project) = match (card, project) {
+                (None, None) if home => (None, None),
                 (Some(text), _) => {
                     let card = read_card(&mut conn, &text).await?;
                     (Some(card.id), card.project)

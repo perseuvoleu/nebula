@@ -903,6 +903,9 @@ enum DecisionCommand {
         /// Record it on this project with no card.
         #[arg(long)]
         project: Option<String>,
+        /// Record it in no project and on no card, wherever it runs.
+        #[arg(long, conflicts_with_all = ["card", "project"])]
+        home: bool,
         /// The decision's ULID, so a rerun records nothing twice.
         #[arg(long)]
         id: Option<String>,
@@ -1494,6 +1497,7 @@ fn main() -> Result<()> {
                     why,
                     card,
                     project,
+                    home,
                     id,
                     json,
                 } => (
@@ -1502,6 +1506,7 @@ fn main() -> Result<()> {
                         why,
                         card,
                         project,
+                        home,
                         id,
                     },
                     json,
