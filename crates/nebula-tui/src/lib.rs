@@ -240,7 +240,10 @@ pub fn run_switch(
 /// is the checkout's writer and `--writer` was passed without `--force-writer`.
 pub fn run_agent_new(opts: NewAgentOpts) -> Result<()> {
     match runtime()?.block_on(ipc::agent_new(opts)) {
-        Err(why) if why.to_string().contains(nebula_core::WRITER_HELD_REFUSAL) => {
+        Err(why)
+            if nebula_core::board::Refusal::of(&why.to_string())
+                == Some(nebula_core::board::Refusal::WriterHeld) =>
+        {
             eprintln!("{why:#}");
             std::process::exit(2);
         }

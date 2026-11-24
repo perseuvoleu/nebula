@@ -1933,7 +1933,8 @@ pub async fn spawn_agent(opts: NewAgentOpts) -> Result<serde_json::Value> {
         let mut upserts = Vec::new();
         match await_ack(&mut conn, req_id, &mut upserts).await {
             Err(why)
-                if why.to_string().contains(nebula_core::WRITER_HELD_REFUSAL)
+                if nebula_core::board::Refusal::of(&why.to_string())
+                    == Some(nebula_core::board::Refusal::WriterHeld)
                     && tokio::time::Instant::now() < wait_until =>
             {
                 if !announced {

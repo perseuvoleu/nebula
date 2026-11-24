@@ -2455,10 +2455,10 @@ impl Daemon {
         }
         if writer == WriterClaim::Exclusive {
             if let Some(holder) = self.live_writer(worktree_id)? {
-                bail!(
+                bail!(nebula_core::board::Refusal::WriterHeld.message(format!(
                     "\"{holder}\" {WRITER_HELD_REFUSAL} {}; wait for it, archive it, or pass --force-writer after the user approves two writers",
                     worktree.branch
-                );
+                )));
             }
         }
         // A warm session for this (worktree, kind) hands over its PTY and
@@ -6046,7 +6046,7 @@ exec sleep 60
             .unwrap_err();
         assert_eq!(
             err.to_string(),
-            "\"holder\" is the writer on main; wait for it, archive it, or pass --force-writer after the user approves two writers"
+            "writer held: \"holder\" is the writer on main; wait for it, archive it, or pass --force-writer after the user approves two writers"
         );
         let ServerEvent::Snapshot { agents, .. } = daemon.snapshot().unwrap() else {
             unreachable!()

@@ -503,14 +503,17 @@ pub enum Refusal {
     Unreachable,
     /// The board link failed after the request was written.
     OutcomeUnknown,
+    /// Another live session holds the checkout's writer slot.
+    WriterHeld,
 }
 
 impl Refusal {
-    const ALL: [Refusal; 4] = [
+    const ALL: [Refusal; 5] = [
         Refusal::NotFound,
         Refusal::Conflict,
         Refusal::Unreachable,
         Refusal::OutcomeUnknown,
+        Refusal::WriterHeld,
     ];
 
     fn tag(self) -> &'static str {
@@ -519,6 +522,7 @@ impl Refusal {
             Refusal::Conflict => "conflict: ",
             Refusal::Unreachable => "; nothing was sent",
             Refusal::OutcomeUnknown => "; outcome unknown; rerun the same command",
+            Refusal::WriterHeld => "writer held: ",
         }
     }
 
@@ -545,7 +549,7 @@ impl Refusal {
             Refusal::Unreachable => 3,
             Refusal::OutcomeUnknown => 4,
             Refusal::NotFound => 5,
-            Refusal::Conflict => 6,
+            Refusal::Conflict | Refusal::WriterHeld => 6,
         }
     }
 }

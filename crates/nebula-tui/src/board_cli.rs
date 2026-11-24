@@ -519,7 +519,7 @@ async fn run_dispatch(
             )),
             None,
         ),
-        Err(why) if why.to_string().contains(nebula_core::WRITER_HELD_REFUSAL) => {
+        Err(why) if Refusal::of(&why.to_string()) == Some(Refusal::WriterHeld) => {
             (None, Some(why.to_string()))
         }
         Err(why) => bail!(
@@ -541,7 +541,7 @@ async fn run_dispatch(
     let receipt = run_receipt(ended)?;
     print_receipt(&receipt, json)?;
     match (receipt.state, error) {
-        (DispatchState::Failed, Some(error)) => bail!(Refusal::Conflict.message(error)),
+        (DispatchState::Failed, Some(error)) => bail!("{error}"),
         _ => Ok(()),
     }
 }
