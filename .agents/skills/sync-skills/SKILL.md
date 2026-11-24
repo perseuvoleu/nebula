@@ -39,6 +39,7 @@ a higher number means the source dir for that symlink wasn't mirrored — add it
 | `~/.claude/{skills,commands,agents,rules,shared,CLAUDE.md}` | same | Claude Code's global config; `CLAUDE.md` `@include`s `shared/` and `commands/shared/` |
 | `~/.codex/{skills,agents,AGENTS.md}` | same | Codex's global skills, subagent definitions, instructions |
 | `~/.pi/agent/skills` | same | Pi skills |
+| `~/.gemini/config/skills`, `~/.gemini/GEMINI.md` | same | Antigravity CLI (`agy`) global skills and instructions; `~/.gemini/settings.json` and `~/.gemini/config/hooks.json` stay machine-local |
 
 Directories sync with `--delete` (a skill removed locally disappears remotely) and skip
 `node_modules`, `.git`, `.DS_Store`. Symlinks are copied as symlinks; ones that point at

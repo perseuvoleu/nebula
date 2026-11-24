@@ -11,6 +11,7 @@
 #   ~/.claude/{skills,commands,agents,rules,shared,CLAUDE.md}
 #   ~/.codex/{skills,agents,AGENTS.md}
 #   ~/.pi/agent/skills
+#   ~/.gemini/config/skills, ~/.gemini/GEMINI.md  (Antigravity CLI, agy)
 # Never touches auth/credential files. Settings change only through the remote's
 # perseu-stack/bin/install-hooks, run after the mirrors, which writes only the
 # entries marked _perseuManaged; --check runs its --check and prints `hooks: …`.
@@ -67,6 +68,8 @@ sync ~/.codex/skills         .codex/skills
 sync ~/.codex/agents         .codex/agents
 sync ~/.codex/AGENTS.md      .codex/AGENTS.md
 sync ~/.pi/agent/skills      .pi/agent/skills
+sync ~/.gemini/config/skills .gemini/config/skills
+sync ~/.gemini/GEMINI.md     .gemini/GEMINI.md
 
 if [ -n "$check" ]; then
   here=$(mktemp) there=$(mktemp)
@@ -85,7 +88,7 @@ if [ -n "$check" ]; then
 fi
 
 # Absolute symlinks into this Mac's home would dangle on Linux.
-ssh "$host" 'for l in $(find ~/.claude/skills ~/.codex/skills ~/.pi/agent/skills -maxdepth 1 -type l 2>/dev/null); do
+ssh "$host" 'for l in $(find ~/.claude/skills ~/.codex/skills ~/.pi/agent/skills ~/.gemini/config/skills -maxdepth 1 -type l 2>/dev/null); do
   t=$(readlink "$l"); case "$t" in /Users/*/.agents/*) ln -sfn "$HOME/.agents/${t#/Users/*/.agents/}" "$l";; esac; done
 echo "skills on $(hostname): $(ls ~/.claude/skills | wc -l) claude, $(ls ~/.codex/skills | wc -l) codex, $(find ~/.claude/skills ~/.codex/skills -maxdepth 1 -type l ! -exec test -e {} \; -print | wc -l) broken links"'
 

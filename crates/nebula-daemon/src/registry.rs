@@ -3755,14 +3755,17 @@ impl RemovalReport {
 /// no resume args. Otherwise the kind picks the CLI and its resume shape:
 /// `claude --resume <sid>` and `cursor-agent --resume <sid>` (flag),
 /// `pi --session <sid>` (flag, takes a full or partial session id) vs
-/// `codex resume <sid>` (subcommand, so resume args must lead). Claude,
-/// codex and cursor always get their skip-permissions flag
-/// (`--dangerously-skip-permissions` / `--yolo` / `--force`), appended
+/// `codex resume <sid>` (subcommand, so resume args must lead), and
+/// `agy --conversation <id>`. Claude, codex, cursor and agy always get their
+/// skip-permissions flag (`--dangerously-skip-permissions` / `--yolo` /
+/// `--force`), appended
 /// after the resume args — yolo mode for everything, same as Herdr.
 /// Pi needs none: it has no permission prompts. Model/effort choices trail
 /// everything: `claude --model m --effort e`, `codex -m m -c
 /// model_reasoning_effort=e`, `pi --model m --thinking e` (pi's "effort" is
-/// its thinking level); cursor has neither knob.
+/// its thinking level); cursor has neither knob, and agy takes only
+/// `--model` (its model ids carry the effort), defaulting to
+/// `AgentKind::default_model`.
 fn agent_spawn_command(
     kind: AgentKind,
     session_id: Option<&str>,
@@ -3785,6 +3788,9 @@ fn agent_spawn_command(
         (AgentKind::Codex, Some(sid)) => (vec!["resume".to_string(), sid.to_string()], true),
         (AgentKind::Cursor, Some(sid)) => (vec!["--resume".to_string(), sid.to_string()], true),
         (AgentKind::Pi, Some(sid)) => (vec!["--session".to_string(), sid.to_string()], true),
+        (AgentKind::Antigravity, Some(sid)) => {
+            (vec!["--conversation".to_string(), sid.to_string()], true)
+        }
         (_, None) => (Vec::new(), false),
     };
     match kind {
@@ -3792,6 +3798,7 @@ fn agent_spawn_command(
         AgentKind::Codex => args.push("--yolo".to_string()),
         AgentKind::Cursor => args.push("--force".to_string()),
         AgentKind::Pi => {}
+        AgentKind::Antigravity => args.push("--dangerously-skip-permissions".to_string()),
     }
     match kind {
         AgentKind::Claude => {
@@ -3811,6 +3818,11 @@ fn agent_spawn_command(
             }
         }
         AgentKind::Cursor => {}
+        AgentKind::Antigravity => {
+            if let Some(m) = model.or(kind.default_model()) {
+                args.extend(["--model".to_string(), m.to_string()]);
+            }
+        }
         AgentKind::Pi => {
             if let Some(m) = model {
                 args.extend(["--model".to_string(), m.to_string()]);
@@ -3824,6 +3836,9 @@ fn agent_spawn_command(
     // on a fresh spawn — a resume continues the old conversation and must
     // not re-submit the prompt.
     if let Some(p) = initial_prompt.filter(|_| !resumed) {
+        if kind == AgentKind::Antigravity {
+            args.push("-i".to_string());
+        }
         args.push(p.to_string());
     }
     (program, args, resumed)
@@ -4240,6 +4255,52 @@ mod tests {
                 None
             ),
             ("/bin/sh".into(), vec![], false)
+        );
+    }
+
+    #[test]
+    fn spawn_command_antigravity_pins_a_model_and_keeps_the_prompt_interactive() {
+        assert_eq!(
+            agent_spawn_command(
+                AgentKind::Antigravity,
+                None,
+                None,
+                None,
+                None,
+                Some("do it")
+            ),
+            (
+                "agy".into(),
+                vec![
+                    "--dangerously-skip-permissions".to_string(),
+                    "--model".to_string(),
+                    "gemini-4-neon-medium".to_string(),
+                    "-i".to_string(),
+                    "do it".to_string()
+                ],
+                false
+            )
+        );
+        assert_eq!(
+            agent_spawn_command(
+                AgentKind::Antigravity,
+                Some("conv-1"),
+                Some("claude-opus-5-5-high"),
+                None,
+                None,
+                Some("do it")
+            ),
+            (
+                "agy".into(),
+                vec![
+                    "--conversation".to_string(),
+                    "conv-1".to_string(),
+                    "--dangerously-skip-permissions".to_string(),
+                    "--model".to_string(),
+                    "claude-opus-5-5-high".to_string()
+                ],
+                true
+            )
         );
     }
 
@@ -7189,6 +7250,7 @@ exec sleep 60
         assert!(cli_missing_message(AgentKind::Claude).starts_with("claude was not found"));
         assert!(cli_missing_message(AgentKind::Codex).starts_with("codex was not found"));
         assert!(cli_missing_message(AgentKind::Pi).starts_with("pi was not found"));
+        assert!(cli_missing_message(AgentKind::Antigravity).starts_with("agy was not found"));
         // No "restart nebula": agent CLIs are spawned through the user's
         // login shell, so a fresh install is picked up on the next try.
         for kind in AgentKind::ALL {
