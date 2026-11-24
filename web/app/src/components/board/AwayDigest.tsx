@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { type ReactNode, useState } from "react";
 import { XIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -7,13 +7,19 @@ import { CardRef, StatusDot } from "./CardTile";
 
 export type AwayDecision = { id: string; title: string; age: string; cardRef: string | null };
 
-function Column({ title, count, empty, children }: { title: ReactNode; count: number; empty: string; children: ReactNode }) {
+const CAP = 3;
+
+function Column({ title, count, empty, children }: { title: ReactNode; count: number; empty: string; children: ReactNode[] }) {
+  const [all, setAll] = useState(false);
   return (
     <section className="flex min-w-0 flex-col gap-1 rounded-lg border bg-card p-2.5">
       <h3 className="flex items-center gap-1.5 px-1 text-xs font-medium text-muted-foreground">
         {title} <span className="font-mono tabular-nums">{count}</span>
       </h3>
-      {count ? <ul className="flex flex-col">{children}</ul> : <p className="px-1 text-xs text-muted-foreground">{empty}</p>}
+      {count ? <ul className="flex flex-col">{all ? children : children.slice(0, CAP)}</ul> : <p className="px-1 text-xs text-muted-foreground">{empty}</p>}
+      {!all && children.length > CAP && (
+        <Button type="button" variant="ghost" size="xs" className="self-start" onClick={() => setAll(true)}>Arată toate ({children.length})</Button>
+      )}
     </section>
   );
 }

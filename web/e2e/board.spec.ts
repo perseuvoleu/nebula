@@ -3,7 +3,8 @@ import path from "node:path";
 import { expect, type Locator, type Page } from "@playwright/test";
 import { test, STATE, TOKEN, noHorizontalOverflow, setBehaviour, shot } from "./helpers";
 
-type Board = { version: number; cards: Record<string, unknown>[]; hosts: { needs_you: number }[]; details: Record<string, { sessions: Record<string, unknown>[] }> };
+type Board = { version: number; cards: Record<string, unknown>[]; hosts: { needs_you: number }[];
+  away: { finished: { id: unknown; at: number }[] }; details: Record<string, { sessions: Record<string, unknown>[] }> };
 
 const readBoard = (): Board => JSON.parse(fs.readFileSync(path.join(STATE, "board.json"), "utf8"));
 
@@ -87,6 +88,19 @@ test("the away digest lists only the scope's project and shows only what it list
   await expect(page).toHaveURL(/\/board\/p\/vela$/);
   await expect(tile(page, "Keep verification results")).toHaveCount(0);
   await expect(digest).toHaveCount(0);
+});
+
+test("at 390 px a long away digest is capped and leaves the board in view", async ({ page }) => {
+  for (let number = 20; number < 50; number++) addCard(number, `Finished ${number}`, "done");
+  writeBoard((board) => board.away.finished.push(...board.cards.filter((c) => c.stage === "done").map((c) => ({ id: c.id, at: 1764000500000 }))));
+  await page.setViewportSize({ width: 390, height: 844 });
+  await awayFrom(page);
+  await open(page, "/board");
+  const digest = page.getByRole("region", { name: "De când ai lipsit" });
+  await expect(digest.getByRole("button", { name: "Finished 20" })).toBeVisible();
+  await expect(column(page, "Backlog")).toBeInViewport();
+  await digest.getByRole("button", { name: /Arată toate/ }).click();
+  await expect(digest.getByRole("button", { name: "Finished 49" })).toBeVisible();
 });
 
 test("blocked card dimmed", async ({ page }) => {
