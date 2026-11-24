@@ -1,0 +1,24 @@
+{
+  "id": "01JG0000000000000000000001",
+  "kind": "e2e-run",
+  "title": "board.spec",
+  "card": "01JD0000000000000000000012",
+  "project": "nebula",
+  "session": {
+    "host": "leaseweb",
+    "id": "01JF0000000000000000000002",
+    "name": "worker"
+  },
+  "checkout": {
+    "host": "leaseweb",
+    "branch": "agent-home-02",
+    "path": "/home/perseu/nebula-worktrees/agent-home-02",
+    "worktree": true
+  },
+  "content": {
+    "host": "leaseweb",
+    "entry": "result.json"
+  },
+  "meta": {},
+  "created_at": 1764000300000
+}

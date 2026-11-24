@@ -1,0 +1,20 @@
+{
+  "id": "01JG0000000000000000000002",
+  "kind": "decision",
+  "title": "Copy published files",
+  "card": null,
+  "project": "nebula",
+  "session": {
+    "host": "leaseweb",
+    "id": "01JF0000000000000000000002",
+    "name": "worker"
+  },
+  "checkout": null,
+  "content": {
+    "body": "The checkout is disposable"
+  },
+  "meta": {
+    "rag_note": 1412
+  },
+  "created_at": 1764000400000
+}

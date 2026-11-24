@@ -1,0 +1,77 @@
+{
+  "id": "01JD0000000000000000000012",
+  "number": 12,
+  "ref": "#12@leaseweb",
+  "title": "Keep verification results",
+  "stage": "doing",
+  "project": "nebula",
+  "proposed": false,
+  "archived": false,
+  "created_by": {
+    "host": "perseu-mbp",
+    "agent": "01JF0000000000000000000001",
+    "name": "AH 02 Contract Worker"
+  },
+  "checkout": {
+    "host": "leaseweb",
+    "branch": "agent-home-02",
+    "path": "/home/perseu/nebula-worktrees/agent-home-02",
+    "worktree": true
+  },
+  "blocked_by": [
+    "#11@leaseweb"
+  ],
+  "sessions": [
+    {
+      "host": "leaseweb",
+      "id": "01JF0000000000000000000002",
+      "name": "worker",
+      "role": "worker",
+      "kind": "codex",
+      "status": "running",
+      "status_changed_at": 1764000200000,
+      "writer": true,
+      "alive": true,
+      "stale": false
+    }
+  ],
+  "artifacts": [
+    {
+      "id": "01JG0000000000000000000001",
+      "kind": "e2e-run",
+      "title": "board.spec",
+      "card": "01JD0000000000000000000012",
+      "project": "nebula",
+      "session": {
+        "host": "leaseweb",
+        "id": "01JF0000000000000000000002",
+        "name": "worker"
+      },
+      "checkout": {
+        "host": "leaseweb",
+        "branch": "agent-home-02",
+        "path": "/home/perseu/nebula-worktrees/agent-home-02",
+        "worktree": true
+      },
+      "content": {
+        "host": "leaseweb",
+        "entry": "result.json"
+      },
+      "meta": {},
+      "created_at": 1764000300000
+    }
+  ],
+  "log": [
+    {
+      "id": "01JH0000000000000000000001",
+      "card": "01JD0000000000000000000012",
+      "text": "Started on leaseweb",
+      "author": {
+        "host": "perseu-mbp",
+        "agent": "01JF0000000000000000000001",
+        "name": "AH 02 Contract Worker"
+      },
+      "created_at": 1764000100000
+    }
+  ]
+}

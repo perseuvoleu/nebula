@@ -285,6 +285,9 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 ClientRequest::MarkPrSeen { url, marker } => {
                     let _ = daemon.store.mark_pr_seen(&url, &marker);
                 }
+                ClientRequest::Board { req_id, .. } => {
+                    reply(&out_tx, req_id, Err(anyhow::anyhow!("no board configured"))).await;
+                }
                 ClientRequest::GetMetrics { req_id } => {
                     // A machine-wide `ps` sweep takes tens of ms; keep it off
                     // the request loop so Input/Attach frames keep flowing.
@@ -528,6 +531,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     writer,
                     spawned_by,
                     code_mode_off,
+                    ..
                 } => {
                     reply(
                         &out_tx,

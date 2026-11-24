@@ -1,4 +1,7 @@
-use crate::ids::{AgentId, LinkId, NoteId, ProjectId, TerminalId, TodoId, WorkspaceId, WorktreeId};
+use crate::board::Role;
+use crate::ids::{
+    AgentId, DispatchId, LinkId, NoteId, ProjectId, TerminalId, TodoId, WorkspaceId, WorktreeId,
+};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -221,6 +224,15 @@ pub struct Agent {
     /// the session lives.
     #[serde(default)]
     pub writer: bool,
+    /// The board card this session works on; the card itself lives on the
+    /// board host, so there is no local foreign key.
+    #[serde(default)]
+    pub card_id: Option<TodoId>,
+    #[serde(default)]
+    pub role: Option<Role>,
+    /// The `todo run` dispatch that spawned this session.
+    #[serde(default)]
+    pub dispatch_id: Option<DispatchId>,
     /// Spawned with `agent new --no-code-mode`: every spawn of this claude
     /// session gets `CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=0`, since a Code
     /// Mode conversation resumes only with Code Mode on. Skipped when false,

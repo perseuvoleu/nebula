@@ -1,14 +1,17 @@
+use crate::board::{BoardOp, BoardResult, Role};
 use crate::entities::{
     Agent, AgentKind, AgentStatus, Entity, EntityId, Link, Note, NoteOwner, Project, TerminalTab,
     Todo, TodoOwner, Workspace, Worktree,
 };
-use crate::ids::{AgentId, LinkId, NoteId, ProjectId, TerminalId, TodoId, WorkspaceId, WorktreeId};
+use crate::ids::{
+    AgentId, DispatchId, LinkId, NoteId, ProjectId, TerminalId, TodoId, WorkspaceId, WorktreeId,
+};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Bump on any breaking change to these enums. The daemon refuses mismatched
 /// clients; the client then offers a kill-and-restart of the old daemon.
-pub const PROTOCOL_VERSION: u32 = 32;
+pub const PROTOCOL_VERSION: u32 = 33;
 
 /// Max IPC frame size (length prefix sanity bound).
 pub const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
@@ -47,7 +50,7 @@ impl WriterClaim {
 }
 
 /// `CreateAgent`'s fields are positional on the wire, so its optional tail
-/// is cut from the end only: `writer` stays while a later field follows it.
+/// is cut from the end only: every slot stays while a later one is set.
 #[allow(clippy::too_many_arguments)]
 fn create_agent_wire<S: serde::Serializer>(
     req_id: &u64,
@@ -62,15 +65,21 @@ fn create_agent_wire<S: serde::Serializer>(
     writer: &WriterClaim,
     spawned_by: &Option<AgentId>,
     code_mode_off: &bool,
+    card: &Option<TodoId>,
+    role: &Option<Role>,
+    dispatch: &Option<DispatchId>,
     serializer: S,
 ) -> Result<S::Ok, S::Error> {
     use serde::ser::SerializeStruct;
-    let tail = match (writer.is_off(), spawned_by.is_some(), *code_mode_off) {
-        (_, _, true) => 3,
-        (_, true, false) => 2,
-        (false, false, false) => 1,
-        (true, false, false) => 0,
-    };
+    let set = [
+        !writer.is_off(),
+        spawned_by.is_some(),
+        *code_mode_off,
+        card.is_some(),
+        role.is_some(),
+        dispatch.is_some(),
+    ];
+    let tail = set.iter().rposition(|s| *s).map_or(0, |last| last + 1);
     let mut fields = serializer.serialize_struct("CreateAgent", 9 + tail)?;
     fields.serialize_field("req_id", req_id)?;
     fields.serialize_field("worktree", worktree)?;
@@ -89,6 +98,15 @@ fn create_agent_wire<S: serde::Serializer>(
     }
     if tail > 2 {
         fields.serialize_field("code_mode_off", code_mode_off)?;
+    }
+    if tail > 3 {
+        fields.serialize_field("card", card)?;
+    }
+    if tail > 4 {
+        fields.serialize_field("role", role)?;
+    }
+    if tail > 5 {
+        fields.serialize_field("dispatch", dispatch)?;
     }
     fields.end()
 }
@@ -292,6 +310,14 @@ pub enum ClientRequest {
         /// `CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=0`.
         #[serde(default)]
         code_mode_off: bool,
+        /// The board card the session works on: `--card`, else the spawner's.
+        #[serde(default)]
+        card: Option<TodoId>,
+        #[serde(default)]
+        role: Option<Role>,
+        /// The `todo run` dispatch this spawn fulfils.
+        #[serde(default)]
+        dispatch: Option<DispatchId>,
     },
     /// Fire-and-forget: pre-spawn an agent CLI for this (worktree, kind) so
     /// the next CreateAgent adopts an already-booted session. Sent the
@@ -507,6 +533,13 @@ pub enum ClientRequest {
         timeout_ms: u64,
     },
 
+    /// Every card, note, artifact and host-report operation; the daemon
+    /// sends it to its configured board host. Answered by `BoardReply` or Error.
+    Board {
+        req_id: u64,
+        op: BoardOp,
+    },
+
     Shutdown,
 }
 
@@ -654,5 +687,11 @@ pub enum ServerEvent {
         cols: u16,
         rows: u16,
         text: String,
+    },
+
+    /// Reply to `ClientRequest::Board`.
+    BoardReply {
+        req_id: u64,
+        result: BoardResult,
     },
 }

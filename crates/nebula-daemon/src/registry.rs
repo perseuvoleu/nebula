@@ -2484,6 +2484,9 @@ impl Daemon {
             branch: Some(worktree.branch.clone()),
             spawned_by,
             writer: !writer.is_off(),
+            card_id: None,
+            role: None,
+            dispatch_id: None,
             code_mode_off,
         };
         self.store
@@ -2592,6 +2595,9 @@ impl Daemon {
             branch: None,
             spawned_by: None,
             writer: false,
+            card_id: None,
+            role: None,
+            dispatch_id: None,
             code_mode_off: false,
         };
         self.spawn_agent_session(&agent, &worktree, 80, 24)?;
@@ -4822,6 +4828,9 @@ mod tests {
                 branch: None,
                 spawned_by: None,
                 writer: false,
+                card_id: None,
+                role: None,
+                dispatch_id: None,
                 code_mode_off: false,
             })
             .unwrap();
@@ -4923,6 +4932,9 @@ mod tests {
                     branch: None,
                     spawned_by: None,
                     writer: false,
+                    card_id: None,
+                    role: None,
+                    dispatch_id: None,
                     code_mode_off: false,
                 },
                 true,
@@ -7378,6 +7390,9 @@ exec sleep 60
                     branch: None,
                     spawned_by: None,
                     writer: false,
+                    card_id: None,
+                    role: None,
+                    dispatch_id: None,
                     code_mode_off: false,
                 })
                 .unwrap();
