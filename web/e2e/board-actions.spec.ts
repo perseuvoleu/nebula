@@ -168,12 +168,40 @@ test("the away digest names the waiting card, and after caught up the strip stil
   await expect(page.getByRole("region", { name: /Te așteaptă/ }).getByRole("button", { name: "Aprobă worker" })).toBeVisible();
 });
 
-test("open in code that cannot reach the laptop shows the command to copy", async ({ page }) => {
-  setBehaviour("fail");
+test("open in code opens on the laptop picked in its dialog and remembers it", async ({ page }) => {
+  writeBoard((board) => { (board as unknown as { hosts: { host: string }[] }).hosts.push({ ...(board as unknown as { hosts: { host: string }[] }).hosts[0], host: "perseu-mbp" }); });
   await open(page, "/board/c/12%40leaseweb");
   await page.getByRole("button", { name: "Deschide în cod" }).click();
-  await expect(page.getByText("nebula open --session=01JF0000000000000000000002")).toBeVisible();
+  const dialog = page.getByRole("dialog", { name: "Deschide în cod" });
+  await dialog.getByLabel("Laptop").selectOption("perseu-mbp");
+  const posted = page.waitForRequest((r) => r.url().endsWith("/open-code"));
+  await dialog.getByRole("button", { name: "Deschide", exact: true }).click();
+  expect((await posted).postDataJSON()).toEqual({ session: "01JF0000000000000000000002", host: "leaseweb", on: "perseu-mbp" });
+  await expect(page.getByText("Deschis în cod pe @perseu-mbp.")).toBeVisible();
+  await page.reload();
+  await page.getByRole("button", { name: "Deschide în cod" }).click();
+  await expect(dialog.getByLabel("Laptop")).toHaveValue("perseu-mbp");
+});
+
+test("open in code shows the gateway's command only when the laptop is unreachable, and any other error as its message", async ({ page }) => {
+  const answers = [
+    { status: 409, body: { error: "Nebula not reachable on leaseweb", command: "nebula open --session=01JF0000000000000000000002 # from the gateway" } },
+    { status: 409, body: { error: "Session is not on this card; refresh the card" } },
+  ];
+  await page.route("**/api/cards/*/open-code", (route) => {
+    const answer = answers.shift()!;
+    return route.fulfill({ status: answer.status, contentType: "application/json", body: JSON.stringify(answer.body) });
+  });
+  await open(page, "/board/c/12%40leaseweb");
+  const dialog = page.getByRole("dialog", { name: "Deschide în cod" });
+  await page.getByRole("button", { name: "Deschide în cod" }).click();
+  await dialog.getByRole("button", { name: "Deschide", exact: true }).click();
+  await expect(page.getByText("nebula open --session=01JF0000000000000000000002 # from the gateway")).toBeVisible();
   await expect(page.getByRole("button", { name: "Copiază comanda" })).toBeVisible();
+  await page.getByRole("button", { name: "Deschide în cod" }).click();
+  await dialog.getByRole("button", { name: "Deschide", exact: true }).click();
+  await expect(page.getByRole("alert")).toHaveText("Session is not on this card; refresh the card");
+  await expect(page.getByRole("button", { name: "Copiază comanda" })).toHaveCount(0);
 });
 
 test("a note typed while the previous one saves stays in the box and saves under a new id", async ({ page }) => {

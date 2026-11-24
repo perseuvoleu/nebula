@@ -1,12 +1,24 @@
 import { useState } from "react";
 import { CodeIcon, CopyIcon, PlayIcon } from "lucide-react";
-import { describeError } from "@/lib/api";
+import { ApiError, describeError } from "@/lib/api";
 import { type BoardData, type CardShow, STAGES, STAGE_LABEL, type Stage } from "@/lib/board";
 import { cardAction, ulid } from "@/lib/board-actions";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
+} from "@/components/ui/dialog";
 import { RunDialog, type RunDraft } from "./RunDialog";
 
 const DEFAULT_HOST = "leaseweb";
+const LAPTOP = "nebula-open-laptop";
+
+function rememberedLaptop(): string | null {
+  try {
+    return localStorage.getItem(LAPTOP);
+  } catch {
+    return null;
+  }
+}
 const fieldCls = "h-9 min-w-0 rounded-lg border border-input bg-card px-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/60";
 
 export function CardActions({ show, board }: { show: CardShow; board: BoardData | null }) {
@@ -23,7 +35,8 @@ export function CardActions({ show, board }: { show: CardShow; board: BoardData 
   const [run, setRun] = useState<{ draft: RunDraft; dispatch: string } | null>(null);
   const [pending, setPending] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [opened, setOpened] = useState<{ ok: boolean; host: string; command: string } | null>(null);
+  const [opening, setOpening] = useState<string | null>(null);
+  const [opened, setOpened] = useState<{ on: string; command: string | null } | null>(null);
   const [blocker, setBlocker] = useState("");
   const [note, setNote] = useState(() => ({ text: "", id: ulid() }));
 
@@ -54,11 +67,27 @@ export function CardActions({ show, board }: { show: CardShow; board: BoardData 
     const worktree = run.draft.worktree === "current" && branch ? branch : "new";
     if (await act("run", () => cardAction(show.ref, "run", { ...run.draft, worktree, dispatch: run.dispatch }))) setRun(null);
   };
+  const remembered = rememberedLaptop();
+  const laptops = remembered && !known.includes(remembered) ? [...known, remembered] : known;
+  const pickLaptop = () => setOpening(remembered ?? known.find((h) => h !== DEFAULT_HOST) ?? known[0] ?? null);
   const openCode = async () => {
-    if (!target) return;
-    const command = `nebula open --session=${target.id}`;
-    const ok = await act("open", () => cardAction(show.ref, "open-code", { session: target.id, host: target.host }));
-    setOpened({ ok, host: target.host, command });
+    const on = opening;
+    if (!target || !on) return;
+    try { localStorage.setItem(LAPTOP, on); } catch { /* Without storage the choice lasts this visit. */ }
+    setOpening(null);
+    setOpened(null);
+    setPending("open");
+    setError(null);
+    try {
+      await cardAction(show.ref, "open-code", { session: target.id, host: target.host, on });
+      setOpened({ on, command: null });
+    } catch (failure) {
+      const command = failure instanceof ApiError && failure.status === 409 && typeof failure.data.command === "string" ? failure.data.command : null;
+      if (command) setOpened({ on, command });
+      else setError(describeError(failure));
+    } finally {
+      setPending(null);
+    }
   };
   const addNote = async () => {
     const sent = note.text;
@@ -74,7 +103,7 @@ export function CardActions({ show, board }: { show: CardShow; board: BoardData 
     <section aria-label="Acțiuni" className="flex flex-col gap-3 rounded-lg border bg-background px-3 py-2.5">
       <div className="flex flex-wrap items-center gap-2">
         <Button type="button" size="sm" onClick={() => { setError(null); openRun(); }} disabled={show.archived}><PlayIcon aria-hidden />Pornește</Button>
-        <Button type="button" size="sm" variant="outline" onClick={openCode} disabled={!target || pending === "open"}>
+        <Button type="button" size="sm" variant="outline" onClick={pickLaptop} disabled={!target || pending === "open"}>
           <CodeIcon aria-hidden />Deschide în cod
         </Button>
         <label className="ml-auto flex items-center gap-1.5 text-xs text-muted-foreground">
@@ -86,15 +115,15 @@ export function CardActions({ show, board }: { show: CardShow; board: BoardData 
         </label>
       </div>
 
-      {opened && (opened.ok
-        ? <p role="status" className="text-sm">Deschis în cod pe <span className="font-mono">@{opened.host}</span>.</p>
+      {opened && (opened.command === null
+        ? <p role="status" className="text-sm">Deschis în cod pe <span className="font-mono">@{opened.on}</span>.</p>
         : (
           <div className="flex flex-col gap-1.5 text-sm">
-            <p>Nebula nu răspunde pe <span className="font-mono">@{opened.host}</span>. Rulează comanda pe laptop:</p>
+            <p>Nebula nu răspunde pe <span className="font-mono">@{opened.on}</span>. Rulează comanda pe laptop:</p>
             <div className="flex min-w-0 items-center gap-2">
               <code className="min-w-0 flex-1 overflow-x-auto rounded-md border bg-card px-2 py-1.5 font-mono text-xs whitespace-nowrap">{opened.command}</code>
               <Button type="button" size="icon-sm" variant="outline" aria-label="Copiază comanda"
-                onClick={() => navigator.clipboard?.writeText(opened.command).catch(() => undefined)}>
+                onClick={() => navigator.clipboard?.writeText(opened.command!).catch(() => undefined)}>
                 <CopyIcon aria-hidden />
               </Button>
             </div>
@@ -125,6 +154,25 @@ export function CardActions({ show, board }: { show: CardShow; board: BoardData 
       </div>
 
       {error && !run && <p role="alert" className="text-sm">{error}</p>}
+
+      <Dialog open={opening !== null} onOpenChange={(open) => { if (!open) setOpening(null); }}>
+        <DialogContent className="sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle>Deschide în cod</DialogTitle>
+            <DialogDescription>Laptopul pe care TUI-ul deschide sesiunea.</DialogDescription>
+          </DialogHeader>
+          <label className="flex flex-col gap-1.5 text-sm">
+            <span className="font-medium">Laptop</span>
+            <select value={opening ?? ""} onChange={(e) => setOpening(e.target.value)} className={`${fieldCls} font-mono`}>
+              {laptops.map((h) => <option key={h} value={h}>@{h}</option>)}
+            </select>
+          </label>
+          <DialogFooter>
+            <Button type="button" variant="ghost" onClick={() => setOpening(null)}>Renunță</Button>
+            <Button type="button" onClick={openCode}>Deschide</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {run && (
         <RunDialog open onOpenChange={(open) => { if (!open) setRun(null); }} cardRef={show.ref} cardTitle={show.title} branch={branch}

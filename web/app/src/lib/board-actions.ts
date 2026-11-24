@@ -25,7 +25,7 @@ type Verbs = {
   unblock: { by: string };
   run: { role: string; kind: string; host: string; worktree: string; dispatch: string };
   approve: { session: string; host: string; expectedStatusAt: number };
-  "open-code": { session: string; host: string };
+  "open-code": { session: string; host: string; on: string };
 };
 
 export const cardAction = <V extends keyof Verbs>(ref: string, verb: V, body: Verbs[V]) =>

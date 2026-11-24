@@ -749,7 +749,7 @@ class BoardTests(unittest.TestCase):
         verbs = {"move": {"stage": "review"}, "edit": {"title": "Renamed"}, "note": {"text": "--all; rm -rf /", "id": CARD_ID},
                  "archive": {}, "accept": {}, "dismiss": {}, "block": {"by": "#11"}, "unblock": {"by": "#11"},
                  "run": {"role": "worker", "kind": "codex", "host": "leaseweb", "worktree": "new"},
-                 "approve": {**session, "expectedStatusAt": 1764000200000}, "open-code": session}
+                 "approve": {**session, "expectedStatusAt": 1764000200000}, "open-code": {**session, "on": "perseu-mbp"}}
         posts = [("/api/cards", {"title": "New", "project": "nebula"}), ("/api/decisions", {"what": "Copy files"})]
         posts += [(f"/api/cards/%2312/{verb}", body) for verb, body in verbs.items()]
         with patch("server.subprocess.run") as run:
@@ -779,7 +779,7 @@ class BoardTests(unittest.TestCase):
         self.assertEqual(argv[:2], ["decision", "add"])
         self.assertEqual(argv[-2:], ["--", "/etc/passwd"])
         self.assertFalse(any(a.startswith(("--kind", "--path", "--url")) or a == "https://x" for a in argv))
-        for body in [{**session, "session": "01JF0000000000000000000009"}, {**session, "host": "elsewhere"}]:
+        for body in [{**session, "session": "01JF0000000000000000000009", "on": "perseu-mbp"}, {**session, "host": "elsewhere", "on": "perseu-mbp"}]:
             with self.subTest(body=body), patch("server.subprocess.run", return_value=cli(fixture("card_show"))) as run:
                 self.assertEqual(self.request("/api/cards/%2312/open-code", "POST", body, self.auth())[0], 409)
                 self.assertEqual(run.call_count, 1)
@@ -880,11 +880,21 @@ class BoardTests(unittest.TestCase):
             self.assertEqual(self.request("/api/cards/%2312/note", "POST", {"text": "x"}, self.auth())[0], 400)
         self.assertEqual(run.call_count, 1)
 
-    def test_open_code_unreachable_shows_command(self):
+    def test_open_code_opens_on_the_chosen_laptop(self):
         session = {"session": "01JF0000000000000000000002", "host": "leaseweb"}
+        with patch("server.subprocess.run", side_effect=[cli(fixture("card_show")), cli({"landed": "tui"})]) as run:
+            self.assertEqual(self.request("/api/cards/%2312/open-code", "POST", {**session, "on": "perseu-mbp"}, self.auth())[0], 200)
+        self.assertEqual(self.argv(run)[-1][:3], ["open", "--session=01JF0000000000000000000002", "--on=perseu-mbp"])
+        with patch("server.subprocess.run", return_value=cli(fixture("card_show"))) as run:
+            for on in [None, "", "-x", "a b"]:
+                with self.subTest(on=on):
+                    self.assertEqual(self.request("/api/cards/%2312/open-code", "POST", {**session, "on": on}, self.auth())[0], 400)
+
+    def test_open_code_unreachable_shows_command(self):
+        session = {"session": "01JF0000000000000000000002", "host": "leaseweb", "on": "perseu-mbp"}
         with patch("server.subprocess.run", side_effect=[cli(fixture("card_show")), cli(None, 3, "ssh failed /home/perseu")]):
             status, _, raw = self.request("/api/cards/%2312/open-code", "POST", session, self.auth())
-        self.assertEqual((status, json.loads(raw)), (409, {"error": "Nebula not reachable on leaseweb",
+        self.assertEqual((status, json.loads(raw)), (409, {"error": "Nebula not reachable on perseu-mbp",
                                                            "command": "nebula open --session=01JF0000000000000000000002"}))
 
 

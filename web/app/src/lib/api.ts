@@ -37,10 +37,13 @@ export class ApiError extends Error {
   status: number;
   /** True when the request may have reached the gateway (timeout/network after send). */
   uncertain: boolean;
-  constructor(message: string, status: number, uncertain = false) {
+  /** The gateway's JSON answer to a refused request. */
+  data: Record<string, unknown>;
+  constructor(message: string, status: number, uncertain = false, data: Record<string, unknown> = {}) {
     super(message);
     this.status = status;
     this.uncertain = uncertain;
+    this.data = data;
   }
 }
 
@@ -104,7 +107,7 @@ export async function api<T>(
     if (options.token === undefined && requestToken === token) setToken("");
     throw new ApiError("Token respins. Autentifică-te din nou.", 401);
   }
-  if (!response.ok) throw new ApiError(typeof data.error === "string" ? data.error : "Cererea a eșuat", response.status);
+  if (!response.ok) throw new ApiError(typeof data.error === "string" ? data.error : "Cererea a eșuat", response.status, false, data);
   return data as T;
 }
 
