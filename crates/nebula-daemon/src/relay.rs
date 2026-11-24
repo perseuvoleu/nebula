@@ -80,7 +80,7 @@ impl RelayClient {
         self.tx.same_channel(&other.tx)
     }
 
-    fn deliver(&self, event: ServerEvent) {
+    pub(crate) fn deliver(&self, event: ServerEvent) {
         if !self.is_closed() && self.tx.try_send(event).is_err() {
             // Never skip VT bytes and then continue the same stream.
             self.closed.cancel();
@@ -365,7 +365,7 @@ impl Relay {
 /// `NEBULA_RELAY_CMD` (tests) is a shell line with `{host}` substituted;
 /// otherwise `ssh host nebula proxy`, BatchMode so a daemon never hangs
 /// on a prompt, keepalives so a dead link is noticed within a minute.
-fn relay_command(host: &str) -> tokio::process::Command {
+pub(crate) fn relay_command(host: &str) -> tokio::process::Command {
     if let Ok(tmpl) = std::env::var("NEBULA_RELAY_CMD") {
         let line = tmpl.replace("{host}", host);
         let mut cmd = tokio::process::Command::new("sh");

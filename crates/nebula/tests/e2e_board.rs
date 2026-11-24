@@ -630,3 +630,198 @@ fn agent_new_card_refuses_unknown_caller() {
     );
     assert!(agent_names(&env).is_empty());
 }
+
+fn board_at(host: &str) -> String {
+    format!(r#"{{"board": "{host}"}}"#)
+}
+
+fn proxy_to(board: &Env) -> String {
+    format!(
+        "NEBULA_RUNTIME_DIR='{}' NEBULA_DATA_DIR='{}' '{}' proxy",
+        board.runtime_dir().display(),
+        board.data_dir().display(),
+        env!("CARGO_BIN_EXE_nebula")
+    )
+}
+
+/// A transport to `board`'s socket that never boots a daemon. With a
+/// `drop_once` marker path it forwards the first BoardReply's request but
+/// dies before passing the reply back, then marks the drop as done.
+fn pump_to(board: &Env, drop_once: Option<&Path>) -> String {
+    let script = board.tmp.path().join("pump.py");
+    std::fs::write(
+        &script,
+        r#"import os, socket, sys, threading
+s = socket.socket(socket.AF_UNIX)
+s.connect(sys.argv[1])
+marker = sys.argv[2] if len(sys.argv) > 2 else None
+drop = marker is not None and not os.path.exists(marker)
+def up():
+    while True:
+        b = os.read(0, 65536)
+        if not b:
+            break
+        s.sendall(b)
+    s.shutdown(socket.SHUT_WR)
+threading.Thread(target=up, daemon=True).start()
+def exact(n):
+    buf = b''
+    while len(buf) < n:
+        c = s.recv(n - len(buf))
+        if not c:
+            os._exit(0)
+        buf += c
+    return buf
+while True:
+    head = exact(4)
+    body = exact(int.from_bytes(head, 'little'))
+    if drop and b'BoardReply' in body:
+        open(marker, 'w').close()
+        os._exit(0)
+    os.write(1, head + body)
+"#,
+    )
+    .unwrap();
+    let mut line = format!(
+        "exec python3 '{}' '{}'",
+        script.display(),
+        board.runtime_dir().join("daemon.sock").display()
+    );
+    if let Some(marker) = drop_once {
+        line.push_str(&format!(" '{}'", marker.display()));
+    }
+    line
+}
+
+fn viewer(relay_cmd: &str) -> Env {
+    let env = Env::new();
+    env.write_config(&board_at("boardhost"));
+    env.start(&[("NEBULA_RELAY_CMD", relay_cmd)])
+}
+
+fn stop(env: &mut Env) {
+    if let Some(mut daemon) = env.daemon.take() {
+        daemon.kill().unwrap();
+        daemon.wait().unwrap();
+    }
+}
+
+#[test]
+fn link_add_shows_on_board() {
+    let board = board_env();
+    let here = viewer(&proxy_to(&board));
+    let card = add(&here, &["--project", "nebula"], "From B");
+    assert_eq!(card["ref"], "#1@boardhost");
+    assert_eq!(card["number"], 1);
+
+    let shown = board.json(&["todo", "show", "#1", "--json"]);
+    assert_eq!(shown["id"], card["id"]);
+    assert_eq!(shown["title"], "From B");
+    assert_eq!(shown["ref"], "#1");
+
+    let moved = here.json(&["todo", "move", "#1@boardhost", "next", "--json"]);
+    assert_eq!(moved["stage"], "next");
+    assert_eq!(
+        board.json(&["todo", "show", "#1", "--json"])["stage"],
+        "next"
+    );
+}
+
+#[test]
+fn link_down_exit_3() {
+    let mut board = board_env();
+    let here = viewer(&pump_to(&board, None));
+    stop(&mut board);
+
+    let out = here.cli(&["todo", "add", "--project", "nebula", "Lost"], None);
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+
+    let board = board.start(&[]);
+    assert_eq!(list(&board, &["--all"]), Vec::<String>::new());
+}
+
+#[test]
+fn link_lost_after_send_exit_4() {
+    let board = board_env();
+    let marker = board.tmp.path().join("dropped");
+    let here = viewer(&pump_to(&board, Some(&marker)));
+    let id = nebula_core::TodoId::generate().0;
+    let argv = [
+        "todo",
+        "add",
+        "--json",
+        "--project",
+        "nebula",
+        "--id",
+        &id,
+        "Once",
+    ];
+
+    let lost = here.cli(&argv, None);
+    assert_eq!(lost.status.code(), Some(4), "{}", stderr(&lost));
+    assert!(
+        marker.exists(),
+        "the reply was dropped after the board wrote"
+    );
+
+    let rerun = json_of(here.cli(&argv, None), &argv);
+    assert_eq!(rerun["id"], id.as_str());
+    assert_eq!(list(&board, &["--all"]), ["Once"]);
+}
+
+#[test]
+fn link_concurrent_replies() {
+    let board = board_env();
+    let here = viewer(&proxy_to(&board));
+    let spawn = |title: &str| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_nebula"));
+        cmd.args(["todo", "add", "--json", "--project", "nebula", title])
+            .env("NEBULA_RUNTIME_DIR", here.runtime_dir())
+            .env("NEBULA_DATA_DIR", here.data_dir())
+            .current_dir(here.tmp.path())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for k in LIVE_SESSION_ENV {
+            cmd.env_remove(k);
+        }
+        cmd.spawn().unwrap()
+    };
+    let children: Vec<_> = (0..4)
+        .map(|i| (format!("Card {i}"), spawn(&format!("Card {i}"))))
+        .collect();
+    let mut numbers = Vec::new();
+    for (title, child) in children {
+        let card = json_of(child.wait_with_output().unwrap(), &[title.as_str()]);
+        assert_eq!(
+            card["title"],
+            title.as_str(),
+            "each caller gets its own reply"
+        );
+        numbers.push(card["number"].as_u64().unwrap());
+    }
+    numbers.sort();
+    assert_eq!(numbers, [1, 2, 3, 4]);
+}
+
+#[test]
+fn link_refuses_protocol_31() {
+    let env = Env::new();
+    let reply = env.tmp.path().join("incompatible.bin");
+    let mut frame = Vec::new();
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(nebula_core::codec::write_frame(
+            &mut frame,
+            &nebula_core::ServerEvent::Incompatible {
+                daemon_protocol_version: 31,
+            },
+        ))
+        .unwrap();
+    std::fs::write(&reply, frame).unwrap();
+    let here = viewer(&format!("cat '{}'; cat > /dev/null", reply.display()));
+
+    let out = here.cli(&["todo", "add", "--project", "nebula", "Old peer"], None);
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+    assert!(stderr(&out).contains("protocol 31"), "{}", stderr(&out));
+}
