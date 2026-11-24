@@ -4,16 +4,16 @@
 use crate::store::Store;
 use anyhow::{bail, Result};
 use nebula_core::board::{
-    card_label, Artifact, ArtifactContent, Author, Away, BoardHost, BoardOp, BoardPage, BoardPoll,
-    BoardRead, BoardResult, BoardScope, Card, CardDraft, CardNote, CardRef, CardSession, CardShow,
-    Page, Placement, ProjectScope, Refusal, SessionAt, Stage,
+    card_label, Author, Away, BoardHost, BoardOp, BoardPage, BoardPoll, BoardRead, BoardResult,
+    BoardScope, Card, CardDraft, CardNote, CardRef, CardSession, CardShow, Page, Placement,
+    ProjectScope, Refusal, SessionAt, Stage,
 };
 use nebula_core::{AgentId, AgentKind, AgentStatus, ArtifactId, NoteId, TodoId, MAX_FRAME_LEN};
 use rusqlite::{params, OptionalExtension, Row, Transaction};
 
 /// Bytes one page may carry, hosts and the away digest included; the rest
 /// of the frame is headroom for the envelope.
-fn page_budget() -> usize {
+pub(crate) fn page_budget() -> usize {
     std::env::var("NEBULA_BOARD_PAGE_BYTES")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -123,11 +123,31 @@ fn apply(tx: &Transaction, op: BoardOp) -> Result<BoardResult> {
             card_by_id(tx, &note.card).map(BoardResult::Card)
         }
         BoardOp::Report(report) => crate::board_report::apply(tx, report),
-        BoardOp::Publish(_)
-        | BoardOp::RemoveArtifact { .. }
-        | BoardOp::BeginRun(_)
-        | BoardOp::EndRun { .. } => bail!("this board does not serve that operation yet"),
+        BoardOp::Publish(artifact) => {
+            crate::artifacts::publish(tx, artifact).map(BoardResult::Artifact)
+        }
+        BoardOp::RemoveArtifact { id } => {
+            crate::artifacts::remove(tx, &id).map(BoardResult::Artifact)
+        }
+        BoardOp::BeginRun(_) | BoardOp::EndRun { .. } => {
+            bail!("this board does not serve that operation yet")
+        }
+        BoardOp::Scoped { scope, op } => {
+            within(tx, &scope, &op)?;
+            apply(tx, *op)
+        }
     }
+}
+
+fn within(tx: &Transaction, scope: &BoardScope, op: &BoardOp) -> Result<()> {
+    let mut named = op.clone();
+    for card in named.card_refs_mut() {
+        let id = resolve(tx, card)?;
+        if !in_scope(scope, card_by_id(tx, &id)?.project.as_deref()) {
+            return Err(not_found(card));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn now_ms() -> i64 {
@@ -152,7 +172,7 @@ fn not_found(card: &CardRef) -> anyhow::Error {
     anyhow::anyhow!(Refusal::NotFound.message(format!("no card {named}")))
 }
 
-fn resolve(tx: &Transaction, card: &CardRef) -> Result<TodoId> {
+pub(crate) fn resolve(tx: &Transaction, card: &CardRef) -> Result<TodoId> {
     let id: Option<String> = match card {
         CardRef::Number {
             board: Some(host), ..
@@ -250,6 +270,10 @@ pub(crate) fn add_note(
     let card = resolve(tx, card)?;
     let known = note_by_id(tx, &id)?;
     if let Some(note) = known {
+        if note.card != card {
+            bail!(Refusal::Conflict
+                .message(format!("note {} was added to another card", id.as_str())));
+        }
         return Ok(note);
     }
     let text = non_empty(text, "a note")?;
@@ -289,14 +313,20 @@ fn note_by_id(tx: &Transaction, id: &NoteId) -> Result<Option<CardNote>> {
         .optional()?)
 }
 
-fn json_column<T: serde::de::DeserializeOwned>(r: &Row, i: usize) -> rusqlite::Result<T> {
+pub(crate) fn json_column<T: serde::de::DeserializeOwned>(
+    r: &Row,
+    i: usize,
+) -> rusqlite::Result<T> {
     let text: String = r.get(i)?;
     serde_json::from_str(&text).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(i, rusqlite::types::Type::Text, e.into())
     })
 }
 
-fn optional_json<T: serde::de::DeserializeOwned>(r: &Row, i: usize) -> rusqlite::Result<Option<T>> {
+pub(crate) fn optional_json<T: serde::de::DeserializeOwned>(
+    r: &Row,
+    i: usize,
+) -> rusqlite::Result<Option<T>> {
     match r.get::<_, Option<String>>(i)? {
         None => Ok(None),
         Some(_) => json_column(r, i).map(Some),
@@ -345,7 +375,7 @@ fn card_by_id(tx: &Transaction, id: &TodoId) -> Result<Card> {
     with_blockers(tx, card)
 }
 
-fn in_scope(scope: &BoardScope, project: Option<&str>) -> bool {
+pub(crate) fn in_scope(scope: &BoardScope, project: Option<&str>) -> bool {
     match (project, &scope.projects) {
         (None, _) => scope.include_home,
         (Some(_), ProjectScope::All) => true,
@@ -374,7 +404,7 @@ fn scoped_cards(
         .collect()
 }
 
-fn cursor(tx: &Transaction) -> Result<String> {
+pub(crate) fn cursor(tx: &Transaction) -> Result<String> {
     Ok(tx.query_row(
         "SELECT board_id || '.' || version FROM board_meta",
         [],
@@ -384,7 +414,7 @@ fn cursor(tx: &Transaction) -> Result<String> {
 
 /// A continuation is the version it was cut at and the offset it resumes
 /// from, so a page read after any write is refused instead of skewed.
-fn page_offset(page: Option<&str>, version: &str) -> Result<usize> {
+pub(crate) fn page_offset(page: Option<&str>, version: &str) -> Result<usize> {
     let Some(page) = page else { return Ok(0) };
     match page.rsplit_once('@') {
         Some((at, offset)) if at == version => offset
@@ -396,7 +426,7 @@ fn page_offset(page: Option<&str>, version: &str) -> Result<usize> {
     }
 }
 
-fn paged<T: serde::Serialize>(
+pub(crate) fn paged<T: serde::Serialize>(
     items: Vec<T>,
     offset: usize,
     version: &str,
@@ -469,7 +499,7 @@ fn read_op(tx: &Transaction, read: BoardRead) -> Result<BoardResult> {
             }
             Ok(BoardResult::Show(Box::new(CardShow {
                 sessions: sessions_of(tx, &id)?,
-                artifacts: artifacts_of(tx, &id)?,
+                artifacts: crate::artifacts::of_card(tx, &id)?,
                 log: tx
                     .prepare(&format!(
                         "SELECT {NOTE_COLUMNS} FROM notes WHERE todo_id = ?1 AND author IS NOT NULL ORDER BY created_at, sort_order"
@@ -479,8 +509,23 @@ fn read_op(tx: &Transaction, read: BoardRead) -> Result<BoardResult> {
                 card: found,
             })))
         }
-        BoardRead::Artifacts { .. } | BoardRead::Artifact { .. } => {
-            bail!("this board does not serve artifact reads yet")
+        BoardRead::Artifacts {
+            scope,
+            card,
+            kind,
+            query,
+            page,
+        } => crate::artifacts::list(
+            tx,
+            &scope,
+            card.as_ref(),
+            kind.as_deref(),
+            query.as_deref(),
+            page.as_deref(),
+        )
+        .map(BoardResult::Artifacts),
+        BoardRead::Artifact { scope, id } => {
+            crate::artifacts::show(tx, &scope, &id).map(BoardResult::Artifact)
         }
     }
 }
@@ -505,41 +550,6 @@ fn sessions_of(tx: &Transaction, card: &TodoId) -> Result<Vec<CardSession>> {
                 writer: r.get::<_, i64>(7)? != 0,
                 alive: r.get::<_, i64>(8)? != 0,
                 stale: false,
-            })
-        })?
-        .collect::<rusqlite::Result<_>>()?)
-}
-
-fn artifacts_of(tx: &Transaction, card: &TodoId) -> Result<Vec<Artifact>> {
-    Ok(tx
-        .prepare(
-            "SELECT id, kind, title, storage_host, entry, url, body, card_id, project, session, checkout, meta, created_at
-             FROM artifacts WHERE card_id = ?1 AND removed_at IS NULL ORDER BY created_at",
-        )?
-        .query_map(params![card.as_str()], |r| {
-            let content = match (
-                r.get::<_, Option<String>>(3)?,
-                r.get::<_, Option<String>>(4)?,
-                r.get::<_, Option<String>>(5)?,
-                r.get::<_, Option<String>>(6)?,
-            ) {
-                (Some(host), Some(entry), _, _) => ArtifactContent::Files { host, entry },
-                (_, _, Some(url), _) => ArtifactContent::Url { url },
-                (_, _, _, body) => ArtifactContent::Body {
-                    body: body.unwrap_or_default(),
-                },
-            };
-            Ok(Artifact {
-                id: ArtifactId(r.get(0)?),
-                kind: r.get(1)?,
-                title: r.get(2)?,
-                card: r.get::<_, Option<String>>(7)?.map(TodoId),
-                project: r.get(8)?,
-                session: optional_json(r, 9)?,
-                checkout: optional_json(r, 10)?,
-                content,
-                meta: json_column(r, 11)?,
-                created_at: r.get(12)?,
             })
         })?
         .collect::<rusqlite::Result<_>>()?)

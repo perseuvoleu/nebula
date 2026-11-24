@@ -238,6 +238,9 @@ pub struct Artifact {
     /// `rag_note` holds a decision's RAG note id.
     pub meta: serde_json::Map<String, serde_json::Value>,
     pub created_at: i64,
+    /// Set by `artifact rm`; the stored bytes stay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -454,6 +457,37 @@ pub enum BoardOp {
         error: Option<String>,
     },
     Report(HostReport),
+    /// A write allowed only on cards inside `scope`, checked in the write's
+    /// own transaction.
+    Scoped {
+        scope: BoardScope,
+        op: Box<BoardOp>,
+    },
+}
+
+impl BoardOp {
+    pub fn card_refs_mut(&mut self) -> Vec<&mut CardRef> {
+        match self {
+            BoardOp::Read(BoardRead::Card { card, .. }) => vec![card],
+            BoardOp::Read(BoardRead::Artifacts { card, .. }) => card.iter_mut().collect(),
+            BoardOp::Read(
+                BoardRead::Board { .. } | BoardRead::Cards { .. } | BoardRead::Artifact { .. },
+            ) => vec![],
+            BoardOp::EditCard { card, .. }
+            | BoardOp::Move { card, .. }
+            | BoardOp::Archive { card }
+            | BoardOp::Proposal { card, .. }
+            | BoardOp::AddNote { card, .. } => vec![card],
+            BoardOp::Block { card, by, .. } => vec![card, by],
+            BoardOp::BeginRun(dispatch) => vec![&mut dispatch.card],
+            BoardOp::Scoped { op, .. } => op.card_refs_mut(),
+            BoardOp::AddCard(_)
+            | BoardOp::Publish(_)
+            | BoardOp::RemoveArtifact { .. }
+            | BoardOp::EndRun { .. }
+            | BoardOp::Report(_) => vec![],
+        }
+    }
 }
 
 /// Why the board refused an op. It leads the `Error` message, so it crosses
@@ -463,28 +497,51 @@ pub enum BoardOp {
 pub enum Refusal {
     NotFound,
     Conflict,
+    /// The board link failed before the request was written.
+    Unreachable,
+    /// The board link failed after the request was written.
+    OutcomeUnknown,
 }
 
 impl Refusal {
-    const ALL: [Refusal; 2] = [Refusal::NotFound, Refusal::Conflict];
+    const ALL: [Refusal; 4] = [
+        Refusal::NotFound,
+        Refusal::Conflict,
+        Refusal::Unreachable,
+        Refusal::OutcomeUnknown,
+    ];
 
     fn tag(self) -> &'static str {
         match self {
             Refusal::NotFound => "not found: ",
             Refusal::Conflict => "conflict: ",
+            Refusal::Unreachable => "; nothing was sent",
+            Refusal::OutcomeUnknown => "; outcome unknown; rerun the same command",
         }
     }
 
+    fn trails(self) -> bool {
+        matches!(self, Refusal::Unreachable | Refusal::OutcomeUnknown)
+    }
+
     pub fn message(self, why: impl std::fmt::Display) -> String {
-        format!("{}{why}", self.tag())
+        match self.trails() {
+            true => format!("{why}{}", self.tag()),
+            false => format!("{}{why}", self.tag()),
+        }
     }
 
     pub fn of(message: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|r| message.starts_with(r.tag()))
+        Self::ALL.into_iter().find(|r| match r.trails() {
+            true => message.contains(r.tag()),
+            false => message.starts_with(r.tag()),
+        })
     }
 
     pub fn exit_code(self) -> i32 {
         match self {
+            Refusal::Unreachable => 3,
+            Refusal::OutcomeUnknown => 4,
             Refusal::NotFound => 5,
             Refusal::Conflict => 6,
         }
@@ -591,6 +648,13 @@ pub struct E2eStep {
 
 /// Parses `result.json` and checks every screenshot it names is among
 /// `files`, the artifact's relative paths.
+pub fn entry_inside(entry: &str) -> bool {
+    !entry.is_empty()
+        && std::path::Path::new(entry)
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+}
+
 pub fn validate_e2e_run(result_json: &str, files: &BTreeSet<String>) -> Result<E2eRun, String> {
     let value: serde_json::Value =
         serde_json::from_str(result_json).map_err(|e| format!("result.json: {e}"))?;

@@ -34,6 +34,23 @@ pub async fn accept_loop(daemon: Arc<Daemon>, listener: UnixListener) {
     }
 }
 
+fn answer_blocking(
+    out_tx: mpsc::Sender<ServerEvent>,
+    req_id: u64,
+    work: impl FnOnce() -> Result<ServerEvent> + Send + 'static,
+) {
+    tokio::spawn(async move {
+        let answered = tokio::task::spawn_blocking(work)
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("request panicked: {e}")));
+        let event = answered.unwrap_or_else(|e| ServerEvent::Error {
+            req_id: Some(req_id),
+            message: format!("{e:#}"),
+        });
+        let _ = out_tx.send(event).await;
+    });
+}
+
 async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
     let (read_half, write_half) = stream.into_split();
     let mut reader = tokio::io::BufReader::new(read_half);
@@ -113,6 +130,35 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         })
                         .await;
                     break;
+                }
+                ClientRequest::Board { req_id, op } => {
+                    let board = crate::config::Config::load().board;
+                    if let Some(host) = board.as_deref().filter(|board| *board != "local") {
+                        let link = crate::board_link::to(host, &daemon.shutdown);
+                        let client = relay_client.clone();
+                        tokio::spawn(async move { link.forward(req_id, op, &client).await });
+                        continue;
+                    }
+                    let daemon = daemon.clone();
+                    let out_tx = out_tx.clone();
+                    tokio::spawn(async move {
+                        let served = tokio::task::spawn_blocking(move || {
+                            match board {
+                                None => Err(anyhow::anyhow!("no board configured")),
+                                Some(_) => crate::board::serve(&daemon.store, op),
+                            }
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(anyhow::anyhow!("board op panicked: {e}")));
+                        let event = match served {
+                            Ok(result) => ServerEvent::BoardReply { req_id, result },
+                            Err(e) => ServerEvent::Error {
+                                req_id: Some(req_id),
+                                message: format!("{e:#}"),
+                            },
+                        };
+                        let _ = out_tx.send(event).await;
+                    });
                 }
                 // A request naming something mirrored from a remote host
                 // belongs to that host's daemon; the relay carries it there
@@ -285,30 +331,34 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 ClientRequest::MarkPrSeen { url, marker } => {
                     let _ = daemon.store.mark_pr_seen(&url, &marker);
                 }
-                ClientRequest::Board { req_id, op } => {
+                ClientRequest::StoreArtifact {
+                    req_id,
+                    id,
+                    kind,
+                    source,
+                } => answer_blocking(out_tx.clone(), req_id, move || {
+                    crate::artifacts::store(&id, &kind, &source).map(|(content, created)| {
+                        ServerEvent::ArtifactStored {
+                            req_id,
+                            content,
+                            created,
+                        }
+                    })
+                }),
+                ClientRequest::LocateArtifact { req_id, id, entry } => {
+                    answer_blocking(out_tx.clone(), req_id, move || {
+                        crate::artifacts::locate(&id, &entry)
+                            .map(|path| ServerEvent::ArtifactLocated { req_id, path })
+                    })
+                }
+                ClientRequest::DiscardArtifact { req_id, id } => {
                     let daemon = daemon.clone();
-                    let out_tx = out_tx.clone();
-                    tokio::spawn(async move {
-                        let served = tokio::task::spawn_blocking(move || {
-                            match crate::config::Config::load().board.as_deref() {
-                                None => Err(anyhow::anyhow!("no board configured")),
-                                Some("local") => crate::board::serve(&daemon.store, op),
-                                Some(host) => Err(anyhow::anyhow!(
-                                    "board = \"{host}\" needs the board link, which this build lacks"
-                                )),
-                            }
+                    answer_blocking(out_tx.clone(), req_id, move || {
+                        crate::artifacts::discard(&daemon.store, &id).map(|()| ServerEvent::Ack {
+                            req_id,
+                            created: None,
                         })
-                        .await
-                        .unwrap_or_else(|e| Err(anyhow::anyhow!("board op panicked: {e}")));
-                        let event = match served {
-                            Ok(result) => ServerEvent::BoardReply { req_id, result },
-                            Err(e) => ServerEvent::Error {
-                                req_id: Some(req_id),
-                                message: format!("{e:#}"),
-                            },
-                        };
-                        let _ = out_tx.send(event).await;
-                    });
+                    })
                 }
                 ClientRequest::GetMetrics { req_id } => {
                     // A machine-wide `ps` sweep takes tens of ms; keep it off

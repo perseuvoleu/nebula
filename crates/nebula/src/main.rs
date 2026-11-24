@@ -153,6 +153,13 @@ enum Command {
         #[command(subcommand)]
         command: Option<TodoCommand>,
     },
+    /// Publish what a session produced (recap, e2e run, diagram, ticket,
+    /// prototype, link): copied into this daemon's data dir, so it outlives
+    /// the worktree, and linked to the caller's card, session and checkout.
+    Artifact {
+        #[command(subcommand)]
+        command: ArtifactCommand,
+    },
     /// Install an agent CLI's nebula status hooks into a checkout — what
     /// the daemon does before every spawn; run on the far host by a remote
     /// session's ssh spawn, where this daemon's installer can't reach.
@@ -272,7 +279,11 @@ enum Command {
     /// Pipe stdin/stdout to this machine's daemon socket — what a remote
     /// nebula runs over ssh to reach the daemon here.
     #[command(hide = true)]
-    Proxy,
+    Proxy {
+        /// Fail when no daemon is running instead of starting one.
+        #[arg(long)]
+        connect_only: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -677,6 +688,8 @@ enum TodoCommand {
         /// Make it a home card.
         #[arg(long)]
         home: bool,
+        #[command(flatten)]
+        scope: WriteScopeArgs,
         #[arg(long)]
         json: bool,
     },
@@ -688,24 +701,32 @@ enum TodoCommand {
         stage: Stage,
         #[arg(long, value_parser = parse_stage)]
         expect: Option<Stage>,
+        #[command(flatten)]
+        scope: WriteScopeArgs,
         #[arg(long)]
         json: bool,
     },
     /// Archive a card; its number stays reserved.
     Archive {
         card: String,
+        #[command(flatten)]
+        scope: WriteScopeArgs,
         #[arg(long)]
         json: bool,
     },
     /// Accept a proposed card onto the board.
     Accept {
         card: String,
+        #[command(flatten)]
+        scope: WriteScopeArgs,
         #[arg(long)]
         json: bool,
     },
     /// Dismiss a proposed card (archives it).
     Dismiss {
         card: String,
+        #[command(flatten)]
+        scope: WriteScopeArgs,
         #[arg(long)]
         json: bool,
     },
@@ -718,6 +739,8 @@ enum TodoCommand {
         /// The note's ULID, so a rerun adds nothing twice.
         #[arg(long)]
         id: Option<String>,
+        #[command(flatten)]
+        scope: WriteScopeArgs,
         #[arg(long)]
         json: bool,
     },
@@ -726,6 +749,8 @@ enum TodoCommand {
         card: String,
         #[arg(long)]
         by: String,
+        #[command(flatten)]
+        scope: WriteScopeArgs,
         #[arg(long)]
         json: bool,
     },
@@ -734,6 +759,8 @@ enum TodoCommand {
         card: String,
         #[arg(long)]
         by: String,
+        #[command(flatten)]
+        scope: WriteScopeArgs,
         #[arg(long)]
         json: bool,
     },
@@ -792,6 +819,69 @@ enum TodoCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum ArtifactCommand {
+    /// Publish a file, a directory or a URL. A directory of a recap,
+    /// diagram or prototype opens at its index.html; an e2e-run needs a
+    /// valid result.json naming only files it holds. Symlinks, special
+    /// files and trees over 64 MiB are refused, and nothing is stored.
+    Add {
+        /// A path, or an http(s) URL (published as kind link).
+        source: String,
+        /// recap, e2e-run, diagram, ticket or prototype (required for a path).
+        #[arg(long)]
+        kind: Option<String>,
+        /// Default: the file or directory name, or the URL.
+        #[arg(long)]
+        title: Option<String>,
+        /// Link this card instead of the caller's (#12, 12 or a ULID).
+        #[arg(long, conflicts_with = "no_card")]
+        card: Option<String>,
+        /// Link no card, even inside a carded session.
+        #[arg(long)]
+        no_card: bool,
+        /// Its project when no card is linked (default: the caller's).
+        #[arg(long, conflicts_with = "card")]
+        project: Option<String>,
+        /// The artifact's ULID, so a rerun stores and publishes nothing twice.
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List published artifacts (default: the caller's project, else all).
+    List {
+        #[command(flatten)]
+        scope: ScopeArgs,
+        /// Only this card's.
+        #[arg(long)]
+        card: Option<String>,
+        #[arg(long)]
+        kind: Option<String>,
+        /// Continue from a previous reply's `next`.
+        #[arg(long)]
+        page: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// One artifact, removed ones included (with removed_at). Exits 5 when
+    /// there is none.
+    Show {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Open it here, or print the command that opens it on the host that
+    /// stores it.
+    Open { id: String },
+    /// Hide it from lists; `show` still reports it, and the bytes stay.
+    Rm {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[derive(clap::Args)]
 struct ScopeArgs {
     /// Only these projects (repeat for more).
@@ -810,6 +900,27 @@ impl From<ScopeArgs> for nebula_tui::board_cli::ScopeFlags {
         Self {
             projects: args.project,
             all: args.all,
+            include_home: args.include_home,
+        }
+    }
+}
+
+#[derive(clap::Args)]
+struct WriteScopeArgs {
+    /// Refuse (exit 5) a card outside this project; repeat for more, `*`
+    /// for every project. Unlike --project, it never moves a card.
+    #[arg(long = "scope", value_name = "PROJECT")]
+    scope: Vec<String>,
+    /// Home cards (no project) are in scope too.
+    #[arg(long)]
+    include_home: bool,
+}
+
+impl From<WriteScopeArgs> for nebula_tui::board_cli::ScopeFlags {
+    fn from(args: WriteScopeArgs) -> Self {
+        Self {
+            all: args.scope.iter().any(|p| p == "*"),
+            projects: args.scope.into_iter().filter(|p| p != "*").collect(),
             include_home: args.include_home,
         }
     }
@@ -1149,6 +1260,7 @@ fn main() -> Result<()> {
                     title,
                     project,
                     home,
+                    scope,
                     json,
                 }) => (
                     TodoVerb::Edit {
@@ -1156,6 +1268,7 @@ fn main() -> Result<()> {
                         title,
                         project,
                         home,
+                        scope: scope.into(),
                     },
                     json,
                 ),
@@ -1163,39 +1276,78 @@ fn main() -> Result<()> {
                     card,
                     stage,
                     expect,
+                    scope,
                     json,
                 }) => (
                     TodoVerb::Move {
                         card,
                         stage,
                         expect,
+                        scope: scope.into(),
                     },
                     json,
                 ),
-                Some(TodoCommand::Archive { card, json }) => (TodoVerb::Archive { card }, json),
-                Some(TodoCommand::Accept { card, json }) => (TodoVerb::Accept { card }, json),
-                Some(TodoCommand::Dismiss { card, json }) => (TodoVerb::Dismiss { card }, json),
+                Some(TodoCommand::Archive { card, scope, json }) => (
+                    TodoVerb::Archive {
+                        card,
+                        scope: scope.into(),
+                    },
+                    json,
+                ),
+                Some(TodoCommand::Accept { card, scope, json }) => (
+                    TodoVerb::Accept {
+                        card,
+                        scope: scope.into(),
+                    },
+                    json,
+                ),
+                Some(TodoCommand::Dismiss { card, scope, json }) => (
+                    TodoVerb::Dismiss {
+                        card,
+                        scope: scope.into(),
+                    },
+                    json,
+                ),
                 Some(TodoCommand::Note {
                     card,
                     text,
                     id,
+                    scope,
                     json,
                 }) => (
                     TodoVerb::Note {
                         card,
                         text: text.join(" "),
                         id,
+                        scope: scope.into(),
                     },
                     json,
                 ),
-                Some(TodoCommand::Block { card, by, json }) => {
-                    (TodoVerb::Block { card, by, on: true }, json)
-                }
-                Some(TodoCommand::Unblock { card, by, json }) => (
+                Some(TodoCommand::Block {
+                    card,
+                    by,
+                    scope,
+                    json,
+                }) => (
+                    TodoVerb::Block {
+                        card,
+                        by,
+                        on: true,
+                        scope: scope.into(),
+                    },
+                    json,
+                ),
+                Some(TodoCommand::Unblock {
+                    card,
+                    by,
+                    scope,
+                    json,
+                }) => (
                     TodoVerb::Block {
                         card,
                         by,
                         on: false,
+                        scope: scope.into(),
                     },
                     json,
                 ),
@@ -1238,6 +1390,54 @@ fn main() -> Result<()> {
                 ),
             };
             nebula_tui::run_board(verb, json)
+        }
+        Some(Command::Artifact { command }) => {
+            use nebula_tui::artifact_cli::{AddArgs, ArtifactVerb, CardChoice};
+            let (verb, json) = match command {
+                ArtifactCommand::Add {
+                    source,
+                    kind,
+                    title,
+                    card,
+                    no_card,
+                    project,
+                    id,
+                    json,
+                } => (
+                    ArtifactVerb::Add(AddArgs {
+                        source,
+                        kind,
+                        title,
+                        project,
+                        id,
+                        card: match (card, no_card) {
+                            (Some(card), _) => CardChoice::Card(card),
+                            (None, true) => CardChoice::None,
+                            (None, false) => CardChoice::Caller,
+                        },
+                    }),
+                    json,
+                ),
+                ArtifactCommand::List {
+                    scope,
+                    card,
+                    kind,
+                    page,
+                    json,
+                } => (
+                    ArtifactVerb::List {
+                        scope: scope.into(),
+                        card,
+                        kind,
+                        page,
+                    },
+                    json,
+                ),
+                ArtifactCommand::Show { id, json } => (ArtifactVerb::Show { id }, json),
+                ArtifactCommand::Open { id } => (ArtifactVerb::Open { id }, false),
+                ArtifactCommand::Rm { id, json } => (ArtifactVerb::Rm { id }, json),
+            };
+            nebula_tui::run_artifact(verb, json)
         }
         Some(Command::Kill) => nebula_tui::run_kill(),
         Some(Command::Rename { title, force }) => nebula_tui::run_rename(title.join(" "), force),
@@ -1312,7 +1512,7 @@ fn main() -> Result<()> {
         }
         Some(Command::Ssh { host, path }) => ssh::run_ssh(&host, path.as_deref()),
         Some(Command::Upgrade { force }) => upgrade::run_upgrade(force),
-        Some(Command::Proxy) => nebula_tui::run_proxy(),
+        Some(Command::Proxy { connect_only }) => nebula_tui::run_proxy(connect_only),
         Some(Command::StaleDaemonNote) => {
             if nebula_daemon::lifecycle::daemon_is_stale() {
                 println!("note: the running daemon was built from older code.");
