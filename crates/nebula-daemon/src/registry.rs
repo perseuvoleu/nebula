@@ -74,7 +74,7 @@ pub struct CardLink {
     pub card: Option<TodoId>,
     pub role: Option<nebula_core::board::Role>,
     pub dispatch: Option<nebula_core::DispatchId>,
-    /// The spawner's host when it is not this one.
+    /// The host the spawner runs on; None means this one.
     pub parent_host: Option<String>,
 }
 
