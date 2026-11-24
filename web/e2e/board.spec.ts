@@ -68,14 +68,14 @@ test("blocked card dimmed", async ({ page }) => {
 test("sidebar counts and quiet projects", async ({ page }) => {
   await open(page, "/board");
   const sidebar = page.getByRole("navigation", { name: "Proiecte" });
-  await expect(sidebar.getByRole("button", { name: /nebula\s*1$/ })).toBeVisible();
+  await expect(sidebar.getByRole("button", { name: /nebula\s*2$/ })).toBeVisible();
   await expect(sidebar.getByRole("button", { name: /vela/ })).toHaveCount(0);
   await sidebar.getByRole("button", { name: /Liniștite/ }).click();
   await expect(sidebar.getByRole("button", { name: /vela\s*0$/ })).toBeVisible();
   await sidebar.getByRole("button", { name: "Checkouturi nebula" }).click();
   await expect(sidebar.getByRole("button", { name: /^main/ })).toBeVisible();
   await expect(sidebar.getByRole("button", { name: /^agent-home-02/ })).toBeVisible();
-  await sidebar.getByRole("button", { name: /nebula\s*1$/ }).click();
+  await sidebar.getByRole("button", { name: /nebula\s*2$/ }).click();
   await expect(page).toHaveURL(/\/board\/p\/nebula$/);
 });
 

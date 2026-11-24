@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { awayDigest, byStage, isBlocked, writerSlots, type BoardData, type Card } from "./board.ts";
+import { awayDigest, byStage, isBlocked, sidebarProjects, writerSlots, type BoardData, type Card } from "./board.ts";
 
 const card = (number: number, stage: Card["stage"], blocked_by: string[] = []): Card => ({
   id: `01JD${String(number).padStart(22, "0")}`, number, ref: `#${number}@leaseweb`, title: `Card ${number}`, stage,
@@ -30,6 +30,12 @@ test("writerSlots reports live writers per host and the slot cap only when the h
     { host: "leaseweb", writers: 1, slots: null },
     { host: "perseu-mbp", writers: 2, slots: 4 },
   ]);
+});
+
+test("sidebarProjects counts every unarchived card of a project, Done included", () => {
+  const board: BoardData = { cards: [card(1, "doing"), card(2, "done"), { ...card(3, "done"), archived: true }], hosts: [],
+    away: { finished: [], needs_you: [], decisions: [] } };
+  assert.deepEqual(sidebarProjects(board).map((p) => [p.name, p.cards]), [["nebula", 2]]);
 });
 
 test("awayDigest resolves finished card ids to cards and keeps needs-you sessions and new decisions", () => {

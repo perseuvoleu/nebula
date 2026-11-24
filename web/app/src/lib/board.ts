@@ -201,9 +201,9 @@ export function sidebarProjects(board: BoardData): SidebarProject[] {
   for (const host of board.hosts) {
     for (const co of host.checkouts) checkout(project(co.project), { branch: co.branch, host: host.host, primary: !co.worktree });
   }
-  for (const card of board.cards) {
+  for (const card of board.cards.filter((c) => !c.archived)) {
     const p = project(projectName(card.project));
-    if (card.stage !== "done") p.cards += 1;
+    p.cards += 1;
     if (card.stage === "doing") p.running = true;
     if (card.checkout) checkout(p, { branch: card.checkout.branch, host: card.checkout.host, primary: !card.checkout.worktree });
   }
