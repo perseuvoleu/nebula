@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { ArrowLeftIcon, MenuIcon, PlusIcon } from "lucide-react";
 import { api, describeError } from "@/lib/api";
 import { activityAge } from "@/lib/activity-age";
@@ -7,6 +7,7 @@ import {
   type Stage, awayDigest, byStage, cardSlug, inScope, projectName, sidebarProjects, sortCards, toBoardCard, writerSlots,
 } from "@/lib/board";
 import { cardAction, createCard, ulid } from "@/lib/board-actions";
+import { type Pending, drop, patchOf, propose, reconcile, settle } from "@/lib/optimistic";
 import type { BoardRoute } from "@/lib/route";
 import { BOARD_POLL_MS, useBoard } from "@/lib/useBoard";
 import { cn } from "@/lib/utils";
@@ -28,7 +29,6 @@ import { WriterSlots } from "./WriterSlots";
 const LAST_SEEN = "nebula-board-last-seen";
 
 type RawCard = BoardData["cards"][number];
-type Pending = { patch: Partial<RawCard>; after?: BoardData | null };
 
 type Decision = { id: string; title: string; card: string | null; project: string | null; content: { body?: string }; created_at: number };
 
@@ -96,7 +96,7 @@ export function BoardPage({ route, onNavigate, onSessions }: {
   onSessions: () => void;
 }) {
   const [lastSeen, setLastSeen] = useState(loadLastSeen);
-  const { board, stale } = useBoard(lastSeen);
+  const { board, stale, readAt } = useBoard(lastSeen);
   const [local, setLocal] = useState<SidebarScope | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const [expanded, setExpanded] = useState<(string | null)[]>([]);
@@ -106,21 +106,20 @@ export function BoardPage({ route, onNavigate, onSessions }: {
   const [collapsed, setCollapsed] = useState<string[]>([]);
   const [digestClosed, setDigestClosed] = useState(false);
   const [decisionQuery, setDecisionQuery] = useState("");
-  const [overlay, setOverlay] = useState<Record<string, Pending>>({});
+  const [overlay, setOverlay] = useState<Pending<Partial<RawCard>>[]>([]);
   const [newCard, setNewCard] = useState<(CardDraft & { id: string }) | null>(null);
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
-  const latest = useRef(board);
-  useEffect(() => { latest.current = board; }, [board]);
-  const pending = Object.fromEntries(Object.entries(overlay).filter(([, p]) => p.after === undefined || p.after === board));
+  useEffect(() => setOverlay((old) => reconcile(old, readAt)), [readAt]);
   const optimistic = (key: string, patch: Partial<RawCard>, request: Promise<unknown>) => {
+    const token = ulid();
     setActionError(null);
-    setOverlay((old) => ({ ...old, [key]: { patch } }));
+    setOverlay((old) => propose(old, token, key, patch));
     request
-      .then(() => setOverlay((old) => old[key] ? { ...old, [key]: { ...old[key], after: latest.current } } : old))
+      .then(() => setOverlay((old) => settle(old, token, Date.now())))
       .catch((failure) => {
-        setOverlay((old) => Object.fromEntries(Object.entries(old).filter(([k]) => k !== key)));
+        setOverlay((old) => drop(old, token));
         setActionError(describeError(failure));
       });
   };
@@ -141,8 +140,8 @@ export function BoardPage({ route, onNavigate, onSessions }: {
   const openPage = (ref: string) => go({ card: cardSlug(ref) });
   const toggle = <T,>(list: T[], name: T) => list.includes(name) ? list.filter((n) => n !== name) : [...list, name];
 
-  const live = (board?.cards ?? []).map((c) => pending[c.ref] ? { ...c, ...pending[c.ref].patch } : c).filter((c) => !c.archived);
-  const waiting = (board?.needs_you ?? []).filter((w) => !pending[w.id]);
+  const live = (board?.cards ?? []).map((c) => ({ ...c, ...patchOf(overlay, c.ref) })).filter((c) => !c.archived);
+  const waiting = (board?.needs_you ?? []).filter((w) => !patchOf(overlay, w.id));
   const all = live.map((c) => ({ ...toBoardCard(c, live), needsYou: waiting.some((w) => w.card === c.id), age: activityAge(c.updated_at, Date.now()) }));
   const scoped = all.filter((c) => inScope(c, scope));
   const cards = scoped.filter((c) => !c.proposed);

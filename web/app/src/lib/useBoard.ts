@@ -17,8 +17,9 @@ async function readBoard(since: string | undefined, awaySince: number | null, si
   return { version: first.version, board };
 }
 
-export function useBoard(awaySince: number | null): { board: BoardData | null; stale: boolean } {
-  const [state, setState] = useState<{ board: BoardData | null; stale: boolean }>({ board: null, stale: false });
+/** `readAt` is when the read behind the current board began, so a write settled before it is in the board. */
+export function useBoard(awaySince: number | null): { board: BoardData | null; stale: boolean; readAt: number } {
+  const [state, setState] = useState<{ board: BoardData | null; stale: boolean; readAt: number }>({ board: null, stale: false, readAt: 0 });
   const version = useRef<string | undefined>(undefined);
   useEffect(() => {
     version.current = undefined;
@@ -31,9 +32,10 @@ export function useBoard(awaySince: number | null): { board: BoardData | null; s
       if (!document.hidden) {
         busy = true;
         try {
+          const readAt = Date.now();
           const next = await readBoard(version.current, awaySince, abort.signal);
           if (next) version.current = next.version;
-          setState((old) => next ? { board: next.board, stale: false } : old.stale ? { ...old, stale: false } : old);
+          setState((old) => next ? { board: next.board, stale: false, readAt } : { ...old, stale: false, readAt });
         } catch (failure) {
           if (!abort.signal.aborted && !(failure instanceof ApiError && failure.status === 401)) setState((old) => ({ ...old, stale: true }));
         } finally {

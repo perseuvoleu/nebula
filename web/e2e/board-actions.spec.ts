@@ -39,7 +39,6 @@ async function open(page: Page, url: string) {
 
 const column = (page: Page, name: string) => page.getByRole("region", { name, exact: true });
 const tile = (scope: Page | Locator, title: string) => scope.getByRole("article").filter({ hasText: title });
-const nextPoll = (page: Page) => page.waitForResponse((r) => r.url().includes("/api/board?") && r.ok());
 
 async function polledAfterThis(page: Page) {
   addCard(90, "Poll marker");
@@ -61,10 +60,37 @@ test("a dragged card moves to its column and stays there after the next poll", a
   await open(page, "/board");
   await tile(column(page, "Backlog"), "Drag me along").dragTo(column(page, "Review"));
   await expect(tile(column(page, "Review"), "Drag me along")).toBeVisible();
-  await nextPoll(page);
-  await nextPoll(page);
+  await polledAfterThis(page);
   await expect(tile(column(page, "Review"), "Drag me along")).toBeVisible();
   expect(cardNumbered(13).stage).toBe("review");
+});
+
+test("a poll already in flight when the drag lands does not snap the card back", async ({ page }) => {
+  addCard(13, "Drag me along");
+  await open(page, "/board");
+  await expect(tile(column(page, "Backlog"), "Drag me along")).toBeVisible();
+  let release = () => {};
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  let fetched = () => {};
+  const inFlight = new Promise<void>((resolve) => { fetched = resolve; });
+  let holding = true;
+  await page.route("**/api/board?*", async (route) => {
+    if (!holding) return route.continue();
+    holding = false;
+    const response = await route.fetch();
+    fetched();
+    await held;
+    await route.fulfill({ response });
+  });
+  addCard(14, "Bystander");
+  await inFlight;
+  const moved = page.waitForResponse((r) => r.url().endsWith("/move"));
+  await tile(column(page, "Backlog"), "Drag me along").dragTo(column(page, "Review"));
+  expect((await moved).ok()).toBe(true);
+  release();
+  await expect(tile(page, "Bystander")).toBeVisible();
+  expect(await tile(column(page, "Backlog"), "Drag me along").count()).toBe(0);
+  await expect(tile(column(page, "Review"), "Drag me along")).toBeVisible();
 });
 
 test("a new card lands in the backlog of the current project", async ({ page }) => {
@@ -135,8 +161,8 @@ test("accept puts a proposed card on the board and dismiss removes it", async ({
   await tray.getByRole("listitem").filter({ hasText: "Proposed and kept" }).getByRole("button", { name: "Acceptă" }).click();
   await expect(tile(column(page, "Backlog"), "Proposed and kept")).toBeVisible();
   await tray.getByRole("listitem").filter({ hasText: "Proposed and dropped" }).getByRole("button", { name: "Respinge" }).click();
+  await polledAfterThis(page);
   await expect(tray).toHaveCount(0);
-  await nextPoll(page);
   await expect(page.getByText("Proposed and dropped")).toHaveCount(0);
   expect([cardNumbered(13).proposed, cardNumbered(14).archived]).toEqual([false, true]);
 });
