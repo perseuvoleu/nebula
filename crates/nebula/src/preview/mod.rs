@@ -408,7 +408,7 @@ pub fn run(args: Args) -> Result<()> {
     };
     println!(
         "{}",
-        serde_json::json!({"project": name, "domain": project.domain, "phase": phase, "offline": args.offline, "active": state.active.as_ref().map(runtime::status_json), "candidate": state.candidate.as_ref().map(runtime::status_json), "previous": state.previous.as_ref().map(runtime::status_json), "published": current, "observation_error": observation_error})
+        serde_json::json!({"project": name, "domain": project.domain, "url": format!("https://{}", project.domain), "phase": phase, "offline": args.offline, "active": state.active.as_ref().map(runtime::status_json), "candidate": state.candidate.as_ref().map(runtime::status_json), "previous": state.previous.as_ref().map(runtime::status_json), "published": current, "observation_error": observation_error})
     );
     Ok(())
 }
