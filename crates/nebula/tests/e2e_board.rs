@@ -1713,7 +1713,7 @@ fn fake_workers_ai(env: &Env) -> PathBuf {
     let attempted = env.tmp.path().join("rag-attempted");
     let hung = env.tmp.path().join("rag-hung-pid");
     let script = format!(
-        "#!/bin/sh\ncat >/dev/null\nif [ -e '{}' ]; then echo $ > '{}'; touch '{}'; exec sleep 30; fi\nif [ -e '{}' ]; then touch '{}'; printf '%s\\n400' '{{\"errors\":[{{\"message\":\"down\"}}]}}'; exit 0; fi\nprintf '%s\\n200' '{{\"result\":{{\"data\":[[{vector}]]}}}}'\n",
+        "#!/bin/sh\ncat >/dev/null\nif [ -e '{}' ]; then echo $$ > '{}'; touch '{}'; exec sleep 30; fi\nif [ -e '{}' ]; then touch '{}'; printf '%s\\n400' '{{\"errors\":[{{\"message\":\"down\"}}]}}'; exit 0; fi\nprintf '%s\\n200' '{{\"result\":{{\"data\":[[{vector}]]}}}}'\n",
         hang.display(),
         hung.display(),
         attempted.display(),

@@ -17,6 +17,7 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 static KICK: Notify = Notify::const_new();
@@ -26,7 +27,7 @@ pub fn kick() {
     KICK.notify_one();
 }
 
-pub fn start(store: Arc<Store>, shutdown: CancellationToken) {
+pub fn start(store: Arc<Store>, shutdown: CancellationToken) -> JoinHandle<()> {
     let period = std::env::var("NEBULA_RAG_COPY_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -51,7 +52,7 @@ pub fn start(store: Arc<Store>, shutdown: CancellationToken) {
             }
             copy_pending(&store, bound, &shutdown).await;
         }
-    });
+    })
 }
 
 async fn copy_pending(store: &Store, bound: Duration, shutdown: &CancellationToken) {
