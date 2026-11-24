@@ -536,6 +536,13 @@ pub fn auto_stage(
         {
             Some(Stage::Doing)
         }
+        Stage::Backlog | Stage::Next
+            if before.is_none()
+                && after.status == AgentStatus::Finished
+                && !others.iter().any(live_unfinished_worker) =>
+        {
+            Some(Stage::Review)
+        }
         Stage::Doing
             if after.status == AgentStatus::Finished
                 && before.is_none_or(|b| b.status != AgentStatus::Finished)
