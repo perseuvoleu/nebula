@@ -2440,6 +2440,19 @@ fn run_writer_name_keeps_the_refusal() {
     assert_eq!(failed["state"], "failed");
 }
 
+#[test]
+fn run_retry_scope_covers_the_admitted_project() {
+    let env = board_env();
+    env.make_repo();
+    let card = add(&env, &["--project", "repo"], "Moved");
+    let dispatch = TodoId::generate().0;
+    begin_run(&env, &card, &dispatch, "main");
+    env.json(&["todo", "edit", "#1", "--project", "twin", "--json"]);
+    let refused = run_card(&env, "#1", &["--dispatch", &dispatch, "--scope", "twin"]);
+    assert_eq!(refused.status.code(), Some(5), "{}", stderr(&refused));
+    assert!(agents_of(&env).is_empty());
+}
+
 fn session_row(env: &Env, id: &str) -> Value {
     agents_of(env).into_iter().find(|a| a["id"] == id).unwrap()
 }

@@ -294,6 +294,16 @@ fn within(tx: &Transaction, scope: &BoardScope, op: &BoardOp) -> Result<()> {
             return Err(not_found(card));
         }
     }
+    if let BoardOp::BeginRun(dispatch) = op {
+        if let Some(project) = receipt(tx, &dispatch.id)?.and_then(|r| r.project) {
+            if !in_scope(scope, Some(&project)) {
+                bail!(Refusal::NotFound.message(format!(
+                    "dispatch {} runs in project \"{project}\", outside the write scope",
+                    dispatch.id.as_str()
+                )));
+            }
+        }
+    }
     Ok(())
 }
 
