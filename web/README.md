@@ -181,17 +181,23 @@ Restart only `nebula-web.service`; never restart the Nebula daemon, bridge or pr
 
 ## Deploy on leaseweb
 
+**Staged:** leaseweb runs the gateway, but code.possu.dev still reaches findl until the
+`cloudflared-leaseweb` tunnel takes the public hostname. Until then, leaseweb answers only on its
+own loopback.
+
 leaseweb serves code.possu.dev from the same per-SHA release layout under
 `~/.local/share/nebula/web-releases/<sha>`, run by the venv `~/.local/share/nebula/web-venv`
 (`web/requirements.txt`) and the `nebula-web.service` user unit with a
 `nebula-web.service.d/90-durable-release.conf` override naming the release. The gateway listens
-on 127.0.0.1:8765 only; the `cloudflared-leaseweb` tunnel carries code.possu.dev to it behind
-Cloudflare Access, and no inbound port opens. `NEBULA_WEB_PROJECTS` lists only projects
+on 127.0.0.1:8765 only. Once the hostname moves, the `cloudflared-leaseweb` tunnel carries
+code.possu.dev to it behind Cloudflare Access, and no inbound port opens. `NEBULA_WEB_PROJECTS` lists only projects
 leaseweb's daemon knows. `NEBULA_WEB_BINARY` points at `web-releases/client-<sha>/bin/nebula`,
 built from the same commit.
 
-**Rollback:** repoint the code.possu.dev public hostname in Cloudflare back to findl, whose
-`nebula-web.service` keeps running release 3b6189c until the leaseweb service is confirmed.
+**Rollback:** findl's `nebula-web.service` stays pinned by its drop-in to release 3b6189c. On
+findl, run `systemctl --user start nebula-web` and check that
+`curl -s -o /dev/null -w '%{http_code}' -H 'Host: code.possu.dev' http://127.0.0.1:8765/` prints
+200. Only then repoint the code.possu.dev public hostname in Cloudflare back to findl.
 
 **The token grants agent control as the server's OS user.** Project allowlisting is an API
 scope, not an OS sandbox. Rotate a leaked token in the env file and restart only `nebula-web`.
