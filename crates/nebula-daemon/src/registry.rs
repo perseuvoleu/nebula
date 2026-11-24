@@ -2554,6 +2554,13 @@ impl Daemon {
         let agent = self.store.get_agent(id)?.ok_or_else(|| {
             anyhow::anyhow!(Refusal::NotFound.message(format!("no session {}", id.as_str())))
         })?;
+        if agent.status != AgentStatus::NeedsFeedback {
+            bail!(Refusal::Conflict.message(format!(
+                "\"{}\" is {}, not waiting for an answer; read it again",
+                agent.name,
+                agent.status.as_str()
+            )));
+        }
         if agent.status_changed_at != expected_status_at {
             bail!(Refusal::Conflict.message(format!(
                 "\"{}\" changed status at {}, after {expected_status_at}; read it again",
