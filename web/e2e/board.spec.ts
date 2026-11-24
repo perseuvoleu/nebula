@@ -3,7 +3,7 @@ import path from "node:path";
 import { expect, type Locator, type Page } from "@playwright/test";
 import { test, STATE, TOKEN, noHorizontalOverflow, setBehaviour, shot } from "./helpers";
 
-type Board = { version: number; cards: Record<string, unknown>[]; details: Record<string, { sessions: Record<string, unknown>[] }> };
+type Board = { version: number; cards: Record<string, unknown>[]; hosts: { needs_you: number }[]; details: Record<string, { sessions: Record<string, unknown>[] }> };
 
 const readBoard = (): Board => JSON.parse(fs.readFileSync(path.join(STATE, "board.json"), "utf8"));
 
@@ -56,6 +56,18 @@ test("peek and card page", async ({ page }) => {
   await expect(page.getByRole("list", { name: "Sesiuni" }).getByRole("listitem")).toHaveText([/worker.*worker/, /reviewer.*review/]);
   await expect(page.getByText("agent-home-02")).toBeVisible();
   await expect(page.getByText("@leaseweb").first()).toBeVisible();
+});
+
+test("a card without session data makes no status claim, and needs-you stays hidden", async ({ page }) => {
+  writeBoard((board) => { board.hosts[0].needs_you = 1; });
+  await open(page, "/board");
+  await expect(tile(page, "Keep verification results")).toBeVisible();
+  await expect(tile(page, "Keep verification results").getByRole("img")).toHaveCount(0);
+  await expect(page.getByRole("navigation", { name: "Proiecte" }).getByRole("button", { name: /Te așteaptă/ })).toHaveCount(0);
+  await page.getByRole("button", { name: "Tabel" }).click();
+  const row = page.getByRole("row").filter({ hasText: "Keep verification results" });
+  await expect(row).toBeVisible();
+  await expect(row.getByRole("img")).toHaveCount(0);
 });
 
 test("blocked card dimmed", async ({ page }) => {

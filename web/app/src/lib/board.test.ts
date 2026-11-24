@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { awayDigest, byStage, inScope, isBlocked, sidebarProjects, toBoardCard, writerSlots, type BoardData, type Card } from "./board.ts";
+import { awayDigest, byStage, cardDot, inScope, isBlocked, sidebarProjects, toBoardCard, writerSlots, type BoardData, type Card } from "./board.ts";
 
 const card = (number: number, stage: Card["stage"], blocked_by: string[] = []): Card => ({
   id: `01JD${String(number).padStart(22, "0")}`, number, ref: `#${number}@leaseweb`, title: `Card ${number}`, stage,
@@ -47,6 +47,11 @@ test("projectless cards and a project named home are separate sidebar projects, 
     const scoped = [home, named].map((c) => toBoardCard(c, [])).filter((c) => inScope(c, { kind: "project", project: p.project }));
     assert.deepEqual([p.cards, scoped.map((c) => c.ref)], [1, [p.project === null ? home.ref : named.ref]]);
   }
+});
+
+test("a board card without session data makes no status claim", () => {
+  const listed = toBoardCard(card(1, "doing"), []);
+  assert.deepEqual([listed.sessions, listed.needsYou, cardDot(listed)], [null, false, null]);
 });
 
 test("awayDigest resolves finished card ids to cards and keeps needs-you sessions and new decisions", () => {

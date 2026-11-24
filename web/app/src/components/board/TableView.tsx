@@ -9,14 +9,15 @@ const Empty = () => <span className="text-muted-foreground">—</span>;
 function Row({ card, selected, onOpen, hasActions, actions }: {
   card: BoardCard; selected: boolean; onOpen?: (ref: string) => void; hasActions: boolean; actions?: ReactNode;
 }) {
-  const last = card.sessions.at(-1);
+  const last = card.sessions?.at(-1);
   const blocked = card.blockers.length > 0;
+  const dot = cardDot(card);
   return (
     <tr className={cn("border-b hover:bg-card", selected && "bg-secondary", blocked && "opacity-60")}>
       <td className="px-2 py-1.5"><CardRef cardRef={card.ref} /></td>
       <td className="w-full px-2 py-1.5">
         <span className="flex min-w-48 items-center gap-1.5">
-          <StatusDot dot={cardDot(card)} />
+          {dot && <StatusDot dot={dot} />}
           <button type="button" onClick={() => onOpen?.(card.ref)} aria-current={selected ? "true" : undefined}
             className="min-w-0 truncate rounded-sm text-left font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring">
             {card.title}

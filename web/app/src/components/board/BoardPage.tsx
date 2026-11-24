@@ -118,7 +118,7 @@ export function BoardPage({ route, onNavigate, onSessions }: {
 
   const sidebar = (
     <ProjectSidebar projects={board ? sidebarProjects(board) : []} total={live.filter((c) => c.stage !== "done").length}
-      needsCount={board?.hosts.reduce((sum, h) => sum + h.needs_you, 0) ?? 0} scope={scope} expanded={expanded} showQuiet={showQuiet}
+      scope={scope} expanded={expanded} showQuiet={showQuiet}
       query={search} onQueryChange={setSearch} onSelect={select}
       onToggleProject={(name) => setExpanded((old) => toggle(old, name))} onToggleQuiet={() => setShowQuiet((v) => !v)} />
   );

@@ -72,7 +72,7 @@ function ProjectNode({ project, scope, expanded, onSelect, onToggle }: {
 export function ProjectSidebar({ projects, total, needsCount, scope, expanded, showQuiet, query = "", onQueryChange, onSelect, onToggleProject, onToggleQuiet }: {
   projects: SidebarProject[];
   total: number;
-  needsCount: number;
+  needsCount?: number;
   scope: SidebarScope;
   expanded: (string | null)[];
   showQuiet: boolean;
@@ -110,14 +110,14 @@ export function ProjectSidebar({ projects, total, needsCount, scope, expanded, s
               <span className={count}>{total}</span>
             </button>
           </li>
-          <li>
+          {needsCount !== undefined && <li>
             <button type="button" aria-current={scope.kind === "needs" ? "page" : undefined} onClick={() => onSelect?.({ kind: "needs" })}
               className={cn(item, scope.kind === "needs" ? on : "text-muted-foreground hover:text-foreground")}>
               <StatusDot dot="needs" label="" />
               <span className="flex-1">Te așteaptă</span>
               <span className={cn(count, needsCount > 0 && "font-medium text-foreground")}>{needsCount}</span>
             </button>
-          </li>
+          </li>}
         </ul>
         <h2 className="flex items-center gap-1.5 px-2 pt-4 pb-1 text-xs font-medium text-muted-foreground">
           Active <span className="font-mono tabular-nums">{active.length}</span>

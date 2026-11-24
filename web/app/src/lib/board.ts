@@ -36,7 +36,7 @@ export type BoardCard = {
   needsYou: boolean;
   blockers: BlockerRef[];
   checkout: CardCheckout | null;
-  sessions: BoardSession[];
+  sessions: BoardSession[] | null;
   artifacts: number;
   age: string;
 };
@@ -61,7 +61,8 @@ export function sessionDot(status: string): Dot {
   return "off";
 }
 
-export function cardDot(card: BoardCard): Dot {
+export function cardDot(card: BoardCard): Dot | null {
+  if (card.sessions === null) return null;
   if (card.needsYou) return "needs";
   if (card.stage === "done") return "done";
   if (card.sessions.some((s) => s.status === "running")) return "running";
@@ -158,14 +159,14 @@ export function awayDigest(board: BoardData): { finished: Card[]; needsYou: Sess
 export const cardSlug = (ref: string): string => ref.replace(/^#/, "");
 
 export function toBoardCard(card: Card, cards: Card[], show?: CardShow): BoardCard {
-  const sessions = show?.sessions ?? [];
+  const sessions = show?.sessions;
   return {
     ref: card.ref, title: card.title, stage: card.stage, project: card.project, proposed: card.proposed,
     proposedBy: card.proposed ? card.created_by.name : null,
-    needsYou: sessions.some((s) => s.status === "needs_feedback"),
+    needsYou: !!sessions?.some((s) => s.status === "needs_feedback"),
     blockers: openBlockers(card, cards),
     checkout: card.checkout && { host: card.checkout.host, branch: card.checkout.branch },
-    sessions: sessions.map((s) => ({ id: s.id, host: s.host, name: s.name, role: s.role ?? "—", kind: s.kind, status: s.status, writer: s.writer })),
+    sessions: sessions?.map((s) => ({ id: s.id, host: s.host, name: s.name, role: s.role ?? "—", kind: s.kind, status: s.status, writer: s.writer })) ?? null,
     artifacts: show?.artifacts.length ?? 0,
     age: "",
   };

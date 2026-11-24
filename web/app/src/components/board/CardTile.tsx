@@ -41,6 +41,7 @@ export function CardTile({ card, selected = false, showProject = false, onOpen, 
   actions?: ReactNode;
 }) {
   const blocked = card.blockers.length > 0;
+  const dot = cardDot(card);
   return (
     <article className={cn(
       "relative flex flex-col gap-1.5 rounded-lg border bg-card p-2.5 text-card-foreground transition-colors hover:bg-secondary/60 has-[button:focus-visible]:ring-2 has-[button:focus-visible]:ring-ring",
@@ -50,7 +51,7 @@ export function CardTile({ card, selected = false, showProject = false, onOpen, 
       blocked && "opacity-60",
     )}>
       <div className="flex min-w-0 items-center gap-1.5">
-        <StatusDot dot={cardDot(card)} />
+        {dot && <StatusDot dot={dot} />}
         <CardRef cardRef={card.ref} />
         {showProject && <span className="min-w-0 truncate font-mono text-xs text-muted-foreground">{projectName(card.project)}</span>}
         <span className="flex-1" />
@@ -72,7 +73,7 @@ export function CardTile({ card, selected = false, showProject = false, onOpen, 
       )}
       <div className="flex flex-wrap items-center gap-1.5 border-t pt-1.5 text-xs text-muted-foreground">
         <span className="flex items-center gap-1">
-          {card.sessions.length
+          {card.sessions?.length
             ? card.sessions.map((s) => <StatusDot key={s.id} dot={sessionDot(s.status)} label={`${s.name}: ${statusLabel(s.status)}`} />)
             : <span aria-label="Nicio sesiune">—</span>}
         </span>
