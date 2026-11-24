@@ -141,12 +141,6 @@ enum Command {
         #[command(subcommand)]
         command: DiagramCommand,
     },
-    /// Read or edit the notes for the current project/worktree (agents can
-    /// too — inside a session the target is the session's own project).
-    Notes {
-        #[command(subcommand)]
-        command: Option<NotesCommand>,
-    },
     /// Cards on the board: add, move and work them (--json for agents).
     /// A daemon without a `board` key refuses every card verb.
     Todo {
@@ -638,23 +632,6 @@ enum DiagramCommand {
 }
 
 #[derive(Subcommand)]
-enum NotesCommand {
-    /// List the project's notes, then the current worktree's (the default).
-    List,
-    /// Add a note to the project's list (--worktree for the checkout's own).
-    Add {
-        /// The note; multiple words need no quotes.
-        #[arg(required = true, num_args = 1..)]
-        text: Vec<String>,
-        /// Add to the current worktree's list instead of the project's.
-        #[arg(long)]
-        worktree: bool,
-    },
-    /// Check a note off, by its number in `nebula notes`.
-    Done { index: usize },
-}
-
-#[derive(Subcommand)]
 enum TodoCommand {
     /// Add a card to the board (default project: the caller's own).
     Add {
@@ -805,17 +782,6 @@ enum TodoCommand {
         page: Option<String>,
         #[arg(long)]
         json: bool,
-    },
-    /// Check a legacy todo off, by its number in the old todo list.
-    Done { index: usize },
-    /// Bring a checked-off legacy todo back.
-    Reopen { index: usize },
-    /// Check a legacy todo's note off.
-    NoteDone {
-        /// The todo's number in the old todo list.
-        index: usize,
-        /// The note's number under it.
-        note: usize,
     },
 }
 
@@ -1203,28 +1169,9 @@ fn main() -> Result<()> {
                 DiagramCommand::Decisions { slug, json } => DiagramOp::Decisions { slug, json },
             })
         }
-        Some(Command::Notes { command }) => {
-            use nebula_tui::NotesOp;
-            let op = match command {
-                None | Some(NotesCommand::List) => NotesOp::List,
-                Some(NotesCommand::Add { text, worktree }) => NotesOp::Add {
-                    text: text.join(" "),
-                    worktree,
-                },
-                Some(NotesCommand::Done { index }) => NotesOp::Done { index },
-            };
-            nebula_tui::run_notes(op)
-        }
         Some(Command::Todo { command }) => {
             use nebula_tui::board_cli::TodoVerb;
-            use nebula_tui::TodoOp;
-            let legacy = |op| nebula_tui::run_todo(op);
             let (verb, json) = match command {
-                Some(TodoCommand::Done { index }) => return legacy(TodoOp::Done { index }),
-                Some(TodoCommand::Reopen { index }) => return legacy(TodoOp::Reopen { index }),
-                Some(TodoCommand::NoteDone { index, note }) => {
-                    return legacy(TodoOp::NoteDone { index, note })
-                }
                 None => (
                     TodoVerb::List {
                         scope: Default::default(),

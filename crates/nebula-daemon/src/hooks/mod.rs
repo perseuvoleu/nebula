@@ -32,34 +32,6 @@ request, unquoted (example: nebula rename Fix Login Redirect). If it reports \
 the session is already titled, accept that and move on. Then continue with \
 the request. Don't mention the rename to the user.";
 
-/// Open-notes pointer, injected on every prompt while the agent's project
-/// or worktree has undone notes. Tells the agent the notes CLI exists —
-/// nothing more; reading or acting on them stays the agent's call.
-pub fn notes_instruction(open: usize) -> String {
-    format!(
-        "[nebula] This project has {open} open note{} — the user's running \
-         to-do list. Read them with `nebula notes`; `nebula notes add <text>` \
-         adds one, `nebula notes done <n>` checks one off (do that when your \
-         work completes one). Bring one up only when it's relevant to the \
-         user's request.",
-        if open == 1 { "" } else { "s" }
-    )
-}
-
-/// Open-todos pointer, injected on every prompt while the agent's project
-/// or worktree has undone todos. Same contract as the notes pointer: it
-/// only tells the agent the CLI exists; acting on a todo stays its call.
-pub fn todos_instruction(open: usize) -> String {
-    format!(
-        "[nebula] This project has {open} open todo{} on the user's legacy \
-         list, separate from notes and from the board. `nebula todo \
-         done <n>` checks one off by its number in that list (do that when \
-         your work completes it; `reopen <n>` undoes). Bring one up only \
-         when it's relevant to the user's request.",
-        if open == 1 { "" } else { "s" }
-    )
-}
-
 /// Shared-checkout pointer, injected on every prompt while other unarchived
 /// sessions that have run share the agent's worktree. Foreign modifications
 /// in the diff are likely theirs — the agent should look before assuming
@@ -407,8 +379,7 @@ async fn receive_hook(
         .await;
 
     if let Some(inject) = inject.filter(|_| injectable) {
-        // Titling instruction while the session is untitled, the notes and
-        // todos pointers while the project/worktree has undone entries, the
+        // Titling instruction while the session is untitled, the
         // shared-checkout pointer while sibling sessions have run on the
         // same worktree, and the twin pointer while the project has a
         // checkout on a host. Unknown ids (prewarm, stale env) and store
@@ -420,20 +391,6 @@ async fn receive_hook(
             .unwrap_or(false)
         {
             parts.push(AUTO_TITLE_INSTRUCTION.to_string());
-        }
-        let open = state
-            .store
-            .open_note_count_for_agent(&agent_id)
-            .unwrap_or(0);
-        if open > 0 {
-            parts.push(notes_instruction(open));
-        }
-        let open_todos = state
-            .store
-            .open_todo_count_for_agent(&agent_id)
-            .unwrap_or(0);
-        if open_todos > 0 {
-            parts.push(todos_instruction(open_todos));
         }
         let siblings = state
             .store
@@ -829,90 +786,6 @@ mod tests {
         .await;
         assert_eq!(body, auto_title_injection());
         assert_eq!(rx.recv().await.unwrap().event, HookEvent::UserPromptSubmit);
-    }
-
-    /// The todos pointer rides UserPromptSubmit while the agent's project
-    /// or worktree has undone todos — and composes with the notes pointer
-    /// when both lists are open. Todo-owned child notes never count as
-    /// standalone notes.
-    #[tokio::test]
-    async fn user_prompt_submit_injects_todos_instruction_while_open() {
-        use nebula_core::{Note, NoteId, NoteOwner, Todo, TodoId, TodoOwner};
-        let store = seeded_store();
-        let (env, _rx) = start_hook_server(store.clone()).await.unwrap();
-        let payload = r#"{"session_id":"s1"}"#;
-
-        // Two open todos (project + worktree) and one done one.
-        let todo = |owner: TodoOwner, done: bool| Todo {
-            id: TodoId::generate(),
-            owner,
-            text: "t".into(),
-            done,
-            sort_order: 0,
-        };
-        store
-            .insert_todo(&todo(TodoOwner::Project(ProjectId("p1".into())), false))
-            .unwrap();
-        let open_wt = todo(TodoOwner::Worktree(WorktreeId("w1".into())), false);
-        store.insert_todo(&open_wt).unwrap();
-        store
-            .insert_todo(&todo(TodoOwner::Worktree(WorktreeId("w1".into())), true))
-            .unwrap();
-        // A child note under a todo is todo-scoped: it must NOT wake the
-        // standalone-notes pointer.
-        store
-            .insert_note(&Note {
-                id: NoteId::generate(),
-                owner: NoteOwner::Todo(open_wt.id.clone()),
-                text: "child".into(),
-                done: false,
-                sort_order: 0,
-            })
-            .unwrap();
-
-        let (status, body) = http_post(
-            env.port,
-            "/api/hooks/claude?agentId=titled&hookEvent=UserPromptSubmit",
-            &env.token,
-            payload,
-        )
-        .await;
-        assert_eq!(status, 200);
-        assert_eq!(body, context_injection(&[todos_instruction(2)]));
-        assert!(body.contains("2 open todos"), "count: {body}");
-        assert!(body.contains("nebula todo done <n>"), "cli pointer: {body}");
-        for card_verb in ["list", "show", "add", "note"] {
-            assert!(
-                !body.contains(&format!("todo {card_verb}")),
-                "the pointer names a card verb: {body}"
-            );
-        }
-        assert!(
-            !body.contains("nebula notes"),
-            "todo child notes must not trigger the notes pointer: {body}"
-        );
-
-        // With a standalone note open too, the pointers compose.
-        store
-            .insert_note(&Note {
-                id: NoteId::generate(),
-                owner: NoteOwner::Project(ProjectId("p1".into())),
-                text: "standalone".into(),
-                done: false,
-                sort_order: 0,
-            })
-            .unwrap();
-        let (_, body) = http_post(
-            env.port,
-            "/api/hooks/claude?agentId=titled&hookEvent=UserPromptSubmit",
-            &env.token,
-            payload,
-        )
-        .await;
-        assert_eq!(
-            body,
-            context_injection(&[notes_instruction(1), todos_instruction(2)])
-        );
     }
 
     /// The shared-checkout pointer rides UserPromptSubmit while another

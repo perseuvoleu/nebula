@@ -38,7 +38,6 @@ id_newtype!(AgentId);
 id_newtype!(TerminalId);
 id_newtype!(NoteId);
 id_newtype!(TodoId);
-id_newtype!(LinkId);
 id_newtype!(ArtifactId);
 id_newtype!(DispatchId);
 

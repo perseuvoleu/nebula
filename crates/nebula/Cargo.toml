@@ -33,4 +33,5 @@ tempfile = "3"
 tokio = { workspace = true, features = ["test-util"] }
 serde_json = { workspace = true }
 portable-pty = "0.9"
+rusqlite = { version = "0.40", features = ["bundled"] }
 vt100 = "0.16"

@@ -729,7 +729,7 @@ fn tui_remote_preview_deadline_attaches_when_the_reply_never_arrives() {
                                     "divider_after":false, "divider_before":false, "host":"findl"}],
                                 "worktrees": [{"id":"w", "project_id":"p", "path":"/remote", "branch":"main", "is_main":true, "sort_order":0}],
                                 "agents": [{"id":"a", "worktree_id":"w", "name":"remote-agent", "status":"finished", "archived":false, "sort_order":0, "alive":true}],
-                                "terminals":[], "notes":[], "todos":[], "links":[], "pr_seen":[],
+                                "terminals":[], "pr_seen":[],
                                 "ui_state":"{\"project\":\"p\",\"worktree\":\"w\",\"session_agent\":\"a\"}"
                             }})).unwrap();
                             write_frame(&mut stream, &snapshot).await.unwrap();

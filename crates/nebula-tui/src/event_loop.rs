@@ -2,10 +2,10 @@
 
 use crate::app::{
     AfterCheckout, App, AttachedTerm, ConfirmDialog, ConnState, ContextMenu, DiffView, FileFinder,
-    Focus, GrepView, HitTarget, LinkRow, MenuAction, MenuItem, MetricsView, NoteInput, NoteView,
-    OpenStage, Overlay, Palette, PaletteTarget, PanelEntry, PanelRow, PendingAction, PendingIntent,
-    PointerShape, ProjectRow, PromptDialog, PromptKind, SessionRow, SettingsView, SplitterDrag,
-    SubmenuKind, TermSelection, TodoInput, TodoInputTarget, TodoView, WorktreeRollback,
+    Focus, GrepView, HitTarget, LinkRow, MenuAction, MenuItem, MetricsView, OpenStage, Overlay,
+    Palette, PaletteTarget, PanelEntry, PanelRow, PendingAction, PendingIntent, PointerShape,
+    ProjectRow, PromptDialog, PromptKind, SessionRow, SettingsView, SplitterDrag, SubmenuKind,
+    TermSelection, WorktreeRollback,
 };
 use crate::pull_request::PullRequest;
 use crate::text_input::TextInput;
@@ -18,8 +18,8 @@ use crossterm::event::{
 };
 use futures::StreamExt;
 use nebula_core::{
-    AgentId, AgentKind, AgentStatus, ClientRequest, EntityId, LinkId, NoteId, NoteOwner, ProjectId,
-    ServerEvent, SessionRef, TodoId, TodoOwner, WorktreeId, WriterClaim,
+    AgentId, AgentKind, AgentStatus, ClientRequest, EntityId, ProjectId, ServerEvent, SessionRef,
+    WorktreeId, WriterClaim,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -1211,14 +1211,6 @@ fn paste_into_overlay(app: &mut App, text: &str) -> bool {
             }
         }
         // These only type while their add/edit input is open.
-        Overlay::Notes(view) => match &mut view.input {
-            Some(input) => input.text.insert_str(text),
-            None => return false,
-        },
-        Overlay::Todos(view) => match &mut view.input {
-            Some(input) => input.text.insert_str(text),
-            None => return false,
-        },
         Overlay::Hosts(view) => match &mut view.input {
             Some(input) => input.insert_str(text),
             None => return false,
@@ -1312,7 +1304,6 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                     Some(
                         crate::keymap::Action::ToggleTerminalFullscreen
                             | crate::keymap::Action::NewAgent
-                            | crate::keymap::Action::Notes
                             | crate::keymap::Action::GitDiff
                             | crate::keymap::Action::SplitTerminal
                             | crate::keymap::Action::CommandPalette
@@ -1355,13 +1346,6 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                     app.term_locked = false;
                     app.focus = Focus::Sessions;
                     new_agent_shortcut(app);
-                    return;
-                }
-                Some(crate::keymap::Action::Notes) => {
-                    app.collapsed = false;
-                    app.term_locked = false;
-                    app.focus = Focus::Sessions;
-                    open_note_view(app);
                     return;
                 }
                 Some(crate::keymap::Action::GitDiff) => {
@@ -1629,8 +1613,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                 Some(SessionRow::Terminal(t)) => {
                     open_prompt(app, PromptKind::RenameTerminal { id: t.id })
                 }
-                Some(SessionRow::Link(l)) => edit_link(app, &l),
-                None => {}
+                Some(SessionRow::Link(_)) | None => {}
             },
             Focus::Projects => {
                 if let Some(ProjectRow::Divider { project, before }) = app.selected_project_row() {
@@ -1651,7 +1634,7 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
                         app.flash = Some("terminals can't be archived — d closes them".into());
                     }
                     Some(SessionRow::Link(_)) => {
-                        app.flash = Some("links can't be archived — d deletes them".into());
+                        app.flash = Some("links can't be archived".into());
                     }
                     _ => {}
                 }
@@ -1792,8 +1775,6 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         Action::AddProject => open_prompt(app, PromptKind::AddProject),
         Action::FindFile => open_file_finder(app),
         Action::Grep => open_grep_view(app),
-        Action::Notes => open_note_view(app),
-        Action::Todos => open_todo_view(app),
         Action::TreeBrowser => open_tree_browser(app),
         Action::ViewFile => open_file_view(app),
         // t: the new-session picker (agents + shell) on the selection's
@@ -1807,7 +1788,6 @@ fn handle_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>) {
         // palette, no terminal-focus guard: an unlocked pane forwards
         // nothing, and the locked path has its own SUPER intercept.
         Action::QuickTerminal => quick_terminal_shortcut(app, out),
-        Action::NewLink => open_new_link_prompt(app),
         Action::ToggleTerminalFullscreen => toggle_terminal_fullscreen(app),
         // Terminal-scope only; never resolved here.
         Action::UnlockTerminal => {}
@@ -1979,21 +1959,6 @@ fn open_prompt(app: &mut App, kind: PromptKind) {
                 .map(|w| w.name.clone())
                 .unwrap_or_default();
             ("Rename workspace".to_string(), "name".to_string(), current)
-        }
-        PromptKind::NewLink { .. } => (
-            "Add link".to_string(),
-            "URL (pull request, doc, ticket)".to_string(),
-            String::new(),
-        ),
-        PromptKind::EditLink { id } => {
-            let current = app
-                .tree
-                .links
-                .iter()
-                .find(|l| &l.id == id)
-                .map(|l| l.url.clone())
-                .unwrap_or_default();
-            ("Edit link".to_string(), "URL".to_string(), current)
         }
     };
     app.overlay = Some(Overlay::Prompt(PromptDialog::new(
@@ -2222,109 +2187,6 @@ fn reload_reviewed_marks(view: &mut DiffView) {
         view.reviewed = unchanged;
     }
     view.recompute_matches();
-}
-
-/// Fuzzy file finder over every tracked + untracked file of the selected
-/// worktree (`f`). Same shell as `open_diff_view`: flash instead of opening
-/// when there's no worktree, the path is gone, or git fails.
-/// Open the note modal (`o`): the project's own notes from the Projects
-/// panel, the selected worktree's notes elsewhere (falling back to the
-/// project when it has no worktrees yet).
-fn open_note_view(app: &mut App) {
-    let owner = if app.focus == Focus::Projects {
-        app.selected_project()
-            .map(|p| NoteOwner::Project(p.id.clone()))
-    } else {
-        app.selected_worktree()
-            .map(|w| NoteOwner::Worktree(w.id.clone()))
-            .or_else(|| {
-                app.selected_project()
-                    .map(|p| NoteOwner::Project(p.id.clone()))
-            })
-    };
-    let Some(owner) = owner else {
-        app.flash = Some("select a project or worktree first".into());
-        return;
-    };
-    open_notes_for_owner(app, owner);
-}
-
-fn open_notes_for_owner(app: &mut App, owner: NoteOwner) {
-    let context = match &owner {
-        NoteOwner::Project(id) => {
-            let Some(project) = app.tree.projects.iter().find(|p| &p.id == id) else {
-                return;
-            };
-            project.name.clone()
-        }
-        NoteOwner::Worktree(id) => {
-            let Some(worktree) = app.tree.worktrees.iter().find(|w| &w.id == id) else {
-                return;
-            };
-            let project = app
-                .tree
-                .projects
-                .iter()
-                .find(|p| p.id == worktree.project_id);
-            format!(
-                "{}/{}",
-                project.map(|p| p.name.as_str()).unwrap_or("?"),
-                worktree.branch
-            )
-        }
-        // A todo's notes open inside the todo modal, never here.
-        NoteOwner::Todo(_) => return,
-    };
-    app.overlay = Some(Overlay::Notes(NoteView::new(owner, context)));
-}
-
-/// Open the todo modal (`E`): the project's own todos from the Projects
-/// panel, the selected worktree's elsewhere (falling back to the project
-/// when it has no worktrees yet) — the notes modal's owner rule.
-fn open_todo_view(app: &mut App) {
-    let owner = if app.focus == Focus::Projects {
-        app.selected_project()
-            .map(|p| TodoOwner::Project(p.id.clone()))
-    } else {
-        app.selected_worktree()
-            .map(|w| TodoOwner::Worktree(w.id.clone()))
-            .or_else(|| {
-                app.selected_project()
-                    .map(|p| TodoOwner::Project(p.id.clone()))
-            })
-    };
-    let Some(owner) = owner else {
-        app.flash = Some("select a project or worktree first".into());
-        return;
-    };
-    open_todos_for_owner(app, owner);
-}
-
-fn open_todos_for_owner(app: &mut App, owner: TodoOwner) {
-    let context = match &owner {
-        TodoOwner::Project(id) => {
-            let Some(project) = app.tree.projects.iter().find(|p| &p.id == id) else {
-                return;
-            };
-            project.name.clone()
-        }
-        TodoOwner::Worktree(id) => {
-            let Some(worktree) = app.tree.worktrees.iter().find(|w| &w.id == id) else {
-                return;
-            };
-            let project = app
-                .tree
-                .projects
-                .iter()
-                .find(|p| p.id == worktree.project_id);
-            format!(
-                "{}/{}",
-                project.map(|p| p.name.as_str()).unwrap_or("?"),
-                worktree.branch
-            )
-        }
-    };
-    app.overlay = Some(Overlay::Todos(TodoView::new(owner, context)));
 }
 
 /// `h`: destinations remembered by `nebula ssh`, newest first. Opens even
@@ -2685,7 +2547,7 @@ fn close_session_shortcut(app: &mut App, out: &mut Vec<ClientRequest>) {
         }
         Some(SessionRow::Terminal(t)) => close_session(app, SessionRef::Terminal(t.id), out),
         Some(SessionRow::Link(_)) => {
-            app.flash = Some("links aren't sessions — d deletes them".into());
+            app.flash = Some("links aren't sessions".into());
         }
         None => {}
     }
@@ -3533,26 +3395,6 @@ fn session_exists(app: &App, sref: &SessionRef) -> bool {
     }
 }
 
-/// `L`: attach a URL to the worktree in context — the selected one, or the
-/// selected project's main checkout when the Projects panel has focus (the
-/// same rule `t` uses for terminals).
-fn open_new_link_prompt(app: &mut App) {
-    let worktree = match app.focus {
-        Focus::Projects => app.selected_project().and_then(|p| {
-            app.tree
-                .worktrees
-                .iter()
-                .find(|w| w.project_id == p.id && w.is_main)
-                .map(|w| w.id.clone())
-        }),
-        _ => app.selected_worktree().map(|w| w.id.clone()),
-    };
-    match worktree {
-        Some(worktree) => open_prompt(app, PromptKind::NewLink { worktree }),
-        None => app.flash = Some("select a project or worktree first".into()),
-    }
-}
-
 fn open_delete_confirm(app: &mut App) {
     match app.focus {
         Focus::Projects => {
@@ -3607,41 +3449,10 @@ fn open_delete_confirm(app: &mut App) {
                     action: PendingAction::CloseTerminal(t.id),
                 }));
             }
-            Some(SessionRow::Link(l)) => delete_link(app, &l),
-            None => {}
+            Some(SessionRow::Link(_)) | None => {}
         },
         Focus::Terminal => {}
     }
-}
-
-/// Edit the URL behind a link row. The detected pull request has no stored
-/// row to rewrite — it comes back from git on every lookup.
-fn edit_link(app: &mut App, row: &LinkRow) {
-    match row.id() {
-        Some(id) => open_prompt(app, PromptKind::EditLink { id: id.clone() }),
-        None => {
-            app.flash =
-                Some("the pull request link comes from git — l adds one you can edit".into())
-        }
-    }
-}
-
-/// Delete a link row, with the same confirm every other `d` gets. The
-/// detected pull request isn't ours to delete: it would be back on the next
-/// lookup.
-fn delete_link(app: &mut App, row: &LinkRow) {
-    let Some(id) = row.id() else {
-        app.flash = Some("the pull request link can't be deleted — it comes from git".into());
-        return;
-    };
-    app.overlay = Some(Overlay::Confirm(ConfirmDialog {
-        title: "Delete link".into(),
-        message: format!(
-            "Delete link '{}'? Nothing it points at is touched.",
-            row.label()
-        ),
-        action: PendingAction::DeleteLink(id.clone()),
-    }));
 }
 
 /// Cap on itemized rows in the bulk-delete confirm; the rest collapse into
@@ -3744,27 +3555,12 @@ fn open_delete_all_confirm(app: &mut App) {
     }
 }
 
-/// Row menu for a link: open it, and — unless it's the pull request nebula
-/// found in git — edit or delete it.
 fn menu_items_for_link(row: &LinkRow) -> Vec<MenuItem> {
-    let mut items = vec![MenuItem {
+    vec![MenuItem {
         label: "Open in browser".into(),
         action: MenuAction::OpenLink(row.url().to_string()),
         destructive: false,
-    }];
-    if let Some(id) = row.id() {
-        items.push(MenuItem {
-            label: "Edit URL".into(),
-            action: MenuAction::EditLink(id.clone()),
-            destructive: false,
-        });
-        items.push(MenuItem {
-            label: "Delete".into(),
-            action: MenuAction::DeleteLink(id.clone()),
-            destructive: true,
-        });
-    }
-    items
+    }]
 }
 
 fn menu_items_for_session(a: &nebula_core::Agent) -> Vec<MenuItem> {
@@ -4021,11 +3817,6 @@ fn open_command_palette(app: &mut App) {
     items.push(row(
         "g · Git diff",
         MenuAction::Command(PaletteCommand::GitDiff),
-    ));
-    items.push(row("n · Notes", MenuAction::Command(PaletteCommand::Notes)));
-    items.push(row(
-        "td · Todos",
-        MenuAction::Command(PaletteCommand::Todos),
     ));
     items.push(row(
         "st · Settings",
@@ -4828,16 +4619,6 @@ fn open_context_menu_for_selection(app: &mut App) {
                         destructive: false,
                     },
                 );
-                items.push(MenuItem {
-                    label: "Notes".into(),
-                    action: MenuAction::OpenNotes(NoteOwner::Project(p.id.clone())),
-                    destructive: false,
-                });
-                items.push(MenuItem {
-                    label: "Todos".into(),
-                    action: MenuAction::OpenTodos(TodoOwner::Project(p.id.clone())),
-                    destructive: false,
-                });
                 items.push(divider_menu_item(p));
                 items.push(MenuItem {
                     label: "Hide".into(),
@@ -4877,21 +4658,6 @@ fn open_context_menu_for_selection(app: &mut App) {
                     MenuItem {
                         label: "New branch".into(),
                         action: MenuAction::NewBranch(project),
-                        destructive: false,
-                    },
-                    MenuItem {
-                        label: "Notes".into(),
-                        action: MenuAction::OpenNotes(NoteOwner::Worktree(w.id.clone())),
-                        destructive: false,
-                    },
-                    MenuItem {
-                        label: "Todos".into(),
-                        action: MenuAction::OpenTodos(TodoOwner::Worktree(w.id.clone())),
-                        destructive: false,
-                    },
-                    MenuItem {
-                        label: "Add link".into(),
-                        action: MenuAction::NewLink(w.id.clone()),
                         destructive: false,
                     },
                     MenuItem {
@@ -5539,376 +5305,6 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                 }
             }
         }
-        Overlay::Notes(view) => {
-            // The CRUD keys need both the view (cursor/input) and the tree
-            // (rows) — resolve the key to a command first, then act, so the
-            // overlay borrow never overlaps the request plumbing.
-            enum NoteCmd {
-                Nothing,
-                Close,
-                Move(i64),
-                StartCreate,
-                StartEdit(NoteId, String),
-                CancelInput,
-                Create(String),
-                Update(NoteId, String),
-                Toggle(NoteId, bool),
-                Delete(NoteId),
-            }
-            // Row order matches the draw: tree order for this owner.
-            let rows: Vec<(NoteId, String, bool)> = app
-                .tree
-                .notes
-                .iter()
-                .filter(|t| t.owner == view.owner)
-                .map(|t| (t.id.clone(), t.text.clone(), t.done))
-                .collect();
-            let selected = view.selected.min(rows.len().saturating_sub(1));
-            view.selected = selected;
-            let cmd = if let Some(input) = &mut view.input {
-                match key.code {
-                    KeyCode::Esc => NoteCmd::CancelInput,
-                    // Nothing typed = cancel; edits and adds both no-op.
-                    KeyCode::Enter => match (&input.editing, input.text.trim()) {
-                        (_, "") => NoteCmd::CancelInput,
-                        (Some(id), text) => NoteCmd::Update(id.clone(), text.to_string()),
-                        (None, text) => NoteCmd::Create(text.to_string()),
-                    },
-                    // Everything else is the line editor's: arrows, ⌥←/⌥→
-                    // by word, the readline chords (see text_input).
-                    _ => {
-                        input.text.handle_key(&key);
-                        NoteCmd::Nothing
-                    }
-                }
-            } else {
-                match key.code {
-                    KeyCode::Esc | KeyCode::Char('q') => NoteCmd::Close,
-                    KeyCode::Char('j') | KeyCode::Down => NoteCmd::Move(1),
-                    KeyCode::Char('k') | KeyCode::Up => NoteCmd::Move(-1),
-                    // `e` mirrors the key that opened the modal; a/n too.
-                    // (That costs `e` as an edit key — Enter/r cover it.)
-                    KeyCode::Char('e') | KeyCode::Char('a') | KeyCode::Char('n') => {
-                        NoteCmd::StartCreate
-                    }
-                    KeyCode::Enter | KeyCode::Char('r') => {
-                        match rows.get(selected) {
-                            Some((id, text, _)) => NoteCmd::StartEdit(id.clone(), text.clone()),
-                            // Empty list: Enter starts the first note.
-                            None => NoteCmd::StartCreate,
-                        }
-                    }
-                    KeyCode::Char(' ') | KeyCode::Char('x') => match rows.get(selected) {
-                        Some((id, _, done)) => NoteCmd::Toggle(id.clone(), !done),
-                        None => NoteCmd::Nothing,
-                    },
-                    KeyCode::Char('d') | KeyCode::Backspace | KeyCode::Delete => {
-                        match rows.get(selected) {
-                            Some((id, _, _)) => NoteCmd::Delete(id.clone()),
-                            None => NoteCmd::Nothing,
-                        }
-                    }
-                    _ => NoteCmd::Nothing,
-                }
-            };
-            match cmd {
-                NoteCmd::Nothing => {}
-                NoteCmd::Close => app.overlay = None,
-                NoteCmd::Move(delta) => {
-                    let max = rows.len().saturating_sub(1) as i64;
-                    view.selected = (selected as i64 + delta).clamp(0, max) as usize;
-                }
-                NoteCmd::StartCreate => {
-                    view.input = Some(NoteInput {
-                        editing: None,
-                        text: TextInput::new(),
-                    });
-                }
-                NoteCmd::StartEdit(id, text) => {
-                    view.input = Some(NoteInput {
-                        editing: Some(id),
-                        // Cursor lands at the end, ready for ⌥← to step back
-                        // through the existing name.
-                        text: TextInput::with_text(text),
-                    });
-                }
-                NoteCmd::CancelInput => view.input = None,
-                NoteCmd::Create(text) => {
-                    view.input = None;
-                    let owner = view.owner.clone();
-                    let req_id = app.alloc_req_id(PendingIntent::SelectCreatedNote);
-                    out.push(ClientRequest::CreateNote {
-                        req_id,
-                        owner,
-                        text,
-                    });
-                }
-                NoteCmd::Update(id, text) => {
-                    view.input = None;
-                    let req_id = app.alloc_req_id(PendingIntent::None);
-                    out.push(ClientRequest::UpdateNote { req_id, id, text });
-                }
-                NoteCmd::Toggle(id, done) => {
-                    let req_id = app.alloc_req_id(PendingIntent::None);
-                    out.push(ClientRequest::SetNoteDone { req_id, id, done });
-                }
-                NoteCmd::Delete(id) => {
-                    let req_id = app.alloc_req_id(PendingIntent::None);
-                    out.push(ClientRequest::DeleteNote { req_id, id });
-                }
-            }
-        }
-        Overlay::Todos(view) => {
-            // Same command-first shape as the notes modal, with a second
-            // mode: Enter on a todo opens its detail, where the cursor and
-            // the CRUD keys work the todo's child notes instead.
-            enum TodoCmd {
-                Nothing,
-                Close,
-                /// Detail → list (Esc inside a detail).
-                Back,
-                Move(i64),
-                OpenDetail(TodoId),
-                StartCreateTodo,
-                StartEditTodo(TodoId, String),
-                StartCreateNote,
-                StartEditNote(NoteId, String),
-                CancelInput,
-                CreateTodo(String),
-                UpdateTodo(TodoId, String),
-                ToggleTodo(TodoId, bool),
-                DeleteTodo(TodoId),
-                CreateNote(TodoId, String),
-                UpdateNote(NoteId, String),
-                ToggleNote(NoteId, bool),
-                DeleteNote(NoteId),
-            }
-            let cmd = if let Some(todo_id) = view.detail.clone() {
-                // Detail mode: rows are the opened todo's child notes, in
-                // draw order.
-                let rows: Vec<(NoteId, String, bool)> = app
-                    .tree
-                    .notes
-                    .iter()
-                    .filter(|n| n.owner == NoteOwner::Todo(todo_id.clone()))
-                    .map(|n| (n.id.clone(), n.text.clone(), n.done))
-                    .collect();
-                let selected = view.note_selected.min(rows.len().saturating_sub(1));
-                view.note_selected = selected;
-                if let Some(input) = &mut view.input {
-                    match key.code {
-                        KeyCode::Esc => TodoCmd::CancelInput,
-                        // Nothing typed = cancel; edits and adds both no-op.
-                        KeyCode::Enter => match (&input.target, input.text.trim()) {
-                            (_, "") => TodoCmd::CancelInput,
-                            (TodoInputTarget::EditNote(id), text) => {
-                                TodoCmd::UpdateNote(id.clone(), text.to_string())
-                            }
-                            (_, text) => TodoCmd::CreateNote(todo_id.clone(), text.to_string()),
-                        },
-                        _ => {
-                            input.text.handle_key(&key);
-                            TodoCmd::Nothing
-                        }
-                    }
-                } else {
-                    match key.code {
-                        KeyCode::Esc | KeyCode::Char('q') => TodoCmd::Back,
-                        KeyCode::Char('j') | KeyCode::Down => TodoCmd::Move(1),
-                        KeyCode::Char('k') | KeyCode::Up => TodoCmd::Move(-1),
-                        KeyCode::Char('e') | KeyCode::Char('a') | KeyCode::Char('n') => {
-                            TodoCmd::StartCreateNote
-                        }
-                        KeyCode::Enter | KeyCode::Char('r') => match rows.get(selected) {
-                            Some((id, text, _)) => TodoCmd::StartEditNote(id.clone(), text.clone()),
-                            // Empty list: Enter starts the first note.
-                            None => TodoCmd::StartCreateNote,
-                        },
-                        KeyCode::Char(' ') | KeyCode::Char('x') => match rows.get(selected) {
-                            Some((id, _, done)) => TodoCmd::ToggleNote(id.clone(), !done),
-                            None => TodoCmd::Nothing,
-                        },
-                        KeyCode::Char('d') | KeyCode::Backspace | KeyCode::Delete => {
-                            match rows.get(selected) {
-                                Some((id, _, _)) => TodoCmd::DeleteNote(id.clone()),
-                                None => TodoCmd::Nothing,
-                            }
-                        }
-                        _ => TodoCmd::Nothing,
-                    }
-                }
-            } else {
-                // List mode: rows are the owner's todos, in draw order.
-                let rows: Vec<(TodoId, String, bool)> = app
-                    .tree
-                    .todos
-                    .iter()
-                    .filter(|t| t.owner == view.owner)
-                    .map(|t| (t.id.clone(), t.text.clone(), t.done))
-                    .collect();
-                let selected = view.selected.min(rows.len().saturating_sub(1));
-                view.selected = selected;
-                if let Some(input) = &mut view.input {
-                    match key.code {
-                        KeyCode::Esc => TodoCmd::CancelInput,
-                        KeyCode::Enter => match (&input.target, input.text.trim()) {
-                            (_, "") => TodoCmd::CancelInput,
-                            (TodoInputTarget::EditTodo(id), text) => {
-                                TodoCmd::UpdateTodo(id.clone(), text.to_string())
-                            }
-                            (_, text) => TodoCmd::CreateTodo(text.to_string()),
-                        },
-                        _ => {
-                            input.text.handle_key(&key);
-                            TodoCmd::Nothing
-                        }
-                    }
-                } else {
-                    match key.code {
-                        KeyCode::Esc | KeyCode::Char('q') => TodoCmd::Close,
-                        KeyCode::Char('j') | KeyCode::Down => TodoCmd::Move(1),
-                        KeyCode::Char('k') | KeyCode::Up => TodoCmd::Move(-1),
-                        // `E` mirrors the key that opened the modal; a/n
-                        // and e match the notes modal's add keys.
-                        KeyCode::Char('e')
-                        | KeyCode::Char('E')
-                        | KeyCode::Char('a')
-                        | KeyCode::Char('n') => TodoCmd::StartCreateTodo,
-                        // Enter drills into the todo's notes — editing the
-                        // text stays on r, like a session rename.
-                        KeyCode::Enter => match rows.get(selected) {
-                            Some((id, _, _)) => TodoCmd::OpenDetail(id.clone()),
-                            // Empty list: Enter starts the first todo.
-                            None => TodoCmd::StartCreateTodo,
-                        },
-                        KeyCode::Char('r') => match rows.get(selected) {
-                            Some((id, text, _)) => TodoCmd::StartEditTodo(id.clone(), text.clone()),
-                            None => TodoCmd::StartCreateTodo,
-                        },
-                        KeyCode::Char(' ') | KeyCode::Char('x') => match rows.get(selected) {
-                            Some((id, _, done)) => TodoCmd::ToggleTodo(id.clone(), !done),
-                            None => TodoCmd::Nothing,
-                        },
-                        KeyCode::Char('d') | KeyCode::Backspace | KeyCode::Delete => {
-                            match rows.get(selected) {
-                                Some((id, _, _)) => TodoCmd::DeleteTodo(id.clone()),
-                                None => TodoCmd::Nothing,
-                            }
-                        }
-                        _ => TodoCmd::Nothing,
-                    }
-                }
-            };
-            match cmd {
-                TodoCmd::Nothing => {}
-                TodoCmd::Close => app.overlay = None,
-                TodoCmd::Back => {
-                    view.detail = None;
-                    view.input = None;
-                }
-                TodoCmd::Move(delta) => {
-                    // Recount here: the row vecs above live in the mode
-                    // branches. Same clamp semantics as the notes modal.
-                    if let Some(todo_id) = &view.detail {
-                        let max = app
-                            .tree
-                            .notes
-                            .iter()
-                            .filter(|n| n.owner == NoteOwner::Todo(todo_id.clone()))
-                            .count()
-                            .saturating_sub(1) as i64;
-                        view.note_selected =
-                            (view.note_selected as i64 + delta).clamp(0, max) as usize;
-                    } else {
-                        let max = app
-                            .tree
-                            .todos
-                            .iter()
-                            .filter(|t| t.owner == view.owner)
-                            .count()
-                            .saturating_sub(1) as i64;
-                        view.selected = (view.selected as i64 + delta).clamp(0, max) as usize;
-                    }
-                }
-                TodoCmd::OpenDetail(id) => {
-                    view.detail = Some(id);
-                    view.note_selected = 0;
-                    view.input = None;
-                }
-                TodoCmd::StartCreateTodo => {
-                    view.input = Some(TodoInput {
-                        target: TodoInputTarget::NewTodo,
-                        text: TextInput::new(),
-                    });
-                }
-                TodoCmd::StartEditTodo(id, text) => {
-                    view.input = Some(TodoInput {
-                        target: TodoInputTarget::EditTodo(id),
-                        // Cursor lands at the end, ready for ⌥← to step
-                        // back through the existing text.
-                        text: TextInput::with_text(text),
-                    });
-                }
-                TodoCmd::StartCreateNote => {
-                    view.input = Some(TodoInput {
-                        target: TodoInputTarget::NewNote,
-                        text: TextInput::new(),
-                    });
-                }
-                TodoCmd::StartEditNote(id, text) => {
-                    view.input = Some(TodoInput {
-                        target: TodoInputTarget::EditNote(id),
-                        text: TextInput::with_text(text),
-                    });
-                }
-                TodoCmd::CancelInput => view.input = None,
-                TodoCmd::CreateTodo(text) => {
-                    view.input = None;
-                    let owner = view.owner.clone();
-                    let req_id = app.alloc_req_id(PendingIntent::SelectCreatedTodo);
-                    out.push(ClientRequest::CreateTodo {
-                        req_id,
-                        owner,
-                        text,
-                    });
-                }
-                TodoCmd::UpdateTodo(id, text) => {
-                    view.input = None;
-                    let req_id = app.alloc_req_id(PendingIntent::None);
-                    out.push(ClientRequest::UpdateTodo { req_id, id, text });
-                }
-                TodoCmd::ToggleTodo(id, done) => {
-                    let req_id = app.alloc_req_id(PendingIntent::None);
-                    out.push(ClientRequest::SetTodoDone { req_id, id, done });
-                }
-                TodoCmd::DeleteTodo(id) => {
-                    let req_id = app.alloc_req_id(PendingIntent::None);
-                    out.push(ClientRequest::DeleteTodo { req_id, id });
-                }
-                TodoCmd::CreateNote(todo, text) => {
-                    view.input = None;
-                    let req_id = app.alloc_req_id(PendingIntent::SelectCreatedNote);
-                    out.push(ClientRequest::CreateNote {
-                        req_id,
-                        owner: NoteOwner::Todo(todo),
-                        text,
-                    });
-                }
-                TodoCmd::UpdateNote(id, text) => {
-                    view.input = None;
-                    let req_id = app.alloc_req_id(PendingIntent::None);
-                    out.push(ClientRequest::UpdateNote { req_id, id, text });
-                }
-                TodoCmd::ToggleNote(id, done) => {
-                    let req_id = app.alloc_req_id(PendingIntent::None);
-                    out.push(ClientRequest::SetNoteDone { req_id, id, done });
-                }
-                TodoCmd::DeleteNote(id) => {
-                    let req_id = app.alloc_req_id(PendingIntent::None);
-                    out.push(ClientRequest::DeleteNote { req_id, id });
-                }
-            }
-        }
     }
 }
 
@@ -6323,24 +5719,6 @@ fn submit_prompt(app: &mut App, prompt: PromptDialog, out: &mut Vec<ClientReques
                 name: value,
             });
         }
-        PromptKind::NewLink { worktree } => {
-            // The new row lands at the end of LINKS; move the cursor there
-            // so the link the user just typed is the one under it.
-            let req_id = app.alloc_req_id(PendingIntent::SelectCreatedLink);
-            out.push(ClientRequest::CreateLink {
-                req_id,
-                worktree,
-                url: value,
-            });
-        }
-        PromptKind::EditLink { id } => {
-            let req_id = app.alloc_req_id(PendingIntent::None);
-            out.push(ClientRequest::UpdateLink {
-                req_id,
-                id,
-                url: value,
-            });
-        }
     }
 }
 
@@ -6365,10 +5743,6 @@ fn run_pending_action(app: &mut App, action: PendingAction, out: &mut Vec<Client
             detach_if_attached(app, &SessionRef::Terminal(id.clone()), out);
             let req_id = app.alloc_req_id(PendingIntent::None);
             out.push(ClientRequest::CloseTerminal { req_id, id });
-        }
-        PendingAction::DeleteLink(id) => {
-            let req_id = app.alloc_req_id(PendingIntent::None);
-            out.push(ClientRequest::DeleteLink { req_id, id });
         }
         PendingAction::DeleteWorktree(id) => {
             // A branch created in place inside a pre-existing checkout: the
@@ -6714,20 +6088,7 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                 action: PendingAction::DeleteBranch { project, branch },
             }));
         }
-        MenuAction::OpenNotes(owner) => open_notes_for_owner(app, owner),
-        MenuAction::OpenTodos(owner) => open_todos_for_owner(app, owner),
-        MenuAction::NewLink(worktree) => open_prompt(app, PromptKind::NewLink { worktree }),
         MenuAction::OpenLink(url) => open_link(app, &url, out),
-        MenuAction::EditLink(id) => open_prompt(app, PromptKind::EditLink { id }),
-        MenuAction::DeleteLink(id) => {
-            if let Some(row) = app
-                .visible_links()
-                .into_iter()
-                .find(|l| l.id() == Some(&id))
-            {
-                delete_link(app, &row);
-            }
-        }
         MenuAction::SetWorktreePinned(id, pinned) => {
             let req_id = app.alloc_req_id(PendingIntent::None);
             out.push(ClientRequest::SetWorktreePinned { req_id, id, pinned });
@@ -6840,8 +6201,6 @@ fn run_menu_action(app: &mut App, action: MenuAction, out: &mut Vec<ClientReques
                     )));
                 }
                 PaletteCommand::GitDiff => open_diff_view(app),
-                PaletteCommand::Notes => open_note_view(app),
-                PaletteCommand::Todos => open_todo_view(app),
                 PaletteCommand::Settings => {
                     let tab = app.settings_tab;
                     app.overlay = Some(Overlay::Settings(SettingsView::new(
@@ -8358,34 +7717,6 @@ fn pointer_wants_hand(app: &App, column: u16, row: u16) -> bool {
             h.hosts.len(),
         ),
         Some(Overlay::Metrics(m)) => list_row(m.list_area, m.scroll, m.rows.len()),
-        Some(Overlay::Notes(n)) => {
-            let count = app.tree.notes.iter().filter(|t| t.owner == n.owner).count();
-            list_row(
-                n.list_area,
-                n.window_start(n.list_area.height as usize),
-                count,
-            )
-        }
-        Some(Overlay::Todos(t)) => {
-            let (count, row_offset) = match &t.detail {
-                Some(todo_id) => (
-                    app.tree
-                        .notes
-                        .iter()
-                        .filter(|n| n.owner == NoteOwner::Todo(todo_id.clone()))
-                        .count(),
-                    1u16,
-                ),
-                None => (
-                    app.tree.todos.iter().filter(|x| x.owner == t.owner).count(),
-                    0u16,
-                ),
-            };
-            let a = t.list_area;
-            let rows_y = a.y + row_offset;
-            let height = a.height.saturating_sub(row_offset) as usize;
-            inside(a) && row >= rows_y && (t.window_start(height) + (row - rows_y) as usize) < count
-        }
         Some(Overlay::Settings(view)) => {
             if view.capture.is_some() || !inside(view.area) {
                 return false;
@@ -9016,138 +8347,6 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
         }
         return;
     }
-    // Note modal: the wheel moves the selection, a click on a row selects
-    // it, a click outside the modal closes; everything else is swallowed.
-    if let Some(Overlay::Notes(view)) = &mut app.overlay {
-        let count = app
-            .tree
-            .notes
-            .iter()
-            .filter(|t| t.owner == view.owner)
-            .count();
-        let max = count.saturating_sub(1) as i64;
-        match mouse.kind {
-            MouseEventKind::ScrollUp => {
-                view.selected = (view.selected as i64 - 1).clamp(0, max) as usize;
-                app.dirty = true;
-            }
-            MouseEventKind::ScrollDown => {
-                view.selected = (view.selected as i64 + 1).clamp(0, max) as usize;
-                app.dirty = true;
-            }
-            MouseEventKind::Down(MouseButton::Left) => {
-                let list = view.list_area;
-                let inside_list = list.width > 0
-                    && mouse.column >= list.x
-                    && mouse.column < list.x + list.width
-                    && mouse.row >= list.y
-                    && mouse.row < list.y + list.height;
-                let area = view.area;
-                let inside_modal = mouse.column >= area.x
-                    && mouse.column < area.x + area.width
-                    && mouse.row >= area.y
-                    && mouse.row < area.y + area.height;
-                if inside_list {
-                    let start = view.window_start(list.height as usize);
-                    let index = start + (mouse.row - list.y) as usize;
-                    if index < count {
-                        view.selected = index;
-                    }
-                } else if !inside_modal {
-                    app.overlay = None;
-                }
-                app.dirty = true;
-            }
-            _ => {}
-        }
-        return;
-    }
-    // Todo modal: same wheel/click grammar as the notes modal; in list
-    // mode a click on the already-selected todo opens its detail (the
-    // settings-rows idiom: select first, activate second).
-    if let Some(Overlay::Todos(view)) = &mut app.overlay {
-        // Rows the current mode shows: child notes in detail (offset by the
-        // todo header row the draw pins on top), todos in the list.
-        let (count, row_offset) = match &view.detail {
-            Some(todo_id) => (
-                app.tree
-                    .notes
-                    .iter()
-                    .filter(|n| n.owner == NoteOwner::Todo(todo_id.clone()))
-                    .count(),
-                1u16,
-            ),
-            None => (
-                app.tree
-                    .todos
-                    .iter()
-                    .filter(|t| t.owner == view.owner)
-                    .count(),
-                0u16,
-            ),
-        };
-        let max = count.saturating_sub(1) as i64;
-        let step = |view: &mut TodoView, delta: i64| {
-            if view.detail.is_some() {
-                view.note_selected = (view.note_selected as i64 + delta).clamp(0, max) as usize;
-            } else {
-                view.selected = (view.selected as i64 + delta).clamp(0, max) as usize;
-            }
-        };
-        match mouse.kind {
-            MouseEventKind::ScrollUp => {
-                step(view, -1);
-                app.dirty = true;
-            }
-            MouseEventKind::ScrollDown => {
-                step(view, 1);
-                app.dirty = true;
-            }
-            MouseEventKind::Down(MouseButton::Left) => {
-                let list = view.list_area;
-                let rows_y = list.y + row_offset;
-                let inside_rows = list.width > 0
-                    && mouse.column >= list.x
-                    && mouse.column < list.x + list.width
-                    && mouse.row >= rows_y
-                    && mouse.row < list.y + list.height;
-                let area = view.area;
-                let inside_modal = mouse.column >= area.x
-                    && mouse.column < area.x + area.width
-                    && mouse.row >= area.y
-                    && mouse.row < area.y + area.height;
-                if inside_rows {
-                    let height = (list.height.saturating_sub(row_offset)) as usize;
-                    let start = view.window_start(height);
-                    let index = start + (mouse.row - rows_y) as usize;
-                    if index < count {
-                        match &view.detail {
-                            Some(_) => view.note_selected = index,
-                            None if view.selected == index && view.input.is_none() => {
-                                // Second click on the selected todo = Enter.
-                                if let Some(todo) = app
-                                    .tree
-                                    .todos
-                                    .iter()
-                                    .filter(|t| t.owner == view.owner)
-                                    .nth(index)
-                                {
-                                    view.detail = Some(todo.id.clone());
-                                    view.note_selected = 0;
-                                }
-                            }
-                            None => view.selected = index,
-                        }
-                    }
-                } else if !inside_modal {
-                    app.overlay = None;
-                }
-                app.dirty = true;
-            }
-            _ => {}
-        }
-        return;
-    }
     // Settings: click a tab to switch, a row to select (or activate it if
     // it was already selected), outside to close; everything else is
     // swallowed. While a hotkey capture is live the mouse is inert — the
@@ -9702,11 +8901,6 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                                 action: MenuAction::NewBranch(w.project_id.clone()),
                                 destructive: false,
                             },
-                            MenuItem {
-                                label: "Add link".into(),
-                                action: MenuAction::NewLink(w.id.clone()),
-                                destructive: false,
-                            },
                         ];
                         if !w.is_main {
                             items.push(MenuItem {
@@ -9781,11 +8975,6 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent, out: &mut Vec<ClientRequest>) 
                                     MenuItem {
                                         label: "New agent".into(),
                                         action: MenuAction::NewAgent(w.id.clone()),
-                                        destructive: false,
-                                    },
-                                    MenuItem {
-                                        label: "Add link".into(),
-                                        action: MenuAction::NewLink(w.id.clone()),
                                         destructive: false,
                                     },
                                     MenuItem {
@@ -9940,9 +9129,6 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             worktrees,
             agents,
             terminals,
-            notes,
-            todos,
-            links,
             pr_seen,
             ui_state,
         } => {
@@ -9952,9 +9138,6 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             app.tree.worktrees = worktrees;
             app.tree.agents = agents;
             app.tree.terminals = terminals;
-            app.tree.notes = notes;
-            app.tree.todos = todos;
-            app.tree.links = links;
             app.sync_remote_hosts();
             app.pr_seen = pr_seen.into_iter().map(|s| (s.url, s.marker)).collect();
             // A snapshot means a fresh subscription; if the daemon restarted
@@ -10200,23 +9383,6 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
                         app.select_project_when_seen = Some(id);
                     }
                 }
-                (Some(PendingIntent::SelectCreatedNote), Some(EntityId::Note(id))) => {
-                    // Same idiom: land the modal's cursor now, or when the
-                    // upsert arrives.
-                    if !select_note_by_id(app, &id) {
-                        app.select_note_when_seen = Some(id);
-                    }
-                }
-                (Some(PendingIntent::SelectCreatedTodo), Some(EntityId::Todo(id))) => {
-                    if !select_todo_by_id(app, &id) {
-                        app.select_todo_when_seen = Some(id);
-                    }
-                }
-                (Some(PendingIntent::SelectCreatedLink), Some(EntityId::Link(id))) => {
-                    if !select_link_by_id(app, &id) {
-                        app.select_link_when_seen = Some(id);
-                    }
-                }
                 (Some(PendingIntent::OpenCreatedWorkspace), Some(EntityId::Workspace(id))) => {
                     // Switcher-created workspace: open it right away (the
                     // switch lands via ActiveWorkspaceChanged as usual).
@@ -10248,24 +9414,6 @@ fn handle_server_event(app: &mut App, event: ServerEvent, out: &mut Vec<ClientRe
             if let Some(pid) = app.select_project_when_seen.clone() {
                 if select_added_project(app, &pid, out) {
                     app.select_project_when_seen = None;
-                }
-            }
-            // ...and the note modal's cursor onto a note we just created.
-            if let Some(note_id) = app.select_note_when_seen.clone() {
-                if select_note_by_id(app, &note_id) {
-                    app.select_note_when_seen = None;
-                }
-            }
-            // ...and the todo modal's cursor onto a todo we just created.
-            if let Some(todo_id) = app.select_todo_when_seen.clone() {
-                if select_todo_by_id(app, &todo_id) {
-                    app.select_todo_when_seen = None;
-                }
-            }
-            // ...and the panel cursor onto a link we just added.
-            if let Some(link_id) = app.select_link_when_seen.clone() {
-                if select_link_by_id(app, &link_id) {
-                    app.select_link_when_seen = None;
                 }
             }
             refresh_palette(app);
@@ -10508,91 +9656,6 @@ fn apply_upsert(app: &mut App, entity: nebula_core::Entity) {
             Some(existing) => *existing = t,
             None => app.tree.terminals.push(t),
         },
-        Entity::Note(t) => match app.tree.notes.iter_mut().find(|x| x.id == t.id) {
-            Some(existing) => *existing = t,
-            None => app.tree.notes.push(t),
-        },
-        Entity::Todo(t) => match app.tree.todos.iter_mut().find(|x| x.id == t.id) {
-            Some(existing) => *existing = t,
-            None => app.tree.todos.push(t),
-        },
-        Entity::Link(l) => match app.tree.links.iter_mut().find(|x| x.id == l.id) {
-            Some(existing) => *existing = l,
-            None => app.tree.links.push(l),
-        },
-    }
-}
-
-/// Land the Sessions panel's cursor on the link row for `id`; false until
-/// its upsert has arrived (or when it belongs to another worktree).
-fn select_link_by_id(app: &mut App, id: &LinkId) -> bool {
-    let found = app
-        .visible_session_rows()
-        .iter()
-        .position(|r| r.as_link().and_then(|l| l.id()) == Some(id));
-    match found {
-        Some(i) => {
-            app.sel_session = i;
-            app.focus = Focus::Sessions;
-            true
-        }
-        None => false,
-    }
-}
-
-/// Land the note modal's cursor on `id` — or, for a todo's child note, the
-/// todo detail's cursor; false when no modal is open on that note's owner
-/// or the note hasn't arrived in the tree yet.
-fn select_note_by_id(app: &mut App, id: &NoteId) -> bool {
-    let pos = match &app.overlay {
-        Some(Overlay::Notes(view)) => app
-            .tree
-            .notes
-            .iter()
-            .filter(|t| t.owner == view.owner)
-            .position(|t| &t.id == id),
-        Some(Overlay::Todos(view)) => match &view.detail {
-            Some(todo_id) => app
-                .tree
-                .notes
-                .iter()
-                .filter(|t| t.owner == NoteOwner::Todo(todo_id.clone()))
-                .position(|t| &t.id == id),
-            None => return false,
-        },
-        _ => return false,
-    };
-    match (pos, &mut app.overlay) {
-        (Some(i), Some(Overlay::Notes(view))) => {
-            view.selected = i;
-            true
-        }
-        (Some(i), Some(Overlay::Todos(view))) => {
-            view.note_selected = i;
-            true
-        }
-        _ => false,
-    }
-}
-
-/// Land the todo modal's cursor on `id`; false when the modal isn't open on
-/// that todo's owner or the todo hasn't arrived in the tree yet.
-fn select_todo_by_id(app: &mut App, id: &TodoId) -> bool {
-    let pos = match &app.overlay {
-        Some(Overlay::Todos(view)) if view.detail.is_none() => app
-            .tree
-            .todos
-            .iter()
-            .filter(|t| t.owner == view.owner)
-            .position(|t| &t.id == id),
-        _ => return false,
-    };
-    match (pos, &mut app.overlay) {
-        (Some(i), Some(Overlay::Todos(view))) => {
-            view.selected = i;
-            true
-        }
-        _ => false,
     }
 }
 
@@ -10618,25 +9681,6 @@ fn apply_removal(app: &mut App, id: &nebula_core::EntityId) {
             app.tree
                 .terminals
                 .retain(|t| !wt_ids.contains(&t.worktree_id));
-            // Todos go first so their ids can prune the notes hanging off
-            // them (project → todo → note is a two-step cascade).
-            let todo_ids: Vec<_> = app
-                .tree
-                .todos
-                .iter()
-                .filter(|t| match &t.owner {
-                    TodoOwner::Project(p) => p == id,
-                    TodoOwner::Worktree(w) => wt_ids.contains(w),
-                })
-                .map(|t| t.id.clone())
-                .collect();
-            app.tree.todos.retain(|t| !todo_ids.contains(&t.id));
-            app.tree.notes.retain(|t| match &t.owner {
-                NoteOwner::Project(p) => p != id,
-                NoteOwner::Worktree(w) => !wt_ids.contains(w),
-                NoteOwner::Todo(t) => !todo_ids.contains(t),
-            });
-            app.tree.links.retain(|l| !wt_ids.contains(&l.worktree_id));
             app.pull_requests.retain(|w, _| !wt_ids.contains(w));
             app.pr_recheck.retain(|w, _| !wt_ids.contains(w));
             app.tree.worktrees.retain(|w| &w.project_id != id);
@@ -10645,35 +9689,12 @@ fn apply_removal(app: &mut App, id: &nebula_core::EntityId) {
         EntityId::Worktree(id) => {
             app.tree.agents.retain(|a| &a.worktree_id != id);
             app.tree.terminals.retain(|t| &t.worktree_id != id);
-            let todo_ids: Vec<_> = app
-                .tree
-                .todos
-                .iter()
-                .filter(|t| t.owner == TodoOwner::Worktree(id.clone()))
-                .map(|t| t.id.clone())
-                .collect();
-            app.tree.todos.retain(|t| !todo_ids.contains(&t.id));
-            app.tree.notes.retain(|t| match &t.owner {
-                NoteOwner::Worktree(w) => w != id,
-                NoteOwner::Todo(t) => !todo_ids.contains(t),
-                NoteOwner::Project(_) => true,
-            });
-            app.tree.links.retain(|l| &l.worktree_id != id);
             app.pull_requests.remove(id);
             app.pr_recheck.remove(id);
             app.tree.worktrees.retain(|w| &w.id != id);
         }
         EntityId::Agent(id) => app.tree.agents.retain(|a| &a.id != id),
         EntityId::Terminal(id) => app.tree.terminals.retain(|t| &t.id != id),
-        EntityId::Note(id) => app.tree.notes.retain(|t| &t.id != id),
-        EntityId::Todo(id) => {
-            // Child notes cascade in the store off this one event.
-            app.tree.todos.retain(|t| &t.id != id);
-            app.tree
-                .notes
-                .retain(|n| n.owner != NoteOwner::Todo(id.clone()));
-        }
-        EntityId::Link(id) => app.tree.links.retain(|l| &l.id != id),
     }
     // Whatever the removal cascaded over, an unseen mark without its agent
     // has nothing left to accent.
@@ -10682,34 +9703,6 @@ fn apply_removal(app: &mut App, id: &nebula_core::EntityId) {
         .retain(|id| tree.agents.iter().any(|a| &a.id == id));
     // Same for a parked parser whose session the cascade took with it.
     app.prune_term_cache();
-    // A note modal aimed at a vanished owner has nothing left to show.
-    if let Some(Overlay::Notes(view)) = &app.overlay {
-        let gone = match &view.owner {
-            NoteOwner::Project(id) => !app.tree.projects.iter().any(|p| &p.id == id),
-            NoteOwner::Worktree(id) => !app.tree.worktrees.iter().any(|w| &w.id == id),
-            NoteOwner::Todo(id) => !app.tree.todos.iter().any(|t| &t.id == id),
-        };
-        if gone {
-            app.overlay = None;
-        }
-    }
-    // Same for the todo modal — and a detail whose todo vanished falls
-    // back to the (still valid) list.
-    if let Some(Overlay::Todos(view)) = &mut app.overlay {
-        if let Some(todo_id) = &view.detail {
-            if !app.tree.todos.iter().any(|t| &t.id == todo_id) {
-                view.detail = None;
-                view.input = None;
-            }
-        }
-        let gone = match &view.owner {
-            TodoOwner::Project(id) => !app.tree.projects.iter().any(|p| &p.id == id),
-            TodoOwner::Worktree(id) => !app.tree.worktrees.iter().any(|w| &w.id == id),
-        };
-        if gone {
-            app.overlay = None;
-        }
-    }
 }
 
 /// Optimistically remove a worktree row and its agent rows, returning a
@@ -12862,18 +11855,18 @@ mod tests {
 
     // ---- worktree links ----
 
-    /// `seed_tree` plus one saved link on w1, cursor parked on it.
+    /// `seed_tree` plus the pull request on w1, cursor parked on its row.
     fn seed_link(app: &mut App, url: &str) {
-        hse(
-            app,
-            ServerEvent::EntityUpserted {
-                entity: nebula_core::Entity::Link(nebula_core::Link {
-                    id: LinkId("l1".into()),
-                    worktree_id: nebula_core::WorktreeId("w1".into()),
-                    url: url.into(),
-                    sort_order: 0,
-                }),
-            },
+        app.pull_requests.insert(
+            nebula_core::WorktreeId("w1".into()),
+            Some(crate::pull_request::PullRequest {
+                number: 7,
+                url: url.into(),
+                title: "Attach links".into(),
+                state: "OPEN".into(),
+                is_draft: false,
+                activity: Vec::new(),
+            }),
         );
         app.focus = Focus::Sessions;
         app.sel_session = app
@@ -12881,34 +11874,6 @@ mod tests {
             .iter()
             .position(|r| r.as_link().is_some())
             .expect("link row");
-    }
-
-    #[test]
-    fn l_adds_a_link_to_the_selected_worktree() {
-        let mut app = App::new();
-        seed_tree(&mut app);
-        app.focus = Focus::Sessions;
-        let mut out = Vec::new();
-        press(&mut app, KeyCode::Char('l'), KeyModifiers::NONE, &mut out);
-        let Some(Overlay::Prompt(p)) = &app.overlay else {
-            panic!("expected the add-link prompt, got {:?}", app.overlay);
-        };
-        assert_eq!(p.title, "Add link");
-        assert!(p.input.trim().is_empty(), "starts empty");
-
-        for c in "github.com/o/r/pull/7".chars() {
-            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
-        }
-        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-        // The daemon normalizes the URL; the client sends what was typed.
-        assert!(
-            out.iter().any(|r| matches!(
-                r,
-                ClientRequest::CreateLink { worktree, url, .. }
-                    if worktree.as_str() == "w1" && url == "github.com/o/r/pull/7"
-            )),
-            "expected CreateLink, got {out:?}"
-        );
     }
 
     #[test]
@@ -12926,35 +11891,6 @@ mod tests {
         assert_eq!(app.focus, Focus::Sessions, "focus stays in the panel");
         assert!(!app.term_locked);
         assert_eq!(app.flash.as_deref(), Some("opened example.dev/spec"));
-    }
-
-    #[test]
-    fn r_edits_a_link_and_d_deletes_it() {
-        let mut app = App::new();
-        seed_tree(&mut app);
-        seed_link(&mut app, "https://example.dev/spec");
-        let mut out = Vec::new();
-
-        press(&mut app, KeyCode::Char('r'), KeyModifiers::NONE, &mut out);
-        let Some(Overlay::Prompt(p)) = &app.overlay else {
-            panic!("expected the edit-link prompt, got {:?}", app.overlay);
-        };
-        assert_eq!(p.title, "Edit link");
-        assert_eq!(p.input.trim(), "https://example.dev/spec", "prefilled");
-        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
-
-        press(&mut app, KeyCode::Char('d'), KeyModifiers::NONE, &mut out);
-        assert!(
-            matches!(&app.overlay, Some(Overlay::Confirm(c)) if c.title == "Delete link"),
-            "expected the delete confirm, got {:?}",
-            app.overlay
-        );
-        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE, &mut out);
-        assert!(
-            out.iter()
-                .any(|r| matches!(r, ClientRequest::DeleteLink { id, .. } if id.as_str() == "l1")),
-            "expected DeleteLink, got {out:?}"
-        );
     }
 
     /// The pull-request row comes back from git on every lookup, so editing
@@ -12984,22 +11920,13 @@ mod tests {
 
         press(&mut app, KeyCode::Char('d'), KeyModifiers::NONE, &mut out);
         assert!(app.overlay.is_none(), "no confirm for a row we don't own");
-        assert!(
-            app.flash
-                .as_deref()
-                .is_some_and(|f| f.contains("can't be deleted")),
-            "got {:?}",
-            app.flash
-        );
 
         press(&mut app, KeyCode::Char('r'), KeyModifiers::NONE, &mut out);
         assert!(app.overlay.is_none(), "nothing stored to edit");
+        assert!(out.is_empty(), "nothing goes to the daemon: {out:?}");
         // Enter still opens it — reading the PR is the whole point.
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
         assert_eq!(app.flash.as_deref(), Some("opened github.com/o/r/pull/7"));
-        assert!(!out
-            .iter()
-            .any(|r| matches!(r, ClientRequest::DeleteLink { .. })));
     }
 
     /// Shift+D wipes the panel's sessions; links are bookmarks and survive.
@@ -13023,318 +11950,6 @@ mod tests {
         };
         assert_eq!(agents.len(), 1);
         assert!(terminals.is_empty());
-    }
-
-    /// `e` opens the notes modal for the current selection.
-    #[test]
-    fn e_opens_notes_for_selection() {
-        let mut app = App::new();
-        seed_tree(&mut app);
-        app.focus = Focus::Worktrees;
-        let mut out = Vec::new();
-        press(&mut app, KeyCode::Char('e'), KeyModifiers::NONE, &mut out);
-        assert!(
-            matches!(app.overlay, Some(Overlay::Notes(_))),
-            "expected notes overlay, got {:?}",
-            app.overlay
-        );
-    }
-
-    /// Editing a note's text behaves like a terminal line: the caret starts
-    /// at the end, ⌥← (which macOS terminals send as ESC b) walks back a
-    /// word at a time, and typing lands at the caret instead of the tail.
-    #[test]
-    fn note_edit_takes_word_motion_and_inserts_at_the_caret() {
-        use crate::app::NoteView;
-        use nebula_core::{Note, NoteId, NoteOwner, ProjectId};
-        let mut app = App::new();
-        seed_tree(&mut app);
-        let owner = NoteOwner::Project(ProjectId("p1".into()));
-        app.tree.notes.push(Note {
-            id: NoteId("t1".into()),
-            owner: owner.clone(),
-            text: "fix login redirect".into(),
-            done: false,
-            sort_order: 0,
-        });
-        app.overlay = Some(Overlay::Notes(NoteView::new(owner, "demo".into())));
-        let mut out = Vec::new();
-
-        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-        for _ in 0..2 {
-            press(&mut app, KeyCode::Char('b'), KeyModifiers::ALT, &mut out);
-        }
-        for c in "the ".chars() {
-            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
-        }
-        let Some(Overlay::Notes(view)) = &app.overlay else {
-            panic!("notes closed")
-        };
-        let input = view.input.as_ref().expect("still editing");
-        assert_eq!(input.text.as_str(), "fix the login redirect");
-
-        out.clear();
-        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-        assert!(
-            matches!(out.as_slice(), [ClientRequest::UpdateNote { text, .. }] if text == "fix the login redirect"),
-            "Enter saves the edited text, got {out:?}"
-        );
-    }
-
-    /// Backspace on a note being edited deletes a character; it must not
-    /// reach the list's "delete the selected note" binding, and at column 0
-    /// it does nothing at all.
-    #[test]
-    fn note_edit_swallows_backspace_instead_of_deleting_the_note() {
-        use crate::app::NoteView;
-        use nebula_core::{Note, NoteId, NoteOwner, ProjectId};
-        let mut app = App::new();
-        seed_tree(&mut app);
-        let owner = NoteOwner::Project(ProjectId("p1".into()));
-        app.tree.notes.push(Note {
-            id: NoteId("t1".into()),
-            owner: owner.clone(),
-            text: "ab".into(),
-            done: false,
-            sort_order: 0,
-        });
-        app.overlay = Some(Overlay::Notes(NoteView::new(owner, "demo".into())));
-        let mut out = Vec::new();
-        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-        out.clear();
-        for _ in 0..4 {
-            press(&mut app, KeyCode::Backspace, KeyModifiers::NONE, &mut out);
-        }
-        let Some(Overlay::Notes(view)) = &app.overlay else {
-            panic!("notes closed")
-        };
-        assert_eq!(
-            view.input.as_ref().expect("still editing").text.as_str(),
-            ""
-        );
-        assert!(out.is_empty(), "no DeleteNote leaked out, got {out:?}");
-    }
-
-    /// `E` opens the todo modal for the current selection: the worktree's
-    /// list from the Worktrees panel, the project's from Projects.
-    #[test]
-    fn shift_e_opens_todos_for_selection() {
-        use nebula_core::{ProjectId, TodoOwner, WorktreeId};
-        let mut app = App::new();
-        seed_tree(&mut app);
-        app.focus = Focus::Worktrees;
-        let mut out = Vec::new();
-        press(&mut app, KeyCode::Char('E'), KeyModifiers::SHIFT, &mut out);
-        match &app.overlay {
-            Some(Overlay::Todos(view)) => {
-                assert_eq!(view.owner, TodoOwner::Worktree(WorktreeId("w1".into())));
-                assert_eq!(view.context, "demo/main");
-            }
-            other => panic!("expected todos overlay, got {other:?}"),
-        }
-        app.overlay = None;
-        app.focus = Focus::Projects;
-        press(&mut app, KeyCode::Char('E'), KeyModifiers::SHIFT, &mut out);
-        match &app.overlay {
-            Some(Overlay::Todos(view)) => {
-                assert_eq!(view.owner, TodoOwner::Project(ProjectId("p1".into())));
-                assert_eq!(view.context, "demo");
-            }
-            other => panic!("expected todos overlay, got {other:?}"),
-        }
-    }
-
-    /// The todo modal's whole grammar: `a` adds a todo, Enter drills into
-    /// its notes, `a` there adds a child note (owned by the todo, not the
-    /// worktree), Space/d work the note, Esc steps back out level by level.
-    #[test]
-    fn todo_modal_flow_add_drill_in_and_note_it() {
-        use nebula_core::{Entity, Note, NoteId, NoteOwner, Todo, TodoId, TodoOwner, WorktreeId};
-        let mut app = App::new();
-        seed_tree(&mut app);
-        app.focus = Focus::Worktrees;
-        let owner = TodoOwner::Worktree(WorktreeId("w1".into()));
-        let mut out = Vec::new();
-        press(&mut app, KeyCode::Char('E'), KeyModifiers::SHIFT, &mut out);
-
-        // a + text + Enter sends CreateTodo for the modal's owner.
-        press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE, &mut out);
-        for c in "ship it".chars() {
-            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
-        }
-        out.clear();
-        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-        assert!(
-            matches!(&out[..], [ClientRequest::CreateTodo { owner: o, text, .. }]
-                if *o == owner && text == "ship it"),
-            "expected CreateTodo, got {out:?}"
-        );
-
-        // The daemon's echo lands the row; Enter opens its detail.
-        let todo_id = TodoId("todo1".into());
-        hse(
-            &mut app,
-            ServerEvent::EntityUpserted {
-                entity: Entity::Todo(Todo {
-                    id: todo_id.clone(),
-                    owner: owner.clone(),
-                    text: "ship it".into(),
-                    done: false,
-                    sort_order: 0,
-                }),
-            },
-        );
-        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-        match &app.overlay {
-            Some(Overlay::Todos(view)) => {
-                assert_eq!(view.detail, Some(todo_id.clone()), "Enter opens the detail")
-            }
-            other => panic!("todos overlay gone: {other:?}"),
-        }
-
-        // a + text + Enter inside the detail creates a note owned by the
-        // todo — never by the worktree.
-        press(&mut app, KeyCode::Char('a'), KeyModifiers::NONE, &mut out);
-        for c in "check ci".chars() {
-            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
-        }
-        out.clear();
-        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-        assert!(
-            matches!(&out[..], [ClientRequest::CreateNote { owner: NoteOwner::Todo(t), text, .. }]
-                if *t == todo_id && text == "check ci"),
-            "expected CreateNote under the todo, got {out:?}"
-        );
-
-        // Space toggles the child note, d deletes it.
-        let note_id = NoteId("note1".into());
-        hse(
-            &mut app,
-            ServerEvent::EntityUpserted {
-                entity: Entity::Note(Note {
-                    id: note_id.clone(),
-                    owner: NoteOwner::Todo(todo_id.clone()),
-                    text: "check ci".into(),
-                    done: false,
-                    sort_order: 0,
-                }),
-            },
-        );
-        out.clear();
-        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE, &mut out);
-        assert!(
-            matches!(&out[..], [ClientRequest::SetNoteDone { id, done: true, .. }] if *id == note_id),
-            "expected SetNoteDone, got {out:?}"
-        );
-        out.clear();
-        press(&mut app, KeyCode::Char('d'), KeyModifiers::NONE, &mut out);
-        assert!(
-            matches!(&out[..], [ClientRequest::DeleteNote { id, .. }] if *id == note_id),
-            "expected DeleteNote, got {out:?}"
-        );
-
-        // Esc: detail → list → closed.
-        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
-        match &app.overlay {
-            Some(Overlay::Todos(view)) => assert_eq!(view.detail, None, "Esc backs out"),
-            other => panic!("todos overlay gone: {other:?}"),
-        }
-        press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
-        assert!(app.overlay.is_none(), "second Esc closes");
-    }
-
-    /// List-mode verbs: Space toggles a todo, r edits its text, d deletes.
-    #[test]
-    fn todo_list_toggle_edit_and_delete_send_requests() {
-        use crate::app::TodoView;
-        use nebula_core::{Todo, TodoId, TodoOwner, WorktreeId};
-        let mut app = App::new();
-        seed_tree(&mut app);
-        let owner = TodoOwner::Worktree(WorktreeId("w1".into()));
-        let id = TodoId("todo1".into());
-        app.tree.todos.push(Todo {
-            id: id.clone(),
-            owner: owner.clone(),
-            text: "fix login".into(),
-            done: false,
-            sort_order: 0,
-        });
-        app.overlay = Some(Overlay::Todos(TodoView::new(owner, "demo/main".into())));
-        let mut out = Vec::new();
-
-        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE, &mut out);
-        assert!(
-            matches!(&out[..], [ClientRequest::SetTodoDone { id: i, done: true, .. }] if *i == id),
-            "expected SetTodoDone, got {out:?}"
-        );
-
-        // r edits the text like a session rename; Enter saves.
-        out.clear();
-        press(&mut app, KeyCode::Char('r'), KeyModifiers::NONE, &mut out);
-        for c in " flow".chars() {
-            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE, &mut out);
-        }
-        out.clear();
-        press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-        assert!(
-            matches!(&out[..], [ClientRequest::UpdateTodo { id: i, text, .. }]
-                if *i == id && text == "fix login flow"),
-            "expected UpdateTodo, got {out:?}"
-        );
-
-        out.clear();
-        press(&mut app, KeyCode::Char('d'), KeyModifiers::NONE, &mut out);
-        assert!(
-            matches!(&out[..], [ClientRequest::DeleteTodo { id: i, .. }] if *i == id),
-            "expected DeleteTodo, got {out:?}"
-        );
-    }
-
-    /// A todo's removal prunes its child notes from the tree, and a detail
-    /// view opened on it falls back to the list instead of dangling.
-    #[test]
-    fn removing_a_todo_prunes_child_notes_and_closes_its_detail() {
-        use crate::app::TodoView;
-        use nebula_core::{EntityId, Note, NoteId, NoteOwner, Todo, TodoId, TodoOwner, WorktreeId};
-        let mut app = App::new();
-        seed_tree(&mut app);
-        let owner = TodoOwner::Worktree(WorktreeId("w1".into()));
-        let id = TodoId("todo1".into());
-        app.tree.todos.push(Todo {
-            id: id.clone(),
-            owner: owner.clone(),
-            text: "fix login".into(),
-            done: false,
-            sort_order: 0,
-        });
-        app.tree.notes.push(Note {
-            id: NoteId("n1".into()),
-            owner: NoteOwner::Todo(id.clone()),
-            text: "child".into(),
-            done: false,
-            sort_order: 0,
-        });
-        let mut view = TodoView::new(owner, "demo/main".into());
-        view.detail = Some(id.clone());
-        app.overlay = Some(Overlay::Todos(view));
-
-        hse(
-            &mut app,
-            ServerEvent::EntityRemoved {
-                id: EntityId::Todo(id),
-            },
-        );
-        assert!(app.tree.todos.is_empty());
-        assert!(
-            app.tree.notes.is_empty(),
-            "child notes pruned with the todo"
-        );
-        match &app.overlay {
-            Some(Overlay::Todos(view)) => {
-                assert_eq!(view.detail, None, "detail falls back to the list")
-            }
-            other => panic!("todos overlay gone: {other:?}"),
-        }
     }
 
     /// The always-live search fields edit the same way — and ⌥←/⌥→ move the
@@ -13734,9 +12349,6 @@ mod tests {
                 worktrees: tree.worktrees,
                 agents: tree.agents,
                 terminals: tree.terminals,
-                notes: tree.notes,
-                todos: tree.todos,
-                links: tree.links,
                 pr_seen: Vec::new(),
                 ui_state: None,
             },
@@ -16011,7 +14623,6 @@ mod tests {
     fn link_rows_render_as_arrow_tabs() {
         let mut app = App::new();
         seed_tree(&mut app);
-        seed_link(&mut app, "https://example.dev/spec");
         app.pull_requests.insert(
             nebula_core::WorktreeId("w1".into()),
             Some(crate::pull_request::PullRequest {
@@ -16030,10 +14641,6 @@ mod tests {
         assert!(
             text.contains("↗ #7 Attach lin"),
             "pull request tab:\n{text}"
-        );
-        assert!(
-            text.contains("↗ example.dev/s"),
-            "saved link tab (scheme stripped):\n{text}"
         );
     }
 
@@ -18901,16 +17508,16 @@ mod tests {
                 }),
             },
         );
-        hse(
-            &mut app,
-            ServerEvent::EntityUpserted {
-                entity: Entity::Link(nebula_core::Link {
-                    id: LinkId("l1".into()),
-                    worktree_id: nebula_core::WorktreeId("w1".into()),
-                    url: "https://example.com/ticket".into(),
-                    sort_order: 0,
-                }),
-            },
+        app.pull_requests.insert(
+            nebula_core::WorktreeId("w1".into()),
+            Some(crate::pull_request::PullRequest {
+                number: 7,
+                url: "https://example.com/pull/7".into(),
+                title: String::new(),
+                state: "OPEN".into(),
+                is_draft: false,
+                activity: Vec::new(),
+            }),
         );
         hse(
             &mut app,
@@ -18973,7 +17580,7 @@ mod tests {
             "terminal follows the agent:\n{text}"
         );
         assert!(
-            worktree_column(worktree.y + worktree.height + 2).contains("  ↗ example.com"),
+            worktree_column(worktree.y + worktree.height + 2).contains("  ↗ #7"),
             "link follows the terminal:\n{text}"
         );
         assert!(
@@ -23722,7 +22329,7 @@ mod tests {
             let mut app = App::new();
             let mut out = Vec::new();
             open_settings_on(&mut app, crate::config::hotkeys_tab(), &mut out);
-            let row = crate::keymap::index_of(crate::keymap::Action::Notes).unwrap();
+            let row = crate::keymap::index_of(crate::keymap::Action::Help).unwrap();
             for _ in 0..row {
                 press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
             }
@@ -23736,15 +22343,15 @@ mod tests {
             assert!(text.contains("Git diff"), "names the current owner: {text}");
             assert!(!view.capturing(), "the capture is paused on the warning");
             assert_eq!(
-                app.keymap.label(crate::keymap::Action::Notes),
-                "e ⌘e",
+                app.keymap.label(crate::keymap::Action::Help),
+                "?",
                 "nothing changed yet"
             );
 
             // Esc leaves it where it was.
             press(&mut app, KeyCode::Esc, KeyModifiers::NONE, &mut out);
             assert_eq!(app.keymap.label(crate::keymap::Action::GitDiff), "g ⌘g");
-            assert_eq!(app.keymap.label(crate::keymap::Action::Notes), "e ⌘e");
+            assert_eq!(app.keymap.label(crate::keymap::Action::Help), "?");
         });
     }
 
@@ -23755,14 +22362,14 @@ mod tests {
             let mut app = App::new();
             let mut out = Vec::new();
             open_settings_on(&mut app, crate::config::hotkeys_tab(), &mut out);
-            let row = crate::keymap::index_of(crate::keymap::Action::Notes).unwrap();
+            let row = crate::keymap::index_of(crate::keymap::Action::Help).unwrap();
             for _ in 0..row {
                 press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE, &mut out);
             }
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
             press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
             press(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut out);
-            assert_eq!(app.keymap.label(crate::keymap::Action::Notes), "g");
+            assert_eq!(app.keymap.label(crate::keymap::Action::Help), "g");
             assert_eq!(
                 app.keymap.label(crate::keymap::Action::GitDiff),
                 "⌘g",
@@ -23773,7 +22380,7 @@ mod tests {
             seed_tree(&mut app);
             app.focus = Focus::Worktrees;
             press(&mut app, KeyCode::Char('g'), KeyModifiers::NONE, &mut out);
-            assert!(matches!(app.overlay, Some(Overlay::Notes(_))));
+            assert!(matches!(app.overlay, Some(Overlay::Help)));
         });
     }
 
@@ -23948,7 +22555,7 @@ mod tests {
     fn a_hand_edited_duplicate_is_called_out_on_the_row() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
-        std::fs::write(&path, r#"{"keybindings": {"notes": "g"}}"#).unwrap();
+        std::fs::write(&path, r#"{"keybindings": {"help": "g"}}"#).unwrap();
         crate::config::with_config_path(path, || {
             let mut app = App::new();
             app.keymap = crate::config::Config::load().keymap();
@@ -23962,7 +22569,7 @@ mod tests {
             terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
             let text = buffer_text(&terminal);
             assert!(
-                text.contains("also belongs to Notes"),
+                text.contains("also belongs to Help"),
                 "the row names its rival:\n{text}"
             );
         });

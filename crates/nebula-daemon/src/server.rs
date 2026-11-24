@@ -180,9 +180,6 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         worktrees: vec![],
                         agents: vec![],
                         terminals: vec![],
-                        notes: vec![],
-                        todos: vec![],
-                        links: vec![],
                         pr_seen: vec![],
                         ui_state: None,
                     });
@@ -720,76 +717,6 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                             .map(Some),
                     )
                     .await;
-                }
-                ClientRequest::CreateNote {
-                    req_id,
-                    owner,
-                    text,
-                } => {
-                    reply(&out_tx, req_id, daemon.create_note(&owner, &text).map(Some)).await;
-                }
-                ClientRequest::UpdateNote { req_id, id, text } => {
-                    reply(
-                        &out_tx,
-                        req_id,
-                        daemon.update_note(&id, &text).map(|_| None),
-                    )
-                    .await;
-                }
-                ClientRequest::SetNoteDone { req_id, id, done } => {
-                    reply(
-                        &out_tx,
-                        req_id,
-                        daemon.set_note_done(&id, done).map(|_| None),
-                    )
-                    .await;
-                }
-                ClientRequest::DeleteNote { req_id, id } => {
-                    reply(&out_tx, req_id, daemon.delete_note(&id).map(|_| None)).await;
-                }
-                ClientRequest::CreateTodo {
-                    req_id,
-                    owner,
-                    text,
-                } => {
-                    reply(&out_tx, req_id, daemon.create_todo(&owner, &text).map(Some)).await;
-                }
-                ClientRequest::UpdateTodo { req_id, id, text } => {
-                    reply(
-                        &out_tx,
-                        req_id,
-                        daemon.update_todo(&id, &text).map(|_| None),
-                    )
-                    .await;
-                }
-                ClientRequest::SetTodoDone { req_id, id, done } => {
-                    reply(
-                        &out_tx,
-                        req_id,
-                        daemon.set_todo_done(&id, done).map(|_| None),
-                    )
-                    .await;
-                }
-                ClientRequest::DeleteTodo { req_id, id } => {
-                    reply(&out_tx, req_id, daemon.delete_todo(&id).map(|_| None)).await;
-                }
-                ClientRequest::CreateLink {
-                    req_id,
-                    worktree,
-                    url,
-                } => {
-                    reply(
-                        &out_tx,
-                        req_id,
-                        daemon.create_link(&worktree, &url).map(Some),
-                    )
-                    .await;
-                }
-                ClientRequest::UpdateLink { req_id, id, url } => {
-                    reply(&out_tx, req_id, daemon.update_link(&id, &url).map(|_| None)).await;
-                }
-                ClientRequest::DeleteLink { req_id, id } => {
-                    reply(&out_tx, req_id, daemon.delete_link(&id).map(|_| None)).await;
                 }
                 ClientRequest::RenameTerminal { req_id, id, name } => {
                     reply(

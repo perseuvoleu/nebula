@@ -1613,3 +1613,88 @@ fn link_lost_note_without_id_names_it() {
     assert_eq!(log.as_array().map(Vec::len), Some(1), "{log}");
     assert_eq!(log[0]["id"], id.as_str());
 }
+
+const SEEDED_TODO: &str = "01JD0000000000000000000T01";
+
+fn seed_v28(db: &Path) {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    for (i, migration) in nebula_daemon::store::MIGRATIONS.iter().take(28).enumerate() {
+        conn.execute_batch(&format!(
+            "BEGIN; {migration}; PRAGMA user_version = {}; COMMIT;",
+            i + 1
+        ))
+        .unwrap();
+    }
+    conn.execute_batch(&format!(
+        "INSERT INTO projects (id, workspace_id, name, repo_path, sort_order, created_at) VALUES ('p1', 'default', 'vela', '/tmp/vela', 0, 0);
+         INSERT INTO worktrees (id, project_id, path, branch, is_main, created_at) VALUES ('w1', 'p1', '/tmp/vela-feature', 'feature', 0, 0);
+         INSERT INTO notes (id, project_id, text, created_at) VALUES ('01JD0000000000000000000N01', 'p1', 'remember the laptop', 10);
+         INSERT INTO todos (id, project_id, text, done, created_at) VALUES ('{SEEDED_TODO}', 'p1', 'ship it', 1, 20);
+         INSERT INTO notes (id, todo_id, text, created_at) VALUES ('01JD0000000000000000000N02', '{SEEDED_TODO}', 'child', 30);
+         INSERT INTO links (id, worktree_id, url, created_at) VALUES ('01JD0000000000000000000L01', 'w1', 'https://vela.possu.dev', 1700000000000);"
+    ))
+    .unwrap();
+}
+
+#[test]
+fn migration_v28_legacy_rows() {
+    let env = Env::new();
+    env.board_local();
+    seed_v28(&env.data_dir().join("nebula.db"));
+    let env = env.start(&[]);
+
+    let mut cards: Vec<(String, String, String)> =
+        env.json(&["todo", "list", "--all", "--include-home", "--json"])["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                assert_eq!(c["project"], "vela");
+                (
+                    c["title"].as_str().unwrap().to_string(),
+                    c["stage"].as_str().unwrap().to_string(),
+                    c["id"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+    cards.sort();
+    assert_eq!(cards.len(), 2, "{cards:?}");
+    assert_eq!(
+        (cards[0].0.as_str(), cards[0].1.as_str()),
+        ("remember the laptop", "backlog")
+    );
+    assert_eq!(
+        cards[1],
+        ("ship it".into(), "done".into(), SEEDED_TODO.into())
+    );
+
+    let shown = env.json(&["todo", "show", SEEDED_TODO, "--json"]);
+    let log: Vec<&str> = shown["log"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(log, ["child"]);
+
+    let artifacts = env.json(&["artifact", "list", "--all", "--include-home", "--json"]);
+    let items = artifacts["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "{artifacts}");
+    let link = &items[0];
+    assert_eq!(link["kind"], "link");
+    assert_eq!(
+        link["content"],
+        serde_json::json!({"url": "https://vela.possu.dev"})
+    );
+    assert_eq!(link["created_at"], 1700000000000_i64);
+    assert_eq!(link["project"], "vela");
+    assert_eq!(
+        link["checkout"],
+        serde_json::json!({
+            "host": nebula_core::host::hostname(),
+            "branch": "feature",
+            "path": "/tmp/vela-feature",
+            "worktree": true,
+        })
+    );
+}
