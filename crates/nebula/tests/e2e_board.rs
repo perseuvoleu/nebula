@@ -228,6 +228,11 @@ fn card_proposal_accept_dismiss() {
     let dismissed = env.json(&["todo", "dismiss", "#2", "--json"]);
     assert_eq!(dismissed["archived"], true);
     assert_eq!(list(&env, &["--all"]), ["Maybe"]);
+
+    let refused = env.cli(&["todo", "dismiss", "#1"], None);
+    assert_eq!(refused.status.code(), Some(6), "{}", stderr(&refused));
+    let kept = env.json(&["todo", "show", "#1", "--json"]);
+    assert_eq!(kept["archived"], false);
 }
 
 #[test]

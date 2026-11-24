@@ -89,6 +89,13 @@ fn apply(tx: &Transaction, op: BoardOp) -> Result<BoardResult> {
                     params![id.as_str()],
                 )?;
             } else {
+                let current = card_by_id(tx, &id)?;
+                if !current.proposed {
+                    bail!(Refusal::Conflict.message(format!(
+                        "{} is not a proposal; archive it instead",
+                        current.label
+                    )));
+                }
                 archive(tx, &id)?;
             }
             card_by_id(tx, &id).map(BoardResult::Card)
