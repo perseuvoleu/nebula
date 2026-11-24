@@ -423,8 +423,7 @@ async fn receive_hook(
         .await;
 
     if let Some(inject) = inject.filter(|_| injectable) {
-        // Titling instruction while the session is untitled, the card
-        // pointer while it works on a card, the notes and
+        // Titling instruction while the session is untitled, the notes and
         // todos pointers while the project/worktree has undone entries, the
         // shared-checkout pointer while sibling sessions have run on the
         // same worktree, and the twin pointer while the project has a

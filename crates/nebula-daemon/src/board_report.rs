@@ -92,19 +92,16 @@ fn host_report(daemon: &Daemon, writer_slots: Option<u32>) -> Result<HostReport>
         .filter(|p| p.host.is_none())
         .map(|p| (&p.id, p.name.as_str()))
         .collect();
-    let checkouts: HashMap<_, _> = worktrees
+    let local_worktrees: HashMap<_, _> = worktrees
         .iter()
-        .filter_map(|w| {
-            local
-                .get(&w.project_id)
-                .map(|project| (&w.id, (w, *project)))
-        })
+        .filter(|w| local.contains_key(&w.project_id))
+        .map(|w| (&w.id, w))
         .collect();
     let mut sessions: Vec<SessionRow> = agents
         .iter()
         .filter_map(|a| {
             let card_id = a.card_id.clone()?;
-            let (worktree, _) = checkouts.get(&a.worktree_id)?;
+            let worktree = local_worktrees.get(&a.worktree_id)?;
             Some(SessionRow {
                 agent_id: a.id.clone(),
                 host: host.clone(),
