@@ -399,6 +399,28 @@ fn board_read_pages() {
 }
 
 #[test]
+fn human_reads_follow_pages() {
+    let env = Env::new();
+    env.board_local();
+    let env = env.start(&[("NEBULA_BOARD_PAGE_BYTES", "600")]);
+    let long = "x".repeat(200);
+    for n in 1..=5 {
+        add(&env, &["--project", "nebula"], &format!("{n} {long}"));
+    }
+    for verb in ["list", "board"] {
+        let out = env.cli(&["todo", verb, "--all"], None);
+        assert!(out.status.success(), "{verb}: {}", stderr(&out));
+        let printed = String::from_utf8_lossy(&out.stdout);
+        for n in 1..=5 {
+            assert!(
+                printed.lines().any(|l| l.starts_with(&format!("#{n} "))),
+                "todo {verb} dropped #{n}: {printed}"
+            );
+        }
+    }
+}
+
+#[test]
 fn card_list_scope() {
     let env = board_env();
     let a = add(&env, &["--project", "a"], "A1");

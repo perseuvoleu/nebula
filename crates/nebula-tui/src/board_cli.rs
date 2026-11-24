@@ -238,7 +238,7 @@ pub async fn run(verb: TodoVerb, json: bool) -> Result<()> {
     let mut conn = connect().await?;
     let (projects, worktrees, agents) = ipc::subscribe_snapshot(&mut conn).await?;
     let caller = Caller::resolve(&projects, &worktrees, &agents)?;
-    let op = match verb {
+    let mut op = match verb {
         TodoVerb::Add {
             title,
             project,
@@ -331,13 +331,35 @@ pub async fn run(verb: TodoVerb, json: bool) -> Result<()> {
             page,
         }),
     };
-    let result = request(&mut conn, op).await?;
-    if json {
-        println!("{}", result_json(&result)?);
-    } else {
+    loop {
+        let result = request(&mut conn, op.clone()).await?;
+        if json {
+            println!("{}", result_json(&result)?);
+            return Ok(());
+        }
         print_human(&result);
+        if !turn_page(&mut op, &result) {
+            return Ok(());
+        }
     }
-    Ok(())
+}
+
+fn turn_page(op: &mut BoardOp, result: &BoardResult) -> bool {
+    let next = match result {
+        BoardResult::Cards(page) => page.next.clone(),
+        BoardResult::Board(BoardPoll::Board { next, .. }) => next.clone(),
+        _ => None,
+    };
+    match (op, next) {
+        (
+            BoardOp::Read(BoardRead::Cards { page, .. } | BoardRead::Board { page, .. }),
+            Some(next),
+        ) => {
+            *page = Some(next);
+            true
+        }
+        _ => false,
+    }
 }
 
 fn result_json(result: &BoardResult) -> Result<serde_json::Value> {
