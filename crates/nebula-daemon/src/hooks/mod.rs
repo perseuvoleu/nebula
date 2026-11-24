@@ -60,6 +60,22 @@ pub fn todos_instruction(open: usize) -> String {
     )
 }
 
+/// Card pointer, injected on every prompt while the session works on a board
+/// card. `card` is the card's ref, or its id when this host's board does
+/// not hold it; the title comes only from the local board.
+pub fn card_instruction(card: &str, title: Option<&str>) -> String {
+    let named = match title {
+        Some(title) => format!("card {card} \"{title}\""),
+        None => format!("card {card}"),
+    };
+    format!(
+        "[nebula] This session works on {named}. `nebula todo show {card}` \
+         reads it with its sessions and log, and `nebula todo note {card} <text>` \
+         adds to its log. Sessions you start with `nebula agent new` join it \
+         unless you pass --no-card or --card."
+    )
+}
+
 /// Shared-checkout pointer, injected on every prompt while other unarchived
 /// sessions that have run share the agent's worktree. Foreign modifications
 /// in the diff are likely theirs — the agent should look before assuming
@@ -407,7 +423,8 @@ async fn receive_hook(
         .await;
 
     if let Some(inject) = inject.filter(|_| injectable) {
-        // Titling instruction while the session is untitled, the notes and
+        // Titling instruction while the session is untitled, the card
+        // pointer while it works on a card, the notes and
         // todos pointers while the project/worktree has undone entries, the
         // shared-checkout pointer while sibling sessions have run on the
         // same worktree, and the twin pointer while the project has a
@@ -420,6 +437,10 @@ async fn receive_hook(
             .unwrap_or(false)
         {
             parts.push(AUTO_TITLE_INSTRUCTION.to_string());
+        }
+        if let Ok(Some((card, title))) = crate::board_report::card_pointer(&state.store, &agent_id)
+        {
+            parts.push(card_instruction(&card, title.as_deref()));
         }
         let open = state
             .store
@@ -952,6 +973,73 @@ mod tests {
             .unwrap();
         let (_, body) = post(env.port, env.token.clone()).await;
         assert_eq!(body, "");
+    }
+
+    #[tokio::test]
+    async fn hook_card_pointer() {
+        use nebula_core::board::{Author, BoardOp, BoardResult, CardDraft, Stage};
+        use nebula_core::TodoId;
+        let store = seeded_store();
+        let (env, _rx) = start_hook_server(store.clone()).await.unwrap();
+        let draft = CardDraft {
+            id: TodoId::generate(),
+            title: "Keep verification results".into(),
+            project: Some("p".into()),
+            stage: Stage::Backlog,
+            proposed: false,
+            created_by: Author {
+                host: "here".into(),
+                agent: None,
+                name: "user".into(),
+            },
+            checkout: None,
+        };
+        let Ok(BoardResult::Card(card)) = crate::board::serve(&store, BoardOp::AddCard(draft))
+        else {
+            panic!("the local board added no card");
+        };
+        let titled = store.get_agent(&AgentId("titled".into())).unwrap().unwrap();
+        let far_card = TodoId::generate();
+        for (id, card_id) in [("carded", &card.id), ("far", &far_card)] {
+            store
+                .insert_agent(&Agent {
+                    id: AgentId(id.into()),
+                    card_id: Some(card_id.clone()),
+                    ..titled.clone()
+                })
+                .unwrap();
+        }
+        let prompt = |agent: &'static str| {
+            let env = env.clone();
+            async move {
+                http_post(
+                    env.port,
+                    &format!("/api/hooks/claude?agentId={agent}&hookEvent=UserPromptSubmit"),
+                    &env.token,
+                    r#"{"session_id":"s1"}"#,
+                )
+                .await
+                .1
+            }
+        };
+
+        let carded = prompt("carded").await;
+        assert_eq!(
+            carded,
+            context_injection(&[card_instruction("#1", Some("Keep verification results"))])
+        );
+        assert!(carded.contains("nebula todo show #1"), "{carded}");
+        assert!(carded.contains("Keep verification results"), "{carded}");
+        let far = prompt("far").await;
+        assert_eq!(
+            far,
+            context_injection(&[card_instruction(far_card.as_str(), None)])
+        );
+        assert_eq!(
+            prompt("titled").await,
+            "",
+            "an uncarded session gets no pointer"
+        );
     }
 
     #[test]

@@ -11,8 +11,8 @@ use nebula_core::board::{
 use nebula_core::{AgentId, AgentKind, AgentStatus, ArtifactId, NoteId, TodoId, MAX_FRAME_LEN};
 use rusqlite::{params, OptionalExtension, Row, Transaction};
 
-/// Bytes of cards one page may carry; the rest of the frame is headroom
-/// for hosts, the away digest and the envelope.
+/// Bytes one page may carry, hosts and the away digest included; the rest
+/// of the frame is headroom for the envelope.
 fn page_budget() -> usize {
     std::env::var("NEBULA_BOARD_PAGE_BYTES")
         .ok()
@@ -122,15 +122,15 @@ fn apply(tx: &Transaction, op: BoardOp) -> Result<BoardResult> {
             let note = add_note(tx, id, &card, &text, &author)?;
             card_by_id(tx, &note.card).map(BoardResult::Card)
         }
+        BoardOp::Report(report) => crate::board_report::apply(tx, report),
         BoardOp::Publish(_)
         | BoardOp::RemoveArtifact { .. }
         | BoardOp::BeginRun(_)
-        | BoardOp::EndRun { .. }
-        | BoardOp::Report(_) => bail!("this board does not serve that operation yet"),
+        | BoardOp::EndRun { .. } => bail!("this board does not serve that operation yet"),
     }
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -240,7 +240,7 @@ fn add_card(tx: &Transaction, draft: CardDraft) -> Result<Card> {
     card_by_id(tx, &draft.id)
 }
 
-fn add_note(
+pub(crate) fn add_note(
     tx: &Transaction,
     id: NoteId,
     card: &CardRef,
@@ -400,8 +400,8 @@ fn paged<T: serde::Serialize>(
     items: Vec<T>,
     offset: usize,
     version: &str,
+    budget: usize,
 ) -> Result<(Vec<T>, Option<String>)> {
-    let budget = page_budget();
     let total = items.len();
     let mut used = 0;
     let mut page = Vec::new();
@@ -436,11 +436,13 @@ fn read_op(tx: &Transaction, read: BoardRead) -> Result<BoardResult> {
                     Some(since) => away(tx, &scope, &cards, since)?,
                     None => Away::default(),
                 };
-                (hosts(tx)?, away)
+                (hosts(tx, &scope)?, away)
             } else {
                 (Vec::new(), Away::default())
             };
-            let (cards, next) = paged(cards, offset, &version)?;
+            let reserved = serde_json::to_vec(&hosts)?.len() + serde_json::to_vec(&away)?.len();
+            let budget = page_budget().saturating_sub(reserved);
+            let (cards, next) = paged(cards, offset, &version, budget)?;
             Ok(BoardResult::Board(BoardPoll::Board {
                 version,
                 board: BoardPage { cards, hosts, away },
@@ -456,7 +458,7 @@ fn read_op(tx: &Transaction, read: BoardRead) -> Result<BoardResult> {
             let version = cursor(tx)?;
             let offset = page_offset(page.as_deref(), &version)?;
             let cards = scoped_cards(tx, &scope, stage, include_archived)?;
-            let (items, next) = paged(cards, offset, &version)?;
+            let (items, next) = paged(cards, offset, &version, page_budget())?;
             Ok(BoardResult::Cards(Page { items, next }))
         }
         BoardRead::Card { scope, card } => {
@@ -543,7 +545,7 @@ fn artifacts_of(tx: &Transaction, card: &TodoId) -> Result<Vec<Artifact>> {
         .collect::<rusqlite::Result<_>>()?)
 }
 
-fn hosts(tx: &Transaction) -> Result<Vec<BoardHost>> {
+fn hosts(tx: &Transaction, scope: &BoardScope) -> Result<Vec<BoardHost>> {
     Ok(tx
         .prepare(
             "SELECT h.host, h.writers, h.writer_slots, h.checkouts,
@@ -552,11 +554,15 @@ fn hosts(tx: &Transaction) -> Result<Vec<BoardHost>> {
              FROM board_hosts h ORDER BY h.host",
         )?
         .query_map([], |r| {
+            let checkouts: Vec<nebula_core::board::HostCheckout> = json_column(r, 3)?;
             Ok(BoardHost {
                 host: r.get(0)?,
                 writers: r.get(1)?,
                 writer_slots: r.get(2)?,
-                checkouts: json_column(r, 3)?,
+                checkouts: checkouts
+                    .into_iter()
+                    .filter(|c| in_scope(scope, Some(&c.project)))
+                    .collect(),
                 needs_you: r.get(4)?,
                 stale: false,
             })

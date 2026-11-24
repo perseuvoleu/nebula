@@ -2526,20 +2526,21 @@ impl Daemon {
         let (_, _, agents, _) = self.store.load_tree()?;
         Ok(agents
             .into_iter()
-            .find(|a| {
-                a.writer
-                    && !a.archived
-                    && &a.worktree_id == worktree_id
-                    && (self.is_alive(&SessionRef::Agent(a.id.clone()))
-                        || matches!(
-                            a.status,
-                            AgentStatus::Running
-                                | AgentStatus::NeedsFeedback
-                                | AgentStatus::Finished
-                                | AgentStatus::Disconnected
-                        ))
-            })
+            .find(|a| &a.worktree_id == worktree_id && self.holds_writer(a))
             .map(|a| a.name))
+    }
+
+    pub(crate) fn holds_writer(&self, a: &Agent) -> bool {
+        a.writer
+            && !a.archived
+            && (self.is_alive(&SessionRef::Agent(a.id.clone()))
+                || matches!(
+                    a.status,
+                    AgentStatus::Running
+                        | AgentStatus::NeedsFeedback
+                        | AgentStatus::Finished
+                        | AgentStatus::Disconnected
+                ))
     }
 
     // ---- prewarm pool ----

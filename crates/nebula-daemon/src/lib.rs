@@ -4,6 +4,7 @@
 )]
 
 pub mod board;
+pub mod board_report;
 mod checkout_lock;
 mod collect;
 pub mod config;
@@ -72,6 +73,7 @@ async fn serve() -> Result<()> {
     let daemon = registry::Daemon::new(store, hook_env);
     daemon.refresh_remote_hosts();
     daemon.ensure_relays();
+    board_report::spawn(daemon.clone());
 
     // Drain hook events into the status machines; a payload that reports a
     // cwd inside another worktree of the same project re-homes the agent row.
