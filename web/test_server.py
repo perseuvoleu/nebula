@@ -784,6 +784,20 @@ class BoardTests(unittest.TestCase):
                 self.assertEqual(self.request("/api/cards/%2312/open-code", "POST", body, self.auth())[0], 409)
                 self.assertEqual(run.call_count, 1)
 
+    def test_card_writes_carry_the_board_scope_and_a_note_id(self):
+        writes = {"move": {"stage": "review"}, "edit": {"title": "Renamed"}, "note": {"text": "x", "id": CARD_ID},
+                  "archive": {}, "accept": {}, "dismiss": {}, "block": {"by": "#11"}, "unblock": {"by": "#11"}}
+        for configured, scope in [(["nebula", "vela"], ["--scope=nebula", "--scope=vela", "--include-home"]),
+                                  ("*", ["--scope=*", "--include-home"])]:
+            self.gateway.board_projects = configured
+            for verb, body in writes.items():
+                with self.subTest(verb=verb, configured=configured), patch("server.subprocess.run", side_effect=[
+                        cli(fixture("card_show")), cli(fixture("card_show")), cli(fixture("card"))]) as run:
+                    self.assertEqual(self.request(f"/api/cards/%2312/{verb}", "POST", body, self.auth())[0], 200)
+                    write = self.argv(run)[-1]
+                    self.assertEqual([a for a in write if a.startswith(("--scope", "--include-home"))], scope)
+                    self.assertEqual("--id=" + CARD_ID in write, verb == "note")
+
     def test_board_writes_need_board_and_explicit_owner(self):
         self.gateway.board_projects = None
         with patch("server.subprocess.run") as run:
