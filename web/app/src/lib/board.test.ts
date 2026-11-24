@@ -5,7 +5,7 @@ import { awayDigest, byStage, cardDot, inScope, isBlocked, sidebarProjects, toBo
 const card = (number: number, stage: Card["stage"], blocked_by: string[] = []): Card => ({
   id: `01JD${String(number).padStart(22, "0")}`, number, ref: `#${number}@leaseweb`, title: `Card ${number}`, stage,
   project: "nebula", proposed: false, archived: false, created_by: { host: "leaseweb", agent: null, name: "web" },
-  checkout: null, blocked_by,
+  checkout: null, blocked_by, cleared_blockers: [], created_at: 1764000000000, updated_at: 1764000000000,
 });
 
 test("byStage puts every card in its stage column, in board order, with every column present", () => {
@@ -21,6 +21,12 @@ test("a card stays blocked until every blocker is done, and a blocker the board 
   assert.equal(isBlocked(card(3, "next", [done.ref, review.ref]), [done, review]), true);
   assert.equal(isBlocked(card(3, "next", ["#99@leaseweb"]), [done, review]), true);
   assert.equal(isBlocked(card(3, "next"), [done, review]), false);
+});
+
+test("a blocker the board marks cleared no longer blocks, though the board cannot see that archived card", () => {
+  const archived = { ...card(3, "next", ["#1@leaseweb", "#2@leaseweb"]), cleared_blockers: ["#1@leaseweb"] };
+  assert.deepEqual(toBoardCard(archived, [card(2, "review")]).blockers, [{ ref: "#2@leaseweb", title: "Card 2" }]);
+  assert.equal(isBlocked({ ...archived, cleared_blockers: ["#1@leaseweb", "#2@leaseweb"] }, []), false);
 });
 
 test("writerSlots reports live writers per host and the slot cap only when the host has one", () => {
@@ -61,7 +67,7 @@ test("awayDigest lists the finished cards and new decisions of the scope's proje
   const board: BoardData = {
     cards: [card(1, "doing"), finished, vela],
     hosts: [],
-    away: { finished: [finished.id, vela.id, "01JD9999999999999999999999"], needs_you: [{ host: "leaseweb", id: "01JF0000000000000000000002" }],
+    away: { finished: [finished.id, vela.id, "01JD9999999999999999999999"], needs_you: [{ host: "leaseweb", id: "01JF0000000000000000000002", card: finished.id, status_changed_at: 1764000200000 }],
       decisions: decisions.map((d) => d.id) },
   };
   const listed = (scope: SidebarScope) => {

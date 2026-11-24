@@ -1,11 +1,12 @@
-import { useEffect, useState } from "react";
-import { ArrowLeftIcon, MenuIcon } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { ArrowLeftIcon, MenuIcon, PlusIcon } from "lucide-react";
 import { api, describeError } from "@/lib/api";
 import { activityAge } from "@/lib/activity-age";
 import {
   type BoardData, type Card, type CardShow, type SidebarScope, type SortKey, type TableSort,
-  awayDigest, byStage, cardSlug, inScope, projectName, sidebarProjects, sortCards, toBoardCard, writerSlots,
+  type Stage, awayDigest, byStage, cardSlug, inScope, projectName, sidebarProjects, sortCards, toBoardCard, writerSlots,
 } from "@/lib/board";
+import { cardAction, createCard, ulid } from "@/lib/board-actions";
 import type { BoardRoute } from "@/lib/route";
 import { BOARD_POLL_MS, useBoard } from "@/lib/useBoard";
 import { cn } from "@/lib/utils";
@@ -13,15 +14,21 @@ import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
 import { AwayDigest, type AwayDecision } from "./AwayDigest";
 import { BoardColumns } from "./BoardColumns";
+import { CardActions } from "./CardActions";
 import { CardDetail } from "./CardDetail";
 import type { DecisionRow } from "./DecisionCard";
 import { DecisionsPage } from "./DecisionsPage";
+import { type CardDraft, NewCardDialog } from "./NewCardDialog";
 import { NeedsYouStrip } from "./NeedsYouStrip";
 import { ProjectSidebar } from "./ProjectSidebar";
+import { ProposalTray } from "./ProposalTray";
 import { TableView } from "./TableView";
 import { WriterSlots } from "./WriterSlots";
 
 const LAST_SEEN = "nebula-board-last-seen";
+
+type RawCard = BoardData["cards"][number];
+type Pending = { patch: Partial<RawCard>; after?: BoardData | null };
 
 type Decision = { id: string; title: string; card: string | null; project: string | null; content: { body?: string }; created_at: number };
 
@@ -76,7 +83,9 @@ function CardPanel({ slug, board, mode, onOpenCard }: { slug: string; board: Boa
   return (
     <>
       {card.error && <span role="status" className="self-start rounded-md border border-dashed px-1.5 py-0.5 text-xs">Date neactualizate</span>}
-      <CardDetail card={toBoardCard(card.show, board?.cards ?? [], card.show)} log={log} mode={mode} onOpenCard={onOpenCard} />
+      <CardDetail card={toBoardCard(card.show, board?.cards ?? [], card.show)} log={log} mode={mode} onOpenCard={onOpenCard}>
+        <CardActions show={card.show} board={board} />
+      </CardDetail>
     </>
   );
 }
@@ -97,6 +106,23 @@ export function BoardPage({ route, onNavigate, onSessions }: {
   const [collapsed, setCollapsed] = useState<string[]>([]);
   const [digestClosed, setDigestClosed] = useState(false);
   const [decisionQuery, setDecisionQuery] = useState("");
+  const [overlay, setOverlay] = useState<Record<string, Pending>>({});
+  const [newCard, setNewCard] = useState<(CardDraft & { id: string }) | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const latest = useRef(board);
+  useEffect(() => { latest.current = board; }, [board]);
+  const pending = Object.fromEntries(Object.entries(overlay).filter(([, p]) => p.after === undefined || p.after === board));
+  const optimistic = (key: string, patch: Partial<RawCard>, request: Promise<unknown>) => {
+    setActionError(null);
+    setOverlay((old) => ({ ...old, [key]: { patch } }));
+    request
+      .then(() => setOverlay((old) => old[key] ? { ...old, [key]: { ...old[key], after: latest.current } } : old))
+      .catch((failure) => {
+        setOverlay((old) => Object.fromEntries(Object.entries(old).filter(([k]) => k !== key)));
+        setActionError(describeError(failure));
+      });
+  };
 
   const routed = (s: SidebarScope) => ({ project: s.kind === "all" || s.kind === "needs" ? null : s.project, decisions: s.kind === "decisions" });
   const fromRoute: SidebarScope = !route.project ? { kind: "all" }
@@ -114,9 +140,11 @@ export function BoardPage({ route, onNavigate, onSessions }: {
   const openPage = (ref: string) => go({ card: cardSlug(ref) });
   const toggle = <T,>(list: T[], name: T) => list.includes(name) ? list.filter((n) => n !== name) : [...list, name];
 
-  const live = (board?.cards ?? []).filter((c) => !c.archived);
-  const all = live.map((c) => toBoardCard(c, live));
-  const cards = all.filter((c) => inScope(c, scope));
+  const live = (board?.cards ?? []).map((c) => pending[c.ref] ? { ...c, ...pending[c.ref].patch } : c).filter((c) => !c.archived);
+  const waiting = (board?.away.needs_you ?? []).filter((w) => !pending[w.id]);
+  const all = live.map((c) => ({ ...toBoardCard(c, live), needsYou: waiting.some((w) => w.card === c.id), age: activityAge(c.updated_at, Date.now()) }));
+  const scoped = all.filter((c) => inScope(c, scope));
+  const cards = scoped.filter((c) => !c.proposed);
   const bySlug = (slug: string | null): Card | undefined => live.find((c) => cardSlug(c.ref) === slug);
   const peeked = bySlug(route.peek);
   const decisions = useDecisions(route.decisions || !!board?.away.decisions.length, route.decisions ? decisionQuery : "", board);
@@ -124,6 +152,31 @@ export function BoardPage({ route, onNavigate, onSessions }: {
   const now = Date.now();
   const awayDecisions: AwayDecision[] = (digest?.decisions ?? [])
     .map((d) => ({ id: d.id, title: d.title, age: activityAge(d.created_at, now), cardRef: live.find((c) => c.id === d.card)?.ref ?? null }));
+
+  const move = (ref: string, stage: Stage) => {
+    const card = live.find((c) => c.ref === ref);
+    if (card && card.stage !== stage) optimistic(ref, { stage }, cardAction(ref, "move", { stage, expect: card.stage }));
+  };
+  const openNew = (stage: Stage = "backlog") =>
+    setNewCard({ title: "", project: scope.kind === "all" || scope.kind === "needs" ? null : scope.project, stage, id: ulid() });
+  const create = async () => {
+    if (!newCard) return;
+    setCreating(true);
+    try {
+      await createCard({ ...newCard, title: newCard.title.trim() });
+      setNewCard(null);
+    } catch (failure) {
+      setActionError(describeError(failure));
+    } finally {
+      setCreating(false);
+    }
+  };
+  const waitingCards = cards.filter((c) => c.needsYou);
+  const approve = (ref: string) => {
+    const card = live.find((c) => c.ref === ref);
+    const session = waiting.find((w) => w.card === card?.id);
+    if (session) optimistic(session.id, {}, cardAction(ref, "approve", { session: session.id, host: session.host, expectedStatusAt: session.status_changed_at }));
+  };
 
   const sidebar = (
     <ProjectSidebar projects={board ? sidebarProjects(board) : []} total={live.filter((c) => c.stage !== "done").length}
@@ -150,7 +203,7 @@ export function BoardPage({ route, onNavigate, onSessions }: {
       sort={sort} onSort={(key: SortKey) => setSort((old) => ({ key, asc: old.key === key ? !old.asc : true }))}
       collapsed={collapsed} onToggleGroup={(name) => setCollapsed((old) => toggle(old, name))} />
   ) : (
-    <BoardColumns columns={byStage(cards)} selected={peeked?.ref} showProject={scope.kind === "all"} onOpen={peek} />
+    <BoardColumns columns={byStage(cards)} selected={peeked?.ref} showProject={scope.kind === "all"} onOpen={peek} onAdd={openNew} onMove={move} />
   );
 
   return (
@@ -166,6 +219,9 @@ export function BoardPage({ route, onNavigate, onSessions }: {
           {stale && board && <span role="status" className="rounded-md border border-dashed px-1.5 py-0.5 text-xs">Date neactualizate</span>}
           <span className="flex-1" />
           {board && board.hosts.length > 0 && <WriterSlots hosts={writerSlots(board.hosts)} />}
+          {board && !route.card && !route.decisions && (
+            <Button type="button" variant="outline" size="sm" onClick={() => openNew()}><PlusIcon aria-hidden />Card nou</Button>
+          )}
           {!route.card && !route.decisions && (
             <div role="group" aria-label="Vizualizare" className="flex rounded-lg border p-0.5">
               {([false, true] as const).map((table) => (
@@ -188,9 +244,28 @@ export function BoardPage({ route, onNavigate, onSessions }: {
               setLastSeen(seen);
             }} />
         )}
-        {!route.card && !route.decisions && <NeedsYouStrip cards={cards.filter((c) => c.needsYou)} onOpen={peek} />}
+        {actionError && (
+          <p role="alert" className="flex items-center gap-2 border-b px-3 py-1.5 text-sm">
+            <span className="flex-1">{actionError}</span>
+            <Button type="button" variant="ghost" size="sm" onClick={() => setActionError(null)}>Închide</Button>
+          </p>
+        )}
+        {!route.card && !route.decisions && (
+          <NeedsYouStrip cards={waitingCards} onOpen={peek}
+            renderActions={(card) => <Button type="button" variant="outline" size="xs" onClick={() => approve(card.ref)}>Aprobă</Button>} />
+        )}
+        {!route.card && !route.decisions && (
+          <ProposalTray proposals={scoped.filter((c) => c.proposed).map((c) => ({ id: c.ref, ref: c.ref, title: c.title, project: c.project, proposedBy: c.proposedBy ?? "agent" }))}
+            onOpen={peek} onAccept={(ref) => optimistic(ref, { proposed: false }, cardAction(ref, "accept", {}))}
+            onDismiss={(ref) => optimistic(ref, { archived: true }, cardAction(ref, "dismiss", {}))} />
+        )}
         {main}
       </main>
+      {newCard && (
+        <NewCardDialog open onOpenChange={(open) => { if (!open) setNewCard(null); }} draft={newCard} pending={creating}
+          projects={(board ? sidebarProjects(board) : []).flatMap((p) => p.project === null ? [] : [p.project])}
+          onDraftChange={(draft) => setNewCard({ ...newCard, ...draft })} onCreate={create} />
+      )}
       <Sheet open={menuOpen} onOpenChange={setMenuOpen}>
         <SheetContent side="left" className="w-[88vw] max-w-sm gap-0 p-0" aria-describedby={undefined}>
           <SheetTitle className="sr-only">Proiecte</SheetTitle>

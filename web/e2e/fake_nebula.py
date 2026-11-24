@@ -83,9 +83,14 @@ def away(board, cards, args):
     ids = {c["id"] for c in cards}
     sessions = {(s["host"], s["id"]) for i in ids for s in board["details"].get(i, {}).get("sessions", [])}
     return {"finished": [e["id"] for e in board["away"]["finished"] if after(e) and e["id"] in ids],
-            "needs_you": [{"host": e["host"], "id": e["id"]} for e in board["away"]["needs_you"]
+            "needs_you": [{k: e[k] for k in ("host", "id", "card", "status_changed_at")} for e in board["away"]["needs_you"]
                           if after(e) and (e["host"], e["id"]) in sessions],
             "decisions": [d["id"] for d in board["decisions"] if d["created_at"] > int(since) and scoped(d, args)]}
+
+
+def with_cleared(card, board):
+    done = {c["ref"] for c in board["cards"] if c["stage"] == "done" or c["archived"]}
+    return {**card, "cleared_blockers": [r for r in card["blocked_by"] if r in done]}
 
 
 def board_command(verb, args, board):
@@ -99,7 +104,7 @@ def board_command(verb, args, board):
             return 3, "board host unreachable"
         if flags("--since") == version:
             return 0, {"version": version, "unchanged": True}
-        cards = [c for c in board["cards"] if scoped(c, args) and not c["archived"]]
+        cards = [with_cleared(c, board) for c in board["cards"] if scoped(c, args) and not c["archived"]]
         hosts = [{**h, "checkouts": [c for c in h["checkouts"] if scoped(c, args)]} for h in board["hosts"]]
         return 0, {"version": version, "board": {"cards": cards, "hosts": hosts, "away": away(board, cards, args)}, "next": None}
     if verb == ("decision", "list"):
@@ -117,7 +122,8 @@ def board_command(verb, args, board):
         card = {"id": flags("--id") or f"01JD{number:022d}", "number": number, "ref": f"#{number}",
                 "title": values[0], "stage": flags("--stage") or "backlog", "project": flags("--project"),
                 "proposed": "--propose" in args, "archived": False,
-                "created_by": {"host": "fake", "agent": None, "name": "web"}, "checkout": None, "blocked_by": []}
+                "created_by": {"host": "fake", "agent": None, "name": "web"}, "checkout": None, "blocked_by": [],
+                "cleared_blockers": [], "created_at": int(time.time() * 1000), "updated_at": int(time.time() * 1000)}
         existing = next((c for c in board["cards"] if c["id"] == card["id"]), None)
         if existing:
             return 0, existing
@@ -133,7 +139,7 @@ def board_command(verb, args, board):
     if verb == ("todo", "move"):
         if flags("--expect") not in (None, card["stage"]):
             return 6, "card moved meanwhile"
-        card["stage"] = values[1]
+        card["stage"], card["updated_at"] = values[1], int(time.time() * 1000)
     elif verb == ("todo", "edit"):
         card["title"], card["project"] = flags("--title") or card["title"], flags("--project") or card["project"]
     elif verb == ("todo", "note"):
@@ -150,11 +156,18 @@ def board_command(verb, args, board):
             return 6, "cannot block on that card"
         card["blocked_by"] = [r for r in card["blocked_by"] if r != by["ref"]] + ([by["ref"]] if verb[1] == "block" else [])
     elif verb == ("todo", "run"):
+        with open(STATE / "sends.log", "a") as handle:
+            handle.write(json.dumps({"run": card["ref"], **{k: flags(f"--{k}") for k in ("role", "kind", "host", "worktree")}}) + "\n")
         card["stage"] = "doing"
         return 0, {"dispatch": flags("--dispatch") or f"01JE{time.time_ns():022d}"[:26], "state": "started",
                    "session": {"host": flags("--host"), "id": "01JF0000000000000000000002"}, "card": card["id"]}
     elif verb == ("todo", "approve"):
-        return 0, {"ok": True}
+        session = next((s for s in board["details"].get(card["id"], {}).get("sessions", []) if s["id"] == flags("--session")), None)
+        if session is None or str(session["status_changed_at"]) != flags("--expected-status-at"):
+            return 6, "the session changed meanwhile"
+        session["status"], session["status_changed_at"] = "running", int(time.time() * 1000)
+        board["away"]["needs_you"] = [e for e in board["away"]["needs_you"] if e["id"] != session["id"]]
+        return 0, {"dispatch": None, "state": "started", "session": {"host": session["host"], "id": session["id"]}, "card": card["id"]}
     else:
         return 2, f"unsupported fake board verb: {verb}"
     return 0, card
@@ -268,6 +281,9 @@ def main(argv):
         save("worktrees.json", trees)
         print(json.dumps({**row, "created": True}))
     elif argv[0] == "open":
+        if behaviour == "fail":
+            print("ssh: connect to host timed out", file=sys.stderr)
+            return 3
         print(json.dumps({"landed": "tui", "tui_pid": 1, "id": arg("--session", argv), "name": "worker",
                           "project": "nebula", "host": arg("--on", argv), "focused": True}))
     elif argv[0] in {"todo", "decision"}:

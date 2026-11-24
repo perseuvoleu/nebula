@@ -88,6 +88,9 @@ export type Card = {
   created_by: Author;
   checkout: Checkout | null;
   blocked_by: string[];
+  cleared_blockers: string[];
+  created_at: number;
+  updated_at: number;
 };
 
 export type HostCheckout = { project: string; branch: string; path: string; worktree: boolean };
@@ -103,7 +106,9 @@ export type BoardHost = {
 
 export type SessionAt = { host: string; id: string };
 
-export type Away = { finished: string[]; needs_you: SessionAt[]; decisions: string[] };
+export type NeedsYou = SessionAt & { card: string; status_changed_at: number };
+
+export type Away = { finished: string[]; needs_you: NeedsYou[]; decisions: string[] };
 
 export type BoardData = { cards: Card[]; hosts: BoardHost[]; away: Away };
 
@@ -141,7 +146,7 @@ export function byStage<T extends { stage: Stage }>(cards: T[]): Record<Stage, T
 export function openBlockers(card: Card, cards: Card[]): BlockerRef[] {
   return card.blocked_by.flatMap((ref) => {
     const blocker = cards.find((c) => c.ref === ref);
-    return blocker?.stage === "done" ? [] : [{ ref, title: blocker?.title ?? "" }];
+    return blocker?.stage === "done" || card.cleared_blockers.includes(ref) ? [] : [{ ref, title: blocker?.title ?? "" }];
   });
 }
 
