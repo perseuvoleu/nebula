@@ -1,18 +1,25 @@
-import type { ReactNode } from "react";
+import { type ReactNode, useState } from "react";
 import { XIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import type { BoardCard } from "./model";
+import { cn } from "@/lib/utils";
+import type { BoardCard } from "@/lib/board";
 import { CardRef, StatusDot } from "./CardTile";
 
 export type AwayDecision = { id: string; title: string; age: string; cardRef: string | null };
 
-function Column({ title, count, empty, children }: { title: ReactNode; count: number; empty: string; children: ReactNode }) {
+const CAP = 3;
+
+function Column({ title, count, empty, children }: { title: ReactNode; count: number; empty: string; children: ReactNode[] }) {
+  const [all, setAll] = useState(false);
   return (
     <section className="flex min-w-0 flex-col gap-1 rounded-lg border bg-card p-2.5">
       <h3 className="flex items-center gap-1.5 px-1 text-xs font-medium text-muted-foreground">
         {title} <span className="font-mono tabular-nums">{count}</span>
       </h3>
-      {count ? <ul className="flex flex-col">{children}</ul> : <p className="px-1 text-xs text-muted-foreground">{empty}</p>}
+      {count ? <ul className="flex flex-col">{all ? children : children.slice(0, CAP)}</ul> : <p className="px-1 text-xs text-muted-foreground">{empty}</p>}
+      {!all && children.length > CAP && (
+        <Button type="button" variant="ghost" size="xs" className="self-start" onClick={() => setAll(true)}>Arată toate ({children.length})</Button>
+      )}
     </section>
   );
 }
@@ -33,7 +40,7 @@ export function AwayDigest({ lastSeen, scope, finished, needsYou, decisions, onO
   lastSeen: string;
   scope: string;
   finished: BoardCard[];
-  needsYou: BoardCard[];
+  needsYou?: BoardCard[];
   decisions: AwayDecision[];
   onOpen?: (ref: string) => void;
   onCaughtUp?: () => void;
@@ -50,13 +57,15 @@ export function AwayDigest({ lastSeen, scope, finished, needsYou, decisions, onO
         {onCaughtUp && <Button type="button" variant="outline" size="xs" onClick={onCaughtUp}>Am văzut tot</Button>}
         {onClose && <Button type="button" variant="ghost" size="icon-xs" aria-label="Închide rezumatul" onClick={onClose}><XIcon aria-hidden /></Button>}
       </div>
-      <div className="grid gap-2 md:grid-cols-3">
+      <div className={cn("grid gap-2", needsYou ? "md:grid-cols-3" : "md:grid-cols-2")}>
         <Column title={<><StatusDot dot="done" label="" />Terminate</>} count={finished.length} empty="Nimic terminat.">
           {finished.map((c) => <Row key={c.ref} cardRef={c.ref} title={c.title} trailing={age(c.age)} onOpen={onOpen} />)}
         </Column>
-        <Column title={<><StatusDot dot="needs" label="" />Te așteaptă</>} count={needsYou.length} empty="Nimic în așteptare.">
-          {needsYou.map((c) => <Row key={c.ref} cardRef={c.ref} title={c.title} trailing={renderNeedsActions?.(c)} onOpen={onOpen} />)}
-        </Column>
+        {needsYou && (
+          <Column title={<><StatusDot dot="needs" label="" />Te așteaptă</>} count={needsYou.length} empty="Nimic în așteptare.">
+            {needsYou.map((c) => <Row key={c.ref} cardRef={c.ref} title={c.title} trailing={renderNeedsActions?.(c)} onOpen={onOpen} />)}
+          </Column>
+        )}
         <Column title="Decizii noi" count={decisions.length} empty="Nicio decizie nouă.">
           {decisions.map((d) => <Row key={d.id} cardRef={d.cardRef} title={d.title} trailing={age(d.age)} onOpen={onOpen} />)}
         </Column>

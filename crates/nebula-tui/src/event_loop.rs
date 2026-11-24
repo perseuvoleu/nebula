@@ -6994,6 +6994,7 @@ fn create_default_agent(
         card: None,
         role: None,
         dispatch: None,
+        spawned_by_host: None,
     });
     // Same warm-slot refill as `create_agent`.
     if kind == AgentKind::Claude {
@@ -7360,6 +7361,7 @@ fn create_agent(
         card: None,
         role: None,
         dispatch: None,
+        spawned_by_host: None,
     });
     // The create consumes (or, off-spec, discards) the worktree's warm
     // Claude slot; refill it so the next create is instant too.

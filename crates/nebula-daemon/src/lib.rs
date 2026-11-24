@@ -6,6 +6,7 @@
 mod artifacts;
 pub mod board;
 pub mod board_link;
+pub mod board_report;
 mod checkout_lock;
 mod collect;
 pub mod config;
@@ -14,6 +15,7 @@ pub mod hooks;
 pub mod lifecycle;
 pub mod metrics;
 pub mod pty;
+mod rag_copy;
 pub mod registry;
 pub mod relay;
 pub mod server;
@@ -74,6 +76,8 @@ async fn serve() -> Result<()> {
     let daemon = registry::Daemon::new(store, hook_env);
     daemon.refresh_remote_hosts();
     daemon.ensure_relays();
+    let rag_copy = rag_copy::start(daemon.store.clone(), daemon.shutdown.clone());
+    board_report::spawn(daemon.clone());
 
     // Drain hook events into the status machines; a payload that reports a
     // cwd inside another worktree of the same project re-homes the agent row.
@@ -233,6 +237,7 @@ async fn serve() -> Result<()> {
     // Cleanup: kill PTYs, remove the socket. (Status persistence joins in
     // phase 4/5 when the store exists.)
     daemon.kill_all();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), rag_copy).await;
     let _ = std::fs::remove_file(&sock);
     tracing::info!("daemon exited cleanly");
     Ok(())

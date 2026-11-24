@@ -1,6 +1,8 @@
 //! Cards on the board host: the `nebula todo` verbs against a daemon whose
 //! config says `board = "local"`, through the real CLI and its --json.
 
+use nebula_core::board::{BoardOp, BoardResult, HostCheckout, HostReport, Role, SessionRow};
+use nebula_core::{AgentId, AgentKind, AgentStatus, TodoId};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -64,6 +66,10 @@ impl Env {
         for k in LIVE_SESSION_ENV {
             cmd.env_remove(k);
         }
+        cmd.env_remove("NEBULA_RAG_ENV")
+            .env("NEBULA_RAG_LOCAL", "1")
+            .env("CF_ACCOUNT_ID", "")
+            .env("CF_AI_TOKEN", "");
         for (k, v) in envs {
             cmd.env(k, v);
         }
@@ -119,16 +125,26 @@ impl Env {
 
 #[expect(
     clippy::disallowed_methods,
-    reason = "the one wait in this file: the daemon's socket appearing"
+    reason = "the one poll loop: every wait in this file goes through it"
 )]
-fn wait_for(sock: &Path) {
-    for _ in 0..200 {
-        if std::os::unix::net::UnixStream::connect(sock).is_ok() {
-            return;
+fn poll_until<T>(timeout: Duration, mut probe: impl FnMut() -> Option<T>) -> Option<T> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(value) = probe() {
+            return Some(value);
+        }
+        if std::time::Instant::now() > deadline {
+            return None;
         }
         std::thread::sleep(Duration::from_millis(25));
     }
-    panic!("daemon socket never appeared");
+}
+
+fn wait_for(sock: &Path) {
+    poll_until(Duration::from_secs(5), || {
+        std::os::unix::net::UnixStream::connect(sock).ok()
+    })
+    .expect("daemon socket never appeared");
 }
 
 fn stderr(out: &Output) -> String {
@@ -629,6 +645,555 @@ fn agent_new_card_refuses_unknown_caller() {
         stderr(&out)
     );
     assert!(agent_names(&env).is_empty());
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    reason = "host reports are debounced by a second, so the board catches up on its own clock"
+)]
+fn eventually<T>(what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
+    for _ in 0..200 {
+        if let Some(found) = probe() {
+            return found;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("{what} never happened");
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+fn board_op(env: &Env, op: BoardOp) -> Result<BoardResult, String> {
+    use nebula_core::codec::{read_frame, write_frame};
+    use nebula_core::{ClientRequest, ServerEvent, PROTOCOL_VERSION};
+    let sock = env.runtime_dir().join("daemon.sock");
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async move {
+            let mut stream = tokio::net::UnixStream::connect(sock).await.unwrap();
+            let hello = ClientRequest::Hello {
+                protocol_version: PROTOCOL_VERSION,
+            };
+            write_frame(&mut stream, &hello).await.unwrap();
+            read_frame::<ServerEvent, _>(&mut stream).await.unwrap();
+            write_frame(&mut stream, &ClientRequest::Board { req_id: 7, op })
+                .await
+                .unwrap();
+            loop {
+                match read_frame::<ServerEvent, _>(&mut stream).await.unwrap() {
+                    Some(ServerEvent::BoardReply { req_id: 7, result }) => return Ok(result),
+                    Some(ServerEvent::Error {
+                        req_id: Some(7),
+                        message,
+                    }) => return Err(message),
+                    Some(_) => continue,
+                    None => return Err("the daemon hung up".into()),
+                }
+            }
+        })
+}
+
+const FAR_HOST: &str = "elsewhere";
+
+fn far_row(card: &Value, agent: &str, status: AgentStatus, changed_at: i64) -> SessionRow {
+    SessionRow {
+        agent_id: AgentId(agent.into()),
+        host: FAR_HOST.into(),
+        card_id: TodoId(card["id"].as_str().unwrap().into()),
+        role: Some(Role::Worker),
+        kind: AgentKind::Codex,
+        name: agent.into(),
+        parent: None,
+        status,
+        status_changed_at: changed_at,
+        writer: false,
+        alive: true,
+        archived: false,
+        branch: Some("main".into()),
+        dispatch_id: None,
+        created_at: changed_at,
+        project: Some("nebula".into()),
+        worktree: false,
+    }
+}
+
+fn far_report(env: &Env, sessions: Vec<SessionRow>) {
+    far_report_holding(env, Vec::new(), sessions);
+}
+
+fn far_report_holding(env: &Env, checkouts: Vec<HostCheckout>, sessions: Vec<SessionRow>) {
+    let report = HostReport {
+        host: FAR_HOST.into(),
+        writers: 0,
+        writer_slots: None,
+        checkouts,
+        sessions,
+    };
+    board_op(env, BoardOp::Report(report)).expect("the board takes a host report");
+}
+
+fn far_host(hosts: &[Value]) -> Value {
+    hosts
+        .iter()
+        .find(|h| h["host"] == FAR_HOST)
+        .cloned()
+        .unwrap()
+}
+
+fn stage_of(env: &Env, card: &str) -> String {
+    env.json(&["todo", "show", card, "--json"])["stage"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+fn hosts_of(env: &Env, scope: &[&str]) -> Vec<Value> {
+    let mut argv = vec!["todo", "board", "--json"];
+    argv.extend_from_slice(scope);
+    env.json(&argv)["board"]["hosts"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+fn this_host(hosts: &[Value]) -> Option<Value> {
+    hosts
+        .iter()
+        .find(|h| h["host"] == nebula_core::host::hostname())
+        .cloned()
+}
+
+fn chain(env: &Env, card: &str) -> Vec<Value> {
+    env.json(&["todo", "show", card, "--json"])["sessions"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+#[test]
+fn child_inherits_card_not_role() {
+    let env = board_env();
+    env.make_repo();
+    let card = add(&env, &["--project", "repo"], "Chain");
+    let parent = json_of(
+        spawn_agent(
+            &env,
+            &["--card", "#1", "--role", "worker", "--name", "parent"],
+        ),
+        &["agent", "new", "parent"],
+    );
+    let parent_id = parent["id"].as_str().unwrap();
+    let child = |extra: &[&str]| {
+        let mut argv = vec!["agent", "new", "--project", "repo", "--worktree", "main"];
+        argv.extend_from_slice(extra);
+        json_of(env.cli(&argv, Some(parent_id)), &argv)
+    };
+    let reviewer = child(&["--role", "review", "--name", "reviewer"]);
+    assert_eq!(reviewer["card"], card["id"]);
+    assert_eq!(reviewer["role"], "review");
+    let roleless = child(&["--name", "roleless"]);
+    assert_eq!(roleless["card"], card["id"]);
+    assert_eq!(roleless["role"], Value::Null, "a child never inherits role");
+    let loose = child(&["--no-card", "--name", "loose"]);
+    assert_eq!(loose["card"], Value::Null);
+    let row = env.json(&["agent", "show", "reviewer", "--project", "repo"]);
+    assert_eq!(row["card"], card["id"]);
+
+    let sessions = eventually("the chain on the card", || {
+        let sessions = chain(&env, "#1");
+        (sessions.len() == 3).then_some(sessions)
+    });
+    let listed: Vec<(&str, &Value)> = sessions
+        .iter()
+        .map(|s| (s["name"].as_str().unwrap(), &s["role"]))
+        .collect();
+    assert_eq!(
+        listed,
+        [
+            ("parent", &serde_json::json!("worker")),
+            ("reviewer", &serde_json::json!("review")),
+            ("roleless", &Value::Null),
+        ]
+    );
+}
+
+#[test]
+fn auto_stage_worker_doing_review() {
+    let replay = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/replay");
+    let agent = format!(
+        "{} {}",
+        replay.join("agent").display(),
+        replay.join("turn.replay").display()
+    );
+    let env = Env::new();
+    env.board_local();
+    let env = env.start(&[
+        ("NEBULA_AGENT_CMD", agent.as_str()),
+        ("NEBULA_STATUS_TICK_MS", "100"),
+    ]);
+    env.make_repo();
+    add(&env, &["--project", "repo"], "Work");
+    json_of(
+        spawn_agent(
+            &env,
+            &["--card", "#1", "--role", "worker", "--name", "worker"],
+        ),
+        &["agent", "new", "worker"],
+    );
+    eventually("the card in doing", || {
+        (stage_of(&env, "#1") == "doing").then_some(())
+    });
+    let sent = env.cli(
+        &["agent", "send", "worker", "go", "--project", "repo"],
+        None,
+    );
+    assert!(sent.status.success(), "{}", stderr(&sent));
+    eventually("the card in review", || {
+        (stage_of(&env, "#1") == "review").then_some(())
+    });
+    let sessions = chain(&env, "#1");
+    assert_eq!(sessions[0]["status"], "finished");
+}
+
+#[test]
+fn auto_stage_ignores_duplicate_report() {
+    let env = board_env();
+    let card = add(&env, &["--project", "nebula"], "Work");
+    let report = vec![far_row(&card, "w1", AgentStatus::Running, 10)];
+    far_report(&env, report.clone());
+    assert_eq!(stage_of(&env, "#1"), "doing");
+    env.json(&["todo", "move", "#1", "next", "--json"]);
+    far_report(&env, report);
+    assert_eq!(stage_of(&env, "#1"), "next");
+}
+
+#[test]
+fn card_show_chain_and_checkout() {
+    let env = board_env();
+    env.make_repo();
+    add(&env, &["--project", "repo"], "Chain");
+    let worker = json_of(
+        spawn_agent(
+            &env,
+            &["--card", "#1", "--role", "worker", "--name", "worker"],
+        ),
+        &["agent", "new", "worker"],
+    );
+    let argv = [
+        "agent",
+        "new",
+        "--project",
+        "repo",
+        "--worktree",
+        "main",
+        "--role",
+        "review",
+        "--name",
+        "reviewer",
+    ];
+    json_of(env.cli(&argv, worker["id"].as_str()), &argv);
+    let archived = env.cli(&["agent", "archive", "reviewer", "--project", "repo"], None);
+    assert!(archived.status.success(), "{}", stderr(&archived));
+
+    let shown = eventually("the archived reviewer reported", || {
+        let shown = env.json(&["todo", "show", "#1", "--json"]);
+        let sessions = shown["sessions"].as_array().unwrap();
+        (sessions.len() == 2 && sessions[1]["alive"] == false).then_some(shown)
+    });
+    let sessions = shown["sessions"].as_array().unwrap();
+    let host = nebula_core::host::hostname();
+    assert_eq!(sessions[0]["name"], "worker");
+    assert_eq!(sessions[0]["id"], worker["id"]);
+    assert_eq!(sessions[0]["role"], "worker");
+    assert_eq!(sessions[0]["alive"], true);
+    assert_eq!(sessions[1]["name"], "reviewer");
+    assert_eq!(sessions[1]["role"], "review");
+    for session in sessions {
+        assert_eq!(session["host"], host.as_str());
+        assert_eq!(session["kind"], "claude");
+        assert_eq!(session["writer"], false);
+        assert_eq!(session["stale"], false);
+        assert!(session["status"].is_string(), "{session}");
+        assert!(session["status_changed_at"].is_i64(), "{session}");
+    }
+    assert_eq!(shown["checkout"]["host"], host.as_str());
+    assert_eq!(shown["checkout"]["branch"], "main");
+    assert_eq!(shown["checkout"]["worktree"], false);
+}
+
+#[test]
+fn board_hosts_writers() {
+    let env = board_env();
+    let repo = env.make_repo();
+    add(&env, &["--project", "repo"], "Write");
+    json_of(
+        spawn_agent(
+            &env,
+            &[
+                "--card", "#1", "--role", "worker", "--writer", "--name", "writer",
+            ],
+        ),
+        &["agent", "new", "--writer"],
+    );
+    let host = eventually("one live writer reported", || {
+        this_host(&hosts_of(&env, &["--all"])).filter(|h| h["writers"] == 1)
+    });
+    assert_eq!(host["writer_slots"], Value::Null);
+    let checkouts = host["checkouts"].as_array().unwrap();
+    assert_eq!(checkouts.len(), 1, "{host}");
+    assert_eq!(checkouts[0]["project"], "repo");
+    assert_eq!(checkouts[0]["branch"], "main");
+    assert_eq!(checkouts[0]["worktree"], false);
+    assert_eq!(
+        Path::new(checkouts[0]["path"].as_str().unwrap())
+            .canonicalize()
+            .unwrap(),
+        repo.canonicalize().unwrap()
+    );
+    let other = this_host(&hosts_of(&env, &["--project", "other"])).unwrap();
+    assert_eq!(other["checkouts"], serde_json::json!([]), "scope applies");
+}
+
+#[test]
+fn report_unchanged_keeps_version() {
+    let env = board_env();
+    eventually("this host's start report", || {
+        this_host(&hosts_of(&env, &["--all"]))
+    });
+    let card = add(&env, &["--project", "nebula"], "Work");
+    let rows = vec![far_row(&card, "w1", AgentStatus::Running, 10)];
+    far_report(&env, rows.clone());
+    let version = env.json(&["todo", "board", "--all", "--json"])["version"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    far_report(&env, rows);
+    let again = env.json(&["todo", "board", "--all", "--since", &version, "--json"]);
+    assert_eq!(again["unchanged"], true, "{again}");
+    far_report(
+        &env,
+        vec![far_row(&card, "w1", AgentStatus::NeedsFeedback, 20)],
+    );
+    let changed = env.json(&["todo", "board", "--all", "--since", &version, "--json"]);
+    assert_ne!(changed["version"], version.as_str());
+}
+
+#[test]
+fn away_digest_sessions() {
+    let env = board_env();
+    let work = add(&env, &["--project", "nebula"], "Work");
+    let old = add(&env, &["--project", "nebula"], "Old");
+    let ask = add(&env, &["--project", "nebula"], "Ask");
+    env.json(&["todo", "move", "#2", "review", "--json"]);
+    let before = now_ms() - 60_000;
+    far_report(
+        &env,
+        vec![far_row(&ask, "n1", AgentStatus::NeedsFeedback, before)],
+    );
+    let since = now_ms();
+    let after = since + 1;
+    far_report(
+        &env,
+        vec![far_row(&work, "w1", AgentStatus::Running, after)],
+    );
+    far_report(
+        &env,
+        vec![
+            far_row(&work, "w1", AgentStatus::Finished, after + 1),
+            far_row(&ask, "n2", AgentStatus::NeedsFeedback, after + 1),
+        ],
+    );
+    let away_since = since.to_string();
+    let board = env.json(&[
+        "todo",
+        "board",
+        "--all",
+        "--away-since",
+        &away_since,
+        "--json",
+    ]);
+    let away = &board["board"]["away"];
+    assert_eq!(away["finished"], serde_json::json!([work["id"]]), "{away}");
+    assert_eq!(
+        away["needs_you"],
+        serde_json::json!([{"host": FAR_HOST, "id": "n2"}]),
+        "{away}"
+    );
+    assert_ne!(old["id"], work["id"]);
+}
+
+#[test]
+fn auto_stage_sees_the_whole_report() {
+    let env = board_env();
+    let card = add(&env, &["--project", "nebula"], "Work");
+    far_report(&env, vec![far_row(&card, "w1", AgentStatus::Running, 10)]);
+    assert_eq!(stage_of(&env, "#1"), "doing");
+    far_report(
+        &env,
+        vec![
+            far_row(&card, "w1", AgentStatus::Finished, 20),
+            far_row(&card, "w2", AgentStatus::Running, 20),
+        ],
+    );
+    assert_eq!(stage_of(&env, "#1"), "doing", "w2 still works on the card");
+}
+
+#[test]
+fn card_show_lists_sessions_in_created_order() {
+    let env = board_env();
+    let card = add(&env, &["--project", "nebula"], "Work");
+    let newer = SessionRow {
+        created_at: 20,
+        ..far_row(&card, "newer", AgentStatus::Running, 5)
+    };
+    let older = SessionRow {
+        created_at: 10,
+        ..far_row(&card, "older", AgentStatus::Running, 5)
+    };
+    far_report(&env, vec![newer.clone()]);
+    far_report(&env, vec![newer, older]);
+    let names: Vec<Value> = chain(&env, "#1")
+        .iter()
+        .map(|s| s["name"].clone())
+        .collect();
+    assert_eq!(names, ["older", "newer"]);
+}
+
+#[test]
+fn card_checkout_matches_project_and_branch() {
+    let env = board_env();
+    let card = add(&env, &["--home"], "Home");
+    let held = |project: &str| HostCheckout {
+        project: project.into(),
+        branch: "main".into(),
+        path: format!("/work/{project}"),
+        worktree: false,
+    };
+    let worker = SessionRow {
+        project: Some("bbb".into()),
+        ..far_row(&card, "w1", AgentStatus::Running, 10)
+    };
+    far_report_holding(&env, vec![held("aaa"), held("bbb")], vec![worker]);
+    let shown = env.json(&["todo", "show", "#1", "--json"]);
+    assert_eq!(shown["checkout"]["path"], "/work/bbb", "{shown}");
+}
+
+#[test]
+fn host_needs_you_follows_the_read_scope() {
+    let env = board_env();
+    let card = add(&env, &["--project", "nebula"], "Ask");
+    far_report(
+        &env,
+        vec![far_row(&card, "n1", AgentStatus::NeedsFeedback, 10)],
+    );
+    assert_eq!(far_host(&hosts_of(&env, &["--all"]))["needs_you"], 1);
+    assert_eq!(
+        far_host(&hosts_of(&env, &["--project", "other"]))["needs_you"],
+        0,
+        "the waiting session's card is out of scope"
+    );
+}
+
+#[test]
+fn omitted_session_stops_needing_the_user() {
+    let env = board_env();
+    let card = add(&env, &["--project", "nebula"], "Ask");
+    let since = now_ms();
+    far_report(
+        &env,
+        vec![far_row(&card, "n1", AgentStatus::NeedsFeedback, since + 1)],
+    );
+    let away_since = since.to_string();
+    let away = |env: &Env| {
+        env.json(&[
+            "todo",
+            "board",
+            "--all",
+            "--away-since",
+            &away_since,
+            "--json",
+        ])["board"]["away"]["needs_you"]
+            .clone()
+    };
+    assert_eq!(
+        away(&env),
+        serde_json::json!([{"host": FAR_HOST, "id": "n1"}])
+    );
+    far_report(&env, Vec::new());
+    assert_eq!(away(&env), serde_json::json!([]), "n1 is no longer live");
+    assert_eq!(far_host(&hosts_of(&env, &["--all"]))["needs_you"], 0);
+}
+
+#[test]
+fn agent_new_refuses_unknown_caller_on_every_path() {
+    let env = board_env();
+    env.make_repo();
+    let stranger = nebula_core::AgentId::generate().to_string();
+    for extra in [&[][..], &["--no-card"]] {
+        let mut argv = vec![
+            "agent",
+            "new",
+            "--project",
+            "repo",
+            "--worktree",
+            "main",
+            "--name",
+            "orphan",
+        ];
+        argv.extend_from_slice(extra);
+        let out = env.cli(&argv, Some(&stranger));
+        assert!(
+            !out.status.success(),
+            "{argv:?} spawned for an unknown caller"
+        );
+        assert!(
+            stderr(&out).contains(&format!("NEBULA_AGENT_ID {stranger} names no session")),
+            "{}",
+            stderr(&out)
+        );
+    }
+    assert!(agent_names(&env).is_empty());
+}
+
+#[test]
+fn human_show_and_away_name_sessions() {
+    let env = board_env();
+    let work = add(&env, &["--project", "nebula"], "Work");
+    let ask = add(&env, &["--project", "nebula"], "Ask");
+    let since = now_ms();
+    let writer = |status, at| SessionRow {
+        writer: true,
+        ..far_row(&work, "w1", status, at)
+    };
+    far_report(&env, vec![writer(AgentStatus::Running, since + 1)]);
+    far_report(
+        &env,
+        vec![
+            writer(AgentStatus::Finished, since + 2),
+            far_row(&ask, "n1", AgentStatus::NeedsFeedback, since + 2),
+        ],
+    );
+    let human = |argv: &[&str]| {
+        let out = env.cli(argv, None);
+        assert!(out.status.success(), "{}", stderr(&out));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let show = human(&["todo", "show", "#1"]);
+    assert!(
+        show.contains("worker w1 on elsewhere: codex finished just now, writer, live"),
+        "{show}"
+    );
+    let away_since = since.to_string();
+    let board = human(&["todo", "board", "--all", "--away-since", &away_since]);
+    assert!(board.contains("finished: #1\n"), "{board}");
+    assert!(board.contains("needs you: n1 on elsewhere\n"), "{board}");
 }
 
 impl Env {
@@ -1696,5 +2261,425 @@ fn migration_v28_legacy_rows() {
             "path": "/tmp/vela-feature",
             "worktree": true,
         })
+    );
+}
+
+fn decide(env: &Env, agent: Option<&str>, args: &[&str]) -> Value {
+    let mut argv = vec!["decision", "add", "--json"];
+    argv.extend_from_slice(args);
+    json_of(env.cli(&argv, agent), &argv)
+}
+
+fn decision_titles(env: &Env, args: &[&str]) -> Vec<String> {
+    let mut argv = vec!["decision", "list", "--json"];
+    argv.extend_from_slice(args);
+    let mut found = titles(&env.json(&argv)["items"]);
+    found.sort();
+    found
+}
+
+#[test]
+fn decision_add_list_query() {
+    let env = board_env();
+    env.make_repo();
+    let (card, agent) = carded_agent(&env, "main");
+    let decided = decide(
+        &env,
+        Some(&agent),
+        &[
+            "Copy published files",
+            "--why",
+            "The checkout is disposable",
+        ],
+    );
+    assert_eq!(decided["kind"], "decision");
+    assert_eq!(decided["title"], "Copy published files");
+    assert_eq!(
+        decided["content"],
+        serde_json::json!({"body": "The checkout is disposable"})
+    );
+    assert_eq!(decided["card"], card["id"]);
+    assert_eq!(decided["project"], "repo");
+    assert_eq!(decided["session"]["id"], agent.as_str());
+    let id = decided["id"].as_str().unwrap();
+    assert_eq!(env.json(&["decision", "show", id, "--json"]), decided);
+
+    let other = decide(
+        &env,
+        None,
+        &["Poll every three seconds", "--project", "web"],
+    );
+    assert_eq!(other["card"], Value::Null);
+    assert_eq!(other["project"], "web");
+    let link = publish(
+        &env,
+        None,
+        &["https://example.com/repo", "--project", "repo"],
+    );
+
+    assert_eq!(
+        decision_titles(&env, &["--all", "--query", "DISPOSABLE"]),
+        ["Copy published files"]
+    );
+    assert_eq!(
+        decision_titles(&env, &["--all", "--query", "three"]),
+        ["Poll every three seconds"]
+    );
+    assert_eq!(
+        decision_titles(&env, &["--project", "web"]),
+        ["Poll every three seconds"]
+    );
+    assert_eq!(
+        decision_titles(&env, &["--project", "repo"]),
+        ["Copy published files"]
+    );
+    let not_one = env.cli(
+        &["decision", "show", link["id"].as_str().unwrap(), "--json"],
+        None,
+    );
+    assert_eq!(not_one.status.code(), Some(5), "{}", stderr(&not_one));
+}
+
+fn fake_workers_ai(env: &Env) -> PathBuf {
+    let bin = env.tmp.path().join("fake-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let vector = vec!["0.03125"; 1024].join(",");
+    let down = env.tmp.path().join("rag-down");
+    let hang = env.tmp.path().join("rag-hang");
+    let attempted = env.tmp.path().join("rag-attempted");
+    let hung = env.tmp.path().join("rag-hung-pid");
+    let script = format!(
+        "#!/bin/sh\ncat >/dev/null\nif [ -e '{}' ]; then echo $$ > '{}'; touch '{}'; exec sleep 30; fi\nif [ -e '{}' ]; then touch '{}'; printf '%s\\n400' '{{\"errors\":[{{\"message\":\"down\"}}]}}'; exit 0; fi\nprintf '%s\\n200' '{{\"result\":{{\"data\":[[{vector}]]}}}}'\n",
+        hang.display(),
+        hung.display(),
+        attempted.display(),
+        down.display(),
+        attempted.display()
+    );
+    let curl = bin.join("curl");
+    std::fs::write(&curl, script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+fn rag_board(state: Option<&str>, envs: &[(&str, &str)]) -> Env {
+    let env = Env::new();
+    env.board_local();
+    let bin = fake_workers_ai(&env);
+    if let Some(state) = state {
+        std::fs::write(env.tmp.path().join(state), "").unwrap();
+    }
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let mut all = vec![
+        ("PATH", path.as_str()),
+        ("CF_ACCOUNT_ID", "test"),
+        ("CF_AI_TOKEN", "test"),
+        ("NEBULA_RAG_COPY_MS", "100"),
+    ];
+    all.extend_from_slice(envs);
+    env.start(&all)
+}
+
+fn rag_note(env: &Env, id: &str) -> i64 {
+    poll_until(Duration::from_secs(10), || {
+        env.json(&["decision", "show", id, "--json"])["meta"]["rag_note"].as_i64()
+    })
+    .unwrap_or_else(|| panic!("decision {id} never got its rag_note"))
+}
+
+fn rag_hit(env: &Env, text: &str, note: i64) -> Value {
+    let search = Command::new(env!("CARGO_BIN_EXE_nebula"))
+        .args(["rag", "search", "--exact", "--ws", "/", "--json", text])
+        .env("NEBULA_DATA_DIR", env.data_dir())
+        .env("NEBULA_RAG_LOCAL", "1")
+        .env_remove("NEBULA_RAG_ENV")
+        .current_dir(env.tmp.path())
+        .output()
+        .unwrap();
+    let hits = json_of(search, &["rag", "search", text]);
+    hits.as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["doc_id"].as_i64() == Some(note))
+        .cloned()
+        .unwrap_or_else(|| panic!("note {note} not among the hits for {text:?}: {hits}"))
+}
+
+fn pid_alive(pid: &str) -> bool {
+    Command::new("kill")
+        .args(["-0", pid])
+        .stderr(Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+}
+
+#[test]
+fn decision_reaches_rag() {
+    let env = Env::new();
+    env.board_local();
+    let bin = fake_workers_ai(&env);
+    let down = env.tmp.path().join("rag-down");
+    std::fs::write(&down, "").unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let env = env.start(&[
+        ("PATH", &path),
+        ("CF_ACCOUNT_ID", "test"),
+        ("CF_AI_TOKEN", "test"),
+        ("NEBULA_RAG_COPY_MS", "100"),
+    ]);
+
+    let decided = decide(
+        &env,
+        None,
+        &[
+            "Copy published files",
+            "--why",
+            "The checkout is disposable",
+            "--project",
+            "repo",
+        ],
+    );
+    let id = decided["id"].as_str().unwrap();
+    let attempted = env.tmp.path().join("rag-attempted");
+    poll_until(Duration::from_secs(10), || attempted.exists().then_some(()))
+        .expect("the board never tried to copy the decision to RAG");
+    let shown = env.json(&["decision", "show", id, "--json"]);
+    assert_eq!(shown["meta"].get("rag_note"), None, "{shown}");
+
+    std::fs::remove_file(&down).unwrap();
+    let note = poll_until(Duration::from_secs(10), || {
+        env.json(&["decision", "show", id, "--json"])["meta"]["rag_note"].as_i64()
+    })
+    .expect("the decision never got its rag_note once RAG answered");
+
+    let search = Command::new(env!("CARGO_BIN_EXE_nebula"))
+        .args([
+            "rag",
+            "search",
+            "--exact",
+            "--ws",
+            "/",
+            "--json",
+            "disposable",
+        ])
+        .env("NEBULA_DATA_DIR", env.data_dir())
+        .env("NEBULA_RAG_LOCAL", "1")
+        .env_remove("NEBULA_RAG_ENV")
+        .current_dir(env.tmp.path())
+        .output()
+        .unwrap();
+    let hits = json_of(search, &["rag", "search"]);
+    let hit = hits
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["doc_id"].as_i64() == Some(note))
+        .unwrap_or_else(|| panic!("note {note} not among {hits}"));
+    assert_eq!(hit["ws"], "apps/repo/notes");
+    assert!(
+        hit["text"]
+            .as_str()
+            .unwrap()
+            .contains("The checkout is disposable"),
+        "{hit}"
+    );
+}
+
+#[test]
+fn away_digest_decisions() {
+    let env = board_env();
+    let before = decide(&env, None, &["Keep the counter", "--project", "repo"]);
+    let since = before["created_at"].as_i64().unwrap();
+    let after = decide(&env, None, &["Drop the cookie grant", "--project", "repo"]);
+    let elsewhere = decide(&env, None, &["Ship slice two", "--project", "web"]);
+    let since = since.to_string();
+    let board = env.json(&[
+        "todo",
+        "board",
+        "--project",
+        "repo",
+        "--away-since",
+        &since,
+        "--json",
+    ]);
+    assert_eq!(
+        board["board"]["away"]["decisions"],
+        serde_json::json!([after["id"]]),
+        "{board} (outside the scope: {})",
+        elsewhere["id"]
+    );
+}
+
+#[test]
+fn similar_decisions_keep_their_own_rag_notes() {
+    let env = rag_board(None, &[]);
+    let first = decide(
+        &env,
+        None,
+        &[
+            "Cache the index",
+            "--why",
+            "Cold starts are slow",
+            "--project",
+            "repo",
+        ],
+    );
+    let first_note = rag_note(&env, first["id"].as_str().unwrap());
+    let second = decide(
+        &env,
+        None,
+        &[
+            "Cache the index",
+            "--why",
+            "Disk reads dominate",
+            "--project",
+            "repo",
+        ],
+    );
+    let second_note = rag_note(&env, second["id"].as_str().unwrap());
+    assert_ne!(first_note, second_note);
+    assert!(rag_hit(&env, "Cold starts are slow", first_note)["text"]
+        .as_str()
+        .unwrap()
+        .contains("Cold starts are slow"));
+    assert!(rag_hit(&env, "Disk reads dominate", second_note)["text"]
+        .as_str()
+        .unwrap()
+        .contains("Disk reads dominate"));
+}
+
+#[test]
+fn decision_on_a_card_takes_its_project() {
+    let env = board_env();
+    env.make_repo();
+    let card = add(&env, &["--project", "repo"], "Publish");
+    let home = add(&env, &["--home"], "Errands");
+    let on_card = decide(&env, None, &["Copy published files", "--card", "#1"]);
+    assert_eq!(on_card["card"], card["id"]);
+    assert_eq!(on_card["project"], "repo");
+    let on_home = decide(&env, None, &["Batch the errands", "--card", "#2"]);
+    assert_eq!(on_home["card"], home["id"]);
+    assert_eq!(on_home["project"], Value::Null);
+    assert_eq!(
+        decision_titles(&env, &["--project", "repo"]),
+        ["Copy published files"]
+    );
+}
+
+#[test]
+fn decision_add_home_ignores_the_callers_checkout() {
+    let env = board_env();
+    env.make_repo();
+    let (_, agent) = carded_agent(&env, "main");
+    let decided = decide(
+        &env,
+        Some(&agent),
+        &["--why=Nobody owns it yet", "--home", "Keep a shared inbox"],
+    );
+    assert_eq!(decided["card"], Value::Null);
+    assert_eq!(decided["project"], Value::Null);
+    assert_eq!(decided["title"], "Keep a shared inbox");
+}
+
+#[test]
+fn decision_in_a_project_rag_cannot_name_still_reaches_rag() {
+    let env = rag_board(None, &[]);
+    let spaced = decide(
+        &env,
+        None,
+        &[
+            "Bill monthly",
+            "--why",
+            "Spaced project",
+            "--project",
+            "Client Portal",
+        ],
+    );
+    let plain = decide(
+        &env,
+        None,
+        &[
+            "Bill yearly",
+            "--why",
+            "Plain project",
+            "--project",
+            "client-portal",
+        ],
+    );
+    let spaced_ws = rag_hit(
+        &env,
+        "Spaced project",
+        rag_note(&env, spaced["id"].as_str().unwrap()),
+    )["ws"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let plain_ws = rag_hit(
+        &env,
+        "Plain project",
+        rag_note(&env, plain["id"].as_str().unwrap()),
+    )["ws"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(plain_ws, "apps/client-portal/notes");
+    assert!(
+        spaced_ws.starts_with("apps/client-portal-") && spaced_ws.ends_with("/notes"),
+        "{spaced_ws}"
+    );
+}
+
+#[test]
+fn hung_rag_copy_is_killed_at_its_deadline() {
+    let env = rag_board(Some("rag-hang"), &[("NEBULA_RAG_TIMEOUT_MS", "500")]);
+    let decided = decide(
+        &env,
+        None,
+        &[
+            "Copy published files",
+            "--why",
+            "The checkout is disposable",
+            "--project",
+            "repo",
+        ],
+    );
+    let hung = env.tmp.path().join("rag-hung-pid");
+    let pid = poll_until(Duration::from_secs(10), || {
+        std::fs::read_to_string(&hung).ok()
+    })
+    .expect("the board never tried to copy the decision to RAG");
+    std::fs::remove_file(env.tmp.path().join("rag-hang")).unwrap();
+    rag_note(&env, decided["id"].as_str().unwrap());
+    assert!(
+        !pid_alive(pid.trim()),
+        "the hung rag child {pid} outlived its deadline"
+    );
+}
+
+#[test]
+fn kill_stops_a_hung_rag_copy() {
+    let mut env = rag_board(Some("rag-hang"), &[]);
+    decide(&env, None, &["Copy published files", "--project", "repo"]);
+    let hung = env.tmp.path().join("rag-hung-pid");
+    let pid = poll_until(Duration::from_secs(10), || {
+        std::fs::read_to_string(&hung).ok()
+    })
+    .expect("the board never tried to copy the decision to RAG");
+    let killed = env.cli(&["kill"], None);
+    assert!(killed.status.success(), "{}", stderr(&killed));
+    let mut daemon = env.daemon.take().unwrap();
+    let exited = poll_until(Duration::from_secs(5), || daemon.try_wait().unwrap());
+    if exited.is_none() {
+        let _ = daemon.kill();
+        let _ = daemon.wait();
+        panic!("the daemon outlived nebula kill while a rag copy hung");
+    }
+    assert!(
+        poll_until(Duration::from_secs(5), || (!pid_alive(pid.trim()))
+            .then_some(()))
+        .is_some(),
+        "the hung rag child {pid} outlived the daemon"
     );
 }

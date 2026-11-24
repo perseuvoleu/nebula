@@ -33,7 +33,8 @@ import usage
 STATIC = Path(__file__).parent / "static"
 KINDS = {"pi", "claude", "codex", "cursor"}
 ATTEMPT = re.compile(r"[A-Za-z0-9_-]{4,64}")
-ROUTE = re.compile(r"/(?:serverless|p/[A-Za-z0-9._@-]{1,80}(?:/s/[A-Za-z0-9._-]{1,80})?)?/?")
+ROUTE = re.compile(r"/(?:serverless|p/[A-Za-z0-9._@-]{1,80}(?:/s/[A-Za-z0-9._-]{1,80})?"
+                   r"|board(?:/p/[A-Za-z0-9._@-]{1,80}|/c/[A-Za-z0-9._@%-]{1,80}|/decisions(?:/p/[A-Za-z0-9._@-]{1,80})?)?)?/?")
 ASSET_TYPES = {".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml",
                ".png": "image/png", ".ico": "image/x-icon", ".webmanifest": "application/manifest+json",
                ".json": "application/json", ".woff2": "font/woff2", ".woff": "font/woff", ".txt": "text/plain",

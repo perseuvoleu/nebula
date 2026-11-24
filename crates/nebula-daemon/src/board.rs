@@ -11,9 +11,9 @@ use nebula_core::board::{
 use nebula_core::{AgentId, AgentKind, AgentStatus, ArtifactId, NoteId, TodoId, MAX_FRAME_LEN};
 use rusqlite::{params, OptionalExtension, Row, Transaction};
 
-/// Bytes of cards one page may carry; the rest of the frame is headroom
-/// for hosts, the away digest and the envelope.
-fn page_budget() -> usize {
+/// Bytes one page may carry, hosts and the away digest included; the rest
+/// of the frame is headroom for the envelope.
+pub(crate) fn page_budget() -> usize {
     std::env::var("NEBULA_BOARD_PAGE_BYTES")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -21,7 +21,13 @@ fn page_budget() -> usize {
 }
 
 pub fn serve(store: &Store, op: BoardOp) -> Result<BoardResult> {
-    store.board_transaction(|tx| apply(tx, op))
+    let result = store.board_transaction(|tx| apply(tx, op))?;
+    if let BoardResult::Artifact(artifact) = &result {
+        if artifact.kind == "decision" && !artifact.meta.contains_key("rag_note") {
+            crate::rag_copy::kick();
+        }
+    }
+    Ok(result)
 }
 
 fn apply(tx: &Transaction, op: BoardOp) -> Result<BoardResult> {
@@ -122,13 +128,14 @@ fn apply(tx: &Transaction, op: BoardOp) -> Result<BoardResult> {
             let note = add_note(tx, id, &card, &text, &author)?;
             card_by_id(tx, &note.card).map(BoardResult::Card)
         }
+        BoardOp::Report(report) => crate::board_report::apply(tx, report),
         BoardOp::Publish(artifact) => {
             crate::artifacts::publish(tx, artifact).map(BoardResult::Artifact)
         }
         BoardOp::RemoveArtifact { id } => {
             crate::artifacts::remove(tx, &id).map(BoardResult::Artifact)
         }
-        BoardOp::BeginRun(_) | BoardOp::EndRun { .. } | BoardOp::Report(_) => {
+        BoardOp::BeginRun(_) | BoardOp::EndRun { .. } => {
             bail!("this board does not serve that operation yet")
         }
         BoardOp::Scoped { scope, op } => {
@@ -259,7 +266,7 @@ fn add_card(tx: &Transaction, draft: CardDraft) -> Result<Card> {
     card_by_id(tx, &draft.id)
 }
 
-fn add_note(
+pub(crate) fn add_note(
     tx: &Transaction,
     id: NoteId,
     card: &CardRef,
@@ -429,8 +436,8 @@ pub(crate) fn paged<T: serde::Serialize>(
     items: Vec<T>,
     offset: usize,
     version: &str,
+    budget: usize,
 ) -> Result<(Vec<T>, Option<String>)> {
-    let budget = page_budget();
     let total = items.len();
     let mut used = 0;
     let mut page = Vec::new();
@@ -465,11 +472,13 @@ fn read_op(tx: &Transaction, read: BoardRead) -> Result<BoardResult> {
                     Some(since) => away(tx, &scope, &cards, since)?,
                     None => Away::default(),
                 };
-                (hosts(tx)?, away)
+                (hosts(tx, &scope)?, away)
             } else {
                 (Vec::new(), Away::default())
             };
-            let (cards, next) = paged(cards, offset, &version)?;
+            let reserved = serde_json::to_vec(&hosts)?.len() + serde_json::to_vec(&away)?.len();
+            let budget = page_budget().saturating_sub(reserved);
+            let (cards, next) = paged(cards, offset, &version, budget)?;
             Ok(BoardResult::Board(BoardPoll::Board {
                 version,
                 board: BoardPage { cards, hosts, away },
@@ -485,7 +494,7 @@ fn read_op(tx: &Transaction, read: BoardRead) -> Result<BoardResult> {
             let version = cursor(tx)?;
             let offset = page_offset(page.as_deref(), &version)?;
             let cards = scoped_cards(tx, &scope, stage, include_archived)?;
-            let (items, next) = paged(cards, offset, &version)?;
+            let (items, next) = paged(cards, offset, &version, page_budget())?;
             Ok(BoardResult::Cards(Page { items, next }))
         }
         BoardRead::Card { scope, card } => {
@@ -531,7 +540,7 @@ fn sessions_of(tx: &Transaction, card: &TodoId) -> Result<Vec<CardSession>> {
     Ok(tx
         .prepare(
             "SELECT host, agent_id, name, role, kind, status, status_changed_at, writer, alive
-             FROM board_sessions WHERE card_id = ?1 ORDER BY rowid",
+             FROM board_sessions WHERE card_id = ?1 ORDER BY created_at, rowid",
         )?
         .query_map(params![card.as_str()], |r| {
             Ok(CardSession {
@@ -552,21 +561,37 @@ fn sessions_of(tx: &Transaction, card: &TodoId) -> Result<Vec<CardSession>> {
         .collect::<rusqlite::Result<_>>()?)
 }
 
-fn hosts(tx: &Transaction) -> Result<Vec<BoardHost>> {
+fn hosts(tx: &Transaction, scope: &BoardScope) -> Result<Vec<BoardHost>> {
+    let waiting: Vec<(String, Option<String>)> = tx
+        .prepare(
+            "SELECT s.host, t.project FROM board_sessions s LEFT JOIN todos t ON t.id = s.card_id
+             WHERE s.status = 'needs_feedback' AND s.archived = 0 AND s.alive = 1",
+        )?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let needs_you = |host: &str| {
+        waiting
+            .iter()
+            .filter(|(h, project)| h == host && in_scope(scope, project.as_deref()))
+            .count() as u32
+    };
     Ok(tx
         .prepare(
-            "SELECT h.host, h.writers, h.writer_slots, h.checkouts,
-                    (SELECT COUNT(*) FROM board_sessions s
-                     WHERE s.host = h.host AND s.status = 'needs_feedback' AND s.archived = 0)
+            "SELECT h.host, h.writers, h.writer_slots, h.checkouts
              FROM board_hosts h ORDER BY h.host",
         )?
         .query_map([], |r| {
+            let host: String = r.get(0)?;
+            let checkouts: Vec<nebula_core::board::HostCheckout> = json_column(r, 3)?;
             Ok(BoardHost {
-                host: r.get(0)?,
+                needs_you: needs_you(&host),
+                host,
                 writers: r.get(1)?,
                 writer_slots: r.get(2)?,
-                checkouts: json_column(r, 3)?,
-                needs_you: r.get(4)?,
+                checkouts: checkouts
+                    .into_iter()
+                    .filter(|c| in_scope(scope, Some(&c.project)))
+                    .collect(),
                 stale: false,
             })
         })?
@@ -591,7 +616,8 @@ fn away(tx: &Transaction, scope: &BoardScope, cards: &[Card], since: i64) -> Res
     let needs_you = tx
         .prepare(
             "SELECT host, agent_id, card_id FROM board_sessions
-             WHERE status = 'needs_feedback' AND archived = 0 AND status_changed_at > ?1
+             WHERE status = 'needs_feedback' AND archived = 0 AND alive = 1
+               AND status_changed_at > ?1
              ORDER BY status_changed_at",
         )?
         .query_map(params![since], |r| {

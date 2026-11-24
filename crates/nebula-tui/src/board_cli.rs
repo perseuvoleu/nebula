@@ -249,12 +249,16 @@ pub(crate) const CLOSED: &str = "daemon closed the connection before replying";
 /// Reads the card `text` names, so a spawn linking it is refused before
 /// anything starts.
 pub async fn check_card(conn: &mut Connection, text: &str) -> Result<TodoId> {
+    Ok(read_card(conn, text).await?.id)
+}
+
+pub async fn read_card(conn: &mut Connection, text: &str) -> Result<Card> {
     let op = BoardOp::Read(BoardRead::Card {
         scope: ScopeFlags::default().scope(None),
         card: card_ref(text)?,
     });
     match request(conn, op).await? {
-        BoardResult::Show(show) => Ok(show.card.id),
+        BoardResult::Show(show) => Ok(show.card),
         other => bail!("the board answered a card read with {other:?}"),
     }
 }
@@ -450,6 +454,37 @@ fn print_human(result: &BoardResult) {
         }
         BoardResult::Show(show) => {
             println!("{}", card_line(&show.card));
+            if let Some(checkout) = &show.card.checkout {
+                let kind = if checkout.worktree {
+                    "worktree"
+                } else {
+                    "primary"
+                };
+                println!("  on {} {} ({kind})", checkout.host, checkout.branch);
+            }
+            let now = crate::hosts::now_ms();
+            for session in &show.sessions {
+                let role = session.role.map_or("-", |r| r.as_str());
+                let mut line = format!(
+                    "  {role} {} on {}: {} {}",
+                    session.name,
+                    session.host,
+                    session.kind.as_str(),
+                    session.status.as_str()
+                );
+                let ago = crate::hosts::ago_label(now - session.status_changed_at);
+                if !ago.is_empty() {
+                    line.push_str(&format!(" {ago}"));
+                }
+                if session.writer {
+                    line.push_str(", writer");
+                }
+                line.push_str(if session.alive { ", live" } else { ", stopped" });
+                if session.stale {
+                    line.push_str(", stale");
+                }
+                println!("{line}");
+            }
             for note in &show.log {
                 println!("  {}: {}", note.author.name, note.text);
             }
@@ -459,6 +494,44 @@ fn print_human(result: &BoardResult) {
         BoardResult::Board(BoardPoll::Board { board, .. }) => {
             for card in &board.cards {
                 println!("{}", card_line(card));
+            }
+            for host in &board.hosts {
+                let slots = host
+                    .writer_slots
+                    .map(|s| format!("/{s}"))
+                    .unwrap_or_default();
+                println!(
+                    "{}: {}{slots} writers, {} checkouts, {} need you",
+                    host.host,
+                    host.writers,
+                    host.checkouts.len(),
+                    host.needs_you
+                );
+            }
+            let away = &board.away;
+            if !away.finished.is_empty() || !away.needs_you.is_empty() {
+                println!(
+                    "while you were away: {} cards finished, {} sessions need you",
+                    away.finished.len(),
+                    away.needs_you.len()
+                );
+            }
+            if !away.finished.is_empty() {
+                let refs: Vec<&str> = away
+                    .finished
+                    .iter()
+                    .map(|id| {
+                        board
+                            .cards
+                            .iter()
+                            .find(|c| &c.id == id)
+                            .map_or(id.as_str(), |c| c.label.as_str())
+                    })
+                    .collect();
+                println!("  finished: {}", refs.join(", "));
+            }
+            for session in &away.needs_you {
+                println!("  needs you: {} on {}", session.id, session.host);
             }
         }
         other => println!("{other:?}"),
