@@ -1968,6 +1968,22 @@ fn link_add_shows_on_board() {
     );
 }
 
+#[test]
+fn link_qualifies_cleared_blockers_like_blocked_by() {
+    let board = board_env();
+    let here = viewer(&proxy_to(&board));
+    add(&board, &["--project", "nebula"], "Waits");
+    add(&board, &["--project", "nebula"], "Blocker");
+    board.json(&["todo", "block", "#1", "--by", "#2", "--json"]);
+    board.json(&["todo", "archive", "#2", "--json"]);
+    let shown = here.json(&["todo", "show", "#1@boardhost", "--json"]);
+    assert_eq!(shown["blocked_by"], serde_json::json!(["#2@boardhost"]));
+    assert_eq!(
+        shown["cleared_blockers"],
+        serde_json::json!(["#2@boardhost"])
+    );
+}
+
 const UNREACHABLE: &str = "nebula: board host boardhost is unreachable; nothing was sent";
 
 #[test]
