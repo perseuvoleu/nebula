@@ -687,6 +687,30 @@ fn card_write_outside_scope_refused() {
     assert_eq!(home["archived"], true);
 }
 
+#[test]
+fn note_replay_bound_to_its_card() {
+    let env = board_env();
+    add(&env, &["--project", "other"], "Elsewhere");
+    add(&env, &["--project", "nebula"], "Here");
+    let id = nebula_core::TodoId::generate().0;
+    env.json(&["todo", "note", "#1", "first", "--id", &id, "--json"]);
+
+    for scope in [&["--scope", "nebula"][..], &[]] {
+        let argv = [&["todo", "note", "#2", "first", "--id", &id][..], scope].concat();
+        let out = env.cli(&argv, None);
+        assert_eq!(out.status.code(), Some(6), "{argv:?}: {}", stderr(&out));
+        assert!(out.stdout.is_empty(), "{argv:?} printed {:?}", out.stdout);
+    }
+    let replay = env.json(&["todo", "note", "#1", "first", "--id", &id, "--json"]);
+    assert_eq!(replay["ref"], "#1");
+    assert_eq!(
+        env.json(&["todo", "show", "#2", "--json"])["log"],
+        serde_json::json!([])
+    );
+    let log = env.json(&["todo", "show", "#1", "--json"])["log"].clone();
+    assert_eq!(log.as_array().map(Vec::len), Some(1), "{log}");
+}
+
 fn board_at(host: &str) -> String {
     format!(r#"{{"board": "{host}"}}"#)
 }

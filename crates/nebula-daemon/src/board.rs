@@ -265,6 +265,10 @@ fn add_note(
     let card = resolve(tx, card)?;
     let known = note_by_id(tx, &id)?;
     if let Some(note) = known {
+        if note.card != card {
+            bail!(Refusal::Conflict
+                .message(format!("note {} was added to another card", id.as_str())));
+        }
         return Ok(note);
     }
     let text = non_empty(text, "a note")?;
