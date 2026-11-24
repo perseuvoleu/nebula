@@ -2468,6 +2468,12 @@ fn approve_checks_status_timestamp() {
         argv.extend_from_slice(scope);
         env.cli(&argv, None)
     };
+    eventually("the session on the card", || {
+        chain(&env, "#1")
+            .iter()
+            .any(|s| s["id"] == session.as_str())
+            .then_some(())
+    });
     let fresh = session_row(&env, &session);
     let not_asking = approve(fresh["status_changed_at"].as_i64().unwrap(), &[]);
     assert_eq!(not_asking.status.code(), Some(6), "{}", stderr(&not_asking));
@@ -2753,10 +2759,10 @@ fn cross_host_run_over_ssh() {
 #[test]
 fn cross_host_report_resent_on_connect() {
     let mut board = board_env();
-    let here = viewer(&proxy_to(&board));
+    let here = viewer_on(&proxy_to(&board), "laptop", &[]);
     here.make_repo();
     add(&here, &["--project", "repo"], "Resend");
-    let worker = json_of(
+    json_of(
         spawn_agent(
             &here,
             &[
@@ -2770,34 +2776,26 @@ fn cross_host_report_resent_on_connect() {
         ),
         &["agent", "new", "worker"],
     );
-    eventually("the worker on the board", || {
-        (chain(&board, "#1").len() == 1).then_some(())
+    let alive = |board: &Env| chain(board, "#1").first().map(|s| s["alive"] == true);
+    eventually("the worker live on the board", || {
+        (alive(&board) == Some(true)).then_some(())
     });
+    let forgotten = HostReport {
+        host: "laptop".into(),
+        writers: 0,
+        writer_slots: None,
+        checkouts: Vec::new(),
+        sessions: Vec::new(),
+    };
+    board_op(&board, BoardOp::Report(forgotten)).expect("the board takes a host report");
+    assert_eq!(alive(&board), Some(false));
     stop(&mut board);
-    let child = json_of(
-        here.cli(
-            &[
-                "agent",
-                "new",
-                "--project",
-                "repo",
-                "--worktree",
-                "main",
-                "--name",
-                "child",
-            ],
-            worker["id"].as_str(),
-        ),
-        &["agent", "new", "child"],
-    );
     let board = board.start(&[]);
     here.json(&["todo", "show", "#1@boardhost", "--json"]);
-    eventually("the child reported once the link is back", || {
-        chain(&board, "#1")
-            .iter()
-            .any(|s| s["id"] == child["id"])
-            .then_some(())
-    });
+    eventually(
+        "the unchanged report sent again once the link is back",
+        || (alive(&board) == Some(true)).then_some(()),
+    );
 }
 
 fn cut_after(board: &Env, needle: &str, count: usize) -> (String, PathBuf) {
@@ -2853,7 +2851,7 @@ while True:
 #[test]
 fn run_end_lost_exit_4() {
     let board = board_env();
-    let (relay, down) = cut_after(&board, "\"Show\"", 2);
+    let (relay, down) = cut_after(&board, "Show", 1);
     let here = viewer(&relay);
     here.make_repo();
     add(&here, &["--project", "repo"], "Cut");
