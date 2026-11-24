@@ -552,8 +552,9 @@ pub enum ClientRequest {
         source: PathBuf,
     },
 
-    /// Removes the tree `StoreArtifact` stored under `id`, after the board
-    /// definitely refused its row. Answered by Ack or Error.
+    /// Removes the tree `StoreArtifact` created under `id`, after the board
+    /// definitely refused its row; refused when this daemon's board holds a
+    /// row for `id`. Answered by Ack or Error.
     DiscardArtifact {
         req_id: u64,
         id: ArtifactId,
@@ -724,9 +725,11 @@ pub enum ServerEvent {
     },
 
     /// Reply to `ClientRequest::StoreArtifact`: the stored copy, to publish.
+    /// `created` is false when the same tree was already stored under the id.
     ArtifactStored {
         req_id: u64,
         content: ArtifactContent,
+        created: bool,
     },
 
     ArtifactLocated {

@@ -333,8 +333,13 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     kind,
                     source,
                 } => answer_blocking(out_tx.clone(), req_id, move || {
-                    crate::artifacts::store(&id, &kind, &source)
-                        .map(|content| ServerEvent::ArtifactStored { req_id, content })
+                    crate::artifacts::store(&id, &kind, &source).map(|(content, created)| {
+                        ServerEvent::ArtifactStored {
+                            req_id,
+                            content,
+                            created,
+                        }
+                    })
                 }),
                 ClientRequest::LocateArtifact { req_id, id, entry } => {
                     answer_blocking(out_tx.clone(), req_id, move || {
@@ -343,8 +348,9 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     })
                 }
                 ClientRequest::DiscardArtifact { req_id, id } => {
+                    let daemon = daemon.clone();
                     answer_blocking(out_tx.clone(), req_id, move || {
-                        crate::artifacts::discard(&id).map(|()| ServerEvent::Ack {
+                        crate::artifacts::discard(&daemon.store, &id).map(|()| ServerEvent::Ack {
                             req_id,
                             created: None,
                         })

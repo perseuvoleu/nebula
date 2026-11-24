@@ -32,7 +32,7 @@ fn store_dir() -> PathBuf {
     paths::data_dir().join("artifacts")
 }
 
-pub fn store(id: &ArtifactId, kind: &str, source: &Path) -> Result<ArtifactContent> {
+pub fn store(id: &ArtifactId, kind: &str, source: &Path) -> Result<(ArtifactContent, bool)> {
     if ulid::Ulid::from_string(id.as_str()).is_err() {
         bail!("artifact id {id} is not a ULID");
     }
@@ -44,22 +44,23 @@ pub fn store(id: &ArtifactId, kind: &str, source: &Path) -> Result<ArtifactConte
     std::fs::create_dir_all(&root)?;
     let tmp = root.join(format!(".tmp-{id}"));
     let _ = std::fs::remove_dir_all(&tmp);
-    let entry = copy_tree(source, &tmp).and_then(|(files, is_dir)| {
+    let stored = copy_tree(source, &tmp).and_then(|(files, is_dir)| {
         let entry = entry_of(kind, is_dir, &tmp, &files)?;
         if !dest.exists() {
             std::fs::rename(&tmp, &dest)?;
-        } else if !same_tree(&tmp, &dest, &files)? {
+            return Ok((entry, true));
+        }
+        if !same_tree(&tmp, &dest, &files)? {
             bail!(Refusal::Conflict.message(format!(
                 "artifact {id} is already stored with other content"
             )));
         }
-        Ok(entry)
+        Ok((entry, false))
     });
     let _ = std::fs::remove_dir_all(&tmp);
-    Ok(ArtifactContent::Files {
-        host: nebula_core::host::hostname(),
-        entry: entry?,
-    })
+    let (entry, created) = stored?;
+    let host = nebula_core::host::hostname();
+    Ok((ArtifactContent::Files { host, entry }, created))
 }
 
 pub fn locate(id: &ArtifactId, entry: &str) -> Result<PathBuf> {
@@ -83,9 +84,14 @@ pub fn locate(id: &ArtifactId, entry: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-pub fn discard(id: &ArtifactId) -> Result<()> {
+pub fn discard(store: &crate::store::Store, id: &ArtifactId) -> Result<()> {
     if ulid::Ulid::from_string(id.as_str()).is_err() {
         bail!("artifact id {id} is not a ULID");
+    }
+    if store.board_transaction(|tx| by_id(tx, id))?.is_some() {
+        bail!(
+            Refusal::Conflict.message(format!("artifact {id} is published; its stored tree stays"))
+        );
     }
     match std::fs::remove_dir_all(store_dir().join(id.as_str())) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),

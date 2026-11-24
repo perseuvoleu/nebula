@@ -954,6 +954,24 @@ fn artifact_add_rerun_with_id() {
 }
 
 #[test]
+fn artifact_add_rerun_without_board_keeps_the_stored_tree() {
+    let env = board_env();
+    let page = tree(&env.tmp.path().join("page"), &[("index.html", b"one")]);
+    let id = nebula_core::ArtifactId::generate().0;
+    let args = [page.to_str().unwrap(), "--kind", "recap", "--id", &id];
+    publish(&env, None, &args);
+
+    env.write_config("{}");
+    let mut argv = vec!["artifact", "add"];
+    argv.extend_from_slice(&args);
+    refused(&env.cli(&argv, None), "no board configured");
+    assert_eq!(
+        std::fs::read(env.stored(&id).join("index.html")).unwrap(),
+        b"one"
+    );
+}
+
+#[test]
 fn artifact_add_refused_publish_drops_the_tree() {
     let env = Env::new().start(&[]);
     let page = tree(&env.tmp.path().join("page"), &[("index.html", b"x")]);

@@ -106,7 +106,7 @@ async fn store(
     id: &ArtifactId,
     kind: &str,
     source: PathBuf,
-) -> Result<ArtifactContent> {
+) -> Result<(ArtifactContent, bool)> {
     let req = ClientRequest::StoreArtifact {
         req_id: 1,
         id: id.clone(),
@@ -114,7 +114,9 @@ async fn store(
         source,
     };
     match exchange(conn, req).await? {
-        ServerEvent::ArtifactStored { content, .. } => Ok(content),
+        ServerEvent::ArtifactStored {
+            content, created, ..
+        } => Ok((content, created)),
         other => bail!("the daemon answered a store with {other:?}"),
     }
 }
@@ -128,7 +130,7 @@ fn outcome_known(why: &anyhow::Error) -> bool {
 async fn unpublished(
     conn: &mut Connection,
     id: &ArtifactId,
-    stored: bool,
+    created: bool,
     why: anyhow::Error,
 ) -> anyhow::Error {
     if !outcome_known(&why) {
@@ -136,7 +138,7 @@ async fn unpublished(
             "artifact {id} may have been published ({why:#}); rerun with --id {id}"
         )));
     }
-    if stored {
+    if created {
         let req = ClientRequest::DiscardArtifact {
             req_id: 1,
             id: id.clone(),
@@ -148,7 +150,7 @@ async fn unpublished(
     why
 }
 
-async fn add(conn: &mut Connection, caller: Caller, args: AddArgs) -> Result<BoardOp> {
+async fn add(conn: &mut Connection, caller: Caller, args: AddArgs) -> Result<(BoardOp, bool)> {
     let AddArgs {
         source,
         kind,
@@ -163,9 +165,9 @@ async fn add(conn: &mut Connection, caller: Caller, args: AddArgs) -> Result<Boa
         CardChoice::None => None,
     };
     let id = ArtifactId(client_id(id)?);
-    let (kind, content, default_title) = if let Some(url) = url(&source)? {
+    let (kind, content, default_title, created) = if let Some(url) = url(&source)? {
         let content = ArtifactContent::Url { url };
-        ("link".to_string(), content, source)
+        ("link".to_string(), content, source, false)
     } else {
         let kind = kind.context("--kind is required for a path")?;
         if !FILE_KINDS.contains(&kind.as_str()) {
@@ -176,15 +178,15 @@ async fn add(conn: &mut Connection, caller: Caller, args: AddArgs) -> Result<Boa
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| source.clone());
-        let content = store(conn, &id, &kind, path).await?;
-        (kind, content, name)
+        let (content, created) = store(conn, &id, &kind, path).await?;
+        (kind, content, name, created)
     };
     let session = caller.author.agent.clone().map(|id| SessionLink {
         host: caller.author.host.clone(),
         id,
         name: caller.author.name.clone(),
     });
-    Ok(BoardOp::Publish(Artifact {
+    let op = BoardOp::Publish(Artifact {
         id,
         kind,
         title: title.unwrap_or(default_title),
@@ -198,7 +200,8 @@ async fn add(conn: &mut Connection, caller: Caller, args: AddArgs) -> Result<Boa
             .duration_since(std::time::UNIX_EPOCH)?
             .as_millis() as i64,
         removed_at: None,
-    }))
+    });
+    Ok((op, created))
 }
 
 pub async fn run(verb: ArtifactVerb, json: bool) -> Result<()> {
@@ -206,8 +209,13 @@ pub async fn run(verb: ArtifactVerb, json: bool) -> Result<()> {
     let (projects, worktrees, agents) = ipc::subscribe_snapshot(&mut conn).await?;
     let caller = Caller::resolve(&projects, &worktrees, &agents)?;
     let mut opening = false;
+    let mut created = false;
     let mut op = match verb {
-        ArtifactVerb::Add(args) => add(&mut conn, caller, args).await?,
+        ArtifactVerb::Add(args) => {
+            let (op, stored) = add(&mut conn, caller, args).await?;
+            created = stored;
+            op
+        }
         ArtifactVerb::List {
             scope,
             card,
@@ -232,8 +240,7 @@ pub async fn run(verb: ArtifactVerb, json: bool) -> Result<()> {
     loop {
         let result = match (&op, request(&mut conn, op.clone()).await) {
             (BoardOp::Publish(artifact), Err(why)) => {
-                let stored = matches!(artifact.content, ArtifactContent::Files { .. });
-                return Err(unpublished(&mut conn, &artifact.id, stored, why).await);
+                return Err(unpublished(&mut conn, &artifact.id, created, why).await);
             }
             (_, result) => result?,
         };
