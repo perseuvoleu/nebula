@@ -1,7 +1,6 @@
 //! Cards on the board host: the `nebula todo` verbs against a daemon whose
 //! config says `board = "local"`, through the real CLI and its --json.
 
-use nebula_core::board::Refusal;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -205,7 +204,7 @@ fn card_move_stages() {
     let unknown = env.cli(&["todo", "move", "#1", "sideways"], None);
     let mismatch = env.cli(&["todo", "move", "#1", "done", "--expect", "review"], None);
     assert!(!unknown.status.success() && !mismatch.status.success());
-    assert_eq!(mismatch.status.code(), Some(Refusal::Conflict.exit_code()));
+    assert_eq!(mismatch.status.code(), Some(6));
     assert_ne!(unknown.status.code(), mismatch.status.code());
     let shown = env.json(&["todo", "show", "#1", "--json"]);
     assert_eq!(shown["stage"], "backlog", "a refused move changes nothing");
@@ -273,7 +272,7 @@ fn card_block_refuses_cycles() {
     let blocked = env.json(&["todo", "block", "#1", "--by", "#2", "--json"]);
     assert_eq!(blocked["blocked_by"], serde_json::json!(["#2"]));
 
-    let conflict = Some(Refusal::Conflict.exit_code());
+    let conflict = Some(6);
     assert_eq!(
         env.cli(&["todo", "block", "#1", "--by", "#1"], None)
             .status
@@ -390,12 +389,7 @@ fn board_read_pages() {
         &["todo", "board", "--all", "--page", &continuation, "--json"],
         None,
     );
-    assert_eq!(
-        stale.status.code(),
-        Some(Refusal::Conflict.exit_code()),
-        "{}",
-        stderr(&stale)
-    );
+    assert_eq!(stale.status.code(), Some(6), "{}", stderr(&stale));
 }
 
 #[test]
@@ -442,7 +436,7 @@ fn card_list_scope() {
             &["todo", "show", reference, "--project", "a", "--json"],
             None,
         );
-        assert_eq!(hidden.status.code(), Some(Refusal::NotFound.exit_code()));
+        assert_eq!(hidden.status.code(), Some(5));
         assert!(hidden.stdout.is_empty());
         let seen = env.json(&["todo", "show", reference, "--project", "b", "--json"]);
         assert_eq!(seen["title"], "B1");
@@ -537,7 +531,12 @@ fn agent_new_explicit_card() {
         &env,
         &["--card", "#99", "--role", "worker", "--name", "ghost"],
     );
-    assert!(!missing.status.success());
+    assert_eq!(missing.status.code(), Some(5), "{}", stderr(&missing));
+    assert!(
+        stderr(&missing).contains("no card #99"),
+        "{}",
+        stderr(&missing)
+    );
     let agents = env.json(&["agent", "list", "--project", "repo"]);
     let names: Vec<&str> = agents
         .as_array()
@@ -546,4 +545,50 @@ fn agent_new_explicit_card() {
         .map(|a| a["name"].as_str().unwrap())
         .collect();
     assert_eq!(names, ["carded"]);
+}
+
+fn agent_names(env: &Env) -> Vec<String> {
+    env.json(&["agent", "list", "--project", "repo"])
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+fn git(repo: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {}", stderr(&out));
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[test]
+fn agent_new_refused_card_leaves_checkout() {
+    let env = board_env();
+    let repo = env.make_repo();
+    git(&repo, &["branch", "feature"]);
+    let out = env.cli(
+        &[
+            "agent",
+            "new",
+            "--project",
+            "repo",
+            "--worktree",
+            "feature",
+            "--card",
+            "#99",
+            "--name",
+            "ghost",
+        ],
+        None,
+    );
+    assert_eq!(out.status.code(), Some(5), "{}", stderr(&out));
+    assert!(stderr(&out).contains("no card #99"), "{}", stderr(&out));
+    assert_eq!(git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]), "main");
+    assert!(agent_names(&env).is_empty());
 }

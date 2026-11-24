@@ -1787,6 +1787,10 @@ pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
     let mut conn = handshake(stream).await?;
     let (projects, worktrees, agents) = subscribe_snapshot(&mut conn).await?;
     let project = resolve_project(&projects, &worktrees, &agents, opts.project.as_deref())?;
+    let card = match opts.card.as_deref() {
+        Some(text) => Some(crate::board_cli::check_card(&mut conn, text).await?),
+        None => None,
+    };
     if let Some(host) = &project.host {
         let cache = paths::log_dir().join("skills-check");
         if let Some(warning) =
@@ -1844,10 +1848,6 @@ pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
             }
         },
         None => bail!("pass --worktree <branch>"),
-    };
-    let card = match opts.card.as_deref() {
-        Some(text) => Some(crate::board_cli::check_card(&mut conn, text).await?),
-        None => None,
     };
     let auto_title = opts.name.is_none();
     let name = opts.name.unwrap_or_else(|| {
