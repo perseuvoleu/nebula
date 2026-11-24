@@ -1946,3 +1946,51 @@ fn decision_add_home_ignores_the_callers_checkout() {
     assert_eq!(decided["project"], Value::Null);
     assert_eq!(decided["title"], "Keep a shared inbox");
 }
+
+#[test]
+fn decision_in_a_project_rag_cannot_name_still_reaches_rag() {
+    let env = rag_board(None, &[]);
+    let spaced = decide(
+        &env,
+        None,
+        &[
+            "Bill monthly",
+            "--why",
+            "Spaced project",
+            "--project",
+            "Client Portal",
+        ],
+    );
+    let plain = decide(
+        &env,
+        None,
+        &[
+            "Bill yearly",
+            "--why",
+            "Plain project",
+            "--project",
+            "client-portal",
+        ],
+    );
+    let spaced_ws = rag_hit(
+        &env,
+        "Spaced project",
+        rag_note(&env, spaced["id"].as_str().unwrap()),
+    )["ws"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let plain_ws = rag_hit(
+        &env,
+        "Plain project",
+        rag_note(&env, plain["id"].as_str().unwrap()),
+    )["ws"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(plain_ws, "apps/client-portal/notes");
+    assert!(
+        spaced_ws.starts_with("apps/client-portal-") && spaced_ws.ends_with("/notes"),
+        "{spaced_ws}"
+    );
+}

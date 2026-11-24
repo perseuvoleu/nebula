@@ -95,7 +95,7 @@ fn nebula() -> Result<PathBuf> {
 
 fn copy(decision: &Artifact) -> Result<i64> {
     let ws = match &decision.project {
-        Some(project) => format!("apps/{project}/notes"),
+        Some(project) => format!("apps/{}/notes", workspace_segment(project)),
         None => "shared".to_string(),
     };
     let why = match &decision.content {
@@ -157,6 +157,31 @@ fn rag(args: &[&str], stdin: Option<&str>) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// A project name RAG accepts as a workspace segment is used as it is.
+/// Any other gets a slug plus a hash of the exact name, so "Client Portal"
+/// and "client-portal" stay in distinct workspaces.
+fn workspace_segment(project: &str) -> String {
+    let valid = !matches!(project, "." | "..")
+        && !project.is_empty()
+        && project
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.'));
+    if valid {
+        return project.to_string();
+    }
+    let slug: String = project
+        .chars()
+        .map(|c| match c.is_ascii_alphanumeric() {
+            true => c.to_ascii_lowercase(),
+            false => '-',
+        })
+        .collect();
+    let hash = project.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+    });
+    format!("{}-{:08x}", slug.trim_matches('-'), hash as u32)
 }
 
 /// `saved note:12 → …`.
