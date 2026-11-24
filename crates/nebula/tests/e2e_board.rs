@@ -912,3 +912,52 @@ fn link_refuses_protocol_31() {
     assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
     assert!(stderr(&out).contains("protocol 31"), "{}", stderr(&out));
 }
+
+#[test]
+fn link_refuses_hello_ok_31() {
+    let env = Env::new();
+    let reply = reply_file(
+        &env,
+        "hello_ok_31.bin",
+        &nebula_core::ServerEvent::HelloOk {
+            protocol_version: 31,
+            daemon_pid: 1,
+        },
+    );
+    let here = viewer(&format!("cat '{}'; cat > /dev/null", reply.display()));
+
+    let out = here.cli(&["todo", "add", "--project", "nebula", "Old peer"], None);
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+    assert!(stderr(&out).contains("protocol 31"), "{}", stderr(&out));
+}
+
+#[test]
+fn link_refusal_cleared_by_later_attempt() {
+    let env = Env::new();
+    let reply = reply_file(
+        &env,
+        "incompatible.bin",
+        &nebula_core::ServerEvent::Incompatible {
+            daemon_protocol_version: 31,
+        },
+    );
+    let marker = env.tmp.path().join("answered");
+    let here = viewer(&format!(
+        "[ -e '{m}' ] && exit 0; touch '{m}'; cat '{}'; cat > /dev/null",
+        reply.display(),
+        m = marker.display()
+    ));
+    let argv = ["todo", "add", "--project", "nebula", "Peer"];
+
+    let refused = here.cli(&argv, None);
+    assert_eq!(refused.status.code(), Some(3), "{}", stderr(&refused));
+    assert!(
+        stderr(&refused).contains("protocol 31"),
+        "{}",
+        stderr(&refused)
+    );
+
+    let gone = here.cli(&argv, None);
+    assert_eq!(gone.status.code(), Some(3), "{}", stderr(&gone));
+    assert!(stderr(&gone).contains(UNREACHABLE), "{}", stderr(&gone));
+}

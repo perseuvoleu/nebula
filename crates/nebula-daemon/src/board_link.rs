@@ -189,8 +189,9 @@ impl BoardLink {
         });
     }
 
-    fn teardown(&self, out_rx: &mut mpsc::Receiver<(u64, BoardOp)>) {
+    fn teardown(&self, out_rx: &mut mpsc::Receiver<(u64, BoardOp)>, refused: Option<String>) {
         let _admission = self.admission.lock().unwrap();
+        *self.refused.lock().unwrap() = refused;
         self.state.send_modify(|s| {
             s.up = false;
             s.attempts += 1;
@@ -217,10 +218,14 @@ async fn run(link: Arc<BoardLink>, mut out_rx: mpsc::Receiver<(u64, BoardOp)>) {
     let mut backoff = RECONNECT_MIN;
     loop {
         let started = Instant::now();
-        if let Err(e) = connect_and_pump(&link, &mut out_rx).await {
-            tracing::warn!(host = %link.host, error = %e, "board link down");
-        }
-        link.teardown(&mut out_rx);
+        let refused = match connect_and_pump(&link, &mut out_rx).await {
+            Ok(()) => None,
+            Err(e) => {
+                tracing::warn!(host = %link.host, error = %e, "board link down");
+                e.downcast_ref::<VersionRefused>().map(|r| r.0.clone())
+            }
+        };
+        link.teardown(&mut out_rx, refused);
         if started.elapsed() >= RECONNECT_MAX {
             backoff = RECONNECT_MIN;
         }
@@ -306,24 +311,35 @@ async fn handshake<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         },
     )
     .await?;
-    let refused = match read_frame::<ServerEvent, _>(reader).await? {
+    let peer = match read_frame::<ServerEvent, _>(reader).await? {
         Some(ServerEvent::HelloOk {
             protocol_version, ..
-        }) if protocol_version == PROTOCOL_VERSION => None,
+        }) => protocol_version,
         Some(ServerEvent::Incompatible {
             daemon_protocol_version,
-        }) => Some(format!(
-            "board host {} runs protocol {daemon_protocol_version}, this daemon {PROTOCOL_VERSION} — upgrade nebula on one side",
-            link.host
-        )),
+        }) => daemon_protocol_version,
         other => bail!("unexpected handshake reply: {other:?}"),
     };
-    *link.refused.lock().unwrap() = refused.clone();
-    match refused {
-        Some(why) => bail!(why),
-        None => Ok(()),
+    if peer == PROTOCOL_VERSION {
+        return Ok(());
+    }
+    Err(VersionRefused(format!(
+        "board host {} runs protocol {peer}, this daemon {PROTOCOL_VERSION} — upgrade nebula on one side",
+        link.host
+    ))
+    .into())
+}
+
+#[derive(Debug)]
+struct VersionRefused(String);
+
+impl std::fmt::Display for VersionRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
     }
 }
+
+impl std::error::Error for VersionRefused {}
 
 fn localize(op: &mut BoardOp, host: &str) {
     for card in op.card_refs_mut() {
