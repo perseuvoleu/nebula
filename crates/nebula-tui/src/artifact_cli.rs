@@ -52,8 +52,28 @@ fn artifact_id(text: &str) -> Result<ArtifactId> {
     }
 }
 
-fn is_url(text: &str) -> bool {
-    text.starts_with("https://") || text.starts_with("http://")
+fn url(text: &str) -> Result<Option<String>> {
+    let Some((scheme, rest)) = text.split_once("://") else {
+        return Ok(None);
+    };
+    if !["http", "https"]
+        .iter()
+        .any(|s| scheme.eq_ignore_ascii_case(s))
+    {
+        return Ok(None);
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let host = match host.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or_default(),
+        None => host.split(':').next().unwrap_or_default(),
+    };
+    if host.is_empty() {
+        bail!("{text} has no host");
+    }
+    Ok(Some(text.to_string()))
 }
 
 async fn store(
@@ -99,13 +119,8 @@ async fn add(
         CardChoice::None => None,
     };
     let id = ArtifactId::generate();
-    let (kind, content, default_title) = if is_url(&source) {
-        if kind.as_deref().is_some_and(|k| k != "link") {
-            bail!("a URL is published as kind link");
-        }
-        let content = ArtifactContent::Url {
-            url: source.clone(),
-        };
+    let (kind, content, default_title) = if let Some(url) = url(&source)? {
+        let content = ArtifactContent::Url { url };
         ("link".to_string(), content, source)
     } else {
         let kind = kind.context("--kind is required for a path")?;

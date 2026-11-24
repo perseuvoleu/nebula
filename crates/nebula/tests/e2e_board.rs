@@ -889,3 +889,31 @@ fn artifact_rm_soft() {
     );
     assert_eq!(unknown.status.code(), Some(5), "{}", stderr(&unknown));
 }
+
+fn refused(out: &Output, why: &str) {
+    assert!(
+        !out.status.success(),
+        "stored: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(out.stdout.is_empty());
+    assert!(stderr(out).contains(why), "{why:?} not in {}", stderr(out));
+}
+
+#[test]
+fn artifact_add_url_forms() {
+    let env = board_env();
+    let upper = publish(&env, None, &["HTTPS://Example.com/x"]);
+    assert_eq!(upper["kind"], "link");
+    assert_eq!(
+        upper["content"],
+        serde_json::json!({"url": "HTTPS://Example.com/x"})
+    );
+    let kinded = publish(&env, None, &["https://vela.possu.dev", "--kind", "recap"]);
+    assert_eq!(kinded["kind"], "link");
+    for hostless in ["https://", "http:///path", "https://:8080/x"] {
+        let out = env.cli(&["artifact", "add", hostless], None);
+        refused(&out, "host");
+    }
+    assert_eq!(artifact_ids(&env).len(), 2);
+}
