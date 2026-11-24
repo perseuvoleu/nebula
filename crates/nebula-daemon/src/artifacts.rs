@@ -13,7 +13,6 @@ use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-/// Lowered by tests through `NEBULA_ARTIFACT_MAX_BYTES`.
 fn max_bytes() -> u64 {
     std::env::var("NEBULA_ARTIFACT_MAX_BYTES")
         .ok()
@@ -25,9 +24,6 @@ fn store_dir() -> PathBuf {
     paths::data_dir().join("artifacts")
 }
 
-/// Copies `source` into data_dir/artifacts/<id>/ through a temp sibling
-/// that is renamed only once every check passed, so a refusal stores
-/// nothing. A rerun with a stored id reuses the copy.
 pub fn store(id: &ArtifactId, kind: &str, source: &Path) -> Result<ArtifactContent> {
     if ulid::Ulid::from_string(id.as_str()).is_err() {
         bail!("artifact id {id} is not a ULID");
@@ -55,8 +51,6 @@ pub fn store(id: &ArtifactId, kind: &str, source: &Path) -> Result<ArtifactConte
     })
 }
 
-/// Which file opens first: result.json for an e2e-run, the only file of a
-/// one-file tree, else index.html for a page kind.
 fn entry_of(kind: &str, dir: &Path, files: &BTreeSet<String>) -> Result<String> {
     if kind == "e2e-run" {
         let result = std::fs::read_to_string(dir.join("result.json"))
@@ -234,8 +228,6 @@ pub(crate) fn of_card(tx: &Transaction, card: &TodoId) -> Result<Vec<Artifact>> 
         .collect::<rusqlite::Result<_>>()?)
 }
 
-/// A rerun with a known id returns the first row. A linked card must exist,
-/// and its project wins over the caller's.
 pub(crate) fn publish(tx: &Transaction, artifact: Artifact) -> Result<Artifact> {
     if let Some(known) = by_id(tx, &artifact.id)? {
         return Ok(known);
@@ -278,7 +270,6 @@ pub(crate) fn publish(tx: &Transaction, artifact: Artifact) -> Result<Artifact> 
     by_id(tx, &artifact.id)?.ok_or_else(|| not_found(&artifact.id))
 }
 
-/// Soft: the row stays for `show` and the stored bytes stay on disk.
 pub(crate) fn remove(tx: &Transaction, id: &ArtifactId) -> Result<Artifact> {
     tx.execute(
         "UPDATE artifacts SET removed_at = ?2 WHERE id = ?1 AND removed_at IS NULL",

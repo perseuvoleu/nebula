@@ -13,7 +13,6 @@ use nebula_core::codec::{read_frame, write_frame};
 use nebula_core::{paths, ArtifactId, ClientRequest, ServerEvent};
 use std::path::PathBuf;
 
-/// Kinds a path may be published as; a URL is always `link`.
 const FILE_KINDS: [&str; 5] = ["recap", "e2e-run", "diagram", "ticket", "prototype"];
 
 pub enum CardChoice {
