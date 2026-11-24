@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 import { PlusIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { type BoardCard, type Stage, STAGES, STAGE_LABEL } from "./model";
+import { type BoardCard, type Stage, STAGES, STAGE_LABEL } from "@/lib/board";
 import { CardTile, StagePill } from "./CardTile";
 
 export function BoardColumns({ columns, selected, showProject = false, onOpen, onAdd, renderActions }: {

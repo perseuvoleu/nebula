@@ -51,7 +51,7 @@ pub enum ArtifactVerb {
     },
 }
 
-fn artifact_id(text: &str) -> Result<ArtifactId> {
+pub(crate) fn artifact_id(text: &str) -> Result<ArtifactId> {
     match parse_card_ref(text) {
         Some(CardRef::Id(id)) => Ok(ArtifactId(id.0)),
         _ => bail!("{text:?} is not an artifact id (a ULID)"),
@@ -127,7 +127,7 @@ fn outcome_known(why: &anyhow::Error) -> bool {
         && Refusal::of(&why.to_string()) != Some(Refusal::OutcomeUnknown)
 }
 
-async fn unpublished(
+pub(crate) async fn unpublished(
     conn: &mut Connection,
     id: &ArtifactId,
     created: bool,

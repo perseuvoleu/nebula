@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 import { GitBranchIcon, PenLineIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { kindLabel, statusLabel } from "@/lib/status";
-import { type BoardCard, type LogEntry, STAGE_LABEL, projectName, sessionDot } from "./model";
+import { type BoardCard, type LogEntry, STAGE_LABEL, projectName, sessionDot } from "@/lib/board";
 import { CardRef, StagePill, StatusDot, Tag } from "./CardTile";
 
 function Section({ title, count, children }: { title: string; count?: number; children: ReactNode }) {
@@ -25,6 +25,7 @@ export function CardDetail({ card, log, mode, actions, proposalActions, onOpenCa
   onOpenCard?: (ref: string) => void;
   children?: ReactNode;
 }) {
+  const sessions = card.sessions ?? [];
   return (
     <div className={cn("flex flex-col gap-4", mode === "page" && "mx-auto w-full max-w-3xl")}>
       <div className="flex flex-col gap-2">
@@ -73,11 +74,11 @@ export function CardDetail({ card, log, mode, actions, proposalActions, onOpenCa
       {children}
 
       <div className={cn("flex flex-col gap-4", mode === "page" && "lg:grid lg:grid-cols-2")}>
-        <Section title="Sesiuni" count={card.sessions.length}>
-          {card.sessions.length
+        <Section title="Sesiuni" count={sessions.length}>
+          {sessions.length
             ? (
-              <ol className="flex flex-col rounded-lg border bg-background">
-                {card.sessions.map((s) => (
+              <ol aria-label="Sesiuni" className="flex flex-col rounded-lg border bg-background">
+                {sessions.map((s) => (
                   <li key={s.id} className="flex min-w-0 items-center gap-2 border-b px-3 py-2 last:border-b-0">
                     <StatusDot dot={sessionDot(s.status)} label={statusLabel(s.status)} />
                     <span className="min-w-0 flex-1">

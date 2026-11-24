@@ -6,6 +6,7 @@ agent dir (`pi/`) with synthetic session files, and board.json (cards, their ses
 artifacts and log, decisions) seeded from the golden board fixtures. Tests mutate these files
 to simulate the host.
 """
+import fcntl
 import json
 import os
 import sys
@@ -21,7 +22,9 @@ def load(name):
 
 
 def save(name, data):
-    (STATE / name).write_text(json.dumps(data, indent=1))
+    temporary = STATE / f".{name}.{os.getpid()}"
+    temporary.write_text(json.dumps(data, indent=1))
+    os.replace(temporary, STATE / name)
 
 
 def arg(flag, args):
@@ -31,6 +34,10 @@ def arg(flag, args):
         if item.startswith(flag + "="):
             return item.split("=", 1)[1]
     return None
+
+
+def options(args):
+    return args[:args.index("--")] if "--" in args else args
 
 
 def positionals(args):
@@ -68,19 +75,36 @@ def find_card(board, ref, args):
     return card if card and scoped(card, args) else None
 
 
+def away(board, cards, args):
+    since = arg("--away-since", args)
+    if since is None:
+        return {"finished": [], "needs_you": [], "decisions": []}
+    after = lambda event: event["at"] > int(since)
+    ids = {c["id"] for c in cards}
+    sessions = {(s["host"], s["id"]) for i in ids for s in board["details"].get(i, {}).get("sessions", [])}
+    return {"finished": [e["id"] for e in board["away"]["finished"] if after(e) and e["id"] in ids],
+            "needs_you": [{"host": e["host"], "id": e["id"]} for e in board["away"]["needs_you"]
+                          if after(e) and (e["host"], e["id"]) in sessions],
+            "decisions": [d["id"] for d in board["decisions"] if d["created_at"] > int(since) and scoped(d, args)]}
+
+
 def board_command(verb, args, board):
     """One `todo`/`decision` verb against board.json; returns (exit code, output)."""
-    flags = lambda name: arg(name, args)
+    flags = lambda name: arg(name, options(args))
     values = positionals(args)
+    args = options(args)
     version = f"{board['board_id']}.{board['version']}"
     if verb == ("todo", "board"):
+        if (STATE / "behaviour").exists() and (STATE / "behaviour").read_text().strip() == "fail":
+            return 3, "board host unreachable"
         if flags("--since") == version:
             return 0, {"version": version, "unchanged": True}
-        return 0, {"version": version, "board": {"cards": [c for c in board["cards"] if scoped(c, args) and not c["archived"]],
-                                                 "hosts": board["hosts"], "away": board["away"]}}
+        cards = [c for c in board["cards"] if scoped(c, args) and not c["archived"]]
+        hosts = [{**h, "checkouts": [c for c in h["checkouts"] if scoped(c, args)]} for h in board["hosts"]]
+        return 0, {"version": version, "board": {"cards": cards, "hosts": hosts, "away": away(board, cards, args)}, "next": None}
     if verb == ("decision", "list"):
         query = (flags("--query") or "").lower()
-        return 0, {"items": [d for d in board["decisions"] if query in (d["title"] + d["content"]["body"]).lower()],
+        return 0, {"items": [d for d in board["decisions"] if scoped(d, args) and query in (d["title"] + d["content"]["body"]).lower()],
                    "next": None}
     if verb == ("decision", "add"):
         decision = {"id": f"01JG{len(board['decisions']) + 100:022d}", "kind": "decision", "title": values[0],
@@ -247,12 +271,14 @@ def main(argv):
         print(json.dumps({"landed": "tui", "tui_pid": 1, "id": arg("--session", argv), "name": "worker",
                           "project": "nebula", "host": arg("--on", argv), "focused": True}))
     elif argv[0] in {"todo", "decision"}:
-        board = load("board.json")
-        before = json.dumps(board)
-        code, output = board_command(command, argv[2:], board)
-        if json.dumps(board) != before:
-            board["version"] += 1
-            save("board.json", board)
+        with open(STATE / "board.lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            board = load("board.json")
+            before = json.dumps(board)
+            code, output = board_command(command, argv[2:], board)
+            if json.dumps(board) != before:
+                board["version"] += 1
+                save("board.json", board)
         if code:
             print(output, file=sys.stderr)
             return code

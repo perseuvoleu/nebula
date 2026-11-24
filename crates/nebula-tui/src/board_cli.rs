@@ -268,12 +268,16 @@ pub(crate) const CLOSED: &str = "daemon closed the connection before replying";
 /// Reads the card `text` names, so a spawn linking it is refused before
 /// anything starts.
 pub async fn check_card(conn: &mut Connection, text: &str) -> Result<TodoId> {
+    Ok(read_card(conn, text).await?.id)
+}
+
+pub async fn read_card(conn: &mut Connection, text: &str) -> Result<Card> {
     let op = BoardOp::Read(BoardRead::Card {
         scope: ScopeFlags::default().scope(None),
         card: card_ref(text)?,
     });
     match request(conn, op).await? {
-        BoardResult::Show(show) => Ok(show.card.id),
+        BoardResult::Show(show) => Ok(show.card),
         other => bail!("the board answered a card read with {other:?}"),
     }
 }
