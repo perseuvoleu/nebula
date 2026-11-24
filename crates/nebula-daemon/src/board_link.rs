@@ -42,13 +42,10 @@ struct Pending {
 pub struct BoardLink {
     host: String,
     out: mpsc::Sender<(u64, BoardOp)>,
-    /// Serializes admission with teardown, so no request lands in the queue
-    /// after the drain.
     admission: Mutex<()>,
     pending: Mutex<HashMap<u64, Pending>>,
     next_req: AtomicU64,
     state: watch::Sender<LinkState>,
-    /// The board host's answer to Hello when it refused our protocol.
     refused: Mutex<Option<String>>,
     kick: Notify,
     stop: CancellationToken,
@@ -133,7 +130,6 @@ impl BoardLink {
         }
     }
 
-    /// A down link gets one immediate attempt before a request is refused.
     async fn connect_now(&self) {
         let mut state = self.state.subscribe();
         let seen = *state.borrow_and_update();
@@ -329,7 +325,6 @@ async fn handshake<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     }
 }
 
-/// A ref qualified with the board host means the board's own number there.
 fn localize(op: &mut BoardOp, host: &str) {
     for card in op.card_refs_mut() {
         if let CardRef::Number { board, .. } = card {
@@ -340,7 +335,6 @@ fn localize(op: &mut BoardOp, host: &str) {
     }
 }
 
-/// Off the board host a card prints as `#12@<board>`.
 fn relabel(result: &mut BoardResult, host: &str) {
     let cards: Vec<&mut Card> = match result {
         BoardResult::Card(card) => vec![card],

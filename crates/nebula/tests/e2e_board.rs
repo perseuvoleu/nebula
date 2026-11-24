@@ -681,9 +681,6 @@ fn proxy_to(board: &Env) -> String {
     )
 }
 
-/// A transport to `board`'s socket that never boots a daemon. With a
-/// `drop_once` marker path it forwards the first BoardReply's request but
-/// dies before passing the reply back, then marks the drop as done.
 fn pump_to(board: &Env, drop_once: Option<&Path>) -> String {
     let script = board.tmp.path().join("pump.py");
     std::fs::write(

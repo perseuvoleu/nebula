@@ -134,7 +134,6 @@ fn apply(tx: &Transaction, op: BoardOp) -> Result<BoardResult> {
     }
 }
 
-/// Every card a scoped write names must still be in scope when it runs.
 fn within(tx: &Transaction, scope: &BoardScope, op: &BoardOp) -> Result<()> {
     let mut named = op.clone();
     for card in named.card_refs_mut() {

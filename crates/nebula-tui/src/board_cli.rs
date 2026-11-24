@@ -105,7 +105,6 @@ pub struct ScopeFlags {
 }
 
 impl ScopeFlags {
-    /// A write naming a scope runs only on cards inside it.
     fn guard(self, op: BoardOp) -> BoardOp {
         match self.all || self.include_home || !self.projects.is_empty() {
             true => BoardOp::Scoped {
