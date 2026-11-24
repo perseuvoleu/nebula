@@ -26,7 +26,6 @@ export default class E2eRunReporter implements Reporter {
   }
 
   onTestEnd(test: TestCase, result: TestResult) {
-    this.results.delete(test.id);
     this.results.set(test.id, { test, result });
   }
 
