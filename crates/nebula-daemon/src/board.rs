@@ -127,7 +127,22 @@ fn apply(tx: &Transaction, op: BoardOp) -> Result<BoardResult> {
         | BoardOp::BeginRun(_)
         | BoardOp::EndRun { .. }
         | BoardOp::Report(_) => bail!("this board does not serve that operation yet"),
+        BoardOp::Scoped { scope, op } => {
+            within(tx, &scope, &op)?;
+            apply(tx, *op)
+        }
     }
+}
+
+fn within(tx: &Transaction, scope: &BoardScope, op: &BoardOp) -> Result<()> {
+    let mut named = op.clone();
+    for card in named.card_refs_mut() {
+        let id = resolve(tx, card)?;
+        if !in_scope(scope, card_by_id(tx, &id)?.project.as_deref()) {
+            return Err(not_found(card));
+        }
+    }
+    Ok(())
 }
 
 fn now_ms() -> i64 {
@@ -250,6 +265,10 @@ fn add_note(
     let card = resolve(tx, card)?;
     let known = note_by_id(tx, &id)?;
     if let Some(note) = known {
+        if note.card != card {
+            bail!(Refusal::Conflict
+                .message(format!("note {} was added to another card", id.as_str())));
+        }
         return Ok(note);
     }
     let text = non_empty(text, "a note")?;
