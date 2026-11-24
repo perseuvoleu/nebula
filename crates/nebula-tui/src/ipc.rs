@@ -1959,21 +1959,29 @@ pub async fn spawn_agent(opts: NewAgentOpts) -> Result<serde_json::Value> {
         _ => String::new(),
     };
     if opts.dispatch.is_some() {
-        let (_, worktrees, agents) = subscribe_snapshot(&mut conn).await?;
-        if let Some(agent) = agents.into_iter().find(|a| a.id.as_str() == id) {
-            return Ok(serde_json::json!({
-                "id": id,
-                "name": agent.name,
-                "kind": agent.kind.as_str(),
-                "project": project.name,
-                "worktree": worktrees
-                    .iter()
-                    .find(|w| w.id == agent.worktree_id)
-                    .map_or(target.branch, |w| w.branch.clone()),
-                "card": agent.card_id,
-                "role": agent.role,
-            }));
-        }
+        let (projects, worktrees, agents) = subscribe_snapshot(&mut conn).await?;
+        let unlisted = || format!("the daemon answered with session {id} but does not list it");
+        let agent = agents
+            .into_iter()
+            .find(|a| a.id.as_str() == id)
+            .with_context(unlisted)?;
+        let worktree = worktrees
+            .iter()
+            .find(|w| w.id == agent.worktree_id)
+            .with_context(unlisted)?;
+        let project = projects
+            .iter()
+            .find(|p| p.id == worktree.project_id)
+            .with_context(unlisted)?;
+        return Ok(serde_json::json!({
+            "id": id,
+            "name": agent.name,
+            "kind": agent.kind.as_str(),
+            "project": project.name,
+            "worktree": worktree.branch,
+            "card": agent.card_id,
+            "role": agent.role,
+        }));
     }
     Ok(serde_json::json!({
         "id": id,

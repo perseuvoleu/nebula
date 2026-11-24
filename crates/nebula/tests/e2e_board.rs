@@ -141,7 +141,11 @@ impl Env {
     }
 
     fn make_repo(&self) -> PathBuf {
-        let repo = self.tmp.path().join("repo");
+        self.make_repo_named("repo")
+    }
+
+    fn make_repo_named(&self, name: &str) -> PathBuf {
+        let repo = self.tmp.path().join(name);
         std::fs::create_dir_all(&repo).unwrap();
         for args in [
             &["init", "-b", "main"][..],
@@ -2517,6 +2521,35 @@ fn run_lost_end_reconciles_before_card_checks() {
         assert_eq!(rerun["session"]["id"], agent["id"], "{card}");
     }
     assert_eq!(agents_of(&env).len(), 2);
+}
+
+#[test]
+fn run_replay_names_the_agents_own_project() {
+    let env = board_env();
+    env.make_repo();
+    env.make_repo_named("twin");
+    add(&env, &["--project", "repo"], "Twin");
+    let dispatch = TodoId::generate().0;
+    let first = lost_spawn(&env, "#1", &dispatch);
+    let argv = [
+        "agent",
+        "new",
+        "--project",
+        "twin",
+        "--worktree",
+        "main",
+        "--card",
+        "#1",
+        "--role",
+        "worker",
+        "--dispatch",
+        &dispatch,
+        "--name",
+        "lost",
+    ];
+    let again = json_of(env.cli(&argv, None), &argv);
+    assert_eq!(again["project"], "repo");
+    assert_eq!(again, first);
 }
 
 fn session_row(env: &Env, id: &str) -> Value {
