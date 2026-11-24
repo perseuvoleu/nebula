@@ -2,7 +2,9 @@
 """Start the real gateway on a loopback port against the fake CLI and synthetic Pi files.
 
 State dir: .scratch/mobile-chat-e2e/state (recreated on every start). Token is synthetic.
+The board (project nebula) is seeded from the golden fixtures in crates/nebula-core.
 """
+import base64
 import json
 import os
 import shutil
@@ -15,8 +17,10 @@ sys.path.insert(0, str(WEB))
 from test_pi_history import assistant, entry, tool_result, user, write_session  # noqa: E402
 
 STATE = WEB.parent / ".scratch" / "mobile-chat-e2e" / "state"
+FIXTURES = WEB.parent / "crates" / "nebula-core" / "tests" / "fixtures" / "board"
 TOKEN = "e2e-synthetic-token-not-a-secret-0123456789"
 PORT = int(os.environ.get("E2E_PORT", "8790"))
+PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=")
 SID = {"pi-1": "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa", "pi-2": "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb",
        "pi-b": "cccccccc-3333-4333-8333-cccccccccccc"}
 
@@ -50,6 +54,28 @@ Link util: [documentația JWT](https://example.com/jwt). Un link nesigur: [click
 """
 
 
+def fixture(name):
+    return json.loads((FIXTURES / f"{name}.json").read_text())
+
+
+def seed_board():
+    board, show, artifact = fixture("board"), fixture("card_show"), fixture("artifact")
+    board_id, version = board["version"].split(".")
+    blocker = {**fixture("card"), "id": "01JD0000000000000000000011", "number": 11, "ref": "#11@leaseweb",
+               "title": "Pin the board contract", "stage": "done", "checkout": None, "blocked_by": []}
+    (STATE / "board.json").write_text(json.dumps({
+        "board_id": board_id, "version": int(version), "cards": [blocker, *board["board"]["cards"]],
+        "hosts": board["board"]["hosts"], "away": board["board"]["away"], "decisions": [fixture("decision")],
+        "details": {show["id"]: {key: show[key] for key in ("sessions", "artifacts", "log")}},
+    }, indent=1))
+    run = STATE / "artifacts" / artifact["id"]
+    (run / "shots").mkdir(parents=True)
+    result = fixture("e2e_run_result")
+    (run / "result.json").write_text(json.dumps(result))
+    for step in result["steps"]:
+        (run / step["screenshot"]).write_bytes(PNG)
+
+
 def seed():
     if STATE.exists():
         shutil.rmtree(STATE)
@@ -74,6 +100,7 @@ def seed():
          "worktree": "main", "path": "/srv/beta", "archived": False, "session_id": SID["pi-b"]},
     ]
     (STATE / "agents.json").write_text(json.dumps(agents, indent=1))
+    seed_board()
     (STATE / "worktrees.json").write_text(json.dumps([
         {"id": "wt-alpha", "path": "/srv/alpha", "branch": "main", "is_main": True, "project": "alpha", "pinned": False, "created_from": None},
         {"id": "wt-feature", "path": "/srv/alpha-wt", "branch": "feature/homepage", "is_main": False, "project": "alpha", "pinned": False, "created_from": "main"},
@@ -108,7 +135,8 @@ def main():
     seed()
     os.chmod(HERE / "fake_nebula.py", 0o755)
     env = {**os.environ, "NEBULA_WEB_TOKEN": TOKEN, "NEBULA_WEB_PROJECTS": "alpha,beta",
-           "NEBULA_WEB_PORT": str(PORT), "NEBULA_WEB_ORIGIN": f"http://127.0.0.1:{PORT}",
+           "NEBULA_WEB_PORT": str(PORT), "NEBULA_WEB_BOARD_PROJECTS": "nebula",
+           "NEBULA_WEB_ARTIFACTS": str(STATE / "artifacts"), "NEBULA_WEB_ORIGIN": f"http://127.0.0.1:{PORT}",
            "NEBULA_WEB_BINARY": str(HERE / "fake_nebula.py"), "NEBULA_WEB_PI_AGENT_DIR": str(STATE / "pi"),
            "FAKE_NEBULA_STATE": str(STATE), "PYTHONDONTWRITEBYTECODE": "1",
            "PYTHONPATH": str(WEB), "PATH": str(STATE / "bin") + os.pathsep + os.environ["PATH"]}

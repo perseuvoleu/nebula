@@ -45,11 +45,10 @@ NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}")
 BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}")
 STAGES = {"backlog", "next", "doing", "review", "done"}
 ROLES = {"worker", "review", "fix", "verify", "research"}
-# The board CLI's typed exits (02-architecture §CLI); any other failure is a plain 502.
 BOARD_EXITS = {3: (503, "Board host unreachable; nothing was sent"),
                4: (504, "Outcome unknown; repeat the same action to finish it"),
                5: (404, "Card not found"), 6: (409, "The card changed; refresh and try again")}
-GRANT_TTL = 3600
+GRANT_TTL, GRANT_STEP = 3600, 1800
 ARTIFACT_TYPES = {**ASSET_TYPES, ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
                   ".webp": "image/webp", ".md": "text/markdown", ".pdf": "application/pdf", ".csv": "text/csv",
                   ".log": "text/plain", ".mp4": "video/mp4", ".webm": "video/webm"}
@@ -275,6 +274,8 @@ class Gateway:
         self.notify_token = notify_token
         self.board_projects = board_projects
         self.artifacts = Path(artifacts) if artifacts else None
+        if self.artifacts is not None and (not self.artifacts.is_absolute() or not self.artifacts.is_dir()):
+            raise ValueError("NEBULA_WEB_ARTIFACTS must be an absolute existing directory")
         self.artifact_key = secrets.token_bytes(32)
 
     def run(self, *args, json_output=True, binary=None, exits=None):
@@ -312,8 +313,6 @@ class Gateway:
     def sessions(self, project):
         return self.run("agent", "list", "--project", project)
 
-    # --- board -----------------------------------------------------------------------------
-
     def board(self, *args, positionals=()):
         return self.run(*args, "--json", *(("--", *positionals) if positionals else ()), exits=BOARD_EXITS)
 
@@ -346,15 +345,12 @@ class Gateway:
             raise Problem(409, "Session is not on this card; refresh the card")
         return session, host
 
-    # --- artifact grants -------------------------------------------------------------------
-
     def sign(self, artifact_id, expiry):
         digest = hmac.new(self.artifact_key, f"{artifact_id}.{expiry}".encode(), "sha256").digest()
         return base64.urlsafe_b64encode(digest).decode().rstrip("=")
 
     def grant(self, artifact_id):
-        # Half-hour steps keep a grant's URL stable across polls, so an open iframe never reloads.
-        expiry = (int(time.time()) // 1800 + 2) * 1800
+        expiry = (int(time.time()) // GRANT_STEP + 2) * GRANT_STEP
         return f"{expiry}.{self.sign(artifact_id, expiry)}"
 
     def artifact_dir(self, artifact_id):
@@ -738,20 +734,31 @@ def open_code(gateway, card, body):
     return ("open", f"--session={session}", f"--on={host}"), ()
 
 
+def move_card(gateway, card, body):
+    expect = field(body, "expect", choices=STAGES, optional=True)
+    return ("todo", "move", *([f"--expect={expect}"] if expect else [])), (card["id"], field(body, "stage", choices=STAGES))
+
+
+def note_card(gateway, card, body):
+    return ("todo", "note"), (card["id"], field(body, "text", limit=16000))
+
+
+def plain_card(verb):
+    return lambda gateway, card, body: (("todo", verb), (card["id"],))
+
+
 def block_card(verb):
     return lambda gateway, card, body: (
         ("todo", verb, f"--by={gateway.card(field(body, 'by', BOARD_REF))['id']}"), (card["id"],))
 
 
-# Every web write on a card: fixed argv from validated fields, aimed at the id of the scoped card read.
 CARD_VERBS = {
-    "move": lambda gateway, card, body: (
-        ("todo", "move", *([f"--expect={e}"] if (e := field(body, "expect", choices=STAGES, optional=True)) else [])),
-        (card["id"], field(body, "stage", choices=STAGES))),
+    "move": move_card,
     "edit": edit_card,
-    "note": lambda gateway, card, body: (("todo", "note"), (card["id"], field(body, "text", limit=16000))),
-    **{verb: (lambda verb: lambda gateway, card, body: (("todo", verb), (card["id"],)))(verb)
-       for verb in ("archive", "accept", "dismiss")},
+    "note": note_card,
+    "archive": plain_card("archive"),
+    "accept": plain_card("accept"),
+    "dismiss": plain_card("dismiss"),
     "block": block_card("block"),
     "unblock": block_card("unblock"),
     "run": run_card,
@@ -858,6 +865,16 @@ class Handler(BaseHTTPRequestHandler):
         self.handle_request("POST")
 
 
+def board_projects(value):
+    """NEBULA_WEB_BOARD_PROJECTS: "*" for every project, else comma-separated names; unset disables the board."""
+    if value.strip() == "*":
+        return "*"
+    names = [p.strip() for p in value.split(",") if p.strip()]
+    if any(not NAME.fullmatch(name) for name in names):
+        raise ValueError("NEBULA_WEB_BOARD_PROJECTS must be * or comma-separated project names")
+    return names or None
+
+
 def main():
     port = int(os.environ.get("NEBULA_WEB_PORT", "8765"))
     origin = os.environ.get("NEBULA_WEB_ORIGIN", f"http://127.0.0.1:{port}")
@@ -869,7 +886,9 @@ def main():
                       os.environ.get("NEBULA_WEB_BINARY", "nebula"),
                       db_path=os.environ.get("NEBULA_WEB_DB") or None,
                       preview_binary=os.environ.get("NEBULA_WEB_PREVIEW_BINARY"), push=push,
-                      notify_token=os.environ.get("NEBULA_WEB_NOTIFY_TOKEN"))
+                      notify_token=os.environ.get("NEBULA_WEB_NOTIFY_TOKEN"),
+                      board_projects=board_projects(os.environ.get("NEBULA_WEB_BOARD_PROJECTS", "")),
+                      artifacts=os.environ.get("NEBULA_WEB_ARTIFACTS") or None)
     if not gateway.static.files.get("/index.html"):
         raise SystemExit(f"No built app in {gateway.static.root}; run `pnpm --dir web/app build` first")
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)

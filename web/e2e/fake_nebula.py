@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Deterministic stand-in for the `nebula` CLI at the gateway's external boundary.
 
-State lives in $FAKE_NEBULA_STATE: agents.json, worktrees.json, sends.log, behaviour and a Pi
-agent dir (`pi/`) with synthetic session files. Tests mutate these files to simulate the host.
+State lives in $FAKE_NEBULA_STATE: agents.json, worktrees.json, sends.log, behaviour, a Pi
+agent dir (`pi/`) with synthetic session files, and board.json (cards, their sessions,
+artifacts and log, decisions) seeded from the golden board fixtures. Tests mutate these files
+to simulate the host.
 """
 import json
 import os
@@ -51,6 +53,87 @@ def append(agent, entry):
              "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime()), "message": entry}
     with open(path, "a") as handle:
         handle.write(json.dumps(entry) + "\n")
+
+
+def scoped(card, args):
+    projects = [a.split("=", 1)[1] for a in args if a.startswith("--project=")]
+    if card["project"] is None:
+        return "--include-home" in args
+    return "--all" in args or card["project"] in projects
+
+
+def find_card(board, ref, args):
+    number = ref.lstrip("#").split("@")[0]
+    card = next((c for c in board["cards"] if c["id"] == ref or (number.isdigit() and c["number"] == int(number))), None)
+    return card if card and scoped(card, args) else None
+
+
+def board_command(verb, args, board):
+    """One `todo`/`decision` verb against board.json; returns (exit code, output)."""
+    flags = lambda name: arg(name, args)
+    values = positionals(args)
+    version = f"{board['board_id']}.{board['version']}"
+    if verb == ("todo", "board"):
+        if flags("--since") == version:
+            return 0, {"version": version, "unchanged": True}
+        return 0, {"version": version, "board": {"cards": [c for c in board["cards"] if scoped(c, args) and not c["archived"]],
+                                                 "hosts": board["hosts"], "away": board["away"]}}
+    if verb == ("decision", "list"):
+        query = (flags("--query") or "").lower()
+        return 0, {"items": [d for d in board["decisions"] if query in (d["title"] + d["content"]["body"]).lower()],
+                   "next": None}
+    if verb == ("decision", "add"):
+        decision = {"id": f"01JG{len(board['decisions']) + 100:022d}", "kind": "decision", "title": values[0],
+                    "card": flags("--card"), "project": flags("--project"), "session": None, "checkout": None,
+                    "content": {"body": flags("--why") or ""}, "meta": {}, "created_at": int(time.time() * 1000)}
+        board["decisions"].insert(0, decision)
+        return 0, decision
+    if verb == ("todo", "add"):
+        number = max((c["number"] for c in board["cards"]), default=0) + 1
+        card = {"id": flags("--id") or f"01JD{number:022d}", "number": number, "ref": f"#{number}",
+                "title": values[0], "stage": flags("--stage") or "backlog", "project": flags("--project"),
+                "proposed": "--propose" in args, "archived": False,
+                "created_by": {"host": "fake", "agent": None, "name": "web"}, "checkout": None, "blocked_by": []}
+        existing = next((c for c in board["cards"] if c["id"] == card["id"]), None)
+        if existing:
+            return 0, existing
+        board["cards"].append(card)
+        return 0, card
+    card = find_card(board, values[0] if values else "", ["--all", "--include-home"])
+    if card is None:
+        return 5, "no such card"
+    if verb == ("todo", "show"):
+        if not scoped(card, args):
+            return 5, "no such card"
+        return 0, {**card, **board["details"].get(card["id"], {"sessions": [], "artifacts": [], "log": []})}
+    if verb == ("todo", "move"):
+        if flags("--expect") not in (None, card["stage"]):
+            return 6, "card moved meanwhile"
+        card["stage"] = values[1]
+    elif verb == ("todo", "edit"):
+        card["title"], card["project"] = flags("--title") or card["title"], flags("--project") or card["project"]
+    elif verb == ("todo", "note"):
+        board["details"].setdefault(card["id"], {"sessions": [], "artifacts": [], "log": []})["log"].append(
+            {"id": f"01JH{time.time_ns():022d}"[:26], "card": card["id"], "text": values[1],
+             "author": {"host": "fake", "agent": None, "name": "web"}, "created_at": int(time.time() * 1000)})
+    elif verb[1] in {"archive", "dismiss"}:
+        card["archived"] = True
+    elif verb == ("todo", "accept"):
+        card["proposed"] = False
+    elif verb[1] in {"block", "unblock"}:
+        by = find_card(board, flags("--by"), ["--all", "--include-home"])
+        if by is None or by["id"] == card["id"]:
+            return 6, "cannot block on that card"
+        card["blocked_by"] = [r for r in card["blocked_by"] if r != by["ref"]] + ([by["ref"]] if verb[1] == "block" else [])
+    elif verb == ("todo", "run"):
+        card["stage"] = "doing"
+        return 0, {"dispatch": flags("--dispatch") or f"01JE{time.time_ns():022d}"[:26], "state": "started",
+                   "session": {"host": flags("--host"), "id": "01JF0000000000000000000002"}, "card": card["id"]}
+    elif verb == ("todo", "approve"):
+        return 0, {"ok": True}
+    else:
+        return 2, f"unsupported fake board verb: {verb}"
+    return 0, card
 
 
 def main(argv):
@@ -160,6 +243,20 @@ def main(argv):
             trees.append(row)
         save("worktrees.json", trees)
         print(json.dumps({**row, "created": True}))
+    elif argv[0] == "open":
+        print(json.dumps({"landed": "tui", "tui_pid": 1, "id": arg("--session", argv), "name": "worker",
+                          "project": "nebula", "host": arg("--on", argv), "focused": True}))
+    elif argv[0] in {"todo", "decision"}:
+        board = load("board.json")
+        before = json.dumps(board)
+        code, output = board_command(command, argv[2:], board)
+        if json.dumps(board) != before:
+            board["version"] += 1
+            save("board.json", board)
+        if code:
+            print(output, file=sys.stderr)
+            return code
+        print(json.dumps(output))
     elif command == ("worktree", "list"):
         trees = [w for w in load("worktrees.json") if w["project"] == project]
         for tree in trees:
