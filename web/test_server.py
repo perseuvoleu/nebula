@@ -671,6 +671,15 @@ class BoardTests(unittest.TestCase):
                 self.assertEqual(self.request("/api/cards", "POST", body, self.auth())[0], 403)
             run.assert_not_called()
 
+    def test_decisions_pass_a_page_token_on(self):
+        with patch("server.subprocess.run", return_value=cli({"items": [], "next": None})) as run:
+            self.assertEqual(self.request("/api/decisions?page=0123.4%402", headers=self.auth())[0], 200)
+        self.assertIn("--page=0123.4@2", self.argv(run)[0])
+        for page in ["--all", "0123.4", "a%20b"]:
+            with self.subTest(page=page), patch("server.subprocess.run") as run:
+                self.assertEqual(self.request("/api/decisions?page=" + page, headers=self.auth())[0], 400)
+                run.assert_not_called()
+
     def test_artifact_grant_expiry_tamper(self):
         src = self.card_src()
         _, grant, artifact, entry = src.split("/")[1:]

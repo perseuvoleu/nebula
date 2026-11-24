@@ -59,7 +59,7 @@ test("peek and card page", async ({ page }) => {
   await expect(page).toHaveURL(/\/board\/c\/12%40leaseweb$/);
   await expect(page.getByRole("heading", { name: "Keep verification results" })).toBeVisible();
   await expect(page.getByRole("list", { name: "Sesiuni" }).getByRole("listitem")).toHaveText([/worker.*worker/, /reviewer.*review/]);
-  await expect(page.getByText("agent-home-02")).toBeVisible();
+  await expect(page.getByText("agent-home-02", { exact: true })).toBeVisible();
   await expect(page.getByText("@leaseweb").first()).toBeVisible();
 });
 
@@ -111,7 +111,7 @@ test("a project's Decisions route lists only that project's decisions", async ({
   await expect(page.getByText("Copy published files")).toHaveCount(0);
   const sidebar = page.getByRole("navigation", { name: "Proiecte" });
   await sidebar.getByRole("button", { name: "Checkouturi nebula" }).click();
-  await sidebar.getByRole("button", { name: "Decizii" }).click();
+  await sidebar.getByRole("button", { name: "Decizii", exact: true }).click();
   await expect(page).toHaveURL(/\/board\/decisions\/p\/nebula$/);
   await expect(page.getByText("Copy published files")).toBeVisible();
 });

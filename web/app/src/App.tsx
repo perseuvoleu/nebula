@@ -151,7 +151,7 @@ function Routes({ workspace }: { workspace: Workspace }) {
   const route = useSelection();
   const [selection, navigate] = route;
   if (!selection.board) return <Shell workspace={workspace} route={route} />;
-  return <BoardPage route={selection.board} onSessions={() => navigate({ project: null, session: null, all: false })}
+  return <BoardPage route={selection.board} workspace={workspace} onSessions={() => navigate({ project: null, session: null, all: false })}
     onNavigate={(board, replace) => navigate({ project: null, session: null, all: false, board }, replace)} />;
 }
 
