@@ -505,6 +505,18 @@ impl Store {
         Ok(out)
     }
 
+    /// A board card's number and title, read without a transaction, so a
+    /// held write lock never hides it.
+    pub fn board_card_title(&self, card: &TodoId) -> Result<Option<(i64, String)>> {
+        Ok(rusqlite::OptionalExtension::optional(
+            self.conn.lock().unwrap().query_row(
+                "SELECT number, title FROM todos WHERE id = ?1 AND stage IS NOT NULL",
+                params![card.as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            ),
+        )?)
+    }
+
     // ---- workspaces ----
 
     pub fn insert_workspace(&self, w: &Workspace) -> Result<()> {

@@ -338,17 +338,8 @@ pub fn card_pointer(store: &Store, agent: &AgentId) -> Result<Option<(String, Op
     let Some(card) = store.get_agent(agent)?.and_then(|a| a.card_id) else {
         return Ok(None);
     };
-    store.board_transaction(|tx| {
-        let local: Option<(i64, String)> = tx
-            .query_row(
-                "SELECT number, title FROM todos WHERE id = ?1 AND stage IS NOT NULL",
-                params![card.as_str()],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        Ok(Some(match local {
-            Some((number, title)) => (card_label(number as u64, None), Some(title)),
-            None => (card.0.clone(), None),
-        }))
-    })
+    Ok(Some(match store.board_card_title(&card)? {
+        Some((number, title)) => (card_label(number as u64, None), Some(title)),
+        None => (card.0.clone(), None),
+    }))
 }
