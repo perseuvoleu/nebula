@@ -824,6 +824,18 @@ class BoardTests(unittest.TestCase):
         self.assertEqual(swapped, [True])
         self.assertNotIn(b"OUTSIDE-SECRET", body)
 
+    def test_board_page_continuation(self):
+        version = fixture("board_unchanged")["version"]
+        with patch("server.subprocess.run", return_value=cli(fixture("board"))) as run:
+            status, _, _ = self.request(f"/api/board?since={version}&page={version}@40", headers=self.auth())
+        self.assertEqual((status, run.call_count), (200, 1))
+        self.assertIn(f"--page={version}@40", self.argv(run)[0])
+        with patch("server.subprocess.run") as run:
+            for page in ["--all", f"{version}@x", "a%20b"]:
+                with self.subTest(page=page):
+                    self.assertEqual(self.request("/api/board?page=" + page, headers=self.auth())[0], 400)
+            run.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

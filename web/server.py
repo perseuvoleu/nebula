@@ -44,6 +44,7 @@ PUSH_STATES = {"finished", "needs_feedback"}
 BOARD_REF = re.compile(r"#?[0-9]{1,9}(?:@[A-Za-z0-9._-]{1,64})?|[0-7][0-9A-HJKMNP-TV-Z]{25}")
 ULID = re.compile(r"[0-7][0-9A-HJKMNP-TV-Z]{25}")
 CURSOR = re.compile(r"[A-Za-z0-9]{1,64}\.[0-9]{1,20}")
+PAGE = re.compile(CURSOR.pattern + r"@[0-9]{1,20}")
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}")
 BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}")
 STAGES = {"backlog", "next", "doing", "review", "done"}
@@ -512,11 +513,12 @@ class Gateway:
             return {"available": self.push is not None,
                     "publicKey": self.push.public_key if self.push else None}
         if path == "/api/board":
-            since, away = query.get("since", [None])[0], query.get("awaySince", [None])[0]
-            if (since is not None and not CURSOR.fullmatch(since)) or (away is not None and not re.fullmatch(r"[0-9]{1,16}", away)):
+            since, away, page = (query.get(k, [None])[0] for k in ("since", "awaySince", "page"))
+            if ((since is not None and not CURSOR.fullmatch(since)) or (away is not None and not re.fullmatch(r"[0-9]{1,16}", away))
+                    or (page is not None and not PAGE.fullmatch(page))):
                 raise Problem(400, "Invalid board cursor")
             return self.board("todo", "board", *self.scope(), *([f"--since={since}"] if since else []),
-                              *([f"--away-since={away}"] if away else []))
+                              *([f"--away-since={away}"] if away else []), *([f"--page={page}"] if page else []))
         if path.startswith("/api/cards/"):
             return self.card(unquote(path[len("/api/cards/"):]))
         if path == "/api/decisions":
