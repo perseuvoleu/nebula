@@ -2424,6 +2424,22 @@ fn run_writer_busy_fails_dispatch() {
     assert_eq!(names, ["holder"]);
 }
 
+#[test]
+fn run_writer_name_keeps_the_refusal() {
+    let env = board_env();
+    env.make_repo();
+    add(&env, &["--project", "repo"], "Busy");
+    json_of(
+        spawn_agent(&env, &["--writer", "--name", "holder; nothing was sent"]),
+        &["agent", "new", "--writer"],
+    );
+    let dispatch = TodoId::generate().0;
+    let refused = run_card(&env, "#1", &["--dispatch", &dispatch]);
+    assert_eq!(refused.status.code(), Some(6), "{}", stderr(&refused));
+    let failed: Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert_eq!(failed["state"], "failed");
+}
+
 fn session_row(env: &Env, id: &str) -> Value {
     agents_of(env).into_iter().find(|a| a["id"] == id).unwrap()
 }

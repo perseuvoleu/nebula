@@ -542,9 +542,13 @@ impl Refusal {
     }
 
     pub fn of(message: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|r| match r.trails() {
-            true => message.contains(r.tag()),
-            false => message.starts_with(r.tag()),
+        let led = Self::ALL
+            .into_iter()
+            .find(|r| !r.trails() && message.starts_with(r.tag()));
+        led.or_else(|| {
+            Self::ALL
+                .into_iter()
+                .find(|r| r.trails() && message.contains(r.tag()))
         })
     }
 
