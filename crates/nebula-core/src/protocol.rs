@@ -1,11 +1,9 @@
 use crate::board::{ArtifactContent, BoardOp, BoardResult, Role};
 use crate::entities::{
-    Agent, AgentKind, AgentStatus, Entity, EntityId, Link, Note, NoteOwner, Project, TerminalTab,
-    Todo, TodoOwner, Workspace, Worktree,
+    Agent, AgentKind, AgentStatus, Entity, EntityId, Project, TerminalTab, Workspace, Worktree,
 };
 use crate::ids::{
-    AgentId, ArtifactId, DispatchId, LinkId, NoteId, ProjectId, TerminalId, TodoId, WorkspaceId,
-    WorktreeId,
+    AgentId, ArtifactId, DispatchId, ProjectId, TerminalId, TodoId, WorkspaceId, WorktreeId,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -411,65 +409,6 @@ pub enum ClientRequest {
         expected_branch: Option<String>,
         name: Option<String>,
     },
-    CreateNote {
-        req_id: u64,
-        owner: NoteOwner,
-        text: String,
-    },
-    /// Rewrite a note's text.
-    UpdateNote {
-        req_id: u64,
-        id: NoteId,
-        text: String,
-    },
-    SetNoteDone {
-        req_id: u64,
-        id: NoteId,
-        done: bool,
-    },
-    DeleteNote {
-        req_id: u64,
-        id: NoteId,
-    },
-    CreateTodo {
-        req_id: u64,
-        owner: TodoOwner,
-        text: String,
-    },
-    /// Rewrite a todo's text.
-    UpdateTodo {
-        req_id: u64,
-        id: TodoId,
-        text: String,
-    },
-    SetTodoDone {
-        req_id: u64,
-        id: TodoId,
-        done: bool,
-    },
-    /// Delete a todo; its child notes go with it (DB cascade).
-    DeleteTodo {
-        req_id: u64,
-        id: TodoId,
-    },
-    /// Pin a URL to a worktree. `url` is normalized daemon-side (a bare
-    /// `github.com/...` gains an https:// scheme) and refused if it can't be
-    /// made into an http(s) URL.
-    CreateLink {
-        req_id: u64,
-        worktree: WorktreeId,
-        url: String,
-    },
-    /// Rewrite a link's URL (same normalization as CreateLink).
-    UpdateLink {
-        req_id: u64,
-        id: LinkId,
-        url: String,
-    },
-    DeleteLink {
-        req_id: u64,
-        id: LinkId,
-    },
     RenameTerminal {
         req_id: u64,
         id: TerminalId,
@@ -642,9 +581,6 @@ pub enum ServerEvent {
         worktrees: Vec<Worktree>,
         agents: Vec<Agent>,
         terminals: Vec<TerminalTab>,
-        notes: Vec<Note>,
-        todos: Vec<Todo>,
-        links: Vec<Link>,
         /// How far the user has read into each pull request they've opened.
         pr_seen: Vec<PrSeen>,
         ui_state: Option<String>,

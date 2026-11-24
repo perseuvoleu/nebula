@@ -540,8 +540,6 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     "PROJECTS",
                     &[
                         (Act(&[New, AddProject]), "add project (2nd: from anywhere)"),
-                        (Act(&[Notes]), "project-level notes"),
-                        (Act(&[Todos]), "todos (Enter: a todo's notes)"),
                         (Act(&[MoveProjectDown, MoveProjectUp]), "reorder project"),
                         (Act(&[ToggleDivider]), "divider below (Enter/r: label)"),
                         (Act(&[Delete]), "remove from list"),
@@ -551,8 +549,6 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     "WORKTREES & BRANCHES",
                     &[
                         (Act(&[New]), "new worktree (⌘K b: new branch)"),
-                        (Act(&[Notes]), "notes for the worktree"),
-                        (Act(&[Todos]), "todos for the worktree"),
                         (
                             Act(&[GitDiff]),
                             "git diff (^g/⌘G: compare with a commit or branch, ^r: mark reviewed ✓)",
@@ -578,9 +574,8 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                     &[
                         (Act(&[New]), "new agent (pick CLI kind)"),
                         (Act(&[NewTerminal]), "new shell terminal"),
-                        (Act(&[NewLink]), "attach a link (PR, doc, ticket)"),
                         (Act(&[Activate]), "attach session / open link"),
-                        (Act(&[Rename]), "rename agent / edit link URL"),
+                        (Act(&[Rename]), "rename agent"),
                         (Act(&[Pin]), "pin / unpin"),
                         (
                             Act(&[Archive, Unarchive, ToggleArchived]),
@@ -2003,416 +1998,6 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
                 v.selected = selected;
             }
         }
-        Overlay::Notes(view) => {
-            // Rows come straight from the tree, so daemon upserts (another
-            // client editing the same list) render live.
-            let notes: Vec<&nebula_core::Note> = app
-                .tree
-                .notes
-                .iter()
-                .filter(|t| t.owner == view.owner)
-                .collect();
-            let total = notes.len();
-            let open = notes.iter().filter(|t| !t.done).count();
-            let selected = view.selected.min(total.saturating_sub(1));
-            let creating = view.input.as_ref().is_some_and(|i| i.editing.is_none());
-
-            let list_rows = (total + creating as usize).max(1);
-            // centered_rect caps to the frame; the max(5) only keeps clamp's
-            // bounds ordered on a tiny screen.
-            let height = (list_rows as u16)
-                .saturating_add(2)
-                .clamp(5, f.area().height.max(5));
-            let area = centered_rect(f.area(), 58, height);
-            f.render_widget(Clear, area);
-            let title = if total == 0 {
-                format!(" Notes — {} ", view.context)
-            } else if open > 0 {
-                format!(" Notes — {} ({open} open) ", view.context)
-            } else {
-                format!(" Notes — {} (all {total} done) ", view.context)
-            };
-            let hint = if view.input.is_some() {
-                " Enter: save  ⌥←→: word  Esc: cancel "
-            } else {
-                " e: add  Enter: edit  Space: done  d: delete "
-            };
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(th.accent))
-                .title(Span::styled(
-                    truncate(&title, (area.width as usize).saturating_sub(2)),
-                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-                ))
-                .title_bottom(Line::from(Span::styled(hint, Style::default().fg(th.dim))));
-            let inner = block.inner(area);
-            f.render_widget(block, area);
-
-            if total == 0 && !creating {
-                if let Some(row_area) = row_rect(inner, 0) {
-                    f.render_widget(
-                        Paragraph::new(Span::styled(
-                            "no notes yet — e adds one",
-                            Style::default().fg(th.dim),
-                        )),
-                        row_area,
-                    );
-                }
-            }
-            // Follow-window keeps the cursor visible; while adding, pin the
-            // window to the tail so the input row is always on screen.
-            let start = if creating {
-                list_rows.saturating_sub(inner.height as usize)
-            } else {
-                view.window_start(inner.height as usize)
-            };
-            let mut screen_row = 0usize;
-            for (i, note) in notes.iter().enumerate().skip(start) {
-                let Some(row_area) = row_rect(inner, screen_row) else {
-                    break;
-                };
-                screen_row += 1;
-                let budget = (inner.width as usize).saturating_sub(2);
-                let editing_this =
-                    view.input.as_ref().and_then(|inp| inp.editing.as_ref()) == Some(&note.id);
-                let spans = if editing_this {
-                    let mut spans = vec![Span::styled("☐ ", Style::default().fg(th.warn))];
-                    if let Some(inp) = &view.input {
-                        spans.extend(input_spans(
-                            &inp.text,
-                            budget.saturating_sub(1),
-                            th.accent,
-                            th,
-                        ));
-                    }
-                    spans
-                } else if note.done {
-                    vec![
-                        Span::styled("✓ ", Style::default().fg(th.ok)),
-                        Span::styled(truncate(&note.text, budget), Style::default().fg(th.dim)),
-                    ]
-                } else {
-                    vec![
-                        Span::styled("☐ ", Style::default().fg(th.warn)),
-                        Span::raw(truncate(&note.text, budget)),
-                    ]
-                };
-                render_row(
-                    f,
-                    row_area,
-                    spans,
-                    i == selected && view.input.is_none(),
-                    true,
-                    th,
-                );
-            }
-            if creating {
-                if let Some(row_area) = row_rect(inner, screen_row) {
-                    let budget = (inner.width as usize).saturating_sub(2);
-                    let mut spans = vec![Span::styled("+ ", Style::default().fg(th.accent))];
-                    if let Some(inp) = &view.input {
-                        spans.extend(input_spans(&inp.text, budget, th.accent, th));
-                    }
-                    f.render_widget(Paragraph::new(Line::from(spans)), row_area);
-                }
-            }
-
-            // Write-back (draw works on a clone): rects for mouse
-            // hit-testing, plus the clamped cursor.
-            if let Some(Overlay::Notes(v)) = &mut app.overlay {
-                v.area = area;
-                v.list_area = inner;
-                v.selected = selected;
-            }
-        }
-        Overlay::Todos(view) => {
-            // Rows come straight from the tree, so daemon upserts (another
-            // client — or an agent's CLI — editing the same list) render
-            // live. Two modes share the shell: the owner's todo list, and
-            // one todo's detail with its child notes under a pinned header.
-            let todos: Vec<&nebula_core::Todo> = app
-                .tree
-                .todos
-                .iter()
-                .filter(|t| t.owner == view.owner)
-                .collect();
-            let detail = view
-                .detail
-                .as_ref()
-                .and_then(|id| todos.iter().find(|t| &t.id == id).copied());
-            let creating = view.input.as_ref().is_some_and(|i| {
-                matches!(
-                    i.target,
-                    crate::app::TodoInputTarget::NewTodo | crate::app::TodoInputTarget::NewNote
-                )
-            });
-
-            let (title, rows_len, header_rows, selected) = match detail {
-                Some(todo) => {
-                    let notes: Vec<&nebula_core::Note> = app
-                        .tree
-                        .notes
-                        .iter()
-                        .filter(|n| n.owner == nebula_core::NoteOwner::Todo(todo.id.clone()))
-                        .collect();
-                    let sel = view.note_selected.min(notes.len().saturating_sub(1));
-                    (
-                        format!(" Todo — {} ", view.context),
-                        notes.len(),
-                        1usize,
-                        sel,
-                    )
-                }
-                None => {
-                    let total = todos.len();
-                    let open = todos.iter().filter(|t| !t.done).count();
-                    let sel = view.selected.min(total.saturating_sub(1));
-                    let title = if total == 0 {
-                        format!(" Todos — {} ", view.context)
-                    } else if open > 0 {
-                        format!(" Todos — {} ({open} open) ", view.context)
-                    } else {
-                        format!(" Todos — {} (all {total} done) ", view.context)
-                    };
-                    (title, total, 0usize, sel)
-                }
-            };
-
-            let list_rows = (rows_len + creating as usize).max(1) + header_rows;
-            let height = (list_rows as u16)
-                .saturating_add(2)
-                .clamp(5, f.area().height.max(5));
-            let area = centered_rect(f.area(), 58, height);
-            f.render_widget(Clear, area);
-            let hint = if view.input.is_some() {
-                " Enter: save  ⌥←→: word  Esc: cancel "
-            } else if detail.is_some() {
-                " a: add note  Enter: edit  Space: done  d: delete  Esc: back "
-            } else {
-                " a: add  Enter: notes  Space: done  r: edit  d: delete "
-            };
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(th.accent))
-                .title(Span::styled(
-                    truncate(&title, (area.width as usize).saturating_sub(2)),
-                    Style::default().fg(th.accent).add_modifier(Modifier::BOLD),
-                ))
-                .title_bottom(Line::from(Span::styled(hint, Style::default().fg(th.dim))));
-            let inner = block.inner(area);
-            f.render_widget(block, area);
-
-            match detail {
-                Some(todo) => {
-                    // Pinned header: the todo itself, never selectable.
-                    if let Some(row_area) = row_rect(inner, 0) {
-                        let budget = (inner.width as usize).saturating_sub(2);
-                        let (mark, mark_style) = if todo.done {
-                            ("✓ ", Style::default().fg(th.ok))
-                        } else {
-                            ("☐ ", Style::default().fg(th.warn))
-                        };
-                        f.render_widget(
-                            Paragraph::new(Line::from(vec![
-                                Span::styled(mark, mark_style),
-                                Span::styled(
-                                    truncate(&todo.text, budget),
-                                    Style::default().add_modifier(Modifier::BOLD),
-                                ),
-                            ])),
-                            row_area,
-                        );
-                    }
-                    let notes: Vec<&nebula_core::Note> = app
-                        .tree
-                        .notes
-                        .iter()
-                        .filter(|n| n.owner == nebula_core::NoteOwner::Todo(todo.id.clone()))
-                        .collect();
-                    let notes_area = Rect {
-                        y: inner.y + 1,
-                        height: inner.height.saturating_sub(1),
-                        ..inner
-                    };
-                    if notes.is_empty() && !creating {
-                        if let Some(row_area) = row_rect(notes_area, 0) {
-                            f.render_widget(
-                                Paragraph::new(Span::styled(
-                                    "  no notes yet — a adds one",
-                                    Style::default().fg(th.dim),
-                                )),
-                                row_area,
-                            );
-                        }
-                    }
-                    let start = if creating {
-                        (notes.len() + 1).saturating_sub(notes_area.height as usize)
-                    } else {
-                        view.window_start(notes_area.height as usize)
-                    };
-                    let mut screen_row = 0usize;
-                    for (i, note) in notes.iter().enumerate().skip(start) {
-                        let Some(row_area) = row_rect(notes_area, screen_row) else {
-                            break;
-                        };
-                        screen_row += 1;
-                        let budget = (notes_area.width as usize).saturating_sub(4);
-                        let editing_this = view.input.as_ref().is_some_and(|inp| {
-                            inp.target == crate::app::TodoInputTarget::EditNote(note.id.clone())
-                        });
-                        let spans = if editing_this {
-                            let mut spans =
-                                vec![Span::styled("  ☐ ", Style::default().fg(th.warn))];
-                            if let Some(inp) = &view.input {
-                                spans.extend(input_spans(
-                                    &inp.text,
-                                    budget.saturating_sub(1),
-                                    th.accent,
-                                    th,
-                                ));
-                            }
-                            spans
-                        } else if note.done {
-                            vec![
-                                Span::styled("  ✓ ", Style::default().fg(th.ok)),
-                                Span::styled(
-                                    truncate(&note.text, budget),
-                                    Style::default().fg(th.dim),
-                                ),
-                            ]
-                        } else {
-                            vec![
-                                Span::styled("  ☐ ", Style::default().fg(th.warn)),
-                                Span::raw(truncate(&note.text, budget)),
-                            ]
-                        };
-                        render_row(
-                            f,
-                            row_area,
-                            spans,
-                            i == selected && view.input.is_none(),
-                            true,
-                            th,
-                        );
-                    }
-                    if creating {
-                        if let Some(row_area) = row_rect(notes_area, screen_row) {
-                            let budget = (notes_area.width as usize).saturating_sub(4);
-                            let mut spans =
-                                vec![Span::styled("  + ", Style::default().fg(th.accent))];
-                            if let Some(inp) = &view.input {
-                                spans.extend(input_spans(&inp.text, budget, th.accent, th));
-                            }
-                            f.render_widget(Paragraph::new(Line::from(spans)), row_area);
-                        }
-                    }
-                }
-                None => {
-                    if todos.is_empty() && !creating {
-                        if let Some(row_area) = row_rect(inner, 0) {
-                            f.render_widget(
-                                Paragraph::new(Span::styled(
-                                    "no todos yet — a adds one",
-                                    Style::default().fg(th.dim),
-                                )),
-                                row_area,
-                            );
-                        }
-                    }
-                    let start = if creating {
-                        (todos.len() + 1).saturating_sub(inner.height as usize)
-                    } else {
-                        view.window_start(inner.height as usize)
-                    };
-                    let mut screen_row = 0usize;
-                    for (i, todo) in todos.iter().enumerate().skip(start) {
-                        let Some(row_area) = row_rect(inner, screen_row) else {
-                            break;
-                        };
-                        screen_row += 1;
-                        // The child-note badge borrows the panels' glyphs
-                        // (✎ open / ✓ all done) so Enter's reveal is
-                        // signposted without a column of its own.
-                        let badge = note_badge(
-                            app.note_stats(&nebula_core::NoteOwner::Todo(todo.id.clone())),
-                            th,
-                        );
-                        let badge_len = badge.as_ref().map_or(0, |(s, _)| s.chars().count() + 2);
-                        let budget = (inner.width as usize)
-                            .saturating_sub(2)
-                            .saturating_sub(badge_len);
-                        let editing_this = view.input.as_ref().is_some_and(|inp| {
-                            inp.target == crate::app::TodoInputTarget::EditTodo(todo.id.clone())
-                        });
-                        let mut spans = if editing_this {
-                            let mut spans = vec![Span::styled("☐ ", Style::default().fg(th.warn))];
-                            if let Some(inp) = &view.input {
-                                spans.extend(input_spans(
-                                    &inp.text,
-                                    budget.saturating_sub(1),
-                                    th.accent,
-                                    th,
-                                ));
-                            }
-                            spans
-                        } else if todo.done {
-                            vec![
-                                Span::styled("✓ ", Style::default().fg(th.ok)),
-                                Span::styled(
-                                    truncate(&todo.text, budget),
-                                    Style::default().fg(th.dim),
-                                ),
-                            ]
-                        } else {
-                            vec![
-                                Span::styled("☐ ", Style::default().fg(th.warn)),
-                                Span::raw(truncate(&todo.text, budget)),
-                            ]
-                        };
-                        if !editing_this {
-                            if let Some((text, style)) = badge {
-                                spans.push(Span::raw("  "));
-                                spans.push(Span::styled(text, style));
-                            }
-                        }
-                        render_row(
-                            f,
-                            row_area,
-                            spans,
-                            i == selected && view.input.is_none(),
-                            true,
-                            th,
-                        );
-                    }
-                    if creating {
-                        if let Some(row_area) = row_rect(inner, screen_row) {
-                            let budget = (inner.width as usize).saturating_sub(2);
-                            let mut spans =
-                                vec![Span::styled("+ ", Style::default().fg(th.accent))];
-                            if let Some(inp) = &view.input {
-                                spans.extend(input_spans(&inp.text, budget, th.accent, th));
-                            }
-                            f.render_widget(Paragraph::new(Line::from(spans)), row_area);
-                        }
-                    }
-                }
-            }
-
-            // Write-back (draw works on a clone): rects for mouse
-            // hit-testing, plus the clamped cursor of the active mode.
-            let in_detail = detail.is_some();
-            if let Some(Overlay::Todos(v)) = &mut app.overlay {
-                v.area = area;
-                v.list_area = inner;
-                if in_detail {
-                    v.note_selected = selected;
-                } else {
-                    v.selected = selected;
-                }
-            }
-        }
         Overlay::FileView(view) => {
             use crate::file_view::FileViewMode;
             let area = centered_rect_pct(f.area(), 92, 90);
@@ -2903,17 +2488,6 @@ fn panel_block(title: &str, focused: bool, th: Theme) -> Block<'_> {
     }
 }
 
-/// Note-count row badge for a (open, total) pair: open notes as `✎n`, an
-/// all-done list as `✓n`; no notes, no badge. The pencil is U+270E — a
-/// text-presentation glyph with no emoji variant, so it stays single-width.
-fn note_badge((open, total): (usize, usize), th: Theme) -> Option<(String, Style)> {
-    match (open, total) {
-        (_, 0) => None,
-        (0, total) => Some((format!(" ✓{total}"), Style::default().fg(th.ok))),
-        (open, _) => Some((format!(" ✎{open}"), Style::default().fg(th.warn))),
-    }
-}
-
 /// Host identity on rows, tabs and breadcrumbs: explicit `@local` is blue,
 /// remote hosts use the theme's pink. No badge when host identity is omitted.
 fn remote_badge(host: Option<&str>, th: Theme) -> Option<Span<'static>> {
@@ -3365,7 +2939,6 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
         ProjectRow,
         String,
         Option<AgentStatus>,
-        (usize, usize),
         crate::app::Activity,
     );
     let rows: Vec<Row> = app
@@ -3378,7 +2951,6 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
                     row,
                     p.name.clone(),
                     app.project_rollup(&p.id),
-                    app.note_stats(&nebula_core::NoteOwner::Project(p.id.clone())),
                     app.project_activity(&p.id),
                 )
             }
@@ -3390,7 +2962,7 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
                     p.divider_label.clone()
                 }
                 .unwrap_or_default();
-                (row, label, None, (0, 0), Default::default())
+                (row, label, None, Default::default())
             }
         })
         .collect();
@@ -3409,7 +2981,7 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
         .collect();
     let skip = scroll_skip(&heights, app.sel_project, mid);
     let mut screen_row = 0usize;
-    for (row_idx, (row, text, roll, notes, activity)) in rows.iter().enumerate().skip(skip) {
+    for (row_idx, (row, text, roll, activity)) in rows.iter().enumerate().skip(skip) {
         match row {
             ProjectRow::Project(i) => {
                 // Compact 2-row pill stride, same as the worktree rows —
@@ -3419,9 +2991,6 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
                 {
                     break;
                 }
-                // Same note-count badge as worktree rows: the project's own
-                // notes only (worktree notes badge on their worktree).
-                let note_badge = note_badge(*notes, th);
                 // Host presence is independent of activity: an absorbed remote
                 // twin still earns a pink dot even with no sessions/worktrees.
                 let family = app.tree.project_family(&app.tree.projects[*i].id);
@@ -3449,8 +3018,7 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
                         ));
                     }
                 }
-                let badge_len = note_badge.as_ref().map_or(0, |(s, _)| s.chars().count())
-                    + hosts.len() * 2
+                let badge_len = hosts.len() * 2
                     + active
                         .iter()
                         .map(|s| s.content.chars().count())
@@ -3465,9 +3033,6 @@ fn draw_projects(f: &mut Frame, app: &mut App, area: Rect) {
                 ));
                 spans.extend(active);
                 spans.extend(hosts);
-                if let Some((text, style)) = note_badge {
-                    spans.push(Span::styled(text, style));
-                }
                 render_pill(
                     f,
                     inner,
@@ -3867,7 +3432,6 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         /// past the nest cap that line up under a sibling.
         sub: Option<String>,
         roll: Option<AgentStatus>,
-        notes: (usize, usize),
         sessions: Vec<(SessionRow, usize)>,
         depth: usize,
         host: Option<String>,
@@ -3891,7 +3455,6 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                         label,
                         sub,
                         roll: app.worktree_rollup(id),
-                        notes: app.note_stats(&nebula_core::NoteOwner::Worktree(id.clone())),
                         sessions: app.nested_sessions_for_panel_row(&entry.row),
                         depth: entry.depth,
                         host: app.worktree_host(id).map(str::to_owned).or_else(|| {
@@ -3906,7 +3469,6 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
                     label: name.clone(),
                     sub,
                     roll: app.branch_rollup(name),
-                    notes: (0, 0),
                     sessions: app.nested_sessions_for_panel_row(&entry.row),
                     depth: entry.depth,
                     host: app.selected_project().and_then(|project| {
@@ -4047,8 +3609,6 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         if row_rect(inner, screen_row + row_height - 1).is_none() {
             break;
         }
-        let note_badge = note_badge(row.notes, th);
-        let badge_len = note_badge.as_ref().map_or(0, |(s, _)| s.chars().count());
         let ramp = sweep_ramp(row.roll, th, app.animations);
         let mut spans = Vec::new();
         if depth > 0 {
@@ -4060,9 +3620,9 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
         }
         // Remote checkouts carry the pink host badge after their tag.
         let remote = remote_badge(row.host.as_deref(), th);
-        let badge_len = badge_len + remote.as_ref().map_or(0, |s| s.content.chars().count());
+        let badge_len = remote.as_ref().map_or(0, |s| s.content.chars().count());
         // Name budget: the rail marker render_pill prepends (1) plus the
-        // status dot and its space (2), the row's tag, and any note badge.
+        // status dot and its space (2), the row's tag, and the host badge.
         const RAIL_AND_DOT: usize = 3;
         match row.kind {
             RowKind::Primary => {
@@ -4126,9 +3686,6 @@ fn draw_worktrees(f: &mut Frame, app: &mut App, area: Rect) {
             }
         }
         spans.extend(remote);
-        if let Some((text, style)) = note_badge {
-            spans.push(Span::styled(text, style));
-        }
         let selected = i == app.sel_worktree;
         render_pill(
             f,
@@ -5177,26 +4734,6 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             },
             Style::default().fg(th.dim),
         )
-    } else if let Some(Overlay::Notes(view)) = &app.overlay {
-        Span::styled(
-            if view.input.is_some() {
-                "type the note  Enter: save  Esc: cancel"
-            } else {
-                "e: add  Enter: edit  Space: toggle done  d: delete  Esc: close"
-            },
-            Style::default().fg(th.dim),
-        )
-    } else if let Some(Overlay::Todos(view)) = &app.overlay {
-        Span::styled(
-            if view.input.is_some() {
-                "type the text  Enter: save  Esc: cancel"
-            } else if view.detail.is_some() {
-                "a: add note  Enter: edit  Space: toggle done  d: delete  Esc: back to todos"
-            } else {
-                "a: add  Enter: open notes  Space: toggle done  r: edit  d: delete  Esc: close"
-            },
-            Style::default().fg(th.dim),
-        )
     } else if matches!(&app.overlay, Some(Overlay::Metrics(_))) {
         Span::styled(
             "↑/↓: select  Enter: open session  Esc: close  (refreshes every 2s)",
@@ -5284,13 +4821,11 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                     k(Action::Help)
                 ),
                 // The divider verb lives in the m menu (and the divider
-                // row's own footer) — the todos slot took its width here.
+                // row's own footer).
                 _ => format!(
-                    "{}/{}: add  {}/{}: notes/todos  {}: remove  {}/{}: move  {}: search  {}: menu  {}: help",
+                    "{}/{}: add  {}: remove  {}/{}: move  {}: search  {}: menu  {}: help",
                     k(Action::New),
                     k(Action::AddProject),
-                    k(Action::Notes),
-                    k(Action::Todos),
                     k(Action::Delete),
                     k(Action::MoveProjectDown),
                     k(Action::MoveProjectUp),
@@ -5300,10 +4835,8 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                 ),
             },
             Focus::Worktrees => format!(
-                "{}: new worktree  {}/{}: notes/todos  {}: terminal  {}: pin  {}: delete  {}: search  {}: menu  {}: help",
+                "{}: new worktree  {}: terminal  {}: pin  {}: delete  {}: search  {}: menu  {}: help",
                 k(Action::New),
-                k(Action::Notes),
-                k(Action::Todos),
                 k(Action::NewTerminal),
                 k(Action::Pin),
                 k(Action::Delete),
@@ -5314,20 +4847,16 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             // A link row answers to a different set of verbs than a
             // session does, so the hint follows the cursor into the group.
             Focus::Sessions if app.selected_link().is_some() => format!(
-                "{}: open in browser  {}: add link  {}: edit URL  {}: delete  {}: menu  {}: help",
+                "{}: open in browser  {}: menu  {}: help",
                 k(Action::Activate),
-                k(Action::NewLink),
-                k(Action::Rename),
-                k(Action::Delete),
                 k(Action::ContextMenu),
                 k(Action::Help)
             ),
             Focus::Sessions => format!(
-                "{}: focus  {}: agent  {}: terminal  {}: link  {}: rename  {}: archive  {}: del  {}: menu  {}: help",
+                "{}: focus  {}: agent  {}: terminal  {}: rename  {}: archive  {}: del  {}: menu  {}: help",
                 k(Action::Activate),
                 k(Action::New),
                 k(Action::NewTerminal),
-                k(Action::NewLink),
                 k(Action::Rename),
                 k(Action::Archive),
                 k(Action::Delete),

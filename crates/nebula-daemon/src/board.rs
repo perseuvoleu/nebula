@@ -43,7 +43,7 @@ fn apply(tx: &Transaction, op: BoardOp) -> Result<BoardResult> {
             if let Some(title) = title {
                 let title = non_empty(&title, "a card title")?;
                 tx.execute(
-                    "UPDATE todos SET title = ?2, text = ?2 WHERE id = ?1",
+                    "UPDATE todos SET title = ?2 WHERE id = ?1",
                     params![id.as_str(), title],
                 )?;
             }
@@ -249,8 +249,8 @@ fn add_card(tx: &Transaction, draft: CardDraft) -> Result<Card> {
     })?;
     let now = now_ms();
     tx.execute(
-        "INSERT INTO todos (id, text, sort_order, created_at, number, title, stage, project, checkout, created_by, proposed, stage_changed_at)
-         VALUES (?1, ?2, ?3, ?4, ?3, ?2, ?5, ?6, ?7, ?8, ?9, ?4)",
+        "INSERT INTO todos (id, sort_order, created_at, number, title, stage, project, checkout, created_by, proposed, stage_changed_at)
+         VALUES (?1, ?3, ?4, ?3, ?2, ?5, ?6, ?7, ?8, ?9, ?4)",
         params![
             draft.id.as_str(),
             title,
