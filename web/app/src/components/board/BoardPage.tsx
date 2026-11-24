@@ -81,7 +81,7 @@ export function BoardPage({ route, onNavigate, onSessions }: {
   const { board, stale } = useBoard(lastSeen);
   const [local, setLocal] = useState<SidebarScope | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
-  const [expanded, setExpanded] = useState<string[]>([]);
+  const [expanded, setExpanded] = useState<(string | null)[]>([]);
   const [showQuiet, setShowQuiet] = useState(false);
   const [search, setSearch] = useState("");
   const [sort, setSort] = useState<TableSort>({ key: "ref", asc: true });
@@ -89,21 +89,21 @@ export function BoardPage({ route, onNavigate, onSessions }: {
   const [digestClosed, setDigestClosed] = useState(false);
   const [decisionQuery, setDecisionQuery] = useState("");
 
-  const scope: SidebarScope = route.decisions && route.project ? { kind: "decisions", project: route.project }
-    : route.project ? (local?.kind === "checkout" && local.project === route.project ? local : { kind: "project", project: route.project })
-      : local?.kind === "needs" ? local : { kind: "all" };
+  const routed = (s: SidebarScope) => ({ project: s.kind === "all" || s.kind === "needs" ? null : s.project, decisions: s.kind === "decisions" });
+  const fromRoute: SidebarScope = !route.project ? { kind: "all" }
+    : route.decisions ? { kind: "decisions", project: route.project } : { kind: "project", project: route.project };
+  const scope = local && routed(local).project === route.project && routed(local).decisions === route.decisions ? local : fromRoute;
   const go = (next: Partial<BoardRoute>) => {
     onNavigate({ ...route, card: null, peek: null, decisions: false, ...next });
     setMenuOpen(false);
   };
   const select = (next: SidebarScope) => {
-    setLocal(next.kind === "needs" || next.kind === "checkout" ? next : null);
-    if (next.kind === "decisions") go({ project: next.project, decisions: true });
-    else go({ project: next.kind === "project" || next.kind === "checkout" ? next.project : null });
+    setLocal(next);
+    go(routed(next));
   };
   const peek = (ref: string) => onNavigate({ ...route, peek: cardSlug(ref) });
   const openPage = (ref: string) => go({ card: cardSlug(ref) });
-  const toggle = (list: string[], name: string) => list.includes(name) ? list.filter((n) => n !== name) : [...list, name];
+  const toggle = <T,>(list: T[], name: T) => list.includes(name) ? list.filter((n) => n !== name) : [...list, name];
 
   const live = (board?.cards ?? []).filter((c) => !c.archived);
   const all = live.map((c) => toBoardCard(c, live));

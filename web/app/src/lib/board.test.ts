@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { awayDigest, byStage, isBlocked, sidebarProjects, writerSlots, type BoardData, type Card } from "./board.ts";
+import { awayDigest, byStage, inScope, isBlocked, sidebarProjects, toBoardCard, writerSlots, type BoardData, type Card } from "./board.ts";
 
 const card = (number: number, stage: Card["stage"], blocked_by: string[] = []): Card => ({
   id: `01JD${String(number).padStart(22, "0")}`, number, ref: `#${number}@leaseweb`, title: `Card ${number}`, stage,
@@ -36,6 +36,17 @@ test("sidebarProjects counts every unarchived card of a project, Done included",
   const board: BoardData = { cards: [card(1, "doing"), card(2, "done"), { ...card(3, "done"), archived: true }], hosts: [],
     away: { finished: [], needs_you: [], decisions: [] } };
   assert.deepEqual(sidebarProjects(board).map((p) => [p.name, p.cards]), [["nebula", 2]]);
+});
+
+test("projectless cards and a project named home are separate sidebar projects, each scoping only its own cards", () => {
+  const home = { ...card(1, "doing"), project: null };
+  const named = { ...card(2, "doing"), project: "home" };
+  const projects = sidebarProjects({ cards: [home, named], hosts: [], away: { finished: [], needs_you: [], decisions: [] } });
+  assert.equal(projects.length, 2);
+  for (const p of projects) {
+    const scoped = [home, named].map((c) => toBoardCard(c, [])).filter((c) => inScope(c, { kind: "project", project: p.project }));
+    assert.deepEqual([p.cards, scoped.map((c) => c.ref)], [1, [p.project === null ? home.ref : named.ref]]);
+  }
 });
 
 test("awayDigest resolves finished card ids to cards and keeps needs-you sessions and new decisions", () => {

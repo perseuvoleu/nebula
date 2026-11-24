@@ -174,6 +174,7 @@ export function toBoardCard(card: Card, cards: Card[], show?: CardShow): BoardCa
 export type SidebarCheckout = { branch: string; host: string | null; primary: boolean };
 
 export type SidebarProject = {
+  project: string | null;
   name: string;
   host: string | null;
   cards: number;
@@ -185,15 +186,15 @@ export type SidebarProject = {
 export type SidebarScope =
   | { kind: "all" }
   | { kind: "needs" }
-  | { kind: "project"; project: string }
-  | { kind: "checkout"; project: string; host: string | null; branch: string }
-  | { kind: "decisions"; project: string };
+  | { kind: "project"; project: string | null }
+  | { kind: "checkout"; project: string | null; host: string | null; branch: string }
+  | { kind: "decisions"; project: string | null };
 
 export function sidebarProjects(board: BoardData): SidebarProject[] {
-  const projects = new Map<string, SidebarProject>();
-  const project = (name: string) => {
-    if (!projects.has(name)) projects.set(name, { name, host: null, cards: 0, needsYou: false, running: false, checkouts: [] });
-    return projects.get(name)!;
+  const projects = new Map<string | null, SidebarProject>();
+  const project = (key: string | null) => {
+    if (!projects.has(key)) projects.set(key, { project: key, name: projectName(key), host: null, cards: 0, needsYou: false, running: false, checkouts: [] });
+    return projects.get(key)!;
   };
   const checkout = (p: SidebarProject, co: SidebarCheckout) => {
     if (!p.checkouts.some((c) => c.host === co.host && c.branch === co.branch)) p.checkouts.push(co);
@@ -202,7 +203,7 @@ export function sidebarProjects(board: BoardData): SidebarProject[] {
     for (const co of host.checkouts) checkout(project(co.project), { branch: co.branch, host: host.host, primary: !co.worktree });
   }
   for (const card of board.cards.filter((c) => !c.archived)) {
-    const p = project(projectName(card.project));
+    const p = project(card.project);
     p.cards += 1;
     if (card.stage === "doing") p.running = true;
     if (card.checkout) checkout(p, { branch: card.checkout.branch, host: card.checkout.host, primary: !card.checkout.worktree });
@@ -214,9 +215,9 @@ export function inScope(card: BoardCard, scope: SidebarScope): boolean {
   switch (scope.kind) {
     case "all": return true;
     case "needs": return card.needsYou;
-    case "checkout": return projectName(card.project) === scope.project && card.checkout?.branch === scope.branch
+    case "checkout": return card.project === scope.project && card.checkout?.branch === scope.branch
       && (scope.host === null || card.checkout.host === scope.host);
-    default: return projectName(card.project) === scope.project;
+    default: return card.project === scope.project;
   }
 }
 

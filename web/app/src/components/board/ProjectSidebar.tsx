@@ -18,19 +18,19 @@ function ProjectNode({ project, scope, expanded, onSelect, onToggle }: {
   scope: SidebarScope;
   expanded: boolean;
   onSelect?: (scope: SidebarScope) => void;
-  onToggle?: (project: string) => void;
+  onToggle?: (project: string | null) => void;
 }) {
-  const selected = scope.kind === "project" && scope.project === project.name;
-  const decisions = scope.kind === "decisions" && scope.project === project.name;
+  const selected = scope.kind === "project" && scope.project === project.project;
+  const decisions = scope.kind === "decisions" && scope.project === project.project;
   const Chevron = expanded ? ChevronDownIcon : ChevronRightIcon;
   return (
     <li>
       <div className={cn("flex items-center rounded-md", selected && on)}>
-        <button type="button" aria-expanded={expanded} aria-label={`Checkouturi ${project.name}`} onClick={() => onToggle?.(project.name)}
+        <button type="button" aria-expanded={expanded} aria-label={`Checkouturi ${project.name}`} onClick={() => onToggle?.(project.project)}
           className="grid size-8 shrink-0 place-items-center rounded-md text-muted-foreground outline-none hover:bg-sidebar-accent hover:text-foreground focus-visible:ring-2 focus-visible:ring-sidebar-ring">
           <Chevron aria-hidden className="size-3.5" />
         </button>
-        <button type="button" aria-current={selected ? "page" : undefined} onClick={() => onSelect?.({ kind: "project", project: project.name })}
+        <button type="button" aria-current={selected ? "page" : undefined} onClick={() => onSelect?.({ kind: "project", project: project.project })}
           className={cn(item, "pl-1", !selected && "text-muted-foreground hover:text-foreground")}>
           <StatusDot dot={projectDot(project)} />
           <span className="min-w-0 flex-1 truncate font-mono text-xs">{project.name}</span>
@@ -41,12 +41,12 @@ function ProjectNode({ project, scope, expanded, onSelect, onToggle }: {
       {expanded && (
         <ul className="mt-0.5 flex flex-col gap-0.5">
           {project.checkouts.map((co) => {
-            const current = scope.kind === "checkout" && scope.project === project.name && scope.branch === co.branch && scope.host === co.host;
+            const current = scope.kind === "checkout" && scope.project === project.project && scope.branch === co.branch && scope.host === co.host;
             const Icon = co.primary ? CircleDotIcon : GitBranchIcon;
             return (
               <li key={`${co.host ?? ""}:${co.branch}`}>
                 <button type="button" aria-current={current ? "page" : undefined}
-                  onClick={() => onSelect?.({ kind: "checkout", project: project.name, host: co.host, branch: co.branch })}
+                  onClick={() => onSelect?.({ kind: "checkout", project: project.project, host: co.host, branch: co.branch })}
                   className={cn(item, "min-h-7 pl-9 font-mono text-xs", current ? on : "text-muted-foreground hover:text-foreground")}>
                   <Icon aria-hidden className="size-3 shrink-0" />
                   <span className="min-w-0 flex-1 truncate">{co.branch}</span>
@@ -57,7 +57,7 @@ function ProjectNode({ project, scope, expanded, onSelect, onToggle }: {
             );
           })}
           <li>
-            <button type="button" aria-current={decisions ? "page" : undefined} onClick={() => onSelect?.({ kind: "decisions", project: project.name })}
+            <button type="button" aria-current={decisions ? "page" : undefined} onClick={() => onSelect?.({ kind: "decisions", project: project.project })}
               className={cn(item, "min-h-7 pl-9 text-xs", decisions ? on : "text-muted-foreground hover:text-foreground")}>
               <ScaleIcon aria-hidden className="size-3 shrink-0" />
               <span className="min-w-0 flex-1 truncate">Decizii</span>
@@ -74,12 +74,12 @@ export function ProjectSidebar({ projects, total, needsCount, scope, expanded, s
   total: number;
   needsCount: number;
   scope: SidebarScope;
-  expanded: string[];
+  expanded: (string | null)[];
   showQuiet: boolean;
   query?: string;
   onQueryChange?: (query: string) => void;
   onSelect?: (scope: SidebarScope) => void;
-  onToggleProject?: (project: string) => void;
+  onToggleProject?: (project: string | null) => void;
   onToggleQuiet?: () => void;
 }) {
   const needle = query.trim().toLowerCase();
@@ -87,7 +87,7 @@ export function ProjectSidebar({ projects, total, needsCount, scope, expanded, s
   const active = visible.filter((p) => p.cards > 0);
   const quiet = visible.filter((p) => p.cards === 0);
   const node = (p: SidebarProject) => (
-    <ProjectNode key={p.name} project={p} scope={scope} expanded={expanded.includes(p.name)} onSelect={onSelect} onToggle={onToggleProject} />
+    <ProjectNode key={JSON.stringify(p.project)} project={p} scope={scope} expanded={expanded.includes(p.project)} onSelect={onSelect} onToggle={onToggleProject} />
   );
   const QuietChevron = showQuiet ? ChevronDownIcon : ChevronRightIcon;
   return (
