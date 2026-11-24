@@ -169,7 +169,7 @@ pub fn split_connection(conn: Connection) -> IpcChannels {
 /// NEBULA_AGENT_ID when it names a real agent session. Shell tabs export a
 /// `term:`-prefixed id (hook routing for hand-run CLIs) that no agent row
 /// matches — commands that resolve their own agent treat it as absent.
-fn env_agent_id() -> Option<String> {
+pub(crate) fn env_agent_id() -> Option<String> {
     std::env::var("NEBULA_AGENT_ID")
         .ok()
         .filter(|v| !v.is_empty() && !v.starts_with("term:"))
@@ -1430,6 +1430,8 @@ pub async fn agent_show(name: String, project_flag: Option<String>) -> Result<()
             "writer": a.writer,
             "code_mode_off": a.code_mode_off,
             "spawned_by": a.spawned_by,
+            "card": a.card_id,
+            "role": a.role,
             "alive": a.alive,
             // Native CLI session id (claude/codex/cursor/pi) the daemon stored for
             // resume; read-only consumers (the web gateway) map it to native history.
@@ -1745,6 +1747,10 @@ pub struct NewAgentOpts {
     pub writer_wait: Duration,
     /// `--no-code-mode`: claude spawns get `CLAUDE_CODE_EXPERIMENTAL_CODE_MODE=0`.
     pub code_mode_off: bool,
+    /// `--card REF`: the board card the session works on, checked on the
+    /// board before anything spawns.
+    pub card: Option<String>,
+    pub role: Option<nebula_core::board::Role>,
 }
 
 /// Session name when the caller passed no `--name`: derived from the
@@ -1781,6 +1787,13 @@ pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
     let mut conn = handshake(stream).await?;
     let (projects, worktrees, agents) = subscribe_snapshot(&mut conn).await?;
     let project = resolve_project(&projects, &worktrees, &agents, opts.project.as_deref())?;
+    let card = match opts.card.as_deref() {
+        Some(text) => {
+            crate::board_cli::Caller::resolve(&projects, &worktrees, &agents)?;
+            Some(crate::board_cli::check_card(&mut conn, text).await?)
+        }
+        None => None,
+    };
     if let Some(host) = &project.host {
         let cache = paths::log_dir().join("skills-check");
         if let Some(warning) =
@@ -1891,8 +1904,8 @@ pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
                 writer: opts.writer,
                 spawned_by: env_agent_id().map(AgentId),
                 code_mode_off: opts.code_mode_off,
-                card: None,
-                role: None,
+                card: card.clone(),
+                role: opts.role,
                 dispatch: None,
             },
         )
@@ -1932,6 +1945,8 @@ pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
             "kind": opts.kind,
             "project": project.name,
             "worktree": target.branch,
+            "card": card,
+            "role": opts.role,
         })
     );
     Ok(())
@@ -2363,18 +2378,13 @@ pub async fn run_notes(op: NotesOp) -> Result<()> {
 }
 
 pub enum TodoOp {
-    List,
-    Add { text: String, worktree: bool },
     Done { index: usize },
     Reopen { index: usize },
-    Show { index: usize },
-    NoteAdd { index: usize, text: String },
     NoteDone { index: usize, note: usize },
 }
 
-/// `nebula todo [list|add|done|reopen|show|note|note-done]` — the todo
-/// lists (project + current worktree) from the CLI, so agents can read and
-/// work the user's task list, including each todo's own notes. Target
+/// `nebula todo done|reopen|note-done` — the legacy positional verbs over
+/// the project and worktree todo lists, including each todo's own notes. Target
 /// resolution mirrors `nebula notes`: the caller's session
 /// (NEBULA_AGENT_ID) when run inside one, else whatever project/worktree
 /// owns the current directory.
@@ -2438,7 +2448,6 @@ pub async fn run_todo(op: TodoOp) -> Result<()> {
         .iter()
         .filter(|t| t.owner == TodoOwner::Project(project.id.clone()))
         .collect();
-    let project_count = visible.len();
     if let Some(w) = worktree {
         visible.extend(
             todos
@@ -2468,62 +2477,6 @@ pub async fn run_todo(op: TodoOp) -> Result<()> {
 
     let req_id = 1u64;
     match op {
-        TodoOp::List => {
-            if visible.is_empty() {
-                println!(
-                    "no todos for {} — add one with `nebula todo add <text>`",
-                    project.name
-                );
-                return Ok(());
-            }
-            for (i, t) in visible.iter().enumerate() {
-                if i == 0 && project_count > 0 {
-                    println!("{} — project todos", project.name);
-                }
-                if i == project_count {
-                    // Reachable only when a worktree was resolved.
-                    println!(
-                        "{}/{} — worktree todos",
-                        project.name,
-                        worktree.map(|w| w.branch.as_str()).unwrap_or("?")
-                    );
-                }
-                let mark = if t.done { "x" } else { " " };
-                let child = notes_of(t).len();
-                let suffix = match child {
-                    0 => String::new(),
-                    1 => "  (1 note)".to_string(),
-                    n => format!("  ({n} notes)"),
-                };
-                println!("  {}. [{mark}] {}{suffix}", i + 1, t.text);
-            }
-            Ok(())
-        }
-        TodoOp::Add {
-            text,
-            worktree: to_worktree,
-        } => {
-            let owner = if to_worktree {
-                let w = worktree.context(
-                    "--worktree needs a current worktree (run inside a session or a checkout)",
-                )?;
-                TodoOwner::Worktree(w.id.clone())
-            } else {
-                TodoOwner::Project(project.id.clone())
-            };
-            write_frame(
-                &mut conn.stream,
-                &ClientRequest::CreateTodo {
-                    req_id,
-                    owner,
-                    text: text.clone(),
-                },
-            )
-            .await?;
-            await_ack(&mut conn, req_id, &mut Vec::new()).await?;
-            println!("todo added: {text}");
-            Ok(())
-        }
         TodoOp::Done { index } | TodoOp::Reopen { index } => {
             let done = matches!(op, TodoOp::Done { .. });
             let t = nth(index)?;
@@ -2542,36 +2495,6 @@ pub async fn run_todo(op: TodoOp) -> Result<()> {
                 if done { "done" } else { "reopened" },
                 t.text
             );
-            Ok(())
-        }
-        TodoOp::Show { index } => {
-            let t = nth(index)?;
-            let mark = if t.done { "x" } else { " " };
-            println!("{index}. [{mark}] {}", t.text);
-            let child = notes_of(t);
-            if child.is_empty() {
-                println!("   no notes — add one with `nebula todo note {index} <text>`");
-            } else {
-                for (i, n) in child.iter().enumerate() {
-                    let mark = if n.done { "x" } else { " " };
-                    println!("   {}. [{mark}] {}", i + 1, n.text);
-                }
-            }
-            Ok(())
-        }
-        TodoOp::NoteAdd { index, text } => {
-            let t = nth(index)?;
-            write_frame(
-                &mut conn.stream,
-                &ClientRequest::CreateNote {
-                    req_id,
-                    owner: NoteOwner::Todo(t.id.clone()),
-                    text: text.clone(),
-                },
-            )
-            .await?;
-            await_ack(&mut conn, req_id, &mut Vec::new()).await?;
-            println!("note added under todo {index}: {text}");
             Ok(())
         }
         TodoOp::NoteDone { index, note } => {

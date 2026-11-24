@@ -68,6 +68,14 @@ fn epoch_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// The board link a `CreateAgent` stores on the session's row.
+#[derive(Debug, Clone, Default)]
+pub struct CardLink {
+    pub card: Option<TodoId>,
+    pub role: Option<nebula_core::board::Role>,
+    pub dispatch: Option<nebula_core::DispatchId>,
+}
+
 pub struct Daemon {
     /// Runtime handoff reservations and accepted prompt notifications.
     pub(crate) collect_owners: Mutex<HashSet<AgentId>>,
@@ -2422,6 +2430,7 @@ impl Daemon {
         writer: WriterClaim,
         spawned_by: Option<AgentId>,
         code_mode_off: bool,
+        link: CardLink,
     ) -> Result<EntityId> {
         let _execution = self.checkout_locks.session(worktree_id).await;
         let worktree = self
@@ -2484,9 +2493,9 @@ impl Daemon {
             branch: Some(worktree.branch.clone()),
             spawned_by,
             writer: !writer.is_off(),
-            card_id: None,
-            role: None,
-            dispatch_id: None,
+            card_id: link.card,
+            role: link.role,
+            dispatch_id: link.dispatch,
             code_mode_off,
         };
         self.store
@@ -5931,6 +5940,7 @@ exec sleep 60
                 WriterClaim::Off,
                 None,
                 false,
+                CardLink::default(),
             )
             .await
             .unwrap()
@@ -5959,6 +5969,7 @@ exec sleep 60
                 writer,
                 None,
                 false,
+                CardLink::default(),
             )
             .await?;
         let EntityId::Agent(id) = id else { panic!() };
@@ -7027,6 +7038,7 @@ exec sleep 60
                 WriterClaim::Off,
                 None,
                 false,
+                CardLink::default(),
             )
             .await
             .unwrap_err();

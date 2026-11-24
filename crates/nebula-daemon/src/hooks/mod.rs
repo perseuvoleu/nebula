@@ -51,13 +51,11 @@ pub fn notes_instruction(open: usize) -> String {
 /// only tells the agent the CLI exists; acting on a todo stays its call.
 pub fn todos_instruction(open: usize) -> String {
     format!(
-        "[nebula] This project has {open} open todo{} — the user's task \
-         list, separate from notes. `nebula todo list` reads them, `nebula \
-         todo show <n>` includes a todo's own notes, `nebula todo done <n>` \
-         checks one off (do that when your work completes it; `reopen <n>` \
-         undoes), `nebula todo add <text>` adds one, and `nebula todo note \
-         <n> <text>` records progress under one. Bring one up only when \
-         it's relevant to the user's request.",
+        "[nebula] This project has {open} open todo{} on the user's legacy \
+         list, separate from notes and from the board. `nebula todo \
+         done <n>` checks one off by its number in that list (do that when \
+         your work completes it; `reopen <n>` undoes). Bring one up only \
+         when it's relevant to the user's request.",
         if open == 1 { "" } else { "s" }
     )
 }
@@ -882,7 +880,13 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(body, context_injection(&[todos_instruction(2)]));
         assert!(body.contains("2 open todos"), "count: {body}");
-        assert!(body.contains("nebula todo list"), "cli pointer: {body}");
+        assert!(body.contains("nebula todo done <n>"), "cli pointer: {body}");
+        for card_verb in ["list", "show", "add", "note"] {
+            assert!(
+                !body.contains(&format!("todo {card_verb}")),
+                "the pointer names a card verb: {body}"
+            );
+        }
         assert!(
             !body.contains("nebula notes"),
             "todo child notes must not trigger the notes pointer: {body}"

@@ -4,6 +4,7 @@
 )]
 
 pub mod app;
+pub mod board_cli;
 pub mod branch_name;
 pub mod branches;
 pub mod collect_cli;
@@ -157,11 +158,15 @@ pub fn run_notes(op: NotesOp) -> Result<()> {
     runtime()?.block_on(ipc::run_notes(op))
 }
 
-/// `nebula todo [list|add|done|reopen|show|note|note-done]` —
-/// project/worktree todos and their child notes from the CLI, agents
-/// included (see `ipc::run_todo`).
+/// `nebula todo done|reopen|note-done` — the legacy positional todo verbs
+/// (see `ipc::run_todo`).
 pub fn run_todo(op: TodoOp) -> Result<()> {
     runtime()?.block_on(ipc::run_todo(op))
+}
+
+/// `nebula todo` card verbs on the board (see `board_cli::run`).
+pub fn run_board(verb: board_cli::TodoVerb, json: bool) -> Result<()> {
+    board_cli::exit_on_refusal(runtime()?.block_on(board_cli::run(verb, json)))
 }
 
 /// `nebula worktree new` — agent-facing orchestration verb.
@@ -227,7 +232,7 @@ pub fn run_agent_new(opts: NewAgentOpts) -> Result<()> {
             eprintln!("{why:#}");
             std::process::exit(2);
         }
-        done => done,
+        done => board_cli::exit_on_refusal(done),
     }
 }
 

@@ -451,6 +451,41 @@ pub enum BoardOp {
     Report(HostReport),
 }
 
+/// Why the board refused an op. It leads the `Error` message, so it crosses
+/// the wire and the board link unchanged, and the CLI turns it into an exit
+/// code the gateway maps to 404 or 409.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    NotFound,
+    Conflict,
+}
+
+impl Refusal {
+    const ALL: [Refusal; 2] = [Refusal::NotFound, Refusal::Conflict];
+
+    fn tag(self) -> &'static str {
+        match self {
+            Refusal::NotFound => "not found: ",
+            Refusal::Conflict => "conflict: ",
+        }
+    }
+
+    pub fn message(self, why: impl std::fmt::Display) -> String {
+        format!("{}{why}", self.tag())
+    }
+
+    pub fn of(message: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|r| message.starts_with(r.tag()))
+    }
+
+    pub fn exit_code(self) -> i32 {
+        match self {
+            Refusal::NotFound => 5,
+            Refusal::Conflict => 6,
+        }
+    }
+}
+
 /// Failures travel as the ordinary `ServerEvent::Error`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum BoardResult {

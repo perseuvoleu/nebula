@@ -2,7 +2,7 @@
 //! attach/forward plumbing.
 
 use crate::pty::PtyEvent;
-use crate::registry::Daemon;
+use crate::registry::{CardLink, Daemon};
 use anyhow::Result;
 use nebula_core::codec::{read_frame, write_frame};
 use nebula_core::{ClientRequest, ServerEvent, SessionRef, PROTOCOL_VERSION};
@@ -285,8 +285,30 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 ClientRequest::MarkPrSeen { url, marker } => {
                     let _ = daemon.store.mark_pr_seen(&url, &marker);
                 }
-                ClientRequest::Board { req_id, .. } => {
-                    reply(&out_tx, req_id, Err(anyhow::anyhow!("no board configured"))).await;
+                ClientRequest::Board { req_id, op } => {
+                    let daemon = daemon.clone();
+                    let out_tx = out_tx.clone();
+                    tokio::spawn(async move {
+                        let served = tokio::task::spawn_blocking(move || {
+                            match crate::config::Config::load().board.as_deref() {
+                                None => Err(anyhow::anyhow!("no board configured")),
+                                Some("local") => crate::board::serve(&daemon.store, op),
+                                Some(host) => Err(anyhow::anyhow!(
+                                    "board = \"{host}\" needs the board link, which this build lacks"
+                                )),
+                            }
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(anyhow::anyhow!("board op panicked: {e}")));
+                        let event = match served {
+                            Ok(result) => ServerEvent::BoardReply { req_id, result },
+                            Err(e) => ServerEvent::Error {
+                                req_id: Some(req_id),
+                                message: format!("{e:#}"),
+                            },
+                        };
+                        let _ = out_tx.send(event).await;
+                    });
                 }
                 ClientRequest::GetMetrics { req_id } => {
                     // A machine-wide `ps` sweep takes tens of ms; keep it off
@@ -531,7 +553,9 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     writer,
                     spawned_by,
                     code_mode_off,
-                    ..
+                    card,
+                    role,
+                    dispatch,
                 } => {
                     reply(
                         &out_tx,
@@ -549,6 +573,11 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                                 writer,
                                 spawned_by,
                                 code_mode_off,
+                                CardLink {
+                                    card,
+                                    role,
+                                    dispatch,
+                                },
                             )
                             .await
                             .map(Some),
