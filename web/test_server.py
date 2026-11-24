@@ -409,7 +409,8 @@ class HTTPTests(unittest.TestCase):
 
     def test_shell_assets_and_route_fallback(self):
         for path in ["/", "/assets/app-abc123.js", "/manifest.webmanifest", "/icon.svg", "/sw.js",
-                     "/p/project", "/p/project/s/one", "/serverless"]:
+                     "/p/project", "/p/project/s/one", "/serverless", "/board", "/board/p/nebula?view=table",
+                     "/board/c/12@leaseweb?peek=12", "/board/c/12%40leaseweb", "/board/decisions/p/nebula"]:
             status, headers, body = self.request(path)
             self.assertEqual(status, 200, path)
             self.assertTrue(body)
@@ -417,7 +418,7 @@ class HTTPTests(unittest.TestCase):
         self.assertTrue(self.request("/p/project/s/one")[2].startswith(b"<!doctype"))
         self.assertTrue(self.request("/assets/app-abc123.js")[1]["Cache-Control"].startswith("public"))
         self.assertEqual(self.request("/")[1]["Cache-Control"], "no-cache")
-        for path in ["/secret.env", "/../server.py", "/assets/../secret.env", "/p/project/s/one/x", "/api", "/server.py"]:
+        for path in ["/secret.env", "/../server.py", "/assets/../secret.env", "/p/project/s/one/x", "/api", "/server.py", "/board/x/y"]:
             self.assertEqual(self.request(path)[0], 404, path)
 
     def test_auth_and_no_cache(self):
