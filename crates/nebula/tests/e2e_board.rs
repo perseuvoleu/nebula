@@ -1038,7 +1038,7 @@ fn away_digest_sessions() {
     assert_eq!(away["finished"], serde_json::json!([work["id"]]), "{away}");
     assert_eq!(
         away["needs_you"],
-        serde_json::json!([{"host": FAR_HOST, "id": "n2", "card": ask["id"], "status_changed_at": after + 1}]),
+        serde_json::json!([{"host": FAR_HOST, "id": "n2", "name": "n2", "card": ask["id"], "status_changed_at": after + 1}]),
         "{away}"
     );
     assert_ne!(old["id"], work["id"]);
@@ -1117,6 +1117,41 @@ fn host_needs_you_follows_the_read_scope() {
 }
 
 #[test]
+fn board_needs_you_lists_every_waiting_session_in_scope() {
+    let env = board_env();
+    let ask = add(&env, &["--project", "nebula"], "Ask");
+    let work = add(&env, &["--project", "nebula"], "Work");
+    let before = now_ms() - 60_000;
+    far_report(
+        &env,
+        vec![
+            far_row(&ask, "n1", AgentStatus::NeedsFeedback, before),
+            far_row(&work, "w1", AgentStatus::Running, before),
+        ],
+    );
+    let away_since = (before + 30_000).to_string();
+    let read = |scope: &str| {
+        env.json(&[
+            "todo",
+            "board",
+            scope,
+            "--away-since",
+            &away_since,
+            "--json",
+        ])["board"]
+            .clone()
+    };
+    let all = read("--all");
+    assert_eq!(
+        all["needs_you"],
+        serde_json::json!([{"host": FAR_HOST, "id": "n1", "name": "n1", "card": ask["id"], "status_changed_at": before}]),
+        "{all}"
+    );
+    assert_eq!(all["away"]["needs_you"], serde_json::json!([]), "{all}");
+    assert_eq!(read("--project=other")["needs_you"], serde_json::json!([]));
+}
+
+#[test]
 fn omitted_session_stops_needing_the_user() {
     let env = board_env();
     let card = add(&env, &["--project", "nebula"], "Ask");
@@ -1139,7 +1174,7 @@ fn omitted_session_stops_needing_the_user() {
     };
     assert_eq!(
         away(&env),
-        serde_json::json!([{"host": FAR_HOST, "id": "n1", "card": card["id"], "status_changed_at": since + 1}])
+        serde_json::json!([{"host": FAR_HOST, "id": "n1", "name": "n1", "card": card["id"], "status_changed_at": since + 1}])
     );
     far_report(&env, Vec::new());
     assert_eq!(away(&env), serde_json::json!([]), "n1 is no longer live");

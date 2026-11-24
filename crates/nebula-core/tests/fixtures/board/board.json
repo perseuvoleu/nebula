@@ -47,6 +47,15 @@
         "stale": false
       }
     ],
+    "needs_you": [
+      {
+        "host": "leaseweb",
+        "id": "01JF0000000000000000000002",
+        "name": "worker",
+        "card": "01JD0000000000000000000012",
+        "status_changed_at": 1764000200000
+      }
+    ],
     "away": {
       "finished": [
         "01JD0000000000000000000012"
@@ -55,6 +64,7 @@
         {
           "host": "leaseweb",
           "id": "01JF0000000000000000000002",
+          "name": "worker",
           "card": "01JD0000000000000000000012",
           "status_changed_at": 1764000200000
         }

@@ -570,6 +570,7 @@ fn worker_waiting() -> NeedsYou {
     NeedsYou {
         host: "leaseweb".into(),
         id: AgentId("01JF0000000000000000000002".into()),
+        name: "worker".into(),
         card: TodoId(CARD.into()),
         status_changed_at: 1764000200000,
     }
@@ -703,6 +704,7 @@ fn board_json_golden() {
                     needs_you: 0,
                     stale: false,
                 }],
+                needs_you: vec![worker_waiting()],
                 away: Away {
                     finished: vec![TodoId(CARD.into())],
                     needs_you: vec![worker_waiting()],
@@ -756,6 +758,7 @@ fn board_json_golden() {
         board: BoardPage {
             cards: vec![],
             hosts: vec![],
+            needs_you: vec![],
             away: Away::default(),
         },
         next: Some("01JB0000000000000000000000.53:1".into()),

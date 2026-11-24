@@ -268,6 +268,8 @@ pub struct BoardHost {
 pub struct NeedsYou {
     pub host: String,
     pub id: AgentId,
+    #[serde(default)]
+    pub name: String,
     pub card: TodoId,
     pub status_changed_at: i64,
 }
@@ -284,6 +286,9 @@ pub struct Away {
 pub struct BoardPage {
     pub cards: Vec<Card>,
     pub hosts: Vec<BoardHost>,
+    /// Every session waiting on the user now, with no time window.
+    #[serde(default)]
+    pub needs_you: Vec<NeedsYou>,
     pub away: Away,
 }
 
