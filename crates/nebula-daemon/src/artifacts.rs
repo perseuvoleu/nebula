@@ -36,8 +36,8 @@ pub fn store(id: &ArtifactId, kind: &str, source: &Path) -> Result<ArtifactConte
     std::fs::create_dir_all(&root)?;
     let tmp = root.join(format!(".tmp-{id}"));
     let _ = std::fs::remove_dir_all(&tmp);
-    let entry = copy_tree(source, &tmp).and_then(|files| {
-        let entry = entry_of(kind, &tmp, &files)?;
+    let entry = copy_tree(source, &tmp).and_then(|(files, is_dir)| {
+        let entry = entry_of(kind, is_dir, &tmp, &files)?;
         if !dest.exists() {
             std::fs::rename(&tmp, &dest)?;
         } else if !same_tree(&tmp, &dest, &files)? {
@@ -76,7 +76,7 @@ fn same_tree(staged: &Path, stored: &Path, files: &BTreeSet<String>) -> Result<b
     Ok(true)
 }
 
-fn entry_of(kind: &str, dir: &Path, files: &BTreeSet<String>) -> Result<String> {
+fn entry_of(kind: &str, is_dir: bool, dir: &Path, files: &BTreeSet<String>) -> Result<String> {
     if kind == "e2e-run" {
         let result = std::fs::read_to_string(dir.join("result.json"))
             .context("an e2e-run needs a result.json at its root")?;
@@ -85,14 +85,14 @@ fn entry_of(kind: &str, dir: &Path, files: &BTreeSet<String>) -> Result<String> 
     }
     match files.len() {
         0 => bail!("nothing to publish: the tree holds no files"),
-        1 => Ok(files.first().cloned().unwrap_or_default()),
-        n if matches!(kind, "recap" | "diagram" | "prototype") => {
+        _ if is_dir && matches!(kind, "recap" | "diagram" | "prototype") => {
             if files.contains("index.html") {
                 Ok("index.html".into())
             } else {
-                bail!("a {kind} directory of {n} files needs an index.html at its root")
+                bail!("a {kind} directory needs an index.html at its root")
             }
         }
+        1 => Ok(files.first().cloned().unwrap_or_default()),
         n => bail!("a {kind} artifact is one file, not {n}"),
     }
 }
@@ -102,7 +102,7 @@ struct Budget {
     cap: u64,
 }
 
-fn copy_tree(source: &Path, dest: &Path) -> Result<BTreeSet<String>> {
+fn copy_tree(source: &Path, dest: &Path) -> Result<(BTreeSet<String>, bool)> {
     let meta = std::fs::symlink_metadata(source)
         .with_context(|| format!("cannot read {}", source.display()))?;
     std::fs::create_dir(dest)?;
@@ -120,7 +120,7 @@ fn copy_tree(source: &Path, dest: &Path) -> Result<BTreeSet<String>> {
     } else {
         bail!("{} is not a regular file or directory", source.display());
     }
-    Ok(files)
+    Ok((files, meta.is_dir()))
 }
 
 fn utf8_name(name: &std::ffi::OsStr, path: &Path) -> Result<String> {

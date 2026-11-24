@@ -950,6 +950,23 @@ fn artifact_add_refused_publish_drops_the_tree() {
 }
 
 #[test]
+fn artifact_directory_needs_index() {
+    let env = board_env();
+    for kind in ["recap", "diagram", "prototype"] {
+        let dir = tree(&env.tmp.path().join(kind), &[("report.html", b"x")]);
+        let out = env.cli(
+            &["artifact", "add", dir.to_str().unwrap(), "--kind", kind],
+            None,
+        );
+        refused(&out, "index.html");
+    }
+    assert!(artifact_ids(&env).is_empty());
+    let file = tree(&env.tmp.path().join("single"), &[("report.html", b"x")]).join("report.html");
+    let added = publish(&env, None, &[file.to_str().unwrap(), "--kind", "recap"]);
+    assert_eq!(added["content"]["entry"], "report.html");
+}
+
+#[test]
 fn artifact_add_url_forms() {
     let env = board_env();
     let upper = publish(&env, None, &["HTTPS://Example.com/x"]);
