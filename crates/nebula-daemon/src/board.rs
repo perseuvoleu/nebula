@@ -489,7 +489,7 @@ fn sessions_of(tx: &Transaction, card: &TodoId) -> Result<Vec<CardSession>> {
     Ok(tx
         .prepare(
             "SELECT host, agent_id, name, role, kind, status, status_changed_at, writer, alive
-             FROM board_sessions WHERE card_id = ?1 ORDER BY rowid",
+             FROM board_sessions WHERE card_id = ?1 ORDER BY created_at, rowid",
         )?
         .query_map(params![card.as_str()], |r| {
             Ok(CardSession {
@@ -546,24 +546,36 @@ fn artifacts_of(tx: &Transaction, card: &TodoId) -> Result<Vec<Artifact>> {
 }
 
 fn hosts(tx: &Transaction, scope: &BoardScope) -> Result<Vec<BoardHost>> {
+    let waiting: Vec<(String, Option<String>)> = tx
+        .prepare(
+            "SELECT s.host, t.project FROM board_sessions s LEFT JOIN todos t ON t.id = s.card_id
+             WHERE s.status = 'needs_feedback' AND s.archived = 0 AND s.alive = 1",
+        )?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let needs_you = |host: &str| {
+        waiting
+            .iter()
+            .filter(|(h, project)| h == host && in_scope(scope, project.as_deref()))
+            .count() as u32
+    };
     Ok(tx
         .prepare(
-            "SELECT h.host, h.writers, h.writer_slots, h.checkouts,
-                    (SELECT COUNT(*) FROM board_sessions s
-                     WHERE s.host = h.host AND s.status = 'needs_feedback' AND s.archived = 0)
+            "SELECT h.host, h.writers, h.writer_slots, h.checkouts
              FROM board_hosts h ORDER BY h.host",
         )?
         .query_map([], |r| {
+            let host: String = r.get(0)?;
             let checkouts: Vec<nebula_core::board::HostCheckout> = json_column(r, 3)?;
             Ok(BoardHost {
-                host: r.get(0)?,
+                needs_you: needs_you(&host),
+                host,
                 writers: r.get(1)?,
                 writer_slots: r.get(2)?,
                 checkouts: checkouts
                     .into_iter()
                     .filter(|c| in_scope(scope, Some(&c.project)))
                     .collect(),
-                needs_you: r.get(4)?,
                 stale: false,
             })
         })?
@@ -588,7 +600,8 @@ fn away(tx: &Transaction, scope: &BoardScope, cards: &[Card], since: i64) -> Res
     let needs_you = tx
         .prepare(
             "SELECT host, agent_id, card_id FROM board_sessions
-             WHERE status = 'needs_feedback' AND archived = 0 AND status_changed_at > ?1
+             WHERE status = 'needs_feedback' AND archived = 0 AND alive = 1
+               AND status_changed_at > ?1
              ORDER BY status_changed_at",
         )?
         .query_map(params![since], |r| {

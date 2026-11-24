@@ -332,6 +332,11 @@ pub struct SessionRow {
     pub archived: bool,
     pub branch: Option<String>,
     pub dispatch_id: Option<DispatchId>,
+    /// When the session was created on its host; `todo show` lists in this order.
+    pub created_at: i64,
+    /// With `branch`, the checkout the session runs in.
+    pub project: Option<String>,
+    pub worktree: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

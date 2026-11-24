@@ -135,6 +135,7 @@ fn host_report(daemon: &Daemon, writer_slots: Option<u32>) -> Result<HostReport>
         .filter_map(|a| {
             let card_id = a.card_id.clone()?;
             let worktree = local_worktrees.get(&a.worktree_id)?;
+            let origin = origins.get(&a.id);
             Some(SessionRow {
                 agent_id: a.id.clone(),
                 host: host.clone(),
@@ -143,8 +144,7 @@ fn host_report(daemon: &Daemon, writer_slots: Option<u32>) -> Result<HostReport>
                 kind: a.kind,
                 name: a.name.clone(),
                 parent: a.spawned_by.clone().map(|id| SessionAt {
-                    host: origins
-                        .get(&a.id)
+                    host: origin
                         .and_then(|(_, parent_host)| parent_host.clone())
                         .unwrap_or_else(|| host.clone()),
                     id,
@@ -156,6 +156,9 @@ fn host_report(daemon: &Daemon, writer_slots: Option<u32>) -> Result<HostReport>
                 archived: a.archived,
                 branch: Some(worktree.branch.clone()),
                 dispatch_id: a.dispatch_id.clone(),
+                created_at: origin.map_or(0, |(created_at, _)| *created_at),
+                project: local.get(&worktree.project_id).map(|p| p.to_string()),
+                worktree: !worktree.is_main,
             })
         })
         .collect();
@@ -210,8 +213,12 @@ pub fn apply(tx: &Transaction, report: HostReport) -> Result<BoardResult> {
             ],
         )?;
     }
+    let mut changed = Vec::new();
     for row in &report.sessions {
-        apply_row(tx, &report, row, now)?;
+        let before = session_row(tx, &row.agent_id)?;
+        if write_row(tx, before.as_ref(), row, now)? {
+            changed.push((before, row));
+        }
     }
     let reported: HashSet<&str> = report
         .sessions
@@ -231,28 +238,35 @@ pub fn apply(tx: &Transaction, report: HostReport) -> Result<BoardResult> {
             params![id, now],
         )?;
     }
+    for (before, row) in changed {
+        follow_card(tx, &report, before.as_ref(), row, now)?;
+    }
     Ok(BoardResult::Done)
 }
 
-fn apply_row(tx: &Transaction, report: &HostReport, row: &SessionRow, now: i64) -> Result<()> {
-    let before = session_row(tx, &row.agent_id)?;
-    if before.as_ref() == Some(row)
-        || before
-            .as_ref()
-            .is_some_and(|b| row.status_changed_at < b.status_changed_at)
-    {
-        return Ok(());
+/// Writes the row unless the board already holds it or a newer one.
+fn write_row(
+    tx: &Transaction,
+    before: Option<&SessionRow>,
+    row: &SessionRow,
+    now: i64,
+) -> Result<bool> {
+    if before == Some(row) || before.is_some_and(|b| row.status_changed_at < b.status_changed_at) {
+        return Ok(false);
     }
     tx.execute(
         "INSERT INTO board_sessions (agent_id, host, card_id, role, kind, name, parent, status,
-           status_changed_at, writer, alive, archived, branch, dispatch_id, reported_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+           status_changed_at, writer, alive, archived, branch, dispatch_id, reported_at,
+           created_at, project, worktree)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
          ON CONFLICT (agent_id) DO UPDATE SET host = excluded.host, card_id = excluded.card_id,
            role = excluded.role, kind = excluded.kind, name = excluded.name,
            parent = excluded.parent, status = excluded.status,
            status_changed_at = excluded.status_changed_at, writer = excluded.writer,
            alive = excluded.alive, archived = excluded.archived, branch = excluded.branch,
-           dispatch_id = excluded.dispatch_id, reported_at = excluded.reported_at",
+           dispatch_id = excluded.dispatch_id, reported_at = excluded.reported_at,
+           created_at = excluded.created_at, project = excluded.project,
+           worktree = excluded.worktree",
         params![
             row.agent_id.as_str(),
             row.host,
@@ -269,8 +283,23 @@ fn apply_row(tx: &Transaction, report: &HostReport, row: &SessionRow, now: i64) 
             row.branch,
             row.dispatch_id.as_ref().map(|d| d.0.as_str()),
             now,
+            row.created_at,
+            row.project,
+            row.worktree,
         ],
     )?;
+    Ok(true)
+}
+
+/// Records the card's checkout and moves the card, once the whole report
+/// is on the board, so a row sees its siblings from the same report.
+fn follow_card(
+    tx: &Transaction,
+    report: &HostReport,
+    before: Option<&SessionRow>,
+    row: &SessionRow,
+    now: i64,
+) -> Result<()> {
     let card: Option<(String, Option<String>, Option<String>)> = tx
         .query_row(
             "SELECT stage, checkout, project FROM todos WHERE id = ?1 AND stage IS NOT NULL",
@@ -283,7 +312,9 @@ fn apply_row(tx: &Transaction, report: &HostReport, row: &SessionRow, now: i64) 
     };
     if before.is_none() && row.role == Some(Role::Worker) && checkout.is_none() {
         let held = report.checkouts.iter().find(|c| {
-            row.branch.as_deref() == Some(c.branch.as_str())
+            row.project.as_deref() == Some(c.project.as_str())
+                && row.branch.as_deref() == Some(c.branch.as_str())
+                && row.worktree == c.worktree
                 && project.as_deref().is_none_or(|p| p == c.project)
         });
         if let Some(held) = held {
@@ -309,7 +340,7 @@ fn apply_row(tx: &Transaction, report: &HostReport, row: &SessionRow, now: i64) 
         )?
         .collect::<rusqlite::Result<_>>()?;
     let stage = Stage::parse(&stage).unwrap_or(Stage::Backlog);
-    let Some(next) = auto_stage(stage, before.as_ref(), row, &others) else {
+    let Some(next) = auto_stage(stage, before, row, &others) else {
         return Ok(());
     };
     tx.execute(
@@ -336,7 +367,7 @@ fn apply_row(tx: &Transaction, report: &HostReport, row: &SessionRow, now: i64) 
 }
 
 const ROW_COLUMNS: &str = "agent_id, host, card_id, role, kind, name, parent, status,
-    status_changed_at, writer, alive, archived, branch, dispatch_id";
+    status_changed_at, writer, alive, archived, branch, dispatch_id, created_at, project, worktree";
 
 fn session_from_row(r: &Row) -> rusqlite::Result<SessionRow> {
     let parent: Option<String> = r.get(6)?;
@@ -357,6 +388,9 @@ fn session_from_row(r: &Row) -> rusqlite::Result<SessionRow> {
         archived: r.get(11)?,
         branch: r.get(12)?,
         dispatch_id: r.get::<_, Option<String>>(13)?.map(DispatchId),
+        created_at: r.get(14)?,
+        project: r.get(15)?,
+        worktree: r.get(16)?,
     })
 }
 

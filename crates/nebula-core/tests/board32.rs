@@ -186,6 +186,9 @@ fn row(id: &str, role: Option<Role>, status: AgentStatus, alive: bool) -> Sessio
         archived: false,
         branch: None,
         dispatch_id: None,
+        created_at: 0,
+        project: None,
+        worktree: false,
     }
 }
 

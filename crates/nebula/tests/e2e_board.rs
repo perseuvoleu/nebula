@@ -1,7 +1,7 @@
 //! Cards on the board host: the `nebula todo` verbs against a daemon whose
 //! config says `board = "local"`, through the real CLI and its --json.
 
-use nebula_core::board::{BoardOp, BoardResult, HostReport, Role, SessionRow};
+use nebula_core::board::{BoardOp, BoardResult, HostCheckout, HostReport, Role, SessionRow};
 use nebula_core::{AgentId, AgentKind, AgentStatus, TodoId};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -704,18 +704,33 @@ fn far_row(card: &Value, agent: &str, status: AgentStatus, changed_at: i64) -> S
         archived: false,
         branch: Some("main".into()),
         dispatch_id: None,
+        created_at: changed_at,
+        project: Some("nebula".into()),
+        worktree: false,
     }
 }
 
 fn far_report(env: &Env, sessions: Vec<SessionRow>) {
+    far_report_holding(env, Vec::new(), sessions);
+}
+
+fn far_report_holding(env: &Env, checkouts: Vec<HostCheckout>, sessions: Vec<SessionRow>) {
     let report = HostReport {
         host: FAR_HOST.into(),
         writers: 0,
         writer_slots: None,
-        checkouts: Vec::new(),
+        checkouts,
         sessions,
     };
     board_op(env, BoardOp::Report(report)).expect("the board takes a host report");
+}
+
+fn far_host(hosts: &[Value]) -> Value {
+    hosts
+        .iter()
+        .find(|h| h["host"] == FAR_HOST)
+        .cloned()
+        .unwrap()
 }
 
 fn stage_of(env: &Env, card: &str) -> String {
@@ -998,4 +1013,106 @@ fn away_digest_sessions() {
         "{away}"
     );
     assert_ne!(old["id"], work["id"]);
+}
+
+#[test]
+fn auto_stage_sees_the_whole_report() {
+    let env = board_env();
+    let card = add(&env, &["--project", "nebula"], "Work");
+    far_report(&env, vec![far_row(&card, "w1", AgentStatus::Running, 10)]);
+    assert_eq!(stage_of(&env, "#1"), "doing");
+    far_report(
+        &env,
+        vec![
+            far_row(&card, "w1", AgentStatus::Finished, 20),
+            far_row(&card, "w2", AgentStatus::Running, 20),
+        ],
+    );
+    assert_eq!(stage_of(&env, "#1"), "doing", "w2 still works on the card");
+}
+
+#[test]
+fn card_show_lists_sessions_in_created_order() {
+    let env = board_env();
+    let card = add(&env, &["--project", "nebula"], "Work");
+    let newer = SessionRow {
+        created_at: 20,
+        ..far_row(&card, "newer", AgentStatus::Running, 5)
+    };
+    let older = SessionRow {
+        created_at: 10,
+        ..far_row(&card, "older", AgentStatus::Running, 5)
+    };
+    far_report(&env, vec![newer.clone()]);
+    far_report(&env, vec![newer, older]);
+    let names: Vec<Value> = chain(&env, "#1")
+        .iter()
+        .map(|s| s["name"].clone())
+        .collect();
+    assert_eq!(names, ["older", "newer"]);
+}
+
+#[test]
+fn card_checkout_matches_project_and_branch() {
+    let env = board_env();
+    let card = add(&env, &["--home"], "Home");
+    let held = |project: &str| HostCheckout {
+        project: project.into(),
+        branch: "main".into(),
+        path: format!("/work/{project}"),
+        worktree: false,
+    };
+    let worker = SessionRow {
+        project: Some("bbb".into()),
+        ..far_row(&card, "w1", AgentStatus::Running, 10)
+    };
+    far_report_holding(&env, vec![held("aaa"), held("bbb")], vec![worker]);
+    let shown = env.json(&["todo", "show", "#1", "--json"]);
+    assert_eq!(shown["checkout"]["path"], "/work/bbb", "{shown}");
+}
+
+#[test]
+fn host_needs_you_follows_the_read_scope() {
+    let env = board_env();
+    let card = add(&env, &["--project", "nebula"], "Ask");
+    far_report(
+        &env,
+        vec![far_row(&card, "n1", AgentStatus::NeedsFeedback, 10)],
+    );
+    assert_eq!(far_host(&hosts_of(&env, &["--all"]))["needs_you"], 1);
+    assert_eq!(
+        far_host(&hosts_of(&env, &["--project", "other"]))["needs_you"],
+        0,
+        "the waiting session's card is out of scope"
+    );
+}
+
+#[test]
+fn omitted_session_stops_needing_the_user() {
+    let env = board_env();
+    let card = add(&env, &["--project", "nebula"], "Ask");
+    let since = now_ms();
+    far_report(
+        &env,
+        vec![far_row(&card, "n1", AgentStatus::NeedsFeedback, since + 1)],
+    );
+    let away_since = since.to_string();
+    let away = |env: &Env| {
+        env.json(&[
+            "todo",
+            "board",
+            "--all",
+            "--away-since",
+            &away_since,
+            "--json",
+        ])["board"]["away"]["needs_you"]
+            .clone()
+    };
+    assert_eq!(
+        away(&env),
+        serde_json::json!([{"host": FAR_HOST, "id": "n1"}])
+    );
+    far_report(&env, Vec::new());
+    assert_eq!(away(&env), serde_json::json!([]), "n1 is no longer live");
+    assert_eq!(far_host(&hosts_of(&env, &["--all"]))["needs_you"], 0);
 }
