@@ -30,8 +30,20 @@ export default class E2eRunReporter implements Reporter {
   }
 
   async onEnd(full: FullResult) {
+    if (this.results.size === 0) return;
     const out = path.resolve(this.root, this.options.outputDir);
-    fs.rmSync(out, { recursive: true, force: true });
+    const staging = `${out}.staging`;
+    fs.rmSync(staging, { recursive: true, force: true });
+    try {
+      this.write(staging, full);
+      fs.rmSync(out, { recursive: true, force: true });
+      fs.renameSync(staging, out);
+    } finally {
+      fs.rmSync(staging, { recursive: true, force: true });
+    }
+  }
+
+  private write(out: string, full: FullResult) {
     fs.mkdirSync(path.join(out, "shots"), { recursive: true });
     const steps = [...this.results.values()].map(({ test, result }, index): Step => {
       const step: Step = { name: test.title, status: stepStatus(result.status), duration_ms: Math.max(0, Math.round(result.duration)) };
@@ -44,8 +56,7 @@ export default class E2eRunReporter implements Reporter {
       if (step.status === "failed" && error) step.error = error;
       return step;
     });
-    const status: Status = full.status === "passed" && !steps.some((s) => s.status === "failed") ? "passed" : "failed";
-    const run = { title: this.options.title ?? "e2e", status, started_at: full.startTime.getTime(),
+    const run = { title: this.options.title ?? "e2e", status: full.status === "passed" ? "passed" : "failed", started_at: full.startTime.getTime(),
       duration_ms: Math.max(0, Math.round(full.duration)), steps };
     fs.writeFileSync(path.join(out, "result.json"), JSON.stringify(run, null, 1));
   }

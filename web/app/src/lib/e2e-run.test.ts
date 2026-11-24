@@ -55,3 +55,51 @@ test("the Playwright reporter writes a result.json in Decision 5's format with e
   assert.ok(!files.has("stale.png"), "a previous run's files are gone");
   assert.equal(new Set(run.steps.flatMap((s) => s.screenshot ?? [])).size, 2);
 });
+
+function reporterIn(work: string, out: string) {
+  const reporter = new E2eRunReporter({ outputDir: out, title: "board.spec" });
+  reporter.onBegin({ configFile: path.join(work, "playwright.config.ts") } as never, {} as never);
+  return reporter;
+}
+
+const ended = (status: string, attachments: object[] = []) =>
+  ({ status, duration: 10, attachments, errors: status === "failed" ? [{ message: "boom" }] : [] });
+
+function previousRun() {
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), "e2e-run-"));
+  const out = path.join(work, "run");
+  fs.mkdirSync(path.join(out, "shots"), { recursive: true });
+  fs.writeFileSync(path.join(out, "result.json"), "{\"previous\":true}");
+  fs.writeFileSync(path.join(out, "shots", "001.png"), PNG);
+  return { work, out };
+}
+
+test("a run that executed no test, such as --list, leaves the previous run in place", async () => {
+  const { work, out } = previousRun();
+  await reporterIn(work, out).onEnd({ status: "passed", startTime: new Date(), duration: 5 } as never);
+  assert.deepEqual([...filesUnder(out)].sort(), ["result.json", "shots/001.png"]);
+  assert.equal(fs.readFileSync(path.join(out, "result.json"), "utf8"), "{\"previous\":true}");
+});
+
+test("a run that fails while it is written leaves the previous run in place", async () => {
+  const { work, out } = previousRun();
+  const reporter = reporterIn(work, out);
+  reporter.onTestEnd({ id: "a", title: "drag a card" } as never, ended("passed", [{ name: "screenshot", contentType: "image/png", path: work }]) as never);
+  await assert.rejects(Promise.resolve().then(() => reporter.onEnd({ status: "passed", startTime: new Date(), duration: 5 } as never)));
+  assert.equal(fs.readFileSync(path.join(out, "result.json"), "utf8"), "{\"previous\":true}");
+  assert.deepEqual(fs.readdirSync(work).sort(), ["run"]);
+});
+
+test("the run's status is Playwright's final outcome, not a tally of its steps", async () => {
+  const statusOf = async (full: string, step: string) => {
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), "e2e-run-"));
+    const out = path.join(work, "run");
+    const reporter = reporterIn(work, out);
+    reporter.onTestEnd({ id: "a", title: "a step" } as never, ended(step) as never);
+    await reporter.onEnd({ status: full, startTime: new Date(), duration: 5 } as never);
+    return JSON.parse(fs.readFileSync(path.join(out, "result.json"), "utf8")).status;
+  };
+  assert.equal(await statusOf("passed", "failed"), "passed", "an expected failure (test.fail) passes the run");
+  assert.equal(await statusOf("failed", "passed"), "failed", "a failing global teardown fails the run");
+  assert.equal(await statusOf("interrupted", "passed"), "failed");
+});
