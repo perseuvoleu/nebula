@@ -10,7 +10,15 @@ const DEFAULT_HOST = "leaseweb";
 const fieldCls = "h-9 min-w-0 rounded-lg border border-input bg-card px-2 text-sm outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/60";
 
 export function CardActions({ show, board }: { show: CardShow; board: BoardData | null }) {
-  const hosts = (board?.hosts ?? []).map((h) => ({ host: h.host, writers: h.writers, writerSlots: h.writer_slots }));
+  const known = [...new Set([
+    ...(board?.hosts ?? []).map((h) => h.host),
+    ...(board?.cards ?? []).flatMap((c) => [c.created_by.host, ...c.ref.split("@").slice(1)]),
+    ...show.sessions.map((s) => s.host),
+  ])];
+  const hosts = known.map((host) => {
+    const reported = board?.hosts.find((h) => h.host === host);
+    return { host, writers: reported?.writers ?? 0, writerSlots: reported?.writer_slots ?? null };
+  });
   const branch = show.checkout?.branch ?? null;
   const [run, setRun] = useState<{ draft: RunDraft; dispatch: string } | null>(null);
   const [pending, setPending] = useState<string | null>(null);
@@ -65,7 +73,7 @@ export function CardActions({ show, board }: { show: CardShow; board: BoardData 
   return (
     <section aria-label="Acțiuni" className="flex flex-col gap-3 rounded-lg border bg-background px-3 py-2.5">
       <div className="flex flex-wrap items-center gap-2">
-        <Button type="button" size="sm" onClick={openRun} disabled={show.archived}><PlayIcon aria-hidden />Pornește</Button>
+        <Button type="button" size="sm" onClick={() => { setError(null); openRun(); }} disabled={show.archived}><PlayIcon aria-hidden />Pornește</Button>
         <Button type="button" size="sm" variant="outline" onClick={openCode} disabled={!target || pending === "open"}>
           <CodeIcon aria-hidden />Deschide în cod
         </Button>
@@ -116,11 +124,12 @@ export function CardActions({ show, board }: { show: CardShow; board: BoardData 
         </Button>
       </div>
 
-      {error && <p role="alert" className="text-sm">{error}</p>}
+      {error && !run && <p role="alert" className="text-sm">{error}</p>}
 
       {run && (
         <RunDialog open onOpenChange={(open) => { if (!open) setRun(null); }} cardRef={show.ref} cardTitle={show.title} branch={branch}
-          hosts={hosts} draft={run.draft} onDraftChange={(draft) => setRun({ ...run, draft })} onRun={startRun} pending={pending === "run"} />
+          hosts={hosts} draft={run.draft} onDraftChange={(draft) => setRun({ draft, dispatch: ulid() })} onRun={startRun} pending={pending === "run"}
+          error={error} />
       )}
     </section>
   );

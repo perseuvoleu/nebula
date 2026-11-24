@@ -85,13 +85,45 @@ test("Run starts the chosen agent and the card shows in doing", async ({ page })
   await page.getByRole("button", { name: "Pornește", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Pornește un agent pe card" });
   await expect(dialog.getByRole("radio", { name: /@leaseweb/ })).toBeChecked();
-  await dialog.getByText("review", { exact: true }).click();
+  await expect(dialog.getByRole("radio", { name: "worker" })).toBeChecked();
   await dialog.getByText("Claude", { exact: true }).click();
   await dialog.getByRole("button", { name: "Pornește", exact: true }).click();
   await expect(dialog).toHaveCount(0);
-  expect(sends().filter((s) => "run" in s)).toEqual([{ run: "#13@leaseweb", role: "review", kind: "claude", host: "leaseweb", worktree: "new" }]);
+  expect(sends().filter((s) => "run" in s)).toEqual([{ run: "#13@leaseweb", role: "worker", kind: "claude", host: "leaseweb", worktree: "new" }]);
   await page.getByRole("button", { name: "Board" }).click();
   await expect(tile(column(page, "În lucru"), "Run this one")).toBeVisible();
+});
+
+test("Run defaults to leaseweb when only a laptop reports slots; a refusal shows in the dialog, and another host runs under a new dispatch", async ({ page }) => {
+  addCard(13, "Run this one");
+  writeBoard((board) => { (board as unknown as { hosts: unknown[] }).hosts = [{ host: "perseu-mbp", writers: 0, writer_slots: 2, checkouts: [], needs_you: 0, stale: false }]; });
+  const bodies: { host: string; dispatch: string }[] = [];
+  await page.route("**/api/cards/*/run", async (route) => {
+    bodies.push(route.request().postDataJSON());
+    if (bodies.length === 1) await route.fulfill({ status: 409, contentType: "application/json", body: JSON.stringify({ error: "No writer slot on leaseweb" }) });
+    else await route.continue();
+  });
+  await open(page, "/board/c/13%40leaseweb");
+  await page.getByRole("button", { name: "Pornește", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Pornește un agent pe card" });
+  await expect(dialog.getByRole("radio", { name: /@leaseweb/ })).toBeChecked();
+  await dialog.getByRole("button", { name: "Pornește", exact: true }).click();
+  await expect(dialog.getByRole("alert")).toHaveText("No writer slot on leaseweb");
+  await dialog.getByText("@perseu-mbp").click();
+  await dialog.getByRole("button", { name: "Pornește", exact: true }).click();
+  await expect(dialog).toHaveCount(0);
+  expect(bodies.map((b) => b.host)).toEqual(["leaseweb", "perseu-mbp"]);
+  expect(bodies[0].dispatch).not.toBe(bodies[1].dispatch);
+});
+
+test("a refused new card shows why inside its dialog", async ({ page }) => {
+  await page.route("**/api/cards", (route) => route.fulfill({ status: 403, contentType: "application/json", body: JSON.stringify({ error: "Project not on this board" }) }));
+  await open(page, "/board/p/nebula");
+  await page.getByRole("button", { name: "Card nou", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Card nou" });
+  await dialog.getByLabel("Titlu").fill("Write the release notes");
+  await dialog.getByRole("button", { name: "Creează cardul" }).click();
+  await expect(dialog.getByRole("alert")).toHaveText("Project not on this board");
 });
 
 test("accept puts a proposed card on the board and dismiss removes it", async ({ page }) => {

@@ -109,6 +109,7 @@ export function BoardPage({ route, onNavigate, onSessions }: {
   const [overlay, setOverlay] = useState<Record<string, Pending>>({});
   const [newCard, setNewCard] = useState<(CardDraft & { id: string }) | null>(null);
   const [creating, setCreating] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const latest = useRef(board);
   useEffect(() => { latest.current = board; }, [board]);
@@ -157,16 +158,19 @@ export function BoardPage({ route, onNavigate, onSessions }: {
     const card = live.find((c) => c.ref === ref);
     if (card && card.stage !== stage) optimistic(ref, { stage }, cardAction(ref, "move", { stage, expect: card.stage }));
   };
-  const openNew = (stage: Stage = "backlog") =>
+  const openNew = (stage: Stage = "backlog") => {
+    setCreateError(null);
     setNewCard({ title: "", project: scope.kind === "all" || scope.kind === "needs" ? null : scope.project, stage, id: ulid() });
+  };
   const create = async () => {
     if (!newCard) return;
     setCreating(true);
+    setCreateError(null);
     try {
       await createCard({ ...newCard, title: newCard.title.trim() });
       setNewCard(null);
     } catch (failure) {
-      setActionError(describeError(failure));
+      setCreateError(describeError(failure));
     } finally {
       setCreating(false);
     }
@@ -264,7 +268,7 @@ export function BoardPage({ route, onNavigate, onSessions }: {
       {newCard && (
         <NewCardDialog open onOpenChange={(open) => { if (!open) setNewCard(null); }} draft={newCard} pending={creating}
           projects={(board ? sidebarProjects(board) : []).flatMap((p) => p.project === null ? [] : [p.project])}
-          onDraftChange={(draft) => setNewCard({ ...newCard, ...draft })} onCreate={create} />
+          onDraftChange={(draft) => setNewCard({ ...newCard, ...draft })} onCreate={create} error={createError} />
       )}
       <Sheet open={menuOpen} onOpenChange={setMenuOpen}>
         <SheetContent side="left" className="w-[88vw] max-w-sm gap-0 p-0" aria-describedby={undefined}>
