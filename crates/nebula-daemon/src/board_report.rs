@@ -504,7 +504,7 @@ mod tests {
             })
             .unwrap();
         let report = host_report(&daemon, None).unwrap();
-        assert_eq!(report.sessions[0].alive, false);
+        assert!(!report.sessions[0].alive);
         assert_eq!(report.writers, 0, "an exited writer is no live writer");
     }
 
