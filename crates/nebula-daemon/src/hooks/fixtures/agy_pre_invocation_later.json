@@ -1,0 +1,14 @@
+{
+  "artifactDirectoryPath": "/home/u/.gemini/antigravity-cli/brain/f10f4382-10cb-4663-abfc-d3bfc069a0cf",
+  "conversationId": "f10f4382-10cb-4663-abfc-d3bfc069a0cf",
+  "cwd": "/work/repo",
+  "hookEventName": "PreInvocation",
+  "initialNumSteps": 3,
+  "invocationNum": 1,
+  "lastUserInput": "What is the secret word you were told, if any? Answer in one line.",
+  "modelName": "gemini-3.8-flash-low",
+  "transcriptPath": "/home/u/.gemini/antigravity-cli/brain/f10f4382-10cb-4663-abfc-d3bfc069a0cf/.system_generated/logs/transcript_full.jsonl",
+  "workspacePaths": [
+    "/work/repo"
+  ]
+}

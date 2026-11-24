@@ -1203,11 +1203,11 @@ fn open_session_attaches_it_in_the_running_tui() {
     tui.wait_for_text(FOOTER_SESSIONS);
     tui.send(b"|");
     tui.wait_for_text("Terminal (shell)");
-    tui.send(b"\x1b[B\x1b[B\x1b[B\x1b[B\r");
+    tui.send(b"\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B\r");
     tui.wait_for_gone("Terminal (shell)");
     tui.wait_for_text(FOOTER_TERMINAL_LOCKED);
-    tui.type_str("echo split-$((6*7))\r");
-    tui.wait_for_text("split-42");
+    tui.type_str("echo split-$((6*7))-[$NEBULA_AGENT_ID]\r");
+    tui.wait_for_text("split-42-[term:");
     let reopen = nebula_cli(&tui, &["open", "--session", &ids[1], "--no-focus"]);
     assert_eq!(reopen.status.code(), Some(0), "{reopen:?}");
     assert_typing_reaches(&mut tui, "t1b", &ids[1]);
