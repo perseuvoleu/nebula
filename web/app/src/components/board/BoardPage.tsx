@@ -6,24 +6,40 @@ import {
   type BoardData, type Card, type CardShow, type SidebarScope, type SortKey, type TableSort,
   awayDigest, byStage, cardSlug, inScope, projectName, sidebarProjects, sortCards, toBoardCard, writerSlots,
 } from "@/lib/board";
-import type { BoardRoute } from "@/lib/route";
+import { type BoardRoute, selectionPath } from "@/lib/route";
 import { BOARD_POLL_MS, useBoard } from "@/lib/useBoard";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
 import { AwayDigest, type AwayDecision } from "./AwayDigest";
 import { BoardColumns } from "./BoardColumns";
+import { CardArtifacts } from "./CardArtifacts";
 import { CardDetail } from "./CardDetail";
 import type { DecisionRow } from "./DecisionCard";
 import { DecisionsPage } from "./DecisionsPage";
 import { NeedsYouStrip } from "./NeedsYouStrip";
 import { ProjectSidebar } from "./ProjectSidebar";
+import { RecordDecision } from "./RecordDecision";
 import { TableView } from "./TableView";
 import { WriterSlots } from "./WriterSlots";
 
 const LAST_SEEN = "nebula-board-last-seen";
 
-type Decision = { id: string; title: string; card: string | null; project: string | null; content: { body?: string }; created_at: number };
+type Decision = { id: string; title: string; card: string | null; project: string | null; session: { id: string; name: string } | null;
+  content: { body?: string }; created_at: number };
+
+const boardHref = (route: Partial<BoardRoute>) => selectionPath({ project: null, session: null, all: false,
+  board: { project: null, card: null, decisions: false, table: false, peek: null, ...route } });
+
+function decisionRow(d: Decision, cards: Card[]): DecisionRow {
+  const card = cards.find((c) => c.id === d.card);
+  return {
+    id: d.id, title: d.title, why: d.content.body || null, project: d.project, createdAt: new Date(d.created_at).toISOString(),
+    session: d.session && d.project ? { name: d.session.name, href: selectionPath({ project: d.project, session: d.session.id, all: false }) } : null,
+    card: card ? { ref: card.ref, title: card.title, href: boardHref({ project: card.project, home: card.project === null, card: cardSlug(card.ref) }) }
+      : d.card ? { ref: "", title: "Cardul deciziei", href: boardHref({ card: d.card }) } : null,
+  };
+}
 
 function loadLastSeen(): number {
   const now = Date.now();
@@ -51,7 +67,7 @@ function useCard(slug: string | null, board: BoardData | null) {
       });
     return () => { abort.abort(); clearTimeout(retry); };
   }, [slug, board, attempt]);
-  return state?.slug === slug ? state : null;
+  return state?.slug === slug ? { ...state, refresh: () => setAttempt((n) => n + 1) } : null;
 }
 
 function useDecisions(enabled: boolean, query: string, board: BoardData | null): Decision[] {
@@ -77,6 +93,12 @@ function CardPanel({ slug, board, mode, onOpenCard }: { slug: string; board: Boa
     <>
       {card.error && <span role="status" className="self-start rounded-md border border-dashed px-1.5 py-0.5 text-xs">Date neactualizate</span>}
       <CardDetail card={toBoardCard(card.show, board?.cards ?? [], card.show)} log={log} mode={mode} onOpenCard={onOpenCard} />
+      {mode === "page" && (
+        <div className="mx-auto mt-4 flex w-full max-w-3xl flex-col gap-4">
+          <RecordDecision cardRef={card.show.ref} onRecorded={card.refresh} />
+          <CardArtifacts artifacts={card.show.artifacts} />
+        </div>
+      )}
     </>
   );
 }
@@ -98,10 +120,13 @@ export function BoardPage({ route, onNavigate, onSessions }: {
   const [digestClosed, setDigestClosed] = useState(false);
   const [decisionQuery, setDecisionQuery] = useState("");
 
-  const routed = (s: SidebarScope) => ({ project: s.kind === "all" || s.kind === "needs" ? null : s.project, decisions: s.kind === "decisions" });
-  const fromRoute: SidebarScope = !route.project ? { kind: "all" }
+  const routed = (s: SidebarScope) => s.kind === "all" || s.kind === "needs"
+    ? { project: null, home: false, decisions: false }
+    : { project: s.project, home: s.project === null, decisions: s.kind === "decisions" };
+  const fromRoute: SidebarScope = !route.project && !route.home ? { kind: "all" }
     : route.decisions ? { kind: "decisions", project: route.project } : { kind: "project", project: route.project };
-  const scope = local && routed(local).project === route.project && routed(local).decisions === route.decisions ? local : fromRoute;
+  const same = (r: ReturnType<typeof routed>) => r.project === route.project && r.home === !!route.home && r.decisions === route.decisions;
+  const scope = local && same(routed(local)) ? local : fromRoute;
   const go = (next: Partial<BoardRoute>) => {
     onNavigate({ ...route, card: null, peek: null, decisions: false, ...next });
     setMenuOpen(false);
@@ -139,8 +164,7 @@ export function BoardPage({ route, onNavigate, onSessions }: {
     </div>
   ) : route.decisions ? (
     <DecisionsPage project={scope.kind === "decisions" ? projectName(scope.project) : null} query={decisionQuery} onQueryChange={setDecisionQuery}
-      decisions={decisions.filter((d) => scope.kind !== "decisions" || d.project === scope.project).map((d): DecisionRow => ({ id: d.id, title: d.title, why: d.content.body ?? null, project: d.project,
-        createdAt: new Date(d.created_at).toISOString(), session: null, card: null }))} />
+      decisions={decisions.filter((d) => scope.kind !== "decisions" || d.project === scope.project).map((d) => decisionRow(d, live))} />
   ) : !board ? (
     <p role={stale ? "alert" : undefined} aria-busy={!stale} className="p-6 text-sm text-muted-foreground">
       {stale ? "Board-ul nu poate fi citit acum." : "Se încarcă board-ul…"}

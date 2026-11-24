@@ -32,6 +32,12 @@ test("board routes parse and round-trip: project, card page, decisions, table vi
     ["/board/c/12%40leaseweb", board({ card: "12@leaseweb" })],
     ["/board/decisions", board({ decisions: true })],
     ["/board/decisions/p/nebula", board({ decisions: true, project: "nebula" })],
+    ["/board/home", board({ home: true })],
+    ["/board/home?view=table&peek=3", board({ home: true, table: true, peek: "3" })],
+    ["/board/home/c/3%40leaseweb", board({ home: true, card: "3@leaseweb" })],
+    ["/board/p/nebula/c/12%40leaseweb", board({ project: "nebula", card: "12@leaseweb" })],
+    ["/board/decisions/home", board({ decisions: true, home: true })],
+    ["/board/p/home", board({ project: "home" })],
   ];
   for (const [path, selection] of cases) {
     assert.deepEqual(parseSelection(path), selection, path);

@@ -17,8 +17,8 @@ function optional(row: Record<string, unknown>, name: string, where: string): st
   return value;
 }
 
-/** Decision 5's result.json, checked as nebula-core's validate_e2e_run does; `files` holds the run's relative paths. */
-export function validateE2eRun(value: unknown, files: ReadonlySet<string>): E2eRun {
+/** Decision 5's result.json shape, as nebula-core's E2eRun decodes it. */
+export function parseE2eRun(value: unknown): E2eRun {
   if (!isObject(value) || !Array.isArray(value.steps) || !value.steps.every(isObject)) {
     throw new Error("result.json: the run and each step must be JSON objects");
   }
@@ -35,14 +35,19 @@ export function validateE2eRun(value: unknown, files: ReadonlySet<string>): E2eR
     if (error !== undefined) step.error = error;
     return step;
   });
-  const run: E2eRun = {
+  return {
     title: field(value, "title", (v) => typeof v === "string", ""),
     status: field(value, "status", (v) => STATUSES.includes(v), ""),
     started_at: field(value, "started_at", Number.isSafeInteger, ""),
     duration_ms: field(value, "duration_ms", isCount, ""),
     steps,
   };
-  const missing = steps.find((s) => s.screenshot !== undefined && !files.has(s.screenshot));
+}
+
+/** parseE2eRun plus validate_e2e_run's check that `files`, the run's relative paths, holds every screenshot. */
+export function validateE2eRun(value: unknown, files: ReadonlySet<string>): E2eRun {
+  const run = parseE2eRun(value);
+  const missing = run.steps.find((s) => s.screenshot !== undefined && !files.has(s.screenshot));
   if (missing) throw new Error(`result.json names ${missing.screenshot}, which is not in the run`);
   return run;
 }

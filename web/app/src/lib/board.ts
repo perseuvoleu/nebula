@@ -22,7 +22,7 @@ export type BoardSession = {
   writer: boolean;
 };
 
-export type CardCheckout = { host: string; branch: string };
+export type CardCheckout = { host: string; branch: string; path: string; worktree: boolean };
 
 export type BlockerRef = { ref: string; title: string };
 
@@ -126,7 +126,22 @@ export type CardSession = {
 
 export type CardNote = { id: string; card: string; text: string; author: Author; created_at: number };
 
-export type Artifact = { id: string; kind: string; title: string; created_at: number; src?: string };
+export type SessionLink = { host: string; id: string; name: string };
+
+export type ArtifactContent = { host: string; entry: string } | { url: string } | { body: string };
+
+export type Artifact = {
+  id: string;
+  kind: string;
+  title: string;
+  card: string | null;
+  project: string | null;
+  session: SessionLink | null;
+  content: ArtifactContent;
+  created_at: number;
+  /** Minted by the gateway when it stores the files: /a/<grant>/<id>/<entry>. */
+  src?: string;
+};
 
 export type CardShow = Card & { sessions: CardSession[]; artifacts: Artifact[]; log: CardNote[] };
 
@@ -169,7 +184,7 @@ export function toBoardCard(card: Card, cards: Card[], show?: CardShow): BoardCa
     proposedBy: card.proposed ? card.created_by.name : null,
     needsYou: !!sessions?.some((s) => s.status === "needs_feedback"),
     blockers: openBlockers(card, cards),
-    checkout: card.checkout && { host: card.checkout.host, branch: card.checkout.branch },
+    checkout: card.checkout,
     sessions: sessions?.map((s) => ({ id: s.id, host: s.host, name: s.name, role: s.role ?? "—", kind: s.kind, status: s.status, writer: s.writer })) ?? null,
     artifacts: show?.artifacts.length ?? 0,
     age: "",

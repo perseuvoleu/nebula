@@ -107,8 +107,9 @@ def board_command(verb, args, board):
         return 0, {"items": [d for d in board["decisions"] if scoped(d, args) and query in (d["title"] + d["content"]["body"]).lower()],
                    "next": None}
     if verb == ("decision", "add"):
+        card = find_card(board, flags("--card"), ["--all", "--include-home"]) if flags("--card") else None
         decision = {"id": f"01JG{len(board['decisions']) + 100:022d}", "kind": "decision", "title": values[0],
-                    "card": flags("--card"), "project": flags("--project"), "session": None, "checkout": None,
+                    "card": flags("--card"), "project": card["project"] if card else flags("--project"), "session": None, "checkout": None,
                     "content": {"body": flags("--why") or ""}, "meta": {}, "created_at": int(time.time() * 1000)}
         board["decisions"].insert(0, decision)
         return 0, decision
@@ -129,7 +130,9 @@ def board_command(verb, args, board):
     if verb == ("todo", "show"):
         if not scoped(card, args):
             return 5, "no such card"
-        return 0, {**card, **board["details"].get(card["id"], {"sessions": [], "artifacts": [], "log": []})}
+        detail = board["details"].get(card["id"], {"sessions": [], "artifacts": [], "log": []})
+        decisions = [d for d in board["decisions"] if d["card"] == card["id"]]
+        return 0, {**card, **detail, "artifacts": detail["artifacts"] + decisions}
     if verb == ("todo", "move"):
         if flags("--expect") not in (None, card["stage"]):
             return 6, "card moved meanwhile"
