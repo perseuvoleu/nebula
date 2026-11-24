@@ -105,7 +105,7 @@ pub struct ScopeFlags {
 }
 
 impl ScopeFlags {
-    fn scope(self, fallback: Option<&str>) -> BoardScope {
+    pub(crate) fn scope(self, fallback: Option<&str>) -> BoardScope {
         let projects = match (self.all, self.projects.is_empty(), fallback) {
             (true, _, _) => ProjectScope::All,
             (false, false, _) => ProjectScope::Named(self.projects),
@@ -196,7 +196,7 @@ fn client_id(id: Option<String>) -> Result<String> {
     }
 }
 
-async fn connect() -> Result<Connection> {
+pub(crate) async fn connect() -> Result<Connection> {
     let Ok(stream) = ipc::try_connect(&paths::socket_path()).await else {
         bail!("no nebula daemon is running");
     };

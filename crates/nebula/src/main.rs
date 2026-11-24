@@ -153,6 +153,13 @@ enum Command {
         #[command(subcommand)]
         command: Option<TodoCommand>,
     },
+    /// Publish what a session produced (recap, e2e run, diagram, ticket,
+    /// prototype, link): copied into this daemon's data dir, so it outlives
+    /// the worktree, and linked to the caller's card, session and checkout.
+    Artifact {
+        #[command(subcommand)]
+        command: ArtifactCommand,
+    },
     /// Install an agent CLI's nebula status hooks into a checkout — what
     /// the daemon does before every spawn; run on the far host by a remote
     /// session's ssh spawn, where this daemon's installer can't reach.
@@ -792,6 +799,63 @@ enum TodoCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum ArtifactCommand {
+    /// Publish a file, a directory or a URL. A directory of a recap,
+    /// diagram or prototype opens at its index.html; an e2e-run needs a
+    /// valid result.json naming only files it holds. Symlinks, special
+    /// files and trees over 64 MiB are refused, and nothing is stored.
+    Add {
+        /// A path, or an http(s) URL (published as kind link).
+        source: String,
+        /// recap, e2e-run, diagram, ticket or prototype (required for a path).
+        #[arg(long)]
+        kind: Option<String>,
+        /// Default: the file or directory name, or the URL.
+        #[arg(long)]
+        title: Option<String>,
+        /// Link this card instead of the caller's (#12, 12 or a ULID).
+        #[arg(long, conflicts_with = "no_card")]
+        card: Option<String>,
+        /// Link no card, even inside a carded session.
+        #[arg(long)]
+        no_card: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List published artifacts (default: the caller's project, else all).
+    List {
+        #[command(flatten)]
+        scope: ScopeArgs,
+        /// Only this card's.
+        #[arg(long)]
+        card: Option<String>,
+        #[arg(long)]
+        kind: Option<String>,
+        /// Continue from a previous reply's `next`.
+        #[arg(long)]
+        page: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// One artifact, removed ones included (with removed_at). Exits 5 when
+    /// there is none.
+    Show {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Open it here, or print the command that opens it on the host that
+    /// stores it.
+    Open { id: String },
+    /// Hide it from lists; `show` still reports it, and the bytes stay.
+    Rm {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[derive(clap::Args)]
 struct ScopeArgs {
     /// Only these projects (repeat for more).
@@ -1236,6 +1300,50 @@ fn main() -> Result<()> {
                 ),
             };
             nebula_tui::run_board(verb, json)
+        }
+        Some(Command::Artifact { command }) => {
+            use nebula_tui::artifact_cli::{ArtifactVerb, CardChoice};
+            let (verb, json) = match command {
+                ArtifactCommand::Add {
+                    source,
+                    kind,
+                    title,
+                    card,
+                    no_card,
+                    json,
+                } => (
+                    ArtifactVerb::Add {
+                        source,
+                        kind,
+                        title,
+                        card: match (card, no_card) {
+                            (Some(card), _) => CardChoice::Card(card),
+                            (None, true) => CardChoice::None,
+                            (None, false) => CardChoice::Caller,
+                        },
+                    },
+                    json,
+                ),
+                ArtifactCommand::List {
+                    scope,
+                    card,
+                    kind,
+                    page,
+                    json,
+                } => (
+                    ArtifactVerb::List {
+                        scope: scope.into(),
+                        card,
+                        kind,
+                        page,
+                    },
+                    json,
+                ),
+                ArtifactCommand::Show { id, json } => (ArtifactVerb::Show { id }, json),
+                ArtifactCommand::Open { id } => (ArtifactVerb::Open { id }, false),
+                ArtifactCommand::Rm { id, json } => (ArtifactVerb::Rm { id }, json),
+            };
+            nebula_tui::run_artifact(verb, json)
         }
         Some(Command::Kill) => nebula_tui::run_kill(),
         Some(Command::Rename { title, force }) => nebula_tui::run_rename(title.join(" "), force),

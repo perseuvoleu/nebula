@@ -238,6 +238,9 @@ pub struct Artifact {
     /// `rag_note` holds a decision's RAG note id.
     pub meta: serde_json::Map<String, serde_json::Value>,
     pub created_at: i64,
+    /// Set by `artifact rm`; the stored bytes stay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

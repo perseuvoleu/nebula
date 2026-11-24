@@ -1,0 +1,330 @@
+//! Artifacts: the storing daemon's copy of a published tree, and the
+//! board's artifact rows.
+
+use crate::board::{
+    cursor, in_scope, json_column, now_ms, optional_json, page_offset, paged, resolve,
+};
+use anyhow::{bail, Context, Result};
+use nebula_core::board::{Artifact, ArtifactContent, BoardScope, CardRef, Page, Refusal};
+use nebula_core::{paths, ArtifactId, TodoId};
+use rusqlite::{params, OptionalExtension, Row, Transaction};
+use std::collections::BTreeSet;
+use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+
+/// Lowered by tests through `NEBULA_ARTIFACT_MAX_BYTES`.
+fn max_bytes() -> u64 {
+    std::env::var("NEBULA_ARTIFACT_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64 << 20)
+}
+
+fn store_dir() -> PathBuf {
+    paths::data_dir().join("artifacts")
+}
+
+/// Copies `source` into data_dir/artifacts/<id>/ through a temp sibling
+/// that is renamed only once every check passed, so a refusal stores
+/// nothing. A rerun with a stored id reuses the copy.
+pub fn store(id: &ArtifactId, kind: &str, source: &Path) -> Result<ArtifactContent> {
+    if ulid::Ulid::from_string(id.as_str()).is_err() {
+        bail!("artifact id {id} is not a ULID");
+    }
+    if !source.is_absolute() {
+        bail!("{} is not an absolute path", source.display());
+    }
+    let root = store_dir();
+    let dest = root.join(id.as_str());
+    if !dest.exists() {
+        std::fs::create_dir_all(&root)?;
+        let tmp = root.join(format!(".tmp-{id}"));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let copied = copy_tree(source, &tmp).and_then(|files| entry_of(kind, &tmp, &files));
+        if let Err(why) = copied {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err(why);
+        }
+        std::fs::rename(&tmp, &dest)?;
+    }
+    let files = stored_files(&dest)?;
+    Ok(ArtifactContent::Files {
+        host: nebula_core::host::hostname(),
+        entry: entry_of(kind, &dest, &files)?,
+    })
+}
+
+/// Which file opens first: result.json for an e2e-run, the only file of a
+/// one-file tree, else index.html for a page kind.
+fn entry_of(kind: &str, dir: &Path, files: &BTreeSet<String>) -> Result<String> {
+    if kind == "e2e-run" {
+        let result = std::fs::read_to_string(dir.join("result.json"))
+            .context("an e2e-run needs a result.json at its root")?;
+        nebula_core::board::validate_e2e_run(&result, files).map_err(anyhow::Error::msg)?;
+        return Ok("result.json".into());
+    }
+    match files.len() {
+        0 => bail!("nothing to publish: the tree holds no files"),
+        1 => Ok(files.first().cloned().unwrap_or_default()),
+        n if matches!(kind, "recap" | "diagram" | "prototype") => {
+            if files.contains("index.html") {
+                Ok("index.html".into())
+            } else {
+                bail!("a {kind} directory of {n} files needs an index.html at its root")
+            }
+        }
+        n => bail!("a {kind} artifact is one file, not {n}"),
+    }
+}
+
+struct Budget {
+    used: u64,
+    cap: u64,
+}
+
+fn copy_tree(source: &Path, dest: &Path) -> Result<BTreeSet<String>> {
+    let meta = std::fs::symlink_metadata(source)
+        .with_context(|| format!("cannot read {}", source.display()))?;
+    std::fs::create_dir(dest)?;
+    let mut budget = Budget {
+        used: 0,
+        cap: max_bytes(),
+    };
+    let mut files = BTreeSet::new();
+    if meta.is_dir() {
+        copy_dir(source, dest, "", &mut budget, &mut files)?;
+    } else if meta.is_file() {
+        let name = utf8_name(source.file_name().unwrap_or_default(), source)?;
+        copy_file(source, &dest.join(&name), &mut budget)?;
+        files.insert(name);
+    } else {
+        bail!("{} is not a regular file or directory", source.display());
+    }
+    Ok(files)
+}
+
+fn utf8_name(name: &std::ffi::OsStr, path: &Path) -> Result<String> {
+    name.to_str()
+        .map(str::to_owned)
+        .with_context(|| format!("{} is not a UTF-8 name", path.display()))
+}
+
+fn copy_dir(
+    src: &Path,
+    dest: &Path,
+    rel: &str,
+    budget: &mut Budget,
+    files: &mut BTreeSet<String>,
+) -> Result<()> {
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = utf8_name(&entry.file_name(), &path)?;
+        let rel = if rel.is_empty() {
+            name.clone()
+        } else {
+            format!("{rel}/{name}")
+        };
+        let kind = entry.file_type()?;
+        if kind.is_symlink() {
+            bail!("{rel} is a symlink; only regular files are published");
+        } else if kind.is_dir() {
+            std::fs::create_dir(dest.join(&name))?;
+            copy_dir(&path, &dest.join(&name), &rel, budget, files)?;
+        } else if kind.is_file() {
+            copy_file(&path, &dest.join(&name), budget)?;
+            files.insert(rel);
+        } else {
+            bail!("{rel} is not a regular file");
+        }
+    }
+    Ok(())
+}
+
+fn copy_file(src: &Path, dest: &Path, budget: &mut Budget) -> Result<()> {
+    let input = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(src)
+        .with_context(|| format!("cannot read {}", src.display()))?;
+    let mut output = std::fs::File::create_new(dest)?;
+    let left = budget.cap - budget.used;
+    let copied = std::io::copy(&mut input.take(left + 1), &mut output)?;
+    if copied > left {
+        bail!("the tree is over the {}-byte artifact cap", budget.cap);
+    }
+    budget.used += copied;
+    Ok(())
+}
+
+fn stored_files(dir: &Path) -> Result<BTreeSet<String>> {
+    fn walk(dir: &Path, rel: &str, files: &mut BTreeSet<String>) -> Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let name = utf8_name(&entry.file_name(), &entry.path())?;
+            let rel = if rel.is_empty() {
+                name
+            } else {
+                format!("{rel}/{name}")
+            };
+            if entry.file_type()?.is_dir() {
+                walk(&entry.path(), &rel, files)?;
+            } else {
+                files.insert(rel);
+            }
+        }
+        Ok(())
+    }
+    let mut files = BTreeSet::new();
+    walk(dir, "", &mut files)?;
+    Ok(files)
+}
+
+const ARTIFACT_COLUMNS: &str = "id, kind, title, storage_host, entry, url, body, card_id, project, session, checkout, meta, created_at, removed_at";
+
+fn artifact_from_row(r: &Row) -> rusqlite::Result<Artifact> {
+    let content = match (
+        r.get::<_, Option<String>>(3)?,
+        r.get::<_, Option<String>>(4)?,
+        r.get::<_, Option<String>>(5)?,
+        r.get::<_, Option<String>>(6)?,
+    ) {
+        (Some(host), Some(entry), _, _) => ArtifactContent::Files { host, entry },
+        (_, _, Some(url), _) => ArtifactContent::Url { url },
+        (_, _, _, body) => ArtifactContent::Body {
+            body: body.unwrap_or_default(),
+        },
+    };
+    Ok(Artifact {
+        id: ArtifactId(r.get(0)?),
+        kind: r.get(1)?,
+        title: r.get(2)?,
+        card: r.get::<_, Option<String>>(7)?.map(TodoId),
+        project: r.get(8)?,
+        session: optional_json(r, 9)?,
+        checkout: optional_json(r, 10)?,
+        content,
+        meta: json_column(r, 11)?,
+        created_at: r.get(12)?,
+        removed_at: r.get(13)?,
+    })
+}
+
+fn by_id(tx: &Transaction, id: &ArtifactId) -> Result<Option<Artifact>> {
+    Ok(tx
+        .query_row(
+            &format!("SELECT {ARTIFACT_COLUMNS} FROM artifacts WHERE id = ?1"),
+            params![id.as_str()],
+            artifact_from_row,
+        )
+        .optional()?)
+}
+
+fn not_found(id: &ArtifactId) -> anyhow::Error {
+    anyhow::anyhow!(Refusal::NotFound.message(format!("no artifact {id}")))
+}
+
+pub(crate) fn of_card(tx: &Transaction, card: &TodoId) -> Result<Vec<Artifact>> {
+    Ok(tx
+        .prepare(&format!(
+            "SELECT {ARTIFACT_COLUMNS} FROM artifacts WHERE card_id = ?1 AND removed_at IS NULL ORDER BY created_at"
+        ))?
+        .query_map(params![card.as_str()], artifact_from_row)?
+        .collect::<rusqlite::Result<_>>()?)
+}
+
+/// A rerun with a known id returns the first row. A linked card must exist,
+/// and its project wins over the caller's.
+pub(crate) fn publish(tx: &Transaction, artifact: Artifact) -> Result<Artifact> {
+    if let Some(known) = by_id(tx, &artifact.id)? {
+        return Ok(known);
+    }
+    let project = match &artifact.card {
+        Some(card) => {
+            let card = resolve(tx, &CardRef::Id(card.clone()))?;
+            tx.query_row(
+                "SELECT project FROM todos WHERE id = ?1",
+                params![card.as_str()],
+                |r| r.get::<_, Option<String>>(0),
+            )?
+        }
+        None => artifact.project.clone(),
+    };
+    let (host, entry, url, body) = match &artifact.content {
+        ArtifactContent::Files { host, entry } => (Some(host), Some(entry), None, None),
+        ArtifactContent::Url { url } => (None, None, Some(url), None),
+        ArtifactContent::Body { body } => (None, None, None, Some(body)),
+    };
+    tx.execute(
+        "INSERT INTO artifacts (id, kind, title, storage_host, entry, url, body, card_id, project, session, checkout, meta, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        params![
+            artifact.id.as_str(),
+            artifact.kind,
+            artifact.title,
+            host,
+            entry,
+            url,
+            body,
+            artifact.card.as_ref().map(TodoId::as_str),
+            project,
+            artifact.session.as_ref().map(serde_json::to_string).transpose()?,
+            artifact.checkout.as_ref().map(serde_json::to_string).transpose()?,
+            serde_json::to_string(&artifact.meta)?,
+            artifact.created_at,
+        ],
+    )?;
+    by_id(tx, &artifact.id)?.ok_or_else(|| not_found(&artifact.id))
+}
+
+/// Soft: the row stays for `show` and the stored bytes stay on disk.
+pub(crate) fn remove(tx: &Transaction, id: &ArtifactId) -> Result<Artifact> {
+    tx.execute(
+        "UPDATE artifacts SET removed_at = ?2 WHERE id = ?1 AND removed_at IS NULL",
+        params![id.as_str(), now_ms()],
+    )?;
+    by_id(tx, id)?.ok_or_else(|| not_found(id))
+}
+
+pub(crate) fn show(tx: &Transaction, scope: &BoardScope, id: &ArtifactId) -> Result<Artifact> {
+    by_id(tx, id)?
+        .filter(|a| in_scope(scope, a.project.as_deref()))
+        .ok_or_else(|| not_found(id))
+}
+
+pub(crate) fn list(
+    tx: &Transaction,
+    scope: &BoardScope,
+    card: Option<&CardRef>,
+    kind: Option<&str>,
+    query: Option<&str>,
+    page: Option<&str>,
+) -> Result<Page<Artifact>> {
+    let version = cursor(tx)?;
+    let offset = page_offset(page, &version)?;
+    let card = card.map(|c| resolve(tx, c)).transpose()?;
+    let query = query.map(str::to_lowercase);
+    let items = tx
+        .prepare(&format!(
+            "SELECT {ARTIFACT_COLUMNS} FROM artifacts WHERE removed_at IS NULL ORDER BY created_at, id"
+        ))?
+        .query_map([], artifact_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|a| in_scope(scope, a.project.as_deref()))
+        .filter(|a| card.is_none() || a.card == card)
+        .filter(|a| kind.is_none_or(|k| a.kind == k))
+        .filter(|a| {
+            query.as_deref().is_none_or(|q| {
+                let body = match &a.content {
+                    ArtifactContent::Body { body } => body.as_str(),
+                    _ => "",
+                };
+                a.title.to_lowercase().contains(q) || body.to_lowercase().contains(q)
+            })
+        })
+        .collect();
+    let (items, next) = paged(items, offset, &version)?;
+    Ok(Page { items, next })
+}

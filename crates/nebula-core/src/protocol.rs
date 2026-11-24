@@ -1,10 +1,11 @@
-use crate::board::{BoardOp, BoardResult, Role};
+use crate::board::{ArtifactContent, BoardOp, BoardResult, Role};
 use crate::entities::{
     Agent, AgentKind, AgentStatus, Entity, EntityId, Link, Note, NoteOwner, Project, TerminalTab,
     Todo, TodoOwner, Workspace, Worktree,
 };
 use crate::ids::{
-    AgentId, DispatchId, LinkId, NoteId, ProjectId, TerminalId, TodoId, WorkspaceId, WorktreeId,
+    AgentId, ArtifactId, DispatchId, LinkId, NoteId, ProjectId, TerminalId, TodoId, WorkspaceId,
+    WorktreeId,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -540,6 +541,17 @@ pub enum ClientRequest {
         op: BoardOp,
     },
 
+    /// Copies the absolute `source` (a file or a directory) into this
+    /// daemon's artifact store under `id`; never forwarded, since the
+    /// bytes stay on the host that holds them. Answered by `ArtifactStored`
+    /// or Error, with nothing stored.
+    StoreArtifact {
+        req_id: u64,
+        id: ArtifactId,
+        kind: String,
+        source: PathBuf,
+    },
+
     Shutdown,
 }
 
@@ -693,5 +705,11 @@ pub enum ServerEvent {
     BoardReply {
         req_id: u64,
         result: BoardResult,
+    },
+
+    /// Reply to `ClientRequest::StoreArtifact`: the stored copy, to publish.
+    ArtifactStored {
+        req_id: u64,
+        content: ArtifactContent,
     },
 }

@@ -630,3 +630,262 @@ fn agent_new_card_refuses_unknown_caller() {
     );
     assert!(agent_names(&env).is_empty());
 }
+
+impl Env {
+    fn restart(mut self) -> Self {
+        if let Some(mut daemon) = self.daemon.take() {
+            let _ = daemon.kill();
+            let _ = daemon.wait();
+        }
+        let _ = std::fs::remove_file(self.runtime_dir().join("daemon.sock"));
+        self.start(&[])
+    }
+
+    fn stored(&self, id: &str) -> PathBuf {
+        self.data_dir().join("artifacts").join(id)
+    }
+}
+
+fn tree(root: &Path, files: &[(&str, &[u8])]) -> PathBuf {
+    for (path, bytes) in files {
+        let path = root.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+    root.to_path_buf()
+}
+
+fn e2e_run(root: &Path, screenshot: &str) -> PathBuf {
+    let result = serde_json::json!({
+        "title": "board.spec",
+        "status": "passed",
+        "started_at": 1764000000000_i64,
+        "duration_ms": 1200,
+        "steps": [
+            {"name": "open", "status": "passed", "duration_ms": 700, "screenshot": screenshot},
+            {"name": "drag", "status": "passed", "duration_ms": 500}
+        ]
+    });
+    tree(
+        root,
+        &[
+            ("result.json", result.to_string().as_bytes()),
+            ("shots/open.png", b"png"),
+        ],
+    )
+}
+
+fn carded_agent(env: &Env, worktree: &str) -> (Value, String) {
+    let card = add(env, &["--project", "repo"], "Publish");
+    let out = env.cli(
+        &[
+            "agent",
+            "new",
+            "--project",
+            "repo",
+            "--worktree",
+            worktree,
+            "--card",
+            "#1",
+            "--role",
+            "worker",
+            "--name",
+            "publisher",
+            "--json",
+        ],
+        None,
+    );
+    let agent = json_of(out, &["agent", "new", "--card"]);
+    (card, agent["id"].as_str().unwrap().to_string())
+}
+
+fn publish(env: &Env, agent: Option<&str>, args: &[&str]) -> Value {
+    let mut argv = vec!["artifact", "add", "--json"];
+    argv.extend_from_slice(args);
+    json_of(env.cli(&argv, agent), &argv)
+}
+
+fn artifact_ids(env: &Env) -> Vec<String> {
+    env.json(&["artifact", "list", "--all", "--include-home", "--json"])["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[test]
+fn artifact_add_links_caller() {
+    let env = board_env();
+    let repo = env.make_repo();
+    let (card, agent) = carded_agent(&env, "main");
+    let recap = tree(
+        &env.tmp.path().join("recap"),
+        &[
+            ("index.html", b"<h1>recap</h1>"),
+            ("assets/app.css", b"h1{}"),
+        ],
+    );
+    let run = e2e_run(&env.tmp.path().join("run"), "shots/open.png");
+    let host = nebula_core::host::hostname();
+
+    for (dir, kind, entry) in [
+        (&recap, "recap", "index.html"),
+        (&run, "e2e-run", "result.json"),
+    ] {
+        let added = publish(&env, Some(&agent), &[dir.to_str().unwrap(), "--kind", kind]);
+        assert_eq!(added["kind"], kind);
+        assert_eq!(added["card"], card["id"], "{kind}");
+        assert_eq!(added["project"], "repo");
+        assert_eq!(added["session"]["id"], agent.as_str());
+        assert_eq!(added["session"]["name"], "publisher");
+        assert_eq!(added["checkout"]["branch"], "main");
+        assert_eq!(
+            Path::new(added["checkout"]["path"].as_str().unwrap()),
+            repo.canonicalize().unwrap()
+        );
+        let id = added["id"].as_str().unwrap();
+        let shown = env.json(&["artifact", "show", id, "--json"]);
+        assert_eq!(
+            shown["content"],
+            serde_json::json!({"host": host, "entry": entry})
+        );
+        assert_eq!(shown, added);
+        assert!(
+            env.stored(id).join(entry).is_file(),
+            "{kind} entry not stored"
+        );
+    }
+    let on_card = env.json(&["todo", "show", "#1", "--json"]);
+    assert_eq!(
+        on_card["artifacts"].as_array().unwrap().len(),
+        2,
+        "{on_card}"
+    );
+}
+
+#[test]
+fn artifact_survives_worktree_archive_restart() {
+    let env = board_env();
+    env.make_repo();
+    let made = env.cli(&["worktree", "new", "feature", "--project", "repo"], None);
+    assert!(made.status.success(), "{}", stderr(&made));
+    let (_, agent) = carded_agent(&env, "feature");
+    let recap = tree(
+        &env.tmp.path().join("recap"),
+        &[("index.html", b"<h1>kept</h1>")],
+    );
+    let added = publish(
+        &env,
+        Some(&agent),
+        &[recap.to_str().unwrap(), "--kind", "recap"],
+    );
+    let id = added["id"].as_str().unwrap().to_string();
+    std::fs::remove_dir_all(&recap).unwrap();
+
+    for step in [
+        &["agent", "archive", "publisher", "--project", "repo"][..],
+        &[
+            "worktree",
+            "delete",
+            "feature",
+            "--force",
+            "--project",
+            "repo",
+        ],
+    ] {
+        let out = env.cli(step, None);
+        assert!(out.status.success(), "{step:?}: {}", stderr(&out));
+    }
+    let env = env.restart();
+    let shown = env.json(&["artifact", "show", &id, "--json"]);
+    assert_eq!(shown, added);
+    let bytes = std::fs::read(env.stored(&id).join("index.html")).unwrap();
+    assert_eq!(bytes, b"<h1>kept</h1>");
+}
+
+#[test]
+fn artifact_add_refusals() {
+    let env = Env::new();
+    env.board_local();
+    let env = env.start(&[("NEBULA_ARTIFACT_MAX_BYTES", "1024")]);
+    let root = env.tmp.path();
+    std::fs::write(root.join("secret.png"), b"secret").unwrap();
+
+    let linked = tree(&root.join("linked"), &[("index.html", b"x")]);
+    std::os::unix::fs::symlink(root.join("secret.png"), linked.join("leak.png")).unwrap();
+    let escape = e2e_run(&root.join("escape"), "../secret.png");
+    let missing = e2e_run(&root.join("missing"), "shots/gone.png");
+    let invalid = tree(&root.join("invalid"), &[("result.json", b"{\"title\": 1}")]);
+    let big = tree(&root.join("big"), &[("index.html", &[b'x'; 2048])]);
+
+    for (dir, kind) in [
+        (&linked, "recap"),
+        (&escape, "e2e-run"),
+        (&missing, "e2e-run"),
+        (&invalid, "e2e-run"),
+        (&big, "recap"),
+    ] {
+        let out = env.cli(
+            &[
+                "artifact",
+                "add",
+                dir.to_str().unwrap(),
+                "--kind",
+                kind,
+                "--json",
+            ],
+            None,
+        );
+        assert!(!out.status.success(), "{dir:?} was stored");
+        assert!(out.stdout.is_empty(), "{dir:?}");
+    }
+    assert!(artifact_ids(&env).is_empty());
+    let leftovers: Vec<_> = std::fs::read_dir(env.data_dir().join("artifacts"))
+        .map(|dir| dir.map(|e| e.unwrap().file_name()).collect())
+        .unwrap_or_default();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
+
+    let small = tree(&root.join("small"), &[("index.html", &[b'x'; 512])]);
+    publish(&env, None, &[small.to_str().unwrap(), "--kind", "recap"]);
+    assert_eq!(artifact_ids(&env).len(), 1);
+}
+
+#[test]
+fn artifact_add_url_link() {
+    let env = board_env();
+    let added = publish(&env, None, &["https://vela.possu.dev"]);
+    assert_eq!(added["kind"], "link");
+    assert_eq!(
+        added["content"],
+        serde_json::json!({"url": "https://vela.possu.dev"})
+    );
+    let id = added["id"].as_str().unwrap();
+    assert_eq!(env.json(&["artifact", "show", id, "--json"]), added);
+    assert!(!env.stored(id).exists());
+}
+
+#[test]
+fn artifact_rm_soft() {
+    let env = board_env();
+    let page = tree(&env.tmp.path().join("page"), &[("index.html", b"x")]);
+    let kept = publish(&env, None, &["https://example.com"]);
+    let gone = publish(&env, None, &[page.to_str().unwrap(), "--kind", "prototype"]);
+    let id = gone["id"].as_str().unwrap();
+
+    let removed = env.json(&["artifact", "rm", id, "--json"]);
+    assert!(removed["removed_at"].is_i64(), "{removed}");
+    assert_eq!(artifact_ids(&env), [kept["id"].as_str().unwrap()]);
+    let shown = env.json(&["artifact", "show", id, "--json"]);
+    assert_eq!(shown["removed_at"], removed["removed_at"]);
+    assert!(
+        env.stored(id).join("index.html").is_file(),
+        "rm deleted the bytes"
+    );
+
+    let unknown = env.cli(
+        &["artifact", "rm", &nebula_core::ArtifactId::generate().0],
+        None,
+    );
+    assert_eq!(unknown.status.code(), Some(5), "{}", stderr(&unknown));
+}

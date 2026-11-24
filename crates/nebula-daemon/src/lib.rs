@@ -3,6 +3,7 @@
     reason = "clippy.toml bans sleeps and wall clock in integration tests only; product code waits and times by design"
 )]
 
+mod artifacts;
 pub mod board;
 mod checkout_lock;
 mod collect;

@@ -310,6 +310,29 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         let _ = out_tx.send(event).await;
                     });
                 }
+                ClientRequest::StoreArtifact {
+                    req_id,
+                    id,
+                    kind,
+                    source,
+                } => {
+                    let out_tx = out_tx.clone();
+                    tokio::spawn(async move {
+                        let stored = tokio::task::spawn_blocking(move || {
+                            crate::artifacts::store(&id, &kind, &source)
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(anyhow::anyhow!("artifact store panicked: {e}")));
+                        let event = match stored {
+                            Ok(content) => ServerEvent::ArtifactStored { req_id, content },
+                            Err(e) => ServerEvent::Error {
+                                req_id: Some(req_id),
+                                message: format!("{e:#}"),
+                            },
+                        };
+                        let _ = out_tx.send(event).await;
+                    });
+                }
                 ClientRequest::GetMetrics { req_id } => {
                     // A machine-wide `ps` sweep takes tens of ms; keep it off
                     // the request loop so Input/Attach frames keep flowing.
