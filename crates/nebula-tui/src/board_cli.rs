@@ -570,6 +570,20 @@ async fn run_dispatch(
     })
     .await;
     let (agent, error) = match spawned {
+        Ok(created)
+            if created["role"] != serde_json::to_value(role)?
+                || created["kind"] != kind.as_str() =>
+        {
+            bail!(Refusal::Conflict.message(format!(
+                "dispatch {} started \"{}\" as {} {}, not {} {}",
+                id.as_str(),
+                created["name"].as_str().unwrap_or_default(),
+                created["role"].as_str().unwrap_or("no role"),
+                created["kind"].as_str().unwrap_or_default(),
+                role.as_str(),
+                kind.as_str()
+            )))
+        }
         Ok(created) => (
             Some(AgentId(
                 created["id"]

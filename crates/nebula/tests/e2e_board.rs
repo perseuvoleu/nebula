@@ -2453,6 +2453,40 @@ fn run_retry_scope_covers_the_admitted_project() {
     assert!(agents_of(&env).is_empty());
 }
 
+#[test]
+fn run_recovery_matches_role_and_kind() {
+    let env = board_env();
+    env.make_repo();
+    add(&env, &["--project", "repo"], "Roles");
+    for (role, kind, name) in [
+        ("review", "claude", "reviewer"),
+        ("worker", "codex", "coder"),
+    ] {
+        let dispatch = TodoId::generate().0;
+        let argv = [
+            "--card",
+            "#1",
+            "--role",
+            role,
+            "--kind",
+            kind,
+            "--dispatch",
+            &dispatch,
+            "--name",
+            name,
+        ];
+        json_of(spawn_agent(&env, &argv), &["agent", "new", name]);
+        let refused = run_card(&env, "#1", &["--dispatch", &dispatch]);
+        assert_eq!(
+            refused.status.code(),
+            Some(6),
+            "{name}: {}",
+            stderr(&refused)
+        );
+    }
+    assert_eq!(agents_of(&env).len(), 2);
+}
+
 fn session_row(env: &Env, id: &str) -> Value {
     agents_of(env).into_iter().find(|a| a["id"] == id).unwrap()
 }
