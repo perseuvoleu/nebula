@@ -111,7 +111,10 @@ fn apply(tx: &Transaction, op: BoardOp) -> Result<BoardResult> {
             card,
             text,
             author,
-        } => add_note(tx, id, &card, &text, &author).map(BoardResult::Note),
+        } => {
+            let note = add_note(tx, id, &card, &text, &author)?;
+            card_by_id(tx, &note.card).map(BoardResult::Card)
+        }
         BoardOp::Publish(_)
         | BoardOp::RemoveArtifact { .. }
         | BoardOp::BeginRun(_)

@@ -300,8 +300,10 @@ fn card_note_log_order() {
     let env = board_env();
     add(&env, &["--project", "nebula"], "Logged");
     for text in ["first", "second", "third"] {
-        let note = env.json(&["todo", "note", "#1", text, "--json"]);
-        assert_eq!(note["text"], text);
+        let card = env.json(&["todo", "note", "#1", text, "--json"]);
+        assert_eq!(card["ref"], "#1");
+        assert_eq!(card["stage"], "backlog");
+        assert_eq!(card["title"], "Logged");
     }
     let shown = env.json(&["todo", "show", "#1", "--json"]);
     let log = shown["log"].as_array().unwrap();
