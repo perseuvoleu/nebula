@@ -64,6 +64,10 @@ impl Env {
         for k in LIVE_SESSION_ENV {
             cmd.env_remove(k);
         }
+        cmd.env_remove("NEBULA_RAG_ENV")
+            .env("NEBULA_RAG_LOCAL", "1")
+            .env("CF_ACCOUNT_ID", "")
+            .env("CF_AI_TOKEN", "");
         for (k, v) in envs {
             cmd.env(k, v);
         }
@@ -119,16 +123,26 @@ impl Env {
 
 #[expect(
     clippy::disallowed_methods,
-    reason = "the one wait in this file: the daemon's socket appearing"
+    reason = "the one poll loop: every wait in this file goes through it"
 )]
-fn wait_for(sock: &Path) {
-    for _ in 0..200 {
-        if std::os::unix::net::UnixStream::connect(sock).is_ok() {
-            return;
+fn poll_until<T>(timeout: Duration, mut probe: impl FnMut() -> Option<T>) -> Option<T> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(value) = probe() {
+            return Some(value);
+        }
+        if std::time::Instant::now() > deadline {
+            return None;
         }
         std::thread::sleep(Duration::from_millis(25));
     }
-    panic!("daemon socket never appeared");
+}
+
+fn wait_for(sock: &Path) {
+    poll_until(Duration::from_secs(5), || {
+        std::os::unix::net::UnixStream::connect(sock).ok()
+    })
+    .expect("daemon socket never appeared");
 }
 
 fn stderr(out: &Output) -> String {
@@ -1612,4 +1626,195 @@ fn link_lost_note_without_id_names_it() {
     let log = board.json(&["todo", "show", "#1", "--json"])["log"].clone();
     assert_eq!(log.as_array().map(Vec::len), Some(1), "{log}");
     assert_eq!(log[0]["id"], id.as_str());
+}
+
+fn decide(env: &Env, agent: Option<&str>, args: &[&str]) -> Value {
+    let mut argv = vec!["decision", "add", "--json"];
+    argv.extend_from_slice(args);
+    json_of(env.cli(&argv, agent), &argv)
+}
+
+fn decision_titles(env: &Env, args: &[&str]) -> Vec<String> {
+    let mut argv = vec!["decision", "list", "--json"];
+    argv.extend_from_slice(args);
+    let mut found = titles(&env.json(&argv)["items"]);
+    found.sort();
+    found
+}
+
+#[test]
+fn decision_add_list_query() {
+    let env = board_env();
+    env.make_repo();
+    let (card, agent) = carded_agent(&env, "main");
+    let decided = decide(
+        &env,
+        Some(&agent),
+        &[
+            "Copy published files",
+            "--why",
+            "The checkout is disposable",
+        ],
+    );
+    assert_eq!(decided["kind"], "decision");
+    assert_eq!(decided["title"], "Copy published files");
+    assert_eq!(
+        decided["content"],
+        serde_json::json!({"body": "The checkout is disposable"})
+    );
+    assert_eq!(decided["card"], card["id"]);
+    assert_eq!(decided["project"], "repo");
+    assert_eq!(decided["session"]["id"], agent.as_str());
+    let id = decided["id"].as_str().unwrap();
+    assert_eq!(env.json(&["decision", "show", id, "--json"]), decided);
+
+    let other = decide(
+        &env,
+        None,
+        &["Poll every three seconds", "--project", "web"],
+    );
+    assert_eq!(other["card"], Value::Null);
+    assert_eq!(other["project"], "web");
+    let link = publish(
+        &env,
+        None,
+        &["https://example.com/repo", "--project", "repo"],
+    );
+
+    assert_eq!(
+        decision_titles(&env, &["--all", "--query", "DISPOSABLE"]),
+        ["Copy published files"]
+    );
+    assert_eq!(
+        decision_titles(&env, &["--all", "--query", "three"]),
+        ["Poll every three seconds"]
+    );
+    assert_eq!(
+        decision_titles(&env, &["--project", "web"]),
+        ["Poll every three seconds"]
+    );
+    assert_eq!(
+        decision_titles(&env, &["--project", "repo"]),
+        ["Copy published files"]
+    );
+    let not_one = env.cli(
+        &["decision", "show", link["id"].as_str().unwrap(), "--json"],
+        None,
+    );
+    assert_eq!(not_one.status.code(), Some(5), "{}", stderr(&not_one));
+}
+
+fn fake_workers_ai(env: &Env) -> PathBuf {
+    let bin = env.tmp.path().join("fake-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let vector = vec!["0.03125"; 1024].join(",");
+    let down = env.tmp.path().join("rag-down");
+    let attempted = env.tmp.path().join("rag-attempted");
+    let script = format!(
+        "#!/bin/sh\ncat >/dev/null\nif [ -e '{}' ]; then touch '{}'; printf '%s\\n400' '{{\"errors\":[{{\"message\":\"down\"}}]}}'; exit 0; fi\nprintf '%s\\n200' '{{\"result\":{{\"data\":[[{vector}]]}}}}'\n",
+        down.display(),
+        attempted.display()
+    );
+    let curl = bin.join("curl");
+    std::fs::write(&curl, script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+#[test]
+fn decision_reaches_rag() {
+    let env = Env::new();
+    env.board_local();
+    let bin = fake_workers_ai(&env);
+    let down = env.tmp.path().join("rag-down");
+    std::fs::write(&down, "").unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let env = env.start(&[
+        ("PATH", &path),
+        ("CF_ACCOUNT_ID", "test"),
+        ("CF_AI_TOKEN", "test"),
+        ("NEBULA_RAG_COPY_MS", "100"),
+    ]);
+
+    let decided = decide(
+        &env,
+        None,
+        &[
+            "Copy published files",
+            "--why",
+            "The checkout is disposable",
+            "--project",
+            "repo",
+        ],
+    );
+    let id = decided["id"].as_str().unwrap();
+    let attempted = env.tmp.path().join("rag-attempted");
+    poll_until(Duration::from_secs(10), || attempted.exists().then_some(()))
+        .expect("the board never tried to copy the decision to RAG");
+    let shown = env.json(&["decision", "show", id, "--json"]);
+    assert_eq!(shown["meta"].get("rag_note"), None, "{shown}");
+
+    std::fs::remove_file(&down).unwrap();
+    let note = poll_until(Duration::from_secs(10), || {
+        env.json(&["decision", "show", id, "--json"])["meta"]["rag_note"].as_i64()
+    })
+    .expect("the decision never got its rag_note once RAG answered");
+
+    let search = Command::new(env!("CARGO_BIN_EXE_nebula"))
+        .args([
+            "rag",
+            "search",
+            "--exact",
+            "--ws",
+            "/",
+            "--json",
+            "disposable",
+        ])
+        .env("NEBULA_DATA_DIR", env.data_dir())
+        .env("NEBULA_RAG_LOCAL", "1")
+        .env_remove("NEBULA_RAG_ENV")
+        .current_dir(env.tmp.path())
+        .output()
+        .unwrap();
+    let hits = json_of(search, &["rag", "search"]);
+    let hit = hits
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["doc_id"].as_i64() == Some(note))
+        .unwrap_or_else(|| panic!("note {note} not among {hits}"));
+    assert_eq!(hit["ws"], "apps/repo/notes");
+    assert!(
+        hit["text"]
+            .as_str()
+            .unwrap()
+            .contains("The checkout is disposable"),
+        "{hit}"
+    );
+}
+
+#[test]
+fn away_digest_decisions() {
+    let env = board_env();
+    let before = decide(&env, None, &["Keep the counter", "--project", "repo"]);
+    let since = before["created_at"].as_i64().unwrap();
+    let after = decide(&env, None, &["Drop the cookie grant", "--project", "repo"]);
+    let elsewhere = decide(&env, None, &["Ship slice two", "--project", "web"]);
+    let since = since.to_string();
+    let board = env.json(&[
+        "todo",
+        "board",
+        "--project",
+        "repo",
+        "--away-since",
+        &since,
+        "--json",
+    ]);
+    assert_eq!(
+        board["board"]["away"]["decisions"],
+        serde_json::json!([after["id"]]),
+        "{board} (outside the scope: {})",
+        elsewhere["id"]
+    );
 }
