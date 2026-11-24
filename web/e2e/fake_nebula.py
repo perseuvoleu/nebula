@@ -15,6 +15,7 @@ import uuid
 from pathlib import Path
 
 STATE = Path(os.environ["FAKE_NEBULA_STATE"])
+DECISION_PAGE = 2
 
 
 def load(name):
@@ -104,8 +105,10 @@ def board_command(verb, args, board):
         return 0, {"version": version, "board": {"cards": cards, "hosts": hosts, "away": away(board, cards, args)}, "next": None}
     if verb == ("decision", "list"):
         query = (flags("--query") or "").lower()
-        return 0, {"items": [d for d in board["decisions"] if scoped(d, args) and query in (d["title"] + d["content"]["body"]).lower()],
-                   "next": None}
+        items = [d for d in board["decisions"] if scoped(d, args) and query in (d["title"] + d["content"]["body"]).lower()]
+        start = int(flags("--page").rsplit("@", 1)[1]) if flags("--page") else 0
+        end = start + DECISION_PAGE
+        return 0, {"items": items[start:end], "next": f"{version}@{end}" if end < len(items) else None}
     if verb == ("decision", "add"):
         card = find_card(board, flags("--card"), ["--all", "--include-home"]) if flags("--card") else None
         decision = {"id": f"01JG{len(board['decisions']) + 100:022d}", "kind": "decision", "title": values[0],

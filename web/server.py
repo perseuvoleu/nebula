@@ -523,10 +523,13 @@ class Gateway:
         if path.startswith("/api/cards/"):
             return self.card(unquote(path[len("/api/cards/"):]))
         if path == "/api/decisions":
-            text = query.get("query", [None])[0]
+            text, page = (query.get(k, [None])[0] for k in ("query", "page"))
             if text is not None and (len(text) > 200 or "\0" in text):
                 raise Problem(400, "Invalid search")
-            return self.board("decision", "list", *self.scope(), *([f"--query={text}"] if text else []))
+            if page is not None and not PAGE.fullmatch(page):
+                raise Problem(400, "Invalid page")
+            return self.board("decision", "list", *self.scope(), *([f"--query={text}"] if text else []),
+                              *([f"--page={page}"] if page else []))
         project = self.project(query.get("project", [None])[0])
         first = {k: v[0] for k, v in query.items()}
         if path == "/api/sessions":
