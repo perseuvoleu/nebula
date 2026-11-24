@@ -75,16 +75,22 @@ def find_card(board, ref, args):
     return card if card and scoped(card, args) else None
 
 
+def waiting(board, cards):
+    return [{"host": s["host"], "id": s["id"], "name": s["name"], "card": c["id"], "status_changed_at": s["status_changed_at"]}
+            for c in cards for s in board["details"].get(c["id"], {}).get("sessions", []) if s["status"] == "needs_feedback"]
+
+
 def away(board, cards, args):
     since = arg("--away-since", args)
     if since is None:
         return {"finished": [], "needs_you": [], "decisions": []}
     after = lambda event: event["at"] > int(since)
     ids = {c["id"] for c in cards}
-    sessions = {(s["host"], s["id"]) for i in ids for s in board["details"].get(i, {}).get("sessions", [])}
+    names = {(s["host"], s["id"]): s["name"] for s in waiting(board, cards)}
     return {"finished": [e["id"] for e in board["away"]["finished"] if after(e) and e["id"] in ids],
-            "needs_you": [{k: e[k] for k in ("host", "id", "card", "status_changed_at")} for e in board["away"]["needs_you"]
-                          if after(e) and (e["host"], e["id"]) in sessions],
+            "needs_you": [{"host": e["host"], "id": e["id"], "name": names[e["host"], e["id"]], "card": e["card"],
+                           "status_changed_at": e["status_changed_at"]} for e in board["away"]["needs_you"]
+                          if after(e) and (e["host"], e["id"]) in names],
             "decisions": [d["id"] for d in board["decisions"] if d["created_at"] > int(since) and scoped(d, args)]}
 
 
@@ -106,7 +112,8 @@ def board_command(verb, args, board):
             return 0, {"version": version, "unchanged": True}
         cards = [with_cleared(c, board) for c in board["cards"] if scoped(c, args) and not c["archived"]]
         hosts = [{**h, "checkouts": [c for c in h["checkouts"] if scoped(c, args)]} for h in board["hosts"]]
-        return 0, {"version": version, "board": {"cards": cards, "hosts": hosts, "away": away(board, cards, args)}, "next": None}
+        return 0, {"version": version, "board": {"cards": cards, "hosts": hosts, "needs_you": waiting(board, cards),
+                                                   "away": away(board, cards, args)}, "next": None}
     if verb == ("decision", "list"):
         query = (flags("--query") or "").lower()
         return 0, {"items": [d for d in board["decisions"] if scoped(d, args) and query in (d["title"] + d["content"]["body"]).lower()],

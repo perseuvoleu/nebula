@@ -3,7 +3,7 @@ import { ArrowLeftIcon, MenuIcon, PlusIcon } from "lucide-react";
 import { api, describeError } from "@/lib/api";
 import { activityAge } from "@/lib/activity-age";
 import {
-  type BoardData, type Card, type CardShow, type SidebarScope, type SortKey, type TableSort,
+  type BoardCard, type BoardData, type Card, type CardShow, type NeedsYou, type SidebarScope, type SortKey, type TableSort,
   type Stage, awayDigest, byStage, cardSlug, inScope, projectName, sidebarProjects, sortCards, toBoardCard, writerSlots,
 } from "@/lib/board";
 import { cardAction, createCard, ulid } from "@/lib/board-actions";
@@ -141,7 +141,7 @@ export function BoardPage({ route, onNavigate, onSessions }: {
   const toggle = <T,>(list: T[], name: T) => list.includes(name) ? list.filter((n) => n !== name) : [...list, name];
 
   const live = (board?.cards ?? []).map((c) => pending[c.ref] ? { ...c, ...pending[c.ref].patch } : c).filter((c) => !c.archived);
-  const waiting = (board?.away.needs_you ?? []).filter((w) => !pending[w.id]);
+  const waiting = (board?.needs_you ?? []).filter((w) => !pending[w.id]);
   const all = live.map((c) => ({ ...toBoardCard(c, live), needsYou: waiting.some((w) => w.card === c.id), age: activityAge(c.updated_at, Date.now()) }));
   const scoped = all.filter((c) => inScope(c, scope));
   const cards = scoped.filter((c) => !c.proposed);
@@ -172,11 +172,11 @@ export function BoardPage({ route, onNavigate, onSessions }: {
     }
   };
   const waitingCards = cards.filter((c) => c.needsYou);
-  const approve = (ref: string) => {
-    const card = live.find((c) => c.ref === ref);
-    const session = waiting.find((w) => w.card === card?.id);
-    if (session) optimistic(session.id, {}, cardAction(ref, "approve", { session: session.id, host: session.host, expectedStatusAt: session.status_changed_at }));
-  };
+  const approve = (ref: string, session: NeedsYou) =>
+    optimistic(session.id, {}, cardAction(ref, "approve", { session: session.id, host: session.host, expectedStatusAt: session.status_changed_at }));
+  const approveButtons = (card: BoardCard) => waiting.filter((w) => w.card === live.find((c) => c.ref === card.ref)?.id).map((w) => (
+    <Button key={`${w.host}/${w.id}`} type="button" variant="outline" size="xs" onClick={() => approve(card.ref, w)}>Aprobă {w.name}</Button>
+  ));
 
   const sidebar = (
     <ProjectSidebar projects={board ? sidebarProjects(board) : []} total={live.filter((c) => c.stage !== "done").length}
@@ -237,7 +237,7 @@ export function BoardPage({ route, onNavigate, onSessions }: {
         {digest && !digest.empty && !digestClosed && !route.card && (
           <AwayDigest lastSeen={new Date(lastSeen).toLocaleString("ro-RO", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}
             scope={scope.kind === "all" || scope.kind === "needs" ? "toate proiectele" : projectName(scope.project)}
-            finished={digest.finished.map((c) => toBoardCard(c, live))} decisions={awayDecisions} onOpen={peek} onClose={() => setDigestClosed(true)}
+            finished={digest.finished.map((c) => toBoardCard(c, live))} needsYou={digest.waiting.length ? digest.waiting.map((c) => toBoardCard(c, live)) : undefined} decisions={awayDecisions} onOpen={peek} onClose={() => setDigestClosed(true)}
             onCaughtUp={() => {
               const seen = Date.now();
               try { localStorage.setItem(LAST_SEEN, String(seen)); } catch { /* The digest still resets for this visit. */ }
@@ -252,7 +252,7 @@ export function BoardPage({ route, onNavigate, onSessions }: {
         )}
         {!route.card && !route.decisions && (
           <NeedsYouStrip cards={waitingCards} onOpen={peek}
-            renderActions={(card) => <Button type="button" variant="outline" size="xs" onClick={() => approve(card.ref)}>Aprobă</Button>} />
+            renderActions={approveButtons} />
         )}
         {!route.card && !route.decisions && (
           <ProposalTray proposals={scoped.filter((c) => c.proposed).map((c) => ({ id: c.ref, ref: c.ref, title: c.title, project: c.project, proposedBy: c.proposedBy ?? "agent" }))}

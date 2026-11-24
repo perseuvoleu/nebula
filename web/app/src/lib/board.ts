@@ -106,11 +106,11 @@ export type BoardHost = {
 
 export type SessionAt = { host: string; id: string };
 
-export type NeedsYou = SessionAt & { card: string; status_changed_at: number };
+export type NeedsYou = SessionAt & { name: string; card: string; status_changed_at: number };
 
 export type Away = { finished: string[]; needs_you: NeedsYou[]; decisions: string[] };
 
-export type BoardData = { cards: Card[]; hosts: BoardHost[]; away: Away };
+export type BoardData = { cards: Card[]; hosts: BoardHost[]; needs_you: NeedsYou[]; away: Away };
 
 export type BoardReply =
   | { version: string; unchanged: true }
@@ -159,10 +159,12 @@ const inProject = (project: string | null, scope: SidebarScope): boolean =>
   scope.kind === "all" || scope.kind === "needs" || project === scope.project;
 
 export function awayDigest<D extends { id: string; project: string | null }>(board: BoardData, scope: SidebarScope, known: D[]):
-  { finished: Card[]; decisions: D[]; empty: boolean } {
-  const finished = board.away.finished.flatMap((id) => board.cards.filter((c) => c.id === id && inProject(c.project, scope)));
+  { finished: Card[]; waiting: Card[]; decisions: D[]; empty: boolean } {
+  const scoped = (id: string) => board.cards.filter((c) => c.id === id && inProject(c.project, scope));
+  const finished = board.away.finished.flatMap(scoped);
+  const waiting = [...new Set(board.away.needs_you.map((w) => w.card))].flatMap(scoped);
   const decisions = board.away.decisions.flatMap((id) => known.filter((d) => d.id === id && inProject(d.project, scope)));
-  return { finished, decisions, empty: !finished.length && !decisions.length };
+  return { finished, waiting, decisions, empty: !finished.length && !waiting.length && !decisions.length };
 }
 
 export const cardSlug = (ref: string): string => ref.replace(/^#/, "");

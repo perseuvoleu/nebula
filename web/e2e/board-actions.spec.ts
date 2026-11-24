@@ -41,6 +41,21 @@ const column = (page: Page, name: string) => page.getByRole("region", { name, ex
 const tile = (scope: Page | Locator, title: string) => scope.getByRole("article").filter({ hasText: title });
 const nextPoll = (page: Page) => page.waitForResponse((r) => r.url().includes("/api/board?") && r.ok());
 
+async function polledAfterThis(page: Page) {
+  addCard(90, "Poll marker");
+  await expect(tile(page, "Poll marker")).toBeVisible();
+}
+
+const REVIEWER = "01JF0000000000000000000003";
+
+function waiting(since: number, reviewer = false) {
+  writeBoard((board) => {
+    const sessions = board.details[CARD].sessions;
+    Object.assign(sessions[0], { status: "needs_feedback", status_changed_at: since });
+    if (reviewer) sessions.push({ ...sessions[0], id: REVIEWER, name: "reviewer", role: "review", writer: false });
+  });
+}
+
 test("a dragged card moves to its column and stays there after the next poll", async ({ page }) => {
   addCard(13, "Drag me along");
   await open(page, "/board");
@@ -94,22 +109,31 @@ test("accept puts a proposed card on the board and dismiss removes it", async ({
   expect([cardNumbered(13).proposed, cardNumbered(14).archived]).toEqual([false, true]);
 });
 
-test("approve in the needs-you strip sends the approval and the card leaves the strip", async ({ page }) => {
+test("on a first visit each waiting session has its own approve button, which answers that session and leaves the strip", async ({ page }) => {
   const waitingSince = 1764000600000;
-  writeBoard((board) => {
-    Object.assign(board.details[CARD].sessions[0], { status: "needs_feedback", status_changed_at: waitingSince });
-    board.away.needs_you = [{ host: "leaseweb", id: "01JF0000000000000000000002", card: CARD, status_changed_at: waitingSince, at: waitingSince }];
-  });
-  await page.addInitScript(() => localStorage.setItem("nebula-board-last-seen", "1764000000000"));
+  waiting(waitingSince, true);
   await open(page, "/board");
   const strip = page.getByRole("region", { name: /Te așteaptă/ });
   await expect(strip.getByRole("button", { name: "Keep verification results" })).toBeVisible();
   const approved = page.waitForResponse((r) => r.url().endsWith("/approve"));
-  await strip.getByRole("button", { name: "Aprobă" }).click();
-  expect((await approved).ok()).toBe(true);
-  await nextPoll(page);
-  await expect(strip).toHaveCount(0);
-  expect(readBoard().details[CARD].sessions[0].status).toBe("running");
+  await strip.getByRole("button", { name: "Aprobă reviewer" }).click();
+  const response = await approved;
+  expect([response.ok(), response.request().postDataJSON()]).toEqual([true, { session: REVIEWER, host: "leaseweb", expectedStatusAt: waitingSince }]);
+  await polledAfterThis(page);
+  await expect(strip.getByRole("button", { name: /^Aprobă/ })).toHaveText(["Aprobă worker"]);
+  expect(readBoard().details[CARD].sessions.map((s) => s.status)).toEqual(["needs_feedback", "running"]);
+});
+
+test("the away digest names the waiting card, and after caught up the strip still offers its approval", async ({ page }) => {
+  waiting(1764000600000);
+  await page.addInitScript(() => localStorage.setItem("nebula-board-last-seen", "1764000000000"));
+  await open(page, "/board");
+  const digest = page.getByRole("region", { name: "De când ai lipsit" });
+  const waits = digest.locator("section").filter({ has: page.getByRole("heading", { name: /Te așteaptă/ }) });
+  await expect(waits.getByRole("button", { name: "Keep verification results" })).toBeVisible();
+  await digest.getByRole("button", { name: "Am văzut tot" }).click();
+  await polledAfterThis(page);
+  await expect(page.getByRole("region", { name: /Te așteaptă/ }).getByRole("button", { name: "Aprobă worker" })).toBeVisible();
 });
 
 test("open in code that cannot reach the laptop shows the command to copy", async ({ page }) => {
