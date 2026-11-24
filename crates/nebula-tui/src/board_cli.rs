@@ -202,9 +202,9 @@ pub fn card_ref(text: &str) -> Result<CardRef> {
         .with_context(|| format!("{text:?} is not a card ref (#12, 12, 12@host or a ULID)"))
 }
 
-fn client_id(id: Option<String>) -> Result<String> {
+fn client_id(id: Option<String>, minted: &mut Option<String>) -> Result<String> {
     match id {
-        None => Ok(TodoId::generate().0),
+        None => Ok(minted.insert(TodoId::generate().0).clone()),
         Some(id) => match parse_card_ref(&id) {
             Some(CardRef::Id(canonical)) => Ok(canonical.0),
             _ => bail!("--id {id:?} is not a ULID"),
@@ -254,6 +254,7 @@ pub async fn run(verb: TodoVerb, json: bool) -> Result<()> {
     let mut conn = connect().await?;
     let (projects, worktrees, agents) = ipc::subscribe_snapshot(&mut conn).await?;
     let caller = Caller::resolve(&projects, &worktrees, &agents)?;
+    let mut minted = None;
     let mut op = match verb {
         TodoVerb::Add {
             title,
@@ -263,7 +264,7 @@ pub async fn run(verb: TodoVerb, json: bool) -> Result<()> {
             propose,
             id,
         } => BoardOp::AddCard(CardDraft {
-            id: TodoId(client_id(id)?),
+            id: TodoId(client_id(id, &mut minted)?),
             title,
             project: match (project, home) {
                 (_, true) => None,
@@ -316,7 +317,7 @@ pub async fn run(verb: TodoVerb, json: bool) -> Result<()> {
             id,
             scope,
         } => scope.guard(BoardOp::AddNote {
-            id: NoteId(client_id(id)?),
+            id: NoteId(client_id(id, &mut minted)?),
             card: card_ref(&card)?,
             text,
             author: caller.author.clone(),
@@ -359,7 +360,9 @@ pub async fn run(verb: TodoVerb, json: bool) -> Result<()> {
         }),
     };
     loop {
-        let result = request(&mut conn, op.clone()).await?;
+        let result = request(&mut conn, op.clone())
+            .await
+            .map_err(|why| with_rerun_id(why, minted.as_deref()))?;
         if json {
             println!("{}", result_json(&result)?);
             return Ok(());
@@ -368,6 +371,13 @@ pub async fn run(verb: TodoVerb, json: bool) -> Result<()> {
         if !turn_page(&mut op, &result) {
             return Ok(());
         }
+    }
+}
+
+fn with_rerun_id(why: anyhow::Error, minted: Option<&str>) -> anyhow::Error {
+    match (Refusal::of(&why.to_string()), minted) {
+        (Some(Refusal::OutcomeUnknown), Some(id)) => anyhow::anyhow!("{why} with --id {id}"),
+        _ => why,
     }
 }
 

@@ -525,7 +525,7 @@ impl Refusal {
 
     pub fn of(message: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|r| match r.trails() {
-            true => message.ends_with(r.tag()),
+            true => message.contains(r.tag()),
             false => message.starts_with(r.tag()),
         })
     }

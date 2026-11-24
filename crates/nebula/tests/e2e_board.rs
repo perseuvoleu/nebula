@@ -961,3 +961,63 @@ fn link_refusal_cleared_by_later_attempt() {
     assert_eq!(gone.status.code(), Some(3), "{}", stderr(&gone));
     assert!(stderr(&gone).contains(UNREACHABLE), "{}", stderr(&gone));
 }
+
+fn rerun_id(out: &Output) -> String {
+    let text = stderr(out);
+    let id = text
+        .split("--id ")
+        .nth(1)
+        .unwrap_or_else(|| panic!("exit 4 names no --id: {text}"));
+    id.chars().take_while(char::is_ascii_alphanumeric).collect()
+}
+
+#[test]
+fn link_lost_add_without_id_names_it() {
+    let board = board_env();
+    let marker = board.tmp.path().join("dropped");
+    let here = viewer(&pump_to(&board, Some(&marker)));
+
+    let lost = here.cli(&["todo", "add", "--project", "nebula", "Once"], None);
+    assert_eq!(lost.status.code(), Some(4), "{}", stderr(&lost));
+    let id = rerun_id(&lost);
+
+    let argv = [
+        "todo",
+        "add",
+        "--json",
+        "--project",
+        "nebula",
+        "--id",
+        &id,
+        "Once",
+    ];
+    let rerun = json_of(here.cli(&argv, None), &argv);
+    assert_eq!(rerun["id"], id.as_str());
+    assert_eq!(list(&board, &["--all"]), ["Once"]);
+}
+
+#[test]
+fn link_lost_note_without_id_names_it() {
+    let board = board_env();
+    add(&board, &["--project", "nebula"], "Card");
+    let marker = board.tmp.path().join("dropped");
+    let here = viewer(&pump_to(&board, Some(&marker)));
+
+    let lost = here.cli(&["todo", "note", "#1@boardhost", "once"], None);
+    assert_eq!(lost.status.code(), Some(4), "{}", stderr(&lost));
+    let id = rerun_id(&lost);
+
+    let argv = [
+        "todo",
+        "note",
+        "#1@boardhost",
+        "once",
+        "--id",
+        &id,
+        "--json",
+    ];
+    json_of(here.cli(&argv, None), &argv);
+    let log = board.json(&["todo", "show", "#1", "--json"])["log"].clone();
+    assert_eq!(log.as_array().map(Vec::len), Some(1), "{log}");
+    assert_eq!(log[0]["id"], id.as_str());
+}
