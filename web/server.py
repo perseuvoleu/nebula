@@ -46,7 +46,6 @@ ULID = re.compile(r"[0-7][0-9A-HJKMNP-TV-Z]{25}")
 CURSOR = re.compile(r"[A-Za-z0-9]{1,64}\.[0-9]{1,20}")
 PAGE = re.compile(CURSOR.pattern + r"@[0-9]{1,20}")
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}")
-BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}")
 STAGES = {"backlog", "next", "doing", "review", "done"}
 ROLES = {"worker", "review", "fix", "verify", "research"}
 BOARD_EXITS = {3: (503, "Board host unreachable; nothing was sent"),
@@ -745,6 +744,16 @@ def field(body, key, pattern=None, *, choices=None, limit=200, optional=False):
     return value
 
 
+def git_branch(value):
+    """A branch name `git check-ref-format --branch` accepts."""
+    parts = value.split("/")
+    if (value.startswith("-") or value.endswith(".") or value == "@" or ".." in value or "@{" in value
+            or any(not part or part.startswith(".") or part.endswith(".lock") for part in parts)
+            or any(ord(c) < 32 or ord(c) == 127 or c in " ~^:?*[\\" for c in value)):
+        raise Problem(400, "Invalid worktree")
+    return value
+
+
 def edit_card(gateway, card, body):
     title = field(body, "title", optional=True)
     project = gateway.board_project(body["project"]) if body.get("project") is not None else None
@@ -756,7 +765,7 @@ def edit_card(gateway, card, body):
 def run_card(gateway, card, body):
     dispatch = field(body, "dispatch", ULID, optional=True)
     return ("todo", "run", f"--role={field(body, 'role', choices=ROLES)}", f"--kind={field(body, 'kind', NAME)}",
-            f"--host={field(body, 'host', NAME)}", f"--worktree={field(body, 'worktree', BRANCH)}",
+            f"--host={field(body, 'host', NAME)}", f"--worktree={git_branch(field(body, 'worktree'))}",
             *([f"--dispatch={dispatch}"] if dispatch else [])), (card["id"],)
 
 

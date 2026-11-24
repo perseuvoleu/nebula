@@ -847,6 +847,19 @@ class BoardTests(unittest.TestCase):
                 status, headers, _ = self.request(f"/a/{grant}/{ARTIFACT_ID}/result.json")
                 self.assertEqual((status, headers["Cache-Control"]), (200, control))
 
+    def test_run_accepts_git_branch_names(self):
+        base = {"role": "worker", "kind": "codex", "host": "leaseweb"}
+        for branch in ["new", "feature/ui+api", "fix/#12@home", "release-1.2"]:
+            with self.subTest(branch=branch), patch("server.subprocess.run", side_effect=[
+                    cli(fixture("card_show")), cli({"ok": True})]) as run:
+                self.assertEqual(self.request("/api/cards/%2312/run", "POST", {**base, "worktree": branch}, self.auth())[0], 200)
+                self.assertIn("--worktree=" + branch, self.argv(run)[-1])
+        for branch in ["-x", "a..b", "a b", "a~1", "x.lock", "a/x.lock/b", "a/.b", "a//b", "a/", "a.", "@", "a@{1}",
+                       "a:b", "a?", "a*", "a[", "a\\b", "/a", ".a", "a^b", "a\x7fb"]:
+            with self.subTest(branch=branch), patch("server.subprocess.run", return_value=cli(fixture("card_show"))) as run:
+                self.assertEqual(self.request("/api/cards/%2312/run", "POST", {**base, "worktree": branch}, self.auth())[0], 400)
+                self.assertEqual(run.call_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
