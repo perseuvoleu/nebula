@@ -37,7 +37,6 @@ export class ApiError extends Error {
   status: number;
   /** True when the request may have reached the gateway (timeout/network after send). */
   uncertain: boolean;
-  /** The gateway's JSON answer to a refused request. */
   data: Record<string, unknown>;
   constructor(message: string, status: number, uncertain = false, data: Record<string, unknown> = {}) {
     super(message);
