@@ -258,7 +258,7 @@ fn app_ancestor(pid: u32, parent_of: impl Fn(u32) -> Option<(u32, String)>) -> O
     None
 }
 
-/// The `ssh` argv that runs `nebula open --session …  --json` on `host`.
+/// The `ssh` argv that runs `nebula open --session … --json` on `host`.
 pub fn open_on_argv(
     host: &str,
     session: &str,
