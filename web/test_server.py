@@ -779,6 +779,18 @@ class BoardTests(unittest.TestCase):
                 self.assertEqual(self.request("/api/cards/%2312/open-code", "POST", body, self.auth())[0], 409)
                 self.assertEqual(run.call_count, 1)
 
+    def test_board_writes_need_board_and_explicit_owner(self):
+        self.gateway.board_projects = None
+        with patch("server.subprocess.run") as run:
+            for path, body in [("/api/cards", {"title": "x", "home": True}), ("/api/decisions", {"what": "Copy files"})]:
+                with self.subTest(path=path):
+                    self.assertEqual(self.request(path, "POST", body, self.auth())[0], 503)
+            run.assert_not_called()
+        self.gateway.board_projects = ["nebula"]
+        with patch("server.subprocess.run", return_value=cli(fixture("decision"))) as run:
+            self.assertEqual(self.request("/api/decisions", "POST", {"what": "Copy files"}, self.auth())[0], 200)
+        self.assertIn("--home", self.argv(run)[0])
+
 
 if __name__ == "__main__":
     unittest.main()

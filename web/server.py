@@ -329,6 +329,15 @@ class Gateway:
         projects = ("--all",) if self.board_projects == "*" else tuple(f"--project={p}" for p in self.board_projects)
         return (*projects, "--include-home")
 
+    def admits(self, project):
+        scope = self.scope()
+        return "--include-home" in scope if project is None else self.board_projects == "*" or project in self.board_projects
+
+    def home(self):
+        if not self.admits(None):
+            raise Problem(403, "Home cards are not on this board")
+        return "--home"
+
     def board_project(self, value):
         self.scope()
         if (not isinstance(value, str) or not NAME.fullmatch(value)
@@ -624,7 +633,7 @@ class Gateway:
             return {"ok": True}
         if path == "/api/cards":
             stage, card_id = field(body, "stage", choices=STAGES, optional=True), field(body, "id", ULID, optional=True)
-            owner = "--home" if body.get("home") is True else f"--project={self.board_project(body.get('project'))}"
+            owner = self.home() if body.get("home") is True else f"--project={self.board_project(body.get('project'))}"
             return self.board("todo", "add", owner, *([f"--stage={stage}"] if stage else []),
                               *(["--propose"] if body.get("propose") is True else []),
                               *([f"--id={card_id}"] if card_id else []), positionals=(field(body, "title"),))
@@ -632,8 +641,8 @@ class Gateway:
             what, why = field(body, "what", limit=500), field(body, "why", limit=4000, optional=True)
             card = field(body, "card", BOARD_REF, optional=True)
             owner = (f"--card={self.card(card)['id']}" if card else
-                     f"--project={self.board_project(body['project'])}" if body.get("project") is not None else None)
-            return self.board("decision", "add", *([f"--why={why}"] if why else []), *([owner] if owner else []),
+                     f"--project={self.board_project(body['project'])}" if body.get("project") is not None else self.home())
+            return self.board("decision", "add", *([f"--why={why}"] if why else []), owner,
                               positionals=(what,))
         if path.startswith("/api/cards/"):
             ref, _, verb = path[len("/api/cards/"):].partition("/")
