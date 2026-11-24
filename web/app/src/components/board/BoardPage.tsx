@@ -4,7 +4,7 @@ import { api, describeError } from "@/lib/api";
 import { activityAge } from "@/lib/activity-age";
 import {
   type BoardData, type Card, type CardShow, type SidebarScope, type SortKey, type TableSort,
-  awayDigest, byStage, cardSlug, inScope, sidebarProjects, sortCards, toBoardCard, writerSlots,
+  awayDigest, byStage, cardSlug, inScope, projectName, sidebarProjects, sortCards, toBoardCard, writerSlots,
 } from "@/lib/board";
 import type { BoardRoute } from "@/lib/route";
 import { useBoard } from "@/lib/useBoard";
@@ -110,10 +110,10 @@ export function BoardPage({ route, onNavigate, onSessions }: {
   const cards = all.filter((c) => inScope(c, scope));
   const bySlug = (slug: string | null): Card | undefined => live.find((c) => cardSlug(c.ref) === slug);
   const peeked = bySlug(route.peek);
-  const digest = board && awayDigest(board);
-  const decisions = useDecisions(route.decisions || !!digest?.decisions.length, route.decisions ? decisionQuery : "", board);
+  const decisions = useDecisions(route.decisions || !!board?.away.decisions.length, route.decisions ? decisionQuery : "", board);
+  const digest = board && awayDigest(board, scope, decisions);
   const now = Date.now();
-  const awayDecisions: AwayDecision[] = (digest?.decisions ?? []).flatMap((id) => decisions.filter((d) => d.id === id))
+  const awayDecisions: AwayDecision[] = (digest?.decisions ?? [])
     .map((d) => ({ id: d.id, title: d.title, age: activityAge(d.created_at, now), cardRef: live.find((c) => c.id === d.card)?.ref ?? null }));
 
   const sidebar = (
@@ -171,8 +171,8 @@ export function BoardPage({ route, onNavigate, onSessions }: {
         </header>
         {digest && !digest.empty && !digestClosed && !route.card && (
           <AwayDigest lastSeen={new Date(lastSeen).toLocaleString("ro-RO", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}
-            scope={route.project ?? "toate proiectele"} finished={digest.finished.map((c) => toBoardCard(c, live))} needsYou={[]}
-            decisions={awayDecisions} onOpen={peek} onClose={() => setDigestClosed(true)}
+            scope={scope.kind === "all" || scope.kind === "needs" ? "toate proiectele" : projectName(scope.project)}
+            finished={digest.finished.map((c) => toBoardCard(c, live))} decisions={awayDecisions} onOpen={peek} onClose={() => setDigestClosed(true)}
             onCaughtUp={() => {
               const seen = Date.now();
               try { localStorage.setItem(LAST_SEEN, String(seen)); } catch { /* The digest still resets for this visit. */ }

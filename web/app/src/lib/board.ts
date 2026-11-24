@@ -150,10 +150,14 @@ export const isBlocked = (card: Card, cards: Card[]): boolean => openBlockers(ca
 export const writerSlots = (hosts: BoardHost[]): HostSlots[] =>
   hosts.map((h) => ({ host: h.host, writers: h.writers, slots: h.writer_slots }));
 
-export function awayDigest(board: BoardData): { finished: Card[]; needsYou: SessionAt[]; decisions: string[]; empty: boolean } {
-  const finished = board.away.finished.flatMap((id) => board.cards.filter((c) => c.id === id));
-  const { needs_you: needsYou, decisions } = board.away;
-  return { finished, needsYou, decisions, empty: !finished.length && !needsYou.length && !decisions.length };
+const inProject = (project: string | null, scope: SidebarScope): boolean =>
+  scope.kind === "all" || scope.kind === "needs" || project === scope.project;
+
+export function awayDigest<D extends { id: string; project: string | null }>(board: BoardData, scope: SidebarScope, known: D[]):
+  { finished: Card[]; decisions: D[]; empty: boolean } {
+  const finished = board.away.finished.flatMap((id) => board.cards.filter((c) => c.id === id && inProject(c.project, scope)));
+  const decisions = board.away.decisions.flatMap((id) => known.filter((d) => d.id === id && inProject(d.project, scope)));
+  return { finished, decisions, empty: !finished.length && !decisions.length };
 }
 
 export const cardSlug = (ref: string): string => ref.replace(/^#/, "");

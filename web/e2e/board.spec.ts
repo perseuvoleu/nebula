@@ -28,6 +28,10 @@ async function open(page: Page, url: string) {
   await expect(page.getByLabel("Token de acces")).toHaveCount(0);
 }
 
+async function awayFrom(page: Page, at = 1764000000000) {
+  await page.addInitScript((seen) => localStorage.setItem("nebula-board-last-seen", String(seen)), at);
+}
+
 const column = (page: Page, name: string) => page.getByRole("region", { name, exact: true });
 const tile = (scope: Page | Locator, title: string) => scope.getByRole("article").filter({ hasText: title });
 
@@ -68,6 +72,21 @@ test("a card without session data makes no status claim, and needs-you stays hid
   const row = page.getByRole("row").filter({ hasText: "Keep verification results" });
   await expect(row).toBeVisible();
   await expect(row.getByRole("img")).toHaveCount(0);
+});
+
+test("the away digest lists only the scope's project and shows only what it lists", async ({ page }) => {
+  await awayFrom(page);
+  await open(page, "/board/p/nebula");
+  const digest = page.getByRole("region", { name: "De când ai lipsit" });
+  await expect(digest.getByRole("button", { name: "Keep verification results" })).toBeVisible();
+  await expect(digest.getByText("Copy published files")).toBeVisible();
+  await expect(digest.getByText("Te așteaptă")).toHaveCount(0);
+  const sidebar = page.getByRole("navigation", { name: "Proiecte" });
+  await sidebar.getByRole("button", { name: /Liniștite/ }).click();
+  await sidebar.getByRole("button", { name: /vela\s*0$/ }).click();
+  await expect(page).toHaveURL(/\/board\/p\/vela$/);
+  await expect(tile(page, "Keep verification results")).toHaveCount(0);
+  await expect(digest).toHaveCount(0);
 });
 
 test("blocked card dimmed", async ({ page }) => {

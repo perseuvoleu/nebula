@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { awayDigest, byStage, cardDot, inScope, isBlocked, sidebarProjects, toBoardCard, writerSlots, type BoardData, type Card } from "./board.ts";
+import { awayDigest, byStage, cardDot, inScope, isBlocked, sidebarProjects, toBoardCard, writerSlots, type BoardData, type Card, type SidebarScope } from "./board.ts";
 
 const card = (number: number, stage: Card["stage"], blocked_by: string[] = []): Card => ({
   id: `01JD${String(number).padStart(22, "0")}`, number, ref: `#${number}@leaseweb`, title: `Card ${number}`, stage,
@@ -54,18 +54,23 @@ test("a board card without session data makes no status claim", () => {
   assert.deepEqual([listed.sessions, listed.needsYou, cardDot(listed)], [null, false, null]);
 });
 
-test("awayDigest resolves finished card ids to cards and keeps needs-you sessions and new decisions", () => {
+test("awayDigest lists the finished cards and new decisions of the scope's project, and counts only those", () => {
   const finished = card(4, "review");
+  const vela = { ...card(5, "done"), project: "vela" };
+  const decisions = [{ id: "01JG0000000000000000000002", project: "nebula" }, { id: "01JG0000000000000000000003", project: "vela" }];
   const board: BoardData = {
-    cards: [card(1, "doing"), finished],
+    cards: [card(1, "doing"), finished, vela],
     hosts: [],
-    away: { finished: [finished.id, "01JD9999999999999999999999"], needs_you: [{ host: "leaseweb", id: "01JF0000000000000000000002" }],
-      decisions: ["01JG0000000000000000000002"] },
+    away: { finished: [finished.id, vela.id, "01JD9999999999999999999999"], needs_you: [{ host: "leaseweb", id: "01JF0000000000000000000002" }],
+      decisions: decisions.map((d) => d.id) },
   };
-  const digest = awayDigest(board);
-  assert.deepEqual(digest.finished.map((c) => c.number), [4]);
-  assert.deepEqual(digest.needsYou, [{ host: "leaseweb", id: "01JF0000000000000000000002" }]);
-  assert.deepEqual(digest.decisions, ["01JG0000000000000000000002"]);
-  assert.equal(digest.empty, false);
-  assert.equal(awayDigest({ cards: [], hosts: [], away: { finished: [], needs_you: [], decisions: [] } }).empty, true);
+  const listed = (scope: SidebarScope) => {
+    const digest = awayDigest(board, scope, decisions);
+    return [digest.finished.map((c) => c.number), digest.decisions.map((d) => d.project), digest.empty];
+  };
+  assert.deepEqual(listed({ kind: "all" }), [[4, 5], ["nebula", "vela"], false]);
+  assert.deepEqual(listed({ kind: "project", project: "nebula" }), [[4], ["nebula"], false]);
+  assert.deepEqual(listed({ kind: "project", project: null }), [[], [], true]);
+  const onlyNeedsYou = { ...board, away: { ...board.away, finished: [], decisions: [] } };
+  assert.equal(awayDigest(onlyNeedsYou, { kind: "all" }, decisions).empty, true);
 });
