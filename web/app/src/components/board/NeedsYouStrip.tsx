@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import type { BoardCard } from "./model";
+import type { BoardCard } from "@/lib/board";
 import { CardRef, StatusDot } from "./CardTile";
 
 export function NeedsYouStrip({ cards, onOpen, renderActions }: {

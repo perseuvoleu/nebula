@@ -1,6 +1,6 @@
 import { ChevronDownIcon, ChevronRightIcon, CircleDotIcon, GitBranchIcon, LayersIcon, SearchIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { type Dot } from "./model";
+import { type Dot } from "@/lib/board";
 import { StatusDot } from "./CardTile";
 
 export type SidebarCheckout = { branch: string; host: string | null; primary: boolean };

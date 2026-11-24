@@ -1,13 +1,12 @@
 import { TriangleAlertIcon } from "lucide-react";
 import type { AgentKind } from "@/lib/types";
+import { RUN_ROLES, type RunRole } from "@/lib/board";
 import { kindLabel } from "@/lib/status";
 import { Button } from "@/components/ui/button";
 import {
   Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
 } from "@/components/ui/dialog";
 
-const RUN_ROLES = ["worker", "review", "fix", "verify", "research"] as const;
-export type RunRole = (typeof RUN_ROLES)[number];
 const KINDS: AgentKind[] = ["claude", "codex", "cursor", "pi"];
 
 export interface RunHost {

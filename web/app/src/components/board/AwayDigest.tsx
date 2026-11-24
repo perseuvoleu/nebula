@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 import { XIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import type { BoardCard } from "./model";
+import type { BoardCard } from "@/lib/board";
 import { CardRef, StatusDot } from "./CardTile";
 
 export type AwayDecision = { id: string; title: string; age: string; cardRef: string | null };

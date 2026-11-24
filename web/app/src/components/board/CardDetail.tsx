@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 import { GitBranchIcon, PenLineIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { kindLabel, statusLabel } from "@/lib/status";
-import { type BoardCard, type LogEntry, STAGE_LABEL, projectName, sessionDot } from "./model";
+import { type BoardCard, type LogEntry, STAGE_LABEL, projectName, sessionDot } from "@/lib/board";
 import { CardRef, StagePill, StatusDot, Tag } from "./CardTile";
 
 function Section({ title, count, children }: { title: string; count?: number; children: ReactNode }) {

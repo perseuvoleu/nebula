@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 import { cn } from "@/lib/utils";
 import { statusLabel } from "@/lib/status";
-import { type BoardCard, cardDot, projectName, sessionDot } from "./model";
+import { type BoardCard, cardDot, projectName, sessionDot } from "@/lib/board";
 import { CardRef, StagePill, StatusDot } from "./CardTile";
 
 const Empty = () => <span className="text-muted-foreground">—</span>;

@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 import { GitBranchIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { statusLabel } from "@/lib/status";
-import { type BoardCard, type Dot, type Stage, DOT_LABEL, STAGE_LABEL, cardDot, projectName, sessionDot } from "./model";
+import { type BoardCard, type Dot, type Stage, DOT_LABEL, STAGE_LABEL, cardDot, projectName, sessionDot } from "@/lib/board";
 
 const DOT_CLASS: Record<Dot, string> = {
   needs: "bg-foreground ring-2 ring-foreground/30",
