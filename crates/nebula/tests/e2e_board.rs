@@ -917,3 +917,21 @@ fn artifact_add_url_forms() {
     }
     assert_eq!(artifact_ids(&env).len(), 2);
 }
+
+#[test]
+fn artifact_add_project_flag() {
+    let env = board_env();
+    let added = publish(
+        &env,
+        None,
+        &[
+            "https://vela.possu.dev",
+            "--kind",
+            "link",
+            "--project",
+            "vela-hub-fork",
+        ],
+    );
+    assert_eq!(added["project"], "vela-hub-fork");
+    assert_eq!(added["card"], Value::Null);
+}

@@ -820,6 +820,9 @@ enum ArtifactCommand {
         /// Link no card, even inside a carded session.
         #[arg(long)]
         no_card: bool,
+        /// Its project when no card is linked (default: the caller's).
+        #[arg(long, conflicts_with = "card")]
+        project: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -1310,12 +1313,14 @@ fn main() -> Result<()> {
                     title,
                     card,
                     no_card,
+                    project,
                     json,
                 } => (
                     ArtifactVerb::Add {
                         source,
                         kind,
                         title,
+                        project,
                         card: match (card, no_card) {
                             (Some(card), _) => CardChoice::Card(card),
                             (None, true) => CardChoice::None,

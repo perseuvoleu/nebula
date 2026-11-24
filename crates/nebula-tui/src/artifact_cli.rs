@@ -26,6 +26,7 @@ pub enum ArtifactVerb {
         source: String,
         kind: Option<String>,
         title: Option<String>,
+        project: Option<String>,
         card: CardChoice,
     },
     List {
@@ -111,6 +112,7 @@ async fn add(
     source: String,
     kind: Option<String>,
     title: Option<String>,
+    project: Option<String>,
     card: CardChoice,
 ) -> Result<BoardOp> {
     let card = match card {
@@ -145,7 +147,7 @@ async fn add(
         kind,
         title: title.unwrap_or(default_title),
         card,
-        project: caller.project,
+        project: project.or(caller.project),
         session,
         checkout: caller.checkout,
         content,
@@ -167,8 +169,9 @@ pub async fn run(verb: ArtifactVerb, json: bool) -> Result<()> {
             source,
             kind,
             title,
+            project,
             card,
-        } => add(&mut conn, caller, source, kind, title, card).await?,
+        } => add(&mut conn, caller, source, kind, title, project, card).await?,
         ArtifactVerb::List {
             scope,
             card,
