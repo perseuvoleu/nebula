@@ -2495,10 +2495,11 @@ fn approve_checks_status_timestamp() {
             .then_some(())
     });
     let before = eventually("both prompts read", || (inputs() == 2).then_some(2));
-    for (stamp, scope) in [(at - 1, &[][..]), (at, &["--include-home"][..])] {
+    for (stamp, scope, code) in [(at - 1, &[][..], 6), (at, &["--include-home"][..], 5)] {
         let refused = approve(stamp, scope);
-        assert!(
-            matches!(refused.status.code(), Some(5 | 6)),
+        assert_eq!(
+            refused.status.code(),
+            Some(code),
             "{scope:?}: {}",
             stderr(&refused)
         );
