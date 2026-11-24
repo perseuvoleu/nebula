@@ -17,7 +17,6 @@ async function readBoard(since: string | undefined, awaySince: number | null, si
   return { version: first.version, board };
 }
 
-/** Polls the board every 3 s with one request in flight, skips hidden tabs, and keeps the last board marked stale on failure. */
 export function useBoard(awaySince: number | null): { board: BoardData | null; stale: boolean } {
   const [state, setState] = useState<{ board: BoardData | null; stale: boolean }>({ board: null, stale: false });
   const version = useRef<string | undefined>(undefined);

@@ -14,7 +14,7 @@ export interface Selection {
 
 export interface BoardRoute {
   project: string | null;
-  /** A card ref without its leading "#", e.g. 12@leaseweb. */
+  /** Without the ref's leading "#", which a URL reads as a fragment. */
   card: string | null;
   decisions: boolean;
   table: boolean;

@@ -1,4 +1,3 @@
-// Wire types of the board endpoints (web/server.py → `nebula todo`) and the board's pure rules.
 export const STAGES = ["backlog", "next", "doing", "review", "done"] as const;
 export type Stage = (typeof STAGES)[number];
 
