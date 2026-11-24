@@ -299,6 +299,30 @@ pub async fn check_card(conn: &mut Connection, text: &str) -> Result<TodoId> {
     Ok(read_card(conn, text).await?.id)
 }
 
+/// Refuses a spawn for a dispatch the board admitted on another host.
+pub async fn check_executor(
+    conn: &mut Connection,
+    dispatch: &DispatchId,
+    executor: &str,
+) -> Result<()> {
+    let op = BoardOp::Read(BoardRead::Dispatch {
+        id: dispatch.clone(),
+    });
+    match request(conn, op).await {
+        Ok(BoardResult::Run(receipt)) if !receipt.host.eq_ignore_ascii_case(executor) => {
+            bail!(Refusal::Conflict.message(format!(
+                "dispatch {} runs on {}, not on {executor}",
+                dispatch.as_str(),
+                receipt.host
+            )))
+        }
+        Ok(BoardResult::Run(_)) => Ok(()),
+        Ok(other) => bail!("the board answered a dispatch read with {other:?}"),
+        Err(why) if Refusal::of(&why.to_string()) == Some(Refusal::NotFound) => Ok(()),
+        Err(why) => Err(why),
+    }
+}
+
 pub async fn read_card(conn: &mut Connection, text: &str) -> Result<Card> {
     let op = BoardOp::Read(BoardRead::Card {
         scope: ScopeFlags::default().scope(None),

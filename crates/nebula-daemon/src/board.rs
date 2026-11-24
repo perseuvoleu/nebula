@@ -296,6 +296,7 @@ fn receipt(tx: &Transaction, id: &DispatchId) -> Result<Option<RunReceipt>> {
                         id: AgentId(agent),
                     }),
                     card: TodoId(r.get(0)?),
+                    host: r.get(1)?,
                     project: r.get(4)?,
                 })
             },
@@ -701,6 +702,9 @@ fn read_op(tx: &Transaction, read: BoardRead) -> Result<BoardResult> {
         BoardRead::Artifact { scope, id } => {
             crate::artifacts::show(tx, &scope, &id).map(BoardResult::Artifact)
         }
+        BoardRead::Dispatch { id } => receipt(tx, &id)?.map(BoardResult::Run).ok_or_else(|| {
+            anyhow::anyhow!(Refusal::NotFound.message(format!("no dispatch {}", id.as_str())))
+        }),
     }
 }
 

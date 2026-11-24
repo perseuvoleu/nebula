@@ -1805,6 +1805,13 @@ pub async fn spawn_agent(opts: NewAgentOpts) -> Result<serde_json::Value> {
     let mut conn = handshake(stream).await?;
     let (projects, worktrees, agents) = subscribe_snapshot(&mut conn).await?;
     let project = resolve_project(&projects, &worktrees, &agents, opts.project.as_deref())?;
+    if let Some(dispatch) = &opts.dispatch {
+        let executor = project
+            .host
+            .clone()
+            .unwrap_or_else(nebula_core::host::hostname);
+        crate::board_cli::check_executor(&mut conn, dispatch, &executor).await?;
+    }
     let caller = (env_agent_id().is_some() || opts.card.is_some())
         .then(|| crate::board_cli::Caller::resolve(&projects, &worktrees, &agents))
         .transpose()?;

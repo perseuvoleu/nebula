@@ -307,6 +307,8 @@ pub struct RunReceipt {
     pub state: DispatchState,
     pub session: Option<SessionAt>,
     pub card: TodoId,
+    /// The host the board admitted the run on, as that host reports itself.
+    pub host: String,
     /// The card's project when the board admitted the run; a rerun spawns
     /// there even if the card has moved since.
     #[serde(default)]
@@ -399,6 +401,9 @@ pub enum BoardRead {
         scope: BoardScope,
         id: ArtifactId,
     },
+    Dispatch {
+        id: DispatchId,
+    },
 }
 
 /// Carries its client-minted id, so a rerun creates nothing twice.
@@ -477,7 +482,10 @@ impl BoardOp {
             BoardOp::Read(BoardRead::Card { card, .. }) => vec![card],
             BoardOp::Read(BoardRead::Artifacts { card, .. }) => card.iter_mut().collect(),
             BoardOp::Read(
-                BoardRead::Board { .. } | BoardRead::Cards { .. } | BoardRead::Artifact { .. },
+                BoardRead::Board { .. }
+                | BoardRead::Cards { .. }
+                | BoardRead::Artifact { .. }
+                | BoardRead::Dispatch { .. },
             ) => vec![],
             BoardOp::EditCard { card, .. }
             | BoardOp::Move { card, .. }

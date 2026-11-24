@@ -2552,6 +2552,31 @@ fn run_replay_names_the_agents_own_project() {
     assert_eq!(again, first);
 }
 
+#[test]
+fn agent_new_dispatch_only_on_the_admitted_host() {
+    let board = board_env();
+    let laptop = viewer_on(&proxy_to(&board), "laptop", &[]);
+    laptop.make_repo();
+    let card = add(&laptop, &["--project", "repo"], "Admitted");
+    let dispatch = TodoId::generate().0;
+    begin_run(&board, &card, &dispatch, "main");
+    let refused = spawn_agent(
+        &laptop,
+        &[
+            "--card",
+            "#1@boardhost",
+            "--role",
+            "worker",
+            "--dispatch",
+            &dispatch,
+            "--name",
+            "stray",
+        ],
+    );
+    assert_eq!(refused.status.code(), Some(6), "{}", stderr(&refused));
+    assert!(agents_of(&laptop).is_empty());
+}
+
 fn session_row(env: &Env, id: &str) -> Value {
     agents_of(env).into_iter().find(|a| a["id"] == id).unwrap()
 }

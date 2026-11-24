@@ -729,6 +729,7 @@ fn board_json_golden() {
             state: DispatchState::Started,
             session: Some(worker_at()),
             card: TodoId(CARD.into()),
+            host: "leaseweb".into(),
             project: Some("nebula".into()),
         },
     );
