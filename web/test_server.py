@@ -791,6 +791,16 @@ class BoardTests(unittest.TestCase):
             self.assertEqual(self.request("/api/decisions", "POST", {"what": "Copy files"}, self.auth())[0], 200)
         self.assertIn("--home", self.argv(run)[0])
 
+    def test_card_create_retry_outside_scope(self):
+        moved = {**fixture("card"), "project": "secret"}
+        for body in [{"title": "x", "project": "nebula", "id": CARD_ID}, {"title": "x", "home": True, "id": CARD_ID}]:
+            with self.subTest(body=body), patch("server.subprocess.run", return_value=cli(moved)):
+                status, _, raw = self.request("/api/cards", "POST", body, self.auth())
+                self.assertEqual(status, 404)
+                self.assertNotIn(b"Keep verification", raw)
+        with patch("server.subprocess.run", return_value=cli({**fixture("card"), "project": None})):
+            self.assertEqual(self.request("/api/cards", "POST", {"title": "x", "home": True}, self.auth())[0], 200)
+
 
 if __name__ == "__main__":
     unittest.main()

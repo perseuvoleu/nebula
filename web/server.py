@@ -634,9 +634,12 @@ class Gateway:
         if path == "/api/cards":
             stage, card_id = field(body, "stage", choices=STAGES, optional=True), field(body, "id", ULID, optional=True)
             owner = self.home() if body.get("home") is True else f"--project={self.board_project(body.get('project'))}"
-            return self.board("todo", "add", owner, *([f"--stage={stage}"] if stage else []),
-                              *(["--propose"] if body.get("propose") is True else []),
-                              *([f"--id={card_id}"] if card_id else []), positionals=(field(body, "title"),))
+            row = self.board("todo", "add", owner, *([f"--stage={stage}"] if stage else []),
+                             *(["--propose"] if body.get("propose") is True else []),
+                             *([f"--id={card_id}"] if card_id else []), positionals=(field(body, "title"),))
+            if not self.admits(row.get("project")):
+                raise Problem(404, "Card not found")
+            return row
         if path == "/api/decisions":
             what, why = field(body, "what", limit=500), field(body, "why", limit=4000, optional=True)
             card = field(body, "card", BOARD_REF, optional=True)
