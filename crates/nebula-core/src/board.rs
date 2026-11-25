@@ -48,6 +48,9 @@ named_enum!(
     }
 );
 
+/// The artifact kind of a recorded decision.
+pub const DECISION_KIND: &str = "decision";
+
 /// A card as a caller names it: its board number (optionally with the board
 /// host it was printed for) or its ULID.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

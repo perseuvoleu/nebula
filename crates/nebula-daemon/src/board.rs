@@ -28,7 +28,7 @@ pub(crate) fn page_budget() -> usize {
 pub(crate) fn serve(store: &Store, links: &HostLinks, op: BoardOp) -> Result<BoardResult> {
     let result = store.board_transaction(|tx| apply(tx, links, op))?;
     if let BoardResult::Artifact(artifact) = &result {
-        if artifact.kind == "decision" && !artifact.meta.contains_key("rag_note") {
+        if artifact.kind == nebula_core::board::DECISION_KIND && !artifact.meta.contains_key("rag_note") {
             crate::rag_copy::kick();
         }
     }
@@ -908,10 +908,10 @@ fn away(tx: &Transaction, scope: &BoardScope, cards: &[Card], since: i64) -> Res
     let decisions = tx
         .prepare(
             "SELECT id, project FROM artifacts
-             WHERE kind = 'decision' AND removed_at IS NULL AND created_at > ?1
+             WHERE kind = ?2 AND removed_at IS NULL AND created_at > ?1
              ORDER BY created_at",
         )?
-        .query_map(params![since], |r| {
+        .query_map(params![since, nebula_core::board::DECISION_KIND], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?

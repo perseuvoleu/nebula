@@ -88,11 +88,11 @@ fn pending(tx: &Transaction) -> Result<Vec<Artifact>> {
     Ok(tx
         .prepare(&format!(
             "SELECT {ARTIFACT_COLUMNS} FROM artifacts
-             WHERE kind = 'decision' AND removed_at IS NULL
+             WHERE kind = ?1 AND removed_at IS NULL
                AND json_extract(meta, '$.rag_note') IS NULL
              ORDER BY created_at"
         ))?
-        .query_map([], artifact_from_row)?
+        .query_map([nebula_core::board::DECISION_KIND], artifact_from_row)?
         .collect::<rusqlite::Result<_>>()?)
 }
 

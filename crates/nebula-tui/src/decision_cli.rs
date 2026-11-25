@@ -11,7 +11,7 @@ use nebula_core::board::{
 };
 use nebula_core::ArtifactId;
 
-pub const KIND: &str = "decision";
+pub use nebula_core::board::DECISION_KIND as KIND;
 
 pub enum DecisionVerb {
     Add {
