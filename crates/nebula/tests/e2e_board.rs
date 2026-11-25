@@ -506,6 +506,46 @@ fn human_reads_follow_pages() {
     }
 }
 
+/// A write between two pages of a human walk re-reads the board: every
+/// card prints once, the new one included.
+#[test]
+fn human_list_survives_a_write_between_pages() {
+    let env = Env::new();
+    env.board_local();
+    let env = env.start(&[("NEBULA_BOARD_PAGE_BYTES", "600")]);
+    let long = "x".repeat(200);
+    for n in 1..=5 {
+        add(&env, &["--project", "nebula"], &format!("{n} {long}"));
+    }
+    let sixth = format!("6 {long}");
+    let (_proxy, rt) = interposer(
+        &env,
+        b"BoardReply",
+        &[
+            env!("CARGO_BIN_EXE_nebula"),
+            "todo",
+            "add",
+            "--project",
+            "nebula",
+            &sixth,
+        ],
+    );
+    let out = env.cli_env(
+        &["todo", "list", "--all"],
+        None,
+        &[("NEBULA_RUNTIME_DIR", rt.to_str().unwrap())],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let printed = String::from_utf8_lossy(&out.stdout);
+    for n in 1..=6 {
+        let lines = printed
+            .lines()
+            .filter(|l| l.starts_with(&format!("#{n} ")))
+            .count();
+        assert_eq!(lines, 1, "#{n} printed {lines} times: {printed}");
+    }
+}
+
 #[test]
 fn card_list_scope() {
     let env = board_env();
@@ -2831,14 +2871,16 @@ impl Drop for Killed {
 }
 
 /// A socket the CLI reaches its daemon through (its runtime dir is
-/// returned) that forwards everything until the daemon's first Ack, then
-/// closes the CLI's connection with that Ack unsent, once.
-fn ack_cutter(env: &Env) -> (Killed, PathBuf) {
-    let script = env.tmp.path().join("ack-cut.py");
+/// returned) that forwards every frame. The first daemon frame holding
+/// `needle` is, once, held back while `run` runs and then forwarded, or
+/// with no `run` never sent: the CLI's connection closes instead.
+fn interposer(env: &Env, needle: &[u8], run: &[&str]) -> (Killed, PathBuf) {
+    let script = env.tmp.path().join("interpose.py");
     std::fs::write(
         &script,
-        r#"import os, socket, sys, threading
-listen, upstream, once = sys.argv[1:4]
+        r#"import os, socket, subprocess, sys, threading
+listen, upstream, once, needle = sys.argv[1], sys.argv[2], sys.argv[3], bytes.fromhex(sys.argv[4])
+run = sys.argv[5:]
 srv = socket.socket(socket.AF_UNIX)
 srv.bind(listen)
 srv.listen(8)
@@ -2867,9 +2909,12 @@ def serve(c):
     while True:
         head = exact(4)
         body = head and exact(int.from_bytes(head, 'little'))
-        if body is None or (b'\xa3Ack' in body and not os.path.exists(once)):
-            if body is not None:
-                open(once, 'w').close()
+        hit = body is not None and needle in body and not os.path.exists(once)
+        if hit:
+            open(once, 'w').close()
+            if run:
+                subprocess.run(run)
+        if body is None or (hit and not run):
             c.shutdown(socket.SHUT_RDWR)
             c.close()
             u.close()
@@ -2883,16 +2928,30 @@ while True:
     .unwrap();
     let rt = env.tmp.path().join("cut-rt");
     std::fs::create_dir_all(&rt).unwrap();
-    let child = Command::new("python3")
+    let hex: String = needle.iter().map(|b| format!("{b:02x}")).collect();
+    let mut cmd = Command::new("python3");
+    for k in LIVE_SESSION_ENV {
+        cmd.env_remove(k);
+    }
+    let child = cmd
         .arg(&script)
         .arg(rt.join("daemon.sock"))
         .arg(env.runtime_dir().join("daemon.sock"))
         .arg(env.tmp.path().join("ack-cut-once"))
+        .arg(hex)
+        .args(run)
+        .env("NEBULA_RUNTIME_DIR", env.runtime_dir())
+        .env("NEBULA_DATA_DIR", env.data_dir())
+        .stdout(Stdio::null())
         .spawn()
         .unwrap();
     let child = Killed(child);
     wait_for(&rt.join("daemon.sock"));
     (child, rt)
+}
+
+fn ack_cutter(env: &Env) -> (Killed, PathBuf) {
+    interposer(env, b"\xa3Ack", &[])
 }
 
 /// Run and Approve whose final Ack is lost after they took effect exit 4

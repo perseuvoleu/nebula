@@ -513,24 +513,46 @@ pub async fn run(verb: TodoVerb, json: bool) -> Result<()> {
             page,
         }),
     };
+    let rerun = |why: anyhow::Error| match minted.as_deref() {
+        Some(id) => with_rerun(why, &format!("with --id {id}")),
+        None => why,
+    };
+    if json {
+        let result = request(&mut conn, op).await.map_err(rerun)?;
+        println!("{}", result_json(&result)?);
+        return Ok(());
+    }
+    let first = op.clone();
+    let mut pages = Vec::new();
+    let mut rereads = 0;
     loop {
-        let result =
-            request(&mut conn, op.clone())
-                .await
-                .map_err(|why| match minted.as_deref() {
-                    Some(id) => with_rerun(why, &format!("with --id {id}")),
-                    None => why,
-                })?;
-        if json {
-            println!("{}", result_json(&result)?);
-            return Ok(());
-        }
-        print_human(&result);
-        if !turn_page(&mut op, &result) {
-            return Ok(());
+        match request(&mut conn, op.clone()).await {
+            Err(why)
+                if !pages.is_empty()
+                    && rereads < REREADS
+                    && Refusal::of(&why.to_string()) == Some(Refusal::Conflict) =>
+            {
+                rereads += 1;
+                pages.clear();
+                op = first.clone();
+            }
+            result => {
+                let result = result.map_err(rerun)?;
+                let more = turn_page(&mut op, &result);
+                pages.push(result);
+                if !more {
+                    break;
+                }
+            }
         }
     }
+    pages.iter().for_each(print_human);
+    Ok(())
 }
+
+/// How often a human page walk starts over when the board changes under
+/// it, before the change is reported.
+const REREADS: usize = 3;
 
 async fn run_dispatch(
     conn: &mut Connection,
