@@ -524,8 +524,8 @@ class Gateway:
             if ((since is not None and not CURSOR.fullmatch(since)) or (away is not None and not re.fullmatch(r"[0-9]{1,16}", away))
                     or (page is not None and not PAGE.fullmatch(page))):
                 raise Problem(400, "Invalid board cursor")
-            return self.board("todo", "board", *self.scope(), *([f"--since={since}"] if since else []),
-                              *([f"--away-since={away}"] if away else []), *([f"--page={page}"] if page else []))
+            return self.board("todo", "board", *self.scope(), *flag("since", since),
+                              *flag("away-since", away), *flag("page", page))
         if path.startswith("/api/cards/"):
             return self.card(unquote(path[len("/api/cards/"):]))
         if path == "/api/decisions":
@@ -534,8 +534,8 @@ class Gateway:
                 raise Problem(400, "Invalid search")
             if page is not None and not PAGE.fullmatch(page):
                 raise Problem(400, "Invalid page")
-            return self.board("decision", "list", *self.scope(), *([f"--query={text}"] if text else []),
-                              *([f"--page={page}"] if page else []))
+            return self.board("decision", "list", *self.scope(), *flag("query", text),
+                              *flag("page", page))
         project = self.project(query.get("project", [None])[0])
         first = {k: v[0] for k, v in query.items()}
         if path == "/api/sessions":
@@ -650,9 +650,9 @@ class Gateway:
         if path == "/api/cards":
             stage, card_id = field(body, "stage", choices=STAGES, optional=True), field(body, "id", ULID, optional=True)
             owner = self.home() if body.get("home") is True else f"--project={self.board_project(body.get('project'))}"
-            row = self.board("todo", "add", owner, *([f"--stage={stage}"] if stage else []),
+            row = self.board("todo", "add", owner, *flag("stage", stage),
                              *(["--propose"] if body.get("propose") is True else []),
-                             *([f"--id={card_id}"] if card_id else []), positionals=(field(body, "title"),))
+                             *flag("id", card_id), positionals=(field(body, "title"),))
             if not self.admits(row.get("project")):
                 raise Problem(404, "Card not found")
             return row
@@ -661,7 +661,7 @@ class Gateway:
             card = field(body, "card", BOARD_REF, optional=True)
             owner = (f"--card={self.card(card)['id']}" if card else
                      f"--project={self.board_project(body['project'])}" if body.get("project") is not None else self.home())
-            return self.board("decision", "add", *([f"--why={why}"] if why else []), owner,
+            return self.board("decision", "add", *flag("why", why), owner,
                               positionals=(what,))
         if path.startswith("/api/cards/"):
             ref, _, verb = path[len("/api/cards/"):].partition("/")
@@ -756,6 +756,10 @@ def field(body, key, pattern=None, *, choices=None, limit=200, optional=False):
     return value
 
 
+def flag(name, value):
+    return (f"--{name}={value}",) if value else ()
+
+
 def git_branch(value):
     """A branch name `git check-ref-format --branch` accepts."""
     parts = value.split("/")
@@ -771,14 +775,14 @@ def edit_card(gateway, card, body):
     project = gateway.board_project(body["project"]) if body.get("project") is not None else None
     if title is None and project is None:
         raise Problem(400, "Nothing to change")
-    return ("todo", "edit", *([f"--title={title}"] if title else []), *([f"--project={project}"] if project else [])), (card["id"],)
+    return ("todo", "edit", *flag("title", title), *flag("project", project)), (card["id"],)
 
 
 def run_card(gateway, card, body):
     dispatch = field(body, "dispatch", ULID, optional=True)
     return ("todo", "run", f"--role={field(body, 'role', choices=ROLES)}", f"--kind={field(body, 'kind', NAME)}",
             f"--host={field(body, 'host', NAME)}", f"--worktree={git_branch(field(body, 'worktree'))}",
-            *([f"--dispatch={dispatch}"] if dispatch else [])), (card["id"],)
+            *flag("dispatch", dispatch)), (card["id"],)
 
 
 def approve_card(gateway, card, body):
@@ -798,7 +802,7 @@ def open_code(gateway, card, body):
 
 def move_card(gateway, card, body):
     expect = field(body, "expect", choices=STAGES, optional=True)
-    return ("todo", "move", *([f"--expect={expect}"] if expect else [])), (card["id"], field(body, "stage", choices=STAGES))
+    return ("todo", "move", *flag("expect", expect)), (card["id"], field(body, "stage", choices=STAGES))
 
 
 def note_card(gateway, card, body):
