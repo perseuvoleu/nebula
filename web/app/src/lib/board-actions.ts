@@ -13,6 +13,7 @@ export function ulid(now = Date.now()): string {
 
 export type NewCard = { title: string; project: string | null; stage: Stage; id: string };
 
+/** Creates a card under the client-minted `id`, so a retry after an unknown outcome is not a second card; null `project` makes a home card. */
 export const createCard = ({ title, project, stage, id }: NewCard) =>
   api<Card>("cards", {}, { title, stage, id, ...(project === null ? { home: true } : { project }) });
 
@@ -28,5 +29,6 @@ type Verbs = {
   "open-code": { session: string; host: string; on: string };
 };
 
+/** POSTs `body` to /api/cards/<ref>/<verb>; rejects with ApiError when the gateway or the CLI refuses it. */
 export const cardAction = <V extends keyof Verbs>(ref: string, verb: V, body: Verbs[V]) =>
   api<unknown>(`cards/${encodeURIComponent(cardSlug(ref))}/${verb}`, {}, body);

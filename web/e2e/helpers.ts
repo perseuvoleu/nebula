@@ -80,7 +80,7 @@ export type BoardState = { version: number; cards: Record<string, unknown>[]; de
   away: { finished: { id: unknown; at: number }[]; needs_you: Record<string, unknown>[] };
   details: Record<string, { sessions: Record<string, unknown>[]; artifacts: Record<string, unknown>[]; log: unknown[] }> };
 
-export function readBoardState(): BoardState {
+function readBoardState(): BoardState {
   return JSON.parse(fs.readFileSync(path.join(STATE, "board.json"), "utf8"));
 }
 

@@ -17,7 +17,12 @@ async function readBoard(since: string | undefined, awaySince: number | null, si
   return { version: first.version, board };
 }
 
-/** `readAt` is when the read behind the current board began, so a write settled before it is in the board. */
+/**
+ * Polls the board every BOARD_POLL_MS while the tab is visible, one read at a time, and at once when it becomes visible.
+ * `board` is null until the first successful read. `stale` is true from a failed read until the next one succeeds,
+ * so before the first success it means "no board could be read"; a 401 never sets it.
+ * `readAt` is when the read behind the current board began, so a write settled before it is in the board.
+ */
 export function useBoard(awaySince: number | null): { board: BoardData | null; stale: boolean; readAt: number } {
   const [state, setState] = useState<{ board: BoardData | null; stale: boolean; readAt: number }>({ board: null, stale: false, readAt: 0 });
   const version = useRef<string | undefined>(undefined);
