@@ -1,6 +1,6 @@
 import os from "node:os";
 import { expect, type Page } from "@playwright/test";
-import { test, changeBoard, openBoard, readBoardState, storeArtifact } from "./helpers";
+import { test, changeBoard, openBoard, storeArtifact } from "./helpers";
 
 const CARD = "01JD0000000000000000000012";
 const RUN = "01JG0000000000000000000001";
@@ -95,9 +95,9 @@ test("record decision", async ({ page }) => {
   await form.getByRole("button", { name: "Notează" }).click();
   await expect(section(page, "Keep runs for a year").getByText("Reviews look back that far")).toBeVisible();
   await expect(form.getByLabel("Decizia")).toHaveValue("");
-  expect(readBoardState().decisions.filter((d) => d.title === "Keep runs for a year")).toHaveLength(1);
   await page.goto("/board/decisions/p/nebula");
   const row = page.getByRole("article").filter({ hasText: "Keep runs for a year" });
+  await expect(row).toHaveCount(1);
   await expect(row.getByRole("link", { name: /#12@leaseweb/ })).toBeVisible();
   await expect(page.getByRole("article").filter({ hasText: "Vela keeps its schema" })).toHaveCount(0);
 });

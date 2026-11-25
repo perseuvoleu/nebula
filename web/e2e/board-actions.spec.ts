@@ -28,7 +28,6 @@ function addCard(number: number, title: string, extra: Record<string, unknown> =
     ref: `#${number}@leaseweb`, title, stage: "backlog", checkout: null, blocked_by: [], ...extra }));
 }
 
-const cardNumbered = (number: number) => readBoard().cards.find((c) => c.number === number)!;
 
 async function open(page: Page, url: string) {
   await page.goto(url);
@@ -62,7 +61,8 @@ test("a dragged card moves to its column and stays there after the next poll", a
   await expect(tile(column(page, "Review"), "Drag me along")).toBeVisible();
   await polledAfterThis(page);
   await expect(tile(column(page, "Review"), "Drag me along")).toBeVisible();
-  expect(cardNumbered(13).stage).toBe("review");
+  await page.reload();
+  await expect(tile(column(page, "Review"), "Drag me along")).toBeVisible();
 });
 
 test("a poll already in flight when the drag lands does not snap the card back", async ({ page }) => {
@@ -100,9 +100,8 @@ test("a new card lands in the backlog of the current project", async ({ page }) 
   await dialog.getByLabel("Titlu").fill("Write the release notes");
   await dialog.getByRole("button", { name: "Creează cardul" }).click();
   await expect(dialog).toHaveCount(0);
+  await page.reload();
   await expect(tile(column(page, "Backlog"), "Write the release notes")).toBeVisible();
-  const created = readBoard().cards.find((c) => c.title === "Write the release notes")!;
-  expect([created.project, created.stage]).toEqual(["nebula", "backlog"]);
 });
 
 test("Run starts the chosen agent and the card shows in doing", async ({ page }) => {
@@ -177,7 +176,10 @@ test("accept puts a proposed card on the board and dismiss removes it", async ({
   await polledAfterThis(page);
   await expect(tray).toHaveCount(0);
   await expect(page.getByText("Proposed and dropped")).toHaveCount(0);
-  expect([cardNumbered(13).proposed, cardNumbered(14).archived]).toEqual([false, true]);
+  await page.reload();
+  await expect(tile(column(page, "Backlog"), "Proposed and kept")).toBeVisible();
+  await expect(page.getByRole("region", { name: "Carduri propuse" })).toHaveCount(0);
+  await expect(page.getByText("Proposed and dropped")).toHaveCount(0);
 });
 
 test("on a first visit each waiting session has its own approve button, which answers that session and leaves the strip", async ({ page }) => {
