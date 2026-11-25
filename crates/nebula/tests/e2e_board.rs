@@ -2524,6 +2524,43 @@ fn run_lost_end_reconciles_before_card_checks() {
 }
 
 #[test]
+fn run_lost_end_takes_the_live_session() {
+    let env = board_env();
+    env.make_repo();
+    let card = add(&env, &["--project", "repo"], "Replaced");
+    let dispatch = TodoId::generate().0;
+    begin_run(&env, &card, &dispatch, "main");
+    let dead = lost_spawn(&env, "#1", &dispatch);
+    let dead = dead["id"].as_str().unwrap().to_string();
+    eventually("the first session on the card", || {
+        chain(&env, "#1")
+            .iter()
+            .any(|s| s["id"] == dead.as_str())
+            .then_some(())
+    });
+    let deleted = env.cli(
+        &["agent", "delete-id", "--project", "repo", "--", &dead],
+        None,
+    );
+    assert!(deleted.status.success(), "{}", stderr(&deleted));
+    let live = lost_spawn(&env, "#1", &dispatch);
+    let live = live["id"].as_str().unwrap().to_string();
+    assert_ne!(live, dead);
+    eventually("the dead and the live session on the card", || {
+        let rows = chain(&env, "#1");
+        let alive = |id: &str| {
+            rows.iter()
+                .find(|s| s["id"] == id)
+                .map(|s| s["alive"] == true)
+        };
+        (alive(&dead) == Some(false) && alive(&live) == Some(true)).then_some(())
+    });
+    let rerun = receipt(run_card(&env, "#1", &["--dispatch", &dispatch]));
+    assert_eq!(rerun["state"], "started");
+    assert_eq!(rerun["session"]["id"], live.as_str());
+}
+
+#[test]
 fn run_replay_names_the_agents_own_project() {
     let env = board_env();
     env.make_repo();

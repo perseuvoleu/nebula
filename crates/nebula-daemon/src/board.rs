@@ -187,7 +187,8 @@ fn begin_run(tx: &Transaction, dispatch: Dispatch) -> Result<RunReceipt> {
         let launched: Option<(String, Option<String>, String)> = tx
             .query_row(
                 "SELECT agent_id, role, kind FROM board_sessions
-                 WHERE dispatch_id = ?1 AND card_id = ?2 AND host = ?3 COLLATE NOCASE",
+                 WHERE dispatch_id = ?1 AND card_id = ?2 AND host = ?3 COLLATE NOCASE
+                   AND alive = 1 AND archived = 0",
                 params![dispatch.id.as_str(), card.as_str(), host],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
