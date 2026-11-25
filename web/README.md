@@ -133,6 +133,11 @@ board, card and decision read (`--project=…` or `--all`, plus `--include-home`
 client asks, and checks every card write against a scoped read first. Unset, the board endpoints
 answer 503.
 
+`Gateway.run` drops every `NEBULA_*` variable from its CLI calls, so `NEBULA_RUNTIME_DIR` and
+`NEBULA_DATA_DIR` never reach the CLI and a gateway started beside a scratch daemon still talks to
+the user's own. To aim it at another daemon, point `NEBULA_WEB_BINARY` at a launcher that exports
+them and execs nebula, as `web/e2e/real_nebula.sh` does.
+
 Endpoints: `GET /api/board?since&awaySince` (one `nebula todo board` call per poll),
 `GET /api/cards/<ref>`, `GET /api/decisions?query`, `POST /api/cards`,
 `POST /api/cards/<ref>/{move,edit,note,archive,accept,dismiss,block,unblock,run,approve,open-code}`
@@ -160,7 +165,7 @@ started before Nebula's Pi extension existed have no stored id.
 ## Verification
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s web -v   # gateway + Pi adapter
+web/checks-python.sh                                               # gateway + Pi adapter, venv from requirements.txt
 pnpm --dir web/app typecheck && pnpm --dir web/app build
 pnpm --dir web/app test:unit                                       # node --test, no browser
 pnpm --dir web/app test:e2e                                        # Playwright, needs a browser
@@ -191,6 +196,8 @@ so the launcher re-exports `NEBULA_RUNTIME_DIR` and `NEBULA_DATA_DIR` from `REAL
 `NEBULA_RAG_LOCAL=0 NEBULA_RAG_HOST=nebula-real-e2e.invalid`, so a decision never reaches the real RAG.
 Any gateway aimed at a non-default daemon needs such a launcher. `REAL_NEBULA_BIN` picks another binary,
 `REAL_E2E_RUN` another reporter run (this lane's own: `.scratch/real-e2e/e2e-run`).
+`E2E_FAKE_PORT` and `E2E_REAL_PORT` move a run off 8790 and 8791, so checkouts on one host run side
+by side. A second real-lane run on the same `REAL_NEBULA_STATE` refuses to start; give it its own.
 
 To inspect a candidate visually from the laptop without touching production, start a
 preview on findl on a loopback port with a synthetic token and tunnel it:
@@ -396,8 +403,8 @@ EOF
 Per host, newest first. Quit every `ng` window first: a TUI reconnects by starting a daemon, which
 would open the database while it is restored, so the block refuses while this user's daemon runs (it
 holds the lock on `daemon.pid` in nebula's runtime dir; daemons in other runtime dirs do not count).
-`B` and `D` below are leaseweb's and findl's; on a laptop, `B=~/.cargo/bin` and
-`D="$HOME/Library/Application Support/dev.nebula.nebula"`.
+`B` and `D` default to leaseweb's and findl's paths; on a laptop, start the block as
+`B=~/.cargo/bin D="$HOME/Library/Application Support/dev.nebula.nebula" bash -euo pipefail <<'EOF'`.
 
 ```bash
 bash -euo pipefail <<'EOF'
@@ -409,7 +416,7 @@ f=open(p,"r+")
 try: fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)
 except OSError: print(p,"held by pid",f.read().strip()); sys.exit(0)
 sys.exit(1)'; }
-B=~/.local/bin D=~/.local/share/nebula
+B=${B:-$HOME/.local/bin} D=${D:-$HOME/.local/share/nebula}
 if command -v systemctl >/dev/null; then systemctl --user stop nebula-web || true; fi
 nebula kill || true
 for i in 1 2 3 4 5; do daemon_alive >/dev/null || break; sleep 1; done
