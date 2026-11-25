@@ -10,7 +10,7 @@ const real = process.env.NEBULA_E2E_LANE === "real";
 const checkout = path.resolve(import.meta.dirname, "../..");
 process.env.REAL_NEBULA_STATE ??= `/tmp/nre-${createHash("sha1").update(checkout).digest("hex").slice(0, 8)}`;
 process.env.REAL_NEBULA_BIN ??= path.join(checkout, "target/verify-nebula/debug/nebula");
-const PORT = real ? 8791 : 8790;
+const PORT = Number((real ? process.env.E2E_REAL_PORT : process.env.E2E_FAKE_PORT) || (real ? 8791 : 8790));
 const scratch = real ? "../../.scratch/real-e2e" : "../../.scratch/mobile-chat-e2e";
 
 export default defineConfig({
