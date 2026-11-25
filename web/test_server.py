@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from urllib.parse import unquote
 
 import serverless
 from server import Gateway, Handler, Problem, PushService, StaticFiles, ThreadingHTTPServer
@@ -902,10 +903,20 @@ class BoardTests(unittest.TestCase):
                 self.assertEqual(self.request("/api/cards/%2312/run", "POST", {**base, "worktree": branch}, self.auth())[0], 200)
                 self.assertIn("--worktree=" + branch, self.argv(run)[-1])
         for branch in ["-x", "a..b", "a b", "a~1", "x.lock", "a/x.lock/b", "a/.b", "a//b", "a/", "a.", "@", "a@{1}",
-                       "a:b", "a?", "a*", "a[", "a\\b", "/a", ".a", "a^b", "a\x7fb"]:
+                       "a:b", "a?", "a*", "a[", "a\\b", "/a", ".a", "a^b", "a\x7fb", "HEAD"]:
             with self.subTest(branch=branch), patch("server.subprocess.run", return_value=cli(fixture("card_show"))) as run:
                 self.assertEqual(self.request("/api/cards/%2312/run", "POST", {**base, "worktree": branch}, self.auth())[0], 400)
                 self.assertEqual(run.call_count, 1)
+
+    def test_card_refs_take_every_positive_u64(self):
+        for ref in ["18446744073709551615", "%2318446744073709551615%40leaseweb", "%2300000000000000000000012"]:
+            with self.subTest(ref=ref), patch("server.subprocess.run", return_value=cli(fixture("card_show"))) as run:
+                self.assertEqual(self.request(f"/api/cards/{ref}", headers=self.auth())[0], 200)
+                self.assertEqual(self.argv(run)[0][-1], unquote(ref))
+        for ref in ["0", "%230", "18446744073709551616", "%23", "-1"]:
+            with self.subTest(ref=ref), patch("server.subprocess.run") as run:
+                self.assertEqual(self.request(f"/api/cards/{ref}", headers=self.auth())[0], 400)
+                run.assert_not_called()
 
     def test_note_without_an_id_is_refused(self):
         with patch("server.subprocess.run", return_value=cli(fixture("card_show"))) as run:

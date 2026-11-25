@@ -42,8 +42,8 @@ ASSET_TYPES = {".html": "text/html", ".js": "text/javascript", ".css": "text/css
 IDENTITY_TTL = 5.0
 TRANSIENT = {502, 503, 504}  # gateway/CLI trouble: reported as an error, not as a capability
 PUSH_STATES = {"finished", "needs_feedback"}
-BOARD_REF = re.compile(r"#?[0-9]{1,9}(?:@[A-Za-z0-9._-]{1,64})?|[0-7][0-9A-HJKMNP-TV-Z]{25}")
 ULID = re.compile(r"[0-7][0-9A-HJKMNP-TV-Z]{25}")
+BOARD_REF = re.compile(ULID.pattern + r"|#?(?P<number>[0-9]+)(?:@[A-Za-z0-9._-]{1,64})?")
 CURSOR = re.compile(r"[A-Za-z0-9]{1,64}\.[0-9]{1,20}")
 PAGE = re.compile(CURSOR.pattern + r"@[0-9]{1,20}")
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}")
@@ -352,7 +352,8 @@ class Gateway:
         return value
 
     def card(self, ref):
-        if not isinstance(ref, str) or not BOARD_REF.fullmatch(ref):
+        match = BOARD_REF.fullmatch(ref) if isinstance(ref, str) else None
+        if not match or (match["number"] is not None and not 0 < int(match["number"]) < 2 ** 64):
             raise Problem(400, "Invalid card reference")
         card = self.board("todo", "show", *self.scope(), positionals=(ref,))
         for row in card.get("artifacts") or []:
@@ -758,7 +759,7 @@ def field(body, key, pattern=None, *, choices=None, limit=200, optional=False):
 def git_branch(value):
     """A branch name `git check-ref-format --branch` accepts."""
     parts = value.split("/")
-    if (value.startswith("-") or value.endswith(".") or value == "@" or ".." in value or "@{" in value
+    if (value.startswith("-") or value.endswith(".") or value in {"@", "HEAD"} or ".." in value or "@{" in value
             or any(not part or part.startswith(".") or part.endswith(".lock") for part in parts)
             or any(ord(c) < 32 or ord(c) == 127 or c in " ~^:?*[\\" for c in value)):
         raise Problem(400, "Invalid worktree")
