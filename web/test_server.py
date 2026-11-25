@@ -846,7 +846,8 @@ class BoardTests(unittest.TestCase):
     def test_board_writes_need_board_and_explicit_owner(self):
         self.gateway.board_scope = None
         with patch("server.subprocess.run") as run:
-            for path, body in [("/api/cards", {"title": "x", "home": True}), ("/api/decisions", {"what": "Copy files"})]:
+            for path, body in [("/api/cards", {"title": "x", "home": True}), ("/api/cards", {"title": "x"}),
+                               ("/api/decisions", {"what": "Copy files"})]:
                 with self.subTest(path=path):
                     self.assertEqual(self.request(path, "POST", body, self.auth())[0], 503)
             run.assert_not_called()
@@ -921,11 +922,12 @@ class BoardTests(unittest.TestCase):
                 self.assertEqual(run.call_count, 1)
 
     def test_card_refs_take_every_positive_u64(self):
-        for ref in ["18446744073709551615", "%2318446744073709551615%40leaseweb", "%2300000000000000000000012"]:
+        for ref in ["18446744073709551615", "%2318446744073709551615%40leaseweb", "%2300000000000000000000012",
+                    "1%40" + "h" * 65, "0" * 5000 + "1"]:
             with self.subTest(ref=ref), patch("server.subprocess.run", return_value=cli(fixture("card_show"))) as run:
                 self.assertEqual(self.request(f"/api/cards/{ref}", headers=self.auth())[0], 200)
                 self.assertEqual(self.argv(run)[0][-1], unquote(ref))
-        for ref in ["0", "%230", "18446744073709551616", "%23", "-1"]:
+        for ref in ["0", "%230", "18446744073709551616", "%23", "-1", "9" * 5000, "1%40"]:
             with self.subTest(ref=ref), patch("server.subprocess.run") as run:
                 self.assertEqual(self.request(f"/api/cards/{ref}", headers=self.auth())[0], 400)
                 run.assert_not_called()

@@ -43,7 +43,7 @@ IDENTITY_TTL = 5.0
 TRANSIENT = {502, 503, 504}  # gateway/CLI trouble: reported as an error, not as a capability
 PUSH_STATES = {"finished", "needs_feedback"}
 ULID = re.compile(r"[0-7][0-9A-HJKMNP-TV-Z]{25}")
-BOARD_REF = re.compile(ULID.pattern + r"|#?(?P<number>[0-9]+)(?:@[A-Za-z0-9._-]{1,64})?")
+BOARD_REF = re.compile(ULID.pattern + r"|#?(?P<number>[0-9]+)(?:@[A-Za-z0-9._-]+)?")
 CURSOR = re.compile(r"[A-Za-z0-9]{1,64}\.[0-9]{1,20}")
 PAGE = re.compile(CURSOR.pattern + r"@[0-9]{1,20}")
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}")
@@ -334,13 +334,15 @@ class Gateway:
         return "--home"
 
     def board_project(self, value):
-        if not isinstance(value, str) or not NAME.fullmatch(value) or not self.scope().allows(value):
+        scope = self.scope()
+        if not isinstance(value, str) or not NAME.fullmatch(value) or not scope.allows(value):
             raise Problem(403, "Project is not on this board")
         return value
 
     def card(self, ref):
         match = BOARD_REF.fullmatch(ref) if isinstance(ref, str) else None
-        if not match or (match["number"] is not None and not 0 < int(match["number"]) < 2 ** 64):
+        digits = match and match["number"] and match["number"].lstrip("0")
+        if not match or (digits is not None and not (0 < len(digits) <= 20 and int(digits) < 2 ** 64)):
             raise Problem(400, "Invalid card reference")
         card = self.board("todo", "show", *self.scope().argv(), positionals=(ref,))
         for row in card.get("artifacts") or []:
