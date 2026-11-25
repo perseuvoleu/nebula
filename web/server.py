@@ -655,8 +655,9 @@ class Gateway:
             if verb not in CARD_VERBS:
                 raise Problem(404, "Unknown endpoint")
             card = self.card(unquote(ref))
-            args, positionals, *exits = CARD_VERBS[verb](self, card, body)
-            if verb in SCOPED_WRITES:
+            build, scoped = CARD_VERBS[verb]
+            args, positionals, *exits = build(self, card, body)
+            if scoped:
                 args = (*args, *self.scope().write_argv())
             return self.board(*args, positionals=positionals, exits=exits[0] if exits else BOARD_EXITS)
         project = self.project(body.get("project"))
@@ -805,20 +806,18 @@ def block_card(verb):
         ("todo", verb, f"--by={gateway.card(field(body, 'by', BOARD_REF))['id']}"), (card["id"],))
 
 
-SCOPED_WRITES = {"move", "edit", "note", "archive", "accept", "dismiss", "block", "unblock", "run", "approve"}
-
 CARD_VERBS = {
-    "move": move_card,
-    "edit": edit_card,
-    "note": note_card,
-    "archive": plain_card("archive"),
-    "accept": plain_card("accept"),
-    "dismiss": plain_card("dismiss"),
-    "block": block_card("block"),
-    "unblock": block_card("unblock"),
-    "run": run_card,
-    "approve": approve_card,
-    "open-code": open_code,
+    "move": (move_card, True),
+    "edit": (edit_card, True),
+    "note": (note_card, True),
+    "archive": (plain_card("archive"), True),
+    "accept": (plain_card("accept"), True),
+    "dismiss": (plain_card("dismiss"), True),
+    "block": (block_card("block"), True),
+    "unblock": (block_card("unblock"), True),
+    "run": (run_card, True),
+    "approve": (approve_card, True),
+    "open-code": (open_code, False),
 }
 
 
