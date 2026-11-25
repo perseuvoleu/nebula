@@ -26,8 +26,9 @@ pub(crate) fn page_budget() -> usize {
 }
 
 pub(crate) fn serve(store: &Store, links: &HostLinks, op: BoardOp) -> Result<BoardResult> {
+    let publishes = matches!(op, BoardOp::Publish(_));
     let result = store.board_transaction(|tx| apply(tx, links, op))?;
-    if let BoardResult::Artifact(artifact) = &result {
+    if let (true, BoardResult::Artifact(artifact)) = (publishes, &result) {
         if artifact.kind == nebula_core::board::DECISION_KIND && !artifact.meta.contains_key("rag_note") {
             crate::rag_copy::kick();
         }

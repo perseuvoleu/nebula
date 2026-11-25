@@ -4381,6 +4381,35 @@ fn an_unanswering_rag_ends_the_copy_tick_at_the_first_decision() {
 }
 
 #[test]
+fn reading_a_pending_decision_does_not_retry_its_copy() {
+    let env = rag_board(
+        Some("rag-hang"),
+        &[
+            ("NEBULA_RAG_TIMEOUT_MS", "300"),
+            ("NEBULA_RAG_COPY_MS", "600000"),
+        ],
+    );
+    let decided = decide(&env, None, &["Read me", "--project", "repo"]);
+    let id = decided["id"].as_str().unwrap();
+    let bodies = env.tmp.path().join("rag-hung-pid.bodies");
+    let attempts = || {
+        std::fs::read_to_string(&bodies)
+            .unwrap_or_default()
+            .matches("Read me")
+            .count()
+            / 2
+    };
+    poll_until(Duration::from_secs(10), || (attempts() == 1).then_some(()))
+        .expect("publishing never copied the decision");
+    poll_until(Duration::from_secs(1), || None::<()>);
+    for _ in 0..3 {
+        env.json(&["decision", "show", id, "--json"]);
+    }
+    let retried = poll_until(Duration::from_secs(2), || (attempts() > 1).then_some(()));
+    assert_eq!(retried, None, "a read woke the RAG copier");
+}
+
+#[test]
 fn kill_stops_a_hung_rag_copy() {
     let mut env = rag_board(Some("rag-hang"), &[]);
     decide(&env, None, &["Copy published files", "--project", "repo"]);
