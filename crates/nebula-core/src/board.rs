@@ -672,8 +672,6 @@ pub struct E2eStep {
     pub error: Option<String>,
 }
 
-/// Parses `result.json` and checks every screenshot it names is among
-/// `files`, the artifact's relative paths.
 pub fn entry_inside(entry: &str) -> bool {
     !entry.is_empty()
         && std::path::Path::new(entry)
@@ -681,6 +679,8 @@ pub fn entry_inside(entry: &str) -> bool {
             .all(|part| matches!(part, std::path::Component::Normal(_)))
 }
 
+/// Parses `result.json` and checks every screenshot it names is among
+/// `files`, the artifact's relative paths.
 pub fn validate_e2e_run(result_json: &str, files: &BTreeSet<String>) -> Result<E2eRun, String> {
     let value: serde_json::Value =
         serde_json::from_str(result_json).map_err(|e| format!("result.json: {e}"))?;
