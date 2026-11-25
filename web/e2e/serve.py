@@ -3,12 +3,17 @@
 
 State dir: .scratch/mobile-chat-e2e/state (recreated on every start). Token is synthetic.
 The board (project nebula) is seeded from the golden fixtures in crates/nebula-core.
+`--real` serves the real lane instead: an isolated daemon at $REAL_NEBULA_STATE running
+$REAL_NEBULA_BIN (both required; playwright.config.ts sets them for --project real).
 """
 import base64
 import json
 import os
 import shutil
+import signal
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -21,6 +26,8 @@ FIXTURES = WEB.parent / "crates" / "nebula-core" / "tests" / "fixtures" / "board
 TOKEN = "e2e-synthetic-token-not-a-secret-0123456789"
 PORT = int(os.environ.get("E2E_PORT", "8790"))
 PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=")
+GATEWAY_ENV = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR",
+               "REAL_NEBULA_STATE", "REAL_NEBULA_BIN", "E2E_STATIC_DIR")
 SID = {"pi-1": "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa", "pi-2": "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb",
        "pi-b": "cccccccc-3333-4333-8333-cccccccccccc"}
 
@@ -151,5 +158,52 @@ def main():
     os.execve(sys.executable, [sys.executable, "-c", script], env)
 
 
+def serve_real():
+    """The real lane: an isolated daemon at $REAL_NEBULA_STATE behind the real gateway, via real_nebula.sh."""
+    state, binary = Path(os.environ["REAL_NEBULA_STATE"]), Path(os.environ["REAL_NEBULA_BIN"])
+    if not os.access(binary, os.X_OK):
+        raise SystemExit(f"No nebula at {binary}; run `heavy web/e2e/build_real_nebula.sh` first")
+    if state.exists() and not (state / ".real-e2e").exists():
+        raise SystemExit(f"{state} was not made by the real lane; refusing to delete it")
+    shutil.rmtree(state, ignore_errors=True)
+    for sub in ("rt", "data/artifacts", "repo", "codex", "pi", "claude"):
+        (state / sub).mkdir(parents=True)
+    (state / ".real-e2e").touch()
+    (state / "rt").chmod(0o700)
+    (state / "data" / "config.json").write_text(json.dumps({"board": "local", "auto_archive_after": "off"}))
+    repo = state / "repo"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "-c", "user.email=e2e@nebula.dev", "-c", "user.name=real-e2e",
+                    "commit", "-q", "--allow-empty", "-m", "init"], check=True)
+    launcher = str(HERE / "real_nebula.sh")
+    replay = WEB.parent / "crates" / "nebula" / "tests" / "replay"
+    env = {**os.environ, "SHELL": "/bin/sh", "CODEX_HOME": str(state / "codex"), "PI_CODING_AGENT_DIR": str(state / "pi"),
+           "NEBULA_AGENT_CMD": f"{replay / 'agent'} {replay / 'turn.replay'}", "NEBULA_STATUS_TICK_MS": "100"}
+    daemon = subprocess.Popen([launcher, "daemon", "--foreground"], cwd=repo, env=env,
+                              stdout=open(state / "daemon.log", "wb"), stderr=subprocess.STDOUT)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    try:
+        deadline = time.monotonic() + 15
+        while subprocess.run([launcher, "agent", "list", "--all"], env=env, capture_output=True).returncode:
+            if time.monotonic() > deadline or daemon.poll() is not None:
+                raise SystemExit(f"The real lane's daemon never answered; see {state / 'daemon.log'}")
+            time.sleep(0.1)
+        subprocess.run([launcher, "add", str(repo)], cwd=repo, env=env, check=True, capture_output=True)
+        gateway = {**{k: os.environ[k] for k in GATEWAY_ENV if k in os.environ}, "NEBULA_WEB_TOKEN": TOKEN, "NEBULA_WEB_PROJECTS": "repo", "NEBULA_WEB_BOARD_PROJECTS": "repo",
+                   "NEBULA_WEB_ARTIFACTS": str(state / "data" / "artifacts"), "NEBULA_WEB_BINARY": launcher,
+                   "NEBULA_WEB_USAGE": "0", "NEBULA_WEB_PORT": str(PORT), "NEBULA_WEB_ORIGIN": f"http://127.0.0.1:{PORT}",
+                   "NEBULA_WEB_CLAUDE_DIR": str(state / "claude"), "NEBULA_WEB_PI_AGENT_DIR": str(state / "pi"),
+                   "PYTHONDONTWRITEBYTECODE": "1", "PYTHONPATH": str(WEB)}
+        script = "import os; from pathlib import Path; import server; " \
+                 "server.STATIC = Path(os.environ.get('E2E_STATIC_DIR', str(server.STATIC))); server.main()"
+        subprocess.run([sys.executable, "-c", script], env=gateway)
+    finally:
+        daemon.terminate()
+        try:
+            daemon.wait(10)
+        except subprocess.TimeoutExpired:
+            daemon.kill()
+
+
 if __name__ == "__main__":
-    main()
+    serve_real() if sys.argv[1:] == ["--real"] else main()

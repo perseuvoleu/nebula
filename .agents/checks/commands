@@ -14,6 +14,7 @@ PATH=/opt/homebrew/opt/zig@0.15/bin:$PATH cargo clippy --workspace --all-targets
 [web/**] PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s web -v
 [web/app/**,web/e2e/e2e-run-reporter.ts,crates/nebula-core/tests/fixtures/board/e2e_run_result.json] pnpm --dir web/app test:unit
 [web/app/**,web/e2e/**,web/*.py] pnpm --dir web/app build && pnpm --dir web/app test:e2e
+[Cargo.toml,Cargo.lock,crates/nebula-core/*,crates/nebula-daemon/*,crates/nebula-tui/*,crates/nebula-rag/*,crates/nebula/Cargo.toml,crates/nebula/build.rs,crates/nebula/src/*,crates/nebula/tests/replay/*,web/app/**,web/e2e/real/**,web/e2e/real_nebula.sh,web/e2e/build_real_nebula.sh,web/e2e/serve.py,web/e2e/helpers.ts,web/e2e/e2e-run-reporter.ts,web/server.py] web/e2e/build_real_nebula.sh && pnpm --dir web/app build && pnpm --dir web/app test:e2e board.spec.ts board-artifacts.spec.ts && pnpm --dir web/app test:e2e --project real
 [scripts/**] sh scripts/sync-skills.test.sh
 [.agents/skills/verify-nebula/*] bash .agents/skills/verify-nebula/test-vn.sh
 [AGENTS.md,.agents/context-budget.json,.agents/skills/**,crates/nebula-daemon/src/hooks/**,crates/nebula-daemon/examples/hook_lines.rs] $HOME/Projects/perseu-stack/bin/context-budget check
