@@ -1445,9 +1445,19 @@ fn artifact_add_links_caller() {
     let run = e2e_run(&env.tmp.path().join("run"), "shots/open.png");
     let host = nebula_core::host::hostname();
 
-    for (dir, kind, entry) in [
-        (&recap, "recap", "index.html"),
-        (&run, "e2e-run", "result.json"),
+    for (dir, kind, entry, files) in [
+        (
+            &recap,
+            "recap",
+            "index.html",
+            ["index.html", "assets/app.css"],
+        ),
+        (
+            &run,
+            "e2e-run",
+            "result.json",
+            ["result.json", "shots/open.png"],
+        ),
     ] {
         let added = publish(&env, Some(&agent), &[dir.to_str().unwrap(), "--kind", kind]);
         assert_eq!(added["kind"], kind);
@@ -1467,10 +1477,13 @@ fn artifact_add_links_caller() {
             serde_json::json!({"host": host, "entry": entry})
         );
         assert_eq!(shown, added);
-        assert!(
-            env.stored(id).join(entry).is_file(),
-            "{kind} entry not stored"
-        );
+        for file in files {
+            assert_eq!(
+                std::fs::read(env.stored(id).join(file)).ok(),
+                std::fs::read(dir.join(file)).ok(),
+                "{kind}: stored {file} differs from the fixture"
+            );
+        }
     }
     let on_card = env.json(&["todo", "show", "#1", "--json"]);
     assert_eq!(
@@ -1535,12 +1548,12 @@ fn artifact_add_refusals() {
     let invalid = tree(&root.join("invalid"), &[("result.json", b"{\"title\": 1}")]);
     let big = tree(&root.join("big"), &[("index.html", &[b'x'; 2048])]);
 
-    for (dir, kind) in [
-        (&linked, "recap"),
-        (&escape, "e2e-run"),
-        (&missing, "e2e-run"),
-        (&invalid, "e2e-run"),
-        (&big, "recap"),
+    for (dir, kind, why) in [
+        (&linked, "recap", "symlink"),
+        (&escape, "e2e-run", "not in the run"),
+        (&missing, "e2e-run", "not in the run"),
+        (&invalid, "e2e-run", "result.json"),
+        (&big, "recap", "artifact cap"),
     ] {
         let out = env.cli(
             &[
@@ -1553,8 +1566,7 @@ fn artifact_add_refusals() {
             ],
             None,
         );
-        assert!(!out.status.success(), "{dir:?} was stored");
-        assert!(out.stdout.is_empty(), "{dir:?}");
+        refused(&out, why);
     }
     assert!(artifact_ids(&env).is_empty());
     let leftovers: Vec<_> = std::fs::read_dir(env.data_dir().join("artifacts"))
