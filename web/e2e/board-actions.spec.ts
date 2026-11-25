@@ -179,7 +179,25 @@ test("on a first visit each waiting session has its own approve button, which an
   expect([response.ok(), response.request().postDataJSON()]).toEqual([true, { session: REVIEWER, host: "leaseweb", expectedStatusAt: waitingSince }]);
   await polledAfterThis(page);
   await expect(strip.getByRole("button", { name: /^Aprobă/ })).toHaveText(["Aprobă worker"]);
-  expect(readBoard().details[CARD].sessions.map((s) => s.status)).toEqual(["needs_feedback", "running"]);
+  expect(sends().filter((s) => "approve" in s)).toEqual([{ approve: REVIEWER, card: "#12@leaseweb" }]);
+});
+
+test("an approved session offers no second approval until its host reports it moved on, and does again once it waits anew", async ({ page }) => {
+  const waitingSince = 1764000600000;
+  waiting(waitingSince);
+  await open(page, "/board");
+  const approvals = page.getByRole("button", { name: /^Aprobă/ });
+  const approved = page.waitForResponse((r) => r.url().endsWith("/approve"));
+  await approvals.click();
+  expect((await approved).ok()).toBe(true);
+  await polledAfterThis(page);
+  await expect(approvals).toHaveCount(0);
+  writeBoard((board) => Object.assign(board.details[CARD].sessions[0], { status: "running", status_changed_at: waitingSince + 1000 }));
+  addCard(91, "Second poll marker");
+  await expect(tile(page, "Second poll marker")).toBeVisible();
+  await expect(approvals).toHaveCount(0);
+  waiting(waitingSince + 2000);
+  await expect(approvals).toHaveText(["Aprobă worker"]);
 });
 
 test("the away digest names the waiting card, and after caught up the strip still offers its approval", async ({ page }) => {

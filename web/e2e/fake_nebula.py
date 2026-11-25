@@ -178,8 +178,8 @@ def board_command(verb, args, board):
         session = next((s for s in board["details"].get(card["id"], {}).get("sessions", []) if s["id"] == flags("--session")), None)
         if session is None or str(session["status_changed_at"]) != flags("--expected-status-at"):
             return 6, "the session changed meanwhile"
-        session["status"], session["status_changed_at"] = "running", int(time.time() * 1000)
-        board["away"]["needs_you"] = [e for e in board["away"]["needs_you"] if e["id"] != session["id"]]
+        with open(STATE / "sends.log", "a") as handle:
+            handle.write(json.dumps({"approve": session["id"], "card": card["ref"]}) + "\n")
         return 0, {"dispatch": None, "state": "started", "session": {"host": session["host"], "id": session["id"]}, "card": card["id"]}
     else:
         return 2, f"unsupported fake board verb: {verb}"

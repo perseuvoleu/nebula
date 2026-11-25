@@ -30,6 +30,9 @@ import { WriterSlots } from "./WriterSlots";
 
 const LAST_SEEN = "nebula-board-last-seen";
 
+/** An approval answers one waiting state, so it stays hidden until the session leaves needs_you or waits anew. */
+const approval = (w: NeedsYou) => `approve:${w.host}/${w.id}@${w.status_changed_at}`;
+
 type RawCard = BoardData["cards"][number];
 
 type Decision = { id: string; title: string; card: string | null; project: string | null; session: SessionLink | null;
@@ -170,7 +173,7 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
-  useEffect(() => setOverlay((old) => reconcile(old, readAt)), [readAt]);
+  useEffect(() => setOverlay((old) => reconcile(old, readAt, (key) => (board?.needs_you ?? []).some((w) => approval(w) === key))), [readAt, board]);
   const optimistic = (key: string, patch: Partial<RawCard>, request: Promise<unknown>) => {
     const token = ulid();
     setActionError(null);
@@ -204,7 +207,7 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
   const toggle = <T,>(list: T[], name: T) => list.includes(name) ? list.filter((n) => n !== name) : [...list, name];
 
   const live = (board?.cards ?? []).map((c) => ({ ...c, ...patchOf(overlay, c.ref) })).filter((c) => !c.archived);
-  const waiting = (board?.needs_you ?? []).filter((w) => !patchOf(overlay, w.id));
+  const waiting = (board?.needs_you ?? []).filter((w) => !patchOf(overlay, approval(w)));
   const all = live.map((c) => ({ ...toBoardCard(c, live), needsYou: waiting.some((w) => w.card === c.id), age: activityAge(c.updated_at, Date.now()) }));
   const scoped = all.filter((c) => inScope(c, scope));
   const cards = scoped.filter((c) => !c.proposed);
@@ -241,7 +244,7 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
   };
   const waitingCards = cards.filter((c) => c.needsYou);
   const approve = (ref: string, session: NeedsYou) =>
-    optimistic(session.id, {}, cardAction(ref, "approve", { session: session.id, host: session.host, expectedStatusAt: session.status_changed_at }));
+    optimistic(approval(session), {}, cardAction(ref, "approve", { session: session.id, host: session.host, expectedStatusAt: session.status_changed_at }));
   const approveButtons = (card: BoardCard) => waiting.filter((w) => w.card === live.find((c) => c.ref === card.ref)?.id).map((w) => (
     <Button key={`${w.host}/${w.id}`} type="button" variant="outline" size="xs" onClick={() => approve(card.ref, w)}>Aprobă {w.name}</Button>
   ));

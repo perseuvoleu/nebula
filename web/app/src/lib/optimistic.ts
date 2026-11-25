@@ -9,9 +9,9 @@ export const settle = <P>(pending: Pending<P>[], token: string, at: number): Pen
 
 export const drop = <P>(pending: Pending<P>[], token: string): Pending<P>[] => pending.filter((p) => p.token !== token);
 
-/** Releases every write that a read begun at `readAt` already includes. */
-export function reconcile<P>(pending: Pending<P>[], readAt: number): Pending<P>[] {
-  const kept = pending.filter((p) => p.settledAt === undefined || p.settledAt >= readAt);
+/** Releases every write that a read begun at `readAt` already includes, except those the read still `holds`. */
+export function reconcile<P>(pending: Pending<P>[], readAt: number, holds: (key: string) => boolean = () => false): Pending<P>[] {
+  const kept = pending.filter((p) => p.settledAt === undefined || p.settledAt >= readAt || holds(p.key));
   return kept.length === pending.length ? pending : kept;
 }
 

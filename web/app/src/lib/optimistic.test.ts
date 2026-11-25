@@ -8,6 +8,12 @@ test("a settled write keeps its patch through a read that began before it, and a
   assert.deepEqual(reconcile(pending, 1001), []);
 });
 
+test("a settled write that the read still holds survives it, and the first read that no longer holds it releases it", () => {
+  const pending = settle(propose([], "a", "s1@100", {}), "a", 1000);
+  assert.equal(reconcile(pending, 2000, (key) => key === "s1@100").length, 1);
+  assert.deepEqual(reconcile(pending, 3000, (key) => key === "s1@200"), []);
+});
+
 test("an unsettled write survives every read", () => {
   assert.equal(reconcile(propose([], "a", "#13", { stage: "review" }), 5000).length, 1);
 });
