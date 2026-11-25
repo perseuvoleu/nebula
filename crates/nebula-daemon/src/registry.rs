@@ -2514,17 +2514,21 @@ impl Daemon {
         };
         self.store
             .insert_agent_with_auto_title(&agent, auto_title)?;
-        if let Some(host) = &link.parent_host {
-            self.store.set_spawned_by_host(&agent.id, host)?;
+        let launched = match &link.parent_host {
+            Some(host) => self.store.set_spawned_by_host(&agent.id, host),
+            None => Ok(()),
         }
-        if adopted.is_none() {
+        .and_then(|()| match adopted.is_some() {
+            true => Ok(()),
             // Cold path: boot the CLI right away.
-            if let Err(e) =
-                self.spawn_agent_session_with_prompt(&agent, &worktree, 80, 24, prompt.as_deref())
-            {
-                self.store.delete_agent(&agent.id)?;
-                return Err(e);
-            }
+            false => self
+                .spawn_agent_session_with_prompt(&agent, &worktree, 80, 24, prompt.as_deref())
+                .map(drop),
+        });
+        if let Err(e) = launched {
+            // A dispatch rerun replays any row it finds as started.
+            self.store.delete_agent(&agent.id)?;
+            return Err(e);
         }
         let mut broadcast_agent = agent.clone();
         broadcast_agent.alive = true;
