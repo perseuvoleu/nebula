@@ -55,7 +55,12 @@ export function CardDetail({ card, log, mode, actions, proposalActions, onOpenCa
         <dt className="text-xs text-muted-foreground">Checkout</dt>
         <dd className="flex min-w-0 flex-wrap items-center gap-1">
           {card.checkout
-            ? <><Tag className="font-mono"><GitBranchIcon aria-hidden className="size-3 shrink-0" /><span className="truncate">{card.checkout.branch}</span></Tag><span className="font-mono text-xs text-muted-foreground">@{card.checkout.host}</span></>
+            ? <>
+              <Tag className="font-mono"><GitBranchIcon aria-hidden className="size-3 shrink-0" /><span className="truncate">{card.checkout.branch}</span></Tag>
+              <span className="font-mono text-xs text-muted-foreground">@{card.checkout.host}</span>
+              {card.checkout.worktree && <Tag>worktree</Tag>}
+              <span className="w-full truncate font-mono text-xs text-muted-foreground" title={card.checkout.path}>{card.checkout.path}</span>
+            </>
             : <span className="text-muted-foreground">Niciunul</span>}
         </dd>
         <dt className="text-xs text-muted-foreground">Blocat de</dt>

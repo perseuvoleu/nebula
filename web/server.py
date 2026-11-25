@@ -34,7 +34,7 @@ STATIC = Path(__file__).parent / "static"
 KINDS = {"pi", "claude", "codex", "cursor"}
 ATTEMPT = re.compile(r"[A-Za-z0-9_-]{4,64}")
 ROUTE = re.compile(r"/(?:serverless|p/[A-Za-z0-9._@-]{1,80}(?:/s/[A-Za-z0-9._-]{1,80})?"
-                   r"|board(?:/p/[A-Za-z0-9._@-]{1,80}|/c/[A-Za-z0-9._@%-]{1,80}|/decisions(?:/p/[A-Za-z0-9._@-]{1,80})?)?)?/?")
+                   r"|board(?:/decisions(?:/p/[A-Za-z0-9._@-]{1,80}|/home)?|(?:/p/[A-Za-z0-9._@-]{1,80}|/home)?(?:/c/[A-Za-z0-9._@%-]{1,80})?))?/?")
 ASSET_TYPES = {".html": "text/html", ".js": "text/javascript", ".css": "text/css", ".svg": "image/svg+xml",
                ".png": "image/png", ".ico": "image/x-icon", ".webmanifest": "application/manifest+json",
                ".json": "application/json", ".woff2": "font/woff2", ".woff": "font/woff", ".txt": "text/plain",
@@ -528,10 +528,13 @@ class Gateway:
         if path.startswith("/api/cards/"):
             return self.card(unquote(path[len("/api/cards/"):]))
         if path == "/api/decisions":
-            text = query.get("query", [None])[0]
+            text, page = (query.get(k, [None])[0] for k in ("query", "page"))
             if text is not None and (len(text) > 200 or "\0" in text):
                 raise Problem(400, "Invalid search")
-            return self.board("decision", "list", *self.scope(), *([f"--query={text}"] if text else []))
+            if page is not None and not PAGE.fullmatch(page):
+                raise Problem(400, "Invalid page")
+            return self.board("decision", "list", *self.scope(), *([f"--query={text}"] if text else []),
+                              *([f"--page={page}"] if page else []))
         project = self.project(query.get("project", [None])[0])
         first = {k: v[0] for k, v in query.items()}
         if path == "/api/sessions":

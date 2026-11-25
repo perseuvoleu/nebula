@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { awayDigest, byStage, cardDot, inScope, isBlocked, sidebarProjects, toBoardCard, writerSlots, type BoardData, type Card, type SidebarScope } from "./board.ts";
+import { awayDigest, byStage, cardDot, hostProjects, inScope, isBlocked, sessionProject, sidebarProjects, toBoardCard, writerSlots, type BoardData, type Card, type SidebarScope } from "./board.ts";
 
 const card = (number: number, stage: Card["stage"], blocked_by: string[] = []): Card => ({
   id: `01JD${String(number).padStart(22, "0")}`, number, ref: `#${number}@leaseweb`, title: `Card ${number}`, stage,
@@ -80,4 +80,13 @@ test("awayDigest lists the finished cards, the cards waiting since last seen and
   assert.deepEqual(listed({ kind: "project", project: null }), [[], [], [], true]);
   const onlyNeedsYou = { ...board, away: { ...board.away, finished: [], decisions: [] } };
   assert.equal(awayDigest(onlyNeedsYou, { kind: "all" }, decisions).empty, false);
+});
+
+test("a session is listed under its bare project on this gateway's host and under project@host for an anchored remote", () => {
+  const workspace = { host: "leaseweb", projects: ["nebula", "vela@findl"] };
+  assert.equal(sessionProject("nebula", "leaseweb", workspace), "nebula");
+  assert.equal(sessionProject("vela", "findl", workspace), "vela@findl");
+  assert.equal(sessionProject("nebula", "findl", workspace), null, "a host the gateway does not anchor has no session page here");
+  assert.deepEqual(hostProjects("findl", workspace), ["vela@findl"]);
+  assert.deepEqual(hostProjects("leaseweb", workspace), ["nebula"]);
 });

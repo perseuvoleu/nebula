@@ -74,6 +74,39 @@ export async function noHorizontalOverflow(page: Page) {
   expect(overflow.body, "body must not scroll horizontally").toBeLessThanOrEqual(0);
 }
 
+export type BoardState = { version: number; cards: Record<string, unknown>[]; decisions: Record<string, unknown>[];
+  details: Record<string, { sessions: Record<string, unknown>[]; artifacts: Record<string, unknown>[]; log: unknown[] }> };
+
+export function readBoardState(): BoardState {
+  return JSON.parse(fs.readFileSync(path.join(STATE, "board.json"), "utf8"));
+}
+
+/** Change the fake host's board the way a daemon write does: one version bump per change. */
+export function changeBoard(change: (board: BoardState) => void): void {
+  const board = readBoardState();
+  change(board);
+  board.version += 1;
+  const temporary = path.join(STATE, ".board.json.helper");
+  fs.writeFileSync(temporary, JSON.stringify(board));
+  fs.renameSync(temporary, path.join(STATE, "board.json"));
+}
+
+/** Store an artifact's files where the gateway serves them (NEBULA_WEB_ARTIFACTS/<id>/). */
+export function storeArtifact(id: string, files: Record<string, string | Buffer>): void {
+  for (const [name, bytes] of Object.entries(files)) {
+    const file = path.join(STATE, "artifacts", id, name);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, bytes);
+  }
+}
+
+export async function openBoard(page: Page, url: string) {
+  await page.goto(url);
+  await page.getByLabel("Token de acces").fill(TOKEN);
+  await page.getByRole("button", { name: "Conectare" }).click();
+  await expect(page.getByLabel("Token de acces")).toHaveCount(0);
+}
+
 export async function shot(page: Page, name: string) {
   fs.mkdirSync(SHOTS, { recursive: true });
   await page.screenshot({ path: path.join(SHOTS, `${name}.png`), fullPage: false });

@@ -22,7 +22,7 @@ export type BoardSession = {
   writer: boolean;
 };
 
-export type CardCheckout = { host: string; branch: string };
+export type CardCheckout = { host: string; branch: string; path: string; worktree: boolean };
 
 export type BlockerRef = { ref: string; title: string };
 
@@ -131,7 +131,22 @@ export type CardSession = {
 
 export type CardNote = { id: string; card: string; text: string; author: Author; created_at: number };
 
-export type Artifact = { id: string; kind: string; title: string; created_at: number; src?: string };
+export type SessionLink = { host: string; id: string; name: string };
+
+export type ArtifactContent = { host: string; entry: string } | { url: string } | { body: string };
+
+export type Artifact = {
+  id: string;
+  kind: string;
+  title: string;
+  card: string | null;
+  project: string | null;
+  session: SessionLink | null;
+  content: ArtifactContent;
+  created_at: number;
+  /** Minted by the gateway when it stores the files: /a/<grant>/<id>/<entry>. */
+  src?: string;
+};
 
 export type CardShow = Card & { sessions: CardSession[]; artifacts: Artifact[]; log: CardNote[] };
 
@@ -156,7 +171,7 @@ export const writerSlots = (hosts: BoardHost[]): HostSlots[] =>
   hosts.map((h) => ({ host: h.host, writers: h.writers, slots: h.writer_slots }));
 
 const inProject = (project: string | null, scope: SidebarScope): boolean =>
-  scope.kind === "all" || scope.kind === "needs" || project === scope.project;
+  scope.kind === "all" || scope.kind === "needs" || scope.kind === "all-decisions" || project === scope.project;
 
 export function awayDigest<D extends { id: string; project: string | null }>(board: BoardData, scope: SidebarScope, known: D[]):
   { finished: Card[]; waiting: Card[]; decisions: D[]; empty: boolean } {
@@ -176,7 +191,7 @@ export function toBoardCard(card: Card, cards: Card[], show?: CardShow): BoardCa
     proposedBy: card.proposed ? card.created_by.name : null,
     needsYou: !!sessions?.some((s) => s.status === "needs_feedback"),
     blockers: openBlockers(card, cards),
-    checkout: card.checkout && { host: card.checkout.host, branch: card.checkout.branch },
+    checkout: card.checkout,
     sessions: sessions?.map((s) => ({ id: s.id, host: s.host, name: s.name, role: s.role ?? "—", kind: s.kind, status: s.status, writer: s.writer })) ?? null,
     artifacts: show?.artifacts.length ?? 0,
     age: "",
@@ -200,7 +215,8 @@ export type SidebarScope =
   | { kind: "needs" }
   | { kind: "project"; project: string | null }
   | { kind: "checkout"; project: string | null; host: string | null; branch: string }
-  | { kind: "decisions"; project: string | null };
+  | { kind: "decisions"; project: string | null }
+  | { kind: "all-decisions" };
 
 export function sidebarProjects(board: BoardData): SidebarProject[] {
   const projects = new Map<string | null, SidebarProject>();
@@ -225,7 +241,8 @@ export function sidebarProjects(board: BoardData): SidebarProject[] {
 
 export function inScope(card: BoardCard, scope: SidebarScope): boolean {
   switch (scope.kind) {
-    case "all": return true;
+    case "all":
+    case "all-decisions": return true;
     case "needs": return card.needsYou;
     case "checkout": return card.project === scope.project && card.checkout?.branch === scope.branch
       && (scope.host === null || card.checkout.host === scope.host);
@@ -247,3 +264,14 @@ export function sortCards(cards: BoardCard[], sort: TableSort): BoardCard[] {
   const value = SORT_VALUE[sort.key];
   return [...cards].sort((a, b) => (value(a) < value(b) ? -1 : value(a) > value(b) ? 1 : 0) * (sort.asc ? 1 : -1));
 }
+
+export type Workspace = { projects: string[]; host: string };
+
+/** The gateway project that lists a session: its bare name on this host, name@host for a remote the gateway anchors. */
+export function sessionProject(project: string, host: string, workspace: Workspace): string | null {
+  const key = host === workspace.host ? project : `${project}@${host}`;
+  return workspace.projects.includes(key) ? key : null;
+}
+
+export const hostProjects = (host: string, workspace: Workspace): string[] =>
+  workspace.projects.filter((p) => host === workspace.host ? !p.includes("@") : p.endsWith(`@${host}`));

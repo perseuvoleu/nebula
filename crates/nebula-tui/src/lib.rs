@@ -11,6 +11,7 @@ pub mod branches;
 pub mod collect_cli;
 pub mod completion;
 pub mod config;
+pub mod decision_cli;
 pub mod diagram_cli;
 pub mod diagrams;
 pub mod event_loop;
@@ -107,9 +108,18 @@ pub fn run_open_on_host(
     project: Option<&str>,
     focus: bool,
 ) -> Result<i32> {
+    run_on_host(
+        host,
+        session_open::open_on_argv(host, reference, project, focus)?,
+    )
+}
+
+/// Runs an ssh argv from [`session_open::ssh_argv`] and passes the remote
+/// command's output through. The exit code to leave with: 3 when HOST is
+/// unreachable, else the remote command's.
+pub(crate) fn run_on_host(host: &str, argv: Vec<String>) -> Result<i32> {
     use anyhow::Context;
     use std::io::Write;
-    let argv = session_open::open_on_argv(host, reference, project, focus)?;
     let out = std::process::Command::new("ssh")
         .args(&argv)
         .stdin(std::process::Stdio::null())
@@ -122,6 +132,51 @@ pub fn run_open_on_host(
             String::from_utf8_lossy(&out.stderr).trim()
         );
         return Ok(3);
+    }
+    std::io::stdout().write_all(&out.stdout)?;
+    std::io::stdout().flush()?;
+    std::io::stderr().write_all(&out.stderr)?;
+    Ok(out.status.code().unwrap_or(1))
+}
+
+/// What ssh's own last `ssh:` line starts with when it failed before the
+/// remote command could start; other stderr lines may come from the far side.
+const SSH_NOT_CONNECTED: [&str; 2] = ["ssh: connect to host", "ssh: Could not resolve hostname"];
+
+/// As [`run_on_host`], for a command with effects: exit 3 only when ssh
+/// failed before the command could start, else 4 with `rerun` named, as
+/// the command may have run.
+pub(crate) fn run_effect_on_host(host: &str, argv: Vec<String>, rerun: &str) -> Result<i32> {
+    use anyhow::Context;
+    use nebula_core::board::Refusal;
+    use std::io::Write;
+    let out = std::process::Command::new("ssh")
+        .args(&argv)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .context("run ssh")?;
+    if matches!(out.status.code(), Some(255) | None) {
+        let why = String::from_utf8_lossy(&out.stderr);
+        let ssh_said = why.lines().rev().find(|l| l.starts_with("ssh:"));
+        let why = match out.status.code() {
+            Some(_) => why.trim().to_string(),
+            None => format!("{} {}", out.status, why.trim()),
+        };
+        let why = why.trim();
+        if out.status.code().is_some()
+            && ssh_said.is_some_and(|l| SSH_NOT_CONNECTED.iter().any(|m| l.starts_with(m)))
+        {
+            eprintln!(
+                "nebula: {}",
+                Refusal::Unreachable.message(format!("host {host} is unreachable: {why}"))
+            );
+            return Ok(3);
+        }
+        eprintln!(
+            "nebula: {} {rerun}",
+            Refusal::OutcomeUnknown.message(format!("ssh to {host} broke off: {why}"))
+        );
+        return Ok(4);
     }
     std::io::stdout().write_all(&out.stdout)?;
     std::io::stdout().flush()?;
@@ -151,19 +206,7 @@ pub fn run_add_project(path: String) -> Result<()> {
     runtime()?.block_on(ipc::add_project(path))
 }
 
-pub use ipc::{NewAgentOpts, NotesOp, TodoOp, WorkspaceOp};
-
-/// `nebula notes [list|add|done]` — project/worktree notes from the CLI,
-/// agents included (see `ipc::run_notes`).
-pub fn run_notes(op: NotesOp) -> Result<()> {
-    runtime()?.block_on(ipc::run_notes(op))
-}
-
-/// `nebula todo done|reopen|note-done` — the legacy positional todo verbs
-/// (see `ipc::run_todo`).
-pub fn run_todo(op: TodoOp) -> Result<()> {
-    runtime()?.block_on(ipc::run_todo(op))
-}
+pub use ipc::{NewAgentOpts, WorkspaceOp};
 
 /// `nebula todo` card verbs on the board (see `board_cli::run`).
 pub fn run_board(verb: board_cli::TodoVerb, json: bool) -> Result<()> {
@@ -173,6 +216,11 @@ pub fn run_board(verb: board_cli::TodoVerb, json: bool) -> Result<()> {
 /// `nebula artifact`: exits 5 for an unknown artifact or card.
 pub fn run_artifact(verb: artifact_cli::ArtifactVerb, json: bool) -> Result<()> {
     board_cli::exit_on_refusal(runtime()?.block_on(artifact_cli::run(verb, json)))
+}
+
+/// `nebula decision`: exits 5 for an unknown decision or card.
+pub fn run_decision(verb: decision_cli::DecisionVerb, json: bool) -> Result<()> {
+    board_cli::exit_on_refusal(runtime()?.block_on(decision_cli::run(verb, json)))
 }
 
 /// `nebula worktree new` — agent-facing orchestration verb.
@@ -234,7 +282,10 @@ pub fn run_switch(
 /// is the checkout's writer and `--writer` was passed without `--force-writer`.
 pub fn run_agent_new(opts: NewAgentOpts) -> Result<()> {
     match runtime()?.block_on(ipc::agent_new(opts)) {
-        Err(why) if why.to_string().contains(nebula_core::WRITER_HELD_REFUSAL) => {
+        Err(why)
+            if nebula_core::board::Refusal::of(&why.to_string())
+                == Some(nebula_core::board::Refusal::WriterHeld) =>
+        {
             eprintln!("{why:#}");
             std::process::exit(2);
         }
@@ -245,11 +296,6 @@ pub fn run_agent_new(opts: NewAgentOpts) -> Result<()> {
 /// `nebula worktree list` — JSON map of the checkouts and who lives on them.
 pub fn run_worktree_list(project: Option<String>, all: bool) -> Result<()> {
     runtime()?.block_on(ipc::worktree_list(project, all))
-}
-
-/// Best-effort preview bookmark used after a successful host-local promotion.
-pub fn pin_checkout_link(checkout: &std::path::Path, url: &str) -> Result<()> {
-    runtime()?.block_on(ipc::pin_checkout_link(checkout, url))
 }
 
 /// `nebula agent list` — the delegating session's JSON view of its workers.

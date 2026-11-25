@@ -130,6 +130,18 @@ impl BoardLink {
         }
     }
 
+    /// One Board request on the daemon's own behalf, such as a host report.
+    pub async fn request(&self, op: BoardOp) -> Result<BoardResult> {
+        let (tx, mut rx) = mpsc::channel(1);
+        let client = RelayClient::new(tx, CancellationToken::new());
+        self.forward(0, op, &client).await;
+        match rx.recv().await {
+            Some(ServerEvent::BoardReply { result, .. }) => Ok(result),
+            Some(ServerEvent::Error { message, .. }) => bail!("{message}"),
+            other => bail!("board host {} answered {other:?}", self.host),
+        }
+    }
+
     async fn connect_now(&self) {
         let mut state = self.state.subscribe();
         let seen = *state.borrow_and_update();
@@ -263,6 +275,7 @@ async fn connect_and_pump(
         });
     }
     tracing::info!(host = %link.host, "board link up");
+    crate::board_report::resend();
     let mut tick = tokio::time::interval(Duration::from_secs(5));
     loop {
         let frame = {

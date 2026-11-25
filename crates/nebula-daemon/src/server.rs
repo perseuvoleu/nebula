@@ -98,6 +98,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
     // Per-connection attach state: forward-task handles keyed by session.
     let mut attached: HashMap<SessionRef, tokio::task::JoinHandle<()>> = HashMap::new();
     let mut handshaken = false;
+    let mut reporting: Option<String> = None;
 
     let result: Result<()> = tokio::select! {
         _ = closed.cancelled() => Ok(()),
@@ -139,12 +140,19 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         tokio::spawn(async move { link.forward(req_id, op, &client).await });
                         continue;
                     }
+                    let mut refreshed = false;
+                    if let (Some(_), nebula_core::board::BoardOp::Report(report), None) = (&board, &op, &reporting) {
+                        refreshed = crate::board::link_opened(&report.host);
+                        reporting = Some(report.host.clone());
+                    }
                     let daemon = daemon.clone();
                     let out_tx = out_tx.clone();
                     tokio::spawn(async move {
                         let served = tokio::task::spawn_blocking(move || {
                             match board {
                                 None => Err(anyhow::anyhow!("no board configured")),
+                                Some(_) if refreshed => crate::board::bump_now(&daemon.store)
+                                    .and_then(|()| crate::board::serve(&daemon.store, op)),
                                 Some(_) => crate::board::serve(&daemon.store, op),
                             }
                         })
@@ -180,9 +188,6 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                         worktrees: vec![],
                         agents: vec![],
                         terminals: vec![],
-                        notes: vec![],
-                        todos: vec![],
-                        links: vec![],
                         pr_seen: vec![],
                         ui_state: None,
                     });
@@ -723,76 +728,6 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     )
                     .await;
                 }
-                ClientRequest::CreateNote {
-                    req_id,
-                    owner,
-                    text,
-                } => {
-                    reply(&out_tx, req_id, daemon.create_note(&owner, &text).map(Some)).await;
-                }
-                ClientRequest::UpdateNote { req_id, id, text } => {
-                    reply(
-                        &out_tx,
-                        req_id,
-                        daemon.update_note(&id, &text).map(|_| None),
-                    )
-                    .await;
-                }
-                ClientRequest::SetNoteDone { req_id, id, done } => {
-                    reply(
-                        &out_tx,
-                        req_id,
-                        daemon.set_note_done(&id, done).map(|_| None),
-                    )
-                    .await;
-                }
-                ClientRequest::DeleteNote { req_id, id } => {
-                    reply(&out_tx, req_id, daemon.delete_note(&id).map(|_| None)).await;
-                }
-                ClientRequest::CreateTodo {
-                    req_id,
-                    owner,
-                    text,
-                } => {
-                    reply(&out_tx, req_id, daemon.create_todo(&owner, &text).map(Some)).await;
-                }
-                ClientRequest::UpdateTodo { req_id, id, text } => {
-                    reply(
-                        &out_tx,
-                        req_id,
-                        daemon.update_todo(&id, &text).map(|_| None),
-                    )
-                    .await;
-                }
-                ClientRequest::SetTodoDone { req_id, id, done } => {
-                    reply(
-                        &out_tx,
-                        req_id,
-                        daemon.set_todo_done(&id, done).map(|_| None),
-                    )
-                    .await;
-                }
-                ClientRequest::DeleteTodo { req_id, id } => {
-                    reply(&out_tx, req_id, daemon.delete_todo(&id).map(|_| None)).await;
-                }
-                ClientRequest::CreateLink {
-                    req_id,
-                    worktree,
-                    url,
-                } => {
-                    reply(
-                        &out_tx,
-                        req_id,
-                        daemon.create_link(&worktree, &url).map(Some),
-                    )
-                    .await;
-                }
-                ClientRequest::UpdateLink { req_id, id, url } => {
-                    reply(&out_tx, req_id, daemon.update_link(&id, &url).map(|_| None)).await;
-                }
-                ClientRequest::DeleteLink { req_id, id } => {
-                    reply(&out_tx, req_id, daemon.delete_link(&id).map(|_| None)).await;
-                }
                 ClientRequest::RenameTerminal { req_id, id, name } => {
                     reply(
                         &out_tx,
@@ -804,11 +739,26 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                 ClientRequest::CloseTerminal { req_id, id } => {
                     reply(&out_tx, req_id, daemon.close_terminal(&id).map(|_| None)).await;
                 }
+                ClientRequest::ApproveSession {
+                    req_id,
+                    id,
+                    expected_status_at,
+                } => {
+                    reply(
+                        &out_tx,
+                        req_id,
+                        daemon.approve(&id, expected_status_at).map(|_| None),
+                    )
+                    .await;
+                }
             }
         }
         Ok(())
         } => result,
     };
+    if let Some(host) = reporting {
+        crate::board::link_closed(&host, daemon.store.clone());
+    }
 
     for (sref, h) in attached.drain() {
         h.abort();

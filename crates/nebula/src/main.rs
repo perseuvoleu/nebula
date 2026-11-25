@@ -141,12 +141,6 @@ enum Command {
         #[command(subcommand)]
         command: DiagramCommand,
     },
-    /// Read or edit the notes for the current project/worktree (agents can
-    /// too — inside a session the target is the session's own project).
-    Notes {
-        #[command(subcommand)]
-        command: Option<NotesCommand>,
-    },
     /// Cards on the board: add, move and work them (--json for agents).
     /// A daemon without a `board` key refuses every card verb.
     Todo {
@@ -159,6 +153,12 @@ enum Command {
     Artifact {
         #[command(subcommand)]
         command: ArtifactCommand,
+    },
+    /// Record why a choice was made, on the caller's card: an artifact of
+    /// kind decision that the board host also copies to RAG.
+    Decision {
+        #[command(subcommand)]
+        command: DecisionCommand,
     },
     /// Install an agent CLI's nebula status hooks into a checkout — what
     /// the daemon does before every spawn; run on the far host by a remote
@@ -439,6 +439,10 @@ enum AgentCommand {
         /// worker, review, fix, verify or research.
         #[arg(long, value_parser = parse_role)]
         role: Option<Role>,
+        /// The `todo run` dispatch this spawn fulfils; a repeat answers with
+        /// the session that dispatch already started.
+        #[arg(long, value_name = "ID")]
+        dispatch: Option<String>,
         /// Accepted for symmetry with the board verbs; the output is JSON anyway.
         #[arg(long)]
         json: bool,
@@ -638,23 +642,6 @@ enum DiagramCommand {
 }
 
 #[derive(Subcommand)]
-enum NotesCommand {
-    /// List the project's notes, then the current worktree's (the default).
-    List,
-    /// Add a note to the project's list (--worktree for the checkout's own).
-    Add {
-        /// The note; multiple words need no quotes.
-        #[arg(required = true, num_args = 1..)]
-        text: Vec<String>,
-        /// Add to the current worktree's list instead of the project's.
-        #[arg(long)]
-        worktree: bool,
-    },
-    /// Check a note off, by its number in `nebula notes`.
-    Done { index: usize },
-}
-
-#[derive(Subcommand)]
 enum TodoCommand {
     /// Add a card to the board (default project: the caller's own).
     Add {
@@ -806,16 +793,51 @@ enum TodoCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Check a legacy todo off, by its number in the old todo list.
-    Done { index: usize },
-    /// Bring a checked-off legacy todo back.
-    Reopen { index: usize },
-    /// Check a legacy todo's note off.
-    NoteDone {
-        /// The todo's number in the old todo list.
-        index: usize,
-        /// The note's number under it.
-        note: usize,
+    /// Start a session on a card: refused (exit 6) for an archived, blocked
+    /// or home card, or when the checkout's writer is taken. A rerun with
+    /// the same --dispatch answers with the session it already started.
+    Run {
+        card: String,
+        #[arg(long, value_parser = parse_role)]
+        role: Role,
+        /// claude | codex | cursor | pi | antigravity.
+        #[arg(long)]
+        kind: String,
+        /// The host to run on.
+        #[arg(long, default_value = "leaseweb")]
+        host: String,
+        /// `new` for a fresh worktree, or a branch.
+        #[arg(long)]
+        worktree: String,
+        /// The dispatch's ULID, so a rerun spawns nothing twice.
+        #[arg(long)]
+        dispatch: Option<String>,
+        /// Set on the hop to the target host, which then never forwards again.
+        #[arg(long, hide = true)]
+        forwarded: bool,
+        /// With --parent-id, the spawning session on the host that forwarded the run.
+        #[arg(long, hide = true, requires = "parent_id")]
+        parent_host: Option<String>,
+        #[arg(long, hide = true, requires = "parent_host")]
+        parent_id: Option<String>,
+        #[command(flatten)]
+        scope: WriteScopeArgs,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Answer a card's waiting session with its approval key, only while its
+    /// status is still the one stamped --expected-status-at (else exit 6).
+    Approve {
+        card: String,
+        #[arg(long)]
+        session: String,
+        /// The session's status_changed_at, as `todo show` printed it.
+        #[arg(long)]
+        expected_status_at: i64,
+        #[command(flatten)]
+        scope: WriteScopeArgs,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -876,6 +898,52 @@ enum ArtifactCommand {
     Open { id: String },
     /// Hide it from lists; `show` still reports it, and the bytes stay.
     Rm {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum DecisionCommand {
+    /// Record a decision, linked to the caller's card, session and checkout.
+    Add {
+        /// What was decided.
+        what: String,
+        /// Why.
+        #[arg(long)]
+        why: Option<String>,
+        /// Link this card instead of the caller's (#12, 12 or a ULID).
+        #[arg(long, conflicts_with = "project")]
+        card: Option<String>,
+        /// Record it on this project with no card.
+        #[arg(long)]
+        project: Option<String>,
+        /// Record it in no project and on no card, wherever it runs.
+        #[arg(long, conflicts_with_all = ["card", "project"])]
+        home: bool,
+        /// The decision's ULID, so a rerun records nothing twice.
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List decisions (default: the caller's project, else all).
+    List {
+        #[command(flatten)]
+        scope: ScopeArgs,
+        /// Only those whose what or why holds this text.
+        #[arg(long)]
+        query: Option<String>,
+        /// Continue from a previous reply's `next`.
+        #[arg(long)]
+        page: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// One decision, with meta.rag_note once RAG holds it. Exits 5 when
+    /// there is none.
+    Show {
         id: String,
         #[arg(long)]
         json: bool,
@@ -1118,6 +1186,7 @@ fn main() -> Result<()> {
                 card,
                 no_card,
                 role,
+                dispatch,
                 ..
             } => nebula_tui::run_agent_new(nebula_tui::NewAgentOpts {
                 worktree,
@@ -1137,6 +1206,11 @@ fn main() -> Result<()> {
                 card,
                 no_card,
                 role,
+                dispatch: dispatch
+                    .as_deref()
+                    .map(nebula_tui::board_cli::dispatch_id)
+                    .transpose()?,
+                parent: None,
             }),
             AgentCommand::Wait {
                 names,
@@ -1205,28 +1279,9 @@ fn main() -> Result<()> {
                 DiagramCommand::Decisions { slug, json } => DiagramOp::Decisions { slug, json },
             })
         }
-        Some(Command::Notes { command }) => {
-            use nebula_tui::NotesOp;
-            let op = match command {
-                None | Some(NotesCommand::List) => NotesOp::List,
-                Some(NotesCommand::Add { text, worktree }) => NotesOp::Add {
-                    text: text.join(" "),
-                    worktree,
-                },
-                Some(NotesCommand::Done { index }) => NotesOp::Done { index },
-            };
-            nebula_tui::run_notes(op)
-        }
         Some(Command::Todo { command }) => {
             use nebula_tui::board_cli::TodoVerb;
-            use nebula_tui::TodoOp;
-            let legacy = |op| nebula_tui::run_todo(op);
             let (verb, json) = match command {
-                Some(TodoCommand::Done { index }) => return legacy(TodoOp::Done { index }),
-                Some(TodoCommand::Reopen { index }) => return legacy(TodoOp::Reopen { index }),
-                Some(TodoCommand::NoteDone { index, note }) => {
-                    return legacy(TodoOp::NoteDone { index, note })
-                }
                 None => (
                     TodoVerb::List {
                         scope: Default::default(),
@@ -1366,6 +1421,52 @@ fn main() -> Result<()> {
                     },
                     json,
                 ),
+                Some(TodoCommand::Run {
+                    card,
+                    role,
+                    kind,
+                    host,
+                    worktree,
+                    dispatch,
+                    forwarded,
+                    parent_host,
+                    parent_id,
+                    scope,
+                    json,
+                }) => (
+                    TodoVerb::Run {
+                        card,
+                        role,
+                        kind,
+                        host,
+                        worktree,
+                        dispatch,
+                        scope: scope.into(),
+                        forwarded,
+                        parent: parent_host.zip(parent_id).map(|(host, id)| {
+                            nebula_core::board::SessionAt {
+                                host,
+                                id: nebula_core::AgentId(id),
+                            }
+                        }),
+                    },
+                    json,
+                ),
+                Some(TodoCommand::Approve {
+                    card,
+                    session,
+                    expected_status_at,
+                    scope,
+                    json,
+                }) => (
+                    TodoVerb::Approve {
+                        card,
+                        session,
+                        expected_status_at,
+                        scope: scope.into(),
+                    },
+                    json,
+                ),
                 Some(TodoCommand::Show { card, scope, json }) => (
                     TodoVerb::Show {
                         card,
@@ -1438,6 +1539,45 @@ fn main() -> Result<()> {
                 ArtifactCommand::Rm { id, json } => (ArtifactVerb::Rm { id }, json),
             };
             nebula_tui::run_artifact(verb, json)
+        }
+        Some(Command::Decision { command }) => {
+            use nebula_tui::decision_cli::DecisionVerb;
+            let (verb, json) = match command {
+                DecisionCommand::Add {
+                    what,
+                    why,
+                    card,
+                    project,
+                    home,
+                    id,
+                    json,
+                } => (
+                    DecisionVerb::Add {
+                        what,
+                        why,
+                        card,
+                        project,
+                        home,
+                        id,
+                    },
+                    json,
+                ),
+                DecisionCommand::List {
+                    scope,
+                    query,
+                    page,
+                    json,
+                } => (
+                    DecisionVerb::List {
+                        scope: scope.into(),
+                        query,
+                        page,
+                    },
+                    json,
+                ),
+                DecisionCommand::Show { id, json } => (DecisionVerb::Show { id }, json),
+            };
+            nebula_tui::run_decision(verb, json)
         }
         Some(Command::Kill) => nebula_tui::run_kill(),
         Some(Command::Rename { title, force }) => nebula_tui::run_rename(title.join(" "), force),
@@ -1531,6 +1671,9 @@ fn main() -> Result<()> {
         },
         Some(Command::RawAttach { name }) => nebula_tui::run_raw_attach(&name),
         None => match cli.dir {
+            Some(dir) if dir == "notes" => anyhow::bail!(
+                "`nebula notes` was removed: notes are board cards now (`nebula todo`); add a directory named notes as `nebula ./notes`"
+            ),
             Some(dir) => nebula_tui::run_add_project(dir),
             None => run_tui_and_handoff(None),
         },

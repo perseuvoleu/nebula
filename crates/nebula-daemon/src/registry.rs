@@ -10,10 +10,9 @@ use crate::store::Store;
 use anyhow::{bail, Context, Result};
 use nebula_core::ClientRequest;
 use nebula_core::{
-    Agent, AgentId, AgentKind, AgentStatus, Entity, EntityId, Link, LinkId, Note, NoteId,
-    NoteOwner, Project, ProjectId, ServerEvent, SessionRef, TerminalId, TerminalTab, Todo, TodoId,
-    TodoOwner, Workspace, WorkspaceId, Worktree, WorktreeId, WriterClaim, BUSY_SESSIONS_REFUSAL,
-    WRITER_HELD_REFUSAL,
+    Agent, AgentId, AgentKind, AgentStatus, Entity, EntityId, Project, ProjectId, ServerEvent,
+    SessionRef, TerminalId, TerminalTab, TodoId, Workspace, WorkspaceId, Worktree, WorktreeId,
+    WriterClaim, BUSY_SESSIONS_REFUSAL, WRITER_HELD_REFUSAL,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -861,9 +860,6 @@ impl Daemon {
 
     pub fn snapshot(&self) -> Result<ServerEvent> {
         let (mut projects, mut worktrees, mut agents, mut terminals) = self.store.load_tree()?;
-        let mut notes = self.store.load_notes()?;
-        let mut todos = self.store.load_todos()?;
-        let mut links = self.store.load_links()?;
         // Remote projects are shown through their host daemon's rows.
         projects.retain(|p| p.host.is_none());
         for m in self.mirrored() {
@@ -871,9 +867,6 @@ impl Daemon {
             worktrees.extend(m.worktrees);
             agents.extend(m.agents);
             terminals.extend(m.terminals);
-            notes.extend(m.notes);
-            todos.extend(m.todos);
-            links.extend(m.links);
         }
         {
             let sessions = self.sessions.lock().unwrap();
@@ -903,9 +896,6 @@ impl Daemon {
             worktrees,
             agents,
             terminals,
-            notes,
-            todos,
-            links,
             pr_seen: self.store.load_pr_seen()?,
             ui_state: self.store.load_ui_state()?,
         })
@@ -2439,17 +2429,33 @@ impl Daemon {
             .store
             .get_worktree(worktree_id)?
             .context("worktree not found")?;
-        self.validate_execution_branch(&worktree, expected_branch.or(Some(&worktree.branch)))?;
-        let _claim = match writer {
-            WriterClaim::Off => None,
+        let _claim = match (writer, &link.dispatch) {
+            (WriterClaim::Off, None) => None,
             _ => Some(self.writer_claims.lock().await),
         };
+        if let Some(dispatch) = &link.dispatch {
+            let (_, _, agents, _) = self.store.load_tree()?;
+            if let Some(known) = agents
+                .into_iter()
+                .find(|a| a.dispatch_id.as_ref() == Some(dispatch))
+            {
+                if known.card_id != link.card {
+                    bail!(nebula_core::board::Refusal::Conflict.message(format!(
+                        "dispatch {} started \"{}\" on another card",
+                        dispatch.as_str(),
+                        known.name
+                    )));
+                }
+                return Ok(EntityId::Agent(known.id));
+            }
+        }
+        self.validate_execution_branch(&worktree, expected_branch.or(Some(&worktree.branch)))?;
         if writer == WriterClaim::Exclusive {
             if let Some(holder) = self.live_writer(worktree_id)? {
-                bail!(
+                bail!(nebula_core::board::Refusal::WriterHeld.message(format!(
                     "\"{holder}\" {WRITER_HELD_REFUSAL} {}; wait for it, archive it, or pass --force-writer after the user approves two writers",
                     worktree.branch
-                );
+                )));
             }
         }
         // A warm session for this (worktree, kind) hands over its PTY and
@@ -2507,7 +2513,12 @@ impl Daemon {
         }
         if adopted.is_none() {
             // Cold path: boot the CLI right away.
-            self.spawn_agent_session_with_prompt(&agent, &worktree, 80, 24, prompt.as_deref())?;
+            if let Err(e) =
+                self.spawn_agent_session_with_prompt(&agent, &worktree, 80, 24, prompt.as_deref())
+            {
+                self.store.delete_agent(&agent.id)?;
+                return Err(e);
+            }
         }
         let mut broadcast_agent = agent.clone();
         broadcast_agent.alive = true;
@@ -2522,6 +2533,33 @@ impl Daemon {
             }
         }
         Ok(EntityId::Agent(agent.id))
+    }
+
+    /// Writes the approval key while the session still carries the status
+    /// the approver saw; status changes take the same lock, so none slips
+    /// between the check and the write.
+    pub fn approve(&self, id: &AgentId, expected_status_at: i64) -> Result<()> {
+        use nebula_core::board::Refusal;
+        let _delivery = self.status_delivery.lock().unwrap();
+        let agent = self.store.get_agent(id)?.ok_or_else(|| {
+            anyhow::anyhow!(Refusal::NotFound.message(format!("no session {}", id.as_str())))
+        })?;
+        if agent.status != AgentStatus::NeedsFeedback {
+            bail!(Refusal::Conflict.message(format!(
+                "\"{}\" is {}, not waiting for an answer; read it again",
+                agent.name,
+                agent.status.as_str()
+            )));
+        }
+        if agent.status_changed_at != expected_status_at {
+            bail!(Refusal::Conflict.message(format!(
+                "\"{}\" changed status at {}, after {expected_status_at}; read it again",
+                agent.name, agent.status_changed_at
+            )));
+        }
+        self.session(&SessionRef::Agent(id.clone()))
+            .ok_or_else(|| anyhow::anyhow!("\"{}\" has no live PTY", agent.name))?
+            .write_input_whole(b"\r")
     }
 
     /// The unarchived writer on this checkout whose turn can still run:
@@ -3280,167 +3318,6 @@ impl Daemon {
         Ok(())
     }
 
-    // ---- notes ----
-
-    pub fn create_note(self: &Arc<Self>, owner: &NoteOwner, text: &str) -> Result<EntityId> {
-        let text = text.trim();
-        if text.is_empty() {
-            bail!("note text is empty");
-        }
-        match owner {
-            NoteOwner::Project(id) => {
-                self.store.get_project(id)?.context("project not found")?;
-            }
-            NoteOwner::Worktree(id) => {
-                self.store.get_worktree(id)?.context("worktree not found")?;
-            }
-            NoteOwner::Todo(id) => {
-                self.store.get_todo(id)?.context("todo not found")?;
-            }
-        }
-        let note = Note {
-            id: NoteId::generate(),
-            owner: owner.clone(),
-            text: text.to_string(),
-            done: false,
-            sort_order: self.store.next_note_sort_order(owner)?,
-        };
-        self.store.insert_note(&note)?;
-        self.broadcast(ServerEvent::EntityUpserted {
-            entity: Entity::Note(note.clone()),
-        });
-        Ok(EntityId::Note(note.id))
-    }
-
-    pub fn update_note(self: &Arc<Self>, id: &NoteId, text: &str) -> Result<()> {
-        let text = text.trim();
-        if text.is_empty() {
-            bail!("note text is empty");
-        }
-        self.store.set_note_text(id, text)?;
-        let note = self.store.get_note(id)?.context("note not found")?;
-        self.broadcast(ServerEvent::EntityUpserted {
-            entity: Entity::Note(note),
-        });
-        Ok(())
-    }
-
-    pub fn set_note_done(self: &Arc<Self>, id: &NoteId, done: bool) -> Result<()> {
-        self.store.set_note_done(id, done)?;
-        let note = self.store.get_note(id)?.context("note not found")?;
-        self.broadcast(ServerEvent::EntityUpserted {
-            entity: Entity::Note(note),
-        });
-        Ok(())
-    }
-
-    pub fn delete_note(self: &Arc<Self>, id: &NoteId) -> Result<()> {
-        self.store.delete_note(id)?;
-        self.broadcast(ServerEvent::EntityRemoved {
-            id: EntityId::Note(id.clone()),
-        });
-        Ok(())
-    }
-
-    // ---- todos ----
-
-    pub fn create_todo(self: &Arc<Self>, owner: &TodoOwner, text: &str) -> Result<EntityId> {
-        let text = text.trim();
-        if text.is_empty() {
-            bail!("todo text is empty");
-        }
-        match owner {
-            TodoOwner::Project(id) => {
-                self.store.get_project(id)?.context("project not found")?;
-            }
-            TodoOwner::Worktree(id) => {
-                self.store.get_worktree(id)?.context("worktree not found")?;
-            }
-        }
-        let todo = Todo {
-            id: TodoId::generate(),
-            owner: owner.clone(),
-            text: text.to_string(),
-            done: false,
-            sort_order: self.store.next_todo_sort_order(owner)?,
-        };
-        self.store.insert_todo(&todo)?;
-        self.broadcast(ServerEvent::EntityUpserted {
-            entity: Entity::Todo(todo.clone()),
-        });
-        Ok(EntityId::Todo(todo.id))
-    }
-
-    pub fn update_todo(self: &Arc<Self>, id: &TodoId, text: &str) -> Result<()> {
-        let text = text.trim();
-        if text.is_empty() {
-            bail!("todo text is empty");
-        }
-        self.store.set_todo_text(id, text)?;
-        let todo = self.store.get_todo(id)?.context("todo not found")?;
-        self.broadcast(ServerEvent::EntityUpserted {
-            entity: Entity::Todo(todo),
-        });
-        Ok(())
-    }
-
-    pub fn set_todo_done(self: &Arc<Self>, id: &TodoId, done: bool) -> Result<()> {
-        self.store.set_todo_done(id, done)?;
-        let todo = self.store.get_todo(id)?.context("todo not found")?;
-        self.broadcast(ServerEvent::EntityUpserted {
-            entity: Entity::Todo(todo),
-        });
-        Ok(())
-    }
-
-    /// Child notes cascade away in the store; clients mirror that pruning
-    /// off this one removal event, so none is broadcast per note.
-    pub fn delete_todo(self: &Arc<Self>, id: &TodoId) -> Result<()> {
-        self.store.delete_todo(id)?;
-        self.broadcast(ServerEvent::EntityRemoved {
-            id: EntityId::Todo(id.clone()),
-        });
-        Ok(())
-    }
-
-    // ---- links ----
-
-    pub fn create_link(self: &Arc<Self>, worktree_id: &WorktreeId, url: &str) -> Result<EntityId> {
-        let url = normalize_url(url)?;
-        self.store
-            .get_worktree(worktree_id)?
-            .context("worktree not found")?;
-        let link = Link {
-            id: LinkId::generate(),
-            worktree_id: worktree_id.clone(),
-            url,
-            sort_order: self.store.next_link_sort_order(worktree_id)?,
-        };
-        self.store.insert_link(&link)?;
-        self.broadcast(ServerEvent::EntityUpserted {
-            entity: Entity::Link(link.clone()),
-        });
-        Ok(EntityId::Link(link.id))
-    }
-
-    pub fn update_link(self: &Arc<Self>, id: &LinkId, url: &str) -> Result<()> {
-        let url = normalize_url(url)?;
-        self.store.set_link_url(id, &url)?;
-        let link = self.store.get_link(id)?.context("link not found")?;
-        self.broadcast(ServerEvent::EntityUpserted {
-            entity: Entity::Link(link),
-        });
-        Ok(())
-    }
-
-    pub fn delete_link(self: &Arc<Self>, id: &LinkId) -> Result<()> {
-        self.store.delete_link(id)?;
-        self.broadcast(ServerEvent::EntityRemoved {
-            id: EntityId::Link(id.clone()),
-        });
-        Ok(())
-    }
-
     // ---- attach / spawn ----
 
     /// Get the live session for an entity, lazily (re)spawning its PTY when
@@ -4060,41 +3937,6 @@ fn is_shell_command<'a>(mut argv: impl Iterator<Item = &'a str>) -> bool {
         && argv.next().is_some_and(|flag| {
             flag.starts_with('-') && !flag.starts_with("--") && flag.contains('c')
         })
-}
-
-/// Canonical form of a user-typed link. Pasting a URL out of a browser is
-/// the common case, but people also type `github.com/o/r/pull/7`, so a
-/// scheme-less value gets https://. Anything else — another scheme, or no
-/// host at all — is refused rather than stored: the TUI hands these to
-/// `open(1)`, and only http(s) may ever reach it.
-fn normalize_url(url: &str) -> Result<String> {
-    let url = url.trim();
-    if url.is_empty() {
-        bail!("link URL is empty");
-    }
-    if url.contains(char::is_whitespace) {
-        bail!("link URL contains whitespace");
-    }
-    let normalized = match url.split_once("://") {
-        Some(("http" | "https", _)) => url.to_string(),
-        Some((scheme, _)) => bail!("only http(s) links are supported (got {scheme}://)"),
-        // Scheme-less: a bare host is a URL people type; a bare word is not.
-        None => {
-            let host = url.split(['/', '?', '#']).next().unwrap_or_default();
-            if !host.contains('.') || host.starts_with('.') || host.ends_with('.') {
-                bail!("not a URL: {url}");
-            }
-            format!("https://{url}")
-        }
-    };
-    // Reject "https://" and friends: a scheme with nothing behind it.
-    if normalized
-        .split_once("://")
-        .is_none_or(|(_, rest)| rest.is_empty())
-    {
-        bail!("not a URL: {url}");
-    }
-    Ok(normalized)
 }
 
 fn user_shell() -> String {
@@ -6017,7 +5859,7 @@ exec sleep 60
             .unwrap_err();
         assert_eq!(
             err.to_string(),
-            "\"holder\" is the writer on main; wait for it, archive it, or pass --force-writer after the user approves two writers"
+            "writer held: \"holder\" is the writer on main; wait for it, archive it, or pass --force-writer after the user approves two writers"
         );
         let ServerEvent::Snapshot { agents, .. } = daemon.snapshot().unwrap() else {
             unreachable!()
@@ -7242,34 +7084,6 @@ exec sleep 60
         assert!(is_background_command(
             "/bin/zsh -c sleep 40 && echo probe-ok"
         ));
-    }
-
-    #[test]
-    fn normalize_url_adds_https_and_refuses_non_links() {
-        // Pasted URLs pass through untouched.
-        assert_eq!(
-            normalize_url("https://github.com/o/r/pull/7").unwrap(),
-            "https://github.com/o/r/pull/7"
-        );
-        assert_eq!(normalize_url("  http://x.dev  ").unwrap(), "http://x.dev");
-        // Typed hosts gain the scheme.
-        assert_eq!(
-            normalize_url("github.com/o/r/pull/7").unwrap(),
-            "https://github.com/o/r/pull/7"
-        );
-        // Anything that isn't an http(s) URL is refused, so `open(1)` can
-        // never be handed a scheme the user didn't intend.
-        for bad in [
-            "",
-            "   ",
-            "file:///etc/passwd",
-            "javascript:alert(1)",
-            "https://",
-            "just a note",
-            "notaurl",
-        ] {
-            assert!(normalize_url(bad).is_err(), "expected refusal: {bad:?}");
-        }
     }
 
     #[test]

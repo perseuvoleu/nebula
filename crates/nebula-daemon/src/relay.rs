@@ -33,8 +33,8 @@ use crate::registry::Daemon;
 use anyhow::{bail, Context, Result};
 use nebula_core::codec::{read_frame, write_frame};
 use nebula_core::{
-    Agent, ClientRequest, Entity, EntityId, Link, Note, Project, ServerEvent, SessionRef,
-    TerminalTab, Todo, Worktree, PROTOCOL_VERSION,
+    Agent, ClientRequest, Entity, EntityId, Project, ServerEvent, SessionRef, TerminalTab,
+    Worktree, PROTOCOL_VERSION,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -51,9 +51,6 @@ pub struct Mirror {
     pub worktrees: Vec<Worktree>,
     pub agents: Vec<Agent>,
     pub terminals: Vec<TerminalTab>,
-    pub notes: Vec<Note>,
-    pub todos: Vec<Todo>,
-    pub links: Vec<Link>,
     /// Every id above, as the string the protocol carries — the routing key.
     pub ids: HashSet<String>,
 }
@@ -234,10 +231,8 @@ impl Relay {
                     if self.pending.lock().unwrap().len() >= 256 {
                         client.deliver(ServerEvent::Error {
                             req_id: Some(local),
-                            message: format!(
-                                "{}: too many pending requests; request was not sent",
-                                self.host
-                            ),
+                            message: nebula_core::board::Refusal::Unreachable
+                                .message(format!("{}: too many pending requests", self.host)),
                         });
                         return;
                     }
@@ -270,7 +265,8 @@ impl Relay {
             if let Some((client, local, _)) = waiting {
                 client.deliver(ServerEvent::Error {
                     req_id: Some(local),
-                    message: format!("{} is unreachable right now", self.host),
+                    message: nebula_core::board::Refusal::Unreachable
+                        .message(format!("{} is unreachable right now", self.host)),
                 });
             }
             return;
@@ -289,7 +285,8 @@ impl Relay {
             });
             client.deliver(ServerEvent::Error {
                 req_id,
-                message: format!("{}: relay queue full; request was not sent", self.host),
+                message: nebula_core::board::Refusal::Unreachable
+                    .message(format!("{}: relay queue full", self.host)),
             });
         }
     }
@@ -463,10 +460,8 @@ async fn pump_transport<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     for (_, (client, local, _)) in pending {
         client.deliver(ServerEvent::Error {
             req_id: Some(local),
-            message: format!(
-                "{}: connection lost; request outcome unknown; not replayed",
-                relay.host
-            ),
+            message: nebula_core::board::Refusal::OutcomeUnknown
+                .message(format!("{}: connection lost, not replayed", relay.host)),
         });
     }
     relay.notify_status(false);
@@ -649,27 +644,6 @@ fn compute_scope(
             m.upsert(Entity::Terminal(t.clone()));
         }
     }
-    for l in &host.links {
-        if m.ids.contains(l.worktree_id.as_str()) {
-            m.upsert(Entity::Link(l.clone()));
-        }
-    }
-    for t in &host.todos {
-        if parent_ids(&Entity::Todo(t.clone()))
-            .iter()
-            .any(|id| m.ids.contains(id))
-        {
-            m.upsert(Entity::Todo(t.clone()));
-        }
-    }
-    for n in &host.notes {
-        if parent_ids(&Entity::Note(n.clone()))
-            .iter()
-            .any(|id| m.ids.contains(id))
-        {
-            m.upsert(Entity::Note(n.clone()));
-        }
-    }
     m
 }
 
@@ -794,9 +768,6 @@ async fn handle_event(
             worktrees,
             agents,
             terminals,
-            notes,
-            todos,
-            links,
             ..
         } => {
             let mut tree = Mirror::default();
@@ -810,15 +781,6 @@ async fn handle_event(
                 tree.upsert(e);
             }
             for e in terminals.into_iter().map(Entity::Terminal) {
-                tree.upsert(e);
-            }
-            for e in notes.into_iter().map(Entity::Note) {
-                tree.upsert(e);
-            }
-            for e in todos.into_iter().map(Entity::Todo) {
-                tree.upsert(e);
-            }
-            for e in links.into_iter().map(Entity::Link) {
                 tree.upsert(e);
             }
             *relay.host_tree.lock().unwrap() = tree;
@@ -1016,9 +978,6 @@ impl Mirror {
         out.extend(self.worktrees.iter().cloned().map(Entity::Worktree));
         out.extend(self.agents.iter().cloned().map(Entity::Agent));
         out.extend(self.terminals.iter().cloned().map(Entity::Terminal));
-        out.extend(self.notes.iter().cloned().map(Entity::Note));
-        out.extend(self.todos.iter().cloned().map(Entity::Todo));
-        out.extend(self.links.iter().cloned().map(Entity::Link));
         out
     }
 
@@ -1040,9 +999,6 @@ impl Mirror {
                 .iter()
                 .map(|t| EntityId::Terminal(t.id.clone())),
         );
-        out.extend(self.notes.iter().map(|n| EntityId::Note(n.id.clone())));
-        out.extend(self.todos.iter().map(|t| EntityId::Todo(t.id.clone())));
-        out.extend(self.links.iter().map(|l| EntityId::Link(l.id.clone())));
         out
     }
 
@@ -1060,9 +1016,6 @@ impl Mirror {
             Entity::Worktree(w) => put(&mut self.worktrees, w.clone(), |x| x.id == w.id),
             Entity::Agent(a) => put(&mut self.agents, a.clone(), |x| x.id == a.id),
             Entity::Terminal(t) => put(&mut self.terminals, t.clone(), |x| x.id == t.id),
-            Entity::Note(n) => put(&mut self.notes, n.clone(), |x| x.id == n.id),
-            Entity::Todo(t) => put(&mut self.todos, t.clone(), |x| x.id == t.id),
-            Entity::Link(l) => put(&mut self.links, l.clone(), |x| x.id == l.id),
             Entity::Workspace(_) => {}
         }
     }
@@ -1074,9 +1027,6 @@ impl Mirror {
             EntityId::Worktree(i) => self.worktrees.retain(|x| &x.id != i),
             EntityId::Agent(i) => self.agents.retain(|x| &x.id != i),
             EntityId::Terminal(i) => self.terminals.retain(|x| &x.id != i),
-            EntityId::Note(i) => self.notes.retain(|x| &x.id != i),
-            EntityId::Todo(i) => self.todos.retain(|x| &x.id != i),
-            EntityId::Link(i) => self.links.retain(|x| &x.id != i),
             EntityId::Workspace(_) => {}
         }
     }
@@ -1100,9 +1050,6 @@ pub fn entity_id_string(id: &EntityId) -> String {
         EntityId::Worktree(i) => i.as_str().to_string(),
         EntityId::Agent(i) => i.as_str().to_string(),
         EntityId::Terminal(i) => i.as_str().to_string(),
-        EntityId::Note(i) => i.as_str().to_string(),
-        EntityId::Link(i) => i.as_str().to_string(),
-        EntityId::Todo(i) => i.as_str().to_string(),
     }
 }
 
@@ -1113,9 +1060,6 @@ fn entity_own_id(e: &Entity) -> String {
         Entity::Worktree(w) => w.id.as_str().to_string(),
         Entity::Agent(a) => a.id.as_str().to_string(),
         Entity::Terminal(t) => t.id.as_str().to_string(),
-        Entity::Note(n) => n.id.as_str().to_string(),
-        Entity::Link(l) => l.id.as_str().to_string(),
-        Entity::Todo(t) => t.id.as_str().to_string(),
     }
 }
 
@@ -1126,16 +1070,6 @@ fn parent_ids(e: &Entity) -> Vec<String> {
         Entity::Worktree(w) => vec![w.project_id.as_str().to_string()],
         Entity::Agent(a) => vec![a.worktree_id.as_str().to_string()],
         Entity::Terminal(t) => vec![t.worktree_id.as_str().to_string()],
-        Entity::Link(l) => vec![l.worktree_id.as_str().to_string()],
-        Entity::Note(n) => vec![match &n.owner {
-            nebula_core::NoteOwner::Project(i) => i.as_str().to_string(),
-            nebula_core::NoteOwner::Worktree(i) => i.as_str().to_string(),
-            nebula_core::NoteOwner::Todo(i) => i.as_str().to_string(),
-        }],
-        Entity::Todo(t) => vec![match &t.owner {
-            nebula_core::TodoOwner::Project(i) => i.as_str().to_string(),
-            nebula_core::TodoOwner::Worktree(i) => i.as_str().to_string(),
-        }],
     }
 }
 
@@ -1190,6 +1124,7 @@ fn with_req_id(req: &ClientRequest, req_id: u64) -> Option<ClientRequest> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nebula_core::board::Refusal;
     use nebula_core::{AgentId, WorktreeId};
     use tokio::io::AsyncWriteExt;
 
@@ -1686,13 +1621,7 @@ mod tests {
             let reply = tokio::time::timeout(Duration::from_millis(100), replies.recv())
                 .await
                 .expect("uncertain mutation was left pending");
-            assert!(matches!(
-                reply,
-                Some(ServerEvent::Error {
-                    req_id: Some(42),
-                    ..
-                })
-            ));
+            assert_eq!(refusal_of(reply), Some(Refusal::OutcomeUnknown));
         }
     }
 
@@ -1727,13 +1656,36 @@ mod tests {
         )
         .await
         .expect("full transport queue blocked a caller");
-        assert!(matches!(
-            replies.recv().await,
+        assert_eq!(refusal_of(replies.recv().await), Some(Refusal::Unreachable));
+    }
+
+    #[tokio::test]
+    async fn disconnected_host_refuses_as_unreachable() {
+        let (_, relay, _requests) = test_relay();
+        let (client, mut replies) = mpsc::channel(4);
+        let client = RelayClient::new(client, tokio_util::sync::CancellationToken::new());
+        relay
+            .forward(
+                ClientRequest::CreateTerminal {
+                    expected_branch: Some("feature".into()),
+                    req_id: 42,
+                    worktree: WorktreeId("worktree".into()),
+                    name: None,
+                },
+                &client,
+            )
+            .await;
+        assert_eq!(refusal_of(replies.recv().await), Some(Refusal::Unreachable));
+    }
+
+    fn refusal_of(reply: Option<ServerEvent>) -> Option<Refusal> {
+        match reply {
             Some(ServerEvent::Error {
                 req_id: Some(42),
-                ..
-            })
-        ));
+                message,
+            }) => Refusal::of(&message),
+            other => panic!("expected the refused request's error, got {other:?}"),
+        }
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 //! The pull request open on a worktree's branch, discovered with the
 //! GitHub CLI (`gh pr view`). The PR itself is never persisted — the row it
-//! feeds sits above the worktree's saved links and refreshes on its own, so
+//! feeds sits in the worktree's LINKS group and refreshes on its own, so
 //! a PR opened outside nebula shows up without anyone typing its URL. The
 //! one thing that outlives the process is how far the user has read into
 //! the conversation, which the daemon keeps (`pr_seen`) so the row can say

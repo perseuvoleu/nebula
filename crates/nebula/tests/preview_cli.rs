@@ -50,6 +50,8 @@ impl Fixture {
         Command::new(env!("CARGO_BIN_EXE_nebula"))
             .args(["preview", "--offline", "--policy"])
             .arg(path)
+            .env("NEBULA_DATA_DIR", self.root.path().join("nebula-data"))
+            .env("NEBULA_RUNTIME_DIR", self.root.path().join("nebula-rt"))
             .args(["--project", "demo"])
             .args(args)
             .output()
@@ -68,6 +70,13 @@ fn a_configured_project_has_a_stopped_preview_without_starting_a_daemon() {
     );
     let status: Value = serde_json::from_slice(&result.stdout).unwrap();
     assert_eq!(status["phase"], "stopped");
+    assert_eq!(status["url"], "https://demo.example.test");
+    for dir in ["nebula-data", "nebula-rt"] {
+        assert!(
+            !fixture.root.path().join(dir).exists(),
+            "preview touched nebula's {dir}, where a link artifact would live"
+        );
+    }
 }
 
 #[test]

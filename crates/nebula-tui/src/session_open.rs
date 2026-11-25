@@ -265,15 +265,20 @@ pub fn open_on_argv(
     project: Option<&str>,
     focus: bool,
 ) -> Result<Vec<String>> {
-    if !is_ssh_token(host) {
-        bail!("host {host:?} is not a plain name (letters, digits, . _ @ -)");
-    }
     let session = format!("--session={session}");
     let project = project.map(|p| format!("--project={p}"));
     let mut words = vec!["nebula", "open", &session, "--json"];
     words.extend(project.as_deref());
     if !focus {
         words.push("--no-focus");
+    }
+    ssh_argv(host, &words)
+}
+
+/// The BatchMode `ssh` argv that runs `words` on `host`.
+pub fn ssh_argv(host: &str, words: &[&str]) -> Result<Vec<String>> {
+    if !is_ssh_token(host) {
+        bail!("host {host:?} is not a plain name (letters, digits, . _ @ -)");
     }
     let mut argv: Vec<String> = nebula_core::remote::SSH_BATCH_OPTS
         .iter()
@@ -282,7 +287,9 @@ pub fn open_on_argv(
     argv.extend([
         "--".to_owned(),
         host.to_owned(),
-        crate::remote_cli::with_remote_path(&nebula_core::remote::join_quoted(words)),
+        crate::remote_cli::with_remote_path(&nebula_core::remote::join_quoted(
+            words.iter().copied(),
+        )),
     ]);
     Ok(argv)
 }

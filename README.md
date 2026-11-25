@@ -13,7 +13,7 @@ agent manager — entirely inside your terminal.
 │           │            │ LINKS        │                                │
 │           │            │ ⇢ PR #42     │                                │
 ├───────────┴────────────┴──────────────┴────────────────────────────────┤
-│ ⏻ connected │ n: agent  t: terminal  l: link  m: menu  ?: help         │
+│ ⏻ connected │ n: agent  t: terminal  m: menu  ?: help                  │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -123,11 +123,9 @@ The panels aren't the only view. With a worktree selected, from any panel:
 - **`b` — file tree browser.** Tree on the left, syntax-highlighted preview on
   the right, and an always-live filter that narrows the tree to matching files
   and the directories holding them.
-- **`e` — notes.** Free-text notes pinned to a project or a worktree.
-- **`l` — links.** Pin a PR, doc or ticket URL to the worktree; it shows up in
-  the Sessions panel's LINKS group. nebula also finds the pull request already
-  open on the branch with `gh` and lists it there on its own, with a count of
-  the comments that landed while you were away.
+- **LINKS.** nebula finds the pull request open on the branch with `gh` and
+  lists it in the Sessions panel's LINKS group, with a count of the comments
+  that landed while you were away.
 - **`p` — pin.** Pinned worktrees and agents sort to the top of their panel; a
   pinned agent is also spared by the idle reaper.
 
@@ -182,7 +180,7 @@ remote twin refuses all four (`<branch> is a branch on <host> — open it there`
   agent attempt is politely declined. `nebula rename --force` overrides.
 - **Everything persists in SQLite** (`~/.local/share/nebula/nebula.db` or the
   platform equivalent): projects, worktrees, agents (with kind + CLI session
-  ids), notes, links, workspaces, pins, and your last selection.
+  ids), workspaces, pins, and your last selection.
 - **Sessions warm up, then get reaped.** The daemon can pre-spawn an agent CLI
   while you're still naming the session, so creating one lands on a booted
   screen instead of a booting shell. An existing session boots when you
@@ -277,7 +275,6 @@ Defaults — every one of them is rebindable in Settings → Hotkeys (`s`).
 | Projects | `d` or `-` on a divider | delete the divider |
 | Worktrees | `n` / `d` | new worktree / delete (typed confirm — deletes files) |
 | New worktree | type a sentence, or `Enter` on the empty prompt | the branch name is slugified (`fix login redirect` → `fix-login-redirect`); empty takes a random `<adj>-<noun>-<verb>` |
-| Projects / Worktrees | `e` | notes for the selected project / worktree |
 | Worktrees / Sessions | `p` | pin / unpin — pinned rows sort to the top; pinned agents also skip the idle reaper |
 | Sessions | `n` | new session (agent or shell terminal) |
 | Sessions | `r`, `a`, `u`, `d`, `A` | rename, archive, unarchive, delete, toggle archived |
@@ -285,8 +282,7 @@ Defaults — every one of them is rebindable in Settings → Hotkeys (`s`).
 | Any panel | `g` | git diff for the selected worktree (the uncommitted changes, or everything since the branch it was cut from when the tree is clean) or `(branch)` row (its tip against its base; no working-tree side and no review marks): filter, `↑↓` files, `Shift+↑↓`/`PgUp/PgDn`/`Ctrl+d/u` scroll, `Ctrl+g` picks what to compare (working tree, upstream, a commit), `Tab`/`Shift+Tab` step through the recent commits listed under the filter, `Ctrl+r` marks a file reviewed ✓ (on the working tree or against a branch), `Ctrl+n`/`Ctrl+p` step to the next/previous checkout that waits for review, `Ctrl+l` lists them |
 | Any panel | `Shift+G` | open the selected repo's page on its git host — the `origin` remote (`git@github.com:o/r.git`, `ssh://`, `https://`) turned into a browsable URL, credentials stripped |
 | Any panel | `f` / `F` / `b` | find file / find in files (`git grep`) / file tree browser, all scoped to the selected worktree or `(branch)` row (a remote twin's branch row refuses them) — `Enter` opens the file in an editor modal (at the matched line, for `F`; a read-only copy on a branch row); in `f` and `b`, `Ctrl+y` copies the path |
-| Any panel | `l` | attach a link (pull request, doc, ticket) to the selected worktree — it lands in the Sessions panel's LINKS group, above any open pull request nebula finds with `gh` |
-| Sessions | `Enter` / `r` / `d` on a link | open it in the browser / edit its URL / delete it (the detected pull request opens but can't be edited or deleted) |
+| Sessions | `Enter` on a link | open the pull request in the browser |
 | Any panel | `t` | new shell terminal in the selected worktree's directory (Projects panel: the repo root) |
 | Any panel | `w` | workspace switcher: `Enter` opens, `n`/`r`/`d` create/rename/delete (the open workspace shows bottom-left; `/` and the panels scope to it) |
 | Any panel | `h` | ssh hosts: every `nebula ssh` destination, newest first. `Enter`/click reconnects (quits this TUI and execs a fresh `nebula ssh` — local sessions keep running), `a` types a new `user@host [dir]`, `d` removes |

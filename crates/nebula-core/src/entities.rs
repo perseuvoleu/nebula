@@ -1,7 +1,5 @@
 use crate::board::Role;
-use crate::ids::{
-    AgentId, DispatchId, LinkId, NoteId, ProjectId, TerminalId, TodoId, WorkspaceId, WorktreeId,
-};
+use crate::ids::{AgentId, DispatchId, ProjectId, TerminalId, TodoId, WorkspaceId, WorktreeId};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -270,63 +268,6 @@ pub struct TerminalTab {
     pub branch: Option<String>,
 }
 
-/// Who a note list hangs off: a project (high-level notes spanning its
-/// worktrees), one worktree (notes for that checkout), or one todo (the
-/// notes recorded under that task). The lists are separate — a project's
-/// notes never mix into its worktrees', and a todo's notes show only in
-/// that todo's detail.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum NoteOwner {
-    Project(ProjectId),
-    Worktree(WorktreeId),
-    Todo(TodoId),
-}
-
-/// One note.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Note {
-    pub id: NoteId,
-    pub owner: NoteOwner,
-    pub text: String,
-    pub done: bool,
-    pub sort_order: i64,
-}
-
-/// Who a todo list hangs off — the same project/worktree split as
-/// standalone notes, and the two scopes stay separate lists. (Unlike
-/// `NoteOwner` there is no third variant: todos don't nest.)
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum TodoOwner {
-    Project(ProjectId),
-    Worktree(WorktreeId),
-}
-
-/// One todo — a first-class task, separate from notes. Its child notes are
-/// plain `Note` rows whose owner is `NoteOwner::Todo(id)`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Todo {
-    pub id: TodoId,
-    pub owner: TodoOwner,
-    pub text: String,
-    pub done: bool,
-    pub sort_order: i64,
-}
-
-/// A URL pinned to a worktree — the pull request, the ticket, the design
-/// doc for whatever that checkout is for. Nebula never fetches these; they
-/// are bookmarks the user opens in a browser from the Sessions panel. The
-/// open pull request shown above them is discovered from git, not stored
-/// here (see the TUI's `PullRequest`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Link {
-    pub id: LinkId,
-    pub worktree_id: WorktreeId,
-    /// Always http(s) — normalized on the way in, so opening one can never
-    /// hand the OS a scheme the user didn't intend.
-    pub url: String,
-    pub sort_order: i64,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Entity {
     Workspace(Workspace),
@@ -334,9 +275,6 @@ pub enum Entity {
     Worktree(Worktree),
     Agent(Agent),
     Terminal(TerminalTab),
-    Note(Note),
-    Link(Link),
-    Todo(Todo),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -346,7 +284,4 @@ pub enum EntityId {
     Worktree(WorktreeId),
     Agent(AgentId),
     Terminal(TerminalId),
-    Note(NoteId),
-    Link(LinkId),
-    Todo(TodoId),
 }

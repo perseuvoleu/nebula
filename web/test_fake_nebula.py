@@ -51,6 +51,15 @@ class FakeBoardTests(unittest.TestCase):
         self.assertEqual(late["away"]["needs_you"], [])
         self.assertEqual(self.cli("todo", "board", "--project=other", "--json")["board"]["needs_you"], [])
 
+    def test_decision_list_pages_with_a_continuation(self):
+        board = json.loads((self.state / "board.json").read_text())
+        board["decisions"] += [{**board["decisions"][0], "id": f"01JG00000000000000000000{n}", "title": f"More {n}"} for n in (50, 51)]
+        (self.state / "board.json").write_text(json.dumps(board))
+        first = self.cli("decision", "list", *SCOPE, "--json")
+        second = self.cli("decision", "list", *SCOPE, f"--page={first['next']}", "--json")
+        self.assertEqual([d["title"] for d in first["items"] + second["items"]], ["Copy published files", "More 50", "More 51"])
+        self.assertEqual(second["next"], None)
+
     def test_away_digest_lists_only_what_happened_after_away_since(self):
         empty = {"finished": [], "needs_you": [], "decisions": []}
         self.wait()

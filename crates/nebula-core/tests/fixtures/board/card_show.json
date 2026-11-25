@@ -35,7 +35,8 @@
       "status_changed_at": 1764000200000,
       "writer": true,
       "alive": true,
-      "stale": false
+      "stale": false,
+      "parent": {"host": "perseu-mbp", "id": "01JF0000000000000000000001"}
     }
   ],
   "artifacts": [

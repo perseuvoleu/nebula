@@ -19,14 +19,6 @@
     "command": "PATH=/opt/homebrew/opt/zig@0.15/bin:$PATH cargo run -q -p nebula-daemon --example hook_lines twin-empty",
     "bytes": 381
   },
-  "notes_instruction (12 open)": {
-    "command": "PATH=/opt/homebrew/opt/zig@0.15/bin:$PATH cargo run -q -p nebula-daemon --example hook_lines notes",
-    "bytes": 280
-  },
-  "todos_instruction (12 open)": {
-    "command": "PATH=/opt/homebrew/opt/zig@0.15/bin:$PATH cargo run -q -p nebula-daemon --example hook_lines todos",
-    "bytes": 424
-  },
   "AUTO_TITLE_INSTRUCTION": {
     "command": "PATH=/opt/homebrew/opt/zig@0.15/bin:$PATH cargo run -q -p nebula-daemon --example hook_lines auto-title",
     "bytes": 376

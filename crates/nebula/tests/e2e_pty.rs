@@ -25,6 +25,17 @@ const LIVE_SESSION_ENV: [&str; 4] = [
     "CLAUDE_CODE_EXPERIMENTAL_CODE_MODE",
 ];
 
+/// The nebula binary with the caller's live-session identity removed, so a
+/// call reaches the test daemon as a fresh caller; a test that means to act
+/// as a session sets NEBULA_AGENT_ID itself.
+fn nebula_cmd() -> std::process::Command {
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"));
+    for k in LIVE_SESSION_ENV {
+        cmd.env_remove(k);
+    }
+    cmd
+}
+
 /// A test daemon that is killed when dropped, so a test that panics before
 /// its Shutdown cannot leave the daemon (and the fds it inherited) behind.
 struct DaemonChild(std::process::Child);
@@ -75,7 +86,7 @@ impl TestEnv {
     }
 
     fn spawn_daemon_with(&self, agent_cmd: &str, envs: &[(&str, &str)]) -> DaemonChild {
-        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"));
+        let mut cmd = nebula_cmd();
         cmd.args(["daemon", "--foreground"])
             .env("NEBULA_RUNTIME_DIR", &self.runtime_dir)
             .env("NEBULA_DATA_DIR", self.tmp.path().join("data"))
@@ -90,9 +101,6 @@ impl TestEnv {
                     .unwrap(),
             )
             .stderr(std::process::Stdio::null());
-        for k in LIVE_SESSION_ENV {
-            cmd.env_remove(k);
-        }
         for (k, v) in envs {
             cmd.env(k, v);
         }
@@ -103,7 +111,7 @@ impl TestEnv {
     /// real login-shell path, and `$SHELL` set to `shell`. Lets a test decide
     /// what the daemon can find on PATH.
     fn spawn_daemon_with_shell(&self, shell: &Path) -> DaemonChild {
-        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"));
+        let mut cmd = nebula_cmd();
         cmd.args(["daemon", "--foreground"])
             .env("NEBULA_RUNTIME_DIR", &self.runtime_dir)
             .env("NEBULA_DATA_DIR", self.tmp.path().join("data"))
@@ -113,9 +121,6 @@ impl TestEnv {
             .env_remove("NEBULA_AGENT_CMD")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        for k in LIVE_SESSION_ENV {
-            cmd.env_remove(k);
-        }
         DaemonChild(cmd.spawn().unwrap())
     }
 
@@ -1194,7 +1199,7 @@ async fn agent_wait_cli_blocks_until_worker_settles() {
     .await;
 
     let wait_cmd = |timeout: &str| {
-        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"));
+        let mut cmd = nebula_cmd();
         cmd.args([
             "agent",
             "wait",
@@ -1771,15 +1776,12 @@ fn agent_cli(
     args: &[&str],
     caller: Option<&nebula_core::AgentId>,
 ) -> std::process::Command {
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"));
+    let mut cmd = nebula_cmd();
     cmd.arg("agent")
         .args(args)
         .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    for k in LIVE_SESSION_ENV {
-        cmd.env_remove(k);
-    }
     if let Some(id) = caller {
         cmd.env("NEBULA_AGENT_ID", id.as_str());
     }
@@ -2595,7 +2597,7 @@ async fn upgrade_shuts_down_idle_daemon_but_spares_live_sessions() {
     let script = env.tmp.path().join("stub-install.sh");
     std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
     let run_upgrade = || {
-        std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        nebula_cmd()
             .args(["upgrade", "--force"])
             .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
             .env("NEBULA_DATA_DIR", env.tmp.path().join("data"))
@@ -4187,7 +4189,7 @@ async fn read_session_serves_the_last_screen_of_a_reaped_agent() {
             .is_some_and(|l| l.contains("not running")),
         "saved screen is marked stale: {text:?}"
     );
-    let cli = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+    let cli = nebula_cmd()
         .args(["agent", "read", "--project", "repo", "--", "worker"])
         .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
         .output()
@@ -4580,7 +4582,7 @@ async fn auto_title_instruction_and_rename_flow() {
     assert_eq!(body, nebula_daemon::hooks::auto_title_injection());
 
     // The model obeys — `nebula rename` runs with the session's env.
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+    let out = nebula_cmd()
         .args(["rename", "Fix", "Login", "Redirect"])
         .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
         .env("NEBULA_AGENT_ID", &agent_id.0)
@@ -4602,7 +4604,7 @@ async fn auto_title_instruction_and_rename_flow() {
     assert_eq!((status, body.as_str()), (200, ""));
 
     // A repeat attempt is declined as a settled answer (exit 0), not a fault.
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+    let out = nebula_cmd()
         .args(["rename", "Another", "Title"])
         .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
         .env("NEBULA_AGENT_ID", &agent_id.0)
@@ -4630,7 +4632,7 @@ async fn worktree_delete_cli_removes_checkout_and_row() {
     let _main = add_project_get_main_worktree(&mut c, &repo).await;
 
     let run_cli = |args: &[&str]| {
-        std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        nebula_cmd()
             .args(args)
             .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
             .output()
@@ -4702,7 +4704,7 @@ async fn worktree_new_seeds_node_modules_when_lockfile_matches() {
     handshake(&mut c).await;
     let _main = add_project_get_main_worktree(&mut c, &repo).await;
 
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+    let out = nebula_cmd()
         .args(["worktree", "new", "seeded", "--project", "repo"])
         .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
         .output()
@@ -4739,7 +4741,7 @@ async fn worktree_new_skips_node_modules_when_lockfile_differs() {
     handshake(&mut c).await;
     let _main = add_project_get_main_worktree(&mut c, &repo).await;
 
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+    let out = nebula_cmd()
         .args(["worktree", "new", "mismatch", "--project", "repo"])
         .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
         .output()
@@ -4774,7 +4776,7 @@ async fn worktree_new_skips_node_modules_when_seeding_is_disabled() {
     handshake(&mut c).await;
     let _main = add_project_get_main_worktree(&mut c, &repo).await;
 
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+    let out = nebula_cmd()
         .args(["worktree", "new", "disabled", "--project", "repo"])
         .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
         .output()
@@ -5229,7 +5231,7 @@ async fn cli_add_project() {
     .await;
 
     let run_cli = |args: &[&str], cwd: &Path| {
-        std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        nebula_cmd()
             .args(args)
             .current_dir(cwd)
             .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
@@ -5563,7 +5565,7 @@ async fn branch_sessions_keep_independent_execution_directories() {
     })
     .await;
     let new_agent = |branch: &str, name: &str| {
-        let out = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        let out = nebula_cmd()
             .args([
                 "agent",
                 "new",
@@ -5576,7 +5578,6 @@ async fn branch_sessions_keep_independent_execution_directories() {
             ])
             .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
             .env("NEBULA_DATA_DIR", env.tmp.path().join("data"))
-            .env_remove("NEBULA_AGENT_ID")
             .current_dir(&repo)
             .output()
             .unwrap();
@@ -5589,11 +5590,10 @@ async fn branch_sessions_keep_independent_execution_directories() {
         SessionRef::Agent(nebula_core::AgentId(json["id"].as_str().unwrap().into()))
     };
     // Independent directories require explicit worktree intent.
-    let explicit = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+    let explicit = nebula_cmd()
         .args(["switch", "main", "--worktree", "--project", "isolation"])
         .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
         .env("NEBULA_DATA_DIR", env.tmp.path().join("data"))
-        .env_remove("NEBULA_AGENT_ID")
         .current_dir(&repo)
         .output()
         .unwrap();
@@ -5814,12 +5814,11 @@ async fn branch_primary_cli_switch_and_agent_destinations() {
         "{evs:?}"
     );
     let cli = |args: &[&str]| {
-        std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        nebula_cmd()
             .args(args)
             .args(["--project", "primary-policy"])
             .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
             .env("NEBULA_DATA_DIR", env.tmp.path().join("data"))
-            .env_remove("NEBULA_AGENT_ID")
             .current_dir(&repo)
             .output()
             .unwrap()
@@ -5932,7 +5931,7 @@ async fn branch_primary_cli_switch_and_agent_destinations() {
     };
     let linked_tab = linked_tab.clone();
     for target in ["busy-target", "main"] {
-        let out = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        let out = nebula_cmd()
             .args([
                 "worktree",
                 "checkout",
@@ -6174,7 +6173,7 @@ async fn branch_primary_cli_switch_and_agent_destinations() {
     )
     .await
     .unwrap();
-    let failed = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+    let failed = nebula_cmd()
         .args(["switch", "feature", "--project", "primary-policy"])
         .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
         .env("NEBULA_DATA_DIR", env.tmp.path().join("data"))
@@ -6207,7 +6206,7 @@ async fn branch_primary_cli_switch_and_agent_destinations() {
         repo.to_str().unwrap()
     );
     for target in ["busy-target", "agent-branch"] {
-        let moved = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        let moved = nebula_cmd()
             .args([
                 "worktree",
                 "checkout",
@@ -6732,7 +6731,7 @@ async fn mobile_keys_and_id_deletion_use_the_exact_pty() {
     let main = add_project_get_main_worktree(&mut c, &repo).await;
     let id = create_agent_get_id(&mut c, &main.id, "fixture", 90).await;
     let cli = |args: &[&str]| {
-        std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        nebula_cmd()
             .args(args)
             .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
             .output()
@@ -6828,7 +6827,7 @@ async fn mobile_safe_removal_preserves_dirty_unmerged_occupied_and_protected_che
     handshake(&mut c).await;
     let main = add_project_get_main_worktree(&mut c, &repo).await;
     let cli = |args: &[&str]| {
-        std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        nebula_cmd()
             .args(args)
             .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
             .output()
@@ -7090,7 +7089,7 @@ async fn agent_send_delivers_a_long_line_as_one_bracketed_paste() {
         ("two\nlines", "\x1b[200~two\nlines\x1b[201~\r".to_string()),
         (long.as_str(), format!("\x1b[200~{long}\x1b[201~\r")),
     ] {
-        let result = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        let result = nebula_cmd()
             .args([
                 "agent",
                 "send",
@@ -7137,7 +7136,7 @@ async fn agent_send_refuses_paste_sized_text_and_sends_a_file_as_a_one_line_poin
     .await;
     assert!(ready.exists());
     let send = |args: &[&str]| {
-        std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        nebula_cmd()
             .args(["agent", "send", "--project", "repo"])
             .args(args)
             .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
@@ -7196,7 +7195,7 @@ async fn agent_new_writer_exits_2_naming_the_live_holder_unless_forced() {
     handshake(&mut c).await;
     add_project_get_main_worktree(&mut c, &repo).await;
     let cli = |args: &[&str]| {
-        std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        nebula_cmd()
             .args(args)
             .args(["--project", "repo"])
             .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
@@ -7277,13 +7276,10 @@ async fn agent_new_writer_waits_for_the_holder_then_spawns_and_its_id_resolves()
     handshake(&mut c).await;
     add_project_get_main_worktree(&mut c, &repo).await;
     let cli = |args: &[&str]| {
-        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"));
+        let mut cmd = nebula_cmd();
         cmd.args(args)
             .args(["--project", "repo"])
             .env("NEBULA_RUNTIME_DIR", &env.runtime_dir);
-        for k in LIVE_SESSION_ENV {
-            cmd.env_remove(k);
-        }
         cmd.output().unwrap()
     };
     let spawn = |name: &str| {
@@ -7354,13 +7350,10 @@ async fn agent_new_no_code_mode_forces_code_mode_off_on_every_spawn() {
     handshake(&mut c).await;
     add_project_get_main_worktree(&mut c, &repo).await;
     let cli = |args: &[&str]| {
-        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"));
+        let mut cmd = nebula_cmd();
         cmd.args(args)
             .args(["--project", "repo"])
             .env("NEBULA_RUNTIME_DIR", &env.runtime_dir);
-        for k in LIVE_SESSION_ENV {
-            cmd.env_remove(k);
-        }
         let out = cmd.output().unwrap();
         assert!(out.status.success(), "{args:?}: {out:?}");
         out
@@ -7428,11 +7421,10 @@ async fn agent_new_records_the_session_that_spawned_it() {
     handshake(&mut c).await;
     add_project_get_main_worktree(&mut c, &repo).await;
     let cli = |args: &[&str], agent_id: Option<&str>| {
-        let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"));
+        let mut cmd = nebula_cmd();
         cmd.args(args)
             .args(["--project", "repo"])
-            .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
-            .env_remove("NEBULA_AGENT_ID");
+            .env("NEBULA_RUNTIME_DIR", &env.runtime_dir);
         if let Some(id) = agent_id {
             cmd.env("NEBULA_AGENT_ID", id);
         }
@@ -7525,7 +7517,7 @@ async fn agent_new_writer_on_a_host_applies_the_rule_there() {
     };
     let in_sync = checker_bin("in-sync", "#!/bin/sh\necho 'differ: 0'\n");
     let cli_with = |args: &[&str], checker: &Path, data: &str| {
-        std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        nebula_cmd()
             .args(args)
             .args(["--project", "repo@testhost"])
             .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
@@ -7646,7 +7638,7 @@ async fn agent_new_writer_against_a_protocol29_daemon_stops_at_the_handshake() {
     });
     let runtime_dir = env.runtime_dir.clone();
     let out = tokio::task::spawn_blocking(move || {
-        std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        nebula_cmd()
             .args(["agent", "new", "--worktree", "main", "--writer"])
             .env("NEBULA_RUNTIME_DIR", runtime_dir)
             .output()
@@ -7682,7 +7674,7 @@ async fn agent_send_refuses_a_long_message_the_tty_would_drop() {
     .await;
     assert!(ready.exists());
 
-    let result = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+    let result = nebula_cmd()
         .args([
             "agent",
             "send",
@@ -7813,7 +7805,7 @@ async fn safe_removal_takes_archived_sessions_only_with_the_flag_and_never_live_
     handshake(&mut c).await;
     add_project_get_main_worktree(&mut c, &repo).await;
     let cli = |args: &[&str]| {
-        std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        nebula_cmd()
             .args(args)
             .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
             .output()
@@ -7893,7 +7885,7 @@ async fn prune_drops_ghost_rows_but_never_one_with_a_live_session() {
     handshake(&mut c).await;
     add_project_get_main_worktree(&mut c, &repo).await;
     let cli = |args: &[&str]| {
-        std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        nebula_cmd()
             .args(args)
             .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
             .output()
@@ -7993,10 +7985,7 @@ fn write_executable(path: &Path, body: &str) {
 }
 
 fn version_build_id() -> String {
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
-        .arg("--version")
-        .output()
-        .unwrap();
+    let out = nebula_cmd().arg("--version").output().unwrap();
     let line = String::from_utf8(out.stdout).unwrap();
     let id = line.trim().rsplit_once('(').unwrap().1;
     id.strip_suffix(')').unwrap().to_string()
@@ -8015,10 +8004,7 @@ async fn version_and_daemon_report_the_git_build() {
         .output()
         .unwrap();
     let sha = String::from_utf8(head.stdout).unwrap().trim().to_string();
-    let version = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
-        .arg("--version")
-        .output()
-        .unwrap();
+    let version = nebula_cmd().arg("--version").output().unwrap();
     let version = String::from_utf8(version.stdout).unwrap();
     let prefix = format!("nebula {} ({sha}", env!("CARGO_PKG_VERSION"));
     let suffix = version
@@ -8029,7 +8015,7 @@ async fn version_and_daemon_report_the_git_build() {
 
     let env = TestEnv::new();
     let daemon_build = || {
-        std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        nebula_cmd()
             .arg("_daemon-build")
             .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
             .env("NEBULA_DATA_DIR", env.tmp.path().join("data"))
@@ -8113,7 +8099,7 @@ async fn remote_status_reports_binary_and_skills_drift() {
         )
     };
     let status = || {
-        let out = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+        let out = nebula_cmd()
             .args(["remote", "fixture-host", "status"])
             .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
             .env("NEBULA_DATA_DIR", env.tmp.path().join("data"))
@@ -8214,7 +8200,7 @@ async fn agent_list_exposes_persistent_status_activity() {
             })
             .unwrap();
         for _ in 0..2 {
-            let output = std::process::Command::new(env!("CARGO_BIN_EXE_nebula"))
+            let output = nebula_cmd()
                 .args(["agent", "list", "--project", "repo"])
                 .env("NEBULA_RUNTIME_DIR", &env.runtime_dir)
                 .env("NEBULA_DATA_DIR", env.tmp.path().join("data"))

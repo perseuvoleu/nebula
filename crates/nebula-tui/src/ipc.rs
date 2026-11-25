@@ -560,50 +560,6 @@ pub(crate) async fn subscribe_snapshot(
     Ok((projects, worktrees, agents))
 }
 
-/// Save a preview URL on its exact checkout so the TUI keeps it beside that
-/// checkout's sessions. Preview startup remains successful when no daemon runs.
-pub async fn pin_checkout_link(checkout: &Path, url: &str) -> Result<()> {
-    let sock = paths::socket_path();
-    let stream = try_connect(&sock)
-        .await
-        .context("no nebula daemon is running")?;
-    let mut conn = handshake(stream).await?;
-    write_frame(&mut conn.stream, &ClientRequest::Subscribe).await?;
-    let (worktrees, links) = loop {
-        match read_frame::<ServerEvent, _>(&mut conn.stream).await? {
-            Some(ServerEvent::Snapshot {
-                worktrees, links, ..
-            }) => break (worktrees, links),
-            Some(_) => continue,
-            None => bail!("daemon closed the connection before the snapshot"),
-        }
-    };
-    let checkout = std::fs::canonicalize(checkout)?;
-    let worktree = worktrees
-        .iter()
-        .find(|w| std::fs::canonicalize(&w.path).ok().as_ref() == Some(&checkout))
-        .context("preview checkout is not registered in nebula")?;
-    if links
-        .iter()
-        .any(|link| link.worktree_id == worktree.id && link.url == url)
-    {
-        return Ok(());
-    }
-    let req_id = 1;
-    write_frame(
-        &mut conn.stream,
-        &ClientRequest::CreateLink {
-            req_id,
-            worktree: worktree.id.clone(),
-            url: url.to_string(),
-        },
-    )
-    .await?;
-    let mut upserts = Vec::new();
-    await_ack(&mut conn, req_id, &mut upserts).await?;
-    Ok(())
-}
-
 async fn subscribe_snapshot_with_terminals(
     conn: &mut Connection,
 ) -> Result<(
@@ -695,7 +651,7 @@ pub(crate) fn resolve_project(
 
 /// Await the Ack (or Error) for `req_id`, collecting entity upserts seen on
 /// the way; the daemon broadcasts the created row just before the Ack.
-async fn await_ack(
+pub(crate) async fn await_ack(
     conn: &mut Connection,
     req_id: u64,
     upserts: &mut Vec<nebula_core::Entity>,
@@ -751,7 +707,7 @@ pub async fn worktree_new(
 
 /// Ask the daemon for a worktree on `branch` (created from `base`, or the
 /// primary's HEAD) and return the checkout's path once its row lands.
-async fn create_worktree_path(
+pub(crate) async fn create_worktree_path(
     conn: &mut Connection,
     project: &nebula_core::ProjectId,
     branch: &str,
@@ -1760,6 +1716,12 @@ pub struct NewAgentOpts {
     /// `--no-card`: the session joins no card, not even its spawner's.
     pub no_card: bool,
     pub role: Option<nebula_core::board::Role>,
+    /// The spawning session when `todo run` crossed an ssh hop to get here;
+    /// otherwise NEBULA_AGENT_ID on this host.
+    pub parent: Option<nebula_core::board::SessionAt>,
+    /// `--dispatch ID`: the `todo run` dispatch this spawn fulfils; the
+    /// owning daemon answers a repeat with the session it already started.
+    pub dispatch: Option<nebula_core::DispatchId>,
 }
 
 /// Session name when the caller passed no `--name`: derived from the
@@ -1783,6 +1745,12 @@ fn default_agent_name(prompt: Option<&str>, taken: &[String]) -> String {
 
 /// `nebula agent new`: spawn a session on the given worktree.
 pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
+    println!("{}", spawn_agent(opts).await?);
+    Ok(())
+}
+
+/// Spawns as `agent new` does and returns the JSON it prints.
+pub async fn spawn_agent(opts: NewAgentOpts) -> Result<serde_json::Value> {
     let kind = nebula_core::AgentKind::parse(&opts.kind).with_context(|| {
         format!(
             "unknown agent kind {:?} (claude|codex|cursor|pi|antigravity)",
@@ -1796,6 +1764,13 @@ pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
     let mut conn = handshake(stream).await?;
     let (projects, worktrees, agents) = subscribe_snapshot(&mut conn).await?;
     let project = resolve_project(&projects, &worktrees, &agents, opts.project.as_deref())?;
+    if let Some(dispatch) = &opts.dispatch {
+        let executor = project
+            .host
+            .clone()
+            .unwrap_or_else(nebula_core::host::hostname);
+        crate::board_cli::check_executor(&mut conn, dispatch, &executor).await?;
+    }
     let caller = (env_agent_id().is_some() || opts.card.is_some())
         .then(|| crate::board_cli::Caller::resolve(&projects, &worktrees, &agents))
         .transpose()?;
@@ -1894,6 +1869,12 @@ pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
     // The owning daemon stays the judge of the writer mark: a refused claim
     // is retried until it is accepted or --writer-wait runs out, so the
     // protocol, the remote path and older daemons are unchanged.
+    let parent = opts.parent.clone().or_else(|| {
+        env_agent_id().map(|id| nebula_core::board::SessionAt {
+            host: nebula_core::host::hostname(),
+            id: AgentId(id),
+        })
+    });
     let wait_until = tokio::time::Instant::now() + opts.writer_wait;
     let mut req_id = 10u64;
     let mut announced = false;
@@ -1912,19 +1893,20 @@ pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
                 auto_title,
                 prompt: opts.prompt.clone(),
                 writer: opts.writer,
-                spawned_by: env_agent_id().map(AgentId),
+                spawned_by: parent.as_ref().map(|p| p.id.clone()),
                 code_mode_off: opts.code_mode_off,
                 card: card.clone(),
                 role: opts.role,
-                dispatch: None,
-                spawned_by_host: env_agent_id().map(|_| nebula_core::host::hostname()),
+                dispatch: opts.dispatch.clone(),
+                spawned_by_host: parent.as_ref().map(|p| p.host.clone()),
             },
         )
         .await?;
         let mut upserts = Vec::new();
         match await_ack(&mut conn, req_id, &mut upserts).await {
             Err(why)
-                if why.to_string().contains(nebula_core::WRITER_HELD_REFUSAL)
+                if nebula_core::board::Refusal::of(&why.to_string())
+                    == Some(nebula_core::board::Refusal::WriterHeld)
                     && tokio::time::Instant::now() < wait_until =>
             {
                 if !announced {
@@ -1948,19 +1930,40 @@ pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
         Some(nebula_core::EntityId::Agent(id)) => id.to_string(),
         _ => String::new(),
     };
-    println!(
-        "{}",
-        serde_json::json!({
+    if opts.dispatch.is_some() {
+        let (projects, worktrees, agents) = subscribe_snapshot(&mut conn).await?;
+        let unlisted = || format!("the daemon answered with session {id} but does not list it");
+        let agent = agents
+            .into_iter()
+            .find(|a| a.id.as_str() == id)
+            .with_context(unlisted)?;
+        let worktree = worktrees
+            .iter()
+            .find(|w| w.id == agent.worktree_id)
+            .with_context(unlisted)?;
+        let project = projects
+            .iter()
+            .find(|p| p.id == worktree.project_id)
+            .with_context(unlisted)?;
+        return Ok(serde_json::json!({
             "id": id,
-            "name": name,
-            "kind": opts.kind,
+            "name": agent.name,
+            "kind": agent.kind.as_str(),
             "project": project.name,
-            "worktree": target.branch,
-            "card": card,
-            "role": opts.role,
-        })
-    );
-    Ok(())
+            "worktree": worktree.branch,
+            "card": agent.card_id,
+            "role": agent.role,
+        }));
+    }
+    Ok(serde_json::json!({
+        "id": id,
+        "name": name,
+        "kind": opts.kind,
+        "project": project.name,
+        "worktree": target.branch,
+        "card": card,
+        "role": opts.role,
+    }))
 }
 
 /// `nebula agent list [--project <name>] [--all] [--worktree <branch>]`:
@@ -2229,309 +2232,6 @@ pub async fn agent_wait(
         .collect();
     println!("{}", serde_json::Value::Array(rows));
     Ok(end)
-}
-
-pub enum NotesOp {
-    List,
-    Add { text: String, worktree: bool },
-    Done { index: usize },
-}
-
-/// `nebula notes [list|add|done]` — the notes lists (project + current
-/// worktree) from the CLI, so agents can read and work the user's to-do
-/// list. Targets the caller's session (NEBULA_AGENT_ID) when run inside
-/// one, else whatever project/worktree owns the current directory.
-pub async fn run_notes(op: NotesOp) -> Result<()> {
-    use nebula_core::{Note, NoteOwner};
-    let sock = paths::socket_path();
-    let Ok(stream) = try_connect(&sock).await else {
-        bail!("no nebula daemon is running");
-    };
-    let mut conn = handshake(stream).await?;
-    write_frame(&mut conn.stream, &ClientRequest::Subscribe).await?;
-    let (projects, worktrees, agents, notes) = loop {
-        match read_frame::<ServerEvent, _>(&mut conn.stream).await? {
-            Some(ServerEvent::Snapshot {
-                projects,
-                worktrees,
-                agents,
-                notes,
-                ..
-            }) => break (projects, worktrees, agents, notes),
-            Some(_) => continue,
-            None => bail!("daemon closed the connection before the snapshot"),
-        }
-    };
-
-    // Whose notes: the session's worktree when inside one, else the deepest
-    // worktree (or failing that, the project) holding the cwd.
-    let by_agent = std::env::var("NEBULA_AGENT_ID")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .and_then(|id| agents.iter().find(|a| a.id.as_str() == id))
-        .and_then(|a| worktrees.iter().find(|w| w.id == a.worktree_id));
-    let worktree = by_agent.or_else(|| {
-        let cwd = std::env::current_dir().ok()?;
-        worktrees
-            .iter()
-            .filter(|w| cwd.starts_with(&w.path))
-            .max_by_key(|w| w.path.components().count())
-    });
-    let project = match worktree {
-        Some(w) => projects
-            .iter()
-            .find(|p| p.id == w.project_id)
-            .context("this worktree's project is gone from the daemon")?,
-        None => {
-            let cwd = std::env::current_dir().context("resolve current directory")?;
-            projects
-                .iter()
-                .find(|p| cwd.starts_with(&p.repo_path))
-                .context(
-                    "not inside a nebula agent session or a known project — \
-                     run from a project directory",
-                )?
-        }
-    };
-
-    // One numbered list: the project's notes, then the worktree's. Indices
-    // are what `done <n>` takes, recomputed per invocation.
-    let mut visible: Vec<&Note> = notes
-        .iter()
-        .filter(|n| n.owner == NoteOwner::Project(project.id.clone()))
-        .collect();
-    let project_count = visible.len();
-    if let Some(w) = worktree {
-        visible.extend(
-            notes
-                .iter()
-                .filter(|n| n.owner == NoteOwner::Worktree(w.id.clone())),
-        );
-    }
-
-    let req_id = 1u64;
-    match op {
-        NotesOp::List => {
-            if visible.is_empty() {
-                println!(
-                    "no notes for {} — add one with `nebula notes add <text>`",
-                    project.name
-                );
-                return Ok(());
-            }
-            for (i, n) in visible.iter().enumerate() {
-                if i == 0 && project_count > 0 {
-                    println!("{} — project notes", project.name);
-                }
-                if i == project_count {
-                    // Reachable only when a worktree was resolved.
-                    println!(
-                        "{}/{} — worktree notes",
-                        project.name,
-                        worktree.map(|w| w.branch.as_str()).unwrap_or("?")
-                    );
-                }
-                let mark = if n.done { "x" } else { " " };
-                println!("  {}. [{mark}] {}", i + 1, n.text);
-            }
-            Ok(())
-        }
-        NotesOp::Add {
-            text,
-            worktree: to_worktree,
-        } => {
-            let owner = if to_worktree {
-                let w = worktree.context(
-                    "--worktree needs a current worktree (run inside a session or a checkout)",
-                )?;
-                NoteOwner::Worktree(w.id.clone())
-            } else {
-                NoteOwner::Project(project.id.clone())
-            };
-            write_frame(
-                &mut conn.stream,
-                &ClientRequest::CreateNote {
-                    req_id,
-                    owner,
-                    text: text.clone(),
-                },
-            )
-            .await?;
-            await_ack(&mut conn, req_id, &mut Vec::new()).await?;
-            println!("note added: {text}");
-            Ok(())
-        }
-        NotesOp::Done { index } => {
-            let n = index
-                .checked_sub(1)
-                .and_then(|i| visible.get(i))
-                .with_context(|| {
-                    format!(
-                        "no note {index} — `nebula notes` lists {} note{}",
-                        visible.len(),
-                        if visible.len() == 1 { "" } else { "s" }
-                    )
-                })?;
-            write_frame(
-                &mut conn.stream,
-                &ClientRequest::SetNoteDone {
-                    req_id,
-                    id: n.id.clone(),
-                    done: true,
-                },
-            )
-            .await?;
-            await_ack(&mut conn, req_id, &mut Vec::new()).await?;
-            println!("note {index} done: {}", n.text);
-            Ok(())
-        }
-    }
-}
-
-pub enum TodoOp {
-    Done { index: usize },
-    Reopen { index: usize },
-    NoteDone { index: usize, note: usize },
-}
-
-/// `nebula todo done|reopen|note-done` — the legacy positional verbs over
-/// the project and worktree todo lists, including each todo's own notes. Target
-/// resolution mirrors `nebula notes`: the caller's session
-/// (NEBULA_AGENT_ID) when run inside one, else whatever project/worktree
-/// owns the current directory.
-pub async fn run_todo(op: TodoOp) -> Result<()> {
-    use nebula_core::{Note, NoteOwner, Todo, TodoOwner};
-    let sock = paths::socket_path();
-    let Ok(stream) = try_connect(&sock).await else {
-        bail!("no nebula daemon is running");
-    };
-    let mut conn = handshake(stream).await?;
-    write_frame(&mut conn.stream, &ClientRequest::Subscribe).await?;
-    let (projects, worktrees, agents, notes, todos) = loop {
-        match read_frame::<ServerEvent, _>(&mut conn.stream).await? {
-            Some(ServerEvent::Snapshot {
-                projects,
-                worktrees,
-                agents,
-                notes,
-                todos,
-                ..
-            }) => break (projects, worktrees, agents, notes, todos),
-            Some(_) => continue,
-            None => bail!("daemon closed the connection before the snapshot"),
-        }
-    };
-
-    // Whose todos: the session's worktree when inside one, else the deepest
-    // worktree (or failing that, the project) holding the cwd.
-    let by_agent = std::env::var("NEBULA_AGENT_ID")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .and_then(|id| agents.iter().find(|a| a.id.as_str() == id))
-        .and_then(|a| worktrees.iter().find(|w| w.id == a.worktree_id));
-    let worktree = by_agent.or_else(|| {
-        let cwd = std::env::current_dir().ok()?;
-        worktrees
-            .iter()
-            .filter(|w| cwd.starts_with(&w.path))
-            .max_by_key(|w| w.path.components().count())
-    });
-    let project = match worktree {
-        Some(w) => projects
-            .iter()
-            .find(|p| p.id == w.project_id)
-            .context("this worktree's project is gone from the daemon")?,
-        None => {
-            let cwd = std::env::current_dir().context("resolve current directory")?;
-            projects
-                .iter()
-                .find(|p| cwd.starts_with(&p.repo_path))
-                .context(
-                    "not inside a nebula agent session or a known project — \
-                     run from a project directory",
-                )?
-        }
-    };
-
-    // One numbered list: the project's todos, then the worktree's. Indices
-    // are what done/reopen/show/note take, recomputed per invocation.
-    let mut visible: Vec<&Todo> = todos
-        .iter()
-        .filter(|t| t.owner == TodoOwner::Project(project.id.clone()))
-        .collect();
-    if let Some(w) = worktree {
-        visible.extend(
-            todos
-                .iter()
-                .filter(|t| t.owner == TodoOwner::Worktree(w.id.clone())),
-        );
-    }
-    // A todo's child notes, in snapshot (per-owner list) order.
-    let notes_of = |todo: &Todo| -> Vec<&Note> {
-        notes
-            .iter()
-            .filter(|n| n.owner == NoteOwner::Todo(todo.id.clone()))
-            .collect()
-    };
-    let nth = |index: usize| -> Result<&&Todo> {
-        index
-            .checked_sub(1)
-            .and_then(|i| visible.get(i))
-            .with_context(|| {
-                format!(
-                    "no todo {index} — `nebula todo list` lists {} todo{}",
-                    visible.len(),
-                    if visible.len() == 1 { "" } else { "s" }
-                )
-            })
-    };
-
-    let req_id = 1u64;
-    match op {
-        TodoOp::Done { index } | TodoOp::Reopen { index } => {
-            let done = matches!(op, TodoOp::Done { .. });
-            let t = nth(index)?;
-            write_frame(
-                &mut conn.stream,
-                &ClientRequest::SetTodoDone {
-                    req_id,
-                    id: t.id.clone(),
-                    done,
-                },
-            )
-            .await?;
-            await_ack(&mut conn, req_id, &mut Vec::new()).await?;
-            println!(
-                "todo {index} {}: {}",
-                if done { "done" } else { "reopened" },
-                t.text
-            );
-            Ok(())
-        }
-        TodoOp::NoteDone { index, note } => {
-            let t = nth(index)?;
-            let child = notes_of(t);
-            let n = note.checked_sub(1).and_then(|i| child.get(i)).with_context(|| {
-                format!(
-                    "no note {note} under todo {index} — `nebula todo show {index}` lists {} note{}",
-                    child.len(),
-                    if child.len() == 1 { "" } else { "s" }
-                )
-            })?;
-            write_frame(
-                &mut conn.stream,
-                &ClientRequest::SetNoteDone {
-                    req_id,
-                    id: n.id.clone(),
-                    done: true,
-                },
-            )
-            .await?;
-            await_ack(&mut conn, req_id, &mut Vec::new()).await?;
-            println!("todo {index} note {note} done: {}", n.text);
-            Ok(())
-        }
-    }
 }
 
 #[cfg(test)]

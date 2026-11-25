@@ -5,11 +5,16 @@ use crate::store::Store;
 use anyhow::{bail, Result};
 use nebula_core::board::{
     card_label, Author, Away, BoardHost, BoardOp, BoardPage, BoardPoll, BoardRead, BoardResult,
-    BoardScope, Card, CardDraft, CardNote, CardRef, CardSession, CardShow, NeedsYou, Page,
-    Placement, ProjectScope, Refusal, Stage,
+    BoardScope, Card, CardDraft, CardNote, CardRef, CardSession, CardShow, Dispatch, DispatchState,
+    NeedsYou, Page, Placement, ProjectScope, Refusal, RunReceipt, SessionAt, Stage,
 };
-use nebula_core::{AgentId, AgentKind, AgentStatus, ArtifactId, NoteId, TodoId, MAX_FRAME_LEN};
+use nebula_core::{
+    AgentId, AgentKind, AgentStatus, ArtifactId, DispatchId, NoteId, TodoId, MAX_FRAME_LEN,
+};
 use rusqlite::{params, OptionalExtension, Row, Transaction};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Bytes one page may carry, hosts and the away digest included; the rest
 /// of the frame is headroom for the envelope.
@@ -21,7 +26,13 @@ pub(crate) fn page_budget() -> usize {
 }
 
 pub fn serve(store: &Store, op: BoardOp) -> Result<BoardResult> {
-    store.board_transaction(|tx| apply(tx, op))
+    let result = store.board_transaction(|tx| apply(tx, op))?;
+    if let BoardResult::Artifact(artifact) = &result {
+        if artifact.kind == "decision" && !artifact.meta.contains_key("rag_note") {
+            crate::rag_copy::kick();
+        }
+    }
+    Ok(result)
 }
 
 fn apply(tx: &Transaction, op: BoardOp) -> Result<BoardResult> {
@@ -37,7 +48,7 @@ fn apply(tx: &Transaction, op: BoardOp) -> Result<BoardResult> {
             if let Some(title) = title {
                 let title = non_empty(&title, "a card title")?;
                 tx.execute(
-                    "UPDATE todos SET title = ?2, text = ?2 WHERE id = ?1",
+                    "UPDATE todos SET title = ?2 WHERE id = ?1",
                     params![id.as_str(), title],
                 )?;
             }
@@ -129,14 +140,183 @@ fn apply(tx: &Transaction, op: BoardOp) -> Result<BoardResult> {
         BoardOp::RemoveArtifact { id } => {
             crate::artifacts::remove(tx, &id).map(BoardResult::Artifact)
         }
-        BoardOp::BeginRun(_) | BoardOp::EndRun { .. } => {
-            bail!("this board does not serve that operation yet")
-        }
+        BoardOp::BeginRun(dispatch) => begin_run(tx, dispatch).map(BoardResult::Run),
+        BoardOp::EndRun {
+            dispatch,
+            agent,
+            error,
+        } => end_run(tx, &dispatch, agent, error).map(BoardResult::Run),
         BoardOp::Scoped { scope, op } => {
             within(tx, &scope, &op)?;
             apply(tx, *op)
         }
     }
+}
+
+fn begin_run(tx: &Transaction, dispatch: Dispatch) -> Result<RunReceipt> {
+    let card = resolve(tx, &dispatch.card)?;
+    let known = receipt(tx, &dispatch.id)?;
+    if let Some(known) = &known {
+        if known.card != card {
+            bail!(Refusal::Conflict.message(format!(
+                "dispatch {} runs another card",
+                dispatch.id.as_str()
+            )));
+        }
+        let (host, role, kind, worktree): (String, String, String, String) = tx.query_row(
+            "SELECT host, role, kind, worktree FROM dispatches WHERE id = ?1",
+            params![dispatch.id.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?;
+        if !host.eq_ignore_ascii_case(&dispatch.host)
+            || (role.as_str(), kind.as_str(), worktree.as_str())
+                != (
+                    dispatch.role.as_str(),
+                    dispatch.kind.as_str(),
+                    dispatch.worktree.as_str(),
+                )
+        {
+            bail!(Refusal::Conflict.message(format!(
+                "dispatch {} runs with --host {host} --role {role} --kind {kind} --worktree {worktree}; rerun it with those",
+                dispatch.id.as_str()
+            )));
+        }
+        if known.state != DispatchState::Pending {
+            return Ok(known.clone());
+        }
+        let launched: Option<(String, Option<String>, String)> = tx
+            .query_row(
+                "SELECT agent_id, role, kind FROM board_sessions
+                 WHERE dispatch_id = ?1 AND card_id = ?2 AND host = ?3 COLLATE NOCASE
+                   AND alive = 1 AND archived = 0",
+                params![dispatch.id.as_str(), card.as_str(), host],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        if let Some((agent, role, kind)) = launched {
+            if role.as_deref() != Some(dispatch.role.as_str()) || kind != dispatch.kind.as_str() {
+                bail!(Refusal::Conflict.message(format!(
+                    "dispatch {} started {agent} with another role or kind",
+                    dispatch.id.as_str()
+                )));
+            }
+            return end_run(tx, &dispatch.id, Some(AgentId(agent)), None);
+        }
+    }
+    let found = card_by_id(tx, &card)?;
+    if found.archived {
+        bail!(Refusal::Conflict.message(format!("{} is archived", found.label)));
+    }
+    let Some(project) = found.project else {
+        bail!(Refusal::Conflict.message(format!(
+            "{} is a home card; give it a project to run it",
+            found.label
+        )));
+    };
+    let open: Vec<String> = tx
+        .prepare(
+            "SELECT t.number FROM card_blocks b JOIN todos t ON t.id = b.by_id
+             WHERE b.card_id = ?1 AND t.stage != 'done' ORDER BY t.number",
+        )?
+        .query_map(params![card.as_str()], |r| r.get::<_, i64>(0))?
+        .map(|n| n.map(|n| card_label(n as u64, None)))
+        .collect::<rusqlite::Result<_>>()?;
+    if !open.is_empty() {
+        bail!(Refusal::Conflict.message(format!(
+            "{} is blocked by {}",
+            found.label,
+            open.join(", ")
+        )));
+    }
+    if let Some(known) = known {
+        return Ok(known);
+    }
+    let here = nebula_core::host::hostname();
+    let host = match here.eq_ignore_ascii_case(&dispatch.host) {
+        true => Some(here),
+        false => tx
+            .query_row(
+                "SELECT host FROM board_hosts WHERE host = ?1 COLLATE NOCASE",
+                params![dispatch.host],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?,
+    };
+    let Some(host) = host else {
+        bail!(Refusal::Conflict.message(format!(
+            "no host {} has reported to the board; --host takes a reported host name",
+            dispatch.host
+        )));
+    };
+    tx.execute(
+        "INSERT INTO dispatches (id, card_id, host, role, kind, worktree, state, created_at, project)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8)",
+        params![
+            dispatch.id.as_str(),
+            card.as_str(),
+            host,
+            dispatch.role.as_str(),
+            dispatch.kind.as_str(),
+            dispatch.worktree,
+            now_ms(),
+            project
+        ],
+    )?;
+    receipt(tx, &dispatch.id)?.ok_or_else(|| anyhow::anyhow!("the dispatch vanished"))
+}
+
+fn end_run(
+    tx: &Transaction,
+    id: &DispatchId,
+    agent: Option<AgentId>,
+    error: Option<String>,
+) -> Result<RunReceipt> {
+    let known = receipt(tx, id)?.ok_or_else(|| {
+        anyhow::anyhow!(Refusal::NotFound.message(format!("no dispatch {}", id.as_str())))
+    })?;
+    if known.state != DispatchState::Pending {
+        return Ok(known);
+    }
+    match (agent, error) {
+        (Some(agent), _) => tx.execute(
+            "UPDATE dispatches SET state = 'started', agent_id = ?2 WHERE id = ?1",
+            params![id.as_str(), agent.as_str()],
+        )?,
+        (None, Some(error)) => tx.execute(
+            "UPDATE dispatches SET state = 'failed', error = ?2 WHERE id = ?1",
+            params![id.as_str(), error],
+        )?,
+        (None, None) => bail!("a run ends with its session or its error"),
+    };
+    receipt(tx, id)?.ok_or_else(|| anyhow::anyhow!("the dispatch vanished"))
+}
+
+fn receipt(tx: &Transaction, id: &DispatchId) -> Result<Option<RunReceipt>> {
+    Ok(tx
+        .query_row(
+            "SELECT card_id, host, state, agent_id, project FROM dispatches WHERE id = ?1",
+            params![id.as_str()],
+            |r| {
+                let host: String = r.get(1)?;
+                let state: String = r.get(2)?;
+                Ok(RunReceipt {
+                    dispatch: id.clone(),
+                    state: match state.as_str() {
+                        "started" => DispatchState::Started,
+                        "failed" => DispatchState::Failed,
+                        _ => DispatchState::Pending,
+                    },
+                    session: r.get::<_, Option<String>>(3)?.map(|agent| SessionAt {
+                        host,
+                        id: AgentId(agent),
+                    }),
+                    card: TodoId(r.get(0)?),
+                    host: r.get(1)?,
+                    project: r.get(4)?,
+                })
+            },
+        )
+        .optional()?)
 }
 
 fn within(tx: &Transaction, scope: &BoardScope, op: &BoardOp) -> Result<()> {
@@ -145,6 +325,16 @@ fn within(tx: &Transaction, scope: &BoardScope, op: &BoardOp) -> Result<()> {
         let id = resolve(tx, card)?;
         if !in_scope(scope, card_by_id(tx, &id)?.project.as_deref()) {
             return Err(not_found(card));
+        }
+    }
+    if let BoardOp::BeginRun(dispatch) = op {
+        if let Some(project) = receipt(tx, &dispatch.id)?.and_then(|r| r.project) {
+            if !in_scope(scope, Some(&project)) {
+                bail!(Refusal::NotFound.message(format!(
+                    "dispatch {} runs in project \"{project}\", outside the write scope",
+                    dispatch.id.as_str()
+                )));
+            }
         }
     }
     Ok(())
@@ -243,8 +433,8 @@ fn add_card(tx: &Transaction, draft: CardDraft) -> Result<Card> {
     })?;
     let now = now_ms();
     tx.execute(
-        "INSERT INTO todos (id, text, sort_order, created_at, number, title, stage, project, checkout, created_by, proposed, stage_changed_at)
-         VALUES (?1, ?2, ?3, ?4, ?3, ?2, ?5, ?6, ?7, ?8, ?9, ?4)",
+        "INSERT INTO todos (id, sort_order, created_at, number, title, stage, project, checkout, created_by, proposed, stage_changed_at)
+         VALUES (?1, ?3, ?4, ?3, ?2, ?5, ?6, ?7, ?8, ?9, ?4)",
         params![
             draft.id.as_str(),
             title,
@@ -550,18 +740,25 @@ fn read_op(tx: &Transaction, read: BoardRead) -> Result<BoardResult> {
         BoardRead::Artifact { scope, id } => {
             crate::artifacts::show(tx, &scope, &id).map(BoardResult::Artifact)
         }
+        BoardRead::Dispatch { id } => receipt(tx, &id)?.map(BoardResult::Run).ok_or_else(|| {
+            anyhow::anyhow!(Refusal::NotFound.message(format!("no dispatch {}", id.as_str())))
+        }),
     }
 }
 
 fn sessions_of(tx: &Transaction, card: &TodoId) -> Result<Vec<CardSession>> {
+    let stale = stale_hosts(tx)?;
     Ok(tx
         .prepare(
-            "SELECT host, agent_id, name, role, kind, status, status_changed_at, writer, alive
+            "SELECT host, agent_id, name, role, kind, status, status_changed_at, writer, alive, parent
              FROM board_sessions WHERE card_id = ?1 ORDER BY created_at, rowid",
         )?
         .query_map(params![card.as_str()], |r| {
+            let host: String = r.get(0)?;
             Ok(CardSession {
-                host: r.get(0)?,
+                stale: stale.contains(&host),
+                parent: optional_json(r, 9)?,
+                host,
                 id: AgentId(r.get(1)?),
                 name: r.get(2)?,
                 role: r
@@ -572,13 +769,13 @@ fn sessions_of(tx: &Transaction, card: &TodoId) -> Result<Vec<CardSession>> {
                 status_changed_at: r.get(6)?,
                 writer: r.get::<_, i64>(7)? != 0,
                 alive: r.get::<_, i64>(8)? != 0,
-                stale: false,
             })
         })?
         .collect::<rusqlite::Result<_>>()?)
 }
 
 fn hosts(tx: &Transaction, scope: &BoardScope) -> Result<Vec<BoardHost>> {
+    let stale = stale_hosts(tx)?;
     let waiting: Vec<(String, Option<String>)> = tx
         .prepare(
             "SELECT s.host, t.project FROM board_sessions s LEFT JOIN todos t ON t.id = s.card_id
@@ -602,6 +799,7 @@ fn hosts(tx: &Transaction, scope: &BoardScope) -> Result<Vec<BoardHost>> {
             let checkouts: Vec<nebula_core::board::HostCheckout> = json_column(r, 3)?;
             Ok(BoardHost {
                 needs_you: needs_you(&host),
+                stale: stale.contains(&host),
                 host,
                 writers: r.get(1)?,
                 writer_slots: r.get(2)?,
@@ -609,7 +807,6 @@ fn hosts(tx: &Transaction, scope: &BoardScope) -> Result<Vec<BoardHost>> {
                     .into_iter()
                     .filter(|c| in_scope(scope, Some(&c.project)))
                     .collect(),
-                stale: false,
             })
         })?
         .collect::<rusqlite::Result<_>>()?)
@@ -673,4 +870,94 @@ fn away(tx: &Transaction, scope: &BoardScope, cards: &[Card], since: i64) -> Res
         needs_you,
         decisions,
     })
+}
+
+fn stale_after() -> Duration {
+    std::env::var("NEBULA_BOARD_STALE_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_secs(300))
+}
+
+#[derive(Default)]
+struct Links {
+    open: HashMap<String, usize>,
+    closed_at: HashMap<String, Instant>,
+}
+
+impl Links {
+    fn down(&self, host: &str, after: Duration) -> bool {
+        self.open.get(host).copied().unwrap_or(0) == 0
+            && self.closed_at.get(host).copied().unwrap_or(*BOOT).elapsed() >= after
+    }
+}
+
+static LINKS: std::sync::LazyLock<Mutex<Links>> = std::sync::LazyLock::new(Default::default);
+static BOOT: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+
+pub(crate) fn boot(store: Arc<Store>) {
+    std::sync::LazyLock::force(&BOOT);
+    tokio::spawn(async move {
+        tokio::time::sleep(stale_after()).await;
+        bump(store).await;
+    });
+}
+
+/// True when `host` read stale until this link opened: the caller bumps
+/// the board version so a poll sees it fresh again.
+pub(crate) fn link_opened(host: &str) -> bool {
+    let mut links = LINKS.lock().unwrap();
+    let was_stale = links.down(host, stale_after());
+    *links.open.entry(host.to_string()).or_default() += 1;
+    links.closed_at.remove(host);
+    was_stale
+}
+
+pub(crate) fn link_closed(host: &str, store: Arc<Store>) {
+    let closed_at = Instant::now();
+    {
+        let mut links = LINKS.lock().unwrap();
+        let open = links.open.entry(host.to_string()).or_default();
+        *open = open.saturating_sub(1);
+        if *open > 0 {
+            return;
+        }
+        links.closed_at.insert(host.to_string(), closed_at);
+    }
+    let host = host.to_string();
+    tokio::spawn(async move {
+        tokio::time::sleep(stale_after()).await;
+        if LINKS.lock().unwrap().closed_at.get(&host) == Some(&closed_at) {
+            bump(store).await;
+        }
+    });
+}
+
+pub(crate) fn bump_now(store: &Store) -> Result<()> {
+    store.board_transaction(|tx| {
+        tx.execute("UPDATE board_meta SET version = version + 1", [])?;
+        Ok(())
+    })
+}
+
+async fn bump(store: Arc<Store>) {
+    let bumped = tokio::task::spawn_blocking(move || bump_now(&store)).await;
+    if let Ok(Err(e)) = bumped {
+        tracing::warn!(error = %e, "board version bump failed");
+    }
+}
+
+fn stale_hosts(tx: &Transaction) -> Result<HashSet<String>> {
+    let known: Vec<String> = tx
+        .prepare("SELECT host FROM board_hosts UNION SELECT host FROM board_sessions")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let links = LINKS.lock().unwrap();
+    let here = nebula_core::host::hostname();
+    let after = stale_after();
+    Ok(known
+        .into_iter()
+        .filter(|h| *h != here && links.down(h, after))
+        .collect())
 }
