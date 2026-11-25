@@ -2,10 +2,10 @@
 
 use crate::app::{
     AfterCheckout, App, AttachedTerm, ConfirmDialog, ConnState, ContextMenu, DiffView, FileFinder,
-    Focus, GrepView, HitTarget, LinkRow, MenuAction, MenuItem, MetricsView, OpenStage, Overlay,
-    Palette, PaletteTarget, PanelEntry, PanelRow, PendingAction, PendingIntent, PointerShape,
-    ProjectRow, PromptDialog, PromptKind, SessionRow, SettingsView, SplitterDrag, SubmenuKind,
-    TermSelection, WorktreeRollback,
+    Focus, GrepView, HitTarget, MenuAction, MenuItem, MetricsView, OpenStage, Overlay, Palette,
+    PaletteTarget, PanelEntry, PanelRow, PendingAction, PendingIntent, PointerShape, ProjectRow,
+    PromptDialog, PromptKind, SessionRow, SettingsView, SplitterDrag, SubmenuKind, TermSelection,
+    WorktreeRollback,
 };
 use crate::pull_request::PullRequest;
 use crate::text_input::TextInput;
@@ -3563,10 +3563,10 @@ fn open_delete_all_confirm(app: &mut App) {
     }
 }
 
-fn menu_items_for_link(row: &LinkRow) -> Vec<MenuItem> {
+fn menu_items_for_link(pr: &crate::pull_request::PullRequest) -> Vec<MenuItem> {
     vec![MenuItem {
         label: "Open in browser".into(),
-        action: MenuAction::OpenLink(row.url().to_string()),
+        action: MenuAction::OpenLink(pr.url.clone()),
         destructive: false,
     }]
 }
@@ -7097,7 +7097,7 @@ fn attach_selected(app: &mut App, out: &mut Vec<ClientRequest>) {
     };
     let Some(sref) = row.sref() else {
         if let Some(link) = row.as_link() {
-            open_link(app, link.url(), out);
+            open_link(app, &link.url, out);
         }
         return;
     };

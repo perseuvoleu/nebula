@@ -1820,48 +1820,6 @@ pub enum ConnState {
     Disconnected,
 }
 
-/// One row of the Sessions panel's LINKS group: the pull request nebula
-/// found on the worktree's branch.
-#[derive(Debug, Clone)]
-pub enum LinkRow {
-    /// Discovered by `gh pr view`, backed by nothing in the store.
-    PullRequest(PullRequest),
-}
-
-impl LinkRow {
-    pub fn url(&self) -> &str {
-        match self {
-            LinkRow::PullRequest(pr) => &pr.url,
-        }
-    }
-
-    pub fn pull_request(&self) -> Option<&PullRequest> {
-        match self {
-            LinkRow::PullRequest(pr) => Some(pr),
-        }
-    }
-
-    /// Comments and reviews other people left on this row's pull request
-    /// since it was last opened from nebula. Zero for a row that isn't a
-    /// pull request — nothing else has a conversation to fall behind on.
-    pub fn unseen_comments(&self, seen: &HashMap<String, String>) -> usize {
-        match self.pull_request() {
-            Some(pr) => pr.unseen(seen.get(&pr.url).map(String::as_str)),
-            None => 0,
-        }
-    }
-
-    /// Row text: a pull request reads as `#42 title`, anything else as its
-    /// URL with the noise (scheme, `www.`, trailing slash) stripped.
-    pub fn label(&self) -> String {
-        match self.pull_request() {
-            Some(pr) if !pr.title.is_empty() => format!("#{} {}", pr.number, pr.title),
-            Some(pr) => format!("#{}", pr.number),
-            None => pretty_url(self.url()),
-        }
-    }
-}
-
 /// A URL as a person reads it: no scheme, no `www.`, no trailing slash.
 /// Purely cosmetic — the full URL is what gets opened.
 pub fn pretty_url(url: &str) -> String {
@@ -1879,7 +1837,9 @@ pub fn pretty_url(url: &str) -> String {
 pub enum SessionRow {
     Agent(Agent),
     Terminal(TerminalTab),
-    Link(LinkRow),
+    /// The LINKS group's row: the pull request `gh pr view` found on the
+    /// worktree's branch, backed by nothing in the store.
+    Link(PullRequest),
 }
 
 impl SessionRow {
@@ -1887,7 +1847,7 @@ impl SessionRow {
         match self {
             SessionRow::Agent(a) => &a.name,
             SessionRow::Terminal(t) => &t.name,
-            SessionRow::Link(l) => l.url(),
+            SessionRow::Link(l) => &l.url,
         }
     }
 
@@ -1914,7 +1874,7 @@ impl SessionRow {
         }
     }
 
-    pub fn as_link(&self) -> Option<&LinkRow> {
+    pub fn as_link(&self) -> Option<&PullRequest> {
         match self {
             SessionRow::Link(l) => Some(l),
             _ => None,
@@ -3738,7 +3698,7 @@ impl App {
     }
 
     /// The selected worktree's LINKS group: the pull request on its branch.
-    pub fn visible_links(&self) -> Vec<LinkRow> {
+    pub fn visible_links(&self) -> Vec<PullRequest> {
         let Some(worktree) = self.selected_worktree() else {
             return vec![];
         };
@@ -3746,25 +3706,24 @@ impl App {
     }
 
     /// Links hang off checkouts; a branch row has none.
-    fn links_for_home(&self, home: &SessionHome) -> Vec<LinkRow> {
+    fn links_for_home(&self, home: &SessionHome) -> Vec<PullRequest> {
         match home {
             SessionHome::Worktree(id) => self.links_for_worktree(id),
             SessionHome::Branch(..) => vec![],
         }
     }
 
-    fn links_for_worktree(&self, worktree: &WorktreeId) -> Vec<LinkRow> {
+    fn links_for_worktree(&self, worktree: &WorktreeId) -> Vec<PullRequest> {
         self.pull_requests
             .get(worktree)
             .cloned()
             .flatten()
-            .map(LinkRow::PullRequest)
             .into_iter()
             .collect()
     }
 
     /// The link row under the cursor, when the cursor is on one.
-    pub fn selected_link(&self) -> Option<LinkRow> {
+    pub fn selected_link(&self) -> Option<PullRequest> {
         match self.selected_session_row() {
             Some(SessionRow::Link(l)) => Some(l),
             _ => None,
