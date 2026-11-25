@@ -1179,9 +1179,8 @@ fn open_session_attaches_it_in_the_running_tui() {
 /// A HOME whose `~/.local/bin` holds `nebula` (`remote`, else this build)
 /// and a stub ssh that records its argv one word per line in `ssh-argv`,
 /// then joins the words after the host with spaces and runs them as ssh
-/// would. It exits 255 like an
-/// unreachable host with SSH_STUB_UNREACHABLE set, and runs nothing with
-/// SSH_STUB_DRY set.
+/// would. It exits 255 like an unreachable host with SSH_STUB_UNREACHABLE
+/// set, and runs nothing with SSH_STUB_DRY set.
 fn ssh_stub_home(remote: Option<&str>) -> tempfile::TempDir {
     use std::os::unix::fs::PermissionsExt;
     let home = tempfile::tempdir().unwrap();
