@@ -4,7 +4,8 @@ export interface DecisionRow {
   why: string | null;
   project: string | null;
   createdAt: string;
-  session: { name: string; href: string } | null;
+  /** href is null when this gateway has no page for the session's host. */
+  session: { name: string; host: string; href: string | null } | null;
   card: { ref: string; title: string; href: string } | null;
 }
 
@@ -29,9 +30,9 @@ export function DecisionCard({ decision, showProject = true }: { decision: Decis
         {decision.card
           ? <a href={decision.card.href} className={linkCls}><span className="font-mono">{decision.card.ref}</span> {decision.card.title}</a>
           : <span>la nivel de proiect</span>}
-        {decision.session
-          ? <a href={decision.session.href} className={linkCls}>sesiunea <span className="font-mono">{decision.session.name}</span></a>
-          : <span>de tine</span>}
+        {!decision.session ? <span>de tine</span>
+          : decision.session.href ? <a href={decision.session.href} className={linkCls}>sesiunea <span className="font-mono">{decision.session.name}</span></a>
+          : <span>sesiunea <span className="font-mono">{decision.session.name} @{decision.session.host}</span></span>}
       </div>
     </article>
   );

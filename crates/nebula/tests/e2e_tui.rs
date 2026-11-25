@@ -732,7 +732,7 @@ fn tui_remote_preview_deadline_attaches_when_the_reply_never_arrives() {
                                     "divider_after":false, "divider_before":false, "host":"findl"}],
                                 "worktrees": [{"id":"w", "project_id":"p", "path":"/remote", "branch":"main", "is_main":true, "sort_order":0}],
                                 "agents": [{"id":"a", "worktree_id":"w", "name":"remote-agent", "status":"finished", "archived":false, "sort_order":0, "alive":true}],
-                                "terminals":[], "notes":[], "todos":[], "links":[], "pr_seen":[],
+                                "terminals":[], "pr_seen":[],
                                 "ui_state":"{\"project\":\"p\",\"worktree\":\"w\",\"session_agent\":\"a\"}"
                             }})).unwrap();
                             write_frame(&mut stream, &snapshot).await.unwrap();
@@ -784,8 +784,7 @@ fn tui_help_modal_grouped_keymap() {
     tui.wait_for_text("no projects yet");
 
     // The grouped two-column keymap: every section header on screen at
-    // once, including the note hotkey (the old single list clipped its
-    // tail on short terminals).
+    // once (the old single list clipped its tail on short terminals).
     tui.send(b"?");
     tui.wait_for_text("NAVIGATE & SEARCH");
     tui.wait_for_text("PROJECTS");
@@ -793,145 +792,35 @@ fn tui_help_modal_grouped_keymap() {
     tui.wait_for_text("SESSIONS");
     tui.wait_for_text("TERMINAL & MOUSE");
     tui.wait_for_text("GENERAL");
-    tui.wait_for_text("notes for the worktree");
-    tui.wait_for_text("project-level notes");
 
     tui.send(&[0x1b]); // Esc closes
     tui.wait_for_gone("NAVIGATE & SEARCH");
 }
 
+/// Notes, todos and saved links are retired: their old keys open nothing in
+/// any panel, so `?` right after them still reaches the help overlay.
 #[test]
-fn tui_note_modal_crud_and_badge() {
+fn tui_retired_note_todo_and_link_shortcuts_do_nothing() {
     let mut tui = TuiHarness::spawn();
-    let repo = tui.make_repo("note-proj");
-
+    let repo = tui.make_repo("retired-proj");
     tui.wait_for_text("no projects yet");
-    add_project(&mut tui, &repo, "note-proj");
-    // The root worktree row must exist before e has a list to open.
+    add_project(&mut tui, &repo, "retired-proj");
     tui.wait_for_text("⌂ primary");
 
-    // ---- Projects focus: t opens the PROJECT's own list (no branch in
-    // the title — the trailing space keeps it from matching ".../main") ----
-    tui.send(b"e");
-    tui.wait_for_text("Notes — note-proj ");
-    tui.wait_for_text("no notes yet");
-    tui.send(b"e"); // start the add input
-    tui.type_str("project level plan");
-    tui.send(b"\r");
-    tui.wait_for_text("☐ project level plan");
-    tui.send(b" "); // done — the project badge reads ✓1
-    tui.wait_for_text("✓ project level plan");
-    tui.send(&[0x1b]); // Esc closes
-    tui.wait_for_gone("Notes — note-proj ");
-    tui.wait_for_text("✓1"); // project-row badge
-
-    // ---- Worktrees focus: t opens the WORKTREE's list — a separate,
-    // still-empty set of notes ----
-    tui.send(b"\r"); // Projects → Worktrees
-    tui.wait_for_text(FOOTER_WORKTREES);
-    tui.send(b"e");
-    tui.wait_for_text("Notes — note-proj/main");
-    tui.wait_for_text("no notes yet");
-
-    // ---- create ----
-    tui.send(b"e"); // start the add input
-    tui.type_str("ship the feature");
-    tui.send(b"\r");
-    tui.wait_for_text("☐ ship the feature");
-    tui.wait_for_text("(1 open)");
-    tui.send(b"a"); // a second note, via the alternate add key
-    tui.type_str("write docs");
-    tui.send(b"\r");
-    tui.wait_for_text("☐ write docs");
-    tui.wait_for_text("(2 open)");
-
-    // ---- update: the cursor sits on the just-created note ----
-    tui.send(b"\r"); // edit "write docs" (prefilled)
-    tui.type_str(" tomorrow");
-    tui.send(b"\r");
-    tui.wait_for_text("☐ write docs tomorrow");
-
-    // ---- toggle done ----
-    tui.send(b" ");
-    tui.wait_for_text("✓ write docs tomorrow");
-    tui.wait_for_text("(1 open)");
-
-    // ---- the worktree row badge shows the open count ----
-    tui.send(&[0x1b]); // Esc closes the modal
-    tui.wait_for_gone("Notes — note-proj/main");
-    tui.wait_for_text("✎1");
-
-    // ---- delete: k up to the open note, d removes it ----
-    tui.send(b"e");
-    tui.wait_for_text("Notes — note-proj/main");
-    tui.send(b"k");
-    tui.wait_for_selected("☐ ship the feature");
-    tui.send(b"d");
-    tui.wait_for_gone("ship the feature");
-    tui.wait_for_text("(all 1 done)");
-
-    // ---- deleting the last worktree note empties only THIS list ----
-    tui.send(b"d");
-    tui.wait_for_text("no notes yet");
-    tui.send(&[0x1b]);
-    tui.wait_for_gone("Notes — note-proj/main");
-
-    // ---- the project's own note survived untouched ----
-    tui.send(b"\x1b[D"); // ← back to Projects focus
-    tui.wait_for_text(FOOTER_PROJECTS);
-    tui.send(b"e");
-    tui.wait_for_text("Notes — note-proj ");
-    tui.wait_for_text("✓ project level plan");
-    tui.send(&[0x1b]);
-    tui.wait_for_gone("Notes — note-proj ");
-}
-
-/// Links live in the Sessions panel's own LINKS group: `L` adds one from
-/// any panel, `r` edits it, Enter would open it, `d` removes it. The
-/// pull-request row is not exercised here — the test repo has no remote,
-/// so `gh` (installed or not) reports no PR.
-#[test]
-fn tui_link_crud_in_sessions_panel() {
-    let mut tui = TuiHarness::spawn();
-    let repo = tui.make_repo("link-proj");
-
-    tui.wait_for_text("no projects yet");
-    add_project(&mut tui, &repo, "link-proj");
-    // The root worktree row must exist before a link has an owner.
-    tui.wait_for_text("⌂ primary");
-
-    // ---- create: l prompts, the URL lands in a LINKS group ----
-    tui.send(b"l");
-    tui.wait_for_text("Add link");
-    tui.type_str("https://example.dev/spec");
-    tui.send(b"\r");
-    // The tab shows the URL without the scheme, and the cursor followed
-    // the new row (the selected tab renders the full label).
-    tui.wait_for_selected("example.dev/spec");
-
-    // ---- update: r prefills the URL, so typing appends to it ----
-    tui.send(b"r");
-    tui.wait_for_text("Edit link");
-    tui.type_str("/v2");
-    tui.send(b"\r");
-    tui.wait_for_text("example.dev/spec/v2");
-
-    // ---- a second link: both list under the one header ----
-    tui.send(b"l");
-    tui.wait_for_text("Add link");
-    // Typed without a scheme — the daemon normalizes it to https://.
-    // Short on purpose: the Sessions panel truncates long rows.
-    tui.type_str("docs.dev/design");
-    tui.send(b"\r");
-    tui.wait_for_text("docs.dev/design");
-
-    // ---- delete: d confirms, y removes the row ----
-    tui.send(b"d");
-    tui.wait_for_text("Delete link");
-    tui.send(b"y");
-    tui.wait_for_sessions_row_gone("docs.dev/design");
-    // The other link is untouched (unselected tabs truncate the label).
-    tui.wait_for_text("example.dev/s");
+    for panel in ["projects", "worktrees", "sessions"] {
+        tui.send(b"eEl?");
+        tui.wait_for_text("NAVIGATE & SEARCH");
+        let screen = tui.screen_text();
+        for overlay in ["Notes —", "Todos —", "Add link"] {
+            assert!(
+                !screen.contains(overlay),
+                "{overlay:?} opened in the {panel} panel:\n{screen}"
+            );
+        }
+        tui.send(&[0x1b]);
+        tui.wait_for_gone("NAVIGATE & SEARCH");
+        tui.send(b"\r");
+    }
 }
 
 /// The pull request nebula finds on the branch leads the LINKS group. A
@@ -963,22 +852,15 @@ fn tui_pull_request_row_leads_the_links_group() {
     // is row 0, so it is selected and carries its full label).
     tui.wait_for_text("#7 Attach links");
 
-    // It is not a stored row: d says so instead of opening a confirm.
+    // It is not a stored row: d and r say so instead of opening a dialog.
     tui.send(b"\r"); // Projects → Worktrees
     tui.wait_for_text(FOOTER_WORKTREES);
     tui.send(b"\r"); // Worktrees → Sessions
     tui.wait_for_selected("#7 Attach links");
     tui.send(b"d");
     tui.wait_for_text("can't be deleted");
-
-    // A link the user adds lands under it.
-    tui.send(b"l");
-    tui.wait_for_text("Add link");
-    tui.type_str("example.dev/spec");
-    tui.send(b"\r");
-    tui.wait_for_selected("example.dev/spec");
-    // The PR tab is unselected now: truncated label, still leading.
-    tui.wait_for_text("#7 Attach li");
+    tui.send(b"r");
+    tui.wait_for_text("can't be renamed");
 }
 
 #[test]

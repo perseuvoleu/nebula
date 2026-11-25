@@ -8,12 +8,14 @@ function byProject(decisions: DecisionRow[]): [string | null, DecisionRow[]][] {
   return [...groups];
 }
 
-export function DecisionsPage({ project, backHref, query, onQueryChange, decisions }: {
+export function DecisionsPage({ project, backHref, query, onQueryChange, decisions, loading = false, error = null }: {
   project: string | null;
   backHref?: string;
   query: string;
   onQueryChange: (query: string) => void;
   decisions: DecisionRow[];
+  loading?: boolean;
+  error?: string | null;
 }) {
   const groups = byProject(decisions);
   return (
@@ -29,13 +31,15 @@ export function DecisionsPage({ project, backHref, query, onQueryChange, decisio
         <label className="relative ml-auto w-full sm:w-64">
           <span className="sr-only">Caută decizii</span>
           <SearchIcon aria-hidden className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
-          <input value={query} onChange={(e) => onQueryChange(e.target.value)} type="search" placeholder="Caută"
+          <input value={query} onChange={(e) => onQueryChange(e.target.value)} type="search" placeholder="Caută" maxLength={200}
             className="h-9 w-full rounded-lg border border-input bg-card pr-3 pl-9 text-sm outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/60" />
         </label>
       </header>
       <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
         <div className="mx-auto flex max-w-3xl flex-col gap-6">
-          {groups.length === 0 && (
+          {error && <p role="alert" className="rounded-lg border border-dashed px-3 py-2 text-sm">{error}</p>}
+          {loading && <p aria-busy="true" className="py-8 text-center text-sm text-muted-foreground">Se caută…</p>}
+          {groups.length === 0 && !loading && !error && (
             <p className="py-8 text-center text-sm text-muted-foreground">
               {query.trim() ? "Nicio decizie nu se potrivește." : "Nicio decizie înregistrată încă."}
             </p>

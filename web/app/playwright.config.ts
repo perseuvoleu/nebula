@@ -11,12 +11,13 @@ export default defineConfig({
   fullyParallel: false,
   workers: 1,
   retries: 0,
-  reporter: [["list"]],
+  reporter: [["list"], ["../e2e/e2e-run-reporter.ts", { outputDir: "../../.scratch/mobile-chat-e2e/e2e-run", title: "web e2e" }]],
   use: {
     baseURL: `http://127.0.0.1:${PORT}`,
     ...devices["Desktop Chrome"],
     locale: "ro-RO",
     trace: "retain-on-failure",
+    screenshot: "on",
   },
   webServer: {
     command: `python3 ../e2e/serve.py`,

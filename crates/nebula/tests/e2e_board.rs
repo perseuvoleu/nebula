@@ -3526,6 +3526,249 @@ fn run_worktree_new() {
     assert_eq!(agents_of(&env).len(), 3);
 }
 
+const SEEDED_TODO: &str = "01JD0000000000000000000T01";
+
+fn seed_at(db: &Path, version: usize, rows: &str) {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    for (i, migration) in nebula_daemon::store::MIGRATIONS
+        .iter()
+        .take(version)
+        .enumerate()
+    {
+        conn.execute_batch(&format!(
+            "BEGIN; {migration}; PRAGMA user_version = {}; COMMIT;",
+            i + 1
+        ))
+        .unwrap();
+    }
+    conn.execute_batch(rows).unwrap();
+}
+
+fn seed_v28(db: &Path) {
+    seed_at(db, 28, &format!(
+        "PRAGMA foreign_keys = OFF;
+         INSERT INTO projects (id, workspace_id, name, repo_path, sort_order, created_at) VALUES ('p1', 'default', 'vela', '/tmp/vela', 0, 0);
+         INSERT INTO worktrees (id, project_id, path, branch, is_main, created_at) VALUES ('w1', 'p1', '/tmp/vela-feature', 'feature', 0, 0);
+         INSERT INTO notes (id, project_id, text, created_at) VALUES ('01JD0000000000000000000N01', 'p1', 'remember the laptop', 10);
+         INSERT INTO todos (id, project_id, text, done, created_at) VALUES ('{SEEDED_TODO}', 'p1', 'ship it', 1, 20);
+         INSERT INTO notes (id, todo_id, text, created_at) VALUES ('01JD0000000000000000000N02', '{SEEDED_TODO}', 'child', 30);
+         INSERT INTO todos (id, project_id, text, done, created_at) VALUES ('01JD0000000000000000000T02', 'p1', 'plan the week', 0, 40);
+         INSERT INTO todos (id, worktree_id, text, done, created_at) VALUES ('01JD0000000000000000000T03', 'w1', 'review it', 0, 50);
+         INSERT INTO notes (id, worktree_id, text, created_at) VALUES ('01JD0000000000000000000N03', 'w1', 'worktree thought', 60);
+         INSERT INTO links (id, worktree_id, url, created_at) VALUES ('01JD0000000000000000000L01', 'w1', 'https://vela.possu.dev', 1700000000000);
+         INSERT INTO links (id, worktree_id, url, created_at) VALUES ('01JD0000000000000000000L02', 'w-gone', 'https://gone.example/pr/1', 1700000000001);"
+    ));
+}
+
+#[test]
+fn migration_v28_legacy_rows() {
+    let env = Env::new();
+    env.board_local();
+    seed_v28(&env.data_dir().join("nebula.db"));
+    let env = env.start(&[]);
+
+    let feature = serde_json::json!({
+        "host": nebula_core::host::hostname(),
+        "branch": "feature",
+        "path": "/tmp/vela-feature",
+        "worktree": true,
+    });
+    let mut cards: Vec<(String, String, String, Value)> =
+        env.json(&["todo", "list", "--all", "--include-home", "--json"])["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                assert_eq!(c["project"], "vela", "{c}");
+                (
+                    c["title"].as_str().unwrap().to_string(),
+                    c["stage"].as_str().unwrap().to_string(),
+                    c["id"].as_str().unwrap().to_string(),
+                    c["checkout"].clone(),
+                )
+            })
+            .collect();
+    cards.sort_by(|a, b| a.0.cmp(&b.0));
+    let shape: Vec<(&str, &str, &Value)> = cards
+        .iter()
+        .map(|(title, stage, _, checkout)| (title.as_str(), stage.as_str(), checkout))
+        .collect();
+    assert_eq!(
+        shape,
+        [
+            ("plan the week", "backlog", &Value::Null),
+            ("remember the laptop", "backlog", &Value::Null),
+            ("review it", "backlog", &feature),
+            ("ship it", "done", &Value::Null),
+            ("worktree thought", "backlog", &feature),
+        ]
+    );
+    assert_eq!(cards[0].2, "01JD0000000000000000000T02");
+    assert_eq!(cards[2].2, "01JD0000000000000000000T03");
+    assert_eq!(cards[3].2, SEEDED_TODO);
+
+    let shown = env.json(&["todo", "show", SEEDED_TODO, "--json"]);
+    let log: Vec<&str> = shown["log"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(log, ["child"]);
+
+    let artifacts = env.json(&["artifact", "list", "--all", "--include-home", "--json"]);
+    let mut items = artifacts["items"].as_array().unwrap().clone();
+    items.sort_by_key(|a| a["created_at"].as_i64());
+    assert_eq!(items.len(), 2, "{artifacts}");
+    let link = &items[0];
+    assert_eq!(link["kind"], "link");
+    assert_eq!(
+        link["content"],
+        serde_json::json!({"url": "https://vela.possu.dev"})
+    );
+    assert_eq!(link["created_at"], 1700000000000_i64);
+    assert_eq!(link["project"], "vela");
+    assert_eq!(link["checkout"], feature);
+    let orphan = &items[1];
+    assert_eq!(orphan["id"], "01JD0000000000000000000L02");
+    assert_eq!(orphan["kind"], "link");
+    assert_eq!(
+        orphan["content"],
+        serde_json::json!({"url": "https://gone.example/pr/1"})
+    );
+    assert_eq!(orphan["created_at"], 1700000000001_i64);
+    assert_eq!(orphan["project"], Value::Null);
+    assert_eq!(orphan["checkout"], Value::Null);
+}
+
+#[test]
+fn bare_notes_is_refused_as_removed() {
+    let env = Env::new().start(&[]);
+    let dir = env.tmp.path().join("notes");
+    std::fs::create_dir_all(&dir).unwrap();
+    for args in [
+        &["init", "-b", "main"][..],
+        &[
+            "-c",
+            "user.email=t@nebula.dev",
+            "-c",
+            "user.name=t",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "init",
+        ],
+    ] {
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    let refused = env.cli(&["notes"], None);
+    assert!(!refused.status.success());
+    assert!(
+        stderr(&refused).contains("`nebula notes` was removed"),
+        "{}",
+        stderr(&refused)
+    );
+    let listed = env.cli(&["worktree", "list", "--project", "notes"], None);
+    assert!(!listed.status.success(), "the refusal added a project");
+
+    let added = env.cli(&["./notes"], None);
+    assert!(added.status.success(), "{}", stderr(&added));
+    let listed = env.cli(&["worktree", "list", "--project", "notes"], None);
+    assert!(listed.status.success(), "{}", stderr(&listed));
+}
+
+fn migrated_cards(env: &Env) -> Vec<(String, String, Value, Value)> {
+    let mut cards: Vec<(String, String, Value, Value)> =
+        env.json(&["todo", "list", "--all", "--include-home", "--json"])["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                (
+                    c["title"].as_str().unwrap().to_string(),
+                    c["stage"].as_str().unwrap().to_string(),
+                    c["project"].clone(),
+                    c["checkout"].clone(),
+                )
+            })
+            .collect();
+    cards.sort_by(|a, b| a.0.cmp(&b.0));
+    cards
+}
+
+fn main_checkout() -> Value {
+    serde_json::json!({
+        "host": nebula_core::host::hostname(),
+        "branch": "main",
+        "path": "/tmp/p",
+        "worktree": false,
+    })
+}
+
+#[test]
+fn migration_v9_notes_reach_the_board() {
+    let env = Env::new();
+    env.board_local();
+    seed_at(
+        &env.data_dir().join("nebula.db"),
+        9,
+        "INSERT INTO projects (id, name, repo_path, sort_order, created_at) VALUES ('p1', 'p', '/tmp/p', 0, 0);
+         INSERT INTO worktrees (id, project_id, path, branch, is_main, sort_order, created_at) VALUES ('w1', 'p1', '/tmp/p', 'main', 1, 0, 0);
+         INSERT INTO todos (id, worktree_id, text, done, sort_order, created_at) VALUES ('t1', 'w1', 'old note', 1, 3, 0);",
+    );
+    let env = env.start(&[]);
+    assert_eq!(
+        migrated_cards(&env),
+        [(
+            "old note".to_string(),
+            "backlog".to_string(),
+            Value::from("p"),
+            main_checkout()
+        )]
+    );
+}
+
+#[test]
+fn migration_v19_notes_reach_the_board() {
+    let env = Env::new();
+    env.board_local();
+    seed_at(
+        &env.data_dir().join("nebula.db"),
+        19,
+        "INSERT INTO projects (id, name, repo_path, sort_order, created_at) VALUES ('p1', 'p', '/tmp/p', 0, 0);
+         INSERT INTO worktrees (id, project_id, path, branch, is_main, sort_order, created_at) VALUES ('w1', 'p1', '/tmp/p', 'main', 1, 0, 0);
+         INSERT INTO notes (id, project_id, text, done, sort_order, created_at) VALUES ('n1', 'p1', 'project note', 0, 0, 0);
+         INSERT INTO notes (id, worktree_id, text, done, sort_order, created_at) VALUES ('n2', 'w1', 'worktree note', 1, 2, 0);",
+    );
+    let env = env.start(&[]);
+    assert_eq!(
+        migrated_cards(&env),
+        [
+            (
+                "project note".to_string(),
+                "backlog".to_string(),
+                Value::from("p"),
+                Value::Null
+            ),
+            (
+                "worktree note".to_string(),
+                "backlog".to_string(),
+                Value::from("p"),
+                main_checkout()
+            ),
+        ]
+    );
+}
+
 fn decide(env: &Env, agent: Option<&str>, args: &[&str]) -> Value {
     let mut argv = vec!["decision", "add", "--json"];
     argv.extend_from_slice(args);

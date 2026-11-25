@@ -115,7 +115,6 @@ pub(crate) fn hook_command(endpoint: &str, event: &str) -> String {
 const CLAUDE_ALLOW_RENAME: &str = "Bash(nebula rename:*)";
 const CLAUDE_ALLOW_WORKTREE: &str = "Bash(nebula worktree:*)";
 const CLAUDE_ALLOW_AGENT: &str = "Bash(nebula agent:*)";
-const CLAUDE_ALLOW_NOTES: &str = "Bash(nebula notes:*)";
 const CLAUDE_ALLOW_TODO: &str = "Bash(nebula todo:*)";
 const CLAUDE_ALLOW_SWITCH: &str = "Bash(nebula switch:*)";
 
@@ -226,7 +225,6 @@ pub fn install_claude_hooks(cwd: &Path) -> Result<()> {
     ensure_permission_allow(root_obj, CLAUDE_ALLOW_RENAME, &path)?;
     ensure_permission_allow(root_obj, CLAUDE_ALLOW_WORKTREE, &path)?;
     ensure_permission_allow(root_obj, CLAUDE_ALLOW_AGENT, &path)?;
-    ensure_permission_allow(root_obj, CLAUDE_ALLOW_NOTES, &path)?;
     ensure_permission_allow(root_obj, CLAUDE_ALLOW_TODO, &path)?;
     ensure_permission_allow(root_obj, CLAUDE_ALLOW_SWITCH, &path)?;
     write_hooks_root(&dir, "settings.local.json", &root)

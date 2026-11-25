@@ -330,17 +330,13 @@ pub fn run(args: Args) -> Result<()> {
         Action::Down { ownership } => authorize(&state, ownership, None)?,
         _ => (),
     }
-    let promoted_checkout = match args.command {
+    match args.command {
         Action::Up {
             ownership,
             checkout,
-        } => Some(promote(
-            &runtime,
-            &mut state,
-            &ownership,
-            &checkout,
-            args.offline,
-        )?),
+        } => {
+            promote(&runtime, &mut state, &ownership, &checkout, args.offline)?;
+        }
         Action::Restart { ownership } => {
             let checkout = state
                 .active
@@ -348,20 +344,13 @@ pub fn run(args: Args) -> Result<()> {
                 .context("no preview to restart; use up")?
                 .checkout
                 .clone();
-            Some(promote(
-                &runtime,
-                &mut state,
-                &ownership,
-                &checkout,
-                args.offline,
-            )?)
+            promote(&runtime, &mut state, &ownership, &checkout, args.offline)?;
         }
         Action::Down { ownership } => {
             authorize(&state, &ownership, None)?;
             state.stopping = true;
             save(&runtime.directory, &state)?;
             reconcile(&runtime, &mut state, args.offline)?;
-            None
         }
         Action::Logs {
             service,
@@ -378,14 +367,8 @@ pub fn run(args: Args) -> Result<()> {
                 lines,
             )
         }
-        Action::Status => None,
+        Action::Status => {}
         Action::Publish { .. } => unreachable!(),
-    };
-    if let Some(checkout) = promoted_checkout {
-        let url = format!("https://{}", project.domain);
-        if let Err(error) = nebula_tui::pin_checkout_link(&checkout, &url) {
-            eprintln!("warning: preview is running but its Nebula link was not pinned: {error:#}");
-        }
     }
     let mut observation_error = None;
     let current = match ingress::current(&runtime.directory, &name, args.offline, runtime.lock) {
@@ -425,7 +408,7 @@ pub fn run(args: Args) -> Result<()> {
     };
     println!(
         "{}",
-        serde_json::json!({"project": name, "domain": project.domain, "phase": phase, "offline": args.offline, "active": state.active.as_ref().map(runtime::status_json), "candidate": state.candidate.as_ref().map(runtime::status_json), "previous": state.previous.as_ref().map(runtime::status_json), "published": current, "observation_error": observation_error})
+        serde_json::json!({"project": name, "domain": project.domain, "url": format!("https://{}", project.domain), "phase": phase, "offline": args.offline, "active": state.active.as_ref().map(runtime::status_json), "candidate": state.candidate.as_ref().map(runtime::status_json), "previous": state.previous.as_ref().map(runtime::status_json), "published": current, "observation_error": observation_error})
     );
     Ok(())
 }

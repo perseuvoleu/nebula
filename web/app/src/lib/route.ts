@@ -14,6 +14,8 @@ export interface Selection {
 
 export interface BoardRoute {
   project: string | null;
+  /** Cards without a project; apart from a project named "home". */
+  home?: boolean;
   /** Without the ref's leading "#", which a URL reads as a fragment. */
   card: string | null;
   decisions: boolean;
@@ -22,20 +24,22 @@ export interface BoardRoute {
 }
 
 const NAME = "([A-Za-z0-9._@-]{1,80})";
-const BOARD = new RegExp(`^/board(?:/p/${NAME}|/c/${NAME}|/decisions(?:/p/${NAME})?)?/?$`);
+const SCOPE = `(?:/p/${NAME}|/(home))?`;
+const BOARD = new RegExp(`^/board(?:/decisions${SCOPE}|${SCOPE}(?:/c/${NAME})?)/?$`);
 const REF = /^[A-Za-z0-9._@-]{1,80}$/;
 
 function parseBoard(pathname: string, params: URLSearchParams): BoardRoute | null {
   const match = BOARD.exec(pathname.replace(/%40/gi, "@"));
   if (!match) return null;
   const peek = params.get("peek");
-  return { project: match[1] ?? match[3] ?? null, card: match[2] ?? null, decisions: pathname.startsWith("/board/decisions"),
+  const home = !!(match[2] ?? match[4]);
+  return { project: match[1] ?? match[3] ?? null, ...(home && { home }), card: match[5] ?? null, decisions: pathname.startsWith("/board/decisions"),
     table: params.get("view") === "table", peek: peek && REF.test(peek) ? peek : null };
 }
 
 function boardPath(route: BoardRoute): string {
-  const project = route.project ? `/p/${encodeURIComponent(route.project)}` : "";
-  const path = route.card ? `/board/c/${encodeURIComponent(route.card)}` : route.decisions ? `/board/decisions${project}` : `/board${project}`;
+  const scope = route.home ? "/home" : route.project ? `/p/${encodeURIComponent(route.project)}` : "";
+  const path = route.card ? `/board${scope}/c/${encodeURIComponent(route.card)}` : route.decisions ? `/board/decisions${scope}` : `/board${scope}`;
   const params = new URLSearchParams();
   if (route.table) params.set("view", "table");
   if (route.peek) params.set("peek", route.peek);

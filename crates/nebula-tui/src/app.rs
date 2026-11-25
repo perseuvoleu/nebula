@@ -4,9 +4,8 @@ use crate::git_diff::{CommitEntry, DiffBase, DiffFile};
 use crate::pull_request::PullRequest;
 use crate::text_input::TextInput;
 use nebula_core::{
-    Agent, AgentId, AgentKind, AgentStatus, Link, LinkId, Note, NoteId, NoteOwner, Project,
-    ProjectId, SessionRef, TerminalId, TerminalTab, Todo, TodoId, TodoOwner, Workspace,
-    WorkspaceId, Worktree, WorktreeId,
+    Agent, AgentId, AgentKind, AgentStatus, Project, ProjectId, SessionRef, TerminalId,
+    TerminalTab, Workspace, WorkspaceId, Worktree, WorktreeId,
 };
 use ratatui::layout::Rect;
 use std::collections::{HashMap, HashSet};
@@ -196,16 +195,8 @@ pub enum MenuAction {
     RenameTerminal(TerminalId),
     CloseTerminal(TerminalId),
     NewWorktree(ProjectId),
-    /// Open the note modal for this owner (project or worktree).
-    OpenNotes(NoteOwner),
-    /// Open the todo modal for this owner (project or worktree).
-    OpenTodos(TodoOwner),
-    /// Attach a URL to this worktree (prompts for it).
-    NewLink(WorktreeId),
     /// Hand a link row's URL to the browser.
     OpenLink(String),
-    EditLink(LinkId),
-    DeleteLink(LinkId),
     SetWorktreePinned(WorktreeId, bool),
     DeleteWorktree(WorktreeId),
     AddProject,
@@ -267,8 +258,6 @@ pub enum PaletteCommand {
     SearchSessions,
     SearchEverything,
     GitDiff,
-    Notes,
-    Todos,
     Settings,
     Workspaces,
 }
@@ -456,7 +445,6 @@ pub enum PendingAction {
         terminals: Vec<TerminalId>,
     },
     RemoveProject(ProjectId),
-    DeleteLink(LinkId),
     /// Confirmed branch-row delete: `git branch -d <branch>` in the
     /// project's primary checkout (git refuses unmerged branches; the
     /// error lands as a flash).
@@ -527,14 +515,6 @@ pub enum PromptKind {
     NewWorkspace,
     RenameWorkspace {
         id: WorkspaceId,
-    },
-    /// Pin a URL to this worktree.
-    NewLink {
-        worktree: WorktreeId,
-    },
-    /// Rewrite a pinned link's URL.
-    EditLink {
-        id: LinkId,
     },
 }
 
@@ -1590,131 +1570,6 @@ impl GrepView {
     }
 }
 
-/// In-progress add/edit inside the note modal; keys feed `text` while set.
-#[derive(Debug, Clone)]
-pub struct NoteInput {
-    /// None = creating a new note; Some = rewriting that note's text.
-    pub editing: Option<NoteId>,
-    pub text: TextInput,
-}
-
-/// Note notes modal (`o`) for one owner — a project (high-level notes) or
-/// a worktree. The rows themselves live in `App::tree.notes` (kept fresh
-/// by upserts) — the view only holds the owner plus cursor/input state.
-#[derive(Debug, Clone)]
-pub struct NoteView {
-    pub owner: NoteOwner,
-    /// `project` or `project/branch`, for the modal title.
-    pub context: String,
-    /// Index into the owner's note rows.
-    pub selected: usize,
-    /// Active add/edit input, if any.
-    pub input: Option<NoteInput>,
-    /// Whole modal rect, written back during draw so clicks outside close.
-    pub area: Rect,
-    /// Screen rect of the note rows, written back during draw so clicks can
-    /// hit-test rows.
-    pub list_area: Rect,
-}
-
-impl NoteView {
-    pub fn new(owner: NoteOwner, context: String) -> Self {
-        Self {
-            owner,
-            context,
-            selected: 0,
-            input: None,
-            area: Rect::default(),
-            list_area: Rect::default(),
-        }
-    }
-
-    /// First visible row of the list's stateless follow-window for a list of
-    /// `height` rows.
-    pub fn window_start(&self, height: usize) -> usize {
-        (self.selected + 1).saturating_sub(height)
-    }
-}
-
-/// What the todo modal's input is writing: the list's own add/edit, or a
-/// child note's add/edit inside the detail view.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TodoInputTarget {
-    /// Creating a new todo (list mode).
-    NewTodo,
-    /// Rewriting this todo's text (list mode).
-    EditTodo(TodoId),
-    /// Creating a child note under the opened todo (detail mode).
-    NewNote,
-    /// Rewriting this child note's text (detail mode).
-    EditNote(NoteId),
-}
-
-/// In-progress add/edit inside the todo modal; keys feed `text` while set.
-#[derive(Debug, Clone)]
-pub struct TodoInput {
-    pub target: TodoInputTarget,
-    pub text: TextInput,
-}
-
-/// First-class todo modal (`E`) for one owner — a project or a worktree,
-/// the same shell as the notes modal plus a drill-in: Enter on a todo opens
-/// its detail, where that todo's child notes live. The rows themselves stay
-/// in `App::tree.todos` / `App::tree.notes` (kept fresh by upserts) — the
-/// view only holds the owner plus cursor/mode/input state.
-#[derive(Debug, Clone)]
-pub struct TodoView {
-    pub owner: TodoOwner,
-    /// `project` or `project/branch`, for the modal title.
-    pub context: String,
-    /// Cursor into the owner's todo rows (list mode).
-    pub selected: usize,
-    /// Some = detail mode: this todo is open and `note_selected` walks its
-    /// child notes; Esc drops back to the list.
-    pub detail: Option<TodoId>,
-    /// Cursor into the opened todo's child notes (detail mode).
-    pub note_selected: usize,
-    /// Active add/edit input, if any (todo text or child-note text, per
-    /// its target).
-    pub input: Option<TodoInput>,
-    /// Whole modal rect, written back during draw so clicks outside close.
-    pub area: Rect,
-    /// Screen rect of the rows, written back during draw so clicks can
-    /// hit-test rows.
-    pub list_area: Rect,
-}
-
-impl TodoView {
-    pub fn new(owner: TodoOwner, context: String) -> Self {
-        Self {
-            owner,
-            context,
-            selected: 0,
-            detail: None,
-            note_selected: 0,
-            input: None,
-            area: Rect::default(),
-            list_area: Rect::default(),
-        }
-    }
-
-    /// The cursor the current mode moves: child notes in detail, todos in
-    /// the list.
-    pub fn cursor(&self) -> usize {
-        if self.detail.is_some() {
-            self.note_selected
-        } else {
-            self.selected
-        }
-    }
-
-    /// First visible row of the list's stateless follow-window for a list
-    /// of `height` rows.
-    pub fn window_start(&self, height: usize) -> usize {
-        (self.cursor() + 1).saturating_sub(height)
-    }
-}
-
 /// Recent-hosts modal (`h`): destinations remembered by `nebula ssh`.
 /// Enter (or a click) quits the TUI and execs a fresh `nebula ssh` at the
 /// selected entry; `a` types a new destination, `d` forgets one. The rows
@@ -1880,8 +1735,6 @@ pub enum Overlay {
     Tree(crate::tree_browser::TreeBrowser),
     /// ⌘I: type a path, read the file below.
     FileView(crate::file_view::FileView),
-    Notes(NoteView),
-    Todos(TodoView),
     Metrics(MetricsView),
     Hosts(HostsView),
 }
@@ -1920,12 +1773,6 @@ pub enum PendingIntent {
     SelectCreatedWorktree,
     /// Project added by `nebula open <dir>`: land the selection on it.
     SelectAddedProject,
-    /// Move the note modal's cursor onto the created note.
-    SelectCreatedNote,
-    /// Move the todo modal's cursor onto the created todo.
-    SelectCreatedTodo,
-    /// Move the Sessions panel's cursor onto the link just created.
-    SelectCreatedLink,
     /// Open the workspace this Ack just created (switcher's "New workspace…"
     /// flow: creating from there means you want to be in it).
     OpenCreatedWorkspace,
@@ -1973,41 +1820,24 @@ pub enum ConnState {
     Disconnected,
 }
 
-/// One row of the Sessions panel's LINKS group: a URL the user pinned to
-/// the worktree, or the pull request nebula found on its branch.
+/// One row of the Sessions panel's LINKS group: the pull request nebula
+/// found on the worktree's branch.
 #[derive(Debug, Clone)]
 pub enum LinkRow {
-    /// Discovered by `gh pr view`, backed by nothing in the store — so it
-    /// can be opened but not edited or deleted.
+    /// Discovered by `gh pr view`, backed by nothing in the store.
     PullRequest(PullRequest),
-    /// A saved link. `pr` is set when this link's URL *is* the detected
-    /// pull request: the row then shows the PR's title and badge instead of
-    /// a bare URL, and stays editable — it is still the user's own row.
-    Saved { link: Link, pr: Option<PullRequest> },
 }
 
 impl LinkRow {
     pub fn url(&self) -> &str {
         match self {
             LinkRow::PullRequest(pr) => &pr.url,
-            LinkRow::Saved { link, .. } => &link.url,
         }
     }
 
-    /// The stored link behind the row; None for the detected pull request,
-    /// which is what makes it un-editable and un-deletable.
-    pub fn id(&self) -> Option<&LinkId> {
-        match self {
-            LinkRow::PullRequest(_) => None,
-            LinkRow::Saved { link, .. } => Some(&link.id),
-        }
-    }
-
-    /// The pull request this row stands for, however it got here.
     pub fn pull_request(&self) -> Option<&PullRequest> {
         match self {
             LinkRow::PullRequest(pr) => Some(pr),
-            LinkRow::Saved { pr, .. } => pr.as_ref(),
         }
     }
 
@@ -2453,9 +2283,6 @@ pub struct Tree {
     pub worktrees: Vec<Worktree>,
     pub agents: Vec<Agent>,
     pub terminals: Vec<TerminalTab>,
-    pub notes: Vec<Note>,
-    pub todos: Vec<Todo>,
-    pub links: Vec<Link>,
     /// Client-side: projects the user hid from the panel (`Hide` in the
     /// project menu). Not part of the daemon snapshot — persisted in the
     /// UI-state blob instead — so a snapshot replaces every other field
@@ -3054,13 +2881,6 @@ pub struct App {
     pub open_at: Option<OpenAt>,
     /// A `nebula open --session` landing in flight.
     pub open_session: Option<OpenSession>,
-    /// Note created by us, awaiting its upsert to land the modal's cursor.
-    pub select_note_when_seen: Option<NoteId>,
-    /// Todo created by us, awaiting its upsert to land the modal's cursor.
-    pub select_todo_when_seen: Option<TodoId>,
-    /// Link created by us, awaiting its upsert to land the panel cursor on
-    /// the new row.
-    pub select_link_when_seen: Option<LinkId>,
     /// Last selected worktree per project — switching back to a project
     /// returns to the worktree the user left it on.
     pub last_worktree_for_project: HashMap<ProjectId, WorktreeId>,
@@ -3281,9 +3101,6 @@ impl App {
             select_project_when_seen: None,
             open_at: None,
             open_session: None,
-            select_note_when_seen: None,
-            select_todo_when_seen: None,
-            select_link_when_seen: None,
             last_worktree_for_project: HashMap::new(),
             last_session_for_project: HashMap::new(),
             last_session_for_worktree: HashMap::new(),
@@ -3920,11 +3737,7 @@ impl App {
         });
     }
 
-    /// The selected worktree's LINKS group: the pull request on its branch
-    /// first (however it got there), then the saved links in list order.
-    /// A saved link that *is* the pull request is shown once, as the
-    /// pull-request row — a duplicate would just be the same destination
-    /// twice.
+    /// The selected worktree's LINKS group: the pull request on its branch.
     pub fn visible_links(&self) -> Vec<LinkRow> {
         let Some(worktree) = self.selected_worktree() else {
             return vec![];
@@ -3941,34 +3754,13 @@ impl App {
     }
 
     fn links_for_worktree(&self, worktree: &WorktreeId) -> Vec<LinkRow> {
-        let saved: Vec<&Link> = self
-            .tree
-            .links
-            .iter()
-            .filter(|l| &l.worktree_id == worktree)
-            .collect();
-        let pr = self.pull_requests.get(worktree).cloned().flatten();
-        let matched = pr
-            .as_ref()
-            .and_then(|p| saved.iter().position(|l| l.url == p.url));
-        let mut rows: Vec<LinkRow> = Vec::new();
-        match (&pr, matched) {
-            (Some(pr), Some(i)) => rows.push(LinkRow::Saved {
-                link: saved[i].clone(),
-                pr: Some(pr.clone()),
-            }),
-            (Some(pr), None) => rows.push(LinkRow::PullRequest(pr.clone())),
-            (None, _) => {}
-        }
-        for (i, link) in saved.iter().enumerate() {
-            if Some(i) != matched {
-                rows.push(LinkRow::Saved {
-                    link: (*link).clone(),
-                    pr: None,
-                });
-            }
-        }
-        rows
+        self.pull_requests
+            .get(worktree)
+            .cloned()
+            .flatten()
+            .map(LinkRow::PullRequest)
+            .into_iter()
+            .collect()
     }
 
     /// The link row under the cursor, when the cursor is on one.
@@ -4677,36 +4469,6 @@ impl App {
         Some(at.saturating_duration_since(std::time::Instant::now()))
     }
 
-    /// An owner's notes, in tree order (snapshot order; new ones append).
-    pub fn notes_for(&self, owner: &NoteOwner) -> Vec<&Note> {
-        self.tree
-            .notes
-            .iter()
-            .filter(|t| &t.owner == owner)
-            .collect()
-    }
-
-    /// (open, total) note counts for an owner — the row badges.
-    pub fn note_stats(&self, owner: &NoteOwner) -> (usize, usize) {
-        let total = self.tree.notes.iter().filter(|t| &t.owner == owner).count();
-        let open = self
-            .tree
-            .notes
-            .iter()
-            .filter(|t| &t.owner == owner && !t.done)
-            .count();
-        (open, total)
-    }
-
-    /// An owner's todos, in tree order (snapshot order; new ones append).
-    pub fn todos_for(&self, owner: &TodoOwner) -> Vec<&Todo> {
-        self.tree
-            .todos
-            .iter()
-            .filter(|t| &t.owner == owner)
-            .collect()
-    }
-
     /// Aggregate status for a worktree row: red > yellow > green > gray,
     /// archived agents excluded.
     pub fn worktree_rollup(&self, worktree_id: &WorktreeId) -> Option<AgentStatus> {
@@ -4906,15 +4668,6 @@ mod tests {
         }
     }
 
-    fn link(id: &str, worktree: &WorktreeId, url: &str, sort_order: i64) -> Link {
-        Link {
-            id: LinkId(id.into()),
-            worktree_id: worktree.clone(),
-            url: url.into(),
-            sort_order,
-        }
-    }
-
     fn pr(url: &str) -> PullRequest {
         PullRequest {
             number: 7,
@@ -4924,62 +4677,6 @@ mod tests {
             is_draft: false,
             activity: Vec::new(),
         }
-    }
-
-    #[test]
-    fn saved_links_list_in_order_under_the_pull_request() {
-        let (mut app, wt) = link_app();
-        app.tree
-            .links
-            .push(link("l1", &wt, "https://a.dev/spec", 0));
-        app.tree
-            .links
-            .push(link("l2", &wt, "https://b.dev/issue", 1));
-        // Another worktree's links never leak into this list.
-        app.tree
-            .links
-            .push(link("l3", &WorktreeId("other".into()), "https://c.dev", 0));
-
-        let rows = app.visible_links();
-        let urls: Vec<&str> = rows.iter().map(|l| l.url()).collect();
-        assert_eq!(urls, ["https://a.dev/spec", "https://b.dev/issue"]);
-
-        app.pull_requests
-            .insert(wt, Some(pr("https://github.com/o/r/pull/7")));
-        let rows = app.visible_links();
-        assert_eq!(
-            rows[0].url(),
-            "https://github.com/o/r/pull/7",
-            "the pull request leads the list"
-        );
-        assert_eq!(rows[0].label(), "#7 Attach links");
-        assert!(rows[0].id().is_none(), "it is not a stored row");
-        assert_eq!(rows.len(), 3);
-    }
-
-    /// A link the user pasted before nebula found the PR is the same
-    /// destination: it shows once, as the pull-request row, and stays
-    /// deletable because it is still the user's own row.
-    #[test]
-    fn a_saved_link_matching_the_pull_request_is_shown_once() {
-        let (mut app, wt) = link_app();
-        let url = "https://github.com/o/r/pull/7";
-        app.tree
-            .links
-            .push(link("l1", &wt, "https://a.dev/spec", 0));
-        app.tree.links.push(link("l2", &wt, url, 1));
-        app.pull_requests.insert(wt, Some(pr(url)));
-
-        let rows = app.visible_links();
-        assert_eq!(rows.len(), 2, "no duplicate row for the same URL");
-        assert_eq!(rows[0].url(), url);
-        assert_eq!(rows[0].label(), "#7 Attach links", "shown as the PR");
-        assert_eq!(
-            rows[0].id().map(|id| id.as_str()),
-            Some("l2"),
-            "still the stored row, so it can be edited and deleted"
-        );
-        assert_eq!(rows[1].url(), "https://a.dev/spec");
     }
 
     #[test]
@@ -5026,9 +4723,8 @@ mod tests {
             status: None,
             status_changed_at: 0,
         });
-        app.tree
-            .links
-            .push(link("l1", &wt, "https://a.dev/spec", 0));
+        app.pull_requests
+            .insert(wt.clone(), Some(pr("https://a.dev/spec")));
         app.show_archived = true;
 
         let rows = app.visible_session_rows();
@@ -5080,9 +4776,8 @@ mod tests {
             status: None,
             status_changed_at: 0,
         });
-        app.tree
-            .links
-            .push(link("l1", &worktree, "https://a.dev/spec", 0));
+        app.pull_requests
+            .insert(worktree.clone(), Some(pr("https://a.dev/spec")));
 
         let visible: Vec<String> = app
             .visible_session_rows()
@@ -5109,9 +4804,8 @@ mod tests {
     #[test]
     fn link_rows_have_no_session_to_attach() {
         let (mut app, wt) = link_app();
-        app.tree
-            .links
-            .push(link("l1", &wt, "https://a.dev/spec", 0));
+        app.pull_requests
+            .insert(wt.clone(), Some(pr("https://a.dev/spec")));
         let rows = app.visible_session_rows();
         assert!(rows[0].sref().is_none(), "a link is not attachable");
         assert!(!rows[0].is_archived_agent());

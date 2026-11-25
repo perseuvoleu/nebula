@@ -1166,6 +1166,7 @@ dependencies = [
  "nebula-rag",
  "nebula-tui",
  "portable-pty",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

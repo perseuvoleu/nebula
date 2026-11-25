@@ -206,19 +206,7 @@ pub fn run_add_project(path: String) -> Result<()> {
     runtime()?.block_on(ipc::add_project(path))
 }
 
-pub use ipc::{NewAgentOpts, NotesOp, TodoOp, WorkspaceOp};
-
-/// `nebula notes [list|add|done]` — project/worktree notes from the CLI,
-/// agents included (see `ipc::run_notes`).
-pub fn run_notes(op: NotesOp) -> Result<()> {
-    runtime()?.block_on(ipc::run_notes(op))
-}
-
-/// `nebula todo done|reopen|note-done` — the legacy positional todo verbs
-/// (see `ipc::run_todo`).
-pub fn run_todo(op: TodoOp) -> Result<()> {
-    runtime()?.block_on(ipc::run_todo(op))
-}
+pub use ipc::{NewAgentOpts, WorkspaceOp};
 
 /// `nebula todo` card verbs on the board (see `board_cli::run`).
 pub fn run_board(verb: board_cli::TodoVerb, json: bool) -> Result<()> {
@@ -308,11 +296,6 @@ pub fn run_agent_new(opts: NewAgentOpts) -> Result<()> {
 /// `nebula worktree list` — JSON map of the checkouts and who lives on them.
 pub fn run_worktree_list(project: Option<String>, all: bool) -> Result<()> {
     runtime()?.block_on(ipc::worktree_list(project, all))
-}
-
-/// Best-effort preview bookmark used after a successful host-local promotion.
-pub fn pin_checkout_link(checkout: &std::path::Path, url: &str) -> Result<()> {
-    runtime()?.block_on(ipc::pin_checkout_link(checkout, url))
 }
 
 /// `nebula agent list` — the delegating session's JSON view of its workers.

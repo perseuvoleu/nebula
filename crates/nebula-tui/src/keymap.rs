@@ -84,8 +84,6 @@ pub enum Action {
     Pin,
     GitDiff,
     OpenRepo,
-    Notes,
-    Todos,
     // sessions
     NewAgent,
     NewSessionPicker,
@@ -93,7 +91,6 @@ pub enum Action {
     QuickTerminal,
     SplitTerminal,
     FocusOtherPane,
-    NewLink,
     Rename,
     CloseSession,
     Archive,
@@ -451,24 +448,6 @@ pub const ACTIONS: &[ActionSpec] = &[
         scope: Scope::Global,
         defaults: &["shift+g"],
     },
-    ActionSpec {
-        action: Action::Notes,
-        id: "notes",
-        label: "Notes",
-        hint: "Notes for the selected project or worktree (⌘e even inside a locked session)",
-        group: "PROJECTS & WORKTREES",
-        scope: Scope::Global,
-        defaults: &["e", "cmd+e"],
-    },
-    ActionSpec {
-        action: Action::Todos,
-        id: "todos",
-        label: "Todos",
-        hint: "Todos for the selected project or worktree (Enter on one opens its notes)",
-        group: "PROJECTS & WORKTREES",
-        scope: Scope::Global,
-        defaults: &["shift+e"],
-    },
     // ---- SESSIONS ----
     ActionSpec {
         action: Action::NewAgent,
@@ -525,19 +504,10 @@ pub const ACTIONS: &[ActionSpec] = &[
         defaults: &["cmd+o", "shift+o"],
     },
     ActionSpec {
-        action: Action::NewLink,
-        id: "new_link",
-        label: "Attach a link",
-        hint: "Pin a PR, doc or ticket URL alongside the sessions",
-        group: "SESSIONS",
-        scope: Scope::Global,
-        defaults: &["l"],
-    },
-    ActionSpec {
         action: Action::Rename,
         id: "rename",
         label: "Rename",
-        hint: "Rename the selected session, or edit a link's URL / divider label",
+        hint: "Rename the selected session, or edit a divider label",
         group: "SESSIONS",
         scope: Scope::Global,
         defaults: &["r"],
@@ -1410,13 +1380,13 @@ mod tests {
     fn binding_steals_the_chord_from_its_previous_owner() {
         let mut map = Keymap::default();
         let g = KeyChord::parse("g").unwrap();
-        let notes = index_of(Action::Notes).unwrap();
+        let repo = index_of(Action::OpenRepo).unwrap();
         assert_eq!(
-            map.conflicts(notes, &g),
+            map.conflicts(repo, &g),
             vec![index_of(Action::GitDiff).unwrap()]
         );
-        map.bind(notes, g, false);
-        assert_eq!(map.lookup(Scope::Global, &g), Some(Action::Notes));
+        map.bind(repo, g, false);
+        assert_eq!(map.lookup(Scope::Global, &g), Some(Action::OpenRepo));
         assert!(!map.chords(Action::GitDiff).contains(&g));
     }
 
@@ -1464,12 +1434,12 @@ mod tests {
     #[test]
     fn a_hand_edited_duplicate_is_flagged_on_both_rows() {
         // Nothing in the overlay can produce this; a text editor can.
-        let map = Keymap::from_overrides(&BTreeMap::from([("notes".into(), "g".into())]));
-        let notes = index_of(Action::Notes).unwrap();
+        let map = Keymap::from_overrides(&BTreeMap::from([("open_repo".into(), "g".into())]));
+        let repo = index_of(Action::OpenRepo).unwrap();
         let diff = index_of(Action::GitDiff).unwrap();
-        assert!(map.is_ambiguous(notes));
+        assert!(map.is_ambiguous(repo));
         assert!(map.is_ambiguous(diff));
-        assert_eq!(map.shadowed_by(notes), vec!["Git diff"]);
+        assert_eq!(map.shadowed_by(repo), vec!["Git diff"]);
         // The defaults themselves are always unambiguous.
         assert!(Keymap::default()
             .binds
