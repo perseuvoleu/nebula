@@ -838,6 +838,11 @@ enum TodoCommand {
         /// Set on the hop to the target host, which then never forwards again.
         #[arg(long, hide = true)]
         forwarded: bool,
+        /// With --parent-id, the spawning session on the host that forwarded the run.
+        #[arg(long, hide = true, requires = "parent_id")]
+        parent_host: Option<String>,
+        #[arg(long, hide = true, requires = "parent_host")]
+        parent_id: Option<String>,
         #[command(flatten)]
         scope: WriteScopeArgs,
         #[arg(long)]
@@ -1239,6 +1244,7 @@ fn main() -> Result<()> {
                     .as_deref()
                     .map(nebula_tui::board_cli::dispatch_id)
                     .transpose()?,
+                parent: None,
             }),
             AgentCommand::Wait {
                 names,
@@ -1476,6 +1482,8 @@ fn main() -> Result<()> {
                     worktree,
                     dispatch,
                     forwarded,
+                    parent_host,
+                    parent_id,
                     scope,
                     json,
                 }) => (
@@ -1488,6 +1496,12 @@ fn main() -> Result<()> {
                         dispatch,
                         scope: scope.into(),
                         forwarded,
+                        parent: parent_host.zip(parent_id).map(|(host, id)| {
+                            nebula_core::board::SessionAt {
+                                host,
+                                id: nebula_core::AgentId(id),
+                            }
+                        }),
                     },
                     json,
                 ),

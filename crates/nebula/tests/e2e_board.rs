@@ -2793,7 +2793,7 @@ fn ssh_stub_as(env: &Env, target: &Env, host: &str) -> (String, PathBuf, PathBuf
     std::fs::write(
         bin.join("ssh"),
         format!(
-            "#!/bin/sh\n[ \"$(cat '{log}' 2>/dev/null | grep -c '^BatchMode=yes$')\" -ge 3 ] && exit 255\nprintf '%s\\n' \"$@\" >> '{log}'\n[ -e '{down}' ] && {{ echo 'ssh: connect to host: Connection refused' >&2; exit 255; }}\nfor arg do script=$arg; done\nexport HOME='{home}' NEBULA_RUNTIME_DIR='{rt}' NEBULA_DATA_DIR='{data}' NEBULA_HOSTNAME='{host}' PATH='{nebula}':\"$PATH\"\nexec /bin/sh -c \"$script\"\n",
+            "#!/bin/sh\n[ \"$(cat '{log}' 2>/dev/null | grep -c '^BatchMode=yes$')\" -ge 3 ] && exit 255\nprintf '%s\\n' \"$@\" >> '{log}'\n[ -e '{down}' ] && {{ echo 'ssh: connect to host: Connection refused' >&2; exit 255; }}\nfor arg do script=$arg; done\nunset NEBULA_AGENT_ID\nexport HOME='{home}' NEBULA_RUNTIME_DIR='{rt}' NEBULA_DATA_DIR='{data}' NEBULA_HOSTNAME='{host}' PATH='{nebula}':\"$PATH\"\nexec /bin/sh -c \"$script\"\n",
             log = log.display(),
             down = down.display(),
             home = home.display(),
@@ -2978,6 +2978,37 @@ fn cross_host_run_keeps_option_values() {
     assert_eq!(run["state"], "started");
     let agents = laptop.json(&["agent", "list", "--project=-ops"]);
     assert_eq!(agents.as_array().map(Vec::len), Some(1), "{agents}");
+}
+
+#[test]
+fn cross_host_run_over_ssh_keeps_parent() {
+    let board = board_env();
+    board.make_repo();
+    let laptop = viewer_on(&proxy_to(&board), "laptop", &[]);
+    laptop.make_repo();
+    add(&board, &["--project", "repo"], "Far child");
+    reported(&board, "laptop");
+    let lead = json_of(
+        spawn_agent(
+            &board,
+            &["--card", "#1", "--role", "research", "--name", "lead"],
+        ),
+        &["agent", "new", "lead"],
+    );
+    let lead = lead["id"].as_str().unwrap();
+    let (path, _, _) = ssh_stub(&board, &laptop);
+    let argv = run_argv(&board, "#1", &[("--host", "laptop")], &[]);
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let run = receipt(board.cli_env(&argv, Some(lead), &[("PATH", &path)]));
+    let child = eventually("the far child on the card", || {
+        chain(&board, "#1")
+            .into_iter()
+            .find(|s| s["id"] == run["session"]["id"] && s["host"] == "laptop")
+    });
+    assert_eq!(
+        child["parent"],
+        serde_json::json!({"host": nebula_core::host::hostname(), "id": lead})
+    );
 }
 
 #[test]

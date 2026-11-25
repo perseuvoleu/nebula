@@ -1760,6 +1760,9 @@ pub struct NewAgentOpts {
     /// `--no-card`: the session joins no card, not even its spawner's.
     pub no_card: bool,
     pub role: Option<nebula_core::board::Role>,
+    /// The spawning session when `todo run` crossed an ssh hop to get here;
+    /// otherwise NEBULA_AGENT_ID on this host.
+    pub parent: Option<nebula_core::board::SessionAt>,
     /// `--dispatch ID`: the `todo run` dispatch this spawn fulfils; the
     /// owning daemon answers a repeat with the session it already started.
     pub dispatch: Option<nebula_core::DispatchId>,
@@ -1910,6 +1913,12 @@ pub async fn spawn_agent(opts: NewAgentOpts) -> Result<serde_json::Value> {
     // The owning daemon stays the judge of the writer mark: a refused claim
     // is retried until it is accepted or --writer-wait runs out, so the
     // protocol, the remote path and older daemons are unchanged.
+    let parent = opts.parent.clone().or_else(|| {
+        env_agent_id().map(|id| nebula_core::board::SessionAt {
+            host: nebula_core::host::hostname(),
+            id: AgentId(id),
+        })
+    });
     let wait_until = tokio::time::Instant::now() + opts.writer_wait;
     let mut req_id = 10u64;
     let mut announced = false;
@@ -1928,12 +1937,12 @@ pub async fn spawn_agent(opts: NewAgentOpts) -> Result<serde_json::Value> {
                 auto_title,
                 prompt: opts.prompt.clone(),
                 writer: opts.writer,
-                spawned_by: env_agent_id().map(AgentId),
+                spawned_by: parent.as_ref().map(|p| p.id.clone()),
                 code_mode_off: opts.code_mode_off,
                 card: card.clone(),
                 role: opts.role,
                 dispatch: opts.dispatch.clone(),
-                spawned_by_host: env_agent_id().map(|_| nebula_core::host::hostname()),
+                spawned_by_host: parent.as_ref().map(|p| p.host.clone()),
             },
         )
         .await?;

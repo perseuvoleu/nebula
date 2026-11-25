@@ -6,7 +6,7 @@ use anyhow::{bail, Context, Result};
 use nebula_core::board::{
     parse_card_ref, Author, BoardOp, BoardPoll, BoardRead, BoardResult, BoardScope, Card,
     CardDraft, CardRef, Checkout, Dispatch, DispatchState, Placement, ProjectScope, Refusal, Role,
-    RunReceipt, Stage,
+    RunReceipt, SessionAt, Stage,
 };
 use nebula_core::codec::{read_frame, write_frame};
 use nebula_core::{
@@ -236,6 +236,7 @@ pub enum TodoVerb {
         dispatch: Option<String>,
         scope: ScopeFlags,
         forwarded: bool,
+        parent: Option<SessionAt>,
     },
     Approve {
         card: String,
@@ -350,6 +351,7 @@ pub async fn run(verb: TodoVerb, json: bool) -> Result<()> {
             dispatch,
             scope,
             forwarded,
+            parent,
         } => {
             let dispatch = Dispatch {
                 id: match dispatch {
@@ -364,7 +366,10 @@ pub async fn run(verb: TodoVerb, json: bool) -> Result<()> {
                 })?,
                 worktree,
             };
-            return run_dispatch(&mut conn, dispatch, scope, forwarded, &projects, json).await;
+            return run_dispatch(
+                &mut conn, dispatch, scope, forwarded, parent, &projects, json,
+            )
+            .await;
         }
         TodoVerb::Approve {
             card,
@@ -507,6 +512,7 @@ async fn run_dispatch(
     dispatch: Dispatch,
     scope: ScopeFlags,
     forwarded: bool,
+    parent: Option<SessionAt>,
     projects: &[Project],
     json: bool,
 ) -> Result<()> {
@@ -567,6 +573,19 @@ async fn run_dispatch(
                 "--forwarded",
             ];
             words.extend(forwarded_scope.iter().map(String::as_str));
+            let origin = parent.or_else(|| {
+                crate::ipc::env_agent_id().map(|id| SessionAt {
+                    host: here.clone(),
+                    id: AgentId(id),
+                })
+            });
+            let parent_words = origin.map(|p| {
+                [
+                    format!("--parent-host={}", p.host),
+                    format!("--parent-id={}", p.id.as_str()),
+                ]
+            });
+            words.extend(parent_words.iter().flatten().map(String::as_str));
             if json {
                 words.push("--json");
             }
@@ -595,6 +614,7 @@ async fn run_dispatch(
         no_card: false,
         role: Some(role),
         dispatch: Some(id.clone()),
+        parent,
     })
     .await;
     let (agent, error) = match spawned {
