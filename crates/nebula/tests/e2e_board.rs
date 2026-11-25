@@ -457,7 +457,9 @@ fn a_local_board_with_no_other_host_keeps_its_version_after_boot() {
     let env = env.start(&[("NEBULA_BOARD_STALE_MS", "100")]);
     let version = || env.json(&["todo", "board", "--all", "--json"])["version"].clone();
     let before = version();
-    let bumped = poll_until(Duration::from_millis(800), || (version() != before).then_some(()));
+    let bumped = poll_until(Duration::from_millis(800), || {
+        (version() != before).then_some(())
+    });
     assert_eq!(bumped, None, "the boot timer bumped an unchanged board");
 }
 
@@ -752,18 +754,8 @@ fn agent_new_card_refuses_unknown_caller() {
     assert!(agent_names(&env).is_empty());
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "host reports are debounced by a second, so the board catches up on its own clock"
-)]
-fn eventually<T>(what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
-    for _ in 0..200 {
-        if let Some(found) = probe() {
-            return found;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    panic!("{what} never happened");
+fn eventually<T>(what: &str, probe: impl FnMut() -> Option<T>) -> T {
+    poll_until(Duration::from_secs(20), probe).unwrap_or_else(|| panic!("{what} never happened"))
 }
 
 fn now_ms() -> i64 {
@@ -892,7 +884,16 @@ fn child_of_an_archived_card_joins_none() {
         &["agent", "new", "parent"],
     );
     env.json(&["todo", "archive", "#1", "--json"]);
-    let argv = ["agent", "new", "--project", "repo", "--worktree", "main", "--name", "late"];
+    let argv = [
+        "agent",
+        "new",
+        "--project",
+        "repo",
+        "--worktree",
+        "main",
+        "--name",
+        "late",
+    ];
     let child = json_of(env.cli(&argv, parent["id"].as_str()), &argv);
     assert_eq!(child["card"], Value::Null);
 }
@@ -2391,7 +2392,10 @@ fn link_stops_when_the_board_turns_local() {
     let before = count();
     assert!(before > 0, "the link never launched its transport");
     let relaunched = poll_until(Duration::from_secs(7), || (count() > before).then_some(()));
-    assert_eq!(relaunched, None, "the old board host's link kept reconnecting");
+    assert_eq!(
+        relaunched, None,
+        "the old board host's link kept reconnecting"
+    );
 }
 
 fn rerun_id(out: &Output) -> String {

@@ -29,7 +29,9 @@ pub(crate) fn serve(store: &Store, links: &HostLinks, op: BoardOp) -> Result<Boa
     let publishes = matches!(op, BoardOp::Publish(_));
     let result = store.board_transaction(|tx| apply(tx, links, op))?;
     if let (true, BoardResult::Artifact(artifact)) = (publishes, &result) {
-        if artifact.kind == nebula_core::board::DECISION_KIND && !artifact.meta.contains_key("rag_note") {
+        if artifact.kind == nebula_core::board::DECISION_KIND
+            && !artifact.meta.contains_key("rag_note")
+        {
             crate::rag_copy::kick();
         }
     }
@@ -944,7 +946,13 @@ struct Links {
 impl Links {
     fn down(&self, host: &str, after: Duration) -> bool {
         self.open.get(host).copied().unwrap_or(0) == 0
-            && self.closed_at.get(host).copied().unwrap_or(self.boot).elapsed() >= after
+            && self
+                .closed_at
+                .get(host)
+                .copied()
+                .unwrap_or(self.boot)
+                .elapsed()
+                >= after
     }
 }
 
@@ -1170,12 +1178,15 @@ mod tests {
             &links,
             BoardOp::Read(BoardRead::Card { scope, card }),
         )
-            .unwrap()
-        else {
+        .unwrap() else {
             panic!("not a show")
         };
         let frame = rmp_serde::to_vec(&BoardResult::Show(show.clone())).unwrap();
-        assert!(frame.len() < MAX_FRAME_LEN as usize, "{} bytes", frame.len());
+        assert!(
+            frame.len() < MAX_FRAME_LEN as usize,
+            "{} bytes",
+            frame.len()
+        );
         let last = show.log.last().unwrap();
         assert!(last.text.starts_with(&format!("{} ", notes - 1)));
         assert!(show.log.len() < notes);

@@ -641,8 +641,12 @@ mod tests {
 
     #[tokio::test]
     async fn an_idle_host_rechecks_its_report_for_config_edits() {
-        let sends = sends_within(false, Duration::from_millis(10), Duration::from_millis(700)).await;
-        assert!(sends >= 2, "no event came and the report was never rechecked");
+        let sends =
+            sends_within(false, Duration::from_millis(10), Duration::from_millis(700)).await;
+        assert!(
+            sends >= 2,
+            "no event came and the report was never rechecked"
+        );
     }
 
     #[tokio::test]

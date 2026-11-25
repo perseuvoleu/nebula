@@ -461,8 +461,10 @@ async fn pump_transport<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         if let Some((client, local, _)) = unwritten {
             client.deliver(ServerEvent::Error {
                 req_id: Some(local),
-                message: nebula_core::board::Refusal::Unreachable
-                    .message(format!("{}: connection lost before it was sent", relay.host)),
+                message: nebula_core::board::Refusal::Unreachable.message(format!(
+                    "{}: connection lost before it was sent",
+                    relay.host
+                )),
             });
         }
     }

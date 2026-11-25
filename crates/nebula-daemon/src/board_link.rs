@@ -77,7 +77,10 @@ impl LinkSlot {
     ) -> Option<Arc<BoardLink>> {
         let host = board.filter(|board| *board != "local");
         let mut slot = self.0.lock().unwrap();
-        if let Some(link) = slot.as_ref().filter(|link| Some(link.host.as_str()) == host) {
+        if let Some(link) = slot
+            .as_ref()
+            .filter(|link| Some(link.host.as_str()) == host)
+        {
             return Some(link.clone());
         }
         if let Some(old) = slot.take() {
@@ -206,10 +209,8 @@ impl BoardLink {
         for pending in overdue {
             pending.client.deliver(ServerEvent::Error {
                 req_id: Some(pending.local),
-                message: Refusal::OutcomeUnknown.message(format!(
-                    "board host {} did not answer in time",
-                    self.host
-                )),
+                message: Refusal::OutcomeUnknown
+                    .message(format!("board host {} did not answer in time", self.host)),
             });
         }
     }
