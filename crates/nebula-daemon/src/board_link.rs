@@ -29,6 +29,8 @@ fn reply_deadline() -> Duration {
         .map(Duration::from_millis)
         .unwrap_or(Duration::from_secs(30))
 }
+/// Unanswered requests the link holds, as the relay caps its own.
+const MAX_PENDING: usize = 256;
 const RECONNECT_MIN: Duration = Duration::from_secs(2);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
 
@@ -89,7 +91,7 @@ impl LinkSlot {
 
 impl BoardLink {
     fn spawn(host: &str, stop: CancellationToken) -> Arc<Self> {
-        let (out, out_rx) = mpsc::channel(256);
+        let (out, out_rx) = mpsc::channel(MAX_PENDING);
         let link = Arc::new(Self {
             host: host.to_string(),
             out,
@@ -118,6 +120,11 @@ impl BoardLink {
             let _admission = self.admission.lock().unwrap();
             if !self.state.borrow().up {
                 Some(self.unreachable())
+            } else if self.pending.lock().unwrap().len() >= MAX_PENDING {
+                Some(Refusal::Unreachable.message(format!(
+                    "board host {} has too many requests in flight",
+                    self.host
+                )))
             } else {
                 let remote = self.next_req.fetch_add(1, Ordering::Relaxed);
                 self.pending.lock().unwrap().insert(

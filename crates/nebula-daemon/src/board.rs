@@ -146,8 +146,8 @@ fn apply(tx: &Transaction, links: &HostLinks, op: BoardOp) -> Result<BoardResult
             agent,
             error,
         } => end_run(tx, &dispatch, agent, error).map(BoardResult::Run),
-        BoardOp::Scoped { scope, op } => {
-            within(tx, &scope, &op)?;
+        BoardOp::Scoped { scope, mut op } => {
+            within(tx, &scope, &mut op)?;
             apply(tx, links, *op)
         }
     }
@@ -317,7 +317,7 @@ fn receipt(tx: &Transaction, id: &DispatchId) -> Result<Option<RunReceipt>> {
         .optional()?)
 }
 
-fn within(tx: &Transaction, scope: &BoardScope, op: &BoardOp) -> Result<()> {
+fn within(tx: &Transaction, scope: &BoardScope, op: &mut BoardOp) -> Result<()> {
     if !matches!(
         op,
         BoardOp::EditCard { .. }
@@ -330,8 +330,7 @@ fn within(tx: &Transaction, scope: &BoardScope, op: &BoardOp) -> Result<()> {
     ) {
         bail!("a scoped op wraps one card write; reads and other ops carry their own scope");
     }
-    let mut named = op.clone();
-    for card in named.card_refs_mut() {
+    for card in op.card_refs_mut() {
         let id = resolve(tx, card)?;
         if !in_scope(scope, card_by_id(tx, &id)?.project.as_deref()) {
             return Err(not_found(card));
