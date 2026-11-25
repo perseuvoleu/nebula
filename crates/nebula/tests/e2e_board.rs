@@ -1127,7 +1127,7 @@ fn report_unchanged_keeps_version() {
 fn away_digest_sessions() {
     let env = board_env();
     let work = add(&env, &["--project", "nebula"], "Work");
-    let old = add(&env, &["--project", "nebula"], "Old");
+    add(&env, &["--project", "nebula"], "Old");
     let ask = add(&env, &["--project", "nebula"], "Ask");
     env.json(&["todo", "move", "#2", "review", "--json"]);
     let before = now_ms() - 60_000;
@@ -1164,7 +1164,6 @@ fn away_digest_sessions() {
         serde_json::json!([{"host": FAR_HOST, "id": "n2", "name": "n2", "card": ask["id"], "status_changed_at": after + 1}]),
         "{away}"
     );
-    assert_ne!(old["id"], work["id"]);
 }
 
 #[test]
