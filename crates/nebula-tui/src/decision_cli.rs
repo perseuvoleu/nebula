@@ -11,8 +11,9 @@ use nebula_core::board::{
 };
 use nebula_core::ArtifactId;
 
-pub const KIND: &str = "decision";
+const KIND: &str = "decision";
 
+/// A `nebula decision` verb, as the binary parsed it.
 pub enum DecisionVerb {
     Add {
         what: String,
@@ -32,6 +33,8 @@ pub enum DecisionVerb {
     },
 }
 
+/// Runs `verb` against the local daemon's board and prints its reply (JSON
+/// with `json`). A refusal's message carries its kind for the exit code.
 pub async fn run(verb: DecisionVerb, json: bool) -> Result<()> {
     let mut conn = connect().await?;
     let (projects, worktrees, agents) = ipc::subscribe_snapshot(&mut conn).await?;

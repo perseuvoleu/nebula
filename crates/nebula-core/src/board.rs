@@ -501,6 +501,10 @@ pub enum BoardOp {
 }
 
 impl BoardOp {
+    /// Every card ref the op names, a `Scoped` op's inner refs included
+    /// (`Block` gives the card and its blocker): the refs a board link
+    /// localizes and a scope check resolves. Ops that name no card by ref
+    /// give none.
     pub fn card_refs_mut(&mut self) -> Vec<&mut CardRef> {
         match self {
             BoardOp::Read(BoardRead::Card { card, .. }) => vec![card],
@@ -675,6 +679,7 @@ pub enum RunStatus {
 pub struct E2eRun {
     pub title: String,
     pub status: RunStatus,
+    /// When the run started, in milliseconds since the Unix epoch.
     pub started_at: i64,
     pub duration_ms: u64,
     pub steps: Vec<E2eStep>,
