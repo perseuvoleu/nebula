@@ -32,7 +32,7 @@ pub fn resend() {
 }
 
 pub fn spawn(daemon: Arc<Daemon>) {
-    crate::board::boot(daemon.store.clone());
+    daemon.host_links.boot(daemon.store.clone());
     let events = daemon.events.subscribe();
     let shutdown = daemon.shutdown.clone();
     tokio::spawn(run(
@@ -106,7 +106,7 @@ async fn send_if_changed(daemon: &Arc<Daemon>, sent: &mut Option<HostReport>) ->
     let Some(board) = config.board else {
         return Ok(());
     };
-    let link = (board != "local").then(|| crate::board_link::to(&board, &daemon.shutdown));
+    let link = daemon.board_link.for_board(Some(&board), &daemon.shutdown);
     if link.as_ref().is_some_and(|link| !link.state().borrow().up) {
         return Ok(());
     }
@@ -120,8 +120,11 @@ async fn send_if_changed(daemon: &Arc<Daemon>, sent: &mut Option<HostReport>) ->
             link.request(op).await?;
         }
         None => {
-            let store = daemon.store.clone();
-            tokio::task::spawn_blocking(move || crate::board::serve(&store, op)).await??;
+            let daemon = daemon.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::board::serve(&daemon.store, &daemon.host_links, op)
+            })
+            .await??;
         }
     }
     *sent = Some(report);

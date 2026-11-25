@@ -2265,6 +2265,29 @@ fn link_refusal_cleared_by_later_attempt() {
     assert!(stderr(&gone).contains(UNREACHABLE), "{}", stderr(&gone));
 }
 
+#[test]
+fn link_stops_when_the_board_turns_local() {
+    let env = Env::new();
+    let launches = env.tmp.path().join("launches");
+    let here = viewer(&format!("echo >> '{}'; exit 0", launches.display()));
+    let count = || {
+        std::fs::read_to_string(&launches)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let out = here.cli(&["todo", "add", "--project", "nebula", "Away"], None);
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+
+    here.board_local();
+    let out = here.cli(&["todo", "list", "--all"], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let before = count();
+    assert!(before > 0, "the link never launched its transport");
+    let relaunched = poll_until(Duration::from_secs(7), || (count() > before).then_some(()));
+    assert_eq!(relaunched, None, "the old board host's link kept reconnecting");
+}
+
 fn rerun_id(out: &Output) -> String {
     let text = stderr(out);
     let id = text

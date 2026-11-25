@@ -25,8 +25,8 @@ pub(crate) fn page_budget() -> usize {
         .unwrap_or(MAX_FRAME_LEN as usize / 2)
 }
 
-pub fn serve(store: &Store, op: BoardOp) -> Result<BoardResult> {
-    let result = store.board_transaction(|tx| apply(tx, op))?;
+pub fn serve(store: &Store, links: &HostLinks, op: BoardOp) -> Result<BoardResult> {
+    let result = store.board_transaction(|tx| apply(tx, links, op))?;
     if let BoardResult::Artifact(artifact) = &result {
         if artifact.kind == "decision" && !artifact.meta.contains_key("rag_note") {
             crate::rag_copy::kick();
@@ -35,9 +35,9 @@ pub fn serve(store: &Store, op: BoardOp) -> Result<BoardResult> {
     Ok(result)
 }
 
-fn apply(tx: &Transaction, op: BoardOp) -> Result<BoardResult> {
+fn apply(tx: &Transaction, links: &HostLinks, op: BoardOp) -> Result<BoardResult> {
     match op {
-        BoardOp::Read(read) => read_op(tx, read),
+        BoardOp::Read(read) => read_op(tx, links, read),
         BoardOp::AddCard(draft) => add_card(tx, draft).map(BoardResult::Card),
         BoardOp::EditCard {
             card,
@@ -148,7 +148,7 @@ fn apply(tx: &Transaction, op: BoardOp) -> Result<BoardResult> {
         } => end_run(tx, &dispatch, agent, error).map(BoardResult::Run),
         BoardOp::Scoped { scope, op } => {
             within(tx, &scope, &op)?;
-            apply(tx, *op)
+            apply(tx, links, *op)
         }
     }
 }
@@ -318,6 +318,18 @@ fn receipt(tx: &Transaction, id: &DispatchId) -> Result<Option<RunReceipt>> {
 }
 
 fn within(tx: &Transaction, scope: &BoardScope, op: &BoardOp) -> Result<()> {
+    if !matches!(
+        op,
+        BoardOp::EditCard { .. }
+            | BoardOp::Move { .. }
+            | BoardOp::Archive { .. }
+            | BoardOp::Proposal { .. }
+            | BoardOp::Block { .. }
+            | BoardOp::AddNote { .. }
+            | BoardOp::BeginRun(_)
+    ) {
+        bail!("a scoped op wraps one card write; reads and other ops carry their own scope");
+    }
     let mut named = op.clone();
     for card in named.card_refs_mut() {
         let id = resolve(tx, card)?;
@@ -667,7 +679,7 @@ pub(crate) fn paged<T: serde::Serialize>(
     Ok((page, None))
 }
 
-fn read_op(tx: &Transaction, read: BoardRead) -> Result<BoardResult> {
+fn read_op(tx: &Transaction, links: &HostLinks, read: BoardRead) -> Result<BoardResult> {
     match read {
         BoardRead::Board {
             scope,
@@ -686,7 +698,7 @@ fn read_op(tx: &Transaction, read: BoardRead) -> Result<BoardResult> {
                     Some(since) => away(tx, &scope, &cards, since)?,
                     None => Away::default(),
                 };
-                (hosts(tx, &scope)?, waiting(tx, &cards, None)?, away)
+                (hosts(tx, links, &scope)?, waiting(tx, &cards, None)?, away)
             } else {
                 (Vec::new(), Vec::new(), Away::default())
             };
@@ -726,7 +738,7 @@ fn read_op(tx: &Transaction, read: BoardRead) -> Result<BoardResult> {
             if !in_scope(&scope, found.project.as_deref()) {
                 return Err(not_found(&card));
             }
-            let sessions = sessions_of(tx, &id)?;
+            let sessions = sessions_of(tx, links, &id)?;
             let artifacts = crate::artifacts::of_card(tx, &id)?;
             let reserved = serde_json::to_vec(&found)?.len()
                 + serde_json::to_vec(&sessions)?.len()
@@ -784,8 +796,8 @@ fn newest_notes(tx: &Transaction, card: &TodoId, budget: usize) -> Result<Vec<Ca
     Ok(log)
 }
 
-fn sessions_of(tx: &Transaction, card: &TodoId) -> Result<Vec<CardSession>> {
-    let stale = stale_hosts(tx)?;
+fn sessions_of(tx: &Transaction, links: &HostLinks, card: &TodoId) -> Result<Vec<CardSession>> {
+    let stale = stale_hosts(tx, links)?;
     Ok(tx
         .prepare(
             "SELECT host, agent_id, name, role, kind, status, status_changed_at, writer, alive, parent
@@ -812,8 +824,8 @@ fn sessions_of(tx: &Transaction, card: &TodoId) -> Result<Vec<CardSession>> {
         .collect::<rusqlite::Result<_>>()?)
 }
 
-fn hosts(tx: &Transaction, scope: &BoardScope) -> Result<Vec<BoardHost>> {
-    let stale = stale_hosts(tx)?;
+fn hosts(tx: &Transaction, links: &HostLinks, scope: &BoardScope) -> Result<Vec<BoardHost>> {
+    let stale = stale_hosts(tx, links)?;
     let waiting: Vec<(String, Option<String>)> = tx
         .prepare(
             "SELECT s.host, t.project FROM board_sessions s LEFT JOIN todos t ON t.id = s.card_id
@@ -918,8 +930,8 @@ fn stale_after() -> Duration {
         .unwrap_or(Duration::from_secs(300))
 }
 
-#[derive(Default)]
 struct Links {
+    boot: Instant,
     open: HashMap<String, usize>,
     closed_at: HashMap<String, Instant>,
 }
@@ -927,49 +939,63 @@ struct Links {
 impl Links {
     fn down(&self, host: &str, after: Duration) -> bool {
         self.open.get(host).copied().unwrap_or(0) == 0
-            && self.closed_at.get(host).copied().unwrap_or(*BOOT).elapsed() >= after
+            && self.closed_at.get(host).copied().unwrap_or(self.boot).elapsed() >= after
     }
 }
 
-static LINKS: std::sync::LazyLock<Mutex<Links>> = std::sync::LazyLock::new(Default::default);
-static BOOT: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+/// On the board host: the report connections each host holds open, so a
+/// host whose last one closed reads stale once `stale_after` passes.
+#[derive(Clone)]
+pub(crate) struct HostLinks(Arc<Mutex<Links>>);
 
-pub(crate) fn boot(store: Arc<Store>) {
-    std::sync::LazyLock::force(&BOOT);
-    tokio::spawn(async move {
-        tokio::time::sleep(stale_after()).await;
-        bump(store).await;
-    });
-}
-
-/// True when `host` read stale until this link opened: the caller bumps
-/// the board version so a poll sees it fresh again.
-pub(crate) fn link_opened(host: &str) -> bool {
-    let mut links = LINKS.lock().unwrap();
-    let was_stale = links.down(host, stale_after());
-    *links.open.entry(host.to_string()).or_default() += 1;
-    links.closed_at.remove(host);
-    was_stale
-}
-
-pub(crate) fn link_closed(host: &str, store: Arc<Store>) {
-    let closed_at = Instant::now();
-    {
-        let mut links = LINKS.lock().unwrap();
-        let open = links.open.entry(host.to_string()).or_default();
-        *open = open.saturating_sub(1);
-        if *open > 0 {
-            return;
-        }
-        links.closed_at.insert(host.to_string(), closed_at);
+impl Default for HostLinks {
+    fn default() -> Self {
+        Self(Arc::new(Mutex::new(Links {
+            boot: Instant::now(),
+            open: HashMap::new(),
+            closed_at: HashMap::new(),
+        })))
     }
-    let host = host.to_string();
-    tokio::spawn(async move {
-        tokio::time::sleep(stale_after()).await;
-        if LINKS.lock().unwrap().closed_at.get(&host) == Some(&closed_at) {
+}
+
+impl HostLinks {
+    pub(crate) fn boot(&self, store: Arc<Store>) {
+        tokio::spawn(async move {
+            tokio::time::sleep(stale_after()).await;
             bump(store).await;
+        });
+    }
+
+    /// True when `host` read stale until this link opened: the caller bumps
+    /// the board version so a poll sees it fresh again.
+    pub(crate) fn opened(&self, host: &str) -> bool {
+        let mut links = self.0.lock().unwrap();
+        let was_stale = links.down(host, stale_after());
+        *links.open.entry(host.to_string()).or_default() += 1;
+        links.closed_at.remove(host);
+        was_stale
+    }
+
+    pub(crate) fn closed(&self, host: &str, store: Arc<Store>) {
+        let closed_at = Instant::now();
+        {
+            let mut links = self.0.lock().unwrap();
+            let open = links.open.entry(host.to_string()).or_default();
+            *open = open.saturating_sub(1);
+            if *open > 0 {
+                return;
+            }
+            links.closed_at.insert(host.to_string(), closed_at);
         }
-    });
+        let host = host.to_string();
+        let links = self.0.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(stale_after()).await;
+            if links.lock().unwrap().closed_at.get(&host) == Some(&closed_at) {
+                bump(store).await;
+            }
+        });
+    }
 }
 
 pub(crate) fn bump_now(store: &Store) -> Result<()> {
@@ -986,12 +1012,12 @@ async fn bump(store: Arc<Store>) {
     }
 }
 
-fn stale_hosts(tx: &Transaction) -> Result<HashSet<String>> {
+fn stale_hosts(tx: &Transaction, links: &HostLinks) -> Result<HashSet<String>> {
     let known: Vec<String> = tx
         .prepare("SELECT host FROM board_hosts UNION SELECT host FROM board_sessions")?
         .query_map([], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
-    let links = LINKS.lock().unwrap();
+    let links = links.0.lock().unwrap();
     let here = nebula_core::host::hostname();
     let after = stale_after();
     Ok(known
@@ -1006,8 +1032,38 @@ mod tests {
     use nebula_core::board::BoardScope;
 
     #[test]
+    fn scoped_admits_only_the_writes_its_guard_checks() {
+        let store = Store::open_in_memory().unwrap();
+        let scope = BoardScope {
+            projects: ProjectScope::Named(vec!["web".into()]),
+            include_home: false,
+        };
+        let read = BoardOp::Read(BoardRead::Cards {
+            scope: BoardScope {
+                projects: ProjectScope::All,
+                include_home: true,
+            },
+            stage: None,
+            include_archived: false,
+            page: None,
+        });
+        let nested = BoardOp::Scoped {
+            scope: scope.clone(),
+            op: Box::new(read.clone()),
+        };
+        for op in [read, nested] {
+            let scoped = BoardOp::Scoped {
+                scope: scope.clone(),
+                op: Box::new(op),
+            };
+            assert!(serve(&store, &HostLinks::default(), scoped).is_err());
+        }
+    }
+
+    #[test]
     fn show_keeps_the_newest_notes_when_the_log_outgrows_a_frame() {
         let store = Store::open_in_memory().unwrap();
+        let links = HostLinks::default();
         let author = Author {
             host: "here".into(),
             agent: None,
@@ -1019,6 +1075,7 @@ mod tests {
         };
         serve(
             &store,
+            &links,
             BoardOp::AddCard(CardDraft {
                 id: id.clone(),
                 title: "Long log".into(),
@@ -1034,6 +1091,7 @@ mod tests {
         for i in 0..notes {
             serve(
                 &store,
+                &links,
                 BoardOp::AddNote {
                     id: NoteId::generate(),
                     card: card.clone(),
@@ -1047,7 +1105,11 @@ mod tests {
             projects: ProjectScope::All,
             include_home: true,
         };
-        let BoardResult::Show(show) = serve(&store, BoardOp::Read(BoardRead::Card { scope, card }))
+        let BoardResult::Show(show) = serve(
+            &store,
+            &links,
+            BoardOp::Read(BoardRead::Card { scope, card }),
+        )
             .unwrap()
         else {
             panic!("not a show")

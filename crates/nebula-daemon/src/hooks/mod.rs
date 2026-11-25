@@ -890,7 +890,7 @@ mod tests {
             },
             checkout: None,
         };
-        let Ok(BoardResult::Card(card)) = crate::board::serve(store, BoardOp::AddCard(draft))
+        let Ok(BoardResult::Card(card)) = crate::board::serve(store, &Default::default(), BoardOp::AddCard(draft))
         else {
             panic!("the local board added no card");
         };

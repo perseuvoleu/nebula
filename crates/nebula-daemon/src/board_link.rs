@@ -51,21 +51,31 @@ pub struct BoardLink {
     stop: CancellationToken,
 }
 
-static LINK: Mutex<Option<Arc<BoardLink>>> = Mutex::new(None);
+/// The daemon's link to its board host, if its config names one.
+#[derive(Default)]
+pub struct LinkSlot(Mutex<Option<Arc<BoardLink>>>);
 
-/// The link to `host`, started on first use; a changed board host stops
-/// the old link.
-pub fn to(host: &str, shutdown: &CancellationToken) -> Arc<BoardLink> {
-    let mut slot = LINK.lock().unwrap();
-    if let Some(link) = slot.as_ref().filter(|link| link.host == host) {
-        return link.clone();
+impl LinkSlot {
+    /// The link to `board`'s host when that is another host, started on
+    /// first use. Any other link stops, so a board set to local or unset
+    /// leaves no reconnect loop behind.
+    pub fn for_board(
+        &self,
+        board: Option<&str>,
+        shutdown: &CancellationToken,
+    ) -> Option<Arc<BoardLink>> {
+        let host = board.filter(|board| *board != "local");
+        let mut slot = self.0.lock().unwrap();
+        if let Some(link) = slot.as_ref().filter(|link| Some(link.host.as_str()) == host) {
+            return Some(link.clone());
+        }
+        if let Some(old) = slot.take() {
+            old.stop.cancel();
+        }
+        let link = BoardLink::spawn(host?, shutdown.child_token());
+        *slot = Some(link.clone());
+        Some(link)
     }
-    if let Some(old) = slot.take() {
-        old.stop.cancel();
-    }
-    let link = BoardLink::spawn(host, shutdown.child_token());
-    *slot = Some(link.clone());
-    link
 }
 
 impl BoardLink {
