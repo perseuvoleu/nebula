@@ -1,0 +1,8 @@
+#!/bin/sh
+# cargo with the Ghostty pane engine where zig 0.15 is installed, and --no-default-features (vt100 only) where it is not.
+PATH=/opt/homebrew/opt/zig@0.15/bin:$PATH
+export PATH
+command -v zig >/dev/null && exec cargo "$@"
+sub=$1
+shift
+exec cargo "$sub" --no-default-features "$@"
