@@ -73,6 +73,17 @@ check "a recorded decision is copied toward the RAG" test -s "$stubs/ssh.log"
 check "no ssh call of that copy names a live host" sh -c "! grep -v -- ' -- [^ ]*\.invalid ' '$stubs/ssh.log'"
 "$vn" down >/dev/null
 rm -rf "$stubs"
+vn_rag_host() { [[ " $(daemon_env "$(cat "$NV_STATE/daemon.pid")") " == *" NEBULA_RAG_HOST=vn-rag.invalid "* ]]; }
+older=$(mktemp -d)
+sed -e '/^  NEBULA_RAG_/d' -e "s|^checkout=.*|checkout=$(cd "$here/../../.." && pwd -P)|" "$vn" >"$older/vn"
+chmod +x "$older/vn"
+NEBULA_RAG_LOCAL=0 NEBULA_RAG_HOST=rag.invalid "$older/vn" up >/dev/null
+older_pid=$(cat "$NV_STATE/daemon.pid")
+check "up restarts a daemon an older vn started without its RAG env" sh -c "'$vn' up | grep -q 'vn: up at'"
+check "the older vn's daemon is gone" sh -c "! kill -0 $older_pid 2>/dev/null"
+check "the restarted daemon carries vn's RAG host" vn_rag_host
+"$vn" down >/dev/null
+rm -rf "$older"
 export NV_STATE="/tmp/nvt-$$"
 
 mkdir -p "$NV_STATE.real" && ln -s "$NV_STATE.real" "$NV_STATE"

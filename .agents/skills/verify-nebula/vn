@@ -40,14 +40,24 @@ isolated_env=(env -u NEBULA_AGENT_ID -u NEBULA_API_URL -u NEBULA_API_TOKEN -u TM
 
 isolated() { "${isolated_env[@]}" "$@"; }
 
+process_env() { printf '%s ' "$(ps -E -ww -p "$1" -o command= 2>/dev/null)"; }
+
 answers() { isolated perl -e 'alarm 2; exec @ARGV' "$bin" agent list --all >/dev/null 2>&1; }
 
 daemon_pid() {
   local pid
   pid=$(cat "$state/daemon.pid" 2>/dev/null) || return 1
   [ -n "$pid" ] || return 1
-  printf '%s ' "$(ps -E -ww -p "$pid" -o command= 2>/dev/null)" | grep -F "$bin daemon" | grep -qF " NEBULA_RUNTIME_DIR=$state/rt " || return 1
+  process_env "$pid" | grep -F "$bin daemon" | grep -qF " NEBULA_RUNTIME_DIR=$state/rt " || return 1
   echo "$pid"
+}
+
+rag_isolated() {
+  local seen entry
+  seen=" $(process_env "$1")"
+  for entry in "${isolated_env[@]}"; do
+    case $entry in NEBULA_RAG_*) [[ $seen == *" $entry "* ]] || return 1 ;; esac
+  done
 }
 
 fingerprint() { shasum -a 256 "$bin" | cut -d' ' -f1; }
@@ -127,15 +137,17 @@ seed_db() {
 }
 
 cmd_up() {
-  local seed=
+  local seed= pid
   if [ "${1:-}" = --seed ]; then seed=${2:-$HOME/Library/Application Support/dev.nebula.nebula/nebula.db}; fi
   refuse_link
   refuse_unowned
   [ -x "$bin" ] || die "no binary at $bin; run vn build first"
   if [ -d "$state" ]; then
-    if daemon_pid >/dev/null; then
-      if [ -z "$seed" ] && [ "$(cat "$state/daemon.sha256")" = "$(fingerprint)" ]; then echo "vn: already up at $state"; return; fi
-      echo "vn: $bin changed since up; restarting"
+    if pid=$(daemon_pid); then
+      if [ -z "$seed" ] && [ "$(cat "$state/daemon.sha256")" = "$(fingerprint)" ] && rag_isolated "$pid"; then
+        echo "vn: already up at $state"; return
+      fi
+      echo "vn: $bin or the daemon's RAG isolation changed since up; restarting"
     fi
     cmd_down >/dev/null
   fi
