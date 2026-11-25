@@ -87,8 +87,8 @@ function useSessions(projects: string[]) {
         sessions: async (project) => (await api<{ sessions: SessionRow[] }>("sessions", { project }, undefined, { timeoutMs: 20000, signal: abort.signal })).sessions,
       }, abort.signal);
       if (version !== generation.current) return;
-      setSnapshot({ projects, rows: data.rows, loaded: data.loaded });
-      setPhase(data.loaded.length ? "ready" : navigator.onLine ? "error" : "offline");
+      setSnapshot(old => data.loaded.length || old?.projects !== projects ? { projects, rows: data.rows, loaded: data.loaded } : old);
+      setPhase(p => data.loaded.length ? "ready" : !navigator.onLine ? "offline" : p === "ready" ? p : "error");
       setError(data.errors.length ? data.errors.map(e => `${e.project}: ${describeError(e.failure)}`).join("; ") : null);
     } catch (failure) {
       if (version !== generation.current) return;
@@ -234,7 +234,7 @@ function Shell({ workspace, route }: { workspace: Workspace; route: ReturnType<t
     setChooseProject(true);
     document.querySelector<HTMLSelectElement>('select[aria-label="Proiect"]')?.focus();
   };
-  const openServerless = () => { navigate({ project: null, session: null, all: false, serverless: true }); setMenuOpen(false); };
+  const openServerless = () => { navigate({ project: selection.all ? null : project, session: null, all: selection.all, serverless: true }); setMenuOpen(false); };
   const serverlessLink = (
     <button type="button" onClick={openServerless} aria-current={selection.serverless ? "page" : undefined}
       className={`flex min-h-11 items-center gap-2 border-t border-sidebar-border px-3 text-left text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${selection.serverless ? "bg-secondary font-medium" : "hover:bg-muted/60"}`}>
@@ -276,7 +276,7 @@ function Shell({ workspace, route }: { workspace: Workspace; route: ReturnType<t
     </aside>
   );
 
-  const closeServerless = () => navigate({ project, session: null, all: false });
+  const closeServerless = () => navigate({ project: selection.all ? null : project, session: null, all: selection.all });
   const conversation = selection.serverless ? <ServerlessRuns onBack={desktop ? undefined : closeServerless} /> : sessionId && controller && state ? (
     <ConversationView key={`${project}/${sessionId}`} project={project} previewUrl={previewUrl} row={row} state={state} controller={controller} sessions={orderedRows} unseen={unseenFinished} onSelect={select} showProjects={selection.all} showBack={!desktop} onBack={() => navigate({ project, session: null, all: selection.all })} />
   ) : (
