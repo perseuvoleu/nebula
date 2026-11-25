@@ -152,7 +152,7 @@ function Routes({ workspace }: { workspace: Workspace }) {
   const [selection, navigate] = route;
   if (!selection.board) return <Shell workspace={workspace} route={route} />;
   return <BoardPage route={selection.board} workspace={workspace} onSessions={() => navigate({ project: null, session: null, all: false })}
-    onNavigate={(board, replace) => navigate({ project: null, session: null, all: false, board }, replace)} />;
+    onNavigate={(board) => navigate({ project: null, session: null, all: false, board })} />;
 }
 
 function Shell({ workspace, route }: { workspace: Workspace; route: ReturnType<typeof useSelection> }) {

@@ -142,6 +142,19 @@ test("Run defaults to leaseweb when only a laptop reports slots; a refusal shows
   expect(bodies[0].dispatch).not.toBe(bodies[1].dispatch);
 });
 
+test("a worker on a host whose writer slots are full starts now, as todo run does, instead of promising to wait", async ({ page }) => {
+  addCard(13, "Run on a full host");
+  writeBoard((board) => { (board as unknown as { hosts: unknown[] }).hosts = [{ host: "leaseweb", writers: 2, writer_slots: 2, checkouts: [], needs_you: 0, stale: false }]; });
+  await open(page, "/board/c/13%40leaseweb");
+  await page.getByRole("button", { name: "Pornește", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Pornește un agent pe card" });
+  await expect(dialog.getByRole("radio", { name: /@leaseweb/ })).toBeChecked();
+  await expect(dialog.getByRole("status")).not.toContainText("așteaptă");
+  await dialog.getByRole("button", { name: "Pornește", exact: true }).click();
+  await expect(dialog).toHaveCount(0);
+  expect(sends().filter((s) => "run" in s)).toHaveLength(1);
+});
+
 test("a refused new card shows why inside its dialog", async ({ page }) => {
   await page.route("**/api/cards", (route) => route.fulfill({ status: 403, contentType: "application/json", body: JSON.stringify({ error: "Project not on this board" }) }));
   await open(page, "/board/p/nebula");
