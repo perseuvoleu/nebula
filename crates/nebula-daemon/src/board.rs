@@ -964,9 +964,22 @@ impl Default for HostLinks {
 }
 
 impl HostLinks {
+    /// Once `stale_after` passes from boot, a host that never linked reads
+    /// stale: bump the version then, only when there is such a host.
     pub(crate) fn boot(&self, store: Arc<Store>) {
+        let links = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(stale_after()).await;
+            let stale = {
+                let store = store.clone();
+                tokio::task::spawn_blocking(move || {
+                    store.board_transaction(|tx| stale_hosts(tx, &links))
+                })
+                .await
+            };
+            if matches!(stale, Ok(Ok(hosts)) if hosts.is_empty()) {
+                return;
+            }
             bump(store).await;
         });
     }

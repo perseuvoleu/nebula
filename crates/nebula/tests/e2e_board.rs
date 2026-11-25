@@ -451,6 +451,17 @@ fn board_since_unchanged() {
 }
 
 #[test]
+fn a_local_board_with_no_other_host_keeps_its_version_after_boot() {
+    let env = Env::new();
+    env.board_local();
+    let env = env.start(&[("NEBULA_BOARD_STALE_MS", "100")]);
+    let version = || env.json(&["todo", "board", "--all", "--json"])["version"].clone();
+    let before = version();
+    let bumped = poll_until(Duration::from_millis(800), || (version() != before).then_some(()));
+    assert_eq!(bumped, None, "the boot timer bumped an unchanged board");
+}
+
+#[test]
 fn edit_to_equal_values_keeps_the_version() {
     let env = board_env();
     add(&env, &["--project", "nebula"], "Same");
