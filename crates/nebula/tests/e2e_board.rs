@@ -2483,6 +2483,21 @@ fn run_refuses_blocked_or_archived() {
 }
 
 #[test]
+fn run_treats_an_archived_blocker_as_cleared() {
+    let env = board_env();
+    env.make_repo();
+    add(&env, &["--project", "repo"], "Blocked");
+    add(&env, &["--project", "repo"], "Shelved blocker");
+    env.json(&["todo", "block", "#1", "--by", "#2", "--json"]);
+    env.json(&["todo", "archive", "#2", "--json"]);
+    let shown = env.json(&["todo", "show", "#1", "--json"]);
+    assert_eq!(shown["cleared_blockers"], serde_json::json!(["#2"]));
+    let run = run_card(&env, "#1", &[]);
+    assert_eq!(run.status.code(), Some(0), "{}", stderr(&run));
+    assert_eq!(receipt(run)["state"], "started");
+}
+
+#[test]
 fn run_writer_busy_fails_dispatch() {
     let env = board_env();
     env.make_repo();

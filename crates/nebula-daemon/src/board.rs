@@ -213,14 +213,12 @@ fn begin_run(tx: &Transaction, dispatch: Dispatch) -> Result<RunReceipt> {
             found.label
         )));
     };
-    let open: Vec<String> = tx
-        .prepare(
-            "SELECT t.number FROM card_blocks b JOIN todos t ON t.id = b.by_id
-             WHERE b.card_id = ?1 AND t.stage != 'done' ORDER BY t.number",
-        )?
-        .query_map(params![card.as_str()], |r| r.get::<_, i64>(0))?
-        .map(|n| n.map(|n| card_label(n as u64, None)))
-        .collect::<rusqlite::Result<_>>()?;
+    let open: Vec<&str> = found
+        .blocked_by
+        .iter()
+        .filter(|b| !found.cleared_blockers.contains(b))
+        .map(String::as_str)
+        .collect();
     if !open.is_empty() {
         bail!(Refusal::Conflict.message(format!(
             "{} is blocked by {}",
