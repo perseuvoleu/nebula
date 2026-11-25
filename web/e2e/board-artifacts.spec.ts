@@ -1,6 +1,6 @@
 import os from "node:os";
 import { expect, type Page } from "@playwright/test";
-import { test, changeBoard, openBoard, storeArtifact } from "./helpers";
+import { test, changeBoard, login, storeArtifact } from "./helpers";
 
 const CARD = "01JD0000000000000000000012";
 const RUN = "01JG0000000000000000000001";
@@ -32,7 +32,7 @@ test("e2e-run with 12 screenshots under poll", async ({ page }) => {
     await incompleteAtPoll;
     await route.fulfill({ response });
   });
-  await openBoard(page, "/board/c/12%40leaseweb");
+  await login(page, "/board/c/12%40leaseweb");
   const run = section(page, "board.spec");
   await expect(run.getByRole("img")).toHaveCount(12);
   for (const [i, image] of (await run.getByRole("img").all()).entries()) {
@@ -55,7 +55,7 @@ test("each kind renders", async ({ page }) => {
   );
   changeBoard((board) => board.decisions.push({ ...board.decisions[0], id: "01JG0000000000000000000014", title: "Poll every three seconds",
     card: CARD, content: { body: "SSE can come later" } }));
-  await openBoard(page, "/board/c/12%40leaseweb");
+  await login(page, "/board/c/12%40leaseweb");
 
   const recap = section(page, "Recap slice 1").locator("iframe");
   await expect(recap).toHaveAttribute("sandbox", "allow-scripts");
@@ -73,7 +73,7 @@ test("decisions search", async ({ page }) => {
   changeBoard((board) => board.decisions.push(
     { ...board.decisions[0], id: "01JG0000000000000000000020", title: "Poll every three seconds", card: CARD, content: { body: "SSE can come later" } },
     { ...board.decisions[0], id: "01JG0000000000000000000021", title: "Vela keeps its schema", project: "vela", card: null, content: { body: "" } }));
-  await openBoard(page, "/board/decisions");
+  await login(page, "/board/decisions");
   await expect(page.getByRole("article")).toHaveCount(3);
   await page.getByRole("searchbox", { name: "Caută decizii" }).fill("three");
   await expect(page.getByRole("article")).toHaveCount(1);
@@ -88,7 +88,7 @@ test("decisions search", async ({ page }) => {
 test("record decision", async ({ page }) => {
   changeBoard((board) => board.decisions.push({ ...board.decisions[0], id: "01JG0000000000000000000021", title: "Vela keeps its schema",
     project: "vela", card: null, content: { body: "" } }));
-  await openBoard(page, "/board/p/nebula/c/12%40leaseweb");
+  await login(page, "/board/p/nebula/c/12%40leaseweb");
   const form = page.getByRole("form", { name: "Notează o decizie" });
   await form.getByLabel("Decizia").fill("Keep runs for a year");
   await form.getByLabel("De ce").fill("Reviews look back that far");
@@ -105,7 +105,7 @@ test("record decision", async ({ page }) => {
 test("a decision's session link lands on that session on its host, a home decision's too", async ({ page }) => {
   changeBoard((board) => board.decisions.push({ ...board.decisions[0], id: "01JG0000000000000000000030", title: "Home chores run nightly",
     project: null, card: null, session: { host: os.hostname(), id: "pi-1", name: "Refactor auth" }, content: { body: "" } }));
-  await openBoard(page, "/board/decisions");
+  await login(page, "/board/decisions");
   const row = page.getByRole("article").filter({ hasText: "Home chores run nightly" });
   const link = row.getByRole("link", { name: /sesiunea Refactor auth/ });
   await expect(link).toHaveAttribute("href", "/p/alpha/s/pi-1");
@@ -117,7 +117,7 @@ test("a decision's session link lands on that session on its host, a home decisi
 test("the sidebar opens the decisions of every project", async ({ page }) => {
   changeBoard((board) => board.decisions.push({ ...board.decisions[0], id: "01JG0000000000000000000021", title: "Vela keeps its schema",
     project: "vela", card: null, content: { body: "" } }));
-  await openBoard(page, "/board/p/nebula");
+  await login(page, "/board/p/nebula");
   const entry = page.getByRole("navigation", { name: "Proiecte" }).getByRole("button", { name: "Toate deciziile" });
   await entry.click();
   await expect(page).toHaveURL(/\/board\/decisions$/);
@@ -128,13 +128,13 @@ test("the sidebar opens the decisions of every project", async ({ page }) => {
 test("a project's decisions show although the first page holds only other projects'", async ({ page }) => {
   changeBoard((board) => board.decisions.unshift(...[1, 2, 3].map((n) => ({ ...board.decisions[0], id: `01JG000000000000000000004${n}`,
     title: `Vela decision ${n}`, project: "vela", card: null, content: { body: "" } }))));
-  await openBoard(page, "/board/decisions/p/nebula");
+  await login(page, "/board/decisions/p/nebula");
   await expect(page.getByRole("article").filter({ hasText: "Copy published files" })).toBeVisible();
   await expect(page.getByRole("article")).toHaveCount(1);
 });
 
 test("a failed search shows its error and no earlier results", async ({ page }) => {
-  await openBoard(page, "/board/decisions");
+  await login(page, "/board/decisions");
   await expect(page.getByRole("article")).toHaveCount(1);
   const search = page.getByRole("searchbox", { name: "Caută decizii" });
   await expect(search).toHaveAttribute("maxlength", "200");
@@ -152,7 +152,7 @@ test("a decision being recorded locks its form until the board answers", async (
     if (route.request().method() === "POST") await held;
     await route.continue();
   });
-  await openBoard(page, "/board/p/nebula/c/12%40leaseweb");
+  await login(page, "/board/p/nebula/c/12%40leaseweb");
   const form = page.getByRole("form", { name: "Notează o decizie" });
   await form.getByLabel("Decizia").fill("Keep runs for a year");
   await form.getByRole("button", { name: "Notează" }).click();
@@ -181,7 +181,7 @@ test("an artifact keeps its frame and content when the card is read again with a
     changeBoard(() => {});
     await response;
   };
-  await openBoard(page, "/board/c/12%40leaseweb");
+  await login(page, "/board/c/12%40leaseweb");
   await expect(page.getByText("Linkul a expirat; reîncarcă pagina.")).toBeVisible();
   await expect(page.frameLocator('iframe[title="Recap slice 1"]').getByText("recap body")).toBeVisible();
   const frame = section(page, "Recap slice 1").locator("iframe");
@@ -232,7 +232,7 @@ test("a card page left open past its grants' expiry still loads its frame and la
     url.pathname = url.pathname.replace(HELD, `/a/${real.get(id)}/`);
     await route.fulfill({ response: await route.fetch({ url: url.href }) });
   });
-  await openBoard(page, "/board/c/12%40leaseweb");
+  await login(page, "/board/c/12%40leaseweb");
   await expect(page.frameLocator('iframe[title="Recap slice 1"]').getByText("recap body")).toBeVisible();
   await expect(section(page, "board.spec").getByRole("img")).toHaveCount(12);
 

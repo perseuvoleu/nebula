@@ -1,10 +1,10 @@
 import { expect } from "@playwright/test";
-import { test, changeBoard, openBoard } from "./helpers";
+import { test, changeBoard, login } from "./helpers";
 
 test("home cards keep their own scope through a reload, and a card page keeps its project", async ({ page }) => {
   changeBoard((board) => board.cards.push({ ...board.cards[1], id: "01JD0000000000000000000030", number: 30, ref: "#30@leaseweb",
     title: "A home chore", stage: "backlog", project: null, checkout: null, blocked_by: [] }));
-  await openBoard(page, "/board");
+  await login(page, "/board");
   const sidebar = page.getByRole("navigation", { name: "Proiecte" });
   await sidebar.getByRole("button", { name: /\bhome\s*1$/ }).click();
   await expect(page).toHaveURL(/\/board\/home$/);

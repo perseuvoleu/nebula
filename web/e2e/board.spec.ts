@@ -1,32 +1,9 @@
-import fs from "node:fs";
-import path from "node:path";
 import { expect, type Locator, type Page } from "@playwright/test";
-import { test, STATE, TOKEN, changeBoard, noHorizontalOverflow, setBehaviour, shot } from "./helpers";
-
-type Board = { version: number; cards: Record<string, unknown>[]; hosts: { needs_you: number }[];
-  away: { finished: { id: unknown; at: number }[] }; details: Record<string, { sessions: Record<string, unknown>[] }> };
-
-const readBoard = (): Board => JSON.parse(fs.readFileSync(path.join(STATE, "board.json"), "utf8"));
-
-function writeBoard(change: (board: Board) => void) {
-  const board = readBoard();
-  change(board);
-  board.version += 1;
-  const temporary = path.join(STATE, ".board.json.spec");
-  fs.writeFileSync(temporary, JSON.stringify(board));
-  fs.renameSync(temporary, path.join(STATE, "board.json"));
-}
+import { test, changeBoard, login, noHorizontalOverflow, setBehaviour, shot } from "./helpers";
 
 function addCard(number: number, title: string, stage: string, blockedBy: string[] = []) {
-  writeBoard((board) => board.cards.push({ ...board.cards[1], id: `01JD${String(number).padStart(22, "0")}`, number,
+  changeBoard((board) => board.cards.push({ ...board.cards[1], id: `01JD${String(number).padStart(22, "0")}`, number,
     ref: `#${number}@leaseweb`, title, stage, checkout: null, blocked_by: blockedBy }));
-}
-
-async function open(page: Page, url: string) {
-  await page.goto(url);
-  await page.getByLabel("Token de acces").fill(TOKEN);
-  await page.getByRole("button", { name: "Conectare" }).click();
-  await expect(page.getByLabel("Token de acces")).toHaveCount(0);
 }
 
 async function awayFrom(page: Page, at = 1764000000000) {
@@ -37,7 +14,7 @@ const column = (page: Page, name: string) => page.getByRole("region", { name, ex
 const tile = (scope: Page | Locator, title: string) => scope.getByRole("article").filter({ hasText: title });
 
 test("columns and table", async ({ page }) => {
-  await open(page, "/board");
+  await login(page, "/board");
   await expect(page.getByRole("heading", { name: "Board", level: 1 })).toBeVisible();
   for (const name of ["Backlog", "Urmează", "În lucru", "Review", "Gata"]) await expect(column(page, name)).toBeVisible();
   await expect(tile(column(page, "În lucru"), "Keep verification results")).toBeVisible();
@@ -50,9 +27,9 @@ test("columns and table", async ({ page }) => {
 });
 
 test("peek and card page", async ({ page }) => {
-  writeBoard((board) => board.details["01JD0000000000000000000012"].sessions.push(
+  changeBoard((board) => board.details["01JD0000000000000000000012"].sessions.push(
     { ...board.details["01JD0000000000000000000012"].sessions[0], id: "01JF0000000000000000000003", name: "reviewer", role: "review", status: "fresh", writer: false }));
-  await open(page, "/board?peek=12%40leaseweb");
+  await login(page, "/board?peek=12%40leaseweb");
   const peek = page.getByRole("dialog", { name: "Keep verification results" });
   await expect(peek.getByText("Started on leaseweb")).toBeVisible();
   await peek.getByRole("link", { name: "Deschide pagina" }).click();
@@ -64,8 +41,8 @@ test("peek and card page", async ({ page }) => {
 });
 
 test("a card without session data makes no status claim, and needs-you stays hidden", async ({ page }) => {
-  writeBoard((board) => { board.hosts[0].needs_you = 1; });
-  await open(page, "/board");
+  changeBoard((board) => { board.hosts[0].needs_you = 1; });
+  await login(page, "/board");
   await expect(tile(page, "Keep verification results")).toBeVisible();
   await expect(tile(page, "Keep verification results").getByRole("img")).toHaveCount(0);
   await expect(page.getByRole("navigation", { name: "Proiecte" }).getByRole("button", { name: /Te așteaptă/ })).toHaveCount(0);
@@ -77,7 +54,7 @@ test("a card without session data makes no status claim, and needs-you stays hid
 
 test("the away digest lists only the scope's project and shows only what it lists", async ({ page }) => {
   await awayFrom(page);
-  await open(page, "/board/p/nebula");
+  await login(page, "/board/p/nebula");
   const digest = page.getByRole("region", { name: "De când ai lipsit" });
   await expect(digest.getByRole("button", { name: "Keep verification results" })).toBeVisible();
   await expect(digest.getByText("Copy published files")).toBeVisible();
@@ -96,7 +73,7 @@ test("the away digest reads the decisions it names once, not every page on every
   const decisionReads: string[] = [];
   page.on("request", (r) => { if (new URL(r.url()).pathname === "/api/decisions") decisionReads.push(r.url()); });
   await awayFrom(page);
-  await open(page, "/board");
+  await login(page, "/board");
   const digest = page.getByRole("region", { name: "De când ai lipsit" });
   await expect(digest.getByText("Copy published files")).toBeVisible();
   for (const [i, stage] of ["next", "doing"].entries()) {
@@ -110,10 +87,10 @@ test("the away digest reads the decisions it names once, not every page on every
 
 test("at 390 px a long away digest is capped and leaves the board in view", async ({ page }) => {
   for (let number = 20; number < 50; number++) addCard(number, `Finished ${number}`, "done");
-  writeBoard((board) => board.away.finished.push(...board.cards.filter((c) => c.stage === "done").map((c) => ({ id: c.id, at: 1764000500000 }))));
+  changeBoard((board) => board.away.finished.push(...board.cards.filter((c) => c.stage === "done").map((c) => ({ id: c.id, at: 1764000500000 }))));
   await page.setViewportSize({ width: 390, height: 844 });
   await awayFrom(page);
-  await open(page, "/board");
+  await login(page, "/board");
   const digest = page.getByRole("region", { name: "De când ai lipsit" });
   await expect(digest.getByRole("button", { name: "Finished 20" })).toBeVisible();
   await expect(column(page, "Backlog")).toBeInViewport();
@@ -123,7 +100,7 @@ test("at 390 px a long away digest is capped and leaves the board in view", asyn
 
 test("a project's Decisions route lists only that project's decisions", async ({ page }) => {
   const listed = page.waitForResponse((r) => r.url().includes("/api/decisions"));
-  await open(page, "/board/decisions/p/vela");
+  await login(page, "/board/decisions/p/vela");
   await listed;
   await expect(page.getByRole("heading", { name: "Decizii" })).toBeVisible();
   await expect(page.getByText("Copy published files")).toHaveCount(0);
@@ -137,7 +114,7 @@ test("a project's Decisions route lists only that project's decisions", async ({
 test("a failed card read is retried on the next poll, and a stale detail is marked stale", async ({ page }) => {
   let fail = true;
   await page.route("**/api/cards/**", (route) => fail ? route.fulfill({ status: 503, body: "{}" }) : route.continue());
-  await open(page, "/board?peek=12%40leaseweb");
+  await login(page, "/board?peek=12%40leaseweb");
   const peek = page.getByRole("dialog", { name: "Keep verification results" });
   await expect(peek.getByRole("alert")).toBeVisible();
   fail = false;
@@ -151,14 +128,14 @@ test("a failed card read is retried on the next poll, and a stale detail is mark
 
 test("blocked card dimmed", async ({ page }) => {
   addCard(13, "Wait for verification", "next", ["#12@leaseweb"]);
-  await open(page, "/board");
+  await login(page, "/board");
   const opacity = (title: string) => tile(page, title).evaluate((el) => Number(getComputedStyle(el).opacity));
   await expect(tile(page, "Wait for verification")).toBeVisible();
   expect(await opacity("Wait for verification")).toBeLessThan(await opacity("Keep verification results"));
 });
 
 test("sidebar counts and quiet projects", async ({ page }) => {
-  await open(page, "/board");
+  await login(page, "/board");
   const sidebar = page.getByRole("navigation", { name: "Proiecte" });
   await expect(sidebar.getByRole("button", { name: /nebula\s*2$/ })).toBeVisible();
   await expect(sidebar.getByRole("button", { name: /^Toate proiectele\s*2$/ })).toBeVisible();
@@ -173,7 +150,7 @@ test("sidebar counts and quiet projects", async ({ page }) => {
 });
 
 test("poll picks up a new version", async ({ page }) => {
-  await open(page, "/board");
+  await login(page, "/board");
   await expect(tile(page, "Keep verification results")).toBeVisible();
   const unchanged = await page.waitForResponse(async (r) => r.url().includes("/api/board?since=") && (await r.json()).unchanged === true);
   expect(unchanged.ok()).toBe(true);
@@ -200,14 +177,14 @@ test("a board read that spans two pages shows the cards of both", async ({ page 
     reply.board.cards = reply.board.cards.filter((c: { title: string }) => c.title !== "Only on the second page");
     await route.fulfill({ response, json: { ...reply, next: "second" } });
   });
-  await open(page, "/board");
+  await login(page, "/board");
   await expect(tile(column(page, "Backlog"), "Only on the second page")).toBeVisible();
   await expect(tile(page, "Keep verification results")).toBeVisible();
 });
 
 test("board polls never overlap and stop while the tab is hidden", async ({ page }) => {
   await page.clock.install();
-  await open(page, "/board");
+  await login(page, "/board");
   await expect(tile(page, "Keep verification results")).toBeVisible();
   let inFlight = 0;
   let most = 0;
@@ -247,7 +224,7 @@ test("board polls never overlap and stop while the tab is hidden", async ({ page
 
 test("board, peek and card page are usable at 390 px", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 });
-  await open(page, "/board");
+  await login(page, "/board");
   await expect(column(page, "Backlog")).toBeInViewport();
   await tile(page, "Keep verification results").scrollIntoViewIfNeeded();
   await expect(tile(page, "Keep verification results")).toBeInViewport();
