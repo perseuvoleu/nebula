@@ -587,25 +587,39 @@ pub(crate) fn in_scope(scope: &BoardScope, project: Option<&str>) -> bool {
     }
 }
 
+/// Cards in `scope` from `offset` on, in number order, without blockers:
+/// `with_blockers` hydrates only the ones a page returns.
 fn scoped_cards(
     tx: &Transaction,
     scope: &BoardScope,
     stage: Option<Stage>,
     include_archived: bool,
+    offset: usize,
 ) -> Result<Vec<Card>> {
-    let cards = tx
+    let named = match &scope.projects {
+        ProjectScope::All => None,
+        ProjectScope::Named(names) => Some(serde_json::to_string(names)?),
+    };
+    Ok(tx
         .prepare(&format!(
-            "SELECT {CARD_COLUMNS} FROM todos WHERE stage IS NOT NULL ORDER BY number"
+            "SELECT {CARD_COLUMNS} FROM todos WHERE stage IS NOT NULL
+               AND (CASE WHEN project IS NULL THEN ?1
+                    ELSE ?2 IS NULL OR project IN (SELECT value FROM json_each(?2)) END)
+               AND (?3 IS NULL OR stage = ?3)
+               AND (?4 OR archived_at IS NULL)
+             ORDER BY number LIMIT -1 OFFSET ?5"
         ))?
-        .query_map([], card_from_row)?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    cards
-        .into_iter()
-        .filter(|c| in_scope(scope, c.project.as_deref()))
-        .filter(|c| stage.is_none_or(|s| s == c.stage))
-        .filter(|c| include_archived || !c.archived)
-        .map(|c| with_blockers(tx, c))
-        .collect()
+        .query_map(
+            params![
+                scope.include_home,
+                named,
+                stage.map(|s| s.as_str()),
+                include_archived,
+                offset as i64
+            ],
+            card_from_row,
+        )?
+        .collect::<rusqlite::Result<_>>()?)
 }
 
 pub(crate) fn cursor(tx: &Transaction) -> Result<String> {
@@ -630,25 +644,27 @@ pub(crate) fn page_offset(page: Option<&str>, version: &str) -> Result<usize> {
     }
 }
 
+/// Fills one page from `items`, which start at `offset`, and cuts a
+/// continuation when an item does not fit.
 pub(crate) fn paged<T: serde::Serialize>(
-    items: Vec<T>,
+    items: impl IntoIterator<Item = Result<T>>,
     offset: usize,
     version: &str,
     budget: usize,
 ) -> Result<(Vec<T>, Option<String>)> {
-    let total = items.len();
     let mut used = 0;
     let mut page = Vec::new();
-    for item in items.into_iter().skip(offset) {
+    for item in items {
+        let item = item?;
         let size = serde_json::to_vec(&item)?.len();
         if !page.is_empty() && used + size > budget {
-            break;
+            let end = offset + page.len();
+            return Ok((page, Some(format!("{version}@{end}"))));
         }
         used += size;
         page.push(item);
     }
-    let end = offset + page.len();
-    Ok((page, (end < total).then(|| format!("{version}@{end}"))))
+    Ok((page, None))
 }
 
 fn read_op(tx: &Transaction, read: BoardRead) -> Result<BoardResult> {
@@ -664,7 +680,7 @@ fn read_op(tx: &Transaction, read: BoardRead) -> Result<BoardResult> {
                 return Ok(BoardResult::Board(BoardPoll::Unchanged { version }));
             }
             let offset = page_offset(page.as_deref(), &version)?;
-            let cards = scoped_cards(tx, &scope, None, false)?;
+            let cards = scoped_cards(tx, &scope, None, false, offset)?;
             let (hosts, needs_you, away) = if offset == 0 {
                 let away = match away_since {
                     Some(since) => away(tx, &scope, &cards, since)?,
@@ -678,6 +694,7 @@ fn read_op(tx: &Transaction, read: BoardRead) -> Result<BoardResult> {
                 + serde_json::to_vec(&needs_you)?.len()
                 + serde_json::to_vec(&away)?.len();
             let budget = page_budget().saturating_sub(reserved);
+            let cards = cards.into_iter().map(|c| with_blockers(tx, c));
             let (cards, next) = paged(cards, offset, &version, budget)?;
             Ok(BoardResult::Board(BoardPoll::Board {
                 version,
@@ -698,7 +715,8 @@ fn read_op(tx: &Transaction, read: BoardRead) -> Result<BoardResult> {
         } => {
             let version = cursor(tx)?;
             let offset = page_offset(page.as_deref(), &version)?;
-            let cards = scoped_cards(tx, &scope, stage, include_archived)?;
+            let cards = scoped_cards(tx, &scope, stage, include_archived, offset)?;
+            let cards = cards.into_iter().map(|c| with_blockers(tx, c));
             let (items, next) = paged(cards, offset, &version, page_budget())?;
             Ok(BoardResult::Cards(Page { items, next }))
         }

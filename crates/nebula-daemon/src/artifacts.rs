@@ -408,7 +408,8 @@ pub(crate) fn list(
                 a.title.to_lowercase().contains(q) || body.to_lowercase().contains(q)
             })
         })
-        .collect();
+        .skip(offset)
+        .map(Ok);
     let (items, next) = paged(items, offset, &version, crate::board::page_budget())?;
     Ok(Page { items, next })
 }
