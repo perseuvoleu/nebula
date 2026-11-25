@@ -4523,7 +4523,7 @@ fn open_move_agent_picker(app: &mut App, agent: AgentId) {
 /// Workspace switcher (`w`): pick which workspace is open. The active one is
 /// checked and starts highlighted; Enter asks the daemon to open the pick
 /// (the switch lands via ActiveWorkspaceChanged, so every client follows).
-/// Management verbs are keys with footer hints, the notes-modal pattern:
+/// Management verbs are keys with footer hints, no submenus:
 /// n creates (and opens) a workspace, r renames the hovered one, d deletes
 /// it. The list refreshes in place as workspace deltas arrive.
 fn open_workspace_picker(app: &mut App) {
@@ -4838,8 +4838,8 @@ fn handle_overlay_key(app: &mut App, key: KeyEvent, out: &mut Vec<ClientRequest>
                     *menu = *parent;
                 }
             }
-            // Workspace-switcher verbs (footer-hinted, the notes-modal
-            // pattern): n creates a workspace (opened on Ack), r renames
+            // Workspace-switcher verbs (footer-hinted keys, no
+            // submenus): n creates a workspace (opened on Ack), r renames
             // the hovered one, d deletes it — no confirm, the daemon only
             // deletes empty workspaces so a refusal just flashes.
             KeyCode::Char('n') if menu.is_workspace_picker() => {
@@ -24414,7 +24414,7 @@ mod tests {
         );
         assert_eq!(menu.hover, 0, "active row starts highlighted");
 
-        // The key verbs ride the modal's bottom border (notes-modal style).
+        // The key verbs ride the modal's bottom border as footer hints.
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
         terminal.draw(|f| ui::draw(f, &mut app)).unwrap();
         let text = buffer_text(&terminal);
@@ -24517,8 +24517,8 @@ mod tests {
         );
     }
 
-    /// `r` and `d` in the switcher act on the hovered workspace (the
-    /// notes-modal pattern — footer hints, no submenus); after a delete the
+    /// `r` and `d` in the switcher act on the hovered workspace (footer
+    /// hints, no submenus); after a delete the
     /// open switcher refreshes its rows in place.
     #[test]
     fn switcher_r_and_d_act_on_the_hovered_workspace() {

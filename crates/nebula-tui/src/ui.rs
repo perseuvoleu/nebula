@@ -238,7 +238,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             // extra column so the affordance is visible before hovering.
             let any_submenu = menu.items.iter().any(|i| i.action.submenu().is_some());
             // The workspace switcher carries its key verbs in the bottom
-            // border, the notes-modal pattern; the modal widens to fit.
+            // border as footer hints; the modal widens to fit.
             let hint = menu
                 .is_workspace_picker()
                 .then_some(" n: new  r: rename  d: delete ");

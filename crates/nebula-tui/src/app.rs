@@ -209,7 +209,7 @@ pub enum MenuAction {
     UnhideProject(ProjectId),
     /// Workspace-switcher row: open this workspace. The switcher's other
     /// verbs are keys, not rows — n: new, r: rename, d: delete (footer
-    /// hints, the notes-modal pattern).
+    /// hints, no submenus).
     OpenWorkspace(WorkspaceId),
     SetProjectDivider {
         id: ProjectId,
