@@ -52,12 +52,11 @@ export function CardTile({ card, selected = false, showProject = false, onOpen, 
       (blocked || card.proposed) && "border-dashed",
       blocked && "opacity-60",
     )}>
-      <div className="flex min-w-0 items-center gap-1.5">
+      <div className="flex min-w-0 flex-wrap items-center gap-1.5">
         {dot && <StatusDot dot={dot} />}
         <CardRef cardRef={card.ref} />
         {showProject && <span className="min-w-0 truncate font-mono text-xs text-muted-foreground">{projectName(card.project)}</span>}
-        <span className="flex-1" />
-        <span className="shrink-0 font-mono text-xs text-muted-foreground tabular-nums">{card.age}</span>
+        <span className="ml-auto shrink-0 font-mono text-xs text-muted-foreground tabular-nums">{card.age}</span>
       </div>
       <h3 className="text-sm leading-snug font-medium break-words">
         <button type="button" onClick={() => onOpen?.(card.ref)} aria-current={selected ? "true" : undefined}

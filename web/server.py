@@ -270,7 +270,7 @@ class Gateway:
         self.pi_agent_dir = Path(pi_agent_dir) if pi_agent_dir else default_pi_agent_dir()
         self.claude_config_dir = Path(claude_config_dir) if claude_config_dir else Path.home() / ".claude"
         self.db_path = Path(db_path) if db_path else None
-        self.hostname = socket.gethostname()
+        self.hostname = os.environ.get("NEBULA_HOSTNAME") or socket.gethostname().split(".")[0]
         self.slots = threading.BoundedSemaphore(4)
         self.identities = {}  # (project, agent id) -> (native session id | None, reason, expires)
         self.lock = threading.Lock()

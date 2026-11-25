@@ -95,6 +95,13 @@ class GatewayTests(unittest.TestCase):
                         {**subscription, "keys": {"p256dh": "!", "auth": "x"}}]:
             with self.assertRaises(Problem): push.subscribe(invalid)
 
+    def test_host_is_named_as_nebula_names_it(self):
+        for env, system, host in [({}, "Gaitanarus-MacBook-Pro.local", "Gaitanarus-MacBook-Pro"),
+                                  ({"NEBULA_HOSTNAME": "perseu-mbp"}, "Gaitanarus-MacBook-Pro.local", "perseu-mbp")]:
+            with self.subTest(env=env), patch.dict("os.environ", env), patch("server.socket.gethostname", return_value=system):
+                gateway = Gateway(TOKEN, "https://example.com", ["p"], usage_service=None)
+                self.assertEqual(gateway.get("/api/projects", {})["host"], host)
+
     def test_project_allowlist(self):
         for path in ["/api/sessions", "/api/conversation", "/api/conversation/updates", "/api/preview"]:
             with self.assertRaises(Problem) as ctx:
