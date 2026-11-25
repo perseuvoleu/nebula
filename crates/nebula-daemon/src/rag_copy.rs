@@ -80,6 +80,9 @@ async fn copy_pending(store: &Store, bound: Duration, shutdown: &CancellationTok
         };
         if let Err(e) = copied {
             tracing::warn!(decision = %decision.id, error = %format!("{e:#}"), "copying a decision to RAG failed; it is retried");
+            if e.is::<Unreachable>() {
+                return;
+            }
         }
     }
 }
@@ -148,6 +151,19 @@ async fn copy(decision: &Artifact, bound: Duration, shutdown: &CancellationToken
 /// kills an ssh hop and whatever it started too. The group is signalled
 /// while the pending wait still holds the leader unreaped, so its id cannot
 /// belong to a recycled process.
+/// RAG gave no answer (a timeout, or ssh's exit 255): the rest of the
+/// tick's decisions would fail the same way, so they wait for the next one.
+#[derive(Debug)]
+struct Unreachable(String);
+
+impl std::fmt::Display for Unreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unreachable {}
+
 async fn rag(
     args: &[&str],
     stdin: Option<&str>,
@@ -187,9 +203,17 @@ async fn rag(
         Err(why) => {
             let _ = killpg(group, Signal::SIGKILL);
             let _ = tokio::time::timeout(Duration::from_secs(1), output).await;
-            bail!("nebula rag {} {why}", args.join(" "));
+            return Err(Unreachable(format!("nebula rag {} {why}", args.join(" "))).into());
         }
     };
+    if out.status.code() == Some(255) {
+        return Err(Unreachable(format!(
+            "nebula rag {} could not reach RAG: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+        .into());
+    }
     if !out.status.success() {
         bail!(
             "nebula rag {} exited {}: {}",

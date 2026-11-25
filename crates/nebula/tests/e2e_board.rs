@@ -4055,8 +4055,9 @@ fn fake_workers_ai(env: &Env) -> PathBuf {
     let attempted = env.tmp.path().join("rag-attempted");
     let hung = env.tmp.path().join("rag-hung-pid");
     let script = format!(
-        "#!/bin/sh\ncat >/dev/null\nif [ -e '{}' ]; then echo $$ > '{}'; touch '{}'; exec sleep 30; fi\nif [ -e '{}' ]; then touch '{}'; printf '%s\\n400' '{{\"errors\":[{{\"message\":\"down\"}}]}}'; exit 0; fi\nprintf '%s\\n200' '{{\"result\":{{\"data\":[[{vector}]]}}}}'\n",
+        "#!/bin/sh\nbody=$(cat)\nif [ -e '{}' ]; then echo \"$body\" >> '{}.bodies'; echo $$ > '{}'; touch '{}'; exec sleep 30; fi\nif [ -e '{}' ]; then touch '{}'; printf '%s\\n400' '{{\"errors\":[{{\"message\":\"down\"}}]}}'; exit 0; fi\nprintf '%s\\n200' '{{\"result\":{{\"data\":[[{vector}]]}}}}'\n",
         hang.display(),
+        hung.display(),
         hung.display(),
         attempted.display(),
         down.display(),
@@ -4362,6 +4363,21 @@ fn hung_rag_copy_is_killed_at_its_deadline() {
         !pid_alive(pid.trim()),
         "the hung rag child {pid} outlived its deadline"
     );
+}
+
+#[test]
+fn an_unanswering_rag_ends_the_copy_tick_at_the_first_decision() {
+    let env = rag_board(Some("rag-hang"), &[("NEBULA_RAG_TIMEOUT_MS", "300")]);
+    decide(&env, None, &["First decision", "--project", "repo"]);
+    decide(&env, None, &["Second decision", "--project", "repo"]);
+    let bodies = env.tmp.path().join("rag-hung-pid.bodies");
+    let tried = poll_until(Duration::from_secs(10), || {
+        std::fs::read_to_string(&bodies)
+            .ok()
+            .filter(|tried| tried.matches("First decision").count() >= 8)
+    })
+    .expect("the board stopped retrying the first decision");
+    assert!(!tried.contains("Second decision"), "{tried}");
 }
 
 #[test]
