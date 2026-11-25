@@ -2461,12 +2461,13 @@ fn run_retry_scope_covers_the_admitted_project() {
 fn run_recovery_matches_role_and_kind() {
     let env = board_env();
     env.make_repo();
-    add(&env, &["--project", "repo"], "Roles");
+    let card = add(&env, &["--project", "repo"], "Roles");
     for (role, kind, name) in [
         ("review", "claude", "reviewer"),
         ("worker", "codex", "coder"),
     ] {
         let dispatch = TodoId::generate().0;
+        begin_run(&env, &card, &dispatch, "main");
         let argv = [
             "--card",
             "#1",
@@ -2565,8 +2566,9 @@ fn run_replay_names_the_agents_own_project() {
     let env = board_env();
     env.make_repo();
     env.make_repo_named("twin");
-    add(&env, &["--project", "repo"], "Twin");
+    let card = add(&env, &["--project", "repo"], "Twin");
     let dispatch = TodoId::generate().0;
+    begin_run(&env, &card, &dispatch, "main");
     let first = lost_spawn(&env, "#1", &dispatch);
     let argv = [
         "agent",
@@ -2595,6 +2597,22 @@ fn agent_new_dispatch_only_on_the_admitted_host() {
     let laptop = viewer_on(&proxy_to(&board), "laptop", &[]);
     laptop.make_repo();
     let card = add(&laptop, &["--project", "repo"], "Admitted");
+    let unadmitted = TodoId::generate().0;
+    let refused = spawn_agent(
+        &laptop,
+        &[
+            "--card",
+            "#1@boardhost",
+            "--role",
+            "review",
+            "--dispatch",
+            &unadmitted,
+            "--name",
+            "unadmitted",
+        ],
+    );
+    assert_eq!(refused.status.code(), Some(6), "{}", stderr(&refused));
+    assert!(agents_of(&laptop).is_empty());
     let dispatch = TodoId::generate().0;
     begin_run(&board, &card, &dispatch, "main");
     let refused = spawn_agent(
@@ -3298,8 +3316,9 @@ fn run_dispatch_id_canonical() {
 fn run_replayed_spawn_names_the_live_agent() {
     let env = board_env();
     env.make_repo();
-    add(&env, &["--project", "repo"], "Replay");
+    let card = add(&env, &["--project", "repo"], "Replay");
     let dispatch = TodoId::generate().0;
+    begin_run(&env, &card, &dispatch, "main");
     let first = lost_spawn(&env, "#1", &dispatch);
     let again = json_of(
         spawn_agent(
@@ -3429,8 +3448,9 @@ fn run_dispatch_on_another_card_conflict() {
     let env = board_env();
     env.make_repo();
     add(&env, &["--project", "repo"], "Mine");
-    add(&env, &["--project", "repo"], "Theirs");
+    let theirs = add(&env, &["--project", "repo"], "Theirs");
     let dispatch = TodoId::generate().0;
+    begin_run(&env, &theirs, &dispatch, "main");
     lost_spawn(&env, "#2", &dispatch);
     let refused = run_card(&env, "#1", &["--dispatch", &dispatch]);
     assert_eq!(refused.status.code(), Some(6), "{}", stderr(&refused));

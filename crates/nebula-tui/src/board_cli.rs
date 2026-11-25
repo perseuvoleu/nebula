@@ -301,7 +301,8 @@ pub async fn check_card(conn: &mut Connection, text: &str) -> Result<TodoId> {
     Ok(read_card(conn, text).await?.id)
 }
 
-/// Refuses a spawn for a dispatch the board admitted on another host.
+/// Refuses a spawn for a dispatch the board has not admitted on this
+/// executor: only `todo run` gives a dispatch its id.
 pub async fn check_executor(
     conn: &mut Connection,
     dispatch: &DispatchId,
@@ -320,7 +321,12 @@ pub async fn check_executor(
         }
         Ok(BoardResult::Run(_)) => Ok(()),
         Ok(other) => bail!("the board answered a dispatch read with {other:?}"),
-        Err(why) if Refusal::of(&why.to_string()) == Some(Refusal::NotFound) => Ok(()),
+        Err(why) if Refusal::of(&why.to_string()) == Some(Refusal::NotFound) => {
+            bail!(Refusal::Conflict.message(format!(
+                "dispatch {} was not admitted by `todo run`",
+                dispatch.as_str()
+            )))
+        }
         Err(why) => Err(why),
     }
 }
