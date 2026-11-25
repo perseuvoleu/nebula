@@ -833,8 +833,8 @@ fn hosts(tx: &Transaction, links: &HostLinks, scope: &BoardScope) -> Result<Vec<
     let stale = stale_hosts(tx, links)?;
     let waiting: Vec<(String, Option<String>)> = tx
         .prepare(
-            "SELECT s.host, t.project FROM board_sessions s LEFT JOIN todos t ON t.id = s.card_id
-             WHERE s.status = 'needs_feedback' AND s.archived = 0 AND s.alive = 1",
+            "SELECT s.host, t.project FROM board_sessions s JOIN todos t ON t.id = s.card_id
+             WHERE t.stage IS NOT NULL AND s.status = 'needs_feedback' AND s.archived = 0 AND s.alive = 1",
         )?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;

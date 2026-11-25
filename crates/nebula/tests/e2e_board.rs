@@ -1211,6 +1211,21 @@ fn host_needs_you_follows_the_read_scope() {
 }
 
 #[test]
+fn host_needs_you_skips_a_card_not_on_this_board() {
+    let env = board_env();
+    let elsewhere = serde_json::json!({"id": nebula_core::TodoId::generate().0});
+    far_report(
+        &env,
+        vec![far_row(&elsewhere, "n1", AgentStatus::NeedsFeedback, 10)],
+    );
+    assert_eq!(
+        far_host(&hosts_of(&env, &["--include-home"]))["needs_you"],
+        0,
+        "a session waiting on another board's card counted as home"
+    );
+}
+
+#[test]
 fn board_needs_you_lists_every_waiting_session_in_scope() {
     let env = board_env();
     let ask = add(&env, &["--project", "nebula"], "Ask");
