@@ -1,6 +1,8 @@
+import fs from "node:fs";
 import os from "node:os";
+import path from "node:path";
 import { expect, type Page } from "@playwright/test";
-import { test, changeBoard, login, storeArtifact } from "./helpers";
+import { test, STATE, changeBoard, login, storeArtifact } from "./helpers";
 
 const CARD = "01JD0000000000000000000012";
 const RUN = "01JG0000000000000000000001";
@@ -22,15 +24,13 @@ test("e2e-run with 12 screenshots under poll", async ({ page }) => {
     screenshot: `shots/${i + 1}.png`, ...(i === 11 ? { error: "row never appeared" } : {}) }));
   storeArtifact(RUN, { "result.json": JSON.stringify({ title: "board.spec", status: "failed", started_at: 1764000000000, duration_ms: 7800, steps }),
     ...Object.fromEntries(steps.map((s) => [s.screenshot, PNG])) });
-  let polled: Promise<unknown> | undefined;
+  fs.writeFileSync(path.join(STATE, "artifact-delay"), "2");
   let incompleteAtPoll: Promise<number> | undefined;
-  await page.route("**/a/**/shots/*.png", async (route) => {
-    const response = await route.fetch();
-    polled ??= page.waitForResponse((r) => new URL(r.url()).pathname === "/api/board" && r.ok());
-    incompleteAtPoll ??= polled.then(() => section(page, "board.spec").getByRole("img")
-      .evaluateAll((imgs: HTMLImageElement[]) => imgs.filter((img) => !(img.complete && img.naturalWidth)).length));
-    await incompleteAtPoll;
-    await route.fulfill({ response });
+  page.on("request", (request) => {
+    if (incompleteAtPoll || !/\/shots\/[0-9]+\.png$/.test(request.url())) return;
+    incompleteAtPoll = page.waitForResponse((r) => new URL(r.url()).pathname === "/api/board" && r.ok())
+      .then(() => section(page, "board.spec").getByRole("img")
+        .evaluateAll((imgs: HTMLImageElement[]) => imgs.filter((img) => !(img.complete && img.naturalWidth)).length));
   });
   await login(page, "/board/c/12%40leaseweb");
   const run = section(page, "board.spec");

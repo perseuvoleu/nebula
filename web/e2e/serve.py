@@ -152,9 +152,13 @@ def main():
            "NEBULA_WEB_BINARY": str(HERE / "fake_nebula.py"), "NEBULA_WEB_PI_AGENT_DIR": str(STATE / "pi"),
            "FAKE_NEBULA_STATE": str(STATE), "PYTHONDONTWRITEBYTECODE": "1",
            "PYTHONPATH": str(WEB), "PATH": str(STATE / "bin") + os.pathsep + os.environ["PATH"]}
-    # Let browser tests serve an isolated build without replacing live web/static.
-    script = "import os; from pathlib import Path; import server; " \
-             "server.STATIC = Path(os.environ.get('E2E_STATIC_DIR', str(server.STATIC))); server.main()"
+    # Let browser tests serve an isolated build without replacing live web/static,
+    # and slow every /a/ read by the seconds in $FAKE_NEBULA_STATE/artifact-delay, so a test can load the gateway itself.
+    script = "import os, time; from pathlib import Path; import server; " \
+             "server.STATIC = Path(os.environ.get('E2E_STATIC_DIR', str(server.STATIC))); " \
+             "delay = Path(os.environ['FAKE_NEBULA_STATE']) / 'artifact-delay'; read = server.Gateway.artifact_file; " \
+             "server.Gateway.artifact_file = lambda self, path: (delay.exists() and time.sleep(float(delay.read_text())), read(self, path))[1]; " \
+             "server.main()"
     os.execve(sys.executable, [sys.executable, "-c", script], env)
 
 
