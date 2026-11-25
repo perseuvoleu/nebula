@@ -18,6 +18,7 @@ export function TerminalView({ project, session, children, revealKey = 0, onOutp
   const [hasMore, setHasMore] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const loadedLimit = useRef(250);
+  const expanded = useRef(false);
   const [reading, setReading] = useState(true);
   const scroller = useRef<HTMLDivElement>(null);
   const positions = useRef<{ reading: number | null; raw: number | null }>({ reading: null, raw: null });
@@ -53,6 +54,7 @@ export function TerminalView({ project, session, children, revealKey = 0, onOutp
         const follow = element ? distance - element.clientHeight < 80 : true;
         const expanding = limit > loadedLimit.current;
         loadedLimit.current = limit;
+        expanded.current = expanding;
         setOutput(data.output); setHasMore(data.hasMore); setError(null); setLoadingOlder(false);
         if (element) requestAnimationFrame(() => {
           if (abort.signal.aborted) return;
@@ -72,7 +74,8 @@ export function TerminalView({ project, session, children, revealKey = 0, onOutp
   const lastOutput = useRef<string | null>(null);
   useEffect(() => {
     if (output === null || output === lastOutput.current) return;
-    if (lastOutput.current !== null) onOutput?.();
+    const olderOnly = expanded.current && lastOutput.current !== null && output.endsWith(lastOutput.current);
+    if (lastOutput.current !== null && !olderOnly) onOutput?.();
     lastOutput.current = output;
   }, [output, onOutput]);
 

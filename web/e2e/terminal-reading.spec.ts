@@ -67,3 +67,23 @@ test("switching terminal views keeps following the latest output", async ({ page
   fs.appendFileSync(path.join(STATE, "output.txt"), "\nRăspuns nou după schimbarea afișării.\n");
   await expect(content.getByText("Răspuns nou după schimbarea afișării.", { exact: true })).toBeInViewport();
 });
+
+test("sent message survives older-output paging", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  const retained = path.join(STATE, "output.txt");
+  fs.writeFileSync(retained, Array.from({ length: 600 }, (_, i) => `line ${i}: build step ${i} ok`).join("\n") + "\n");
+  await login(page, "/p/alpha/s/claude-1");
+  const content = page.getByLabel("Conținut terminal", { exact: true });
+  await expect(content).toContainText("line 599:");
+  await page.getByLabel("Mesaj către agent").fill("Mesaj încă neconfirmat");
+  await page.getByRole("button", { name: "Trimite", exact: true }).click();
+  const pending = page.locator("article[data-attempt=accepted]");
+  await expect(pending).toContainText("Mesaj încă neconfirmat");
+  await page.getByRole("button", { name: "Terminal brut", exact: true }).click();
+  await content.evaluate(el => { el.scrollTop = 0; });
+  await expect(content).toContainText("line 100:");
+  await page.waitForTimeout(3000);
+  await expect(pending).toContainText("Mesaj încă neconfirmat");
+  fs.appendFileSync(retained, "> Mesaj încă neconfirmat\n");
+  await expect(pending).toHaveCount(0);
+});
