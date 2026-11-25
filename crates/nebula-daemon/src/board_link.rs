@@ -62,7 +62,6 @@ pub struct BoardLink {
     stop: CancellationToken,
 }
 
-/// The daemon's link to its board host, if its config names one.
 #[derive(Default)]
 pub struct LinkSlot(Mutex<Option<Arc<BoardLink>>>);
 

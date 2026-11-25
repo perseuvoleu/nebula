@@ -127,7 +127,6 @@ pub struct Daemon {
     /// daemon's tree for those projects and forwards our clients' requests
     /// to it (see `relay.rs`).
     relays: Mutex<HashMap<String, Arc<crate::relay::Relay>>>,
-    /// The link to another host's board, when the config names one.
     pub(crate) board_link: crate::board_link::LinkSlot,
     /// On the board host: which hosts hold a report connection open.
     pub(crate) host_links: crate::board::HostLinks,

@@ -25,7 +25,6 @@ const DEBOUNCE: Duration = Duration::from_secs(1);
 /// Debounces between checks of an idle host's report, so a config edit
 /// such as `writer_slots`, which raises no event, still reaches the board.
 const RECHECK: u32 = 30;
-/// The most debounces a failing report waits before it tries again.
 const MAX_BACKOFF: u32 = 60;
 
 static RESEND: Notify = Notify::const_new();
