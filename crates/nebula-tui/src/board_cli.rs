@@ -5,8 +5,8 @@ use crate::ipc::{self, Connection};
 use anyhow::{bail, Context, Result};
 use nebula_core::board::{
     parse_card_ref, Author, BoardOp, BoardPoll, BoardRead, BoardResult, BoardScope, Card,
-    CardDraft, CardRef, Checkout, Dispatch, DispatchState, Placement, ProjectScope, Refusal, Role,
-    RunReceipt, SessionAt, Stage,
+    CardDraft, CardRef, CardShow, Checkout, Dispatch, DispatchState, Placement, ProjectScope,
+    Refusal, Role, RunReceipt, SessionAt, Stage,
 };
 use nebula_core::codec::{read_frame, write_frame};
 use nebula_core::{
@@ -230,7 +230,7 @@ pub enum TodoVerb {
     Run {
         card: String,
         role: Role,
-        kind: String,
+        kind: AgentKind,
         host: String,
         worktree: String,
         dispatch: Option<String>,
@@ -311,7 +311,10 @@ pub async fn request(conn: &mut Connection, op: BoardOp) -> Result<BoardResult> 
 /// Reads the card `text` names, so a spawn linking it is refused before
 /// anything starts.
 pub async fn check_card(conn: &mut Connection, text: &str) -> Result<TodoId> {
-    Ok(read_card(conn, text).await?.id)
+    Ok(read_card(conn, ScopeFlags::default().scope(None), text)
+        .await?
+        .card
+        .id)
 }
 
 /// Refuses a spawn for a dispatch the board has not admitted on this
@@ -344,13 +347,14 @@ pub async fn check_executor(
     }
 }
 
-pub async fn read_card(conn: &mut Connection, text: &str) -> Result<Card> {
+/// The card `text` names within `scope`, with its sessions and log.
+pub async fn read_card(conn: &mut Connection, scope: BoardScope, text: &str) -> Result<CardShow> {
     let op = BoardOp::Read(BoardRead::Card {
-        scope: ScopeFlags::default().scope(None),
+        scope,
         card: card_ref(text)?,
     });
     match request(conn, op).await? {
-        BoardResult::Show(show) => Ok(show.card),
+        BoardResult::Show(show) => Ok(*show),
         other => bail!("the board answered a card read with {other:?}"),
     }
 }
@@ -380,9 +384,7 @@ pub async fn run(verb: TodoVerb, json: bool) -> Result<()> {
                 card: card_ref(&card)?,
                 host,
                 role,
-                kind: AgentKind::parse(&kind).with_context(|| {
-                    format!("unknown agent kind {kind:?} (claude|codex|cursor|pi|antigravity)")
-                })?,
+                kind,
                 worktree,
             };
             return run_dispatch(
@@ -751,7 +753,9 @@ async fn fresh_worktree(
     card: &TodoId,
     dispatch: &DispatchId,
 ) -> Result<String> {
-    let card = read_card(conn, card.as_str()).await?;
+    let card = read_card(conn, ScopeFlags::default().scope(None), card.as_str())
+        .await?
+        .card;
     let branch = format!("card-{}-{}", card.number, dispatch.as_str().to_lowercase());
     let (projects, worktrees, agents) = ipc::subscribe_snapshot(conn).await?;
     let project = ipc::resolve_project(&projects, &worktrees, &agents, Some(project))?;
@@ -814,18 +818,7 @@ async fn approve(
     let read_scope = scope
         .write_scope()
         .unwrap_or_else(|| ScopeFlags::default().scope(None));
-    let show = match request(
-        conn,
-        BoardOp::Read(BoardRead::Card {
-            scope: read_scope,
-            card: card_ref(card)?,
-        }),
-    )
-    .await?
-    {
-        BoardResult::Show(show) => show,
-        other => bail!("the board answered a card read with {other:?}"),
-    };
+    let show = read_card(conn, read_scope, card).await?;
     let found = show
         .sessions
         .iter()

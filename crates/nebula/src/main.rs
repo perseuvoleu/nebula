@@ -802,8 +802,8 @@ enum TodoCommand {
         #[arg(long, value_parser = parse_role)]
         role: Role,
         /// claude | codex | cursor | pi | antigravity.
-        #[arg(long)]
-        kind: String,
+        #[arg(long, value_parser = parse_kind)]
+        kind: nebula_core::AgentKind,
         /// The host to run on.
         #[arg(long, default_value = "leaseweb")]
         host: String,
@@ -998,6 +998,16 @@ impl From<WriteScopeArgs> for nebula_tui::board_cli::ScopeFlags {
 fn parse_stage(text: &str) -> Result<Stage, String> {
     Stage::parse(text)
         .ok_or_else(|| format!("{text:?} is not a stage (backlog, next, doing, review, done)"))
+}
+
+fn parse_kind(text: &str) -> Result<nebula_core::AgentKind, String> {
+    nebula_core::AgentKind::parse(text).ok_or_else(|| {
+        let kinds: Vec<&str> = nebula_core::AgentKind::ALL
+            .iter()
+            .map(|k| k.as_str())
+            .collect();
+        format!("{text:?} is not an agent kind ({})", kinds.join(", "))
+    })
 }
 
 fn parse_role(text: &str) -> Result<Role, String> {

@@ -54,7 +54,9 @@ pub async fn run(verb: DecisionVerb, json: bool) -> Result<()> {
             let (card, project) = match (card, project) {
                 (None, None) if home => (None, None),
                 (Some(text), _) => {
-                    let card = read_card(&mut conn, &text).await?;
+                    let card = read_card(&mut conn, ScopeFlags::default().scope(None), &text)
+                        .await?
+                        .card;
                     (Some(card.id), card.project)
                 }
                 (None, Some(project)) => (None, Some(project)),
