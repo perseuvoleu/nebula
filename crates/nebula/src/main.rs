@@ -67,7 +67,8 @@ enum Command {
         #[arg(long, requires = "session")]
         no_focus: bool,
         /// Run this open on HOST over ssh (BatchMode) and print its object;
-        /// an unreachable HOST exits 3. This machine's own name opens here.
+        /// an unreachable HOST exits 3, a HOST with no TUI running 5. This
+        /// machine's own name opens here.
         #[arg(long, value_name = "HOST", requires = "session")]
         on: Option<String>,
         /// Print the landed object as JSON (what --session prints anyway).
@@ -1086,6 +1087,9 @@ fn main() -> Result<()> {
             ..
         }) => {
             use std::io::IsTerminal;
+            if let Some(host) = &on {
+                nebula_tui::session_open::check_host(host)?;
+            }
             if let Some(host) = on.filter(|h| !nebula_core::host::names_this_machine(h)) {
                 let code =
                     nebula_tui::run_open_on_host(&host, &reference, project.as_deref(), !no_focus)?;
