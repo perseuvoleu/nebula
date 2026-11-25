@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite, BufReader, BufWriter};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, BufReader, BufWriter};
 use tokio::sync::{mpsc, watch, Notify};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -245,7 +245,7 @@ async fn run(link: Arc<BoardLink>, mut out_rx: mpsc::Receiver<(u64, BoardOp)>) {
             Ok(()) => None,
             Err(e) => {
                 tracing::warn!(host = %link.host, error = %e, "board link down");
-                e.downcast_ref::<VersionRefused>().map(|r| r.0.clone())
+                e.downcast_ref::<LinkRefused>().map(|r| r.0.clone())
             }
         };
         link.teardown(&mut out_rx, refused);
@@ -265,18 +265,45 @@ async fn connect_and_pump(
     link: &BoardLink,
     out_rx: &mut mpsc::Receiver<(u64, BoardOp)>,
 ) -> Result<()> {
+    if std::env::var("NEBULA_RELAY_CMD")
+        .is_ok_and(|line| line.contains("proxy") && !line.contains("{proxy}"))
+    {
+        return Err(LinkRefused(
+            "NEBULA_RELAY_CMD runs proxy without {proxy}, which would drop the board link's --connect-only"
+                .into(),
+        )
+        .into());
+    }
     let mut child = relay_command(&link.host, "proxy --connect-only")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .context("spawn board link transport")?;
     let mut writer = BufWriter::new(child.stdin.take().context("board link stdin")?);
     let mut reader = BufReader::new(child.stdout.take().context("board link stdout")?);
-    tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(link, &mut reader, &mut writer))
+    let mut errors = child.stderr.take().context("board link stderr")?;
+    let shook = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(link, &mut reader, &mut writer))
         .await
-        .context("board link handshake timed out")??;
+        .context("board link handshake timed out")
+        .and_then(|shook| shook);
+    if let Err(e) = shook {
+        if e.is::<LinkRefused>() {
+            return Err(e);
+        }
+        let mut said = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(1), errors.read_to_end(&mut said)).await;
+        if String::from_utf8_lossy(&said).contains("--connect-only") {
+            return Err(LinkRefused(format!(
+                "board host {} runs a nebula without `proxy --connect-only` — upgrade nebula there",
+                link.host
+            ))
+            .into());
+        }
+        return Err(e);
+    }
+    tokio::spawn(async move { tokio::io::copy(&mut errors, &mut tokio::io::sink()).await });
     {
         let _admission = link.admission.lock().unwrap();
         link.state.send_modify(|s| {
@@ -346,7 +373,7 @@ async fn handshake<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     if peer == PROTOCOL_VERSION {
         return Ok(());
     }
-    Err(VersionRefused(format!(
+    Err(LinkRefused(format!(
         "board host {} runs protocol {peer}, this daemon {PROTOCOL_VERSION} — upgrade nebula on one side",
         link.host
     ))
@@ -354,15 +381,15 @@ async fn handshake<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 }
 
 #[derive(Debug)]
-struct VersionRefused(String);
+struct LinkRefused(String);
 
-impl std::fmt::Display for VersionRefused {
+impl std::fmt::Display for LinkRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
 }
 
-impl std::error::Error for VersionRefused {}
+impl std::error::Error for LinkRefused {}
 
 fn localize(op: &mut BoardOp, host: &str) {
     for card in op.card_refs_mut() {

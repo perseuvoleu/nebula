@@ -2238,6 +2238,26 @@ fn link_refuses_protocol_31() {
 }
 
 #[test]
+fn link_names_a_host_without_connect_only() {
+    let here = viewer("echo \"error: unexpected argument '--connect-only' found\" >&2; exit 2");
+    let out = here.cli(&["todo", "add", "--project", "nebula", "Old peer"], None);
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("without `proxy --connect-only`"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn link_refuses_a_relay_template_without_proxy() {
+    let here = viewer(&proxy_to(&board_env()).replace("{proxy}", "proxy"));
+    let out = here.cli(&["todo", "add", "--project", "nebula", "Plain"], None);
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+    assert!(stderr(&out).contains("{proxy}"), "{}", stderr(&out));
+}
+
+#[test]
 fn link_refuses_hello_ok_31() {
     let env = Env::new();
     let reply = reply_file(
