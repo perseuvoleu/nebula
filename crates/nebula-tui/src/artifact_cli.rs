@@ -3,7 +3,7 @@
 //! session and checkout; a URL is published as kind link.
 
 use crate::board_cli::{
-    card_ref, check_card, client_id, connect, request, Caller, ScopeFlags, CLOSED,
+    card_ref, check_card, client_id, connect, exchange, request, Caller, ScopeFlags, REQ,
 };
 use crate::ipc::{self, Connection};
 use anyhow::{bail, Context, Result};
@@ -11,7 +11,6 @@ use nebula_core::board::{
     parse_card_ref, Artifact, ArtifactContent, BoardOp, BoardRead, BoardResult, CardRef, Refusal,
     SessionLink,
 };
-use nebula_core::codec::{read_frame, write_frame};
 use nebula_core::{ArtifactId, ClientRequest, ServerEvent};
 use std::path::PathBuf;
 
@@ -82,25 +81,6 @@ fn url(text: &str) -> Result<Option<String>> {
     Ok(Some(text.to_string()))
 }
 
-async fn exchange(conn: &mut Connection, req: ClientRequest) -> Result<ServerEvent> {
-    write_frame(&mut conn.stream, &req).await?;
-    loop {
-        match read_frame::<ServerEvent, _>(&mut conn.stream).await? {
-            Some(ServerEvent::Error {
-                req_id: Some(1),
-                message,
-            }) => bail!("{message}"),
-            Some(
-                reply @ (ServerEvent::ArtifactStored { req_id: 1, .. }
-                | ServerEvent::ArtifactLocated { req_id: 1, .. }
-                | ServerEvent::Ack { req_id: 1, .. }),
-            ) => return Ok(reply),
-            Some(_) => continue,
-            None => bail!(CLOSED),
-        }
-    }
-}
-
 async fn store(
     conn: &mut Connection,
     id: &ArtifactId,
@@ -108,7 +88,7 @@ async fn store(
     source: PathBuf,
 ) -> Result<(ArtifactContent, bool)> {
     let req = ClientRequest::StoreArtifact {
-        req_id: 1,
+        req_id: REQ,
         id: id.clone(),
         kind: kind.to_string(),
         source,
@@ -123,7 +103,7 @@ async fn store(
 
 fn outcome_known(why: &anyhow::Error) -> bool {
     why.downcast_ref::<std::io::Error>().is_none()
-        && why.to_string() != CLOSED
+        && why.downcast_ref::<ipc::ReplyLost>().is_none()
         && Refusal::of(&why.to_string()) != Some(Refusal::OutcomeUnknown)
 }
 
@@ -140,7 +120,7 @@ pub(crate) async fn unpublished(
     }
     if created {
         let req = ClientRequest::DiscardArtifact {
-            req_id: 1,
+            req_id: REQ,
             id: id.clone(),
         };
         if let Err(e) = exchange(conn, req).await {
@@ -310,7 +290,7 @@ async fn open(conn: &mut Connection, a: &Artifact) -> Result<()> {
         }
         ArtifactContent::Files { entry, .. } => {
             let req = ClientRequest::LocateArtifact {
-                req_id: 1,
+                req_id: REQ,
                 id: a.id.clone(),
                 entry: entry.clone(),
             };
@@ -350,7 +330,7 @@ mod tests {
         assert!(outcome_known(&anyhow::anyhow!("no board configured")));
         let lost = std::io::Error::from(std::io::ErrorKind::BrokenPipe);
         assert!(!outcome_known(&anyhow::Error::from(lost)));
-        assert!(!outcome_known(&anyhow::anyhow!(CLOSED)));
+        assert!(!outcome_known(&anyhow::Error::from(ipc::CLOSED)));
         assert!(!outcome_known(&anyhow::anyhow!(
             Refusal::OutcomeUnknown.message("link dropped")
         )));

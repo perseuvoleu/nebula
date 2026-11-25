@@ -649,6 +649,21 @@ pub(crate) fn resolve_project(
         .cloned()
 }
 
+/// The connection closed or timed out after a request went out and before
+/// its reply: the request may have taken effect.
+#[derive(Debug)]
+pub struct ReplyLost(pub &'static str);
+
+impl std::fmt::Display for ReplyLost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for ReplyLost {}
+
+pub(crate) const CLOSED: ReplyLost = ReplyLost("daemon closed the connection before replying");
+
 /// Await the Ack (or Error) for `req_id`, collecting entity upserts seen on
 /// the way; the daemon broadcasts the created row just before the Ack.
 pub(crate) async fn await_ack(
@@ -662,7 +677,7 @@ pub(crate) async fn await_ack(
             read_frame::<ServerEvent, _>(&mut conn.stream),
         )
         .await
-        .context("timed out waiting for the daemon's reply")??;
+        .map_err(|_| ReplyLost("timed out waiting for the daemon's reply"))??;
         match event {
             Some(ServerEvent::Ack { req_id: r, created }) if r == req_id => return Ok(created),
             Some(ServerEvent::Error {
@@ -671,7 +686,7 @@ pub(crate) async fn await_ack(
             }) if r == req_id => bail!("{message}"),
             Some(ServerEvent::EntityUpserted { entity }) => upserts.push(entity),
             Some(_) => continue,
-            None => bail!("daemon closed the connection before replying"),
+            None => return Err(CLOSED.into()),
         }
     }
 }

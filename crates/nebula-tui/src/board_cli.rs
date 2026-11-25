@@ -275,25 +275,38 @@ pub(crate) async fn connect() -> Result<Connection> {
     ipc::handshake(stream).await
 }
 
-pub async fn request(conn: &mut Connection, op: BoardOp) -> Result<BoardResult> {
-    let req_id = 1;
-    write_frame(&mut conn.stream, &ClientRequest::Board { req_id, op }).await?;
+/// The one request id of a CLI connection: each request awaits its reply
+/// before the next is written, so a reply can never answer another request.
+pub(crate) const REQ: u64 = 1;
+
+/// Writes `req`, sent with [`REQ`], and returns the first reply to it. An
+/// Error reply becomes Err, a connection that closes first [`ipc::CLOSED`].
+pub(crate) async fn exchange(conn: &mut Connection, req: ClientRequest) -> Result<ServerEvent> {
+    write_frame(&mut conn.stream, &req).await?;
     loop {
         match read_frame::<ServerEvent, _>(&mut conn.stream).await? {
-            Some(ServerEvent::BoardReply { req_id: r, result }) if r == req_id => {
-                return Ok(result)
-            }
             Some(ServerEvent::Error {
-                req_id: Some(r),
+                req_id: Some(REQ),
                 message,
-            }) if r == req_id => bail!("{message}"),
+            }) => bail!("{message}"),
+            Some(
+                reply @ (ServerEvent::BoardReply { req_id: REQ, .. }
+                | ServerEvent::ArtifactStored { req_id: REQ, .. }
+                | ServerEvent::ArtifactLocated { req_id: REQ, .. }
+                | ServerEvent::Ack { req_id: REQ, .. }),
+            ) => return Ok(reply),
             Some(_) => continue,
-            None => bail!(CLOSED),
+            None => return Err(ipc::CLOSED.into()),
         }
     }
 }
 
-pub(crate) const CLOSED: &str = "daemon closed the connection before replying";
+pub async fn request(conn: &mut Connection, op: BoardOp) -> Result<BoardResult> {
+    match exchange(conn, ClientRequest::Board { req_id: REQ, op }).await? {
+        ServerEvent::BoardReply { result, .. } => Ok(result),
+        other => bail!("the daemon answered a board request with {other:?}"),
+    }
+}
 
 /// Reads the card `text` names, so a spawn linking it is refused before
 /// anything starts.
@@ -843,17 +856,15 @@ async fn approve(
         );
         return on_host(&found.host, &words, &rerun);
     }
-    let req_id = 2;
-    write_frame(
-        &mut conn.stream,
-        &ClientRequest::ApproveSession {
-            req_id,
+    exchange(
+        conn,
+        ClientRequest::ApproveSession {
+            req_id: REQ,
             id: found.id.clone(),
             expected_status_at,
         },
     )
     .await?;
-    ipc::await_ack(conn, req_id, &mut Vec::new()).await?;
     if json {
         println!(
             "{}",
