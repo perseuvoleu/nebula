@@ -374,7 +374,11 @@ fn relabel(result: &mut BoardResult, host: &str) {
     };
     for card in cards {
         card.label = card_label(card.number, Some(host));
-        for blocker in &mut card.blocked_by {
+        for blocker in card
+            .blocked_by
+            .iter_mut()
+            .chain(card.cleared_blockers.iter_mut())
+        {
             blocker.push('@');
             blocker.push_str(host);
         }

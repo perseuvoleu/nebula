@@ -52,7 +52,7 @@ function Segmented<T extends string>({ legend, name, options, value, onChange, l
   );
 }
 
-export function RunDialog({ open, onOpenChange, cardRef, cardTitle, branch, hosts, draft, onDraftChange, onRun, pending }: {
+export function RunDialog({ open, onOpenChange, cardRef, cardTitle, branch, hosts, draft, onDraftChange, onRun, pending, error }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   cardRef: string;
@@ -63,6 +63,7 @@ export function RunDialog({ open, onOpenChange, cardRef, cardTitle, branch, host
   onDraftChange: (draft: RunDraft) => void;
   onRun: () => void;
   pending?: boolean;
+  error?: string | null;
 }) {
   const set = <K extends keyof RunDraft>(key: K) => (value: RunDraft[K]) => onDraftChange({ ...draft, [key]: value });
   const target = hosts.find((h) => h.host === draft.host);
@@ -107,6 +108,7 @@ export function RunDialog({ open, onOpenChange, cardRef, cardTitle, branch, host
           <pre className="overflow-x-auto rounded-lg border border-border bg-card px-3 py-2 font-mono text-xs leading-relaxed whitespace-pre-wrap wrap-anywhere text-muted-foreground">
             <span aria-hidden>$ </span>{runCommand(cardRef, draft, worktree === "current" && branch ? branch : "new")}
           </pre>
+          {error && <p role="alert" className="text-sm">{error}</p>}
         </div>
         <DialogFooter>
           <Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>Renunță</Button>

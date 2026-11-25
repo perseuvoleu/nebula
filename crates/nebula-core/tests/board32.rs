@@ -566,6 +566,16 @@ fn worker_at() -> SessionAt {
     }
 }
 
+fn worker_waiting() -> NeedsYou {
+    NeedsYou {
+        host: "leaseweb".into(),
+        id: AgentId("01JF0000000000000000000002".into()),
+        name: "worker".into(),
+        card: TodoId(CARD.into()),
+        status_changed_at: 1764000200000,
+    }
+}
+
 const CARD: &str = "01JD0000000000000000000012";
 
 fn card() -> Card {
@@ -581,6 +591,9 @@ fn card() -> Card {
         created_by: author(),
         checkout: Some(checkout()),
         blocked_by: vec!["#11@leaseweb".into()],
+        cleared_blockers: Vec::new(),
+        created_at: 1764000000000,
+        updated_at: 1764000150000,
     }
 }
 
@@ -695,9 +708,10 @@ fn board_json_golden() {
                     needs_you: 0,
                     stale: false,
                 }],
+                needs_you: vec![worker_waiting()],
                 away: Away {
                     finished: vec![TodoId(CARD.into())],
-                    needs_you: vec![worker_at()],
+                    needs_you: vec![worker_waiting()],
                     decisions: vec![ArtifactId("01JG0000000000000000000002".into())],
                 },
             },
@@ -750,6 +764,7 @@ fn board_json_golden() {
         board: BoardPage {
             cards: vec![],
             hosts: vec![],
+            needs_you: vec![],
             away: Away::default(),
         },
         next: Some("01JB0000000000000000000000.53:1".into()),

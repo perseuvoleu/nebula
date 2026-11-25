@@ -330,6 +330,11 @@ class Gateway:
         projects = ("--all",) if self.board_projects == "*" else tuple(f"--project={p}" for p in self.board_projects)
         return (*projects, "--include-home")
 
+    def write_scope(self):
+        """The board scope as the write flags, so the daemon refuses an out-of-scope card in its transaction."""
+        projects = ("--scope=*",) if self.scope()[0] == "--all" else tuple(f"--scope={p}" for p in self.board_projects)
+        return (*projects, "--include-home")
+
     def admits(self, project):
         scope = self.scope()
         return "--include-home" in scope if project is None else self.board_projects == "*" or project in self.board_projects
@@ -663,6 +668,8 @@ class Gateway:
                 raise Problem(404, "Unknown endpoint")
             card = self.card(unquote(ref))
             args, positionals, *exits = CARD_VERBS[verb](self, card, body)
+            if verb in SCOPED_WRITES:
+                args = (*args, *self.write_scope())
             return self.board(*args, positionals=positionals, exits=exits[0] if exits else BOARD_EXITS)
         project = self.project(body.get("project"))
         if path == "/api/worktrees":
@@ -782,9 +789,10 @@ def approve_card(gateway, card, body):
 
 
 def open_code(gateway, card, body):
-    session, host = gateway.card_session(card, body)
-    unreachable = (409, f"Nebula not reachable on {host}", {"command": f"nebula open --session={session}"})
-    return ("open", f"--session={session}", f"--on={host}"), (), {3: unreachable}
+    session, _ = gateway.card_session(card, body)
+    on = field(body, "on", NAME)
+    unreachable = (409, f"Nebula not reachable on {on}", {"command": f"nebula open --session={session}"})
+    return ("open", f"--session={session}", f"--on={on}"), (), {3: unreachable}
 
 
 def move_card(gateway, card, body):
@@ -793,7 +801,7 @@ def move_card(gateway, card, body):
 
 
 def note_card(gateway, card, body):
-    return ("todo", "note"), (card["id"], field(body, "text", limit=16000))
+    return ("todo", "note", f"--id={field(body, 'id', ULID)}"), (card["id"], field(body, "text", limit=16000))
 
 
 def plain_card(verb):
@@ -804,6 +812,8 @@ def block_card(verb):
     return lambda gateway, card, body: (
         ("todo", verb, f"--by={gateway.card(field(body, 'by', BOARD_REF))['id']}"), (card["id"],))
 
+
+SCOPED_WRITES = {"move", "edit", "note", "archive", "accept", "dismiss", "block", "unblock", "run", "approve"}
 
 CARD_VERBS = {
     "move": move_card,

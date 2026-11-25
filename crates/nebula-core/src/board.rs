@@ -173,6 +173,15 @@ pub struct Card {
     pub created_by: Author,
     pub checkout: Option<Checkout>,
     pub blocked_by: Vec<String>,
+    /// The refs in `blocked_by` whose card is done or archived, so a
+    /// reader without those cards still knows they no longer block.
+    #[serde(default)]
+    pub cleared_blockers: Vec<String>,
+    #[serde(default)]
+    pub created_at: i64,
+    /// The later of creation and the last stage change.
+    #[serde(default)]
+    pub updated_at: i64,
 }
 
 /// One entry of a card's log.
@@ -255,11 +264,23 @@ pub struct BoardHost {
     pub stale: bool,
 }
 
+/// A session waiting on the user, with its card and the status timestamp an
+/// approval must still match.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NeedsYou {
+    pub host: String,
+    pub id: AgentId,
+    #[serde(default)]
+    pub name: String,
+    pub card: TodoId,
+    pub status_changed_at: i64,
+}
+
 /// What changed since the viewer's last visit (`--away-since`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Away {
     pub finished: Vec<TodoId>,
-    pub needs_you: Vec<SessionAt>,
+    pub needs_you: Vec<NeedsYou>,
     pub decisions: Vec<ArtifactId>,
 }
 
@@ -267,6 +288,9 @@ pub struct Away {
 pub struct BoardPage {
     pub cards: Vec<Card>,
     pub hosts: Vec<BoardHost>,
+    /// Every session waiting on the user now, with no time window.
+    #[serde(default)]
+    pub needs_you: Vec<NeedsYou>,
     pub away: Away,
 }
 

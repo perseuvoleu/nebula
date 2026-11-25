@@ -16,7 +16,7 @@ export interface CardDraft {
 
 const HOME = "";
 
-export function NewCardDialog({ open, onOpenChange, projects, draft, onDraftChange, onCreate, pending }: {
+export function NewCardDialog({ open, onOpenChange, projects, draft, onDraftChange, onCreate, pending, error }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   projects: string[];
@@ -24,6 +24,7 @@ export function NewCardDialog({ open, onOpenChange, projects, draft, onDraftChan
   onDraftChange: (draft: CardDraft) => void;
   onCreate: () => void;
   pending?: boolean;
+  error?: string | null;
 }) {
   const fieldCls = "h-11 rounded-lg border border-input bg-card px-3 text-base outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/60";
   return (
@@ -55,6 +56,7 @@ export function NewCardDialog({ open, onOpenChange, projects, draft, onDraftChan
               </select>
             </label>
           </div>
+          {error && <p role="alert" className="text-sm">{error}</p>}
         </div>
         <DialogFooter>
           <Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>Renunță</Button>

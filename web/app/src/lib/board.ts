@@ -88,6 +88,9 @@ export type Card = {
   created_by: Author;
   checkout: Checkout | null;
   blocked_by: string[];
+  cleared_blockers: string[];
+  created_at: number;
+  updated_at: number;
 };
 
 export type HostCheckout = { project: string; branch: string; path: string; worktree: boolean };
@@ -103,9 +106,11 @@ export type BoardHost = {
 
 export type SessionAt = { host: string; id: string };
 
-export type Away = { finished: string[]; needs_you: SessionAt[]; decisions: string[] };
+export type NeedsYou = SessionAt & { name: string; card: string; status_changed_at: number };
 
-export type BoardData = { cards: Card[]; hosts: BoardHost[]; away: Away };
+export type Away = { finished: string[]; needs_you: NeedsYou[]; decisions: string[] };
+
+export type BoardData = { cards: Card[]; hosts: BoardHost[]; needs_you: NeedsYou[]; away: Away };
 
 export type BoardReply =
   | { version: string; unchanged: true }
@@ -156,7 +161,7 @@ export function byStage<T extends { stage: Stage }>(cards: T[]): Record<Stage, T
 export function openBlockers(card: Card, cards: Card[]): BlockerRef[] {
   return card.blocked_by.flatMap((ref) => {
     const blocker = cards.find((c) => c.ref === ref);
-    return blocker?.stage === "done" ? [] : [{ ref, title: blocker?.title ?? "" }];
+    return blocker?.stage === "done" || card.cleared_blockers.includes(ref) ? [] : [{ ref, title: blocker?.title ?? "" }];
   });
 }
 
@@ -169,10 +174,12 @@ const inProject = (project: string | null, scope: SidebarScope): boolean =>
   scope.kind === "all" || scope.kind === "needs" || scope.kind === "all-decisions" || project === scope.project;
 
 export function awayDigest<D extends { id: string; project: string | null }>(board: BoardData, scope: SidebarScope, known: D[]):
-  { finished: Card[]; decisions: D[]; empty: boolean } {
-  const finished = board.away.finished.flatMap((id) => board.cards.filter((c) => c.id === id && inProject(c.project, scope)));
+  { finished: Card[]; waiting: Card[]; decisions: D[]; empty: boolean } {
+  const scoped = (id: string) => board.cards.filter((c) => c.id === id && inProject(c.project, scope));
+  const finished = board.away.finished.flatMap(scoped);
+  const waiting = [...new Set(board.away.needs_you.map((w) => w.card))].flatMap(scoped);
   const decisions = board.away.decisions.flatMap((id) => known.filter((d) => d.id === id && inProject(d.project, scope)));
-  return { finished, decisions, empty: !finished.length && !decisions.length };
+  return { finished, waiting, decisions, empty: !finished.length && !waiting.length && !decisions.length };
 }
 
 export const cardSlug = (ref: string): string => ref.replace(/^#/, "");

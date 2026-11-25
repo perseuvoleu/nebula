@@ -21,6 +21,9 @@
   "blocked_by": [
     "#11@leaseweb"
   ],
+  "cleared_blockers": [],
+  "created_at": 1764000000000,
+  "updated_at": 1764000150000,
   "sessions": [
     {
       "host": "leaseweb",

@@ -1,11 +1,13 @@
 import { useEffect, useState } from "react";
-import { ArrowLeftIcon, MenuIcon } from "lucide-react";
+import { ArrowLeftIcon, MenuIcon, PlusIcon } from "lucide-react";
 import { api, describeError } from "@/lib/api";
 import { activityAge } from "@/lib/activity-age";
 import {
-  type BoardData, type Card, type CardShow, type SessionLink, type SidebarScope, type SortKey, type TableSort, type Workspace,
+  type BoardCard, type BoardData, type Card, type CardShow, type NeedsYou, type SessionLink, type SidebarScope, type SortKey, type TableSort, type Stage, type Workspace,
   awayDigest, byStage, cardSlug, hostProjects, inScope, projectName, sessionProject, sidebarProjects, sortCards, toBoardCard, writerSlots,
 } from "@/lib/board";
+import { cardAction, createCard, ulid } from "@/lib/board-actions";
+import { type Pending, drop, patchOf, propose, reconcile, settle } from "@/lib/optimistic";
 import { type BoardRoute, selectionPath } from "@/lib/route";
 import { BOARD_POLL_MS, useBoard } from "@/lib/useBoard";
 import { cn } from "@/lib/utils";
@@ -13,17 +15,25 @@ import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
 import { AwayDigest, type AwayDecision } from "./AwayDigest";
 import { BoardColumns } from "./BoardColumns";
+import { CardActions } from "./CardActions";
 import { CardArtifacts } from "./CardArtifacts";
 import { CardDetail } from "./CardDetail";
 import type { DecisionRow } from "./DecisionCard";
 import { DecisionsPage } from "./DecisionsPage";
+import { type CardDraft, NewCardDialog } from "./NewCardDialog";
 import { NeedsYouStrip } from "./NeedsYouStrip";
 import { ProjectSidebar } from "./ProjectSidebar";
+import { ProposalTray } from "./ProposalTray";
 import { RecordDecision } from "./RecordDecision";
 import { TableView } from "./TableView";
 import { WriterSlots } from "./WriterSlots";
 
 const LAST_SEEN = "nebula-board-last-seen";
+
+/** An approval answers one waiting state, so it stays hidden until the session leaves needs_you or waits anew. */
+const approval = (w: NeedsYou) => `approve:${w.host}/${w.id}@${w.status_changed_at}`;
+
+type RawCard = BoardData["cards"][number];
 
 type Decision = { id: string; title: string; card: string | null; project: string | null; session: SessionLink | null;
   content: { body?: string }; created_at: number };
@@ -128,7 +138,9 @@ function CardPanel({ slug, board, mode, onOpenCard }: { slug: string; board: Boa
   return (
     <>
       {card.error && <span role="status" className="self-start rounded-md border border-dashed px-1.5 py-0.5 text-xs">Date neactualizate</span>}
-      <CardDetail card={toBoardCard(card.show, board?.cards ?? [], card.show)} log={log} mode={mode} onOpenCard={onOpenCard} />
+      <CardDetail card={toBoardCard(card.show, board?.cards ?? [], card.show)} log={log} mode={mode} onOpenCard={onOpenCard}>
+        <CardActions show={card.show} board={board} />
+      </CardDetail>
       {mode === "page" && (
         <div className="mx-auto mt-4 flex w-full max-w-3xl flex-col gap-4">
           <RecordDecision cardRef={card.show.ref} onRecorded={card.refresh} />
@@ -146,7 +158,7 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
   onSessions: () => void;
 }) {
   const [lastSeen, setLastSeen] = useState(loadLastSeen);
-  const { board, stale } = useBoard(lastSeen);
+  const { board, stale, readAt } = useBoard(lastSeen);
   const [local, setLocal] = useState<SidebarScope | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const [expanded, setExpanded] = useState<(string | null)[]>([]);
@@ -156,6 +168,23 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
   const [collapsed, setCollapsed] = useState<string[]>([]);
   const [digestClosed, setDigestClosed] = useState(false);
   const [decisionQuery, setDecisionQuery] = useState("");
+  const [overlay, setOverlay] = useState<Pending<Partial<RawCard>>[]>([]);
+  const [newCard, setNewCard] = useState<(CardDraft & { id: string }) | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
+  useEffect(() => setOverlay((old) => reconcile(old, readAt, (key) => (board?.needs_you ?? []).some((w) => approval(w) === key))), [readAt, board]);
+  const optimistic = (key: string, patch: Partial<RawCard>, request: Promise<unknown>) => {
+    const token = ulid();
+    setActionError(null);
+    setOverlay((old) => propose(old, token, key, patch));
+    request
+      .then(() => setOverlay((old) => settle(old, token, Date.now())))
+      .catch((failure) => {
+        setOverlay((old) => drop(old, token));
+        setActionError(describeError(failure));
+      });
+  };
 
   const routed = (s: SidebarScope) => s.kind === "all" || s.kind === "needs" || s.kind === "all-decisions"
     ? { project: null, home: false, decisions: s.kind === "all-decisions" }
@@ -177,9 +206,11 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
   const openPage = (ref: string) => go(cardPage(ref));
   const toggle = <T,>(list: T[], name: T) => list.includes(name) ? list.filter((n) => n !== name) : [...list, name];
 
-  const live = (board?.cards ?? []).filter((c) => !c.archived);
-  const all = live.map((c) => toBoardCard(c, live));
-  const cards = all.filter((c) => inScope(c, scope));
+  const live = (board?.cards ?? []).map((c) => ({ ...c, ...patchOf(overlay, c.ref) })).filter((c) => !c.archived);
+  const waiting = (board?.needs_you ?? []).filter((w) => !patchOf(overlay, approval(w)));
+  const all = live.map((c) => ({ ...toBoardCard(c, live), needsYou: waiting.some((w) => w.card === c.id), age: activityAge(c.updated_at, Date.now()) }));
+  const scoped = all.filter((c) => inScope(c, scope));
+  const cards = scoped.filter((c) => !c.proposed);
   const bySlug = (slug: string | null): Card | undefined => live.find((c) => cardSlug(c.ref) === slug);
   const peeked = bySlug(route.peek);
   const listed = useDecisions(route.decisions || !!board?.away.decisions.length, route.decisions ? decisionQuery : "", board);
@@ -189,6 +220,34 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
   const now = Date.now();
   const awayDecisions: AwayDecision[] = (digest?.decisions ?? [])
     .map((d) => ({ id: d.id, title: d.title, age: activityAge(d.created_at, now), cardRef: live.find((c) => c.id === d.card)?.ref ?? null }));
+
+  const move = (ref: string, stage: Stage) => {
+    const card = live.find((c) => c.ref === ref);
+    if (card && card.stage !== stage) optimistic(ref, { stage }, cardAction(ref, "move", { stage, expect: card.stage }));
+  };
+  const openNew = (stage: Stage = "backlog") => {
+    setCreateError(null);
+    setNewCard({ title: "", project: scope.kind === "all" || scope.kind === "needs" || scope.kind === "all-decisions" ? null : scope.project, stage, id: ulid() });
+  };
+  const create = async () => {
+    if (!newCard) return;
+    setCreating(true);
+    setCreateError(null);
+    try {
+      await createCard({ ...newCard, title: newCard.title.trim() });
+      setNewCard(null);
+    } catch (failure) {
+      setCreateError(describeError(failure));
+    } finally {
+      setCreating(false);
+    }
+  };
+  const waitingCards = cards.filter((c) => c.needsYou);
+  const approve = (ref: string, session: NeedsYou) =>
+    optimistic(approval(session), {}, cardAction(ref, "approve", { session: session.id, host: session.host, expectedStatusAt: session.status_changed_at }));
+  const approveButtons = (card: BoardCard) => waiting.filter((w) => w.card === live.find((c) => c.ref === card.ref)?.id).map((w) => (
+    <Button key={`${w.host}/${w.id}`} type="button" variant="outline" size="xs" onClick={() => approve(card.ref, w)}>Aprobă {w.name}</Button>
+  ));
 
   const sidebar = (
     <ProjectSidebar projects={board ? sidebarProjects(board) : []} total={live.filter((c) => c.stage !== "done").length}
@@ -215,7 +274,7 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
       sort={sort} onSort={(key: SortKey) => setSort((old) => ({ key, asc: old.key === key ? !old.asc : true }))}
       collapsed={collapsed} onToggleGroup={(name) => setCollapsed((old) => toggle(old, name))} />
   ) : (
-    <BoardColumns columns={byStage(cards)} selected={peeked?.ref} showProject={scope.kind === "all"} onOpen={peek} />
+    <BoardColumns columns={byStage(cards)} selected={peeked?.ref} showProject={scope.kind === "all"} onOpen={peek} onAdd={openNew} onMove={move} />
   );
 
   return (
@@ -231,6 +290,9 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
           {stale && board && <span role="status" className="rounded-md border border-dashed px-1.5 py-0.5 text-xs">Date neactualizate</span>}
           <span className="flex-1" />
           {board && board.hosts.length > 0 && <WriterSlots hosts={writerSlots(board.hosts)} />}
+          {board && !route.card && !route.decisions && (
+            <Button type="button" variant="outline" size="sm" onClick={() => openNew()}><PlusIcon aria-hidden />Card nou</Button>
+          )}
           {!route.card && !route.decisions && (
             <div role="group" aria-label="Vizualizare" className="flex rounded-lg border p-0.5">
               {([false, true] as const).map((table) => (
@@ -246,16 +308,35 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
         {digest && !digest.empty && !digestClosed && !route.card && (
           <AwayDigest lastSeen={new Date(lastSeen).toLocaleString("ro-RO", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}
             scope={scope.kind === "all" || scope.kind === "needs" || scope.kind === "all-decisions" ? "toate proiectele" : projectName(scope.project)}
-            finished={digest.finished.map((c) => toBoardCard(c, live))} decisions={awayDecisions} onOpen={peek} onClose={() => setDigestClosed(true)}
+            finished={digest.finished.map((c) => toBoardCard(c, live))} needsYou={digest.waiting.length ? digest.waiting.map((c) => toBoardCard(c, live)) : undefined} decisions={awayDecisions} onOpen={peek} onClose={() => setDigestClosed(true)}
             onCaughtUp={() => {
               const seen = Date.now();
               try { localStorage.setItem(LAST_SEEN, String(seen)); } catch { /* The digest still resets for this visit. */ }
               setLastSeen(seen);
             }} />
         )}
-        {!route.card && !route.decisions && <NeedsYouStrip cards={cards.filter((c) => c.needsYou)} onOpen={peek} />}
+        {actionError && (
+          <p role="alert" className="flex items-center gap-2 border-b px-3 py-1.5 text-sm">
+            <span className="flex-1">{actionError}</span>
+            <Button type="button" variant="ghost" size="sm" onClick={() => setActionError(null)}>Închide</Button>
+          </p>
+        )}
+        {!route.card && !route.decisions && (
+          <NeedsYouStrip cards={waitingCards} onOpen={peek}
+            renderActions={approveButtons} />
+        )}
+        {!route.card && !route.decisions && (
+          <ProposalTray proposals={scoped.filter((c) => c.proposed).map((c) => ({ id: c.ref, ref: c.ref, title: c.title, project: c.project, proposedBy: c.proposedBy ?? "agent" }))}
+            onOpen={peek} onAccept={(ref) => optimistic(ref, { proposed: false }, cardAction(ref, "accept", {}))}
+            onDismiss={(ref) => optimistic(ref, { archived: true }, cardAction(ref, "dismiss", {}))} />
+        )}
         {main}
       </main>
+      {newCard && (
+        <NewCardDialog open onOpenChange={(open) => { if (!open) setNewCard(null); }} draft={newCard} pending={creating}
+          projects={(board ? sidebarProjects(board) : []).flatMap((p) => p.project === null ? [] : [p.project])}
+          onDraftChange={(draft) => setNewCard({ ...newCard, ...draft })} onCreate={create} error={createError} />
+      )}
       <Sheet open={menuOpen} onOpenChange={setMenuOpen}>
         <SheetContent side="left" className="w-[88vw] max-w-sm gap-0 p-0" aria-describedby={undefined}>
           <SheetTitle className="sr-only">Proiecte</SheetTitle>

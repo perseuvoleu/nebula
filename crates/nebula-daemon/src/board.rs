@@ -6,7 +6,7 @@ use anyhow::{bail, Result};
 use nebula_core::board::{
     card_label, Author, Away, BoardHost, BoardOp, BoardPage, BoardPoll, BoardRead, BoardResult,
     BoardScope, Card, CardDraft, CardNote, CardRef, CardSession, CardShow, Dispatch, DispatchState,
-    Page, Placement, ProjectScope, Refusal, RunReceipt, SessionAt, Stage,
+    NeedsYou, Page, Placement, ProjectScope, Refusal, RunReceipt, SessionAt, Stage,
 };
 use nebula_core::{
     AgentId, AgentKind, AgentStatus, ArtifactId, DispatchId, NoteId, TodoId, MAX_FRAME_LEN,
@@ -213,14 +213,12 @@ fn begin_run(tx: &Transaction, dispatch: Dispatch) -> Result<RunReceipt> {
             found.label
         )));
     };
-    let open: Vec<String> = tx
-        .prepare(
-            "SELECT t.number FROM card_blocks b JOIN todos t ON t.id = b.by_id
-             WHERE b.card_id = ?1 AND t.stage != 'done' ORDER BY t.number",
-        )?
-        .query_map(params![card.as_str()], |r| r.get::<_, i64>(0))?
-        .map(|n| n.map(|n| card_label(n as u64, None)))
-        .collect::<rusqlite::Result<_>>()?;
+    let open: Vec<&str> = found
+        .blocked_by
+        .iter()
+        .filter(|b| !found.cleared_blockers.contains(b))
+        .map(String::as_str)
+        .collect();
     if !open.is_empty() {
         bail!(Refusal::Conflict.message(format!(
             "{} is blocked by {}",
@@ -524,7 +522,7 @@ pub(crate) fn optional_json<T: serde::de::DeserializeOwned>(
 }
 
 const CARD_COLUMNS: &str =
-    "id, number, title, stage, project, proposed, archived_at, created_by, checkout";
+    "id, number, title, stage, project, proposed, archived_at, created_by, checkout, created_at, stage_changed_at";
 
 fn card_from_row(r: &Row) -> rusqlite::Result<Card> {
     let number: i64 = r.get(1)?;
@@ -541,18 +539,34 @@ fn card_from_row(r: &Row) -> rusqlite::Result<Card> {
         created_by: json_column(r, 7)?,
         checkout: optional_json(r, 8)?,
         blocked_by: Vec::new(),
+        cleared_blockers: Vec::new(),
+        created_at: r.get(9)?,
+        updated_at: r
+            .get::<_, i64>(9)?
+            .max(r.get::<_, Option<i64>>(10)?.unwrap_or(0)),
     })
 }
 
 fn with_blockers(tx: &Transaction, mut card: Card) -> Result<Card> {
-    card.blocked_by = tx
+    let blockers = tx
         .prepare(
-            "SELECT t.number FROM card_blocks b JOIN todos t ON t.id = b.by_id
+            "SELECT t.number, t.stage = 'done' OR t.archived_at IS NOT NULL
+             FROM card_blocks b JOIN todos t ON t.id = b.by_id
              WHERE b.card_id = ?1 ORDER BY t.number",
         )?
-        .query_map(params![card.id.as_str()], |r| r.get::<_, i64>(0))?
-        .map(|n| n.map(|n| card_label(n as u64, None)))
-        .collect::<rusqlite::Result<_>>()?;
+        .query_map(params![card.id.as_str()], |r| {
+            Ok((
+                card_label(r.get::<_, i64>(0)? as u64, None),
+                r.get::<_, bool>(1)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (label, cleared) in blockers {
+        if cleared {
+            card.cleared_blockers.push(label.clone());
+        }
+        card.blocked_by.push(label);
+    }
     Ok(card)
 }
 
@@ -651,21 +665,28 @@ fn read_op(tx: &Transaction, read: BoardRead) -> Result<BoardResult> {
             }
             let offset = page_offset(page.as_deref(), &version)?;
             let cards = scoped_cards(tx, &scope, None, false)?;
-            let (hosts, away) = if offset == 0 {
+            let (hosts, needs_you, away) = if offset == 0 {
                 let away = match away_since {
                     Some(since) => away(tx, &scope, &cards, since)?,
                     None => Away::default(),
                 };
-                (hosts(tx, &scope)?, away)
+                (hosts(tx, &scope)?, waiting(tx, &cards, None)?, away)
             } else {
-                (Vec::new(), Away::default())
+                (Vec::new(), Vec::new(), Away::default())
             };
-            let reserved = serde_json::to_vec(&hosts)?.len() + serde_json::to_vec(&away)?.len();
+            let reserved = serde_json::to_vec(&hosts)?.len()
+                + serde_json::to_vec(&needs_you)?.len()
+                + serde_json::to_vec(&away)?.len();
             let budget = page_budget().saturating_sub(reserved);
             let (cards, next) = paged(cards, offset, &version, budget)?;
             Ok(BoardResult::Board(BoardPoll::Board {
                 version,
-                board: BoardPage { cards, hosts, away },
+                board: BoardPage {
+                    cards,
+                    hosts,
+                    needs_you,
+                    away,
+                },
                 next,
             }))
         }
@@ -789,6 +810,30 @@ fn hosts(tx: &Transaction, scope: &BoardScope) -> Result<Vec<BoardHost>> {
         .collect::<rusqlite::Result<_>>()?)
 }
 
+fn waiting(tx: &Transaction, cards: &[Card], since: Option<i64>) -> Result<Vec<NeedsYou>> {
+    let scoped: std::collections::HashSet<&str> = cards.iter().map(|c| c.id.as_str()).collect();
+    Ok(tx
+        .prepare(
+            "SELECT host, agent_id, name, card_id, status_changed_at FROM board_sessions
+             WHERE status = 'needs_feedback' AND archived = 0 AND alive = 1
+               AND status_changed_at > ?1
+             ORDER BY status_changed_at",
+        )?
+        .query_map(params![since.unwrap_or(i64::MIN)], |r| {
+            Ok(NeedsYou {
+                host: r.get(0)?,
+                id: AgentId(r.get(1)?),
+                name: r.get(2)?,
+                card: TodoId(r.get(3)?),
+                status_changed_at: r.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|waiting| scoped.contains(waiting.card.as_str()))
+        .collect())
+}
+
 fn away(tx: &Transaction, scope: &BoardScope, cards: &[Card], since: i64) -> Result<Away> {
     let changed_after = |id: &TodoId| -> Result<bool> {
         Ok(tx.query_row(
@@ -803,29 +848,7 @@ fn away(tx: &Transaction, scope: &BoardScope, cards: &[Card], since: i64) -> Res
             finished.push(card.id.clone());
         }
     }
-    let scoped: std::collections::HashSet<&str> = cards.iter().map(|c| c.id.as_str()).collect();
-    let needs_you = tx
-        .prepare(
-            "SELECT host, agent_id, card_id FROM board_sessions
-             WHERE status = 'needs_feedback' AND archived = 0 AND alive = 1
-               AND status_changed_at > ?1
-             ORDER BY status_changed_at",
-        )?
-        .query_map(params![since], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?
-        .into_iter()
-        .filter(|(_, _, card)| scoped.contains(card.as_str()))
-        .map(|(host, id, _)| SessionAt {
-            host,
-            id: AgentId(id),
-        })
-        .collect();
+    let needs_you = waiting(tx, cards, Some(since))?;
     let decisions = tx
         .prepare(
             "SELECT id, project FROM artifacts

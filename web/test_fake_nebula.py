@@ -38,6 +38,19 @@ class FakeBoardTests(unittest.TestCase):
                     for c in h["checkouts"]}
         self.assertEqual(projects, set())
 
+    def wait(self):
+        board = json.loads((self.state / "board.json").read_text())
+        board["details"]["01JD0000000000000000000012"]["sessions"][0]["status"] = "needs_feedback"
+        (self.state / "board.json").write_text(json.dumps(board))
+
+    def test_needs_you_lists_every_waiting_session_with_no_time_window(self):
+        self.assertEqual(self.cli("todo", "board", *SCOPE, "--json")["board"]["needs_you"], [])
+        self.wait()
+        late = self.cli("todo", "board", *SCOPE, "--away-since=1764999999999", "--json")["board"]
+        self.assertEqual([(w["id"], w["name"]) for w in late["needs_you"]], [("01JF0000000000000000000002", "worker")])
+        self.assertEqual(late["away"]["needs_you"], [])
+        self.assertEqual(self.cli("todo", "board", "--project=other", "--json")["board"]["needs_you"], [])
+
     def test_decision_list_pages_with_a_continuation(self):
         board = json.loads((self.state / "board.json").read_text())
         board["decisions"] += [{**board["decisions"][0], "id": f"01JG00000000000000000000{n}", "title": f"More {n}"} for n in (50, 51)]
@@ -49,6 +62,7 @@ class FakeBoardTests(unittest.TestCase):
 
     def test_away_digest_lists_only_what_happened_after_away_since(self):
         empty = {"finished": [], "needs_you": [], "decisions": []}
+        self.wait()
         self.assertEqual(self.cli("todo", "board", *SCOPE, "--json")["board"]["away"], empty)
         before = self.cli("todo", "board", *SCOPE, "--away-since=1764000000000", "--json")["board"]["away"]
         self.assertEqual(before["finished"], ["01JD0000000000000000000012"])

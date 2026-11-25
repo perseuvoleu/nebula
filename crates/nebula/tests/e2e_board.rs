@@ -363,6 +363,35 @@ fn card_block_refuses_cycles() {
 }
 
 #[test]
+fn board_marks_cleared_blockers_and_card_ages() {
+    let env = board_env();
+    for title in ["Blocked", "Finished", "Shelved", "Open"] {
+        add(&env, &["--project", "nebula"], title);
+    }
+    for by in ["#2", "#3", "#4"] {
+        env.json(&["todo", "block", "#1", "--by", by, "--json"]);
+    }
+    let start = now_ms();
+    env.json(&["todo", "move", "#2", "done", "--json"]);
+    env.json(&["todo", "archive", "#3", "--json"]);
+    let board = env.json(&["todo", "board", "--all", "--json"]);
+    let blocked = board["board"]["cards"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["ref"] == "#1")
+        .unwrap()
+        .clone();
+    assert_eq!(blocked["blocked_by"], serde_json::json!(["#2", "#3", "#4"]));
+    assert_eq!(blocked["cleared_blockers"], serde_json::json!(["#2", "#3"]));
+    let created = blocked["created_at"].as_i64().unwrap();
+    assert!(created > 0 && created <= start, "{blocked}");
+    let moved = env.json(&["todo", "show", "#2", "--json"]);
+    assert!(moved["updated_at"].as_i64().unwrap() >= start, "{moved}");
+    assert!(moved["created_at"].as_i64().unwrap() <= start, "{moved}");
+}
+
+#[test]
 fn card_note_log_order() {
     let env = board_env();
     add(&env, &["--project", "nebula"], "Logged");
@@ -1070,7 +1099,7 @@ fn away_digest_sessions() {
     assert_eq!(away["finished"], serde_json::json!([work["id"]]), "{away}");
     assert_eq!(
         away["needs_you"],
-        serde_json::json!([{"host": FAR_HOST, "id": "n2"}]),
+        serde_json::json!([{"host": FAR_HOST, "id": "n2", "name": "n2", "card": ask["id"], "status_changed_at": after + 1}]),
         "{away}"
     );
     assert_ne!(old["id"], work["id"]);
@@ -1149,6 +1178,41 @@ fn host_needs_you_follows_the_read_scope() {
 }
 
 #[test]
+fn board_needs_you_lists_every_waiting_session_in_scope() {
+    let env = board_env();
+    let ask = add(&env, &["--project", "nebula"], "Ask");
+    let work = add(&env, &["--project", "nebula"], "Work");
+    let before = now_ms() - 60_000;
+    far_report(
+        &env,
+        vec![
+            far_row(&ask, "n1", AgentStatus::NeedsFeedback, before),
+            far_row(&work, "w1", AgentStatus::Running, before),
+        ],
+    );
+    let away_since = (before + 30_000).to_string();
+    let read = |scope: &str| {
+        env.json(&[
+            "todo",
+            "board",
+            scope,
+            "--away-since",
+            &away_since,
+            "--json",
+        ])["board"]
+            .clone()
+    };
+    let all = read("--all");
+    assert_eq!(
+        all["needs_you"],
+        serde_json::json!([{"host": FAR_HOST, "id": "n1", "name": "n1", "card": ask["id"], "status_changed_at": before}]),
+        "{all}"
+    );
+    assert_eq!(all["away"]["needs_you"], serde_json::json!([]), "{all}");
+    assert_eq!(read("--project=other")["needs_you"], serde_json::json!([]));
+}
+
+#[test]
 fn omitted_session_stops_needing_the_user() {
     let env = board_env();
     let card = add(&env, &["--project", "nebula"], "Ask");
@@ -1171,7 +1235,7 @@ fn omitted_session_stops_needing_the_user() {
     };
     assert_eq!(
         away(&env),
-        serde_json::json!([{"host": FAR_HOST, "id": "n1"}])
+        serde_json::json!([{"host": FAR_HOST, "id": "n1", "name": "n1", "card": card["id"], "status_changed_at": since + 1}])
     );
     far_report(&env, Vec::new());
     assert_eq!(away(&env), serde_json::json!([]), "n1 is no longer live");
@@ -1965,6 +2029,22 @@ fn link_add_shows_on_board() {
     );
 }
 
+#[test]
+fn link_qualifies_cleared_blockers_like_blocked_by() {
+    let board = board_env();
+    let here = viewer(&proxy_to(&board));
+    add(&board, &["--project", "nebula"], "Waits");
+    add(&board, &["--project", "nebula"], "Blocker");
+    board.json(&["todo", "block", "#1", "--by", "#2", "--json"]);
+    board.json(&["todo", "archive", "#2", "--json"]);
+    let shown = here.json(&["todo", "show", "#1@boardhost", "--json"]);
+    assert_eq!(shown["blocked_by"], serde_json::json!(["#2@boardhost"]));
+    assert_eq!(
+        shown["cleared_blockers"],
+        serde_json::json!(["#2@boardhost"])
+    );
+}
+
 const UNREACHABLE: &str = "nebula: board host boardhost is unreachable; nothing was sent";
 
 #[test]
@@ -2400,6 +2480,21 @@ fn run_refuses_blocked_or_archived() {
     assert!(agents_of(&env).is_empty());
     env.json(&["todo", "move", "#2", "done", "--json"]);
     assert_eq!(receipt(run_card(&env, "#1", &[]))["state"], "started");
+}
+
+#[test]
+fn run_treats_an_archived_blocker_as_cleared() {
+    let env = board_env();
+    env.make_repo();
+    add(&env, &["--project", "repo"], "Blocked");
+    add(&env, &["--project", "repo"], "Shelved blocker");
+    env.json(&["todo", "block", "#1", "--by", "#2", "--json"]);
+    env.json(&["todo", "archive", "#2", "--json"]);
+    let shown = env.json(&["todo", "show", "#1", "--json"]);
+    assert_eq!(shown["cleared_blockers"], serde_json::json!(["#2"]));
+    let run = run_card(&env, "#1", &[]);
+    assert_eq!(run.status.code(), Some(0), "{}", stderr(&run));
+    assert_eq!(receipt(run)["state"], "started");
 }
 
 #[test]
