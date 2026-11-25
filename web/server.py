@@ -813,7 +813,7 @@ def block_card(verb):
         ("todo", verb, f"--by={gateway.card(field(body, 'by', BOARD_REF))['id']}"), (card["id"],))
 
 
-SCOPED_WRITES = {"move", "edit", "note", "archive", "accept", "dismiss", "block", "unblock"}
+SCOPED_WRITES = {"move", "edit", "note", "archive", "accept", "dismiss", "block", "unblock", "run", "approve"}
 
 CARD_VERBS = {
     "move": move_card,

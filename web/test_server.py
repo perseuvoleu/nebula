@@ -795,7 +795,9 @@ class BoardTests(unittest.TestCase):
 
     def test_card_writes_carry_the_board_scope_and_a_note_id(self):
         writes = {"move": {"stage": "review"}, "edit": {"title": "Renamed"}, "note": {"text": "x", "id": CARD_ID},
-                  "archive": {}, "accept": {}, "dismiss": {}, "block": {"by": "#11"}, "unblock": {"by": "#11"}}
+                  "archive": {}, "accept": {}, "dismiss": {}, "block": {"by": "#11"}, "unblock": {"by": "#11"},
+                  "run": {"role": "worker", "kind": "codex", "host": "leaseweb", "worktree": "new"},
+                  "approve": {"session": "01JF0000000000000000000002", "host": "leaseweb", "expectedStatusAt": 1764000200000}}
         for configured, scope in [(["nebula", "vela"], ["--scope=nebula", "--scope=vela", "--include-home"]),
                                   ("*", ["--scope=*", "--include-home"])]:
             self.gateway.board_projects = configured
