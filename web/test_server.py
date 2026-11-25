@@ -1,6 +1,7 @@
 import http.client
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import tempfile
@@ -125,7 +126,7 @@ class GatewayTests(unittest.TestCase):
                 Gateway(TOKEN, "http://127.0.0.1:8765", ["project"], preview_binary=binary, usage_service=None)
 
     def test_preview_fails_closed_for_bad_status_and_never_exposes_diagnostics(self):
-        gateway = Gateway(TOKEN, "http://127.0.0.1:8765", ["project"], preview_binary="/bin/true", usage_service=None)
+        gateway = Gateway(TOKEN, "http://127.0.0.1:8765", ["project"], preview_binary=shutil.which("true"), usage_service=None)
         invalid = [None, [], "running", {}, {"domain": "demo.example.test", "phase": []}]
         invalid += [{"domain": domain, "phase": "running"} for domain in [
             None, [], "", "localhost", "evil.test/path", "user@evil.test", "evil.test:443", "a..test",
