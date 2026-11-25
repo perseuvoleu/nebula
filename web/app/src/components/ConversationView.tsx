@@ -15,6 +15,9 @@ import { TerminalView } from "./TerminalView";
 import { sessionKey } from "@/lib/session-list";
 import { SessionTabs } from "./SessionTabs";
 
+/** How often the terminal shows `text`'s first line; a send's echo raises the count it had when sent. */
+const echoes = (text: string, output: string): number => output.split(text.trim().split("\n")[0]).length - 1;
+
 const ATTEMPT_LABEL: Record<Attempt["state"], string> = {
   sending: "Se trimite…",
   accepted: "Acceptat de Nebula · așteaptă confirmarea în istoric",
@@ -128,8 +131,22 @@ export function ConversationView({ project, previewUrl, row, state, controller, 
     if (attempt.state === "failed" && !getDraft(key)) onDraft(text);
   };
   // Terminal output echoes what was typed, so a delivered bubble would only sit below newer output.
-  const dismissDelivered = useCallback(() => {
-    for (const attempt of state.attempts) if (attempt.state === "accepted") controller.dismissAttempt(attempt.id);
+  const shown = useRef<string | null>(null);
+  const echoesWhenSent = useRef(new Map<string, number>());
+  useEffect(() => {
+    for (const attempt of state.attempts) {
+      if (shown.current !== null && !echoesWhenSent.current.has(attempt.id)) echoesWhenSent.current.set(attempt.id, echoes(attempt.text, shown.current));
+    }
+  }, [state.attempts]);
+  const dismissDelivered = useCallback((output: string, widened: boolean) => {
+    const previous = shown.current;
+    for (const attempt of state.attempts) {
+      const sent = echoesWhenSent.current.get(attempt.id);
+      if (sent === undefined || previous === null) echoesWhenSent.current.set(attempt.id, echoes(attempt.text, output));
+      else if (widened) echoesWhenSent.current.set(attempt.id, sent + echoes(attempt.text, output) - echoes(attempt.text, previous));
+      else if (attempt.state === "accepted" && echoes(attempt.text, output) > sent) controller.dismissAttempt(attempt.id);
+    }
+    shown.current = output;
   }, [state.attempts, controller]);
   const retry = (attempt: Attempt) => { controller.dismissAttempt(attempt.id); void send(attempt.text); };
 
