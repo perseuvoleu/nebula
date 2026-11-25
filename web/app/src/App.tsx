@@ -71,7 +71,7 @@ function PreviewButton({ url, className }: { url: string | null; className: stri
   );
 }
 
-function useSessions(projects: string[]) {
+function useSessions(projects: string[], keepLastList: boolean) {
   const [snapshot, setSnapshot] = useState<{ projects: string[]; rows: SessionRow[]; loaded: string[] } | null>(null);
   const [phase, setPhase] = useState<ListPhase>("loading");
   const [error, setError] = useState<string | null>(null);
@@ -87,8 +87,8 @@ function useSessions(projects: string[]) {
         sessions: async (project) => (await api<{ sessions: SessionRow[] }>("sessions", { project }, undefined, { timeoutMs: 20000, signal: abort.signal })).sessions,
       }, abort.signal);
       if (version !== generation.current) return;
-      setSnapshot(old => data.loaded.length || old?.projects !== projects ? { projects, rows: data.rows, loaded: data.loaded } : old);
-      setPhase(p => data.loaded.length ? "ready" : !navigator.onLine ? "offline" : p === "ready" ? p : "error");
+      setSnapshot(old => !data.loaded.length && keepLastList && old?.projects === projects ? { ...old, loaded: [] } : { projects, rows: data.rows, loaded: data.loaded });
+      setPhase(data.loaded.length ? "ready" : navigator.onLine ? "error" : "offline");
       setError(data.errors.length ? data.errors.map(e => `${e.project}: ${describeError(e.failure)}`).join("; ") : null);
     } catch (failure) {
       if (version !== generation.current) return;
@@ -96,7 +96,7 @@ function useSessions(projects: string[]) {
       setError(describeError(failure));
       setPhase((p) => (p === "loading" ? "error" : navigator.onLine ? p : "offline"));
     }
-  }, [projects]);
+  }, [projects, keepLastList]);
   useEffect(() => {
     setSnapshot(null); setPhase("loading"); setError(null);
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -160,7 +160,7 @@ function Shell({ workspace, route }: { workspace: Workspace; route: ReturnType<t
   const project = selection.project && workspace.projects.includes(selection.project) ? selection.project : workspace.projects[0];
   const sessionId = selection.project && !workspace.projects.includes(selection.project) ? null : selection.session;
   const listProjects = useMemo(() => selection.all ? workspace.projects : [project], [selection.all, workspace.projects, project]);
-  const sessions = useSessions(listProjects);
+  const sessions = useSessions(listProjects, !selection.all);
   const previewUrl = usePreview(selection.all && !selection.session ? null : project);
   const latestSelection = useRef(selection);
   const latestSessions = useRef(sessions);

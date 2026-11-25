@@ -52,6 +52,7 @@ export function SessionList({ sessions, phase, error, selected, unseen, onSelect
           </ul>
         )}
         {error && phase !== "offline" && <p role="alert" className="px-2 py-3 text-sm text-muted-foreground">Nu s-au putut încărca sesiunile: {error}</p>}
+        {phase === "error" && sessions.length > 0 && <p role="status" className="px-2 py-3 text-sm text-muted-foreground">Lista poate fi veche; se reîncearcă.</p>}
         {phase === "offline" && <p role="status" className="px-2 py-3 text-sm text-muted-foreground">Fără conexiune. Lista poate fi veche; agenții continuă pe server.</p>}
         {phase === "ready" && !error && sessions.length === 0 && (
           <div className="px-2 py-6 text-sm text-muted-foreground">
