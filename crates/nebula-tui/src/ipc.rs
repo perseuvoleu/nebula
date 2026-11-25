@@ -651,7 +651,7 @@ pub(crate) fn resolve_project(
 
 /// Await the Ack (or Error) for `req_id`, collecting entity upserts seen on
 /// the way; the daemon broadcasts the created row just before the Ack.
-async fn await_ack(
+pub(crate) async fn await_ack(
     conn: &mut Connection,
     req_id: u64,
     upserts: &mut Vec<nebula_core::Entity>,
@@ -707,7 +707,7 @@ pub async fn worktree_new(
 
 /// Ask the daemon for a worktree on `branch` (created from `base`, or the
 /// primary's HEAD) and return the checkout's path once its row lands.
-async fn create_worktree_path(
+pub(crate) async fn create_worktree_path(
     conn: &mut Connection,
     project: &nebula_core::ProjectId,
     branch: &str,
@@ -1716,6 +1716,12 @@ pub struct NewAgentOpts {
     /// `--no-card`: the session joins no card, not even its spawner's.
     pub no_card: bool,
     pub role: Option<nebula_core::board::Role>,
+    /// The spawning session when `todo run` crossed an ssh hop to get here;
+    /// otherwise NEBULA_AGENT_ID on this host.
+    pub parent: Option<nebula_core::board::SessionAt>,
+    /// `--dispatch ID`: the `todo run` dispatch this spawn fulfils; the
+    /// owning daemon answers a repeat with the session it already started.
+    pub dispatch: Option<nebula_core::DispatchId>,
 }
 
 /// Session name when the caller passed no `--name`: derived from the
@@ -1739,6 +1745,12 @@ fn default_agent_name(prompt: Option<&str>, taken: &[String]) -> String {
 
 /// `nebula agent new`: spawn a session on the given worktree.
 pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
+    println!("{}", spawn_agent(opts).await?);
+    Ok(())
+}
+
+/// Spawns as `agent new` does and returns the JSON it prints.
+pub async fn spawn_agent(opts: NewAgentOpts) -> Result<serde_json::Value> {
     let kind = nebula_core::AgentKind::parse(&opts.kind).with_context(|| {
         format!(
             "unknown agent kind {:?} (claude|codex|cursor|pi|antigravity)",
@@ -1752,6 +1764,13 @@ pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
     let mut conn = handshake(stream).await?;
     let (projects, worktrees, agents) = subscribe_snapshot(&mut conn).await?;
     let project = resolve_project(&projects, &worktrees, &agents, opts.project.as_deref())?;
+    if let Some(dispatch) = &opts.dispatch {
+        let executor = project
+            .host
+            .clone()
+            .unwrap_or_else(nebula_core::host::hostname);
+        crate::board_cli::check_executor(&mut conn, dispatch, &executor).await?;
+    }
     let caller = (env_agent_id().is_some() || opts.card.is_some())
         .then(|| crate::board_cli::Caller::resolve(&projects, &worktrees, &agents))
         .transpose()?;
@@ -1850,6 +1869,12 @@ pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
     // The owning daemon stays the judge of the writer mark: a refused claim
     // is retried until it is accepted or --writer-wait runs out, so the
     // protocol, the remote path and older daemons are unchanged.
+    let parent = opts.parent.clone().or_else(|| {
+        env_agent_id().map(|id| nebula_core::board::SessionAt {
+            host: nebula_core::host::hostname(),
+            id: AgentId(id),
+        })
+    });
     let wait_until = tokio::time::Instant::now() + opts.writer_wait;
     let mut req_id = 10u64;
     let mut announced = false;
@@ -1868,19 +1893,20 @@ pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
                 auto_title,
                 prompt: opts.prompt.clone(),
                 writer: opts.writer,
-                spawned_by: env_agent_id().map(AgentId),
+                spawned_by: parent.as_ref().map(|p| p.id.clone()),
                 code_mode_off: opts.code_mode_off,
                 card: card.clone(),
                 role: opts.role,
-                dispatch: None,
-                spawned_by_host: env_agent_id().map(|_| nebula_core::host::hostname()),
+                dispatch: opts.dispatch.clone(),
+                spawned_by_host: parent.as_ref().map(|p| p.host.clone()),
             },
         )
         .await?;
         let mut upserts = Vec::new();
         match await_ack(&mut conn, req_id, &mut upserts).await {
             Err(why)
-                if why.to_string().contains(nebula_core::WRITER_HELD_REFUSAL)
+                if nebula_core::board::Refusal::of(&why.to_string())
+                    == Some(nebula_core::board::Refusal::WriterHeld)
                     && tokio::time::Instant::now() < wait_until =>
             {
                 if !announced {
@@ -1904,19 +1930,40 @@ pub async fn agent_new(opts: NewAgentOpts) -> Result<()> {
         Some(nebula_core::EntityId::Agent(id)) => id.to_string(),
         _ => String::new(),
     };
-    println!(
-        "{}",
-        serde_json::json!({
+    if opts.dispatch.is_some() {
+        let (projects, worktrees, agents) = subscribe_snapshot(&mut conn).await?;
+        let unlisted = || format!("the daemon answered with session {id} but does not list it");
+        let agent = agents
+            .into_iter()
+            .find(|a| a.id.as_str() == id)
+            .with_context(unlisted)?;
+        let worktree = worktrees
+            .iter()
+            .find(|w| w.id == agent.worktree_id)
+            .with_context(unlisted)?;
+        let project = projects
+            .iter()
+            .find(|p| p.id == worktree.project_id)
+            .with_context(unlisted)?;
+        return Ok(serde_json::json!({
             "id": id,
-            "name": name,
-            "kind": opts.kind,
+            "name": agent.name,
+            "kind": agent.kind.as_str(),
             "project": project.name,
-            "worktree": target.branch,
-            "card": card,
-            "role": opts.role,
-        })
-    );
-    Ok(())
+            "worktree": worktree.branch,
+            "card": agent.card_id,
+            "role": agent.role,
+        }));
+    }
+    Ok(serde_json::json!({
+        "id": id,
+        "name": name,
+        "kind": opts.kind,
+        "project": project.name,
+        "worktree": target.branch,
+        "card": card,
+        "role": opts.role,
+    }))
 }
 
 /// `nebula agent list [--project <name>] [--all] [--worktree <branch>]`:

@@ -660,6 +660,10 @@ fn board_json_golden() {
                 writer: true,
                 alive: true,
                 stale: false,
+                parent: Some(SessionAt {
+                    host: "perseu-mbp".into(),
+                    id: AgentId("01JF0000000000000000000001".into()),
+                }),
             }],
             artifacts: vec![artifact()],
             log: vec![CardNote {
@@ -725,6 +729,8 @@ fn board_json_golden() {
             state: DispatchState::Started,
             session: Some(worker_at()),
             card: TodoId(CARD.into()),
+            host: "leaseweb".into(),
+            project: Some("nebula".into()),
         },
     );
 

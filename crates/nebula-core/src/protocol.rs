@@ -500,6 +500,15 @@ pub enum ClientRequest {
         source: PathBuf,
     },
 
+    /// Sends the approval key only while the session's status still carries
+    /// `expected_status_at`, so an approval never answers a newer question.
+    /// Answered by Ack, or Error (`not found:`, `conflict:`) with nothing sent.
+    ApproveSession {
+        req_id: u64,
+        id: AgentId,
+        expected_status_at: i64,
+    },
+
     /// Removes the tree `StoreArtifact` created under `id`, after the board
     /// definitely refused its row; refused when this daemon's board holds a
     /// row for `id`. Answered by Ack or Error.

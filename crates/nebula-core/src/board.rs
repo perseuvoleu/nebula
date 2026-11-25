@@ -198,6 +198,8 @@ pub struct CardSession {
     pub alive: bool,
     /// The host has not reported recently, so the row may be out of date.
     pub stale: bool,
+    /// The session that spawned this one, on whichever host it runs.
+    pub parent: Option<SessionAt>,
 }
 
 /// `todo show`: the card's fields with its sessions, artifacts and log beside them.
@@ -305,6 +307,12 @@ pub struct RunReceipt {
     pub state: DispatchState,
     pub session: Option<SessionAt>,
     pub card: TodoId,
+    /// The host the board admitted the run on, as that host reports itself.
+    pub host: String,
+    /// The card's project when the board admitted the run; a rerun spawns
+    /// there even if the card has moved since.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -393,6 +401,9 @@ pub enum BoardRead {
         scope: BoardScope,
         id: ArtifactId,
     },
+    Dispatch {
+        id: DispatchId,
+    },
 }
 
 /// Carries its client-minted id, so a rerun creates nothing twice.
@@ -471,7 +482,10 @@ impl BoardOp {
             BoardOp::Read(BoardRead::Card { card, .. }) => vec![card],
             BoardOp::Read(BoardRead::Artifacts { card, .. }) => card.iter_mut().collect(),
             BoardOp::Read(
-                BoardRead::Board { .. } | BoardRead::Cards { .. } | BoardRead::Artifact { .. },
+                BoardRead::Board { .. }
+                | BoardRead::Cards { .. }
+                | BoardRead::Artifact { .. }
+                | BoardRead::Dispatch { .. },
             ) => vec![],
             BoardOp::EditCard { card, .. }
             | BoardOp::Move { card, .. }
@@ -501,14 +515,17 @@ pub enum Refusal {
     Unreachable,
     /// The board link failed after the request was written.
     OutcomeUnknown,
+    /// Another live session holds the checkout's writer slot.
+    WriterHeld,
 }
 
 impl Refusal {
-    const ALL: [Refusal; 4] = [
+    const ALL: [Refusal; 5] = [
         Refusal::NotFound,
         Refusal::Conflict,
         Refusal::Unreachable,
         Refusal::OutcomeUnknown,
+        Refusal::WriterHeld,
     ];
 
     fn tag(self) -> &'static str {
@@ -517,6 +534,7 @@ impl Refusal {
             Refusal::Conflict => "conflict: ",
             Refusal::Unreachable => "; nothing was sent",
             Refusal::OutcomeUnknown => "; outcome unknown; rerun the same command",
+            Refusal::WriterHeld => "writer held: ",
         }
     }
 
@@ -532,9 +550,13 @@ impl Refusal {
     }
 
     pub fn of(message: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|r| match r.trails() {
-            true => message.contains(r.tag()),
-            false => message.starts_with(r.tag()),
+        let led = Self::ALL
+            .into_iter()
+            .find(|r| !r.trails() && message.starts_with(r.tag()));
+        led.or_else(|| {
+            Self::ALL
+                .into_iter()
+                .find(|r| r.trails() && message.contains(r.tag()))
         })
     }
 
@@ -543,7 +565,7 @@ impl Refusal {
             Refusal::Unreachable => 3,
             Refusal::OutcomeUnknown => 4,
             Refusal::NotFound => 5,
-            Refusal::Conflict => 6,
+            Refusal::Conflict | Refusal::WriterHeld => 6,
         }
     }
 }

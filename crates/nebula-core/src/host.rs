@@ -1,9 +1,16 @@
 //! Machine identity for the status bar: which host is this nebula running on,
 //! and did we get here over ssh?
 
-/// Short machine hostname: gethostname(2), then the `HOSTNAME` env var, then
+/// Short machine hostname: `NEBULA_HOSTNAME` (tests run two hosts on one
+/// machine), else gethostname(2), then the `HOSTNAME` env var, then
 /// "unknown". Domain suffix is stripped ("mbp.local" -> "mbp").
 pub fn hostname() -> String {
+    if let Some(name) = std::env::var("NEBULA_HOSTNAME")
+        .ok()
+        .filter(|h| !h.is_empty())
+    {
+        return name;
+    }
     short_name(&full_hostname()).to_string()
 }
 
