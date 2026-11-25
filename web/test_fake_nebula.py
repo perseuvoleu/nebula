@@ -80,6 +80,8 @@ class FakeBoardTests(unittest.TestCase):
     def test_a_title_after_the_delimiter_is_not_a_flag(self):
         card = self.cli("todo", "add", "--project=nebula", "--json", "--", "--propose")
         self.assertEqual((card["title"], card["proposed"]), ("--propose", False))
+        card = self.cli("todo", "add", "--home", "--json", "--", "--project")
+        self.assertEqual((card["title"], card["project"]), ("--project", None))
 
     def test_concurrent_notes_all_land_and_each_bumps_the_version(self):
         version = int(self.cli("todo", "board", *SCOPE, "--json")["version"].split(".")[1])
