@@ -8,7 +8,10 @@ import base64
 import json
 import os
 import shutil
+import signal
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -153,9 +156,6 @@ def main():
 
 def serve_real():
     """The real lane: an isolated daemon at $REAL_NEBULA_STATE behind the real gateway, via real_nebula.sh."""
-    import signal
-    import subprocess
-    import time
     state, binary = Path(os.environ["REAL_NEBULA_STATE"]), Path(os.environ["REAL_NEBULA_BIN"])
     if not os.access(binary, os.X_OK):
         raise SystemExit(f"No nebula at {binary}; run `heavy .agents/skills/verify-nebula/vn build` first")
