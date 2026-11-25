@@ -139,6 +139,51 @@ pub(crate) fn run_on_host(host: &str, argv: Vec<String>) -> Result<i32> {
     Ok(out.status.code().unwrap_or(1))
 }
 
+/// What ssh prints when it failed before the remote command could start.
+const SSH_NOT_CONNECTED: [&str; 7] = [
+    "ssh: connect to host",
+    "ssh: Could not resolve hostname",
+    "Connection refused",
+    "Permission denied (",
+    "Host key verification failed",
+    "Connection timed out during banner exchange",
+    "kex_exchange_identification",
+];
+
+/// As [`run_on_host`], for a command with effects: exit 3 only when ssh
+/// failed before the command could start, else 4 with `rerun` named, as
+/// the command may have run.
+pub(crate) fn run_effect_on_host(host: &str, argv: Vec<String>, rerun: &str) -> Result<i32> {
+    use anyhow::Context;
+    use nebula_core::board::Refusal;
+    use std::io::Write;
+    let out = std::process::Command::new("ssh")
+        .args(&argv)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .context("run ssh")?;
+    if out.status.code() == Some(255) {
+        let why = String::from_utf8_lossy(&out.stderr);
+        let why = why.trim();
+        if SSH_NOT_CONNECTED.iter().any(|m| why.contains(m)) {
+            eprintln!(
+                "nebula: {}",
+                Refusal::Unreachable.message(format!("host {host} is unreachable: {why}"))
+            );
+            return Ok(3);
+        }
+        eprintln!(
+            "nebula: {} {rerun}",
+            Refusal::OutcomeUnknown.message(format!("ssh to {host} broke off: {why}"))
+        );
+        return Ok(4);
+    }
+    std::io::stdout().write_all(&out.stdout)?;
+    std::io::stdout().flush()?;
+    std::io::stderr().write_all(&out.stderr)?;
+    Ok(out.status.code().unwrap_or(1))
+}
+
 /// Phase-2 throwaway raw-mode client (`nebula _raw-attach`).
 pub fn run_raw_attach(name: &str) -> Result<()> {
     runtime()?.block_on(raw_attach::run(name))

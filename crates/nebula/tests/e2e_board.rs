@@ -2793,9 +2793,10 @@ fn ssh_stub_as(env: &Env, target: &Env, host: &str) -> (String, PathBuf, PathBuf
     std::fs::write(
         bin.join("ssh"),
         format!(
-            "#!/bin/sh\n[ \"$(cat '{log}' 2>/dev/null | grep -c '^BatchMode=yes$')\" -ge 3 ] && exit 255\nprintf '%s\\n' \"$@\" >> '{log}'\n[ -e '{down}' ] && {{ echo 'ssh: connect to host: Connection refused' >&2; exit 255; }}\nfor arg do script=$arg; done\nunset NEBULA_AGENT_ID\nexport HOME='{home}' NEBULA_RUNTIME_DIR='{rt}' NEBULA_DATA_DIR='{data}' NEBULA_HOSTNAME='{host}' PATH='{nebula}':\"$PATH\"\nexec /bin/sh -c \"$script\"\n",
+            "#!/bin/sh\n[ \"$(cat '{log}' 2>/dev/null | grep -c '^BatchMode=yes$')\" -ge 3 ] && exit 255\nprintf '%s\\n' \"$@\" >> '{log}'\n[ -e '{down}' ] && {{ echo 'ssh: connect to host: Connection refused' >&2; exit 255; }}\nfor arg do script=$arg; done\nunset NEBULA_AGENT_ID\nexport HOME='{home}' NEBULA_RUNTIME_DIR='{rt}' NEBULA_DATA_DIR='{data}' NEBULA_HOSTNAME='{host}' PATH='{nebula}':\"$PATH\"\n[ -e '{lost}' ] && {{ /bin/sh -c \"$script\" >/dev/null 2>&1; echo 'Connection to host closed by remote host.' >&2; exit 255; }}\nexec /bin/sh -c \"$script\"\n",
             log = log.display(),
             down = down.display(),
+            lost = env.tmp.path().join("ssh-lost").display(),
             home = home.display(),
             rt = target.runtime_dir().display(),
             data = target.data_dir().display(),
@@ -3009,6 +3010,86 @@ fn cross_host_run_over_ssh_keeps_parent() {
         child["parent"],
         serde_json::json!({"host": nebula_core::host::hostname(), "id": lead})
     );
+}
+
+#[test]
+fn cross_host_ssh_lost_exit_4() {
+    let board = board_env();
+    let agent = replay_agent("ask.replay");
+    let laptop = viewer_on(
+        &proxy_to(&board),
+        "laptop",
+        &[
+            ("NEBULA_AGENT_CMD", agent.as_str()),
+            ("NEBULA_STATUS_TICK_MS", "100"),
+        ],
+    );
+    laptop.make_repo();
+    add(&board, &["--project", "repo"], "Lost reply");
+    reported(&board, "laptop");
+    let (path, _, _) = ssh_stub(&board, &laptop);
+    let lost = board.tmp.path().join("ssh-lost");
+    std::fs::write(&lost, "").unwrap();
+    let argv = run_argv(&board, "#1", &[("--host", "laptop")], &[]);
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let cut = board.cli_env(&argv, None, &[("PATH", &path)]);
+    assert_eq!(cut.status.code(), Some(4), "{}", stderr(&cut));
+    let dispatch = stderr(&cut)
+        .split("--dispatch ")
+        .nth(1)
+        .map(|rest| rest.split_whitespace().next().unwrap().to_string())
+        .unwrap_or_else(|| panic!("no dispatch named: {}", stderr(&cut)));
+    let agents = agents_of(&laptop);
+    assert_eq!(agents.len(), 1);
+    std::fs::remove_file(&lost).unwrap();
+    let rerun = run_argv(
+        &board,
+        "#1",
+        &[("--host", "laptop")],
+        &["--dispatch", &dispatch],
+    );
+    let rerun: Vec<&str> = rerun.iter().map(String::as_str).collect();
+    let run = receipt(board.cli_env(&rerun, None, &[("PATH", &path)]));
+    assert_eq!(run["session"]["id"], agents[0]["id"]);
+    assert_eq!(agents_of(&laptop).len(), 1);
+
+    let session = run["session"]["id"].as_str().unwrap().to_string();
+    let name = agents[0]["name"].as_str().unwrap().to_string();
+    for text in ["go", "on"] {
+        let sent = laptop.cli(&["agent", "send", &name, text, "--project", "repo"], None);
+        assert!(sent.status.success(), "{}", stderr(&sent));
+    }
+    let at = eventually("the laptop session asking on the board", || {
+        chain(&board, "#1")
+            .iter()
+            .find(|s| s["id"] == session.as_str() && s["status"] == "needs_feedback")
+            .and_then(|s| s["status_changed_at"].as_i64())
+    })
+    .to_string();
+    std::fs::write(&lost, "").unwrap();
+    let approve = board.cli_env(
+        &[
+            "todo",
+            "approve",
+            "#1",
+            "--session",
+            &session,
+            "--expected-status-at",
+            &at,
+            "--json",
+        ],
+        None,
+        &[("PATH", &path)],
+    );
+    assert_eq!(approve.status.code(), Some(4), "{}", stderr(&approve));
+    assert!(
+        stderr(&approve).contains(&session) && stderr(&approve).contains(&at),
+        "{}",
+        stderr(&approve)
+    );
+    eventually("the laptop session moving on", || {
+        (session_row(&laptop, &session)["status"] != "needs_feedback").then_some(())
+    });
 }
 
 #[test]

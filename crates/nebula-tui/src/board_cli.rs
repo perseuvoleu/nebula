@@ -589,7 +589,7 @@ async fn run_dispatch(
             if json {
                 words.push("--json");
             }
-            return on_host(&host, &words);
+            return on_host(&host, &words, &format!("with --dispatch {}", id.as_str()));
         }
     };
     let worktree = match worktree.as_str() {
@@ -682,8 +682,8 @@ fn run_target(projects: &[Project], here: &str, host: &str, project: &str) -> Ta
     }
 }
 
-fn on_host(host: &str, words: &[&str]) -> Result<()> {
-    match crate::run_on_host(host, crate::session_open::ssh_argv(host, words)?)? {
+fn on_host(host: &str, words: &[&str], rerun: &str) -> Result<()> {
+    match crate::run_effect_on_host(host, crate::session_open::ssh_argv(host, words)?, rerun)? {
         0 => Ok(()),
         code => std::process::exit(code),
     }
@@ -831,7 +831,11 @@ async fn approve(
         if json {
             words.push("--json");
         }
-        return on_host(&found.host, &words);
+        let rerun = format!(
+            "for session {} with --expected-status-at {expected_status_at}",
+            found.id.as_str()
+        );
+        return on_host(&found.host, &words, &rerun);
     }
     let req_id = 2;
     write_frame(
