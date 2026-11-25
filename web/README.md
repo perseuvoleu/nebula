@@ -184,7 +184,7 @@ The real lane runs the same gateway against an isolated daemon built from this c
 the real CLI and its JSON (no fake), and publishes a Playwright reporter run as an artifact:
 
 ```bash
-heavy web/e2e/build_real_nebula.sh                                 # target/verify-nebula/debug/nebula, no Ghostty without zig
+heavy web/e2e/build_real_nebula.sh                                 # target/verify-nebula/debug/nebula, no Ghostty without zig 0.15
 pnpm --dir web/app test:e2e board.spec.ts board-artifacts.spec.ts  # a reporter run with ≥ 12 screenshots
 pnpm --dir web/app test:e2e --project real                         # 127.0.0.1:8791
 ```

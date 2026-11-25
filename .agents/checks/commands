@@ -14,7 +14,7 @@ cargo fmt --check
 [web/**,.agents/checks/commands] web/checks-python.sh
 [web/app/**,web/e2e/e2e-run-reporter.ts,crates/nebula-core/tests/fixtures/board/e2e_run_result.json,.agents/checks/commands] pnpm --dir web/app test:unit
 [web/app/**,web/e2e/**,web/*.py,.agents/checks/commands] pnpm --dir web/app build && pnpm --dir web/app test:e2e
-[Cargo.toml,Cargo.lock,crates/nebula-core/*,crates/nebula-daemon/*,crates/nebula-tui/*,crates/nebula-rag/*,crates/nebula/Cargo.toml,crates/nebula/build.rs,crates/nebula/src/*,crates/nebula/tests/replay/*,web/app/**,web/e2e/real/**,web/e2e/real_nebula.sh,web/e2e/build_real_nebula.sh,web/e2e/serve.py,web/e2e/helpers.ts,web/e2e/e2e-run-reporter.ts,web/server.py,.agents/checks/commands] web/e2e/build_real_nebula.sh && pnpm --dir web/app build && pnpm --dir web/app test:e2e board.spec.ts board-artifacts.spec.ts && pnpm --dir web/app test:e2e --project real
+[Cargo.toml,Cargo.lock,crates/nebula-core/*,crates/nebula-daemon/*,crates/nebula-tui/*,crates/nebula-rag/*,crates/nebula/Cargo.toml,crates/nebula/build.rs,crates/nebula/src/*,crates/nebula/tests/replay/*,web/app/**,web/e2e/real/**,web/e2e/real_nebula.sh,web/e2e/build_real_nebula.sh,.agents/checks/cargo,web/e2e/serve.py,web/e2e/helpers.ts,web/e2e/e2e-run-reporter.ts,web/server.py,.agents/checks/commands] web/e2e/build_real_nebula.sh && pnpm --dir web/app build && pnpm --dir web/app test:e2e board.spec.ts board-artifacts.spec.ts && pnpm --dir web/app test:e2e --project real
 [web/deploy/prep-release.sh,.agents/checks/commands] bash -n web/deploy/prep-release.sh
 [scripts/**,.agents/checks/commands] sh scripts/sync-skills.test.sh
 [.agents/skills/verify-nebula/*,.agents/checks/commands] bash .agents/skills/verify-nebula/test-vn.sh
