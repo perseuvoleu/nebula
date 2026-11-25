@@ -60,9 +60,12 @@ test("a decision recorded on the card is found by the decisions search", async (
   await form.getByLabel("De ce").fill("One CLI call per poll is cheap");
   await form.getByRole("button", { name: "Notează" }).click();
   await expect(section(page, "Poll the real board every three seconds").getByText("One CLI call per poll is cheap")).toBeVisible();
+  nebula("decision", "add", "Keep the drag handle on the left", "--why", "Thumbs rest there", "--card", String(card.number));
   await page.goto("/board/decisions");
+  await expect(page.getByRole("article")).toHaveCount(2);
   await page.getByRole("searchbox", { name: "Caută decizii" }).fill("three seconds");
   await expect(page.getByRole("article")).toHaveCount(1);
+  await expect(page.getByRole("article").filter({ hasText: "Keep the drag handle on the left" })).toHaveCount(0);
   await expect(page.getByRole("article").getByRole("link", { name: new RegExp(`#${card.number}`) })).toBeVisible();
   expect(nebula("decision", "list", "--project", "repo")).toContain("Poll the real board every three seconds");
 });
@@ -78,11 +81,20 @@ test("a reporter run published with nebula artifact add opens with every screens
   const card = add("Show the runs");
   nebula("artifact", "add", RUN, "--kind", "e2e-run", "--title", "Reporter run", "--card", String(card.number), "--json");
   nebula("artifact", "add", recap, "--kind", "recap", "--title", "Real recap", "--card", String(card.number), "--json");
-  await openBoard(page, `/board/p/repo/c/${card.number}`);
   const images = section(page, "Reporter run").getByRole("img");
+  const incomplete = () => images.evaluateAll((imgs: HTMLImageElement[]) => imgs.filter((img) => !(img.complete && img.naturalWidth)).length);
+  let incompleteAtPoll: Promise<number> | undefined;
+  await page.route("**/a/**/shots/*.png", async (route) => {
+    const response = await route.fetch();
+    incompleteAtPoll ??= page.waitForResponse((r) => new URL(r.url()).pathname === "/api/board" && r.ok()).then(incomplete);
+    await incompleteAtPoll;
+    await route.fulfill({ response });
+  });
+  await openBoard(page, `/board/p/repo/c/${card.number}`);
   await expect(images).toHaveCount(shots.length);
   for (const image of await images.all()) await image.scrollIntoViewIfNeeded();
-  await expect.poll(() => images.evaluateAll((imgs: HTMLImageElement[]) => imgs.filter((img) => !(img.complete && img.naturalWidth)).length)).toBe(0);
+  await expect.poll(incomplete).toBe(0);
+  expect(await incompleteAtPoll, "a board poll succeeded while screenshots were still loading").toBeGreaterThan(0);
   const frame = section(page, "Real recap").locator("iframe");
   await frame.scrollIntoViewIfNeeded();
   await expect(frame).toHaveAttribute("sandbox", "allow-scripts");

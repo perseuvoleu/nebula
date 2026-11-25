@@ -1,5 +1,4 @@
 #!/bin/sh
-# The real lane's nebula: the gateway's NEBULA_WEB_BINARY and the isolated daemon's launcher.
 # Gateway.run strips every NEBULA_* variable, so the isolated dirs travel as REAL_NEBULA_STATE.
 set -eu
 : "${REAL_NEBULA_STATE:?}" "${REAL_NEBULA_BIN:?}"

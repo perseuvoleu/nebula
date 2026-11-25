@@ -3,7 +3,6 @@ import path from "node:path";
 import { defineConfig, devices } from "@playwright/test";
 
 // Real gateway (web/server.py) on a loopback port, fake `nebula` CLI and synthetic Pi files.
-// Real lane (--project real): the same gateway on an isolated daemon built from this checkout (web/e2e/real_nebula.sh).
 // Workers reload this file without the main process's argv, so the lane travels in the environment.
 const asked = process.argv.some((arg, i, argv) => arg === "--project=real" || (arg === "--project" && argv[i + 1] === "real"));
 process.env.NEBULA_E2E_LANE ??= asked ? "real" : "fake";
