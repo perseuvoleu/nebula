@@ -297,6 +297,22 @@ pub(crate) const CLOSED: &str = "daemon closed the connection before replying";
 
 /// Reads the card `text` names, so a spawn linking it is refused before
 /// anything starts.
+/// The spawner's card while the board still holds it unarchived; a child of
+/// an archived or removed card joins none. A board that cannot answer keeps
+/// the card, as a spawn without a board does.
+pub async fn inherited_card(conn: &mut Connection, card: TodoId) -> Result<Option<TodoId>> {
+    let op = BoardOp::Read(BoardRead::Card {
+        scope: ScopeFlags::default().scope(None),
+        card: CardRef::Id(card.clone()),
+    });
+    match request(conn, op).await {
+        Ok(BoardResult::Show(show)) => Ok((!show.card.archived).then_some(show.card.id)),
+        Ok(other) => bail!("the board answered a card read with {other:?}"),
+        Err(why) if Refusal::of(&why.to_string()) == Some(Refusal::NotFound) => Ok(None),
+        Err(_) => Ok(Some(card)),
+    }
+}
+
 pub async fn check_card(conn: &mut Connection, text: &str) -> Result<TodoId> {
     Ok(read_card(conn, text).await?.id)
 }

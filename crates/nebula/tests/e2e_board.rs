@@ -872,6 +872,21 @@ fn chain(env: &Env, card: &str) -> Vec<Value> {
 }
 
 #[test]
+fn child_of_an_archived_card_joins_none() {
+    let env = board_env();
+    env.make_repo();
+    add(&env, &["--project", "repo"], "Gone");
+    let parent = json_of(
+        spawn_agent(&env, &["--card", "#1", "--name", "parent"]),
+        &["agent", "new", "parent"],
+    );
+    env.json(&["todo", "archive", "#1", "--json"]);
+    let argv = ["agent", "new", "--project", "repo", "--worktree", "main", "--name", "late"];
+    let child = json_of(env.cli(&argv, parent["id"].as_str()), &argv);
+    assert_eq!(child["card"], Value::Null);
+}
+
+#[test]
 fn child_inherits_card_not_role() {
     let env = board_env();
     env.make_repo();
