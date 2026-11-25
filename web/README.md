@@ -175,6 +175,23 @@ phone/tablet/desktop/landscape layouts with screenshots in `.scratch/mobile-chat
 machine with a browser (`pnpm --dir web/app exec playwright install chromium` once).
 **findl has no browser: those checks stay pending until run from the laptop.**
 
+The real lane runs the same gateway against an isolated daemon built from this checkout, through
+the real CLI and its JSON (no fake), and publishes a Playwright reporter run as an artifact:
+
+```bash
+heavy .agents/skills/verify-nebula/vn build                        # target/verify-nebula/debug/nebula
+pnpm --dir web/app test:e2e board.spec.ts board-artifacts.spec.ts  # a reporter run with ≥ 12 screenshots
+pnpm --dir web/app test:e2e --project real                         # 127.0.0.1:8791
+```
+
+`web/e2e/serve.py --real` starts the daemon under `$REAL_NEBULA_STATE` (default `/tmp/nre-<checkout hash>`)
+with `board = "local"` and the replay agent as its agent command, then the gateway with
+`NEBULA_WEB_BINARY=web/e2e/real_nebula.sh`. The gateway strips every `NEBULA_*` variable from its CLI calls,
+so the launcher re-exports `NEBULA_RUNTIME_DIR` and `NEBULA_DATA_DIR` from `REAL_NEBULA_STATE` and sets
+`NEBULA_RAG_LOCAL=0 NEBULA_RAG_HOST=nebula-real-e2e.invalid`, so a decision never reaches the real RAG.
+Any gateway aimed at a non-default daemon needs such a launcher. `REAL_NEBULA_BIN` picks another binary,
+`REAL_E2E_RUN` another reporter run (this lane's own: `.scratch/real-e2e/e2e-run`).
+
 To inspect a candidate visually from the laptop without touching production, start a
 preview on findl on a loopback port with a synthetic token and tunnel it:
 
@@ -223,6 +240,110 @@ on, HTTP/2 origin on. The leaseweb route it replaces is `http://127.0.0.1:8765`.
 
 **The token grants agent control as the server's OS user.** Project allowlisting is an API
 scope, not an OS sandbox. Rotate a leaked token in the env file and restart only `nebula-web`.
+
+## Board rollout (protocol 33, migration 29)
+
+Order: leaseweb, then the laptops, then findl. `nebula kill` stops every session on its host, so
+each one waits for the user's go. Build every host from the same commit `<sha>` (the merged
+agent-home release on main). Facts measured 2026-11-25: leaseweb runs `~/.local/bin/nebula`
+0.6.0 (b7dfd64), has no zig and no `config.json`; findl runs a hand-built `~/.local/bin/nebula`
+that has `rag` and no zig (never `nebula upgrade` there: the published build drops `rag`); the
+laptop runs `~/.cargo/bin/nebula`. A daemon migrated to 29 cannot be read by an older binary, so
+every host keeps a copy of its database from before the upgrade.
+
+### 1. leaseweb becomes the board host
+
+Any CLI call starts a daemon when none runs, the gateway's polls included, so the gateway stops
+first and the database is copied online before the kill. `backup` below is
+`python3 -c 'import sqlite3,sys; sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True).backup(sqlite3.connect(sys.argv[2]))'`
+(leaseweb and findl have no `sqlite3` binary).
+
+```bash
+git -C ~/nebula fetch && git -C ~/nebula worktree add ~/nebula-release-33 <sha>
+cp -p ~/.local/bin/nebula ~/.local/bin/nebula.pre-33
+cd ~/nebula-release-33 && heavy make install-novt PREFIX=$HOME/.local/bin
+systemctl --user stop nebula-web
+backup ~/.local/share/nebula/nebula.db ~/.local/share/nebula/nebula.db.pre-33
+printf '{"board": "local"}\n' > ~/.local/share/nebula/config.json
+nebula kill                                                       # user's go
+nebula todo board --json | head -c 300                            # starts the new daemon; answers
+mkdir -p -m 700 ~/.local/share/nebula/artifacts
+```
+
+Projects: the board host serves every project findl's `NEBULA_WEB_PROJECTS` listed (14 on
+2026-11-25; leaseweb's daemon knew 4 of them). Each missing one is cloned under
+`~/Projects/<name>` from the origin findl uses, which needs the same deploy-key alias in leaseweb's
+`~/.ssh/config` that findl's has. A checkout with no origin is copied through the laptop
+(`scp -3 -r findl:<dir> leaseweb:Projects/`), since findl and leaseweb cannot ssh to each other.
+Then `nebula add ~/Projects/<name>` for each.
+
+Re-add the legacy rows: `nebula artifact add https://vela.possu.dev --project vela-hub-fork
+--title vela` (the findl link); the laptop note only if the user wants it.
+
+Gateway: a release at `<sha>` built the way ticket 01 did (`git archive` on the laptop, then
+`prep-leaseweb.sh <sha>` on leaseweb, which also builds `web-releases/client-<sha>/bin/nebula`),
+then in `~/.config/nebula-web.env` (keep a copy as `nebula-web.env.bak-pre-33`):
+
+```bash
+NEBULA_WEB_PROJECTS=<findl's 14>
+NEBULA_WEB_BOARD_PROJECTS=<the same 14>
+NEBULA_WEB_ARTIFACTS=/home/<user>/.local/share/nebula/artifacts
+NEBULA_WEB_BINARY=/home/<user>/.local/share/nebula/web-releases/client-<sha>/bin/nebula
+```
+
+Point `nebula-web.service.d/90-durable-release.conf` at `web-releases/<sha>`, then
+`systemctl --user daemon-reload && systemctl --user start nebula-web`. Check:
+`nebula --version` names `<sha>`; `curl -s -H 'Host: code.possu.dev' -H "Authorization: Bearer $T"
+http://127.0.0.1:8765/api/board` answers 200 with `cards`.
+
+Decisions are copied to the RAG on findl over ssh. leaseweb → findl ssh fails today on host key
+verification, so the copy retries until leaseweb trusts findl (an `ssh findl true` that exits 0).
+
+### 2. The laptops
+
+Quit every `ng` window first: a TUI restarts the daemon it lost.
+
+```bash
+D="$HOME/Library/Application Support/dev.nebula.nebula"
+cp -p ~/.cargo/bin/nebula ~/.cargo/bin/nebula.pre-33
+git -C ~/Projects/nebula worktree add ~/nebula-release-33 <sha>
+cd ~/nebula-release-33 && heavy make install
+sqlite3 "$D/nebula.db" ".backup '$D/nebula.db.pre-33'"
+python3 -c 'import json,sys; p=sys.argv[1]; c=json.load(open(p)); c["board"]="leaseweb"; json.dump(c, open(p,"w"), indent=2)' "$D/config.json"
+nebula kill                                                           # user's go
+nebula todo add --project nebula Rollout check                        # prints #<n>@leaseweb
+```
+
+The board link is `ssh leaseweb` in BatchMode, so `ssh -o BatchMode=yes leaseweb true` must exit 0
+first (it does from the main laptop). Run on the laptop, approve and open in code from the web
+need the reverse: Remote Login on the laptop and a `Host <laptop>` entry with its `User` in
+leaseweb's `~/.ssh/config`, checked with `ssh leaseweb ssh -o BatchMode=yes <laptop> true`.
+
+### 3. findl
+
+findl cannot reach leaseweb on port 22 (its public and its tailnet address both time out,
+measured 2026-11-25), so `board = "leaseweb"` waits for a path (a Tailscale ACL or Tailscale
+SSH, plus a `Host leaseweb` entry). Then, building beside the dirty `~/nebula` checkout:
+
+```bash
+git -C ~/nebula fetch && git -C ~/nebula worktree add ~/nebula-release-33 <sha>
+cp -p ~/.local/bin/nebula ~/.local/bin/nebula.pre-33
+cd ~/nebula-release-33 && heavy make install-novt PREFIX=$HOME/.local/bin && nebula rag --help >/dev/null
+backup ~/.local/share/nebula/nebula.db ~/.local/share/nebula/nebula.db.pre-33
+python3 -c 'import json,sys; p=sys.argv[1]; c=json.load(open(p)); c["board"]="leaseweb"; json.dump(c, open(p,"w"), indent=2)' ~/.local/share/nebula/config.json
+nebula kill                                                           # user's go
+nebula todo board --json | head -c 300
+```
+
+### Rollback
+
+Per host, newest first: on leaseweb stop `nebula-web` first; `nebula kill`, restore the binary
+(`mv nebula.pre-33 nebula` in its directory), delete `nebula.db-wal` and `nebula.db-shm`, move
+`nebula.db.pre-33` over `nebula.db`, delete the `board` key from
+`config.json` (leaseweb: delete the file), then start the daemon (`nebula agent list --all`). On
+leaseweb also restore `nebula-web.env.bak-pre-33`, point the drop-in back at release
+1df2ca59b7aaea1fc536811c6dacc04c1b17b69f, `systemctl --user daemon-reload` and start `nebula-web`. Cards, artifacts and
+decisions made after the upgrade are lost with the database copy.
 
 ## Delivery semantics and limitations
 
