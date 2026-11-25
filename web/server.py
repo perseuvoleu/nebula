@@ -358,7 +358,8 @@ class Gateway:
         for row in card.get("artifacts") or []:
             entry = (row.get("content") or {}).get("entry")
             if isinstance(entry, str) and self.artifact_dir(row.get("id")):
-                row["src"] = f"/a/{self.grant(row['id'])}/{row['id']}/{quote(entry)}"
+                grant = self.grant(row["id"])
+                row["src"], row["expires"] = f"/a/{grant}/{row['id']}/{quote(entry)}", int(grant.partition(".")[0])
         return card
 
     def card_session(self, card, body):

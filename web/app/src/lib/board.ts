@@ -24,8 +24,6 @@ export type BoardSession = {
   writer: boolean;
 };
 
-export type CardCheckout = { host: string; branch: string; path: string; worktree: boolean };
-
 export type BlockerRef = { ref: string; title: string };
 
 export type BoardCard = {
@@ -37,7 +35,7 @@ export type BoardCard = {
   proposedBy: string | null;
   needsYou: boolean;
   blockers: BlockerRef[];
-  checkout: CardCheckout | null;
+  checkout: Checkout | null;
   sessions: BoardSession[] | null;
   artifacts: number;
   age: string;
@@ -148,7 +146,15 @@ export type Artifact = {
   created_at: number;
   /** Minted by the gateway when it stores the files: /a/<grant>/<id>/<entry>. */
   src?: string;
+  /** Unix seconds after which `src`'s grant is refused. */
+  expires?: number;
 };
+
+/** How long before a grant's expiry the card page reads a fresh one and moves its artifacts to it. */
+export const GRANT_RENEW_MS = 5 * 60_000;
+
+export const grantLapsing = (expires: number | undefined, now: number): boolean =>
+  expires !== undefined && expires * 1000 - GRANT_RENEW_MS <= now;
 
 export type CardShow = Card & { sessions: CardSession[]; artifacts: Artifact[]; log: CardNote[] };
 

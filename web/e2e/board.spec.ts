@@ -142,6 +142,7 @@ test("sidebar counts and quiet projects", async ({ page }) => {
   await open(page, "/board");
   const sidebar = page.getByRole("navigation", { name: "Proiecte" });
   await expect(sidebar.getByRole("button", { name: /nebula\s*2$/ })).toBeVisible();
+  await expect(sidebar.getByRole("button", { name: /^Toate proiectele\s*2$/ })).toBeVisible();
   await expect(sidebar.getByRole("button", { name: /vela/ })).toHaveCount(0);
   await sidebar.getByRole("button", { name: /Liniștite/ }).click();
   await expect(sidebar.getByRole("button", { name: /vela\s*0$/ })).toBeVisible();

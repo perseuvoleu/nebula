@@ -201,3 +201,51 @@ test("an artifact keeps its frame and content when the card is read again with a
   await expect(run.getByText(/pași au trecut|trecuți/)).toBeVisible();
   await expect(page.frameLocator('iframe[title="Recap slice 1"]').getByText("recap body")).toBeVisible();
 });
+
+test("a card page left open past its grants' expiry still loads its frame and lazy thumbnails with a fresh grant", async ({ page }) => {
+  const steps = Array.from({ length: 12 }, (_, i) => ({ name: `step ${i + 1}`, status: "passed", duration_ms: 100, screenshot: `shots/${i + 1}.png` }));
+  storeArtifact(RUN, { "result.json": JSON.stringify({ title: "board.spec", status: "passed", started_at: 1764000000000, duration_ms: 1200, steps }),
+    ...Object.fromEntries(steps.map((s) => [s.screenshot, PNG])) });
+  storeArtifact("01JG0000000000000000000010", { "index.html": "<!doctype html><title>r</title><p>recap body</p>" });
+  addArtifacts(artifact("01JG0000000000000000000010", "recap", "Recap slice 1", { host: "leaseweb", entry: "index.html" }));
+  await page.clock.install({ time: Date.now() });
+  const HELD = "/a/1.held/";
+  const real = new Map<string, string>();
+  let lapsed = false;
+  let expires: number | undefined;
+  await page.route("**/api/cards/*", async (route) => {
+    const response = await route.fetch();
+    const card = await response.json();
+    if (!lapsed) {
+      expires ??= Math.floor((await page.evaluate(() => Date.now())) / 1000) + 600;
+      for (const a of card.artifacts ?? []) if (a.src) {
+        real.set(a.id, a.src.split("/")[2]);
+        Object.assign(a, { src: a.src.replace(/^\/a\/[^/]+\//, HELD), expires });
+      }
+    }
+    await route.fulfill({ response, json: card });
+  });
+  await page.route(`**${HELD}**`, async (route) => {
+    if (lapsed) return route.fulfill({ status: 403, body: "Artifact link expired" });
+    const url = new URL(route.request().url());
+    const id = url.pathname.split("/")[3];
+    url.pathname = url.pathname.replace(HELD, `/a/${real.get(id)}/`);
+    await route.fulfill({ response: await route.fetch({ url: url.href }) });
+  });
+  await openBoard(page, "/board/c/12%40leaseweb");
+  await expect(page.frameLocator('iframe[title="Recap slice 1"]').getByText("recap body")).toBeVisible();
+  await expect(section(page, "board.spec").getByRole("img")).toHaveCount(12);
+
+  lapsed = true;
+  await page.clock.fastForward("10:00");
+  const frame = section(page, "Recap slice 1").locator("iframe");
+  await expect(frame).not.toHaveAttribute("src", new RegExp(HELD));
+  await expect(page.frameLocator('iframe[title="Recap slice 1"]').getByText("recap body")).toBeVisible();
+  const run = section(page, "board.spec");
+  await expect(run.getByRole("img")).toHaveCount(12);
+  for (const image of await run.getByRole("img").all()) {
+    await expect(image).not.toHaveAttribute("src", new RegExp(HELD));
+    await image.scrollIntoViewIfNeeded();
+    await expect.poll(() => image.evaluate((img: HTMLImageElement) => img.complete && img.naturalWidth)).toBeGreaterThan(0);
+  }
+});

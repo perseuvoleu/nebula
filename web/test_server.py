@@ -721,6 +721,14 @@ class BoardTests(unittest.TestCase):
             stale = self.card_src()
         self.assertEqual(self.request(stale)[0], 403)
 
+    def test_artifact_expires_is_when_its_src_is_refused(self):
+        with patch("server.subprocess.run", return_value=cli(fixture("card_show"))):
+            row = json.loads(self.request("/api/cards/%2312", headers=self.auth())[2])["artifacts"][0]
+        with patch("server.time.time", return_value=row["expires"] - 1):
+            self.assertEqual(self.request(row["src"])[0], 200)
+        with patch("server.time.time", return_value=row["expires"]):
+            self.assertEqual(self.request(row["src"])[0], 403)
+
     def test_artifact_traversal(self):
         grant = self.card_src().split("/")[2]
         linked = self.gateway.grant(self.linked_id)

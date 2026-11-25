@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import type { Artifact } from "@/lib/board";
+import { type Artifact, grantLapsing } from "@/lib/board";
 import { parseE2eRun } from "@/lib/e2e-run";
 import { ArtifactFrame, type ArtifactContent, type ArtifactMeta } from "./ArtifactFrame";
 
@@ -21,18 +21,19 @@ async function fetched(kind: string, entry: string, src: string, signal: AbortSi
   if (response.status === 403) throw new Expired("Linkul a expirat; reîncarcă pagina.");
   if (!response.ok) throw new Error("Artefactul nu poate fi citit acum.");
   if (kind !== "e2e-run") return { view: "ticket", markdown: await response.text(), source: entry };
-  const root = src.split("/").slice(0, 4).join("/");
+  const base = new URL(src, location.href);
   return { view: "e2e-run", run: parseE2eRun(await response.json()),
-    assetUrl: (path) => `${root}/${path.split("/").map(encodeURIComponent).join("/")}` };
+    assetUrl: (path) => new URL(path.split("/").map(encodeURIComponent).join("/"), base).pathname };
 }
 
-/** Each card read mints a new grant; the URL first used is kept until it gets a 403, so a frame never reloads under its reader. */
-function ArtifactItem({ artifact }: { artifact: Artifact }) {
-  const [held, setHeld] = useState(artifact.src ?? null);
+/** Each card read mints a new grant; the URL first used is kept until it gets a 403 or its grant is about to lapse, so a frame does not reload under its reader. */
+function ArtifactItem({ artifact, now }: { artifact: Artifact; now: number }) {
+  const [held, setHeld] = useState({ src: artifact.src ?? null, expires: artifact.expires });
   const [loaded, setLoaded] = useState<{ src: string; content?: ArtifactContent; error?: string; expired?: boolean } | null>(null);
-  if (loaded?.expired && loaded.src === held && artifact.src && artifact.src !== held) setHeld(artifact.src);
-  const immediate = direct(artifact, held ?? artifact.src ?? null);
-  const src = immediate ? null : held ?? artifact.src ?? null;
+  const refused = loaded?.expired && loaded.src === held.src;
+  if (artifact.src && artifact.src !== held.src && (refused || grantLapsing(held.expires, now))) setHeld({ src: artifact.src, expires: artifact.expires });
+  const immediate = direct(artifact, held.src ?? artifact.src ?? null);
+  const src = immediate ? null : held.src ?? artifact.src ?? null;
   const entry = "entry" in artifact.content ? artifact.content.entry : "";
   useEffect(() => {
     if (!src) return;
@@ -57,14 +58,14 @@ function ArtifactItem({ artifact }: { artifact: Artifact }) {
   );
 }
 
-export function CardArtifacts({ artifacts }: { artifacts: Artifact[] }) {
+export function CardArtifacts({ artifacts, now }: { artifacts: Artifact[]; now: number }) {
   return (
     <section aria-label="Artefacte" className="flex min-w-0 flex-col gap-2">
       <h3 className="text-xs font-medium text-muted-foreground">
         Artefacte<span className="ml-1.5 font-mono tabular-nums">{artifacts.length}</span>
       </h3>
       {artifacts.length
-        ? artifacts.map((a) => <ArtifactItem key={a.id} artifact={a} />)
+        ? artifacts.map((a) => <ArtifactItem key={a.id} artifact={a} now={now} />)
         : <p className="rounded-lg border bg-background px-3 py-2.5 text-sm text-muted-foreground">Niciun artefact încă.</p>}
     </section>
   );

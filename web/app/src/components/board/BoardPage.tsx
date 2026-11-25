@@ -3,7 +3,7 @@ import { ArrowLeftIcon, MenuIcon, PlusIcon } from "lucide-react";
 import { api, describeError } from "@/lib/api";
 import { activityAge } from "@/lib/activity-age";
 import {
-  type BoardCard, type BoardData, type Card, type CardShow, type NeedsYou, type SessionLink, type SidebarScope, type SortKey, type TableSort, type Stage, type Workspace,
+  type BoardCard, type BoardData, type Card, type CardShow, type NeedsYou, type SessionLink, type SidebarScope, type SortKey, type TableSort, type Stage, type Workspace, GRANT_RENEW_MS,
   awayDigest, byStage, cardSlug, hostProjects, inScope, projectName, sessionProject, sidebarProjects, sortCards, toBoardCard, writerSlots,
 } from "@/lib/board";
 import { cardAction, createCard, ulid } from "@/lib/board-actions";
@@ -81,6 +81,12 @@ function useCard(slug: string | null, board: BoardData | null) {
       });
     return () => { abort.abort(); clearTimeout(retry); };
   }, [slug, board, attempt]);
+  const expires = Math.min(...(state?.slug === slug ? state.show?.artifacts ?? [] : []).flatMap((a) => a.expires ?? []));
+  useEffect(() => {
+    if (!Number.isFinite(expires)) return;
+    const renew = setTimeout(() => setAttempt((n) => n + 1), Math.max(BOARD_POLL_MS, expires * 1000 - GRANT_RENEW_MS - Date.now()));
+    return () => clearTimeout(renew);
+  }, [expires]);
   return state?.slug === slug ? { ...state, refresh: () => setAttempt((n) => n + 1) } : null;
 }
 
@@ -144,7 +150,7 @@ function CardPanel({ slug, board, mode, onOpenCard }: { slug: string; board: Boa
       {mode === "page" && (
         <div className="mx-auto mt-4 flex w-full max-w-3xl flex-col gap-4">
           <RecordDecision cardRef={card.show.ref} onRecorded={card.refresh} />
-          <CardArtifacts artifacts={card.show.artifacts} />
+          <CardArtifacts artifacts={card.show.artifacts} now={now} />
         </div>
       )}
     </>
@@ -154,7 +160,7 @@ function CardPanel({ slug, board, mode, onOpenCard }: { slug: string; board: Boa
 export function BoardPage({ route, workspace, onNavigate, onSessions }: {
   route: BoardRoute;
   workspace: Workspace;
-  onNavigate: (route: BoardRoute, replace?: boolean) => void;
+  onNavigate: (route: BoardRoute) => void;
   onSessions: () => void;
 }) {
   const [lastSeen, setLastSeen] = useState(loadLastSeen);
@@ -250,7 +256,7 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
   ));
 
   const sidebar = (
-    <ProjectSidebar projects={board ? sidebarProjects(board) : []} total={live.filter((c) => c.stage !== "done").length}
+    <ProjectSidebar projects={board ? sidebarProjects(board) : []} total={live.length}
       scope={scope} expanded={expanded} showQuiet={showQuiet}
       query={search} onQueryChange={setSearch} onSelect={select}
       onToggleProject={(name) => setExpanded((old) => toggle(old, name))} onToggleQuiet={() => setShowQuiet((v) => !v)} />
