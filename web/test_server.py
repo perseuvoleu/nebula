@@ -14,7 +14,7 @@ from unittest.mock import patch
 from urllib.parse import unquote
 
 import serverless
-from server import Gateway, Handler, Problem, PushService, StaticFiles, ThreadingHTTPServer
+from server import BoardScope, Gateway, Handler, Problem, PushService, StaticFiles, ThreadingHTTPServer
 from test_pi_history import SID_A, SID_B, assistant, user, write_session
 
 TOKEN = "test-token-" * 5
@@ -622,7 +622,7 @@ class BoardTests(unittest.TestCase):
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.origin = f"http://127.0.0.1:{self.server.server_port}"
         self.gateway = Gateway(TOKEN, self.origin, ["project"], static=StaticFiles(make_static(root / "static")),
-                               board_projects=["nebula"], artifacts=self.artifacts, usage_service=None)
+                               board_scope=BoardScope(["nebula"]), artifacts=self.artifacts, usage_service=None)
         self.server.gateway = self.gateway
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -672,10 +672,10 @@ class BoardTests(unittest.TestCase):
         reads = [("/api/board?project=secret&scope=all", fixture("board")),
                  ("/api/cards/%2312?project=secret&all=1", fixture("card_show")),
                  ("/api/decisions?query=copy&project=secret", {"items": [fixture("decision")], "next": None})]
-        for configured, scope in [(["nebula"], ["--project=nebula", "--include-home"]),
-                                  (["nebula", "vela"], ["--project=nebula", "--project=vela", "--include-home"]),
+        for configured, scope in [("nebula", ["--project=nebula", "--include-home"]),
+                                  ("nebula,vela", ["--project=nebula", "--project=vela", "--include-home"]),
                                   ("*", ["--all", "--include-home"])]:
-            self.gateway.board_projects = configured
+            self.gateway.board_scope = BoardScope.parse(configured)
             for path, output in reads:
                 with self.subTest(path=path, configured=configured), \
                         patch("server.subprocess.run", return_value=cli(output)) as run:
@@ -683,7 +683,7 @@ class BoardTests(unittest.TestCase):
                     argv = self.argv(run)[0]
                     self.assertEqual([a for a in argv if a.startswith(("--project", "--all", "--include-home"))], scope)
                     self.assertFalse(any("secret" in a for a in argv))
-        self.gateway.board_projects = ["nebula"]
+        self.gateway.board_scope = BoardScope(["nebula"])
         with patch("server.subprocess.run", return_value=cli(None, 5, "no card #99 in scope")) as run:
             status, _, _ = self.request("/api/cards/%2399/move", "POST", {"stage": "done"}, self.auth())
         self.assertEqual(status, 404)
@@ -820,9 +820,9 @@ class BoardTests(unittest.TestCase):
                   "archive": {}, "accept": {}, "dismiss": {}, "block": {"by": "#11"}, "unblock": {"by": "#11"},
                   "run": {"role": "worker", "kind": "codex", "host": "leaseweb", "worktree": "new"},
                   "approve": {"session": "01JF0000000000000000000002", "host": "leaseweb", "expectedStatusAt": 1764000200000}}
-        for configured, scope in [(["nebula", "vela"], ["--scope=nebula", "--scope=vela", "--include-home"]),
+        for configured, scope in [("nebula,vela", ["--scope=nebula", "--scope=vela", "--include-home"]),
                                   ("*", ["--scope=*", "--include-home"])]:
-            self.gateway.board_projects = configured
+            self.gateway.board_scope = BoardScope.parse(configured)
             for verb, body in writes.items():
                 with self.subTest(verb=verb, configured=configured), patch("server.subprocess.run", side_effect=[
                         cli(fixture("card_show")), cli(fixture("card_show")), cli(fixture("card"))]) as run:
@@ -832,13 +832,13 @@ class BoardTests(unittest.TestCase):
                     self.assertEqual("--id=" + CARD_ID in write, verb == "note")
 
     def test_board_writes_need_board_and_explicit_owner(self):
-        self.gateway.board_projects = None
+        self.gateway.board_scope = None
         with patch("server.subprocess.run") as run:
             for path, body in [("/api/cards", {"title": "x", "home": True}), ("/api/decisions", {"what": "Copy files"})]:
                 with self.subTest(path=path):
                     self.assertEqual(self.request(path, "POST", body, self.auth())[0], 503)
             run.assert_not_called()
-        self.gateway.board_projects = ["nebula"]
+        self.gateway.board_scope = BoardScope(["nebula"])
         with patch("server.subprocess.run", return_value=cli(fixture("decision"))) as run:
             self.assertEqual(self.request("/api/decisions", "POST", {"what": "Copy files"}, self.auth())[0], 200)
         self.assertIn("--home", self.argv(run)[0])

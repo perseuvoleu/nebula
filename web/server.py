@@ -246,7 +246,7 @@ class StaticFiles:
 
 
 class Gateway:
-    def __init__(self, token, origin, projects, binary="nebula", static=None, pi_agent_dir=None, db_path=None, *, preview_binary=None, push=None, usage_service, claude_config_dir=None, serverless_runs=None, notify_token=None, board_projects=None, artifacts=None):
+    def __init__(self, token, origin, projects, binary="nebula", static=None, pi_agent_dir=None, db_path=None, *, preview_binary=None, push=None, usage_service, claude_config_dir=None, serverless_runs=None, notify_token=None, board_scope=None, artifacts=None):
         if len(token) < 8:
             raise ValueError("NEBULA_WEB_TOKEN must contain at least 8 characters")
         if notify_token and notify_token == token:
@@ -280,7 +280,7 @@ class Gateway:
         self.usage = usage_service
         self.serverless = serverless_runs
         self.notify_token = notify_token
-        self.board_projects = board_projects
+        self.board_scope = board_scope
         self.artifacts = Path(artifacts) if artifacts else None
         if self.artifacts is not None and (not self.artifacts.is_absolute() or not self.artifacts.is_dir()):
             raise ValueError("NEBULA_WEB_ARTIFACTS must be an absolute existing directory")
@@ -325,29 +325,16 @@ class Gateway:
         return self.run(*args, "--json", *(("--", *positionals) if positionals else ()), exits=exits)
 
     def scope(self):
-        if self.board_projects is None:
+        if self.board_scope is None:
             raise Problem(503, "Board is not configured")
-        projects = ("--all",) if self.board_projects == "*" else tuple(f"--project={p}" for p in self.board_projects)
-        return (*projects, "--include-home")
-
-    def write_scope(self):
-        """The board scope as the write flags, so the daemon refuses an out-of-scope card in its transaction."""
-        projects = ("--scope=*",) if self.scope()[0] == "--all" else tuple(f"--scope={p}" for p in self.board_projects)
-        return (*projects, "--include-home")
-
-    def admits(self, project):
-        scope = self.scope()
-        return "--include-home" in scope if project is None else self.board_projects == "*" or project in self.board_projects
+        return self.board_scope
 
     def home(self):
-        if not self.admits(None):
-            raise Problem(403, "Home cards are not on this board")
+        self.scope()
         return "--home"
 
     def board_project(self, value):
-        self.scope()
-        if (not isinstance(value, str) or not NAME.fullmatch(value)
-                or (self.board_projects != "*" and value not in self.board_projects)):
+        if not isinstance(value, str) or not NAME.fullmatch(value) or not self.scope().allows(value):
             raise Problem(403, "Project is not on this board")
         return value
 
@@ -355,7 +342,7 @@ class Gateway:
         match = BOARD_REF.fullmatch(ref) if isinstance(ref, str) else None
         if not match or (match["number"] is not None and not 0 < int(match["number"]) < 2 ** 64):
             raise Problem(400, "Invalid card reference")
-        card = self.board("todo", "show", *self.scope(), positionals=(ref,))
+        card = self.board("todo", "show", *self.scope().argv(), positionals=(ref,))
         for row in card.get("artifacts") or []:
             entry = (row.get("content") or {}).get("entry")
             if isinstance(entry, str) and self.artifact_dir(row.get("id")):
@@ -524,7 +511,7 @@ class Gateway:
             if ((since is not None and not CURSOR.fullmatch(since)) or (away is not None and not re.fullmatch(r"[0-9]{1,16}", away))
                     or (page is not None and not PAGE.fullmatch(page))):
                 raise Problem(400, "Invalid board cursor")
-            return self.board("todo", "board", *self.scope(), *flag("since", since),
+            return self.board("todo", "board", *self.scope().argv(), *flag("since", since),
                               *flag("away-since", away), *flag("page", page))
         if path.startswith("/api/cards/"):
             return self.card(unquote(path[len("/api/cards/"):]))
@@ -534,7 +521,7 @@ class Gateway:
                 raise Problem(400, "Invalid search")
             if page is not None and not PAGE.fullmatch(page):
                 raise Problem(400, "Invalid page")
-            return self.board("decision", "list", *self.scope(), *flag("query", text),
+            return self.board("decision", "list", *self.scope().argv(), *flag("query", text),
                               *flag("page", page))
         project = self.project(query.get("project", [None])[0])
         first = {k: v[0] for k, v in query.items()}
@@ -653,7 +640,7 @@ class Gateway:
             row = self.board("todo", "add", owner, *flag("stage", stage),
                              *(["--propose"] if body.get("propose") is True else []),
                              *flag("id", card_id), positionals=(field(body, "title"),))
-            if not self.admits(row.get("project")):
+            if not self.scope().allows(row.get("project")):
                 raise Problem(404, "Card not found")
             return row
         if path == "/api/decisions":
@@ -670,7 +657,7 @@ class Gateway:
             card = self.card(unquote(ref))
             args, positionals, *exits = CARD_VERBS[verb](self, card, body)
             if verb in SCOPED_WRITES:
-                args = (*args, *self.write_scope())
+                args = (*args, *self.scope().write_argv())
             return self.board(*args, positionals=positionals, exits=exits[0] if exits else BOARD_EXITS)
         project = self.project(body.get("project"))
         if path == "/api/worktrees":
@@ -933,14 +920,31 @@ class Handler(BaseHTTPRequestHandler):
         self.handle_request("POST")
 
 
-def board_projects(value):
-    """NEBULA_WEB_BOARD_PROJECTS: "*" for every project, else comma-separated names; unset disables the board."""
-    if value.strip() == "*":
-        return "*"
-    names = [p.strip() for p in value.split(",") if p.strip()]
-    if any(not NAME.fullmatch(name) for name in names):
-        raise ValueError("NEBULA_WEB_BOARD_PROJECTS must be * or comma-separated project names")
-    return names or None
+class BoardScope:
+    """The projects the board shows: every one (`projects` None) or the named ones; home cards always belong."""
+
+    def __init__(self, projects=None):
+        self.projects = projects
+
+    @classmethod
+    def parse(cls, value):
+        """NEBULA_WEB_BOARD_PROJECTS: "*" for every project, else comma-separated names; unset disables the board."""
+        if value.strip() == "*":
+            return cls()
+        names = [p.strip() for p in value.split(",") if p.strip()]
+        if any(not NAME.fullmatch(name) for name in names):
+            raise ValueError("NEBULA_WEB_BOARD_PROJECTS must be * or comma-separated project names")
+        return cls(names) if names else None
+
+    def allows(self, project):
+        return project is None or self.projects is None or project in self.projects
+
+    def argv(self):
+        return (*(("--all",) if self.projects is None else (f"--project={p}" for p in self.projects)), "--include-home")
+
+    def write_argv(self):
+        """The scope as write flags, so the daemon refuses an out-of-scope card in its transaction."""
+        return (*(f"--scope={p}" for p in self.projects or ["*"]), "--include-home")
 
 
 def main():
@@ -958,7 +962,7 @@ def main():
                       usage_service=usage.from_environment() if os.environ.get("NEBULA_WEB_USAGE", "1") != "0" else None,
                       serverless_runs=serverless.from_environment(),
                       notify_token=os.environ.get("NEBULA_WEB_NOTIFY_TOKEN"),
-                      board_projects=board_projects(os.environ.get("NEBULA_WEB_BOARD_PROJECTS", "")),
+                      board_scope=BoardScope.parse(os.environ.get("NEBULA_WEB_BOARD_PROJECTS", "")),
                       artifacts=os.environ.get("NEBULA_WEB_ARTIFACTS") or None)
     if not gateway.static.files.get("/index.html"):
         raise SystemExit(f"No built app in {gateway.static.root}; run `pnpm --dir web/app build` first")
