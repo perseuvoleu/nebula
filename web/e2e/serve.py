@@ -180,7 +180,8 @@ def serve_real():
         raise SystemExit(f"No nebula at {binary}; run `heavy web/e2e/build_real_nebula.sh` first")
     if any(c.isspace() for c in str(state)):
         raise SystemExit(f"{state} holds whitespace, which the daemon's agent command cannot carry; set REAL_NEBULA_STATE")
-    lock = open(state.with_name(state.name + ".lock"), "w")
+    state.parent.mkdir(parents=True, exist_ok=True)
+    lock = open(state.with_name(state.name + ".lock"), "a")
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
