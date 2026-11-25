@@ -485,26 +485,43 @@ fn edit_to_equal_values_keeps_the_version() {
 fn board_read_pages() {
     let env = Env::new();
     env.board_local();
-    let env = env.start(&[("NEBULA_BOARD_PAGE_BYTES", "600")]);
-    let long = "x".repeat(200);
-    for n in 1..=6 {
-        add(&env, &["--project", "nebula"], &format!("{n} {long}"));
+    let budget = 1600;
+    let env = env.start(&[("NEBULA_BOARD_PAGE_BYTES", &budget.to_string())]);
+    let long = "x".repeat(1200);
+    for title in ["1", "2", &format!("3 {long}"), "4", "5", "6"] {
+        add(&env, &["--project", "nebula"], title);
     }
     let mut pages = vec![env.json(&["todo", "board", "--all", "--json"])];
     while let Some(next) = pages.last().unwrap()["next"].as_str().map(str::to_owned) {
         assert!(pages.len() < 10, "paging never ends");
         pages.push(env.json(&["todo", "board", "--all", "--page", &next, "--json"]));
     }
-    assert!(pages.len() > 1, "six 200-byte cards fit one 600-byte page");
     let version = &pages[0]["version"];
     let mut numbers = Vec::new();
+    let mut sizes = Vec::new();
     for page in &pages {
         assert_eq!(&page["version"], version);
-        for card in page["board"]["cards"].as_array().unwrap() {
-            numbers.push(card["number"].as_u64().unwrap());
-        }
+        let cards = page["board"]["cards"].as_array().unwrap();
+        let bytes: usize = cards
+            .iter()
+            .map(|c| serde_json::to_vec(c).unwrap().len())
+            .sum();
+        assert!(
+            cards.len() == 1 || bytes <= budget,
+            "{bytes} bytes over a {budget}-byte page"
+        );
+        sizes.push(cards.len());
+        numbers.extend(cards.iter().map(|c| c["number"].as_u64().unwrap()));
     }
     assert_eq!(numbers, [1, 2, 3, 4, 5, 6]);
+    assert!(
+        pages.len() > 1,
+        "a 1200-byte card and five short ones fit one page: {sizes:?}"
+    );
+    assert!(
+        sizes.iter().any(|n| *n > 1),
+        "short cards never share a page: {sizes:?}"
+    );
 
     let continuation = pages[0]["next"].as_str().unwrap().to_string();
     add(&env, &["--project", "nebula"], "late");
