@@ -3,72 +3,50 @@ use crate::ids::{AgentId, ArtifactId, DispatchId, NoteId, TodoId};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeSet;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Stage {
-    Backlog,
-    Next,
-    Doing,
-    Review,
-    Done,
-}
-
-impl Stage {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Stage::Backlog => "backlog",
-            Stage::Next => "next",
-            Stage::Doing => "doing",
-            Stage::Review => "review",
-            Stage::Done => "done",
+/// One table gives each variant its serde name, `as_str` and `parse`.
+macro_rules! named_enum {
+    ($(#[$meta:meta])* $name:ident { $($variant:ident = $text:literal,)* }) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        pub enum $name {
+            $(#[serde(rename = $text)] $variant,)*
         }
-    }
 
-    pub fn parse(s: &str) -> Option<Self> {
-        Some(match s {
-            "backlog" => Stage::Backlog,
-            "next" => Stage::Next,
-            "doing" => Stage::Doing,
-            "review" => Stage::Review,
-            "done" => Stage::Done,
-            _ => return None,
-        })
-    }
-}
+        impl $name {
+            pub fn as_str(&self) -> &'static str {
+                match self {
+                    $($name::$variant => $text,)*
+                }
+            }
 
-/// Closed because stage automation matches on it; never inherited by a child.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Role {
-    Worker,
-    Review,
-    Fix,
-    Verify,
-    Research,
-}
-
-impl Role {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Role::Worker => "worker",
-            Role::Review => "review",
-            Role::Fix => "fix",
-            Role::Verify => "verify",
-            Role::Research => "research",
+            pub fn parse(s: &str) -> Option<Self> {
+                match s {
+                    $($text => Some($name::$variant),)*
+                    _ => None,
+                }
+            }
         }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        Some(match s {
-            "worker" => Role::Worker,
-            "review" => Role::Review,
-            "fix" => Role::Fix,
-            "verify" => Role::Verify,
-            "research" => Role::Research,
-            _ => return None,
-        })
-    }
+    };
 }
+
+named_enum!(Stage {
+    Backlog = "backlog",
+    Next = "next",
+    Doing = "doing",
+    Review = "review",
+    Done = "done",
+});
+
+named_enum!(
+    /// Closed because stage automation matches on it; never inherited by a child.
+    Role {
+        Worker = "worker",
+        Review = "review",
+        Fix = "fix",
+        Verify = "verify",
+        Research = "research",
+    }
+);
 
 /// A card as a caller names it: its board number (optionally with the board
 /// host it was printed for) or its ULID.
@@ -817,15 +795,26 @@ enum BoardPollWire {
     },
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
 struct BoardPollJson {
     version: String,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default)]
     unchanged: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     board: Option<BoardPage>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     next: Option<String>,
+}
+
+#[derive(Serialize)]
+struct BoardPollJsonRef<'a> {
+    version: &'a str,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    unchanged: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    board: Option<&'a BoardPage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next: Option<&'a str>,
 }
 
 impl Serialize for BoardPoll {
@@ -833,8 +822,8 @@ impl Serialize for BoardPoll {
         if !s.is_human_readable() {
             return BoardPollWire::serialize(self, s);
         }
-        let json = match self.clone() {
-            BoardPoll::Unchanged { version } => BoardPollJson {
+        let json = match self {
+            BoardPoll::Unchanged { version } => BoardPollJsonRef {
                 version,
                 unchanged: true,
                 board: None,
@@ -844,11 +833,11 @@ impl Serialize for BoardPoll {
                 version,
                 board,
                 next,
-            } => BoardPollJson {
+            } => BoardPollJsonRef {
                 version,
                 unchanged: false,
                 board: Some(board),
-                next,
+                next: next.as_deref(),
             },
         };
         json.serialize(s)
