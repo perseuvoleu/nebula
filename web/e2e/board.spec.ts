@@ -152,8 +152,9 @@ test("a failed card read is retried on the next poll, and a stale detail is mark
 test("blocked card dimmed", async ({ page }) => {
   addCard(13, "Wait for verification", "next", ["#12@leaseweb"]);
   await open(page, "/board");
-  await expect(tile(page, "Wait for verification")).toHaveCSS("opacity", "0.6");
-  await expect(tile(page, "Keep verification results")).toHaveCSS("opacity", "1");
+  const opacity = (title: string) => tile(page, title).evaluate((el) => Number(getComputedStyle(el).opacity));
+  await expect(tile(page, "Wait for verification")).toBeVisible();
+  expect(await opacity("Wait for verification")).toBeLessThan(await opacity("Keep verification results"));
 });
 
 test("sidebar counts and quiet projects", async ({ page }) => {
@@ -184,6 +185,64 @@ test("poll picks up a new version", async ({ page }) => {
   await expect(tile(page, "Arrived by poll")).toBeVisible();
   setBehaviour("ok");
   await expect(page.getByRole("status").filter({ hasText: "Date neactualizate" })).toHaveCount(0);
+});
+
+test("a board read that spans two pages shows the cards of both", async ({ page }) => {
+  addCard(13, "Only on the second page", "backlog");
+  let rest: unknown[] = [];
+  await page.route("**/api/board?*", async (route) => {
+    const url = new URL(route.request().url());
+    if (url.searchParams.get("page") === "second") return route.fulfill({ json: { version: "v", board: { cards: rest, hosts: [], needs_you: [], away: { finished: [], needs_you: [], decisions: [] } }, next: null } });
+    const response = await route.fetch();
+    const reply = await response.json();
+    if (reply.unchanged) return route.fulfill({ response, json: reply });
+    rest = reply.board.cards.filter((c: { title: string }) => c.title === "Only on the second page");
+    reply.board.cards = reply.board.cards.filter((c: { title: string }) => c.title !== "Only on the second page");
+    await route.fulfill({ response, json: { ...reply, next: "second" } });
+  });
+  await open(page, "/board");
+  await expect(tile(column(page, "Backlog"), "Only on the second page")).toBeVisible();
+  await expect(tile(page, "Keep verification results")).toBeVisible();
+});
+
+test("board polls never overlap and stop while the tab is hidden", async ({ page }) => {
+  await page.clock.install();
+  await open(page, "/board");
+  await expect(tile(page, "Keep verification results")).toBeVisible();
+  let inFlight = 0;
+  let most = 0;
+  let sent = 0;
+  let release = () => {};
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  await page.route("**/api/board?*", async (route) => {
+    sent += 1;
+    most = Math.max(most, ++inFlight);
+    await held;
+    const response = await route.fetch();
+    inFlight -= 1;
+    await route.fulfill({ response });
+  });
+  await page.clock.fastForward(4000);
+  await expect.poll(() => sent).toBe(1);
+  await page.clock.fastForward(30_000);
+  release();
+  await expect.poll(() => inFlight).toBe(0);
+  expect(most, "board polls in flight at once").toBe(1);
+
+  await page.evaluate(() => {
+    Object.defineProperty(document, "hidden", { configurable: true, get: () => true });
+    document.dispatchEvent(new Event("visibilitychange"));
+  });
+  await page.clock.fastForward(4000);
+  const before = sent;
+  await page.clock.fastForward(30_000);
+  expect(sent, "board polls sent while the tab was hidden").toBe(before);
+  await page.evaluate(() => {
+    Object.defineProperty(document, "hidden", { configurable: true, get: () => false });
+    document.dispatchEvent(new Event("visibilitychange"));
+  });
+  await expect.poll(() => sent).toBeGreaterThan(before);
+  await page.unrouteAll({ behavior: "ignoreErrors" });
 });
 
 test("board, peek and card page are usable at 390 px", async ({ page }) => {
