@@ -48,7 +48,7 @@ fn apply(tx: &Transaction, op: BoardOp) -> Result<BoardResult> {
             if let Some(title) = title {
                 let title = non_empty(&title, "a card title")?;
                 tx.execute(
-                    "UPDATE todos SET title = ?2 WHERE id = ?1",
+                    "UPDATE todos SET title = ?2 WHERE id = ?1 AND title IS NOT ?2",
                     params![id.as_str(), title],
                 )?;
             }
@@ -58,7 +58,7 @@ fn apply(tx: &Transaction, op: BoardOp) -> Result<BoardResult> {
                     Placement::Project(name) => Some(name),
                 };
                 tx.execute(
-                    "UPDATE todos SET project = ?2 WHERE id = ?1",
+                    "UPDATE todos SET project = ?2 WHERE id = ?1 AND project IS NOT ?2",
                     params![id.as_str(), project],
                 )?;
             }

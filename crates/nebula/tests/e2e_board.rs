@@ -451,6 +451,24 @@ fn board_since_unchanged() {
 }
 
 #[test]
+fn edit_to_equal_values_keeps_the_version() {
+    let env = board_env();
+    add(&env, &["--project", "nebula"], "Same");
+    add(&env, &[], "Home");
+    let version = || env.json(&["todo", "board", "--all", "--json"])["version"].clone();
+    let before = version();
+    for edit in [
+        &["todo", "edit", "#1", "--title", "Same"][..],
+        &["todo", "edit", "#1", "--project", "nebula"],
+        &["todo", "edit", "#2", "--home"],
+    ] {
+        let out = env.cli(edit, None);
+        assert!(out.status.success(), "{edit:?}: {}", stderr(&out));
+        assert_eq!(version(), before, "{edit:?} bumped the version");
+    }
+}
+
+#[test]
 fn board_read_pages() {
     let env = Env::new();
     env.board_local();
