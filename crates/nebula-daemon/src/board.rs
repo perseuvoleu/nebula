@@ -168,17 +168,14 @@ fn begin_run(tx: &Transaction, dispatch: Dispatch) -> Result<RunReceipt> {
             params![dispatch.id.as_str()],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )?;
-        if (
-            host.as_str(),
-            role.as_str(),
-            kind.as_str(),
-            worktree.as_str(),
-        ) != (
-            dispatch.host.as_str(),
-            dispatch.role.as_str(),
-            dispatch.kind.as_str(),
-            dispatch.worktree.as_str(),
-        ) {
+        if !host.eq_ignore_ascii_case(&dispatch.host)
+            || (role.as_str(), kind.as_str(), worktree.as_str())
+                != (
+                    dispatch.role.as_str(),
+                    dispatch.kind.as_str(),
+                    dispatch.worktree.as_str(),
+                )
+        {
             bail!(Refusal::Conflict.message(format!(
                 "dispatch {} runs with --host {host} --role {role} --kind {kind} --worktree {worktree}; rerun it with those",
                 dispatch.id.as_str()
@@ -233,13 +230,30 @@ fn begin_run(tx: &Transaction, dispatch: Dispatch) -> Result<RunReceipt> {
     if let Some(known) = known {
         return Ok(known);
     }
+    let here = nebula_core::host::hostname();
+    let host = match here.eq_ignore_ascii_case(&dispatch.host) {
+        true => Some(here),
+        false => tx
+            .query_row(
+                "SELECT host FROM board_hosts WHERE host = ?1 COLLATE NOCASE",
+                params![dispatch.host],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?,
+    };
+    let Some(host) = host else {
+        bail!(Refusal::Conflict.message(format!(
+            "no host {} has reported to the board; --host takes a reported host name",
+            dispatch.host
+        )));
+    };
     tx.execute(
         "INSERT INTO dispatches (id, card_id, host, role, kind, worktree, state, created_at, project)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8)",
         params![
             dispatch.id.as_str(),
             card.as_str(),
-            dispatch.host,
+            host,
             dispatch.role.as_str(),
             dispatch.kind.as_str(),
             dispatch.worktree,

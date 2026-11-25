@@ -2769,7 +2769,20 @@ fn viewer_on(relay_cmd: &str, host: &str, envs: &[(&str, &str)]) -> Env {
     env.start(&all)
 }
 
+fn reported(board: &Env, host: &str) {
+    eventually("the host reported to the board", || {
+        hosts_of(board, &["--all"])
+            .iter()
+            .any(|h| h["host"] == host)
+            .then_some(())
+    });
+}
+
 fn ssh_stub(env: &Env, target: &Env) -> (String, PathBuf, PathBuf) {
+    ssh_stub_as(env, target, &target.host_name())
+}
+
+fn ssh_stub_as(env: &Env, target: &Env, host: &str) -> (String, PathBuf, PathBuf) {
     use std::os::unix::fs::PermissionsExt;
     let home = env.tmp.path().join("ssh-home");
     let bin = home.join("bin");
@@ -2780,13 +2793,12 @@ fn ssh_stub(env: &Env, target: &Env) -> (String, PathBuf, PathBuf) {
     std::fs::write(
         bin.join("ssh"),
         format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{log}'\n[ -e '{down}' ] && {{ echo 'ssh: connect to host: Connection refused' >&2; exit 255; }}\nfor arg do script=$arg; done\nexport HOME='{home}' NEBULA_RUNTIME_DIR='{rt}' NEBULA_DATA_DIR='{data}' NEBULA_HOSTNAME='{host}' PATH='{nebula}':\"$PATH\"\nexec /bin/sh -c \"$script\"\n",
+            "#!/bin/sh\n[ \"$(cat '{log}' 2>/dev/null | grep -c '^BatchMode=yes$')\" -ge 3 ] && exit 255\nprintf '%s\\n' \"$@\" >> '{log}'\n[ -e '{down}' ] && {{ echo 'ssh: connect to host: Connection refused' >&2; exit 255; }}\nfor arg do script=$arg; done\nexport HOME='{home}' NEBULA_RUNTIME_DIR='{rt}' NEBULA_DATA_DIR='{data}' NEBULA_HOSTNAME='{host}' PATH='{nebula}':\"$PATH\"\nexec /bin/sh -c \"$script\"\n",
             log = log.display(),
             down = down.display(),
             home = home.display(),
             rt = target.runtime_dir().display(),
             data = target.data_dir().display(),
-            host = target.host_name(),
             nebula = nebula.display(),
         ),
     )
@@ -2819,6 +2831,7 @@ fn cross_host_approve_over_ssh() {
     );
     laptop.make_repo();
     add(&laptop, &["--project", "repo"], "Far ask");
+    reported(&board, "laptop");
     let run = receipt(run_card(&laptop, "#1@boardhost", &[]));
     assert_eq!(run["session"]["host"], "laptop");
     let session = run["session"]["id"].as_str().unwrap().to_string();
@@ -2883,6 +2896,7 @@ fn cross_host_run_over_ssh() {
     let laptop = viewer_on(&proxy_to(&board), "laptop", &[]);
     laptop.make_repo();
     let card = add(&board, &["--project", "repo"], "Far run");
+    reported(&board, "laptop");
     let (path, _, _) = ssh_stub(&board, &laptop);
     let dispatch = TodoId::generate().0;
     let argv = run_argv(
@@ -2907,6 +2921,46 @@ fn cross_host_run_over_ssh() {
     });
     let again = receipt(board.cli_env(&argv, None, &[("PATH", &path)]));
     assert_eq!(again, run);
+    assert_eq!(agents_of(&laptop).len(), 1);
+}
+
+#[test]
+fn run_host_is_a_reported_host() {
+    let board = board_env();
+    let laptop = viewer_on(&proxy_to(&board), "laptop", &[]);
+    laptop.make_repo();
+    add(&board, &["--project", "repo"], "Hosts");
+    reported(&board, "laptop");
+    let run_as = |host: &str, landing: &str| {
+        let (path, log, _) = ssh_stub_as(&board, &laptop, landing);
+        let argv = run_argv(&board, "#1", &[("--host", host)], &[]);
+        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let out = board.cli_env(&argv, None, &[("PATH", &path)]);
+        let hops = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| *l == "BatchMode=yes")
+            .count();
+        std::fs::remove_file(&log).ok();
+        (out, hops)
+    };
+    let (unknown, hops) = run_as("user@laptop", "laptop");
+    assert_eq!(unknown.status.code(), Some(6), "{}", stderr(&unknown));
+    assert_eq!(hops, 0);
+    let (elsewhere, hops) = run_as("laptop", "otherbox");
+    assert_eq!(elsewhere.status.code(), Some(6), "{}", stderr(&elsewhere));
+    assert!(
+        stderr(&elsewhere).contains("laptop is not this host (otherbox)"),
+        "{}",
+        stderr(&elsewhere)
+    );
+    assert_eq!(hops, 1);
+    assert!(agents_of(&laptop).is_empty());
+    let (upper, hops) = run_as("LAPTOP", "laptop");
+    let run = receipt(upper);
+    assert_eq!(run["state"], "started");
+    assert_eq!(run["session"]["host"], "laptop");
+    assert_eq!(hops, 1);
     assert_eq!(agents_of(&laptop).len(), 1);
 }
 

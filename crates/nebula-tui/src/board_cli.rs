@@ -235,6 +235,7 @@ pub enum TodoVerb {
         worktree: String,
         dispatch: Option<String>,
         scope: ScopeFlags,
+        forwarded: bool,
     },
     Approve {
         card: String,
@@ -348,6 +349,7 @@ pub async fn run(verb: TodoVerb, json: bool) -> Result<()> {
             worktree,
             dispatch,
             scope,
+            forwarded,
         } => {
             let dispatch = Dispatch {
                 id: match dispatch {
@@ -362,7 +364,7 @@ pub async fn run(verb: TodoVerb, json: bool) -> Result<()> {
                 })?,
                 worktree,
             };
-            return run_dispatch(&mut conn, dispatch, scope, &projects, json).await;
+            return run_dispatch(&mut conn, dispatch, scope, forwarded, &projects, json).await;
         }
         TodoVerb::Approve {
             card,
@@ -504,6 +506,7 @@ async fn run_dispatch(
     conn: &mut Connection,
     dispatch: Dispatch,
     scope: ScopeFlags,
+    forwarded: bool,
     projects: &[Project],
     json: bool,
 ) -> Result<()> {
@@ -512,13 +515,8 @@ async fn run_dispatch(
         Some(Refusal::OutcomeUnknown) => anyhow::anyhow!("{why} with --dispatch {}", id.as_str()),
         _ => why,
     };
-    let (host, role, kind, worktree) = (
-        dispatch.host.clone(),
-        dispatch.role,
-        dispatch.kind,
-        dispatch.worktree.clone(),
-    );
-    let forwarded = scope.args();
+    let (role, kind, worktree) = (dispatch.role, dispatch.kind, dispatch.worktree.clone());
+    let forwarded_scope = scope.args();
     let begun = request(conn, scope.guard(BoardOp::BeginRun(dispatch)))
         .await
         .map_err(rerun)?;
@@ -538,11 +536,16 @@ async fn run_dispatch(
         .project
         .clone()
         .context("the board admitted the run without a project")?;
-    let project = match run_target(projects, &nebula_core::host::hostname(), &host, &project) {
+    let host = receipt.host.clone();
+    let here = nebula_core::host::hostname();
+    let project = match run_target(projects, &here, &host, &project) {
         Target::Here(project) => project,
         Target::Missing => {
             let missing = Refusal::Conflict.message(format!("{host} has no project \"{project}\""));
             return end_run(conn, &id, None, Some(missing), json).await;
+        }
+        Target::Over if forwarded => {
+            bail!(Refusal::Conflict.message(format!("{host} is not this host ({here})")))
         }
         Target::Over => {
             let card = receipt.card.as_str();
@@ -561,8 +564,9 @@ async fn run_dispatch(
                 &worktree,
                 "--dispatch",
                 id.as_str(),
+                "--forwarded",
             ];
-            words.extend(forwarded.iter().map(String::as_str));
+            words.extend(forwarded_scope.iter().map(String::as_str));
             if json {
                 words.push("--json");
             }
@@ -639,7 +643,7 @@ enum Target {
 /// is this host, else a mirror of the target, else ssh to the target, which
 /// resolves it there. A mirror never stands in for this host's project.
 fn run_target(projects: &[Project], here: &str, host: &str, project: &str) -> Target {
-    if host == here {
+    if host.eq_ignore_ascii_case(here) {
         return match projects
             .iter()
             .any(|p| p.name == project && p.host.is_none())
@@ -648,12 +652,13 @@ fn run_target(projects: &[Project], here: &str, host: &str, project: &str) -> Ta
             false => Target::Missing,
         };
     }
-    match projects
-        .iter()
-        .any(|p| p.name == project && p.host.as_deref() == Some(host))
-    {
-        true => Target::Here(format!("{project}@{host}")),
-        false => Target::Over,
+    match projects.iter().find_map(|p| {
+        p.host
+            .as_deref()
+            .filter(|h| p.name == project && h.eq_ignore_ascii_case(host))
+    }) {
+        Some(mirror) => Target::Here(format!("{project}@{mirror}")),
+        None => Target::Over,
     }
 }
 
@@ -786,7 +791,11 @@ async fn approve(
         .with_context(|| {
             Refusal::NotFound.message(format!("{} has no session {session}", show.card.label))
         })?;
-    if found.host != nebula_core::host::hostname() && !agents.iter().any(|a| a.id == found.id) {
+    if !found
+        .host
+        .eq_ignore_ascii_case(&nebula_core::host::hostname())
+        && !agents.iter().any(|a| a.id == found.id)
+    {
         let at = expected_status_at.to_string();
         let mut words = vec![
             "nebula",

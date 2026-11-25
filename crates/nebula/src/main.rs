@@ -835,6 +835,9 @@ enum TodoCommand {
         /// The dispatch's ULID, so a rerun spawns nothing twice.
         #[arg(long)]
         dispatch: Option<String>,
+        /// Set on the hop to the target host, which then never forwards again.
+        #[arg(long, hide = true)]
+        forwarded: bool,
         #[command(flatten)]
         scope: WriteScopeArgs,
         #[arg(long)]
@@ -1472,6 +1475,7 @@ fn main() -> Result<()> {
                     host,
                     worktree,
                     dispatch,
+                    forwarded,
                     scope,
                     json,
                 }) => (
@@ -1483,6 +1487,7 @@ fn main() -> Result<()> {
                         worktree,
                         dispatch,
                         scope: scope.into(),
+                        forwarded,
                     },
                     json,
                 ),
