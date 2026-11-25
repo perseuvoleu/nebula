@@ -7,7 +7,7 @@ PATH=/opt/homebrew/opt/zig@0.15/bin:$PATH cargo build --tests # build
 [Cargo.toml,Cargo.lock,crates/nebula-core/*,crates/nebula-daemon/*,crates/nebula-tui/*,vendor/vt100/*,crates/nebula/Cargo.toml,crates/nebula/build.rs,crates/nebula/src/*,crates/nebula/tests/e2e_pty.rs,scripts/sync-skills.sh] PATH=/opt/homebrew/opt/zig@0.15/bin:$PATH cargo test -p nebula --test e2e_pty
 [Cargo.toml,Cargo.lock,crates/nebula-core/*,crates/nebula-daemon/*,crates/nebula-tui/*,vendor/vt100/*,crates/nebula/Cargo.toml,crates/nebula/build.rs,crates/nebula/src/*,crates/nebula/tests/e2e_tui.rs,crates/nebula/tests/replay/*] PATH=/opt/homebrew/opt/zig@0.15/bin:$PATH cargo test -p nebula --test e2e_tui
 [Cargo.toml,Cargo.lock,crates/nebula-core/*,crates/nebula-daemon/*,crates/nebula/Cargo.toml,crates/nebula/build.rs,crates/nebula/src/*,crates/nebula/tests/preview_cli.rs] PATH=/opt/homebrew/opt/zig@0.15/bin:$PATH cargo test -p nebula --test preview_cli
-[Cargo.toml,Cargo.lock,crates/nebula-core/*,crates/nebula-daemon/*,crates/nebula-tui/*,crates/nebula-rag/*,vendor/vt100/*,crates/nebula/Cargo.toml,crates/nebula/build.rs,crates/nebula/src/*,crates/nebula/tests/e2e_board.rs] PATH=/opt/homebrew/opt/zig@0.15/bin:$PATH cargo test -p nebula --test e2e_board
+[Cargo.toml,Cargo.lock,crates/nebula-core/*,crates/nebula-daemon/*,crates/nebula-tui/*,crates/nebula-rag/*,vendor/vt100/*,crates/nebula/Cargo.toml,crates/nebula/build.rs,crates/nebula/src/*,crates/nebula/tests/e2e_board.rs,crates/nebula/tests/fixtures/*] PATH=/opt/homebrew/opt/zig@0.15/bin:$PATH cargo test -p nebula --test e2e_board
 cargo fmt --check
 PATH=/opt/homebrew/opt/zig@0.15/bin:$PATH cargo clippy --workspace --all-targets -- -D warnings
 [.githooks/**] sh .githooks/pre-commit.test.sh

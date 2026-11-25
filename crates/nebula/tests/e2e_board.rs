@@ -3770,19 +3770,18 @@ fn run_worktree_new() {
 
 const SEEDED_TODO: &str = "01JD0000000000000000000T01";
 
-fn seed_at(db: &Path, version: usize, rows: &str) {
+/// Frozen schemas of released versions, so a migration test seeds the
+/// schema users have, not the SQL under test.
+fn seed_at(db: &Path, version: i64, rows: &str) {
+    let schema = match version {
+        9 => include_str!("fixtures/schema_v9.sql"),
+        19 => include_str!("fixtures/schema_v19.sql"),
+        28 => include_str!("fixtures/schema_v28.sql"),
+        _ => panic!("no frozen schema for v{version}"),
+    };
     let conn = rusqlite::Connection::open(db).unwrap();
-    for (i, migration) in nebula_daemon::store::MIGRATIONS
-        .iter()
-        .take(version)
-        .enumerate()
-    {
-        conn.execute_batch(&format!(
-            "BEGIN; {migration}; PRAGMA user_version = {}; COMMIT;",
-            i + 1
-        ))
-        .unwrap();
-    }
+    conn.execute_batch(schema).unwrap();
+    conn.pragma_update(None, "user_version", version).unwrap();
     conn.execute_batch(rows).unwrap();
 }
 

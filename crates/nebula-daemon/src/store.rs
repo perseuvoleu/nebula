@@ -13,7 +13,7 @@ use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-pub const MIGRATIONS: &[&str] = &[
+const MIGRATIONS: &[&str] = &[
     // 1: initial schema
     "
     CREATE TABLE projects (
