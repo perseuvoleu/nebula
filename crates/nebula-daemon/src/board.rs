@@ -142,6 +142,11 @@ fn apply(tx: &Transaction, links: &HostLinks, op: BoardOp) -> Result<BoardResult
         }
         BoardOp::BeginRun(dispatch) => begin_run(tx, dispatch).map(BoardResult::Run),
         BoardOp::EndRun {
+            agent: Some(_),
+            error: Some(_),
+            ..
+        } => bail!("a run ends with its session or its error, not both"),
+        BoardOp::EndRun {
             dispatch,
             agent,
             error,
@@ -1059,33 +1064,75 @@ mod tests {
         }
     }
 
-    #[test]
-    fn show_keeps_the_newest_notes_when_the_log_outgrows_a_frame() {
-        let store = Store::open_in_memory().unwrap();
-        let links = HostLinks::default();
-        let author = Author {
+    fn author() -> Author {
+        Author {
             host: "here".into(),
             agent: None,
             name: "me".into(),
-        };
-        let card = CardRef::Id(TodoId::generate());
-        let CardRef::Id(id) = &card else {
-            unreachable!()
-        };
+        }
+    }
+
+    fn add_card(store: &Store, links: &HostLinks) -> CardRef {
+        let id = TodoId::generate();
         serve(
-            &store,
-            &links,
+            store,
+            links,
             BoardOp::AddCard(CardDraft {
                 id: id.clone(),
-                title: "Long log".into(),
-                project: None,
+                title: "Card".into(),
+                project: Some("web".into()),
                 stage: Stage::Backlog,
                 proposed: false,
-                created_by: author.clone(),
+                created_by: author(),
                 checkout: None,
             }),
         )
         .unwrap();
+        CardRef::Id(id)
+    }
+
+    #[test]
+    fn end_run_with_both_a_session_and_an_error_is_refused() {
+        let store = Store::open_in_memory().unwrap();
+        let links = HostLinks::default();
+        let CardRef::Id(card) = add_card(&store, &links) else {
+            unreachable!()
+        };
+        let id = DispatchId::generate();
+        store
+            .board_transaction(|tx| {
+                tx.execute(
+                    "INSERT INTO dispatches (id, card_id, host, role, kind, worktree, state, created_at)
+                     VALUES (?1, ?2, 'here', 'worker', 'claude', 'new', 'pending', 0)",
+                    params![id.as_str(), card.as_str()],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let ended = serve(
+            &store,
+            &links,
+            BoardOp::EndRun {
+                dispatch: id.clone(),
+                agent: Some(AgentId::generate()),
+                error: Some("spawn failed".into()),
+            },
+        );
+        assert!(ended.is_err(), "{ended:?}");
+        let Ok(BoardResult::Run(receipt)) =
+            serve(&store, &links, BoardOp::Read(BoardRead::Dispatch { id }))
+        else {
+            panic!("no receipt")
+        };
+        assert_eq!(receipt.state, DispatchState::Pending);
+    }
+
+    #[test]
+    fn show_keeps_the_newest_notes_when_the_log_outgrows_a_frame() {
+        let store = Store::open_in_memory().unwrap();
+        let links = HostLinks::default();
+        let author = author();
+        let card = add_card(&store, &links);
         let notes = 2 * MAX_FRAME_LEN as usize / 100_000;
         for i in 0..notes {
             serve(
