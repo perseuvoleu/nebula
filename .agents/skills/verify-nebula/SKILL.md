@@ -25,6 +25,7 @@ Every process `vn` starts gets this environment, which is what keeps it off the 
 |---|---|---|
 | `NEBULA_RUNTIME_DIR` | `<state>/rt` | socket, pidfile and inboxes (`crates/nebula-core/src/paths.rs:7`) |
 | `NEBULA_DATA_DIR` | `<state>/data` | `nebula.db`, `config.json` and the logs (`paths.rs:60`, `paths.rs:83`) |
+| `NEBULA_RAG_LOCAL`, `NEBULA_RAG_HOST` | `0`, `vn-rag.invalid` | a `"board": "local"` daemon copies each decision to the RAG over ssh; a host that never resolves keeps it out of the shared RAG (`crates/nebula-daemon/src/rag_copy.rs`, `crates/nebula-rag/src/cli.rs:379`) |
 | `NEBULA_AGENT_CMD` | `/bin/sh` | agent sessions run a shell, not a model, and the daemon skips the CLI trust writes into `~/.claude.json` / `~/.codex` (`crates/nebula-daemon/src/registry.rs:128`, `registry.rs:3465`) |
 | `CODEX_HOME` | `<state>/codex` | a codex spawn writes its hooks there even with the override (`crates/nebula-daemon/src/hooks/installer.rs:338`) |
 | `PI_CODING_AGENT_DIR` | `<state>/pi` | a pi spawn writes its extension there (`installer.rs:573`) |

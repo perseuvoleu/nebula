@@ -29,6 +29,8 @@ refuse_unowned() {
 isolated_env=(env -u NEBULA_AGENT_ID -u NEBULA_API_URL -u NEBULA_API_TOKEN -u TMUX -u NO_COLOR -u FORCE_COLOR
   NEBULA_RUNTIME_DIR="$state/rt"
   NEBULA_DATA_DIR="$state/data"
+  NEBULA_RAG_LOCAL=0
+  NEBULA_RAG_HOST=vn-rag.invalid
   NEBULA_AGENT_CMD=/bin/sh
   SHELL=/bin/sh
   CODEX_HOME="$state/codex"
