@@ -1,10 +1,10 @@
 import { ExternalLinkIcon, ServerIcon, XIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { CopyButton } from "@/components/Markdown";
+import { formatWhen } from "@/lib/status";
 import { E2eRunView, type E2eRun } from "./E2eRunView";
 import { TicketView } from "./TicketView";
 import { LinkCard } from "./LinkCard";
-import { formatWhen } from "./DecisionCard";
 
 export interface ArtifactMeta {
   id: string;

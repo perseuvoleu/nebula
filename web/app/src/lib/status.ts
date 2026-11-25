@@ -24,3 +24,10 @@ export function formatTime(value: string | number | null | undefined): string {
   if (Number.isNaN(date.getTime())) return "";
   return date.toLocaleTimeString("ro-RO", { hour: "2-digit", minute: "2-digit" });
 }
+
+export function formatWhen(value: string | number): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  const year = date.getFullYear() === new Date().getFullYear() ? undefined : "numeric";
+  return date.toLocaleString("ro-RO", { day: "numeric", month: "short", year, hour: "2-digit", minute: "2-digit" });
+}
