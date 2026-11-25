@@ -32,10 +32,14 @@ test("phone loads older Claude conversation beyond the terminal screen and keeps
   await expect(log.locator("strong", { hasText: /^0$/ })).toHaveCount(0);
   await expect(log).not.toContainText("PRIVATE REASONING");
   const scroller = log.locator("> div").first();
-  await scroller.evaluate(el => { el.scrollTop = 0; });
+  const before = await scroller.evaluate(el => {
+    el.scrollTop = 0;
+    const first = [...el.querySelectorAll("strong")].find(s => /^[0-9]+$/.test(s.textContent ?? ""))!;
+    return { number: first.textContent, top: first.getBoundingClientRect().top };
+  });
   await expect(log.locator("strong", { hasText: /^20$/ })).toBeAttached();
-  // Prepending keeps the previous first message at the same visual position.
-  expect(await scroller.evaluate(el => el.scrollTop)).toBeGreaterThan(100);
+  const after = await log.locator("strong", { hasText: new RegExp(`^${before.number}$`) }).evaluate(el => el.getBoundingClientRect().top);
+  expect(Math.abs(after - before.top), `message ${before.number} stays where it was when older messages load above it`).toBeLessThan(2);
   fs.appendFileSync(file, entry(80));
   await expect(log.locator("strong", { hasText: /^80$/ })).toBeAttached();
   await expect(log.locator("strong", { hasText: /^80$/ })).not.toBeInViewport();

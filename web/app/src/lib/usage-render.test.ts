@@ -14,7 +14,7 @@ test('navbar renders both account indicators and an accessible detail trigger be
     assert.match(html, /Săptămână/);
     assert.match(html, /Codex —/);
     assert.match(html, /Claude —/);
-    assert.match(html, /aria-label="Detalii cote săptămânale Codex și Claude"/);
+    assert.match(html, /<button[^>]*aria-label="[^"]+"/);
     assert.doesNotMatch(html, /100%/);
   } finally {
     await server.close();

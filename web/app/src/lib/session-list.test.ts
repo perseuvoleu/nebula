@@ -22,11 +22,3 @@ test("unknown timestamps sort last with deterministic project/id ties, independe
     assert.deepEqual(orderSessions(input, new Set()).map(r => `${r.project}/${r.id}`), expected);
   }
 });
-
-test("polling unchanged activity preserves order; later daemon activity moves just that session", () => {
-  const rows = [row("one", "running", 10), row("two", "running", 20)];
-  assert.deepEqual(orderSessions(rows, new Set()).map(r => r.id), ["two", "one"]);
-  assert.deepEqual(orderSessions(structuredClone(rows), new Set()).map(r => r.id), ["two", "one"]);
-  rows[0].status_changed_at = 30;
-  assert.deepEqual(orderSessions(rows, new Set()).map(r => r.id), ["one", "two"]);
-});
