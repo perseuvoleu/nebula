@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { expect, test, type Locator, type Page } from "@playwright/test";
-import { openBoard } from "../helpers";
+import { login } from "../helpers";
 
 type Card = { number: number; title: string; stage: string; sessions: { name: string; role: string }[] };
 
@@ -20,7 +20,7 @@ const tile = (scope: Locator, title: string) => scope.getByRole("article").filte
 const section = (page: Page, title: string) => page.getByRole("region", { name: title, exact: true });
 
 test("a card made on the web is the daemon's card: a drag moves it there and a CLI move shows on the web", async ({ page }) => {
-  await openBoard(page, "/board/p/repo");
+  await login(page, "/board/p/repo");
   await page.getByRole("button", { name: "Card nou", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Card nou" });
   await dialog.getByLabel("Titlu").fill("Ship the real lane");
@@ -37,7 +37,7 @@ test("a card made on the web is the daemon's card: a drag moves it there and a C
 
 test("Run starts the replay agent on the card, and its finished turn moves the card to review", async ({ page }) => {
   const card = add("Run the replay agent");
-  await openBoard(page, `/board/p/repo/c/${card.number}`);
+  await login(page, `/board/p/repo/c/${card.number}`);
   await page.getByRole("button", { name: "Pornește", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Pornește un agent pe card" });
   await expect(dialog.getByRole("radio", { name: "worker" })).toBeChecked();
@@ -54,7 +54,7 @@ test("Run starts the replay agent on the card, and its finished turn moves the c
 
 test("a decision recorded on the card is found by the decisions search", async ({ page }) => {
   const card = add("Decide the poll");
-  await openBoard(page, `/board/p/repo/c/${card.number}`);
+  await login(page, `/board/p/repo/c/${card.number}`);
   const form = page.getByRole("form", { name: "Notează o decizie" });
   await form.getByLabel("Decizia").fill("Poll the real board every three seconds");
   await form.getByLabel("De ce").fill("One CLI call per poll is cheap");
@@ -90,7 +90,7 @@ test("a reporter run published with nebula artifact add opens with every screens
     await incompleteAtPoll;
     await route.fulfill({ response });
   });
-  await openBoard(page, `/board/p/repo/c/${card.number}`);
+  await login(page, `/board/p/repo/c/${card.number}`);
   await expect(images).toHaveCount(shots.length);
   for (const image of await images.all()) await image.scrollIntoViewIfNeeded();
   await expect.poll(incomplete).toBe(0);
