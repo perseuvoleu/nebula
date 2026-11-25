@@ -234,10 +234,8 @@ impl Relay {
                     if self.pending.lock().unwrap().len() >= 256 {
                         client.deliver(ServerEvent::Error {
                             req_id: Some(local),
-                            message: format!(
-                                "{}: too many pending requests; request was not sent",
-                                self.host
-                            ),
+                            message: nebula_core::board::Refusal::Unreachable
+                                .message(format!("{}: too many pending requests", self.host)),
                         });
                         return;
                     }
@@ -270,7 +268,8 @@ impl Relay {
             if let Some((client, local, _)) = waiting {
                 client.deliver(ServerEvent::Error {
                     req_id: Some(local),
-                    message: format!("{} is unreachable right now", self.host),
+                    message: nebula_core::board::Refusal::Unreachable
+                        .message(format!("{} is unreachable right now", self.host)),
                 });
             }
             return;
@@ -289,7 +288,8 @@ impl Relay {
             });
             client.deliver(ServerEvent::Error {
                 req_id,
-                message: format!("{}: relay queue full; request was not sent", self.host),
+                message: nebula_core::board::Refusal::Unreachable
+                    .message(format!("{}: relay queue full", self.host)),
             });
         }
     }
@@ -463,10 +463,8 @@ async fn pump_transport<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     for (_, (client, local, _)) in pending {
         client.deliver(ServerEvent::Error {
             req_id: Some(local),
-            message: format!(
-                "{}: connection lost; request outcome unknown; not replayed",
-                relay.host
-            ),
+            message: nebula_core::board::Refusal::OutcomeUnknown
+                .message(format!("{}: connection lost, not replayed", relay.host)),
         });
     }
     relay.notify_status(false);
@@ -1190,6 +1188,7 @@ fn with_req_id(req: &ClientRequest, req_id: u64) -> Option<ClientRequest> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nebula_core::board::Refusal;
     use nebula_core::{AgentId, WorktreeId};
     use tokio::io::AsyncWriteExt;
 
@@ -1686,13 +1685,7 @@ mod tests {
             let reply = tokio::time::timeout(Duration::from_millis(100), replies.recv())
                 .await
                 .expect("uncertain mutation was left pending");
-            assert!(matches!(
-                reply,
-                Some(ServerEvent::Error {
-                    req_id: Some(42),
-                    ..
-                })
-            ));
+            assert_eq!(refusal_of(reply), Some(Refusal::OutcomeUnknown));
         }
     }
 
@@ -1727,13 +1720,36 @@ mod tests {
         )
         .await
         .expect("full transport queue blocked a caller");
-        assert!(matches!(
-            replies.recv().await,
+        assert_eq!(refusal_of(replies.recv().await), Some(Refusal::Unreachable));
+    }
+
+    #[tokio::test]
+    async fn disconnected_host_refuses_as_unreachable() {
+        let (_, relay, _requests) = test_relay();
+        let (client, mut replies) = mpsc::channel(4);
+        let client = RelayClient::new(client, tokio_util::sync::CancellationToken::new());
+        relay
+            .forward(
+                ClientRequest::CreateTerminal {
+                    expected_branch: Some("feature".into()),
+                    req_id: 42,
+                    worktree: WorktreeId("worktree".into()),
+                    name: None,
+                },
+                &client,
+            )
+            .await;
+        assert_eq!(refusal_of(replies.recv().await), Some(Refusal::Unreachable));
+    }
+
+    fn refusal_of(reply: Option<ServerEvent>) -> Option<Refusal> {
+        match reply {
             Some(ServerEvent::Error {
                 req_id: Some(42),
-                ..
-            })
-        ));
+                message,
+            }) => Refusal::of(&message),
+            other => panic!("expected the refused request's error, got {other:?}"),
+        }
     }
 
     #[tokio::test]
