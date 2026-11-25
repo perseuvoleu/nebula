@@ -2063,6 +2063,28 @@ fn link_qualifies_cleared_blockers_like_blocked_by() {
     );
 }
 
+#[test]
+fn link_refusals_name_cards_with_their_host() {
+    let board = board_env();
+    let here = viewer(&proxy_to(&board));
+    add(&board, &["--project", "nebula"], "Waits");
+    let missing = here.cli(&["todo", "show", "99@boardhost"], None);
+    assert!(
+        stderr(&missing).contains("no card #99@boardhost"),
+        "{}",
+        stderr(&missing)
+    );
+    let moved = here.cli(
+        &["todo", "move", "#1@boardhost", "doing", "--expect", "next"],
+        None,
+    );
+    assert!(
+        stderr(&moved).contains("#1@boardhost is in backlog"),
+        "{}",
+        stderr(&moved)
+    );
+}
+
 const UNREACHABLE: &str = "nebula: board host boardhost is unreachable; nothing was sent";
 
 #[test]

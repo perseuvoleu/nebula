@@ -24,7 +24,8 @@ const RECONNECT_MIN: Duration = Duration::from_secs(2);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
 
 /// Where the link stands. `connections` counts handshakes, so a watcher
-/// sees every (re)connect; `attempts` counts finished connection attempts.
+/// sees every (re)connect; `attempts` counts connections that ended,
+/// whether or not they came up.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LinkState {
     pub up: bool,
@@ -193,7 +194,7 @@ impl BoardLink {
             ServerEvent::Error {
                 req_id: Some(req_id),
                 message,
-            } => (req_id, Err(message)),
+            } => (req_id, Err(qualify(&message, &self.host))),
             _ => return,
         };
         let Some(pending) = self.pending.lock().unwrap().remove(&remote) else {
@@ -281,7 +282,6 @@ async fn connect_and_pump(
         link.state.send_modify(|s| {
             s.up = true;
             s.connections += 1;
-            s.attempts += 1;
         });
     }
     tracing::info!(host = %link.host, "board link up");
@@ -393,4 +393,25 @@ fn relabel(result: &mut BoardResult, host: &str) {
             blocker.push_str(host);
         }
     }
+}
+
+/// The board's own refusals name cards as `#12`; off the board host they
+/// read `#12@host`, as relabeled replies do.
+fn qualify(message: &str, host: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    let mut rest = message;
+    while let Some(at) = rest.find('#') {
+        let (before, from) = rest.split_at(at);
+        out.push_str(before);
+        let digits = from[1..].bytes().take_while(u8::is_ascii_digit).count();
+        let (label, after) = from.split_at(1 + digits);
+        out.push_str(label);
+        if digits > 0 && !after.starts_with('@') {
+            out.push('@');
+            out.push_str(host);
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
 }
