@@ -4427,6 +4427,24 @@ fn decision_add_home_ignores_the_callers_checkout() {
     assert_eq!(decided["title"], "Keep a shared inbox");
 }
 
+/// A decision in no project reaches RAG's `shared` workspace.
+#[test]
+fn home_decision_reaches_shared_rag() {
+    let env = rag_board(None, &[]);
+    let decided = decide(
+        &env,
+        None,
+        &[
+            "--home",
+            "--why=Nobody owns the inbox",
+            "Keep a shared inbox",
+        ],
+    );
+    assert_eq!(decided["project"], Value::Null);
+    let note = rag_note(&env, decided["id"].as_str().unwrap());
+    assert_eq!(rag_hit(&env, "Nobody owns the inbox", note)["ws"], "shared");
+}
+
 #[test]
 fn decision_in_a_project_rag_cannot_name_still_reaches_rag() {
     let env = rag_board(None, &[]);
