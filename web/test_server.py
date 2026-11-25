@@ -353,7 +353,7 @@ class GatewayTests(unittest.TestCase):
             with self.assertRaises(Problem) as ctx:
                 self.gateway.get("/api/conversation", {"project": ["project"], "id": ["one"]})
         self.assertEqual(ctx.exception.status, 503)
-        self.assertNotIn("one", self.gateway.identities)  # nothing cached from a transient failure
+        self.assertNotIn(("project", "one"), self.gateway.identities)  # nothing cached from a transient failure
         show = {**SHOW, "session_id": SID_A}
         rows = [{**ROWS[0], "session_id": SID_A}]
         with patch.object(self.gateway, "run", side_effect=[rows]):
@@ -361,6 +361,26 @@ class GatewayTests(unittest.TestCase):
         with patch.object(self.gateway, "run", side_effect=[rows, show]):
             result = self.gateway.get("/api/conversation", {"project": ["project"], "id": ["one"]})
         self.assertNotIn("session_id", result["session"])
+
+    def test_native_history_cache_per_project(self):
+        config = Path(self.tmp.name) / "claude"
+        gateway = Gateway(TOKEN, "http://127.0.0.1:8765", ["alpha", "beta"], usage_service=None,
+                          static=self.gateway.static, claude_config_dir=config)
+        sessions = {"alpha": SID_A, "beta": SID_B}
+        for project, sid in sessions.items():
+            directory = config / "projects" / f"-srv-{project}"
+            directory.mkdir(parents=True)
+            (directory / f"{sid}.jsonl").write_text(json.dumps({
+                "type": "user", "sessionId": sid, "uuid": "u1",
+                "message": {"content": f"{project} transcript"}}) + "\n")
+        for project, sid in sessions.items():
+            rows = [{**ROWS[0], "kind": "claude", "path": f"/srv/{project}"}]
+            show = {**SHOW, "kind": "claude", "session_id": sid}
+            with patch.object(gateway, "run", side_effect=[rows, show]):
+                result = gateway.get("/api/conversation", {"project": [project], "id": ["one"]})
+            self.assertTrue(result["capabilities"]["structured"], result["capabilities"]["reason"])
+            self.assertEqual([p["text"] for m in result["snapshot"]["messages"] for p in m["parts"]],
+                             [f"{project} transcript"])
 
     def test_native_identity_db_fallback_is_read_only_and_schema_checked(self):
         db = Path(self.tmp.name) / "nebula.db"

@@ -272,7 +272,7 @@ class Gateway:
         self.db_path = Path(db_path) if db_path else None
         self.hostname = socket.gethostname()
         self.slots = threading.BoundedSemaphore(4)
-        self.identities = {}  # agent id -> (native session id | None, reason, expires)
+        self.identities = {}  # (project, agent id) -> (native session id | None, reason, expires)
         self.lock = threading.Lock()
         self.checkout_lock = threading.Lock()
         self.push = push
@@ -435,7 +435,7 @@ class Gateway:
         read-only lookup of the daemon's SQLite row when NEBULA_WEB_DB is configured.
         """
         with self.lock:
-            cached = self.identities.get(row["id"])
+            cached = self.identities.get((project, row["id"]))
             if cached and cached[2] > time.monotonic():
                 if cached[1]:
                     raise Problem(409, cached[1])
@@ -456,10 +456,10 @@ class Gateway:
             if error.status in TRANSIENT:
                 raise  # busy/timeout/CLI failure: not an identity fact, never cached or "unsupported"
             with self.lock:
-                self.identities[row["id"]] = (None, error.message, time.monotonic() + IDENTITY_TTL)
+                self.identities[(project, row["id"])] = (None, error.message, time.monotonic() + IDENTITY_TTL)
             raise
         with self.lock:
-            self.identities[row["id"]] = (value, None, time.monotonic() + IDENTITY_TTL)
+            self.identities[(project, row["id"])] = (value, None, time.monotonic() + IDENTITY_TTL)
         return value
 
     def db_session_id(self, agent_id):
