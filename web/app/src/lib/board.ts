@@ -1,3 +1,5 @@
+import { STATUS_LABEL } from "./status.ts";
+
 export const STAGES = ["backlog", "next", "doing", "review", "done"] as const;
 export type Stage = (typeof STAGES)[number];
 
@@ -46,10 +48,10 @@ export type LogEntry = { id: string; author: string; text: string; age: string }
 export type Dot = "needs" | "running" | "done" | "queued" | "off";
 
 export const DOT_LABEL: Record<Dot, string> = {
-  needs: "Așteaptă răspuns",
-  running: "Lucrează",
-  done: "Gata",
-  queued: "Nou",
+  needs: STATUS_LABEL.needs_feedback,
+  running: STATUS_LABEL.running,
+  done: STATUS_LABEL.finished,
+  queued: STATUS_LABEL.fresh,
   off: "Inactiv",
 };
 

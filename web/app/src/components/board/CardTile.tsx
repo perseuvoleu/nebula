@@ -12,8 +12,10 @@ const DOT_CLASS: Record<Dot, string> = {
   off: "border border-muted-foreground/60",
 };
 
-export function StatusDot({ dot, label = DOT_LABEL[dot] }: { dot: Dot; label?: string }) {
-  return <span role="img" aria-label={label} title={label} className={cn("inline-block size-2 shrink-0 rounded-full", DOT_CLASS[dot])} />;
+export function StatusDot({ dot, label = DOT_LABEL[dot] }: { dot: Dot; label?: string | null }) {
+  const className = cn("inline-block size-2 shrink-0 rounded-full", DOT_CLASS[dot]);
+  if (label === null) return <span aria-hidden className={className} />;
+  return <span role="img" aria-label={label} title={label} className={className} />;
 }
 
 export function CardRef({ cardRef }: { cardRef: string }) {
@@ -66,7 +68,7 @@ export function CardTile({ card, selected = false, showProject = false, onOpen, 
       {(card.proposed || blocked || card.checkout || card.artifacts > 0) && (
         <div className="flex flex-wrap items-center gap-1">
           {card.proposed && <Tag className="border-dashed text-foreground">propus de {card.proposedBy ?? "agent"}</Tag>}
-          {card.blockers.map((b) => <Tag key={b.ref} className="text-foreground"><span title={b.title}>blocat de {b.ref}</span></Tag>)}
+          {card.blockers.map((b) => <Tag key={b.ref} className="relative z-10 text-foreground"><span title={b.title}>blocat de {b.ref}</span></Tag>)}
           {card.checkout && <Tag className="font-mono"><GitBranchIcon aria-hidden className="size-3 shrink-0" /><span className="truncate">{card.checkout.branch}</span></Tag>}
           {card.artifacts > 0 && <Tag><span className="tabular-nums">{card.artifacts}</span> artefacte</Tag>}
         </div>
