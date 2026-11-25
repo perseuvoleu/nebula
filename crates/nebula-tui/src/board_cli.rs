@@ -902,7 +902,6 @@ fn result_json(result: &BoardResult) -> Result<serde_json::Value> {
         BoardResult::Show(show) => serde_json::to_value(show)?,
         BoardResult::Artifacts(page) => serde_json::to_value(page)?,
         BoardResult::Artifact(artifact) => serde_json::to_value(artifact)?,
-        BoardResult::Note(note) => serde_json::to_value(note)?,
         BoardResult::Run(receipt) => serde_json::to_value(receipt)?,
         BoardResult::Done => serde_json::Value::Null,
     })
@@ -970,7 +969,6 @@ fn print_human(result: &BoardResult) {
                 println!("  {}: {}", note.author.name, note.text);
             }
         }
-        BoardResult::Note(note) => println!("note added: {}", note.text),
         BoardResult::Board(BoardPoll::Unchanged { version }) => println!("unchanged at {version}"),
         BoardResult::Board(BoardPoll::Board { board, .. }) => {
             for card in &board.cards {

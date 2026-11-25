@@ -581,7 +581,6 @@ pub enum BoardResult {
     Show(Box<CardShow>),
     Artifacts(Page<Artifact>),
     Artifact(Artifact),
-    Note(CardNote),
     Run(RunReceipt),
     Done,
 }
