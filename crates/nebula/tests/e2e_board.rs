@@ -2965,6 +2965,22 @@ fn run_host_is_a_reported_host() {
 }
 
 #[test]
+fn cross_host_run_keeps_option_values() {
+    let board = board_env();
+    let laptop = viewer_on(&proxy_to(&board), "laptop", &[]);
+    laptop.make_repo_named("-ops");
+    add(&board, &["--project=-ops"], "Dashed");
+    reported(&board, "laptop");
+    let (path, _, _) = ssh_stub(&board, &laptop);
+    let argv = run_argv(&board, "#1", &[("--host", "laptop")], &["--scope=-ops"]);
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let run = receipt(board.cli_env(&argv, None, &[("PATH", &path)]));
+    assert_eq!(run["state"], "started");
+    let agents = laptop.json(&["agent", "list", "--project=-ops"]);
+    assert_eq!(agents.as_array().map(Vec::len), Some(1), "{agents}");
+}
+
+#[test]
 fn cross_host_report_resent_on_connect() {
     let mut board = board_env();
     let here = viewer_on(&proxy_to(&board), "laptop", &[]);

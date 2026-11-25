@@ -135,7 +135,7 @@ impl ScopeFlags {
     fn args(&self) -> Vec<String> {
         let mut args = Vec::new();
         for project in &self.projects {
-            args.extend(["--scope".to_string(), project.clone()]);
+            args.push(format!("--scope={project}"));
         }
         if self.all {
             args.extend(["--scope".to_string(), "*".to_string()]);
@@ -549,6 +549,7 @@ async fn run_dispatch(
         }
         Target::Over => {
             let card = receipt.card.as_str();
+            let worktree_word = format!("--worktree={worktree}");
             let mut words = vec![
                 "nebula",
                 "todo",
@@ -560,8 +561,7 @@ async fn run_dispatch(
                 kind.as_str(),
                 "--host",
                 &host,
-                "--worktree",
-                &worktree,
+                &worktree_word,
                 "--dispatch",
                 id.as_str(),
                 "--forwarded",
