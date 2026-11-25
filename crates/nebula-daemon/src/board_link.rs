@@ -19,7 +19,16 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-const REPLY_DEADLINE: Duration = Duration::from_secs(30);
+
+/// How long a written request waits for its answer before it alone ends
+/// as outcome unknown.
+fn reply_deadline() -> Duration {
+    std::env::var("NEBULA_BOARD_REPLY_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_secs(30))
+}
 const RECONNECT_MIN: Duration = Duration::from_secs(2);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
 
@@ -36,8 +45,7 @@ pub struct LinkState {
 struct Pending {
     client: RelayClient,
     local: u64,
-    sent: bool,
-    admitted: Instant,
+    written: Option<Instant>,
 }
 
 pub struct BoardLink {
@@ -117,8 +125,7 @@ impl BoardLink {
                     Pending {
                         client: client.clone(),
                         local,
-                        sent: false,
-                        admitted: Instant::now(),
+                        written: None,
                     },
                 );
                 match self.out.try_send((remote, op)) {
@@ -177,12 +184,27 @@ impl BoardLink {
         )
     }
 
-    fn overdue(&self) -> bool {
-        self.pending
-            .lock()
-            .unwrap()
-            .values()
-            .any(|p| p.sent && p.admitted.elapsed() >= REPLY_DEADLINE)
+    /// Ends each request written longer than the deadline ago; the link
+    /// stays up for the rest.
+    fn expire(&self, deadline: Duration) {
+        let overdue: Vec<Pending> = {
+            let mut pending = self.pending.lock().unwrap();
+            let late: Vec<u64> = pending
+                .iter()
+                .filter(|(_, p)| p.written.is_some_and(|at| at.elapsed() >= deadline))
+                .map(|(remote, _)| *remote)
+                .collect();
+            late.iter().filter_map(|r| pending.remove(r)).collect()
+        };
+        for pending in overdue {
+            pending.client.deliver(ServerEvent::Error {
+                req_id: Some(pending.local),
+                message: Refusal::OutcomeUnknown.message(format!(
+                    "board host {} did not answer in time",
+                    self.host
+                )),
+            });
+        }
     }
 
     fn answer(&self, event: ServerEvent) {
@@ -222,7 +244,7 @@ impl BoardLink {
         while out_rx.try_recv().is_ok() {}
         let unreachable = self.unreachable();
         for (_, pending) in std::mem::take(&mut *self.pending.lock().unwrap()) {
-            let message = match pending.sent {
+            let message = match pending.written.is_some() {
                 true => Refusal::OutcomeUnknown.message(format!(
                     "board host {}: the link dropped after the request was sent",
                     self.host
@@ -313,7 +335,8 @@ async fn connect_and_pump(
     }
     tracing::info!(host = %link.host, "board link up");
     crate::board_report::resend();
-    let mut tick = tokio::time::interval(Duration::from_secs(5));
+    let deadline = reply_deadline();
+    let mut tick = tokio::time::interval(deadline.min(Duration::from_secs(5)));
     loop {
         let frame = {
             let read = read_frame::<ServerEvent, _>(&mut reader);
@@ -321,11 +344,7 @@ async fn connect_and_pump(
             loop {
                 tokio::select! {
                     _ = link.stop.cancelled() => return Ok(()),
-                    _ = tick.tick() => {
-                        if link.overdue() {
-                            bail!("board host {} did not answer in time", link.host);
-                        }
-                    }
+                    _ = tick.tick() => link.expire(deadline),
                     frame = &mut read => break frame?,
                     queued = out_rx.recv() => {
                         let Some((remote, op)) = queued else {
@@ -336,7 +355,7 @@ async fn connect_and_pump(
                             .await
                             .context("board link write timed out")??;
                         if let Some(pending) = link.pending.lock().unwrap().get_mut(&remote) {
-                            pending.sent = true;
+                            pending.written = Some(Instant::now());
                         }
                     }
                 }

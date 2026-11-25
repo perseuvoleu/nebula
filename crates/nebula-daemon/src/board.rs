@@ -25,7 +25,7 @@ pub(crate) fn page_budget() -> usize {
         .unwrap_or(MAX_FRAME_LEN as usize / 2)
 }
 
-pub fn serve(store: &Store, links: &HostLinks, op: BoardOp) -> Result<BoardResult> {
+pub(crate) fn serve(store: &Store, links: &HostLinks, op: BoardOp) -> Result<BoardResult> {
     let result = store.board_transaction(|tx| apply(tx, links, op))?;
     if let BoardResult::Artifact(artifact) = &result {
         if artifact.kind == "decision" && !artifact.meta.contains_key("rag_note") {

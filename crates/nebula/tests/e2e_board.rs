@@ -1976,6 +1976,7 @@ s = socket.socket(socket.AF_UNIX)
 s.connect(sys.argv[1])
 marker = sys.argv[2] if len(sys.argv) > 2 else None
 drop = marker is not None and not os.path.exists(marker)
+swallow = os.environ.get('PUMP_SWALLOW', '').encode()
 def up():
     while True:
         b = os.read(0, 65536)
@@ -1998,6 +1999,8 @@ while True:
     if drop and b'BoardReply' in body:
         open(marker, 'w').close()
         os._exit(0)
+    if swallow and swallow in body and b'BoardReply' in body:
+        continue
     os.write(1, head + body)
 "#,
     )
@@ -2143,6 +2146,26 @@ fn link_lost_after_send_exit_4() {
     let rerun = json_of(here.cli(&argv, None), &argv);
     assert_eq!(rerun["id"], id.as_str());
     assert_eq!(list(&board, &["--all"]), ["Once"]);
+}
+
+#[test]
+fn link_times_out_one_request_alone() {
+    let board = board_env();
+    let launches = board.tmp.path().join("launches");
+    let here = viewer_on(
+        &format!(
+            "echo >> '{}'; PUMP_SWALLOW=Swallowed {}",
+            launches.display(),
+            pump_to(&board, None)
+        ),
+        "here",
+        &[("NEBULA_BOARD_REPLY_MS", "500")],
+    );
+    let lost = here.cli(&["todo", "add", "--project", "nebula", "Swallowed"], None);
+    assert_eq!(lost.status.code(), Some(4), "{}", stderr(&lost));
+    add(&here, &["--project", "nebula"], "After");
+    let launched = std::fs::read_to_string(&launches).unwrap().lines().count();
+    assert_eq!(launched, 1, "the link reconnected over one late reply");
 }
 
 #[test]
