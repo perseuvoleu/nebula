@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { expect, type Locator, type Page } from "@playwright/test";
-import { test, STATE, TOKEN, noHorizontalOverflow, setBehaviour, shot } from "./helpers";
+import { test, STATE, TOKEN, changeBoard, noHorizontalOverflow, setBehaviour, shot } from "./helpers";
 
 type Board = { version: number; cards: Record<string, unknown>[]; hosts: { needs_you: number }[];
   away: { finished: { id: unknown; at: number }[] }; details: Record<string, { sessions: Record<string, unknown>[] }> };
@@ -88,6 +88,24 @@ test("the away digest lists only the scope's project and shows only what it list
   await expect(page).toHaveURL(/\/board\/p\/vela$/);
   await expect(tile(page, "Keep verification results")).toHaveCount(0);
   await expect(digest).toHaveCount(0);
+});
+
+test("the away digest reads the decisions it names once, not every page on every board change", async ({ page }) => {
+  changeBoard((board) => board.decisions.push(...[1, 2, 3].map((n) => ({ ...board.decisions[0], id: `01JG${String(n).padStart(22, "0")}`,
+    title: `Older decision ${n}`, created_at: 1763000000000 + n }))));
+  const decisionReads: string[] = [];
+  page.on("request", (r) => { if (new URL(r.url()).pathname === "/api/decisions") decisionReads.push(r.url()); });
+  await awayFrom(page);
+  await open(page, "/board");
+  const digest = page.getByRole("region", { name: "De când ai lipsit" });
+  await expect(digest.getByText("Copy published files")).toBeVisible();
+  for (const [i, stage] of ["next", "doing"].entries()) {
+    const polled = page.waitForResponse((r) => new URL(r.url()).pathname === "/api/board" && r.ok() && r.request().url().includes("since"));
+    addCard(30 + i, `Board change to ${stage}`, stage);
+    await polled;
+    await expect(tile(page, `Board change to ${stage}`)).toBeVisible();
+  }
+  expect(decisionReads).toHaveLength(1);
 });
 
 test("at 390 px a long away digest is capped and leaves the board in view", async ({ page }) => {

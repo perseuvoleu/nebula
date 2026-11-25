@@ -90,29 +90,34 @@ function useCard(slug: string | null, board: BoardData | null) {
   return state?.slug === slug ? { ...state, refresh: () => setAttempt((n) => n + 1) } : null;
 }
 
-async function allDecisions(query: string, signal: AbortSignal): Promise<Decision[]> {
+/** Reads pages until `wanted` are all found, or every page when `wanted` is null. */
+async function readDecisions(query: string, wanted: string[] | null, signal: AbortSignal): Promise<Decision[]> {
   const items: Decision[] = [];
   let page: string | null = null;
   do {
     const data: { items: Decision[]; next: string | null } = await api("decisions", { query: query || undefined, page: page ?? undefined }, undefined, { signal });
     items.push(...data.items);
     page = data.next;
-  } while (page);
+  } while (page && !wanted?.every((id) => items.some((d) => d.id === id)));
   return items;
 }
 
-function useDecisions(enabled: boolean, query: string, board: BoardData | null) {
+/** The decisions page reads every page on each board change; the away digest reads only until it has the decisions it names. */
+function useDecisions(page: boolean, wanted: string[], query: string, board: BoardData | null) {
   const [state, setState] = useState<{ query: string; items: Decision[]; error: string | null } | null>(null);
+  const enabled = page || wanted.length > 0;
+  const want = page ? null : wanted.join(" ");
+  const changed = page ? board : want;
   useEffect(() => {
     if (!enabled) return;
     const abort = new AbortController();
-    allDecisions(query, abort.signal)
+    readDecisions(query, want === null ? null : want.split(" "), abort.signal)
       .then((items) => setState({ query, items, error: null }))
       .catch((failure) => {
         if (!abort.signal.aborted) setState((old) => ({ query, items: old?.query === query ? old.items : [], error: describeError(failure) }));
       });
     return () => abort.abort();
-  }, [enabled, query, board]);
+  }, [enabled, query, want, changed]);
   const current = enabled && state?.query === query ? state : null;
   return { items: current?.items ?? [], error: current?.error ?? null, loading: enabled && !current };
 }
@@ -219,7 +224,7 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
   const cards = scoped.filter((c) => !c.proposed);
   const bySlug = (slug: string | null): Card | undefined => live.find((c) => cardSlug(c.ref) === slug);
   const peeked = bySlug(route.peek);
-  const listed = useDecisions(route.decisions || !!board?.away.decisions.length, route.decisions ? decisionQuery : "", board);
+  const listed = useDecisions(route.decisions, board?.away.decisions ?? [], route.decisions ? decisionQuery : "", board);
   const decisions = listed.items;
   const homeSessions = useHomeSessions(route.decisions ? decisions.flatMap((d) => d.project === null && d.session ? [d.session] : []) : [], workspace);
   const digest = board && awayDigest(board, scope, decisions);
