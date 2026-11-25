@@ -394,18 +394,28 @@ EOF
 ### Rollback
 
 Per host, newest first. Quit every `ng` window first: a TUI reconnects by starting a daemon, which
-would open the database while it is restored, so the block refuses while any `nebula` process runs.
+would open the database while it is restored, so the block refuses while this user's daemon runs (it
+holds the lock on `daemon.pid` in nebula's runtime dir; daemons in other runtime dirs do not count).
 `B` and `D` below are leaseweb's and findl's; on a laptop, `B=~/.cargo/bin` and
 `D="$HOME/Library/Application Support/dev.nebula.nebula"`.
 
 ```bash
 bash -euo pipefail <<'EOF'
+daemon_alive() { python3 -c '
+import fcntl,os,sys; e=os.environ.get; x=e("XDG_RUNTIME_DIR")
+p=os.path.join(e("NEBULA_RUNTIME_DIR") or (x and os.path.join(x,"nebula")) or "/tmp/nebula-%d" % os.geteuid(),"daemon.pid")
+if not os.path.exists(p): sys.exit(1)
+f=open(p,"r+")
+try: fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)
+except OSError: print(p,"held by pid",f.read().strip()); sys.exit(0)
+sys.exit(1)'; }
 B=~/.local/bin D=~/.local/share/nebula
 if command -v systemctl >/dev/null; then systemctl --user stop nebula-web || true; fi
 nebula kill || true
-for i in 1 2 3 4 5; do pgrep -x nebula >/dev/null || break; sleep 1; done
-if pgrep -lx nebula; then echo "nebula still runs: quit every ng window and nebula client, then rerun" >&2; exit 1; fi
-cp -p "$B/nebula.pre-33" "$B/nebula"
+for i in 1 2 3 4 5; do daemon_alive >/dev/null || break; sleep 1; done
+if daemon_alive; then echo "nebula daemon still runs: quit every ng window and nebula client, then rerun" >&2; exit 1; fi
+cp -p "$B/nebula.pre-33" "$B/nebula.new"
+mv "$B/nebula.new" "$B/nebula"
 rm -f "$D/nebula.db-wal" "$D/nebula.db-shm"
 cp -p "$D/nebula.db.pre-33" "$D/nebula.db"
 python3 -c 'import json,sys; p=sys.argv[1]; c=json.load(open(p)); c.pop("board",None); json.dump(c,open(p,"w"),indent=2)' "$D/config.json"
