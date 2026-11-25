@@ -2821,6 +2821,179 @@ fn approve_checks_status_timestamp() {
     assert_eq!(inputs(), before + 1);
 }
 
+struct Killed(Child);
+
+impl Drop for Killed {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// A socket the CLI reaches its daemon through (its runtime dir is
+/// returned) that forwards everything until the daemon's first Ack, then
+/// closes the CLI's connection with that Ack unsent, once.
+fn ack_cutter(env: &Env) -> (Killed, PathBuf) {
+    let script = env.tmp.path().join("ack-cut.py");
+    std::fs::write(
+        &script,
+        r#"import os, socket, sys, threading
+listen, upstream, once = sys.argv[1:4]
+srv = socket.socket(socket.AF_UNIX)
+srv.bind(listen)
+srv.listen(8)
+def serve(c):
+    u = socket.socket(socket.AF_UNIX)
+    u.connect(upstream)
+    def up():
+        try:
+            while True:
+                b = c.recv(65536)
+                if not b:
+                    break
+                u.sendall(b)
+            u.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+    threading.Thread(target=up, daemon=True).start()
+    def exact(n):
+        buf = b''
+        while len(buf) < n:
+            got = u.recv(n - len(buf))
+            if not got:
+                return None
+            buf += got
+        return buf
+    while True:
+        head = exact(4)
+        body = head and exact(int.from_bytes(head, 'little'))
+        if body is None or (b'\xa3Ack' in body and not os.path.exists(once)):
+            if body is not None:
+                open(once, 'w').close()
+            c.shutdown(socket.SHUT_RDWR)
+            c.close()
+            u.close()
+            return
+        c.sendall(head + body)
+while True:
+    c, _ = srv.accept()
+    threading.Thread(target=serve, args=(c,), daemon=True).start()
+"#,
+    )
+    .unwrap();
+    let rt = env.tmp.path().join("cut-rt");
+    std::fs::create_dir_all(&rt).unwrap();
+    let child = Command::new("python3")
+        .arg(&script)
+        .arg(rt.join("daemon.sock"))
+        .arg(env.runtime_dir().join("daemon.sock"))
+        .arg(env.tmp.path().join("ack-cut-once"))
+        .spawn()
+        .unwrap();
+    let child = Killed(child);
+    wait_for(&rt.join("daemon.sock"));
+    (child, rt)
+}
+
+/// Run and Approve whose final Ack is lost after they took effect exit 4
+/// and name what reruns them, as a lost board reply does.
+#[test]
+fn lost_final_ack_exit_4() {
+    let replay = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/replay");
+    let agent = format!(
+        "{} {}",
+        replay.join("agent").display(),
+        replay.join("ask.replay").display()
+    );
+    let env = Env::new();
+    env.board_local();
+    let input = env.tmp.path().join("input.log");
+    let env = env.start(&[
+        ("NEBULA_AGENT_CMD", agent.as_str()),
+        ("NEBULA_STATUS_TICK_MS", "100"),
+        ("REPLAY_INPUT_LOG", input.to_str().unwrap()),
+    ]);
+    let inputs = || {
+        std::fs::read_to_string(&input)
+            .map(|log| log.lines().count())
+            .unwrap_or(0)
+    };
+    env.make_repo();
+    add(&env, &["--project", "repo"], "Ask");
+
+    let (cutter, cut_rt) = ack_cutter(&env);
+    let cut_rt = cut_rt.to_str().unwrap();
+    let dispatch = TodoId::generate().0;
+    let argv = run_argv(&env, "#1", &[], &["--dispatch", &dispatch]);
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let lost = env.cli_env(&argv, None, &[("NEBULA_RUNTIME_DIR", cut_rt)]);
+    assert_eq!(lost.status.code(), Some(4), "{}", stderr(&lost));
+    assert!(
+        stderr(&lost).contains(&format!("--dispatch {dispatch}")),
+        "{}",
+        stderr(&lost)
+    );
+    let session = eventually("the spawned session", || {
+        agents_of(&env)
+            .first()
+            .map(|a| a["id"].as_str().unwrap().to_string())
+    });
+    let rerun = receipt(run_card(&env, "#1", &["--dispatch", &dispatch]));
+    assert_eq!(rerun["state"], "started");
+    assert_eq!(rerun["session"]["id"], session.as_str());
+    assert_eq!(agents_of(&env).len(), 1);
+
+    let name = session_row(&env, &session)["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for text in ["go", "on"] {
+        let sent = env.cli(&["agent", "send", &name, text, "--project", "repo"], None);
+        assert!(sent.status.success(), "{}", stderr(&sent));
+    }
+    let asked = eventually("the session asking", || {
+        let row = session_row(&env, &session);
+        (row["status"] == "needs_feedback").then_some(row)
+    });
+    let at = asked["status_changed_at"].as_i64().unwrap();
+    eventually("the asking session on the card", || {
+        chain(&env, "#1")
+            .iter()
+            .any(|s| s["id"] == session.as_str() && s["status_changed_at"] == at)
+            .then_some(())
+    });
+    let before = eventually("both prompts read", || (inputs() == 2).then_some(2));
+    drop(cutter);
+    std::fs::remove_file(env.tmp.path().join("ack-cut-once")).unwrap();
+    std::fs::remove_file(Path::new(cut_rt).join("daemon.sock")).unwrap();
+    let (cutter, _) = ack_cutter(&env);
+    let at = at.to_string();
+    let lost = env.cli_env(
+        &[
+            "todo",
+            "approve",
+            "#1",
+            "--session",
+            &session,
+            "--expected-status-at",
+            &at,
+        ],
+        None,
+        &[("NEBULA_RUNTIME_DIR", cut_rt)],
+    );
+    drop(cutter);
+    assert_eq!(lost.status.code(), Some(4), "{}", stderr(&lost));
+    assert!(
+        stderr(&lost).contains(&session)
+            && stderr(&lost).contains(&format!("--expected-status-at {at}")),
+        "{}",
+        stderr(&lost)
+    );
+    eventually("the approval's Enter", || {
+        (inputs() == before + 1).then_some(())
+    });
+}
+
 #[test]
 fn cross_host_child_keeps_parent() {
     let board = board_env();

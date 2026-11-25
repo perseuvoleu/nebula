@@ -512,9 +512,13 @@ pub async fn run(verb: TodoVerb, json: bool) -> Result<()> {
         }),
     };
     loop {
-        let result = request(&mut conn, op.clone())
-            .await
-            .map_err(|why| with_rerun_id(why, minted.as_deref()))?;
+        let result =
+            request(&mut conn, op.clone())
+                .await
+                .map_err(|why| match minted.as_deref() {
+                    Some(id) => with_rerun(why, &format!("with --id {id}")),
+                    None => why,
+                })?;
         if json {
             println!("{}", result_json(&result)?);
             return Ok(());
@@ -536,10 +540,8 @@ async fn run_dispatch(
     json: bool,
 ) -> Result<()> {
     let id = dispatch.id.clone();
-    let rerun = |why: anyhow::Error| match Refusal::of(&why.to_string()) {
-        Some(Refusal::OutcomeUnknown) => anyhow::anyhow!("{why} with --dispatch {}", id.as_str()),
-        _ => why,
-    };
+    let rerun_with = format!("with --dispatch {}", id.as_str());
+    let rerun = |why: anyhow::Error| with_rerun(why, &rerun_with);
     let (role, kind, worktree) = (dispatch.role, dispatch.kind, dispatch.worktree.clone());
     let forwarded_scope = scope.args();
     let begun = request(conn, scope.guard(BoardOp::BeginRun(dispatch)))
@@ -608,7 +610,7 @@ async fn run_dispatch(
             if json {
                 words.push("--json");
             }
-            return on_host(&host, &words, &format!("with --dispatch {}", id.as_str()));
+            return on_host(&host, &words, &rerun_with);
         }
     };
     let worktree = match worktree.as_str() {
@@ -663,6 +665,7 @@ async fn run_dispatch(
         Err(why) if Refusal::of(&why.to_string()) == Some(Refusal::WriterHeld) => {
             (None, Some(why.to_string()))
         }
+        Err(why) if why.downcast_ref::<ipc::ReplyLost>().is_some() => return Err(rerun(why)),
         Err(why) => bail!(
             "{why:#}; dispatch {} stays pending, rerun with --dispatch {}",
             id.as_str(),
@@ -830,6 +833,10 @@ async fn approve(
         .with_context(|| {
             Refusal::NotFound.message(format!("{} has no session {session}", show.card.label))
         })?;
+    let rerun = format!(
+        "for session {} with --expected-status-at {expected_status_at}",
+        found.id.as_str()
+    );
     if !found
         .host
         .eq_ignore_ascii_case(&nebula_core::host::hostname())
@@ -850,10 +857,6 @@ async fn approve(
         if json {
             words.push("--json");
         }
-        let rerun = format!(
-            "for session {} with --expected-status-at {expected_status_at}",
-            found.id.as_str()
-        );
         return on_host(&found.host, &words, &rerun);
     }
     exchange(
@@ -864,7 +867,8 @@ async fn approve(
             expected_status_at,
         },
     )
-    .await?;
+    .await
+    .map_err(|why| with_rerun(why, &rerun))?;
     if json {
         println!(
             "{}",
@@ -880,9 +884,17 @@ async fn approve(
     Ok(())
 }
 
-fn with_rerun_id(why: anyhow::Error, minted: Option<&str>) -> anyhow::Error {
-    match (Refusal::of(&why.to_string()), minted) {
-        (Some(Refusal::OutcomeUnknown), Some(id)) => anyhow::anyhow!("{why} with --id {id}"),
+/// A write whose outcome is unknown (the board said so, or the reply was
+/// lost after the request went out) names what reruns it.
+fn with_rerun(why: anyhow::Error, rerun: &str) -> anyhow::Error {
+    if why.downcast_ref::<ipc::ReplyLost>().is_some() {
+        return anyhow::anyhow!(
+            "{} {rerun}",
+            Refusal::OutcomeUnknown.message(why.to_string())
+        );
+    }
+    match Refusal::of(&why.to_string()) {
+        Some(Refusal::OutcomeUnknown) => anyhow::anyhow!("{why} {rerun}"),
         _ => why,
     }
 }
