@@ -726,15 +726,15 @@ fn read_op(tx: &Transaction, read: BoardRead) -> Result<BoardResult> {
             if !in_scope(&scope, found.project.as_deref()) {
                 return Err(not_found(&card));
             }
+            let sessions = sessions_of(tx, &id)?;
+            let artifacts = crate::artifacts::of_card(tx, &id)?;
+            let reserved = serde_json::to_vec(&found)?.len()
+                + serde_json::to_vec(&sessions)?.len()
+                + serde_json::to_vec(&artifacts)?.len();
             Ok(BoardResult::Show(Box::new(CardShow {
-                sessions: sessions_of(tx, &id)?,
-                artifacts: crate::artifacts::of_card(tx, &id)?,
-                log: tx
-                    .prepare(&format!(
-                        "SELECT {NOTE_COLUMNS} FROM notes WHERE todo_id = ?1 AND author IS NOT NULL ORDER BY created_at, sort_order"
-                    ))?
-                    .query_map(params![id.as_str()], note_from_row)?
-                    .collect::<rusqlite::Result<_>>()?,
+                log: newest_notes(tx, &id, page_budget().saturating_sub(reserved))?,
+                sessions,
+                artifacts,
                 card: found,
             })))
         }
@@ -760,6 +760,28 @@ fn read_op(tx: &Transaction, read: BoardRead) -> Result<BoardResult> {
             anyhow::anyhow!(Refusal::NotFound.message(format!("no dispatch {}", id.as_str())))
         }),
     }
+}
+
+/// The card's log in order, cut at the oldest note so it fits in `budget`
+/// bytes and the reply stays under the frame limit.
+fn newest_notes(tx: &Transaction, card: &TodoId, budget: usize) -> Result<Vec<CardNote>> {
+    let mut stmt = tx.prepare(&format!(
+        "SELECT {NOTE_COLUMNS} FROM notes WHERE todo_id = ?1 AND author IS NOT NULL
+         ORDER BY created_at DESC, sort_order DESC"
+    ))?;
+    let rows = stmt.query_map(params![card.as_str()], note_from_row)?;
+    let mut used = 0;
+    let mut log = Vec::new();
+    for note in rows {
+        let note = note?;
+        used += serde_json::to_vec(&note)?.len();
+        if used > budget {
+            break;
+        }
+        log.push(note);
+    }
+    log.reverse();
+    Ok(log)
 }
 
 fn sessions_of(tx: &Transaction, card: &TodoId) -> Result<Vec<CardSession>> {
@@ -976,4 +998,64 @@ fn stale_hosts(tx: &Transaction) -> Result<HashSet<String>> {
         .into_iter()
         .filter(|h| *h != here && links.down(h, after))
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nebula_core::board::BoardScope;
+
+    #[test]
+    fn show_keeps_the_newest_notes_when_the_log_outgrows_a_frame() {
+        let store = Store::open_in_memory().unwrap();
+        let author = Author {
+            host: "here".into(),
+            agent: None,
+            name: "me".into(),
+        };
+        let card = CardRef::Id(TodoId::generate());
+        let CardRef::Id(id) = &card else {
+            unreachable!()
+        };
+        serve(
+            &store,
+            BoardOp::AddCard(CardDraft {
+                id: id.clone(),
+                title: "Long log".into(),
+                project: None,
+                stage: Stage::Backlog,
+                proposed: false,
+                created_by: author.clone(),
+                checkout: None,
+            }),
+        )
+        .unwrap();
+        let notes = 2 * MAX_FRAME_LEN as usize / 100_000;
+        for i in 0..notes {
+            serve(
+                &store,
+                BoardOp::AddNote {
+                    id: NoteId::generate(),
+                    card: card.clone(),
+                    text: format!("{i} {}", "x".repeat(100_000)),
+                    author: author.clone(),
+                },
+            )
+            .unwrap();
+        }
+        let scope = BoardScope {
+            projects: ProjectScope::All,
+            include_home: true,
+        };
+        let BoardResult::Show(show) = serve(&store, BoardOp::Read(BoardRead::Card { scope, card }))
+            .unwrap()
+        else {
+            panic!("not a show")
+        };
+        let frame = rmp_serde::to_vec(&BoardResult::Show(show.clone())).unwrap();
+        assert!(frame.len() < MAX_FRAME_LEN as usize, "{} bytes", frame.len());
+        let last = show.log.last().unwrap();
+        assert!(last.text.starts_with(&format!("{} ", notes - 1)));
+        assert!(show.log.len() < notes);
+    }
 }
