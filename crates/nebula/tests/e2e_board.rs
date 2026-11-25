@@ -2793,7 +2793,7 @@ fn ssh_stub_as(env: &Env, target: &Env, host: &str) -> (String, PathBuf, PathBuf
     std::fs::write(
         bin.join("ssh"),
         format!(
-            "#!/bin/sh\n[ \"$(cat '{log}' 2>/dev/null | grep -c '^BatchMode=yes$')\" -ge 3 ] && exit 255\nprintf '%s\\n' \"$@\" >> '{log}'\n[ -e '{down}' ] && {{ echo 'ssh: connect to host: Connection refused' >&2; exit 255; }}\nfor arg do script=$arg; done\nunset NEBULA_AGENT_ID\nexport HOME='{home}' NEBULA_RUNTIME_DIR='{rt}' NEBULA_DATA_DIR='{data}' NEBULA_HOSTNAME='{host}' PATH='{nebula}':\"$PATH\"\n[ -e '{lost}' ] && {{ /bin/sh -c \"$script\" >/dev/null 2>&1; echo 'Connection to host closed by remote host.' >&2; exit 255; }}\nexec /bin/sh -c \"$script\"\n",
+            "#!/bin/sh\n[ \"$(cat '{log}' 2>/dev/null | grep -c '^BatchMode=yes$')\" -ge 3 ] && exit 255\nprintf '%s\\n' \"$@\" >> '{log}'\n[ -e '{down}' ] && {{ echo 'ssh: connect to host: Connection refused' >&2; exit 255; }}\nfor arg do script=$arg; done\nunset NEBULA_AGENT_ID\nexport HOME='{home}' NEBULA_RUNTIME_DIR='{rt}' NEBULA_DATA_DIR='{data}' NEBULA_HOSTNAME='{host}' PATH='{nebula}':\"$PATH\"\n[ -e '{lost}' ] && {{ /bin/sh -c \"$script\" >/dev/null 2>&1; . '{lost}'; echo 'Connection to host closed by remote host.' >&2; exit 255; }}\nexec /bin/sh -c \"$script\"\n",
             log = log.display(),
             down = down.display(),
             lost = env.tmp.path().join("ssh-lost").display(),
@@ -3090,6 +3090,39 @@ fn cross_host_ssh_lost_exit_4() {
     eventually("the laptop session moving on", || {
         (session_row(&laptop, &session)["status"] != "needs_feedback").then_some(())
     });
+}
+
+#[test]
+fn cross_host_ssh_ambiguous_loss_exit_4() {
+    let board = board_env();
+    let laptop = viewer_on(&proxy_to(&board), "laptop", &[]);
+    laptop.make_repo();
+    reported(&board, "laptop");
+    let (path, _, _) = ssh_stub(&board, &laptop);
+    let lost = board.tmp.path().join("ssh-lost");
+    let cases = [
+        (
+            "Aux channel",
+            "echo 'channel 2: open failed: connect failed: Connection refused' >&2",
+        ),
+        ("Killed", "kill -9 $$"),
+    ];
+    for (n, (title, after)) in cases.into_iter().enumerate() {
+        add(&board, &["--project", "repo"], title);
+        std::fs::write(&lost, after).unwrap();
+        let card = format!("#{}", n + 1);
+        let set = [("--host", "laptop"), ("--role", "review")];
+        let argv = run_argv(&board, &card, &set, &[]);
+        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let cut = board.cli_env(&argv, None, &[("PATH", &path)]);
+        assert_eq!(cut.status.code(), Some(4), "{title}: {}", stderr(&cut));
+        assert!(
+            stderr(&cut).contains("--dispatch "),
+            "{title}: {}",
+            stderr(&cut)
+        );
+        assert_eq!(agents_of(&laptop).len(), n + 1, "{title}");
+    }
 }
 
 #[test]

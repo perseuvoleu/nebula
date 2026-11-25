@@ -139,16 +139,9 @@ pub(crate) fn run_on_host(host: &str, argv: Vec<String>) -> Result<i32> {
     Ok(out.status.code().unwrap_or(1))
 }
 
-/// What ssh prints when it failed before the remote command could start.
-const SSH_NOT_CONNECTED: [&str; 7] = [
-    "ssh: connect to host",
-    "ssh: Could not resolve hostname",
-    "Connection refused",
-    "Permission denied (",
-    "Host key verification failed",
-    "Connection timed out during banner exchange",
-    "kex_exchange_identification",
-];
+/// What ssh's own last `ssh:` line starts with when it failed before the
+/// remote command could start; other stderr lines may come from the far side.
+const SSH_NOT_CONNECTED: [&str; 2] = ["ssh: connect to host", "ssh: Could not resolve hostname"];
 
 /// As [`run_on_host`], for a command with effects: exit 3 only when ssh
 /// failed before the command could start, else 4 with `rerun` named, as
@@ -162,10 +155,17 @@ pub(crate) fn run_effect_on_host(host: &str, argv: Vec<String>, rerun: &str) -> 
         .stdin(std::process::Stdio::null())
         .output()
         .context("run ssh")?;
-    if out.status.code() == Some(255) {
+    if matches!(out.status.code(), Some(255) | None) {
         let why = String::from_utf8_lossy(&out.stderr);
+        let ssh_said = why.lines().rev().find(|l| l.starts_with("ssh:"));
+        let why = match out.status.code() {
+            Some(_) => why.trim().to_string(),
+            None => format!("{} {}", out.status, why.trim()),
+        };
         let why = why.trim();
-        if SSH_NOT_CONNECTED.iter().any(|m| why.contains(m)) {
+        if out.status.code().is_some()
+            && ssh_said.is_some_and(|l| SSH_NOT_CONNECTED.iter().any(|m| l.starts_with(m)))
+        {
             eprintln!(
                 "nebula: {}",
                 Refusal::Unreachable.message(format!("host {host} is unreachable: {why}"))
