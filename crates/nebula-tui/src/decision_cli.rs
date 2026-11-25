@@ -2,13 +2,11 @@
 //! whose title is what was decided and whose body is why; the board host
 //! copies each one to RAG.
 
-use crate::artifact_cli::{artifact_id, unpublished};
-use crate::board_cli::{client_id, connect, read_card, request, Caller, ScopeFlags};
+use crate::artifact_cli::{answer, artifact_id, Draft, Printer};
+use crate::board_cli::{client_id, connect, read_card, Caller, ScopeFlags};
 use crate::ipc;
 use anyhow::{bail, Result};
-use nebula_core::board::{
-    Artifact, ArtifactContent, BoardOp, BoardRead, BoardResult, Refusal, SessionLink,
-};
+use nebula_core::board::{Artifact, ArtifactContent, BoardOp, BoardRead};
 use nebula_core::ArtifactId;
 
 const KIND: &str = "decision";
@@ -39,7 +37,7 @@ pub async fn run(verb: DecisionVerb, json: bool) -> Result<()> {
     let mut conn = connect().await?;
     let (projects, worktrees, agents) = ipc::subscribe_snapshot(&mut conn).await?;
     let caller = Caller::resolve(&projects, &worktrees, &agents)?;
-    let mut op = match verb {
+    let op = match verb {
         DecisionVerb::Add {
             what,
             why,
@@ -60,30 +58,19 @@ pub async fn run(verb: DecisionVerb, json: bool) -> Result<()> {
                     (Some(card.id), card.project)
                 }
                 (None, Some(project)) => (None, Some(project)),
-                (None, None) => (caller.card.clone(), caller.project),
+                (None, None) => (caller.card.clone(), caller.project.clone()),
             };
-            let session = caller.author.agent.clone().map(|id| SessionLink {
-                host: caller.author.host.clone(),
-                id,
-                name: caller.author.name.clone(),
-            });
-            BoardOp::Publish(Artifact {
+            let draft = Draft {
                 id: ArtifactId(client_id(id, &mut None)?),
                 kind: KIND.into(),
                 title: what,
                 card,
                 project,
-                session,
-                checkout: caller.checkout,
                 content: ArtifactContent::Body {
                     body: why.unwrap_or_default(),
                 },
-                meta: Default::default(),
-                created_at: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)?
-                    .as_millis() as i64,
-                removed_at: None,
-            })
+            };
+            BoardOp::Publish(draft.by(caller)?)
         }
         DecisionVerb::List { scope, query, page } => BoardOp::Read(BoardRead::Artifacts {
             scope: scope.scope(caller.project.as_deref()),
@@ -97,46 +84,18 @@ pub async fn run(verb: DecisionVerb, json: bool) -> Result<()> {
             id: artifact_id(&id)?,
         }),
     };
-    loop {
-        let result = match (&op, request(&mut conn, op.clone()).await) {
-            (BoardOp::Publish(decision), Err(why)) => {
-                return Err(unpublished(&mut conn, &decision.id, false, why).await);
-            }
-            (_, result) => result?,
-        };
-        let next = match result {
-            BoardResult::Artifact(decision) => {
-                if decision.kind != KIND {
-                    bail!(Refusal::NotFound.message(format!("no decision {}", decision.id)));
-                }
-                match json {
-                    true => println!("{}", serde_json::to_value(&decision)?),
-                    false => println!("{}", line(&decision)),
-                }
-                None
-            }
-            BoardResult::Artifacts(page) if json => {
-                println!("{}", serde_json::to_value(&page)?);
-                None
-            }
-            BoardResult::Artifacts(page) => {
-                if page.items.is_empty() {
-                    println!(
-                        "no decisions — record one with `nebula decision add <what> --why <why>`"
-                    );
-                }
-                for decision in &page.items {
-                    println!("{}", line(decision));
-                }
-                page.next
-            }
-            other => bail!("the board answered with {other:?}"),
-        };
-        match (&mut op, next) {
-            (BoardOp::Read(BoardRead::Artifacts { page, .. }), Some(next)) => *page = Some(next),
-            _ => return Ok(()),
-        }
-    }
+    answer(
+        &mut conn,
+        op,
+        false,
+        json,
+        &Printer {
+            kind: Some(KIND),
+            line,
+            empty: "no decisions — record one with `nebula decision add <what> --why <why>`",
+        },
+    )
+    .await
 }
 
 fn line(decision: &Artifact) -> String {

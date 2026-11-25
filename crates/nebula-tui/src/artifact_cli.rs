@@ -11,7 +11,7 @@ use nebula_core::board::{
     parse_card_ref, Artifact, ArtifactContent, BoardOp, BoardRead, BoardResult, CardRef, Refusal,
     SessionLink,
 };
-use nebula_core::{ArtifactId, ClientRequest, ServerEvent};
+use nebula_core::{ArtifactId, ClientRequest, ServerEvent, TodoId};
 use std::path::PathBuf;
 
 const FILE_KINDS: [&str; 5] = ["recap", "e2e-run", "diagram", "ticket", "prototype"];
@@ -161,27 +161,115 @@ async fn add(conn: &mut Connection, caller: Caller, args: AddArgs) -> Result<(Bo
         let (content, created) = store(conn, &id, &kind, path).await?;
         (kind, content, name, created)
     };
-    let session = caller.author.agent.clone().map(|id| SessionLink {
-        host: caller.author.host.clone(),
-        id,
-        name: caller.author.name.clone(),
-    });
-    let op = BoardOp::Publish(Artifact {
+    let project = project.or(caller.project.clone());
+    let draft = Draft {
         id,
         kind,
         title: title.unwrap_or(default_title),
         card,
-        project: project.or(caller.project),
-        session,
-        checkout: caller.checkout,
+        project,
         content,
-        meta: Default::default(),
-        created_at: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_millis() as i64,
-        removed_at: None,
-    });
-    Ok((op, created))
+    };
+    Ok((BoardOp::Publish(draft.by(caller)?), created))
+}
+
+/// An artifact before the caller's session, checkout and time are added.
+pub(crate) struct Draft {
+    pub id: ArtifactId,
+    pub kind: String,
+    pub title: String,
+    pub card: Option<TodoId>,
+    pub project: Option<String>,
+    pub content: ArtifactContent,
+}
+
+impl Draft {
+    /// The artifact as `caller` publishes it now.
+    pub(crate) fn by(self, caller: Caller) -> Result<Artifact> {
+        let session = caller.author.agent.map(|id| SessionLink {
+            host: caller.author.host,
+            id,
+            name: caller.author.name,
+        });
+        Ok(Artifact {
+            id: self.id,
+            kind: self.kind,
+            title: self.title,
+            card: self.card,
+            project: self.project,
+            session,
+            checkout: caller.checkout,
+            content: self.content,
+            meta: Default::default(),
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis() as i64,
+            removed_at: None,
+        })
+    }
+}
+
+/// How a verb family prints the board's artifact answers. With `kind`, an
+/// artifact of another kind is not found.
+pub(crate) struct Printer {
+    pub kind: Option<&'static str>,
+    pub line: fn(&Artifact) -> String,
+    pub empty: &'static str,
+}
+
+const ARTIFACTS: Printer = Printer {
+    kind: None,
+    line,
+    empty: "no artifacts — publish one with `nebula artifact add <path> --kind <kind>`",
+};
+
+/// Sends `op` and prints its answer, walking every page of a human list;
+/// a publish that fails is undone or named for a rerun by [`unpublished`].
+pub(crate) async fn answer(
+    conn: &mut Connection,
+    mut op: BoardOp,
+    created: bool,
+    json: bool,
+    printer: &Printer,
+) -> Result<()> {
+    loop {
+        let result = match (&op, request(conn, op.clone()).await) {
+            (BoardOp::Publish(artifact), Err(why)) => {
+                return Err(unpublished(conn, &artifact.id, created, why).await);
+            }
+            (_, result) => result?,
+        };
+        let next = match result {
+            BoardResult::Artifact(a) => {
+                if let Some(kind) = printer.kind.filter(|kind| *kind != a.kind) {
+                    bail!(Refusal::NotFound.message(format!("no {kind} {}", a.id)));
+                }
+                match json {
+                    true => println!("{}", serde_json::to_value(&a)?),
+                    false => println!("{}", (printer.line)(&a)),
+                }
+                None
+            }
+            BoardResult::Artifacts(page) if json => {
+                println!("{}", serde_json::to_value(&page)?);
+                None
+            }
+            BoardResult::Artifacts(page) => {
+                if page.items.is_empty() {
+                    println!("{}", printer.empty);
+                }
+                for a in &page.items {
+                    println!("{}", (printer.line)(a));
+                }
+                page.next
+            }
+            other => bail!("the board answered with {other:?}"),
+        };
+        match (&mut op, next) {
+            (BoardOp::Read(BoardRead::Artifacts { page, .. }), Some(next)) => *page = Some(next),
+            _ => return Ok(()),
+        }
+    }
 }
 
 pub async fn run(verb: ArtifactVerb, json: bool) -> Result<()> {
@@ -190,7 +278,7 @@ pub async fn run(verb: ArtifactVerb, json: bool) -> Result<()> {
     let caller = Caller::resolve(&projects, &worktrees, &agents)?;
     let mut opening = false;
     let mut created = false;
-    let mut op = match verb {
+    let op = match verb {
         ArtifactVerb::Add(args) => {
             let (op, stored) = add(&mut conn, caller, args).await?;
             created = stored;
@@ -217,49 +305,14 @@ pub async fn run(verb: ArtifactVerb, json: bool) -> Result<()> {
             id: artifact_id(&id)?,
         },
     };
-    loop {
-        let result = match (&op, request(&mut conn, op.clone()).await) {
-            (BoardOp::Publish(artifact), Err(why)) => {
-                return Err(unpublished(&mut conn, &artifact.id, created, why).await);
-            }
-            (_, result) => result?,
+    if opening {
+        let result = request(&mut conn, op).await?;
+        let BoardResult::Artifact(artifact) = result else {
+            bail!("the board answered an artifact read with {result:?}");
         };
-        if opening {
-            let BoardResult::Artifact(artifact) = result else {
-                bail!("the board answered an artifact read with {result:?}");
-            };
-            return open(&mut conn, &artifact).await;
-        }
-        if json {
-            let value = match &result {
-                BoardResult::Artifact(a) => serde_json::to_value(a)?,
-                BoardResult::Artifacts(page) => serde_json::to_value(page)?,
-                other => bail!("the board answered with {other:?}"),
-            };
-            println!("{value}");
-            return Ok(());
-        }
-        let next = match &result {
-            BoardResult::Artifact(a) => {
-                println!("{}", line(a));
-                None
-            }
-            BoardResult::Artifacts(page) => {
-                if page.items.is_empty() {
-                    println!("no artifacts — publish one with `nebula artifact add <path> --kind <kind>`");
-                }
-                for a in &page.items {
-                    println!("{}", line(a));
-                }
-                page.next.clone()
-            }
-            other => bail!("the board answered with {other:?}"),
-        };
-        match (&mut op, next) {
-            (BoardOp::Read(BoardRead::Artifacts { page, .. }), Some(next)) => *page = Some(next),
-            _ => return Ok(()),
-        }
+        return open(&mut conn, &artifact).await;
     }
+    answer(&mut conn, op, created, json, &ARTIFACTS).await
 }
 
 fn show_op(id: &str) -> Result<BoardOp> {
