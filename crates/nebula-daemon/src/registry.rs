@@ -6055,6 +6055,61 @@ exec sleep 60
     }
 
     #[tokio::test]
+    async fn a_dispatch_retried_after_a_failed_parent_host_write_starts_a_live_session() {
+        let (_script, agent) = stand_in_agent(&[]);
+        let (_tmp, _repo, daemon, _pid, primary) =
+            primary_with_feat_on(test_daemon_with(DaemonOverrides {
+                stop_deadline: Duration::from_millis(1500),
+                agent_cmd: agent,
+            }))
+            .await;
+        let fail_write = |on: bool| {
+            daemon
+                .store
+                .board_transaction(|tx| {
+                    tx.execute_batch(match on {
+                        true => "CREATE TEMP TRIGGER no_parent_host BEFORE UPDATE OF spawned_by_host ON agents
+                                 BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END",
+                        false => "DROP TRIGGER no_parent_host",
+                    })?;
+                    Ok(())
+                })
+                .unwrap()
+        };
+        let create = || {
+            daemon.create_agent(
+                &primary.id,
+                None,
+                "worker",
+                AgentKind::Claude,
+                None,
+                None,
+                false,
+                None,
+                WriterClaim::Off,
+                None,
+                false,
+                CardLink {
+                    dispatch: Some(nebula_core::DispatchId("d1".into())),
+                    parent_host: Some("far".into()),
+                    ..CardLink::default()
+                },
+            )
+        };
+        fail_write(true);
+        assert!(create().await.is_err());
+        fail_write(false);
+        let EntityId::Agent(id) = create().await.unwrap() else {
+            panic!("not an agent")
+        };
+        assert!(
+            daemon.is_alive(&SessionRef::Agent(id)),
+            "the retry replayed a never-launched row as started"
+        );
+        daemon.kill_all();
+    }
+
+    #[tokio::test]
     async fn a_resume_that_falls_back_publishes_the_respawned_agent() {
         let (_script, agent) = stand_in_agent(&[]);
         let (_tmp, repo, daemon, _pid, primary) =
