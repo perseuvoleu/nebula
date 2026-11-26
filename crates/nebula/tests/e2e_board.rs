@@ -2437,6 +2437,39 @@ fn link_stops_when_the_board_turns_local() {
     );
 }
 
+#[test]
+fn link_stops_when_an_idle_host_unsets_its_board() {
+    let board = Env::new();
+    board.board_local();
+    let board = board.start(&[("NEBULA_BOARD_STALE_MS", "1500")]);
+    let here = viewer_on(&proxy_to(&board), "herehost", &[]);
+    reported(&board, "herehost");
+    here.write_config("{}");
+    here.make_repo();
+    eventually("the unset board's link closing", || {
+        hosts_of(&board, &["--all"])
+            .iter()
+            .any(|h| h["host"] == "herehost" && h["stale"] == true)
+            .then_some(())
+    });
+}
+
+#[test]
+fn a_host_reports_to_the_local_board_it_switched_to() {
+    let board = board_env();
+    let here = viewer_on(&proxy_to(&board), "herehost", &[]);
+    reported(&board, "herehost");
+    here.board_local();
+    let added = here.cli(&["workspace", "add", "elsewhere"], None);
+    assert!(added.status.success(), "{}", stderr(&added));
+    eventually("the host reporting to its new local board", || {
+        hosts_of(&here, &["--all"])
+            .iter()
+            .any(|h| h["host"] == "herehost")
+            .then_some(())
+    });
+}
+
 fn rerun_id(out: &Output) -> String {
     let text = stderr(out);
     let id = text

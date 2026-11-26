@@ -53,7 +53,8 @@ trait Reporter {
 
 struct HostReporter {
     daemon: Arc<Daemon>,
-    sent: Option<HostReport>,
+    /// The last report a board took, with the board it went to.
+    sent: Option<(String, HostReport)>,
 }
 
 impl Reporter for HostReporter {
@@ -116,17 +117,25 @@ async fn next_change(events: &mut broadcast::Receiver<ServerEvent>) -> bool {
     }
 }
 
-async fn send_if_changed(daemon: &Arc<Daemon>, sent: &mut Option<HostReport>) -> Result<()> {
+async fn send_if_changed(
+    daemon: &Arc<Daemon>,
+    sent: &mut Option<(String, HostReport)>,
+) -> Result<()> {
     let config = crate::config::Config::load();
+    let link = daemon
+        .board_link
+        .for_board(config.board.as_deref(), &daemon.shutdown);
     let Some(board) = config.board else {
         return Ok(());
     };
-    let link = daemon.board_link.for_board(Some(&board), &daemon.shutdown);
     if link.as_ref().is_some_and(|link| !link.state().borrow().up) {
         return Ok(());
     }
     let report = host_report(daemon, config.writer_slots)?;
-    if sent.as_ref() == Some(&report) {
+    if sent
+        .as_ref()
+        .is_some_and(|(to, last)| *to == board && *last == report)
+    {
         return Ok(());
     }
     let op = BoardOp::Report(report.clone());
@@ -142,7 +151,7 @@ async fn send_if_changed(daemon: &Arc<Daemon>, sent: &mut Option<HostReport>) ->
             .await??;
         }
     }
-    *sent = Some(report);
+    *sent = Some((board, report));
     Ok(())
 }
 
