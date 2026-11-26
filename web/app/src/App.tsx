@@ -158,6 +158,8 @@ function Routes({ workspace }: { workspace: Workspace }) {
 function Shell({ workspace, route }: { workspace: Workspace; route: ReturnType<typeof useSelection> }) {
   const [selection, navigate] = route;
   const project = selection.project && workspace.projects.includes(selection.project) ? selection.project : workspace.projects[0];
+  /** The session list a selection belongs to: one project, or All. */
+  const listOrigin = { project: selection.all ? null : project, all: selection.all };
   const sessionId = selection.project && !workspace.projects.includes(selection.project) ? null : selection.session;
   const listProjects = useMemo(() => selection.all ? workspace.projects : [project], [selection.all, workspace.projects, project]);
   const sessions = useSessions(listProjects, !selection.all);
@@ -182,7 +184,7 @@ function Shell({ workspace, route }: { workspace: Workspace; route: ReturnType<t
   useEffect(() => {
     if (selection.serverless) return;
     if (selection.project && !workspace.projects.includes(selection.project)) {
-      navigate({ project: selection.all ? null : project, session: null, all: selection.all }, true);
+      navigate({ ...listOrigin, session: null }, true);
     } else if (!selection.all && selection.project !== project) {
       navigate({ project, session: selection.session, all: false }, true);
     }
@@ -234,7 +236,7 @@ function Shell({ workspace, route }: { workspace: Workspace; route: ReturnType<t
     setChooseProject(true);
     document.querySelector<HTMLSelectElement>('select[aria-label="Proiect"]')?.focus();
   };
-  const openServerless = () => { navigate({ project: selection.all ? null : project, session: null, all: selection.all, serverless: true }); setMenuOpen(false); };
+  const openServerless = () => { navigate({ ...listOrigin, session: null, serverless: true }); setMenuOpen(false); };
   const serverlessLink = (
     <button type="button" onClick={openServerless} aria-current={selection.serverless ? "page" : undefined}
       className={`flex min-h-11 items-center gap-2 border-t border-sidebar-border px-3 text-left text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${selection.serverless ? "bg-secondary font-medium" : "hover:bg-muted/60"}`}>
@@ -276,7 +278,7 @@ function Shell({ workspace, route }: { workspace: Workspace; route: ReturnType<t
     </aside>
   );
 
-  const closeServerless = () => navigate({ project: selection.all ? null : project, session: null, all: selection.all });
+  const closeServerless = () => navigate({ ...listOrigin, session: null });
   const conversation = selection.serverless ? <ServerlessRuns onBack={desktop ? undefined : closeServerless} /> : sessionId && controller && state ? (
     <ConversationView key={`${project}/${sessionId}`} project={project} previewUrl={previewUrl} row={row} state={state} controller={controller} sessions={orderedRows} unseen={unseenFinished} onSelect={select} showProjects={selection.all} showBack={!desktop} onBack={() => navigate({ project, session: null, all: selection.all })} />
   ) : (
