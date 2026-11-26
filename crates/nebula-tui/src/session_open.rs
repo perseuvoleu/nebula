@@ -295,17 +295,23 @@ pub fn ssh_argv(host: &str, words: &[&str]) -> Result<Vec<String>> {
 /// Refuse `host` unless it is safe as an ssh destination.
 pub fn check_host(host: &str) -> Result<()> {
     if !is_ssh_token(host) {
-        bail!("host {host:?} is not a plain name (letters, digits, . _ @ -)");
+        bail!("host {host:?} is not a plain name (letters, digits, . _ @ -) or an IP address");
     }
     Ok(())
 }
 
 /// Safe as an ssh destination.
 fn is_ssh_token(s: &str) -> bool {
+    let ip = s
+        .rsplit_once('@')
+        .map_or(s, |(_, addr)| addr)
+        .parse::<std::net::IpAddr>()
+        .is_ok();
     !s.is_empty()
         && !s.starts_with('-')
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '@' | '-'))
+        && s.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '@' | '-') || (ip && c == ':')
+        })
 }
 
 /// Write-then-rename: the reader never sees half a file.
@@ -340,6 +346,23 @@ mod tests {
 
     #[test]
     fn open_on_refuses_bad_host_token() {
+        assert_eq!(
+            open_on_argv("me@mbp.tail.ts.net", "a1b2", Some("alpha@findl"), false).unwrap(),
+            [
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=10",
+                "--",
+                "me@mbp.tail.ts.net",
+                "export PATH=\"$HOME/.local/bin:$HOME/.cargo/bin:$PATH\";",
+                "'nebula'",
+                "'open'",
+                "'--session=a1b2'",
+                "'--project=alpha@findl'",
+                "'--no-focus'",
+            ]
+        );
         for host in [
             "",
             "-oProxyCommand=sh",
@@ -354,6 +377,13 @@ mod tests {
                 open_on_argv(host, "a1b2", None, true).is_err(),
                 "host {host:?}"
             );
+        }
+    }
+
+    #[test]
+    fn open_on_accepts_ip_addresses() {
+        for host in ["::1", "me@::1", "127.0.0.1", "fe80::1"] {
+            assert!(check_host(host).is_ok(), "host {host:?}");
         }
     }
 
