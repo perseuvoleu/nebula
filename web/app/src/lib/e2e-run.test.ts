@@ -51,6 +51,7 @@ test("the Playwright reporter writes the result.json board32's e2e_run_reporter_
   assert.deepEqual(written, JSON.parse(fs.readFileSync(REPORTED, "utf8")));
   const files = filesUnder(out);
   assert.deepEqual([...files].sort(), ["result.json", "shots/001.png", "shots/002.png"], "a previous run's files are gone");
+  assert.deepEqual(validateE2eRun(written, files), written, "the web viewer reads the run");
   assert.deepEqual(fs.readFileSync(path.join(out, "shots/002.png")), PNG);
 });
 

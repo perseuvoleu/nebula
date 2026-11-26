@@ -7,7 +7,6 @@ type Step = { name: string; status: Status; duration_ms: number; screenshot?: st
 
 const ANSI = /\u001b\[[0-9;]*m/g;
 
-/** The parts of Playwright's objects the reporter reads. */
 type Case = Pick<TestCase, "id" | "title">;
 type Result = Pick<TestResult, "status" | "duration" | "attachments" | "errors">;
 type Full = Pick<FullResult, "status" | "startTime" | "duration">;

@@ -4456,7 +4456,6 @@ fn decision_add_home_ignores_the_callers_checkout() {
     assert_eq!(decided["title"], "Keep a shared inbox");
 }
 
-/// A decision in no project reaches RAG's `shared` workspace.
 #[test]
 fn home_decision_reaches_shared_rag() {
     let env = rag_board(None, &[]);
