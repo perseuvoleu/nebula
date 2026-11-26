@@ -7,7 +7,7 @@ export interface Selection {
   session: string | null;
   /** Keep the aggregate list context when opening a real project session. */
   all: boolean;
-  /** The serverless runs section; the URL keeps only the list it was opened from (`?from=<project>` or `?from=all`). */
+  /** The serverless runs section; the URL keeps only the list it was opened from (`?from=<project>` or `?view=all`). */
   serverless?: boolean;
   board?: BoardRoute;
 }
@@ -52,8 +52,10 @@ const PATTERN = /^\/(?:p\/([A-Za-z0-9._@-]{1,80})(?:\/s\/([A-Za-z0-9._-]{1,80}))
 export function parseSelection(path: string): Selection {
   const [pathname, query] = path.split("?");
   if (/^\/serverless\/?$/.test(pathname)) {
-    const from = new URLSearchParams(query).get("from");
-    return { project: from && from !== "all" && REF.test(from) ? from : null, session: null, all: from === "all", serverless: true };
+    const params = new URLSearchParams(query);
+    const from = params.get("from");
+    const all = params.get("view") === "all";
+    return { project: !all && from && REF.test(from) ? from : null, session: null, all, serverless: true };
   }
   const board = parseBoard(pathname, new URLSearchParams(query));
   if (board) return { project: null, session: null, all: false, board };
@@ -65,8 +67,8 @@ export function parseSelection(path: string): Selection {
 /** Encode real session identity separately from the virtual All filter. */
 export function selectionPath(selection: Selection): string {
   if (selection.serverless) {
-    const from = selection.all ? "all" : selection.project;
-    return from ? `/serverless?from=${encodeURIComponent(from)}` : "/serverless";
+    if (selection.all) return "/serverless?view=all";
+    return selection.project ? `/serverless?from=${encodeURIComponent(selection.project)}` : "/serverless";
   }
   if (selection.board) return boardPath(selection.board);
   if (selection.all && !selection.session) return "/?view=all";

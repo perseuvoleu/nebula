@@ -53,7 +53,7 @@ test("serverless back returns to the originating list", async ({ page }) => {
   const project = page.getByRole("combobox", { name: "Proiect", exact: true });
   const roundTrip = async () => {
     await page.getByRole("button", { name: "Rulări serverless" }).click();
-    await expect(page).toHaveURL(/\/serverless\?from=/);
+    await expect(page).toHaveURL(/\/serverless\?(from|view)=/);
     await page.goBack();
     await page.goForward();
     await page.reload();

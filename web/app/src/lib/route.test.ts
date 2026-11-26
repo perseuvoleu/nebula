@@ -15,7 +15,7 @@ test("All is a virtual list route; opening preserves real project identity and a
 
 test("/serverless is its own section and does not shadow project or session routes", () => {
   assert.deepEqual(parseSelection("/serverless"), { project: null, session: null, all: false, serverless: true });
-  for (const origin of [{ project: "beta", all: false }, { project: null, all: true }]) {
+  for (const origin of [{ project: "beta", all: false }, { project: "all", all: false }, { project: null, all: true }]) {
     const opened = parseSelection(selectionPath({ ...origin, session: "one", serverless: true }));
     assert.deepEqual(opened, { ...origin, session: null, serverless: true }, "the list it was opened from survives a reload");
   }
