@@ -220,6 +220,7 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
   const toggle = <T,>(list: T[], name: T) => list.includes(name) ? list.filter((n) => n !== name) : [...list, name];
 
   const live = (board?.cards ?? []).map((c) => ({ ...c, ...patchOf(overlay, c.ref) })).filter((c) => !c.archived);
+  const projects = board ? sidebarProjects({ ...board, cards: live }) : [];
   const waiting = (board?.needs_you ?? []).filter((w) => !patchOf(overlay, approval(w)));
   const all = live.map((c) => ({ ...toBoardCard(c, live), needsYou: waiting.some((w) => w.card === c.id), age: activityAge(c.updated_at, Date.now()) }));
   const scoped = all.filter((c) => inScope(c, scope));
@@ -264,7 +265,7 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
   ));
 
   const sidebar = (
-    <ProjectSidebar projects={board ? sidebarProjects(board) : []} total={live.length}
+    <ProjectSidebar projects={projects} total={live.length}
       scope={scope} expanded={expanded} showQuiet={showQuiet}
       query={search} onQueryChange={setSearch} onSelect={select}
       onToggleProject={(name) => setExpanded((old) => toggle(old, name))} onToggleQuiet={() => setShowQuiet((v) => !v)} />
@@ -348,7 +349,7 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
       </main>
       {newCard && (
         <NewCardDialog open onOpenChange={(open) => { if (!open) setNewCard(null); }} draft={newCard} pending={creating}
-          projects={(board ? sidebarProjects(board) : []).flatMap((p) => p.project === null ? [] : [p.project])}
+          projects={projects.flatMap((p) => p.project === null ? [] : [p.project])}
           onDraftChange={(draft) => setNewCard({ ...newCard, ...draft })} onCreate={create} error={createError} />
       )}
       <Sheet open={menuOpen} onOpenChange={setMenuOpen}>

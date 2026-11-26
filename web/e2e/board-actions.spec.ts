@@ -153,6 +153,22 @@ test("accept puts a proposed card on the board and dismiss removes it", async ({
   await expect(page.getByText("Proposed and dropped")).toHaveCount(0);
 });
 
+test("a dismissed proposal leaves Toate and its project's count together", async ({ page }) => {
+  addCard(14, "Proposed and dropped", { proposed: true });
+  let release = () => {};
+  const held = new Promise<void>((resolve) => { release = resolve; });
+  await page.route("**/api/cards/*/dismiss", async (route) => { await held; await route.continue(); });
+  await login(page, "/board");
+  const sidebar = page.getByRole("navigation", { name: "Proiecte" });
+  await expect(sidebar.getByRole("button", { name: /^Toate proiectele\s*3$/ })).toBeVisible();
+  await expect(sidebar.getByRole("button", { name: /nebula\s*3$/ })).toBeVisible();
+  await page.getByRole("region", { name: "Carduri propuse" }).getByRole("listitem").filter({ hasText: "Proposed and dropped" })
+    .getByRole("button", { name: "Respinge" }).click();
+  await expect(sidebar.getByRole("button", { name: /^Toate proiectele\s*2$/ })).toBeVisible();
+  await expect(sidebar.getByRole("button", { name: /nebula\s*2$/ })).toBeVisible();
+  release();
+});
+
 test("on a first visit each waiting session has its own approve button, which answers that session and leaves the strip", async ({ page }) => {
   const waitingSince = 1764000600000;
   waiting(waitingSince, true);
