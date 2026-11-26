@@ -23,9 +23,12 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a written request waits for its answer before it alone ends
 /// as outcome unknown.
 fn reply_deadline() -> Duration {
-    std::env::var("NEBULA_BOARD_REPLY_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
+    deadline(std::env::var("NEBULA_BOARD_REPLY_MS").ok().as_deref())
+}
+
+fn deadline(ms: Option<&str>) -> Duration {
+    ms.and_then(|v| v.parse().ok())
+        .filter(|ms| *ms > 0)
         .map(Duration::from_millis)
         .unwrap_or(Duration::from_secs(30))
 }
@@ -467,4 +470,15 @@ fn qualify(message: &str, host: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_zero_reply_deadline_keeps_the_default() {
+        assert_eq!(deadline(Some("200")), Duration::from_millis(200));
+        assert_eq!(deadline(Some("0")), Duration::from_secs(30));
+    }
 }
