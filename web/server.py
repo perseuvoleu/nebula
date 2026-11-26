@@ -791,8 +791,10 @@ def approve_card(gateway, card, body):
 def open_code(gateway, card, body):
     session, _ = gateway.card_session(card, body)
     on = field(body, "on", NAME)
-    unreachable = (409, f"Nebula not reachable on {on}", {"command": f"nebula open --session={session}"})
-    return ("open", f"--session={session}", f"--on={on}"), (), {3: unreachable}
+    command = {"command": f"nebula open --session={session}"}
+    unreachable = (409, f"Nebula not reachable on {on}", command)
+    no_tui = (409, f"No nebula TUI is running on {on}", command)
+    return ("open", f"--session={session}", f"--on={on}"), (), {3: unreachable, 5: no_tui}
 
 
 def move_card(gateway, card, body):

@@ -928,6 +928,12 @@ class BoardTests(unittest.TestCase):
         self.assertEqual((status, json.loads(raw)), (409, {"error": "Nebula not reachable on perseu-mbp",
                                                            "command": "nebula open --session=01JF0000000000000000000002"}))
 
+    def test_open_code_without_a_tui_shows_command(self):
+        session = {"session": "01JF0000000000000000000002", "host": "leaseweb", "on": "perseu-mbp"}
+        with patch("server.subprocess.run", side_effect=[cli(fixture("card_show")), cli(None, 5, "no nebula TUI")]):
+            status, _, raw = self.request("/api/cards/%2312/open-code", "POST", session, self.auth())
+        self.assertEqual((status, json.loads(raw)["command"]), (409, "nebula open --session=01JF0000000000000000000002"))
+
 
 if __name__ == "__main__":
     unittest.main()
