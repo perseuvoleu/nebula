@@ -554,6 +554,46 @@ fn human_reads_follow_pages() {
     }
 }
 
+/// A write between two pages of a human walk re-reads the board: every
+/// card prints once, the new one included.
+#[test]
+fn human_list_survives_a_write_between_pages() {
+    let env = Env::new();
+    env.board_local();
+    let env = env.start(&[("NEBULA_BOARD_PAGE_BYTES", "600")]);
+    let long = "x".repeat(200);
+    for n in 1..=5 {
+        add(&env, &["--project", "nebula"], &format!("{n} {long}"));
+    }
+    let sixth = format!("6 {long}");
+    let (_proxy, rt) = interposer(
+        &env,
+        b"BoardReply",
+        &[
+            env!("CARGO_BIN_EXE_nebula"),
+            "todo",
+            "add",
+            "--project",
+            "nebula",
+            &sixth,
+        ],
+    );
+    let out = env.cli_env(
+        &["todo", "list", "--all"],
+        None,
+        &[("NEBULA_RUNTIME_DIR", rt.to_str().unwrap())],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let printed = String::from_utf8_lossy(&out.stdout);
+    for n in 1..=6 {
+        let lines = printed
+            .lines()
+            .filter(|l| l.starts_with(&format!("#{n} ")))
+            .count();
+        assert_eq!(lines, 1, "#{n} printed {lines} times: {printed}");
+    }
+}
+
 #[test]
 fn card_list_scope() {
     let env = board_env();
@@ -1481,9 +1521,19 @@ fn artifact_add_links_caller() {
     let run = e2e_run(&env.tmp.path().join("run"), "shots/open.png");
     let host = nebula_core::host::hostname();
 
-    for (dir, kind, entry) in [
-        (&recap, "recap", "index.html"),
-        (&run, "e2e-run", "result.json"),
+    for (dir, kind, entry, files) in [
+        (
+            &recap,
+            "recap",
+            "index.html",
+            ["index.html", "assets/app.css"],
+        ),
+        (
+            &run,
+            "e2e-run",
+            "result.json",
+            ["result.json", "shots/open.png"],
+        ),
     ] {
         let added = publish(&env, Some(&agent), &[dir.to_str().unwrap(), "--kind", kind]);
         assert_eq!(added["kind"], kind);
@@ -1503,10 +1553,13 @@ fn artifact_add_links_caller() {
             serde_json::json!({"host": host, "entry": entry})
         );
         assert_eq!(shown, added);
-        assert!(
-            env.stored(id).join(entry).is_file(),
-            "{kind} entry not stored"
-        );
+        for file in files {
+            assert_eq!(
+                std::fs::read(env.stored(id).join(file)).ok(),
+                std::fs::read(dir.join(file)).ok(),
+                "{kind}: stored {file} differs from the fixture"
+            );
+        }
     }
     let on_card = env.json(&["todo", "show", "#1", "--json"]);
     assert_eq!(
@@ -1571,12 +1624,12 @@ fn artifact_add_refusals() {
     let invalid = tree(&root.join("invalid"), &[("result.json", b"{\"title\": 1}")]);
     let big = tree(&root.join("big"), &[("index.html", &[b'x'; 2048])]);
 
-    for (dir, kind) in [
-        (&linked, "recap"),
-        (&escape, "e2e-run"),
-        (&missing, "e2e-run"),
-        (&invalid, "e2e-run"),
-        (&big, "recap"),
+    for (dir, kind, why) in [
+        (&linked, "recap", "symlink"),
+        (&escape, "e2e-run", "not in the run"),
+        (&missing, "e2e-run", "not in the run"),
+        (&invalid, "e2e-run", "result.json"),
+        (&big, "recap", "artifact cap"),
     ] {
         let out = env.cli(
             &[
@@ -1589,8 +1642,7 @@ fn artifact_add_refusals() {
             ],
             None,
         );
-        assert!(!out.status.success(), "{dir:?} was stored");
-        assert!(out.stdout.is_empty(), "{dir:?}");
+        refused(&out, why);
     }
     assert!(artifact_ids(&env).is_empty());
     let leftovers: Vec<_> = std::fs::read_dir(env.data_dir().join("artifacts"))
@@ -3044,6 +3096,227 @@ fn approve_checks_status_timestamp() {
     assert_eq!(inputs(), before + 1);
 }
 
+struct Killed(Child);
+
+impl Drop for Killed {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// A socket the CLI reaches its daemon through (its runtime dir is
+/// returned) that forwards every frame. The first daemon frame holding
+/// `needle` is, once, held back while `run` runs and then forwarded, or
+/// with no `run` never sent: the CLI's connection closes instead.
+fn interposer(env: &Env, needle: &[u8], run: &[&str]) -> (Killed, PathBuf) {
+    let script = env.tmp.path().join("interpose.py");
+    std::fs::write(
+        &script,
+        r#"import os, socket, subprocess, sys, threading
+listen, upstream, once, needle = sys.argv[1], sys.argv[2], sys.argv[3], bytes.fromhex(sys.argv[4])
+run = sys.argv[5:]
+srv = socket.socket(socket.AF_UNIX)
+srv.bind(listen)
+srv.listen(8)
+def serve(c):
+    u = socket.socket(socket.AF_UNIX)
+    u.connect(upstream)
+    def up():
+        try:
+            while True:
+                b = c.recv(65536)
+                if not b:
+                    break
+                u.sendall(b)
+            u.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+    threading.Thread(target=up, daemon=True).start()
+    def exact(n):
+        buf = b''
+        while len(buf) < n:
+            got = u.recv(n - len(buf))
+            if not got:
+                return None
+            buf += got
+        return buf
+    while True:
+        head = exact(4)
+        body = head and exact(int.from_bytes(head, 'little'))
+        hit = body is not None and needle in body and not os.path.exists(once)
+        if hit:
+            open(once, 'w').close()
+            if run:
+                subprocess.run(run)
+        if body is None or (hit and not run):
+            c.shutdown(socket.SHUT_RDWR)
+            c.close()
+            u.close()
+            return
+        c.sendall(head + body)
+while True:
+    c, _ = srv.accept()
+    threading.Thread(target=serve, args=(c,), daemon=True).start()
+"#,
+    )
+    .unwrap();
+    let rt = env.tmp.path().join("cut-rt");
+    std::fs::create_dir_all(&rt).unwrap();
+    let hex: String = needle.iter().map(|b| format!("{b:02x}")).collect();
+    let mut cmd = Command::new("python3");
+    for k in LIVE_SESSION_ENV {
+        cmd.env_remove(k);
+    }
+    let child = cmd
+        .arg(&script)
+        .arg(rt.join("daemon.sock"))
+        .arg(env.runtime_dir().join("daemon.sock"))
+        .arg(env.tmp.path().join("ack-cut-once"))
+        .arg(hex)
+        .args(run)
+        .env("NEBULA_RUNTIME_DIR", env.runtime_dir())
+        .env("NEBULA_DATA_DIR", env.data_dir())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let child = Killed(child);
+    wait_for(&rt.join("daemon.sock"));
+    (child, rt)
+}
+
+fn ack_cutter(env: &Env) -> (Killed, PathBuf) {
+    interposer(env, b"\xa3Ack", &[])
+}
+
+/// An add whose reply is lost exits 4 naming the caller's own --id, and
+/// that rerun lands the one card.
+#[test]
+fn lost_reply_to_a_given_id_exit_4() {
+    let env = board_env();
+    let (cutter, rt) = interposer(&env, b"BoardReply", &[]);
+    let id = TodoId::generate().0;
+    let argv = [
+        "todo",
+        "add",
+        "--json",
+        "--project",
+        "nebula",
+        "--id",
+        &id,
+        "T",
+    ];
+    let lost = env.cli_env(&argv, None, &[("NEBULA_RUNTIME_DIR", rt.to_str().unwrap())]);
+    drop(cutter);
+    assert_eq!(lost.status.code(), Some(4), "{}", stderr(&lost));
+    assert!(
+        stderr(&lost).contains(&format!("--id {id}")),
+        "{}",
+        stderr(&lost)
+    );
+    assert_eq!(env.json(&argv)["id"], id.as_str());
+    assert_eq!(list(&env, &["--project", "nebula"]), ["T"]);
+}
+
+/// Run and Approve whose final Ack is lost after they took effect exit 4
+/// and name what reruns them, as a lost board reply does.
+#[test]
+fn lost_final_ack_exit_4() {
+    let replay = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/replay");
+    let agent = format!(
+        "{} {}",
+        replay.join("agent").display(),
+        replay.join("ask.replay").display()
+    );
+    let env = Env::new();
+    env.board_local();
+    let input = env.tmp.path().join("input.log");
+    let env = env.start(&[
+        ("NEBULA_AGENT_CMD", agent.as_str()),
+        ("NEBULA_STATUS_TICK_MS", "100"),
+        ("REPLAY_INPUT_LOG", input.to_str().unwrap()),
+    ]);
+    let inputs = || {
+        std::fs::read_to_string(&input)
+            .map(|log| log.lines().count())
+            .unwrap_or(0)
+    };
+    env.make_repo();
+    add(&env, &["--project", "repo"], "Ask");
+
+    let (cutter, cut_rt) = ack_cutter(&env);
+    let cut_rt = cut_rt.to_str().unwrap();
+    let dispatch = TodoId::generate().0;
+    let argv = run_argv(&env, "#1", &[], &["--dispatch", &dispatch]);
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let lost = env.cli_env(&argv, None, &[("NEBULA_RUNTIME_DIR", cut_rt)]);
+    assert_eq!(lost.status.code(), Some(4), "{}", stderr(&lost));
+    assert!(
+        stderr(&lost).contains(&format!("--dispatch {dispatch}")),
+        "{}",
+        stderr(&lost)
+    );
+    let session = eventually("the spawned session", || {
+        agents_of(&env)
+            .first()
+            .map(|a| a["id"].as_str().unwrap().to_string())
+    });
+    let rerun = receipt(run_card(&env, "#1", &["--dispatch", &dispatch]));
+    assert_eq!(rerun["state"], "started");
+    assert_eq!(rerun["session"]["id"], session.as_str());
+    assert_eq!(agents_of(&env).len(), 1);
+
+    let name = session_row(&env, &session)["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for text in ["go", "on"] {
+        let sent = env.cli(&["agent", "send", &name, text, "--project", "repo"], None);
+        assert!(sent.status.success(), "{}", stderr(&sent));
+    }
+    let asked = eventually("the session asking", || {
+        let row = session_row(&env, &session);
+        (row["status"] == "needs_feedback").then_some(row)
+    });
+    let at = asked["status_changed_at"].as_i64().unwrap();
+    eventually("the asking session on the card", || {
+        chain(&env, "#1")
+            .iter()
+            .any(|s| s["id"] == session.as_str() && s["status_changed_at"] == at)
+            .then_some(())
+    });
+    let before = eventually("both prompts read", || (inputs() == 2).then_some(2));
+    drop(cutter);
+    std::fs::remove_file(env.tmp.path().join("ack-cut-once")).unwrap();
+    std::fs::remove_file(Path::new(cut_rt).join("daemon.sock")).unwrap();
+    let (cutter, _) = ack_cutter(&env);
+    let at = at.to_string();
+    let lost = env.cli_env(
+        &[
+            "todo",
+            "approve",
+            "#1",
+            "--session",
+            &session,
+            "--expected-status-at",
+            &at,
+        ],
+        None,
+        &[("NEBULA_RUNTIME_DIR", cut_rt)],
+    );
+    drop(cutter);
+    assert_eq!(lost.status.code(), Some(4), "{}", stderr(&lost));
+    assert!(
+        stderr(&lost).contains(&session)
+            && stderr(&lost).contains(&format!("--expected-status-at {at}")),
+        "{}",
+        stderr(&lost)
+    );
+    eventually("the approval's Enter", || {
+        (inputs() == before + 1).then_some(())
+    });
+}
+
 #[test]
 fn cross_host_child_keeps_parent() {
     let board = board_env();
@@ -3166,7 +3439,7 @@ fn ssh_stub_as(env: &Env, target: &Env, host: &str) -> (String, PathBuf, PathBuf
     std::fs::write(
         bin.join("ssh"),
         format!(
-            "#!/bin/sh\n[ \"$(cat '{log}' 2>/dev/null | grep -c '^BatchMode=yes$')\" -ge 3 ] && exit 255\nprintf '%s\\n' \"$@\" >> '{log}'\n[ -e '{down}' ] && {{ echo 'ssh: connect to host: Connection refused' >&2; exit 255; }}\nfor arg do script=$arg; done\nunset NEBULA_AGENT_ID\nexport HOME='{home}' NEBULA_RUNTIME_DIR='{rt}' NEBULA_DATA_DIR='{data}' NEBULA_HOSTNAME='{host}' PATH='{nebula}':\"$PATH\"\n[ -e '{lost}' ] && {{ /bin/sh -c \"$script\" >/dev/null 2>&1; . '{lost}'; echo 'Connection to host closed by remote host.' >&2; exit 255; }}\nexec /bin/sh -c \"$script\"\n",
+            "#!/bin/sh\n[ \"$(cat '{log}' 2>/dev/null | grep -c '^BatchMode=yes$')\" -ge 3 ] && exit 255\nprintf '%s\\n' \"$@\" >> '{log}'\n[ -e '{down}' ] && {{ echo 'ssh: connect to host: Connection refused' >&2; exit 255; }}\nwhile [ \"$1\" != -- ]; do shift; done\nshift 2\nscript=\"$*\"\nunset NEBULA_AGENT_ID\nexport HOME='{home}' NEBULA_RUNTIME_DIR='{rt}' NEBULA_DATA_DIR='{data}' NEBULA_HOSTNAME='{host}' PATH='{nebula}':\"$PATH\"\n[ -e '{lost}' ] && {{ /bin/sh -c \"$script\" >/dev/null 2>&1; . '{lost}'; echo 'Connection to host closed by remote host.' >&2; exit 255; }}\nexec /bin/sh -c \"$script\"\n",
             log = log.display(),
             down = down.display(),
             lost = env.tmp.path().join("ssh-lost").display(),
@@ -4404,6 +4677,23 @@ fn decision_add_home_ignores_the_callers_checkout() {
     assert_eq!(decided["card"], Value::Null);
     assert_eq!(decided["project"], Value::Null);
     assert_eq!(decided["title"], "Keep a shared inbox");
+}
+
+#[test]
+fn home_decision_reaches_shared_rag() {
+    let env = rag_board(None, &[]);
+    let decided = decide(
+        &env,
+        None,
+        &[
+            "--home",
+            "--why=Nobody owns the inbox",
+            "Keep a shared inbox",
+        ],
+    );
+    assert_eq!(decided["project"], Value::Null);
+    let note = rag_note(&env, decided["id"].as_str().unwrap());
+    assert_eq!(rag_hit(&env, "Nobody owns the inbox", note)["ws"], "shared");
 }
 
 #[test]

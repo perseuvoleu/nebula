@@ -35,7 +35,12 @@ pub fn resend() {
     RESEND.notify_one();
 }
 
-pub fn spawn(daemon: Arc<Daemon>) {
+/// Starts the host reporter, once at daemon startup: it starts the board's
+/// boot clock (see `HostLinks::boot`), then sends this host's report now,
+/// again after each entity, status or exit event (debounced) and when idle
+/// for [`RECHECK`] debounces, in full after [`resend`], retrying a failed send
+/// with backoff, until shutdown.
+pub(crate) fn spawn(daemon: Arc<Daemon>) {
     daemon.host_links.boot(daemon.store.clone());
     let events = daemon.events.subscribe();
     let shutdown = daemon.shutdown.clone();

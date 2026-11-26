@@ -5,10 +5,10 @@ use crate::ipc::{self, Connection};
 use anyhow::{bail, Context, Result};
 use nebula_core::board::{
     parse_card_ref, Author, BoardOp, BoardPoll, BoardRead, BoardResult, BoardScope, Card,
-    CardDraft, CardRef, Checkout, Dispatch, DispatchState, Placement, ProjectScope, Refusal, Role,
-    RunReceipt, SessionAt, Stage,
+    CardDraft, CardRef, CardShow, Checkout, Dispatch, DispatchState, Placement, ProjectScope,
+    Refusal, Role, RunReceipt, SessionAt, Stage,
 };
-use nebula_core::codec::{read_frame, write_frame};
+use nebula_core::codec::write_frame;
 use nebula_core::{
     paths, Agent, AgentId, AgentKind, ClientRequest, DispatchId, NoteId, Project, ServerEvent,
     TodoId, Worktree,
@@ -230,7 +230,7 @@ pub enum TodoVerb {
     Run {
         card: String,
         role: Role,
-        kind: String,
+        kind: AgentKind,
         host: String,
         worktree: String,
         dispatch: Option<String>,
@@ -258,9 +258,9 @@ pub fn dispatch_id(text: &str) -> Result<DispatchId> {
     }
 }
 
-pub(crate) fn client_id(id: Option<String>, minted: &mut Option<String>) -> Result<String> {
+pub(crate) fn client_id(id: Option<String>) -> Result<String> {
     match id {
-        None => Ok(minted.insert(TodoId::generate().0).clone()),
+        None => Ok(TodoId::generate().0),
         Some(id) => match parse_card_ref(&id) {
             Some(CardRef::Id(canonical)) => Ok(canonical.0),
             _ => bail!("--id {id:?} is not a ULID"),
@@ -275,25 +275,35 @@ pub(crate) async fn connect() -> Result<Connection> {
     ipc::handshake(stream).await
 }
 
-pub async fn request(conn: &mut Connection, op: BoardOp) -> Result<BoardResult> {
-    let req_id = 1;
-    write_frame(&mut conn.stream, &ClientRequest::Board { req_id, op }).await?;
+/// The one request id of a CLI connection: each request awaits its reply
+/// before the next is written, so a reply can never answer another request.
+pub(crate) const REQ: u64 = 1;
+
+/// Writes `req`, sent with [`REQ`], and returns the first reply to it. An
+/// Error reply becomes Err, a reply that never arrives [`ipc::ReplyLost`].
+pub(crate) async fn exchange(conn: &mut Connection, req: ClientRequest) -> Result<ServerEvent> {
+    write_frame(&mut conn.stream, &req).await?;
     loop {
-        match read_frame::<ServerEvent, _>(&mut conn.stream).await? {
-            Some(ServerEvent::BoardReply { req_id: r, result }) if r == req_id => {
-                return Ok(result)
-            }
-            Some(ServerEvent::Error {
-                req_id: Some(r),
+        match ipc::read_reply(conn).await? {
+            ServerEvent::Error {
+                req_id: Some(REQ),
                 message,
-            }) if r == req_id => bail!("{message}"),
-            Some(_) => continue,
-            None => bail!(CLOSED),
+            } => bail!("{message}"),
+            reply @ (ServerEvent::BoardReply { req_id: REQ, .. }
+            | ServerEvent::ArtifactStored { req_id: REQ, .. }
+            | ServerEvent::ArtifactLocated { req_id: REQ, .. }
+            | ServerEvent::Ack { req_id: REQ, .. }) => return Ok(reply),
+            _ => continue,
         }
     }
 }
 
-pub(crate) const CLOSED: &str = "daemon closed the connection before replying";
+pub async fn request(conn: &mut Connection, op: BoardOp) -> Result<BoardResult> {
+    match exchange(conn, ClientRequest::Board { req_id: REQ, op }).await? {
+        ServerEvent::BoardReply { result, .. } => Ok(result),
+        other => bail!("the daemon answered a board request with {other:?}"),
+    }
+}
 
 /// The spawner's card while the board still holds it unarchived; a child of
 /// an archived or removed card joins none. A board that cannot answer keeps
@@ -314,7 +324,10 @@ pub async fn inherited_card(conn: &mut Connection, card: TodoId) -> Result<Optio
 /// Reads the card `text` names, so a spawn linking it is refused before
 /// anything starts.
 pub async fn check_card(conn: &mut Connection, text: &str) -> Result<TodoId> {
-    Ok(read_card(conn, text).await?.id)
+    Ok(read_card(conn, ScopeFlags::default().scope(None), text)
+        .await?
+        .card
+        .id)
 }
 
 /// Refuses a spawn for a dispatch the board has not admitted on this
@@ -347,13 +360,14 @@ pub async fn check_executor(
     }
 }
 
-pub async fn read_card(conn: &mut Connection, text: &str) -> Result<Card> {
+/// The card `text` names within `scope`, with its sessions and log.
+pub async fn read_card(conn: &mut Connection, scope: BoardScope, text: &str) -> Result<CardShow> {
     let op = BoardOp::Read(BoardRead::Card {
-        scope: ScopeFlags::default().scope(None),
+        scope,
         card: card_ref(text)?,
     });
     match request(conn, op).await? {
-        BoardResult::Show(show) => Ok(show.card),
+        BoardResult::Show(show) => Ok(*show),
         other => bail!("the board answered a card read with {other:?}"),
     }
 }
@@ -362,7 +376,7 @@ pub async fn run(verb: TodoVerb, json: bool) -> Result<()> {
     let mut conn = connect().await?;
     let (projects, worktrees, agents) = ipc::subscribe_snapshot(&mut conn).await?;
     let caller = Caller::resolve(&projects, &worktrees, &agents)?;
-    let mut minted = None;
+    let mut written = None;
     let mut op = match verb {
         TodoVerb::Run {
             card,
@@ -383,9 +397,7 @@ pub async fn run(verb: TodoVerb, json: bool) -> Result<()> {
                 card: card_ref(&card)?,
                 host,
                 role,
-                kind: AgentKind::parse(&kind).with_context(|| {
-                    format!("unknown agent kind {kind:?} (claude|codex|cursor|pi|antigravity)")
-                })?,
+                kind,
                 worktree,
             };
             return run_dispatch(
@@ -418,7 +430,7 @@ pub async fn run(verb: TodoVerb, json: bool) -> Result<()> {
             propose,
             id,
         } => BoardOp::AddCard(CardDraft {
-            id: TodoId(client_id(id, &mut minted)?),
+            id: TodoId(written.insert(client_id(id)?).clone()),
             title,
             project: match (project, home) {
                 (_, true) => None,
@@ -472,7 +484,7 @@ pub async fn run(verb: TodoVerb, json: bool) -> Result<()> {
             id,
             scope,
         } => scope.guard(BoardOp::AddNote {
-            id: NoteId(client_id(id, &mut minted)?),
+            id: NoteId(written.insert(client_id(id)?).clone()),
             card: card_ref(&card)?,
             text,
             author: caller.author.clone(),
@@ -514,20 +526,46 @@ pub async fn run(verb: TodoVerb, json: bool) -> Result<()> {
             page,
         }),
     };
+    let rerun = |why: anyhow::Error| match written.as_deref() {
+        Some(id) => with_rerun(why, &format!("with --id {id}")),
+        None => why,
+    };
+    if json {
+        let result = request(&mut conn, op).await.map_err(rerun)?;
+        println!("{}", result_json(&result)?);
+        return Ok(());
+    }
+    let first = op.clone();
+    let mut pages = Vec::new();
+    let mut rereads = 0;
     loop {
-        let result = request(&mut conn, op.clone())
-            .await
-            .map_err(|why| with_rerun_id(why, minted.as_deref()))?;
-        if json {
-            println!("{}", result_json(&result)?);
-            return Ok(());
-        }
-        print_human(&result);
-        if !turn_page(&mut op, &result) {
-            return Ok(());
+        match request(&mut conn, op.clone()).await {
+            Err(why)
+                if !pages.is_empty()
+                    && rereads < REREADS
+                    && Refusal::of(&why.to_string()) == Some(Refusal::Conflict) =>
+            {
+                rereads += 1;
+                pages.clear();
+                op = first.clone();
+            }
+            result => {
+                let result = result.map_err(rerun)?;
+                let more = turn_page(&mut op, &result);
+                pages.push(result);
+                if !more {
+                    break;
+                }
+            }
         }
     }
+    pages.iter().for_each(print_human);
+    Ok(())
 }
+
+/// How often a human page walk starts over when the board changes under
+/// it, before the change is reported.
+const REREADS: usize = 3;
 
 async fn run_dispatch(
     conn: &mut Connection,
@@ -539,10 +577,8 @@ async fn run_dispatch(
     json: bool,
 ) -> Result<()> {
     let id = dispatch.id.clone();
-    let rerun = |why: anyhow::Error| match Refusal::of(&why.to_string()) {
-        Some(Refusal::OutcomeUnknown) => anyhow::anyhow!("{why} with --dispatch {}", id.as_str()),
-        _ => why,
-    };
+    let rerun_with = format!("with --dispatch {}", id.as_str());
+    let rerun = |why: anyhow::Error| with_rerun(why, &rerun_with);
     let (role, kind, worktree) = (dispatch.role, dispatch.kind, dispatch.worktree.clone());
     let forwarded_scope = scope.args();
     let begun = request(conn, scope.guard(BoardOp::BeginRun(dispatch)))
@@ -611,7 +647,7 @@ async fn run_dispatch(
             if json {
                 words.push("--json");
             }
-            return on_host(&host, &words, &format!("with --dispatch {}", id.as_str()));
+            return on_host(&host, &words, &rerun_with);
         }
     };
     let worktree = match worktree.as_str() {
@@ -666,6 +702,7 @@ async fn run_dispatch(
         Err(why) if Refusal::of(&why.to_string()) == Some(Refusal::WriterHeld) => {
             (None, Some(why.to_string()))
         }
+        Err(why) if outcome_unknown(&why) => return Err(rerun(why)),
         Err(why) => bail!(
             "{why:#}; dispatch {} stays pending, rerun with --dispatch {}",
             id.as_str(),
@@ -751,7 +788,9 @@ async fn fresh_worktree(
     card: &TodoId,
     dispatch: &DispatchId,
 ) -> Result<String> {
-    let card = read_card(conn, card.as_str()).await?;
+    let card = read_card(conn, ScopeFlags::default().scope(None), card.as_str())
+        .await?
+        .card;
     let branch = format!("card-{}-{}", card.number, dispatch.as_str().to_lowercase());
     let (projects, worktrees, agents) = ipc::subscribe_snapshot(conn).await?;
     let project = ipc::resolve_project(&projects, &worktrees, &agents, Some(project))?;
@@ -814,18 +853,7 @@ async fn approve(
     let read_scope = scope
         .write_scope()
         .unwrap_or_else(|| ScopeFlags::default().scope(None));
-    let show = match request(
-        conn,
-        BoardOp::Read(BoardRead::Card {
-            scope: read_scope,
-            card: card_ref(card)?,
-        }),
-    )
-    .await?
-    {
-        BoardResult::Show(show) => show,
-        other => bail!("the board answered a card read with {other:?}"),
-    };
+    let show = read_card(conn, read_scope, card).await?;
     let found = show
         .sessions
         .iter()
@@ -833,6 +861,10 @@ async fn approve(
         .with_context(|| {
             Refusal::NotFound.message(format!("{} has no session {session}", show.card.label))
         })?;
+    let rerun = format!(
+        "for session {} with --expected-status-at {expected_status_at}",
+        found.id.as_str()
+    );
     if !found
         .host
         .eq_ignore_ascii_case(&nebula_core::host::hostname())
@@ -853,23 +885,18 @@ async fn approve(
         if json {
             words.push("--json");
         }
-        let rerun = format!(
-            "for session {} with --expected-status-at {expected_status_at}",
-            found.id.as_str()
-        );
         return on_host(&found.host, &words, &rerun);
     }
-    let req_id = 2;
-    write_frame(
-        &mut conn.stream,
-        &ClientRequest::ApproveSession {
-            req_id,
+    exchange(
+        conn,
+        ClientRequest::ApproveSession {
+            req_id: REQ,
             id: found.id.clone(),
             expected_status_at,
         },
     )
-    .await?;
-    ipc::await_ack(conn, req_id, &mut Vec::new()).await?;
+    .await
+    .map_err(|why| with_rerun(why, &rerun))?;
     if json {
         println!(
             "{}",
@@ -885,10 +912,25 @@ async fn approve(
     Ok(())
 }
 
-fn with_rerun_id(why: anyhow::Error, minted: Option<&str>) -> anyhow::Error {
-    match (Refusal::of(&why.to_string()), minted) {
-        (Some(Refusal::OutcomeUnknown), Some(id)) => anyhow::anyhow!("{why} with --id {id}"),
-        _ => why,
+/// The board said a write's outcome is unknown, or the connection failed
+/// once the request could have gone out.
+pub(crate) fn outcome_unknown(why: &anyhow::Error) -> bool {
+    why.downcast_ref::<std::io::Error>().is_some()
+        || why.downcast_ref::<ipc::ReplyLost>().is_some()
+        || Refusal::of(&why.to_string()) == Some(Refusal::OutcomeUnknown)
+}
+
+/// A write whose outcome is unknown names what reruns it.
+fn with_rerun(why: anyhow::Error, rerun: &str) -> anyhow::Error {
+    if !outcome_unknown(&why) {
+        return why;
+    }
+    match Refusal::of(&why.to_string()) {
+        Some(Refusal::OutcomeUnknown) => anyhow::anyhow!("{why} {rerun}"),
+        _ => anyhow::anyhow!(
+            "{} {rerun}",
+            Refusal::OutcomeUnknown.message(format!("{why:#}"))
+        ),
     }
 }
 
@@ -1051,8 +1093,82 @@ pub fn exit_on_refusal(result: Result<()>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nebula_core::codec::read_frame;
     use nebula_core::{ProjectId, WorktreeId};
     use std::path::Path;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::UnixStream;
+
+    #[test]
+    fn only_an_answer_settles_a_write() {
+        assert!(!outcome_unknown(&anyhow::anyhow!(
+            Refusal::Conflict.message("taken")
+        )));
+        assert!(!outcome_unknown(&anyhow::anyhow!("no board configured")));
+        let lost = std::io::Error::from(std::io::ErrorKind::BrokenPipe);
+        assert!(outcome_unknown(&anyhow::Error::from(lost)));
+        assert!(outcome_unknown(&anyhow::Error::from(ipc::CLOSED)));
+        assert!(outcome_unknown(&anyhow::anyhow!(
+            Refusal::OutcomeUnknown.message("link dropped")
+        )));
+    }
+
+    async fn approve_against(
+        daemon: impl FnOnce(UnixStream) -> tokio::task::JoinHandle<()>,
+    ) -> anyhow::Error {
+        let (cli, end) = UnixStream::pair().unwrap();
+        let _daemon = daemon(end);
+        let mut conn = Connection {
+            stream: cli,
+            daemon_pid: 0,
+        };
+        let req = ClientRequest::ApproveSession {
+            req_id: REQ,
+            id: AgentId("s1".into()),
+            expected_status_at: 7,
+        };
+        let why = tokio::time::timeout(
+            std::time::Duration::from_secs(3600),
+            exchange(&mut conn, req),
+        )
+        .await
+        .expect("the approve still waits an hour on")
+        .unwrap_err();
+        with_rerun(why, "for session s1 with --expected-status-at 7")
+    }
+
+    fn names_the_rerun(why: &anyhow::Error) {
+        let text = why.to_string();
+        assert_eq!(Refusal::of(&text), Some(Refusal::OutcomeUnknown), "{text}");
+        assert!(text.contains("--expected-status-at 7"), "{text}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_approve_the_daemon_never_answers_ends_outcome_unknown() {
+        names_the_rerun(
+            &approve_against(|mut end| {
+                tokio::spawn(async move {
+                    let _ = read_frame::<ClientRequest, _>(&mut end).await;
+                    std::future::pending::<()>().await;
+                })
+            })
+            .await,
+        );
+    }
+
+    #[tokio::test]
+    async fn an_approve_reply_cut_mid_frame_ends_outcome_unknown() {
+        names_the_rerun(
+            &approve_against(|mut end| {
+                tokio::spawn(async move {
+                    let _ = read_frame::<ClientRequest, _>(&mut end).await;
+                    end.write_all(&100u32.to_le_bytes()).await.unwrap();
+                    end.write_all(&[0x81; 10]).await.unwrap();
+                })
+            })
+            .await,
+        );
+    }
 
     #[test]
     fn cwd_matches_only_local_checkouts() {

@@ -101,27 +101,18 @@ pub fn run_open_session(
 
 /// `nebula open --session --on HOST`: the same open run on HOST over ssh,
 /// its object passed through. The exit code to leave with: 3 when HOST is
-/// unreachable, else the remote command's.
+/// unreachable, 5 when HOST has no TUI running, 1 with an upgrade hint
+/// when HOST's nebula rejects the command line, else the remote command's.
 pub fn run_open_on_host(
     host: &str,
     reference: &str,
     project: Option<&str>,
     focus: bool,
 ) -> Result<i32> {
-    run_on_host(
-        host,
-        session_open::open_on_argv(host, reference, project, focus)?,
-    )
-}
-
-/// Runs an ssh argv from [`session_open::ssh_argv`] and passes the remote
-/// command's output through. The exit code to leave with: 3 when HOST is
-/// unreachable, else the remote command's.
-pub(crate) fn run_on_host(host: &str, argv: Vec<String>) -> Result<i32> {
     use anyhow::Context;
     use std::io::Write;
     let out = std::process::Command::new("ssh")
-        .args(&argv)
+        .args(session_open::open_on_argv(host, reference, project, focus)?)
         .stdin(std::process::Stdio::null())
         .output()
         .context("run ssh")?;
@@ -136,14 +127,21 @@ pub(crate) fn run_on_host(host: &str, argv: Vec<String>) -> Result<i32> {
     std::io::stdout().write_all(&out.stdout)?;
     std::io::stdout().flush()?;
     std::io::stderr().write_all(&out.stderr)?;
-    Ok(out.status.code().unwrap_or(1))
+    Ok(match out.status.code() {
+        Some(3) => 5,
+        Some(2) => {
+            eprintln!("nebula: upgrade nebula on {host}: its `nebula open` predates --session");
+            1
+        }
+        code => code.unwrap_or(1),
+    })
 }
 
 /// What ssh's own last `ssh:` line starts with when it failed before the
 /// remote command could start; other stderr lines may come from the far side.
 const SSH_NOT_CONNECTED: [&str; 2] = ["ssh: connect to host", "ssh: Could not resolve hostname"];
 
-/// As [`run_on_host`], for a command with effects: exit 3 only when ssh
+/// As [`run_open_on_host`], for a command with effects: exit 3 only when ssh
 /// failed before the command could start, else 4 with `rerun` named, as
 /// the command may have run.
 pub(crate) fn run_effect_on_host(host: &str, argv: Vec<String>, rerun: &str) -> Result<i32> {

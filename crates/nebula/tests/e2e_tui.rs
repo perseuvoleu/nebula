@@ -1176,12 +1176,82 @@ fn open_session_attaches_it_in_the_running_tui() {
     assert_typing_reaches(&mut tui, "t3", &ids[1]);
 }
 
+/// A HOME whose `~/.local/bin` holds `nebula` (`remote`, else this build)
+/// and a stub ssh that records its argv one word per line in `ssh-argv`,
+/// then joins the words after the host with spaces and runs them as ssh
+/// would. It exits 255 like an unreachable host with SSH_STUB_UNREACHABLE
+/// set, and runs nothing with SSH_STUB_DRY set.
+fn ssh_stub_home(remote: Option<&str>) -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    let bin = home.path().join(".local/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    match remote {
+        Some(script) => {
+            std::fs::write(bin.join("nebula"), script).unwrap();
+            std::fs::set_permissions(bin.join("nebula"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        None => {
+            std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_nebula"), bin.join("nebula")).unwrap()
+        }
+    }
+    std::fs::write(
+        bin.join("ssh"),
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n[ -n \"$SSH_STUB_UNREACHABLE\" ] && {{ echo 'ssh: connect to host laptop-b: Connection refused' >&2; exit 255; }}\n[ -n \"$SSH_STUB_DRY\" ] && exit 0\nwhile [ \"$1\" != -- ]; do shift; done\nshift 2\nexec /bin/sh -c \"$*\"\n",
+            home.path().join("ssh-argv").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(bin.join("ssh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    home
+}
+
+fn open_on(
+    home: &Path,
+    runtime_dir: &Path,
+    data_dir: &Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> std::process::Output {
+    nebula_cmd()
+        .arg("open")
+        .args(args)
+        .env("NEBULA_RUNTIME_DIR", runtime_dir)
+        .env("NEBULA_DATA_DIR", data_dir)
+        .env("HOME", home)
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                home.join(".local/bin").display(),
+                std::env::var("PATH").unwrap()
+            ),
+        )
+        .envs(env.iter().copied())
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap()
+}
+
+/// The words the stub ssh was asked to run on HOST, after its PATH prefix.
+fn remote_words(home: &Path, host: &str) -> Vec<String> {
+    let argv = std::fs::read_to_string(home.join("ssh-argv")).unwrap_or_default();
+    let lines: Vec<&str> = argv.lines().collect();
+    assert!(lines.contains(&"BatchMode=yes"), "ssh argv: {argv:?}");
+    let at = lines
+        .iter()
+        .position(|l| *l == host)
+        .unwrap_or_else(|| panic!("no {host} in ssh argv: {argv:?}"));
+    lines[at + 2..].iter().map(|l| l.to_string()).collect()
+}
+
 /// `--on HOST` runs the open on HOST over ssh: a stub ssh (the relay tests'
 /// PATH override) runs the remote command line on this machine, where the
 /// remote `~/.local/bin/nebula` is this build talking to the same TUI.
 #[test]
 fn open_on_host_returns_landed_focused() {
-    use std::os::unix::fs::PermissionsExt;
     let mut tui = TuiHarness::spawn();
     let repo = tui.make_repo("alpha proj");
     add_project(&mut tui, &repo, "alpha proj");
@@ -1205,47 +1275,58 @@ fn open_on_host_returns_landed_focused() {
         .to_owned();
     tui.wait_for_text("far away");
 
-    let home = tempfile::tempdir().unwrap();
-    let bin = home.path().join(".local/bin");
-    std::fs::create_dir_all(&bin).unwrap();
-    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_nebula"), bin.join("nebula")).unwrap();
-    let hops = home.path().join("ssh-argv");
-    std::fs::write(
-        bin.join("ssh"),
-        format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\nfor arg do script=$arg; done\nexec /bin/sh -c \"$script\"\n",
-            hops.display()
-        ),
-    )
-    .unwrap();
-    std::fs::set_permissions(bin.join("ssh"), std::fs::Permissions::from_mode(0o755)).unwrap();
-    let out = nebula_cmd()
-        .args([
-            "open",
-            "--session",
-            "far away",
-            "--project",
-            "alpha proj",
-            "--on",
-            "laptop-b",
-            "--no-focus",
-            "--json",
-        ])
-        .env("NEBULA_RUNTIME_DIR", &tui.runtime_dir)
-        .env("NEBULA_DATA_DIR", &tui.data_dir)
-        .env("HOME", home.path())
-        .env(
-            "PATH",
-            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
-        )
-        .stdin(std::process::Stdio::null())
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(0), "{out:?}");
-    let argv = std::fs::read_to_string(&hops).unwrap_or_default();
+    let home = ssh_stub_home(None);
+    let (rt, data) = (tui.runtime_dir.clone(), tui.data_dir.clone());
+    let session = ["--session", "far away", "--project", "alpha proj"];
+
+    let bad = open_on(
+        home.path(),
+        &rt,
+        &data,
+        &[&session[..], &["--on", "bad host@localhost", "--no-focus"]].concat(),
+        &[],
+    );
+    assert_eq!(bad.status.code(), Some(1), "{bad:?}");
     assert!(
-        argv.lines().any(|l| l == "BatchMode=yes") && argv.lines().any(|l| l == "laptop-b"),
-        "ssh argv: {argv:?}"
+        bad.stdout.is_empty(),
+        "an invalid host never lands: {bad:?}"
+    );
+
+    let default = open_on(
+        home.path(),
+        &rt,
+        &data,
+        &[&session[..], &["--on", "laptop-b"]].concat(),
+        &[("SSH_STUB_DRY", "1")],
+    );
+    assert_eq!(default.status.code(), Some(0), "{default:?}");
+    assert_eq!(
+        remote_words(home.path(), "laptop-b"),
+        [
+            "'nebula'",
+            "'open'",
+            "'--session=far away'",
+            "'--project=alpha proj'"
+        ]
+    );
+
+    let out = open_on(
+        home.path(),
+        &rt,
+        &data,
+        &[&session[..], &["--on", "laptop-b", "--no-focus", "--json"]].concat(),
+        &[],
+    );
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(
+        remote_words(home.path(), "laptop-b"),
+        [
+            "'nebula'",
+            "'open'",
+            "'--session=far away'",
+            "'--project=alpha proj'",
+            "'--no-focus'"
+        ]
     );
     let landed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(
@@ -1262,6 +1343,43 @@ fn open_on_host_returns_landed_focused() {
     );
     tui.wait_for_selected("far away");
     assert_typing_reaches(&mut tui, "on1", &id);
+}
+
+/// A caller of `open --on` tells apart an unreachable HOST (3), a HOST with
+/// no TUI running (5) and a HOST whose nebula predates `open --session`
+/// (1, with an upgrade hint instead of clap's 2).
+#[test]
+fn open_on_host_exit_codes_name_the_failure() {
+    let dirs = tempfile::tempdir().unwrap();
+    let (rt, data) = (dirs.path().join("rt"), dirs.path().join("data"));
+    let args = ["--session", "far", "--on", "laptop-b", "--no-focus"];
+
+    let up = ssh_stub_home(None);
+    let unreachable = open_on(
+        up.path(),
+        &rt,
+        &data,
+        &args,
+        &[("SSH_STUB_UNREACHABLE", "1")],
+    );
+    assert_eq!(unreachable.status.code(), Some(3), "{unreachable:?}");
+    assert!(unreachable.stdout.is_empty(), "{unreachable:?}");
+
+    let no_tui = ssh_stub_home(Some(
+        "#!/bin/sh\necho 'nebula: no nebula TUI is running' >&2\nexit 3\n",
+    ));
+    let out = open_on(no_tui.path(), &rt, &data, &args, &[]);
+    assert_eq!(out.status.code(), Some(5), "{out:?}");
+
+    let old = ssh_stub_home(Some(
+        "#!/bin/sh\necho \"error: unexpected argument '--session' found\" >&2\nexit 2\n",
+    ));
+    let out = open_on(old.path(), &rt, &data, &args, &[]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("upgrade"),
+        "{out:?}"
+    );
 }
 
 /// An attach the daemon cannot complete (the agent CLI vanished, so the

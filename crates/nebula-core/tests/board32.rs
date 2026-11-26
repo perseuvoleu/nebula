@@ -486,6 +486,21 @@ fn e2e_files(names: &[&str]) -> BTreeSet<String> {
     names.iter().map(|n| n.to_string()).collect()
 }
 
+/// The Playwright reporter's own output (web/e2e/e2e-run-reporter.ts,
+/// whose unit test writes exactly this file) passes the validator
+/// `artifact add` runs.
+#[test]
+fn e2e_run_reporter_output_validates() {
+    let result = include_str!("fixtures/board/e2e_run_reporter.json");
+    let run = validate_e2e_run(
+        result,
+        &e2e_files(&["result.json", "shots/001.png", "shots/002.png"]),
+    )
+    .unwrap();
+    assert_eq!(run.status, RunStatus::Failed);
+    assert_eq!(run.steps.len(), 3);
+}
+
 #[test]
 fn e2e_run_validate() {
     let result = include_str!("fixtures/board/e2e_run_result.json");

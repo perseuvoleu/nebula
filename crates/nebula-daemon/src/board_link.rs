@@ -112,6 +112,10 @@ impl BoardLink {
         link
     }
 
+    /// A watch on the link's [`LinkState`]: it starts at the current state
+    /// and sees each change, so a subscriber that lags still reads the
+    /// latest `up` and the running `connections`/`attempts` counts across
+    /// reconnects.
     pub fn state(&self) -> watch::Receiver<LinkState> {
         self.state.subscribe()
     }

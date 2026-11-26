@@ -238,7 +238,7 @@ fn draw_overlay(f: &mut Frame, app: &mut App) {
             // extra column so the affordance is visible before hovering.
             let any_submenu = menu.items.iter().any(|i| i.action.submenu().is_some());
             // The workspace switcher carries its key verbs in the bottom
-            // border, the notes-modal pattern; the modal widens to fit.
+            // border as footer hints; the modal widens to fit.
             let hint = menu
                 .is_workspace_picker()
                 .then_some(" n: new  r: rename  d: delete ");
@@ -4000,22 +4000,20 @@ fn session_tab(
             Span::styled(truncate(&t.name, name_max), name_style)
         }),
         SessionRow::Link(l) => {
-            let pr = l.pull_request();
             let unseen = l.unseen_comments(&app.pr_seen);
-            let glyph_color = match pr {
-                Some(_) if unseen > 0 => th.warn,
-                Some(pr) if pr.is_open() => th.accent,
-                Some(_) => th.dim,
-                None => th.muted,
+            let glyph_color = if unseen > 0 {
+                th.warn
+            } else if l.is_open() {
+                th.accent
+            } else {
+                th.dim
             };
-            if let Some(pr) = pr {
-                let (text, color) = if unseen > 0 {
-                    (format!(" {unseen} new"), th.warn)
-                } else {
-                    (format!(" {}", pr.badge()), th.dim)
-                };
-                badge = Some(Span::styled(text, Style::default().fg(color)));
-            }
+            let (text, color) = if unseen > 0 {
+                (format!(" {unseen} new"), th.warn)
+            } else {
+                (format!(" {}", l.badge()), th.dim)
+            };
+            badge = Some(Span::styled(text, Style::default().fg(color)));
             (
                 Span::styled("↗ ", Style::default().fg(glyph_color)),
                 Span::styled(truncate(&l.label(), name_max), name_style),

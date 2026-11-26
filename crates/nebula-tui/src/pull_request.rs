@@ -69,6 +69,19 @@ impl PullRequest {
             None => self.activity.len(),
         }
     }
+
+    /// [`Self::unseen`] against the marks stored per PR URL in `seen`.
+    pub fn unseen_comments(&self, seen: &std::collections::HashMap<String, String>) -> usize {
+        self.unseen(seen.get(&self.url).map(String::as_str))
+    }
+
+    /// Row text: `#42 title`, or `#42` for an untitled PR.
+    pub fn label(&self) -> String {
+        match self.title.is_empty() {
+            true => format!("#{}", self.number),
+            false => format!("#{} {}", self.number, self.title),
+        }
+    }
 }
 
 /// Ask `gh` for the pull request on `dir`'s current branch. `None` covers
