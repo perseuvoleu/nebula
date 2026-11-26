@@ -103,19 +103,23 @@ async function readDecisions(query: string, wanted: string[] | null, signal: Abo
 
 function useDecisions(page: boolean, wanted: string[], query: string, board: BoardData | null) {
   const [state, setState] = useState<{ query: string; items: Decision[]; error: string | null } | null>(null);
+  const [attempt, setAttempt] = useState(0);
   const enabled = page || wanted.length > 0;
   const want = page ? null : wanted.join(" ");
   const changed = page ? board : want;
   useEffect(() => {
     if (!enabled) return;
     const abort = new AbortController();
+    let retry: ReturnType<typeof setTimeout> | undefined;
     readDecisions(query, want === null ? null : want.split(" "), abort.signal)
       .then((items) => setState({ query, items, error: null }))
       .catch((failure) => {
-        if (!abort.signal.aborted) setState((old) => ({ query, items: old?.query === query ? old.items : [], error: describeError(failure) }));
+        if (abort.signal.aborted) return;
+        setState((old) => ({ query, items: old?.query === query ? old.items : [], error: describeError(failure) }));
+        retry = setTimeout(() => setAttempt((n) => n + 1), BOARD_POLL_MS);
       });
-    return () => abort.abort();
-  }, [enabled, query, want, changed]);
+    return () => { abort.abort(); clearTimeout(retry); };
+  }, [enabled, query, want, changed, attempt]);
   const current = enabled && state?.query === query ? state : null;
   return { items: current?.items ?? [], error: current?.error ?? null, loading: enabled && !current };
 }
@@ -222,7 +226,8 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
   const cards = scoped.filter((c) => !c.proposed);
   const bySlug = (slug: string | null): Card | undefined => live.find((c) => cardSlug(c.ref) === slug);
   const peeked = bySlug(route.peek);
-  const listed = useDecisions(route.decisions, board?.away.decisions ?? [], route.decisions ? decisionQuery : "", board);
+  const digestShown = !digestClosed && !route.card;
+  const listed = useDecisions(route.decisions, digestShown ? board?.away.decisions ?? [] : [], route.decisions ? decisionQuery : "", board);
   const decisions = listed.items;
   const homeSessions = useHomeSessions(route.decisions ? decisions.flatMap((d) => d.project === null && d.session ? [d.session] : []) : [], workspace);
   const digest = board && awayDigest(board, scope, decisions);
@@ -314,7 +319,7 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
           )}
           <Button type="button" variant="ghost" size="sm" onClick={onSessions}>Sesiuni</Button>
         </header>
-        {digest && !digest.empty && !digestClosed && !route.card && (
+        {digest && !digest.empty && digestShown && (
           <AwayDigest lastSeen={new Date(lastSeen).toLocaleString("ro-RO", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}
             scope={scope.kind === "all" || scope.kind === "needs" || scope.kind === "all-decisions" ? "toate proiectele" : projectName(scope.project)}
             finished={digest.finished.map((c) => toBoardCard(c, live))} needsYou={digest.waiting.length ? digest.waiting.map((c) => toBoardCard(c, live)) : undefined} decisions={awayDecisions} onOpen={peek} onClose={() => setDigestClosed(true)}

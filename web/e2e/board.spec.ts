@@ -85,6 +85,31 @@ test("the away digest reads the decisions it names once, not every page on every
   expect(decisionReads).toHaveLength(1);
 });
 
+test("a failed digest read of its decisions is retried without a board change", async ({ page }) => {
+  let failed = false;
+  await page.route("**/api/decisions*", (route) => {
+    if (failed) return route.continue();
+    failed = true;
+    return route.fulfill({ status: 503, json: { error: "Synthetic unavailable" } });
+  });
+  await awayFrom(page);
+  await login(page, "/board");
+  const digest = page.getByRole("region", { name: "De când ai lipsit" });
+  await expect(digest.getByRole("button", { name: "Keep verification results" })).toBeVisible();
+  expect(failed).toBe(true);
+  await expect(digest.getByText("Copy published files")).toBeVisible();
+});
+
+test("a hidden away digest reads no decisions", async ({ page }) => {
+  const decisionReads: string[] = [];
+  page.on("request", (r) => { if (new URL(r.url()).pathname === "/api/decisions") decisionReads.push(r.url()); });
+  await awayFrom(page);
+  await login(page, "/board/c/12%40leaseweb");
+  await expect(page.getByRole("heading", { name: "Keep verification results" })).toBeVisible();
+  await page.waitForResponse((r) => new URL(r.url()).pathname === "/api/board" && r.request().url().includes("since"));
+  expect(decisionReads).toEqual([]);
+});
+
 test("at 390 px a long away digest is capped and leaves the board in view", async ({ page }) => {
   for (let number = 20; number < 50; number++) addCard(number, `Finished ${number}`, "done");
   changeBoard((board) => board.away.finished.push(...board.cards.filter((c) => c.stage === "done").map((c) => ({ id: c.id, at: 1764000500000 }))));
