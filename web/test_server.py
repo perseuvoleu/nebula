@@ -360,7 +360,10 @@ class GatewayTests(unittest.TestCase):
             with self.assertRaises(Problem) as ctx:
                 self.gateway.get("/api/conversation", {"project": ["project"], "id": ["one"]})
         self.assertEqual(ctx.exception.status, 503)
-        self.assertNotIn(("project", "one"), self.gateway.identities)  # nothing cached from a transient failure
+        write_session(self.gateway.pi_agent_dir, "/srv/project", SID_A, [user("u1", None, "hello")])
+        with patch.object(self.gateway, "run", side_effect=[ROWS, {**SHOW, "session_id": SID_A}]):
+            retried = self.gateway.get("/api/conversation", {"project": ["project"], "id": ["one"]})
+        self.assertEqual([m["id"] for m in retried["snapshot"]["messages"]], ["u1"])
         show = {**SHOW, "session_id": SID_A}
         rows = [{**ROWS[0], "session_id": SID_A}]
         with patch.object(self.gateway, "run", side_effect=[rows]):
@@ -380,10 +383,13 @@ class GatewayTests(unittest.TestCase):
             (directory / f"{sid}.jsonl").write_text(json.dumps({
                 "type": "user", "sessionId": sid, "uuid": "u1",
                 "message": {"content": f"{project} transcript"}}) + "\n")
-        for project, sid in sessions.items():
-            rows = [{**ROWS[0], "kind": "claude", "path": f"/srv/{project}"}]
-            show = {**SHOW, "kind": "claude", "session_id": sid}
-            with patch.object(gateway, "run", side_effect=[rows, show]):
+        def nebula(argv, *_, **__):
+            project = argv[argv.index("--project") + 1]
+            if "show" in argv:
+                return cli({**SHOW, "kind": "claude", "session_id": sessions[project]})
+            return cli([{**ROWS[0], "kind": "claude", "path": f"/srv/{project}"}])
+        for project in sessions:
+            with patch("server.subprocess.run", side_effect=nebula):
                 result = gateway.get("/api/conversation", {"project": [project], "id": ["one"]})
             self.assertTrue(result["capabilities"]["structured"], result["capabilities"]["reason"])
             self.assertEqual([p["text"] for m in result["snapshot"]["messages"] for p in m["parts"]],

@@ -435,8 +435,9 @@ class Gateway:
         Source order: the `agent show` JSON field `session_id` (CLI ≥ this branch), else a
         read-only lookup of the daemon's SQLite row when NEBULA_WEB_DB is configured.
         """
+        key = (project, row["id"])
         with self.lock:
-            cached = self.identities.get((project, row["id"]))
+            cached = self.identities.get(key)
             if cached and cached[2] > time.monotonic():
                 if cached[1]:
                     raise Problem(409, cached[1])
@@ -457,10 +458,10 @@ class Gateway:
             if error.status in TRANSIENT:
                 raise  # busy/timeout/CLI failure: not an identity fact, never cached or "unsupported"
             with self.lock:
-                self.identities[(project, row["id"])] = (None, error.message, time.monotonic() + IDENTITY_TTL)
+                self.identities[key] = (None, error.message, time.monotonic() + IDENTITY_TTL)
             raise
         with self.lock:
-            self.identities[(project, row["id"])] = (value, None, time.monotonic() + IDENTITY_TTL)
+            self.identities[key] = (value, None, time.monotonic() + IDENTITY_TTL)
         return value
 
     def db_session_id(self, agent_id):
