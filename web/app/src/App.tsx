@@ -71,6 +71,18 @@ function PreviewButton({ url, className }: { url: string | null; className: stri
   );
 }
 
+/**
+ * The list phase after a read. A read that loaded a project is ready; one that loaded none is an error,
+ * or offline. A read that threw leaves a shown list as it was (offline aside); a first read becomes an error.
+ */
+function phaseAfter(phase: ListPhase, read: "loaded" | "none" | "threw", online: boolean): ListPhase {
+  switch (read) {
+    case "loaded": return "ready";
+    case "none": return online ? "error" : "offline";
+    case "threw": return phase === "loading" ? "error" : online ? phase : "offline";
+  }
+}
+
 function useSessions(projects: string[], keepLastList: boolean) {
   const [snapshot, setSnapshot] = useState<{ projects: string[]; rows: SessionRow[]; loaded: string[] } | null>(null);
   const [phase, setPhase] = useState<ListPhase>("loading");
@@ -88,13 +100,13 @@ function useSessions(projects: string[], keepLastList: boolean) {
       }, abort.signal);
       if (version !== generation.current) return;
       setSnapshot(old => !data.loaded.length && keepLastList && old?.projects === projects ? { ...old, loaded: [] } : { projects, rows: data.rows, loaded: data.loaded });
-      setPhase(data.loaded.length ? "ready" : navigator.onLine ? "error" : "offline");
+      setPhase((p) => phaseAfter(p, data.loaded.length ? "loaded" : "none", navigator.onLine));
       setError(data.errors.length ? data.errors.map(e => `${e.project}: ${describeError(e.failure)}`).join("; ") : null);
     } catch (failure) {
       if (version !== generation.current) return;
       if (failure instanceof ApiError && failure.status === 401) return;
       setError(describeError(failure));
-      setPhase((p) => (p === "loading" ? "error" : navigator.onLine ? p : "offline"));
+      setPhase((p) => phaseAfter(p, "threw", navigator.onLine));
     }
   }, [projects, keepLastList]);
   useEffect(() => {
