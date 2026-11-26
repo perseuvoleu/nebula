@@ -2331,6 +2331,29 @@ fn link_names_a_host_without_connect_only() {
 }
 
 #[test]
+fn link_survives_a_transport_that_talks_on_stderr() {
+    let board = board_env();
+    let here = viewer(&format!(
+        "head -c 200000 /dev/zero >&2; {}",
+        proxy_to(&board)
+    ));
+    let card = add(&here, &["--project", "nebula"], "Loud");
+    assert_eq!(card["ref"], "#1@boardhost");
+}
+
+#[test]
+fn link_echoing_its_command_is_not_an_old_peer() {
+    let here = viewer("echo \"+ ssh boardhost nebula {proxy}\" >&2; exit 1");
+    let out = here.cli(&["todo", "add", "--project", "nebula", "Echo"], None);
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+    assert!(
+        !stderr(&out).contains("without `proxy --connect-only`"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
 fn link_refuses_a_relay_template_without_proxy() {
     let here = viewer(&proxy_to(&board_env()).replace("{proxy}", "proxy"));
     let out = here.cli(&["todo", "add", "--project", "nebula", "Plain"], None);

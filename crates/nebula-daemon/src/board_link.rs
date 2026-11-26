@@ -315,7 +315,11 @@ async fn connect_and_pump(
         .context("spawn board link transport")?;
     let mut writer = BufWriter::new(child.stdin.take().context("board link stdin")?);
     let mut reader = BufReader::new(child.stdout.take().context("board link stdout")?);
-    let mut errors = child.stderr.take().context("board link stderr")?;
+    let said = Arc::new(Mutex::new(Vec::new()));
+    let drained = tokio::spawn(drain(
+        child.stderr.take().context("board link stderr")?,
+        said.clone(),
+    ));
     let shook = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(link, &mut reader, &mut writer))
         .await
         .context("board link handshake timed out")
@@ -324,9 +328,8 @@ async fn connect_and_pump(
         if e.is::<LinkRefused>() {
             return Err(e);
         }
-        let mut said = Vec::new();
-        let _ = tokio::time::timeout(Duration::from_secs(1), errors.read_to_end(&mut said)).await;
-        if String::from_utf8_lossy(&said).contains("--connect-only") {
+        let _ = tokio::time::timeout(Duration::from_secs(1), drained).await;
+        if String::from_utf8_lossy(&said.lock().unwrap()).contains(OLD_PEER) {
             return Err(LinkRefused(format!(
                 "board host {} runs a nebula without `proxy --connect-only` — upgrade nebula there",
                 link.host
@@ -335,7 +338,6 @@ async fn connect_and_pump(
         }
         return Err(e);
     }
-    tokio::spawn(async move { tokio::io::copy(&mut errors, &mut tokio::io::sink()).await });
     {
         let _admission = link.admission.lock().unwrap();
         link.state.send_modify(|s| {
@@ -375,6 +377,23 @@ async fn connect_and_pump(
             bail!("board host {} closed the link", link.host);
         };
         link.answer(event);
+    }
+}
+
+/// What clap prints on a nebula that predates `proxy --connect-only`.
+const OLD_PEER: &str = "unexpected argument '--connect-only'";
+const STDERR_TAIL: usize = 8 * 1024;
+
+/// Keeps the transport's stderr flowing, so a verbose transport never
+/// blocks on a full pipe, and holds its last bytes to explain a failed
+/// handshake.
+async fn drain(mut errors: impl AsyncRead + Unpin, tail: Arc<Mutex<Vec<u8>>>) {
+    let mut buf = [0; 4096];
+    while let Ok(n @ 1..) = errors.read(&mut buf).await {
+        let mut tail = tail.lock().unwrap();
+        tail.extend_from_slice(&buf[..n]);
+        let over = tail.len().saturating_sub(STDERR_TAIL);
+        tail.drain(..over);
     }
 }
 
