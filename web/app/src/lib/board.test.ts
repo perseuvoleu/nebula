@@ -66,7 +66,7 @@ test("awayDigest lists the finished cards, the cards waiting since last seen and
   const decisions = [{ id: "01JG0000000000000000000002", project: "nebula" }, { id: "01JG0000000000000000000003", project: "vela" }];
   const board: BoardData = {
     cards: [card(1, "doing"), finished, vela],
-    hosts: [], needs_you: [], needs_you: [],
+    hosts: [], needs_you: [],
     away: { finished: [finished.id, vela.id, "01JD9999999999999999999999"], needs_you: [{ host: "leaseweb", id: "01JF0000000000000000000002", card: finished.id, status_changed_at: 1764000200000 }],
       decisions: decisions.map((d) => d.id) },
   };

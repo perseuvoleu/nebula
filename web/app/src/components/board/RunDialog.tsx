@@ -67,9 +67,11 @@ export function RunDialog({ open, onOpenChange, cardRef, cardTitle, branch, host
 }) {
   const set = <K extends keyof RunDraft>(key: K) => (value: RunDraft[K]) => onDraftChange({ ...draft, [key]: value });
   const target = hosts.find((h) => h.host === draft.host);
-  const waits = draft.role === "worker" && slotsFull(target);
+  const writes = draft.role === "worker" || draft.role === "fix";
+  const overCap = writes && slotsFull(target);
   const worktrees = branch ? (["current", "new"] as const) : (["new"] as const);
-  const worktree = branch ? draft.worktree : "new";
+  const current = draft.worktree === "current" ? branch : null;
+  const worktree = current ? "current" : "new";
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -96,24 +98,32 @@ export function RunDialog({ open, onOpenChange, cardRef, cardTitle, branch, host
             }} />
           <Segmented legend="Checkout" name="run-worktree" options={worktrees} value={worktree} onChange={set("worktree")}
             label={(w) => w === "new" ? "Worktree nou" : <span className="truncate font-mono">{branch}</span>} />
-          {waits && target && (
+          {overCap && target && (
             <p role="status" className="flex gap-2 rounded-lg border border-border px-3 py-2 text-sm">
               <TriangleAlertIcon aria-hidden className="mt-0.5 size-4 shrink-0" />
               <span>
                 Sloturile de scriere de pe <span className="font-mono">@{target.host}</span> sunt ocupate ({slotText(target)}).
-                Workerul așteaptă un slot liber până la 10 minute; alege alt host ca să pornească acum.
+                Numărul e doar informativ: pornirea nu îl verifică; alege alt host ca să rămâi sub el.
+              </span>
+            </p>
+          )}
+          {writes && current && (
+            <p role="status" className="flex gap-2 rounded-lg border border-border px-3 py-2 text-sm">
+              <TriangleAlertIcon aria-hidden className="mt-0.5 size-4 shrink-0" />
+              <span>
+                Pornirea pe <span className="font-mono">{current}</span> e refuzată dacă acest checkout are deja un writer; un worktree nou nu are.
               </span>
             </p>
           )}
           <pre className="overflow-x-auto rounded-lg border border-border bg-card px-3 py-2 font-mono text-xs leading-relaxed whitespace-pre-wrap wrap-anywhere text-muted-foreground">
-            <span aria-hidden>$ </span>{runCommand(cardRef, draft, worktree === "current" && branch ? branch : "new")}
+            <span aria-hidden>$ </span>{runCommand(cardRef, draft, current ?? "new")}
           </pre>
           {error && <p role="alert" className="text-sm">{error}</p>}
         </div>
         <DialogFooter>
           <Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>Renunță</Button>
           <Button type="button" onClick={onRun} disabled={pending}>
-            {pending ? "Se pornește…" : waits ? "Pornește când e liber" : "Pornește"}
+            {pending ? "Se pornește…" : "Pornește"}
           </Button>
         </DialogFooter>
       </DialogContent>

@@ -1,3 +1,5 @@
+import { STATUS_LABEL } from "./status.ts";
+
 export const STAGES = ["backlog", "next", "doing", "review", "done"] as const;
 export type Stage = (typeof STAGES)[number];
 
@@ -22,8 +24,6 @@ export type BoardSession = {
   writer: boolean;
 };
 
-export type CardCheckout = { host: string; branch: string; path: string; worktree: boolean };
-
 export type BlockerRef = { ref: string; title: string };
 
 export type BoardCard = {
@@ -35,7 +35,7 @@ export type BoardCard = {
   proposedBy: string | null;
   needsYou: boolean;
   blockers: BlockerRef[];
-  checkout: CardCheckout | null;
+  checkout: Checkout | null;
   sessions: BoardSession[] | null;
   artifacts: number;
   age: string;
@@ -46,10 +46,10 @@ export type LogEntry = { id: string; author: string; text: string; age: string }
 export type Dot = "needs" | "running" | "done" | "queued" | "off";
 
 export const DOT_LABEL: Record<Dot, string> = {
-  needs: "Așteaptă răspuns",
-  running: "Lucrează",
-  done: "Gata",
-  queued: "Nou",
+  needs: STATUS_LABEL.needs_feedback,
+  running: STATUS_LABEL.running,
+  done: STATUS_LABEL.finished,
+  queued: STATUS_LABEL.fresh,
   off: "Inactiv",
 };
 
@@ -61,6 +61,7 @@ export function sessionDot(status: string): Dot {
   return "off";
 }
 
+/** Null when the card's sessions are unknown (a list row, not a card read), so the tile makes no status claim. */
 export function cardDot(card: BoardCard): Dot | null {
   if (card.sessions === null) return null;
   if (card.needsYou) return "needs";
@@ -146,7 +147,16 @@ export type Artifact = {
   created_at: number;
   /** Minted by the gateway when it stores the files: /a/<grant>/<id>/<entry>. */
   src?: string;
+  /** Unix seconds after which `src`'s grant is refused. */
+  expires?: number;
 };
+
+/** How long before a grant's expiry the card page reads a fresh one and moves its artifacts to it. */
+export const GRANT_RENEW_MS = 5 * 60_000;
+
+/** True once `now` (epoch ms) is within GRANT_RENEW_MS of `expires` (unix seconds); never for an unknown expiry. */
+export const grantLapsing = (expires: number | undefined, now: number): boolean =>
+  expires !== undefined && expires * 1000 - GRANT_RENEW_MS <= now;
 
 export type CardShow = Card & { sessions: CardSession[]; artifacts: Artifact[]; log: CardNote[] };
 
@@ -158,6 +168,7 @@ export function byStage<T extends { stage: Stage }>(cards: T[]): Record<Stage, T
   return columns;
 }
 
+/** Blockers still open: not done and not cleared. A blocker outside `cards` stays open with an empty title. */
 export function openBlockers(card: Card, cards: Card[]): BlockerRef[] {
   return card.blocked_by.flatMap((ref) => {
     const blocker = cards.find((c) => c.ref === ref);
@@ -173,6 +184,7 @@ export const writerSlots = (hosts: BoardHost[]): HostSlots[] =>
 const inProject = (project: string | null, scope: SidebarScope): boolean =>
   scope.kind === "all" || scope.kind === "needs" || scope.kind === "all-decisions" || project === scope.project;
 
+/** What changed since the last visit within `scope`; decisions come from `known`, so one not read yet is left out. */
 export function awayDigest<D extends { id: string; project: string | null }>(board: BoardData, scope: SidebarScope, known: D[]):
   { finished: Card[]; waiting: Card[]; decisions: D[]; empty: boolean } {
   const scoped = (id: string) => board.cards.filter((c) => c.id === id && inProject(c.project, scope));
@@ -184,6 +196,7 @@ export function awayDigest<D extends { id: string; project: string | null }>(boa
 
 export const cardSlug = (ref: string): string => ref.replace(/^#/, "");
 
+/** Without `show` (a card read) sessions are null and needsYou false: a list row does not carry them. */
 export function toBoardCard(card: Card, cards: Card[], show?: CardShow): BoardCard {
   const sessions = show?.sessions;
   return {
@@ -218,6 +231,7 @@ export type SidebarScope =
   | { kind: "decisions"; project: string | null }
   | { kind: "all-decisions" };
 
+/** One entry per project with cards or checkouts, counting every unarchived card (Done included), sorted by name. */
 export function sidebarProjects(board: BoardData): SidebarProject[] {
   const projects = new Map<string | null, SidebarProject>();
   const project = (key: string | null) => {
@@ -273,5 +287,6 @@ export function sessionProject(project: string, host: string, workspace: Workspa
   return workspace.projects.includes(key) ? key : null;
 }
 
+/** The gateway projects that list sessions on `host`: bare names for this host, name@host for a remote. */
 export const hostProjects = (host: string, workspace: Workspace): string[] =>
   workspace.projects.filter((p) => host === workspace.host ? !p.includes("@") : p.endsWith(`@${host}`));

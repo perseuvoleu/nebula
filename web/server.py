@@ -270,7 +270,7 @@ class Gateway:
         self.pi_agent_dir = Path(pi_agent_dir) if pi_agent_dir else default_pi_agent_dir()
         self.claude_config_dir = Path(claude_config_dir) if claude_config_dir else Path.home() / ".claude"
         self.db_path = Path(db_path) if db_path else None
-        self.hostname = socket.gethostname()
+        self.hostname = os.environ.get("NEBULA_HOSTNAME") or socket.gethostname().split(".")[0]
         self.slots = threading.BoundedSemaphore(4)
         self.identities = {}  # (project, agent id) -> (native session id | None, reason, expires)
         self.lock = threading.Lock()
@@ -348,7 +348,8 @@ class Gateway:
         for row in card.get("artifacts") or []:
             entry = (row.get("content") or {}).get("entry")
             if isinstance(entry, str) and self.artifact_dir(row.get("id")):
-                row["src"] = f"/a/{self.grant(row['id'])}/{row['id']}/{quote(entry)}"
+                grant = self.grant(row["id"])
+                row["src"], row["expires"] = f"/a/{grant}/{row['id']}/{quote(entry)}", int(grant.partition(".")[0])
         return card
 
     def card_session(self, card, body):
@@ -424,8 +425,9 @@ class Gateway:
         Source order: the `agent show` JSON field `session_id` (CLI ≥ this branch), else a
         read-only lookup of the daemon's SQLite row when NEBULA_WEB_DB is configured.
         """
+        key = (project, row["id"])
         with self.lock:
-            cached = self.identities.get((project, row["id"]))
+            cached = self.identities.get(key)
             if cached and cached[2] > time.monotonic():
                 if cached[1]:
                     raise Problem(409, cached[1])
@@ -446,10 +448,10 @@ class Gateway:
             if error.status in TRANSIENT:
                 raise  # busy/timeout/CLI failure: not an identity fact, never cached or "unsupported"
             with self.lock:
-                self.identities[(project, row["id"])] = (None, error.message, time.monotonic() + IDENTITY_TTL)
+                self.identities[key] = (None, error.message, time.monotonic() + IDENTITY_TTL)
             raise
         with self.lock:
-            self.identities[(project, row["id"])] = (value, None, time.monotonic() + IDENTITY_TTL)
+            self.identities[key] = (value, None, time.monotonic() + IDENTITY_TTL)
         return value
 
     def db_session_id(self, agent_id):

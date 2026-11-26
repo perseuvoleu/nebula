@@ -1,4 +1,4 @@
-import { type ReactNode, useState } from "react";
+import { type ReactNode, useId, useState } from "react";
 import { XIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -47,22 +47,23 @@ export function AwayDigest({ lastSeen, scope, finished, needsYou, decisions, onO
   onClose?: () => void;
   renderNeedsActions?: (card: BoardCard) => ReactNode;
 }) {
+  const titleId = useId();
   const age = (text: string) => <span className="shrink-0 font-mono text-xs text-muted-foreground tabular-nums">{text}</span>;
   return (
-    <section aria-labelledby="away-title" className="flex shrink-0 flex-col gap-2 border-b bg-sidebar px-3 py-2.5">
+    <section aria-labelledby={titleId} className="flex shrink-0 flex-col gap-2 border-b bg-sidebar px-3 py-2.5">
       <div className="flex flex-wrap items-center gap-2">
-        <h2 id="away-title" className="text-sm font-medium">De când ai lipsit</h2>
+        <h2 id={titleId} className="text-sm font-medium">De când ai lipsit</h2>
         <span className="font-mono text-xs text-muted-foreground">ultima vizită {lastSeen} · {scope}</span>
         <span className="flex-1" />
         {onCaughtUp && <Button type="button" variant="outline" size="xs" onClick={onCaughtUp}>Am văzut tot</Button>}
         {onClose && <Button type="button" variant="ghost" size="icon-xs" aria-label="Închide rezumatul" onClick={onClose}><XIcon aria-hidden /></Button>}
       </div>
       <div className={cn("grid gap-2", needsYou ? "md:grid-cols-3" : "md:grid-cols-2")}>
-        <Column title={<><StatusDot dot="done" label="" />Terminate</>} count={finished.length} empty="Nimic terminat.">
+        <Column title={<><StatusDot dot="done" label={null} />Terminate</>} count={finished.length} empty="Nimic terminat.">
           {finished.map((c) => <Row key={c.ref} cardRef={c.ref} title={c.title} trailing={age(c.age)} onOpen={onOpen} />)}
         </Column>
         {needsYou && (
-          <Column title={<><StatusDot dot="needs" label="" />Te așteaptă</>} count={needsYou.length} empty="Nimic în așteptare.">
+          <Column title={<><StatusDot dot="needs" label={null} />Te așteaptă</>} count={needsYou.length} empty="Nimic în așteptare.">
             {needsYou.map((c) => <Row key={c.ref} cardRef={c.ref} title={c.title} trailing={renderNeedsActions?.(c)} onOpen={onOpen} />)}
           </Column>
         )}

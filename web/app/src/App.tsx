@@ -71,6 +71,14 @@ function PreviewButton({ url, className }: { url: string | null; className: stri
   );
 }
 
+function phaseAfter(phase: ListPhase, read: "loaded" | "none" | "threw", online: boolean): ListPhase {
+  switch (read) {
+    case "loaded": return "ready";
+    case "none": return online ? "error" : "offline";
+    case "threw": return phase === "loading" ? "error" : online ? phase : "offline";
+  }
+}
+
 function useSessions(projects: string[], keepLastList: boolean) {
   const [snapshot, setSnapshot] = useState<{ projects: string[]; rows: SessionRow[]; loaded: string[] } | null>(null);
   const [phase, setPhase] = useState<ListPhase>("loading");
@@ -88,13 +96,13 @@ function useSessions(projects: string[], keepLastList: boolean) {
       }, abort.signal);
       if (version !== generation.current) return;
       setSnapshot(old => !data.loaded.length && keepLastList && old?.projects === projects ? { ...old, loaded: [] } : { projects, rows: data.rows, loaded: data.loaded });
-      setPhase(data.loaded.length ? "ready" : navigator.onLine ? "error" : "offline");
+      setPhase((p) => phaseAfter(p, data.loaded.length ? "loaded" : "none", navigator.onLine));
       setError(data.errors.length ? data.errors.map(e => `${e.project}: ${describeError(e.failure)}`).join("; ") : null);
     } catch (failure) {
       if (version !== generation.current) return;
       if (failure instanceof ApiError && failure.status === 401) return;
       setError(describeError(failure));
-      setPhase((p) => (p === "loading" ? "error" : navigator.onLine ? p : "offline"));
+      setPhase((p) => phaseAfter(p, "threw", navigator.onLine));
     }
   }, [projects, keepLastList]);
   useEffect(() => {
@@ -152,12 +160,13 @@ function Routes({ workspace }: { workspace: Workspace }) {
   const [selection, navigate] = route;
   if (!selection.board) return <Shell workspace={workspace} route={route} />;
   return <BoardPage route={selection.board} workspace={workspace} onSessions={() => navigate({ project: null, session: null, all: false })}
-    onNavigate={(board, replace) => navigate({ project: null, session: null, all: false, board }, replace)} />;
+    onNavigate={(board) => navigate({ project: null, session: null, all: false, board })} />;
 }
 
 function Shell({ workspace, route }: { workspace: Workspace; route: ReturnType<typeof useSelection> }) {
   const [selection, navigate] = route;
   const project = selection.project && workspace.projects.includes(selection.project) ? selection.project : workspace.projects[0];
+  const listOrigin = useMemo(() => ({ project: selection.all ? null : project, all: selection.all }), [project, selection.all]);
   const sessionId = selection.project && !workspace.projects.includes(selection.project) ? null : selection.session;
   const listProjects = useMemo(() => selection.all ? workspace.projects : [project], [selection.all, workspace.projects, project]);
   const sessions = useSessions(listProjects, !selection.all);
@@ -182,11 +191,11 @@ function Shell({ workspace, route }: { workspace: Workspace; route: ReturnType<t
   useEffect(() => {
     if (selection.serverless) return;
     if (selection.project && !workspace.projects.includes(selection.project)) {
-      navigate({ project: selection.all ? null : project, session: null, all: selection.all }, true);
+      navigate({ ...listOrigin, session: null }, true);
     } else if (!selection.all && selection.project !== project) {
       navigate({ project, session: selection.session, all: false }, true);
     }
-  }, [project, selection.project, selection.session, selection.all, selection.serverless, workspace.projects, navigate]);
+  }, [project, listOrigin, selection.project, selection.session, selection.all, selection.serverless, workspace.projects, navigate]);
 
   const row = sessions.rows.find((r) => r.project === project && r.id === sessionId) ?? null;
   const currentPath = row?.path ?? (checkout?.project === project ? checkout.path : undefined);
@@ -234,7 +243,7 @@ function Shell({ workspace, route }: { workspace: Workspace; route: ReturnType<t
     setChooseProject(true);
     document.querySelector<HTMLSelectElement>('select[aria-label="Proiect"]')?.focus();
   };
-  const openServerless = () => { navigate({ project: selection.all ? null : project, session: null, all: selection.all, serverless: true }); setMenuOpen(false); };
+  const openServerless = () => { navigate({ ...listOrigin, session: null, serverless: true }); setMenuOpen(false); };
   const serverlessLink = (
     <button type="button" onClick={openServerless} aria-current={selection.serverless ? "page" : undefined}
       className={`flex min-h-11 items-center gap-2 border-t border-sidebar-border px-3 text-left text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${selection.serverless ? "bg-secondary font-medium" : "hover:bg-muted/60"}`}>
@@ -276,7 +285,7 @@ function Shell({ workspace, route }: { workspace: Workspace; route: ReturnType<t
     </aside>
   );
 
-  const closeServerless = () => navigate({ project: selection.all ? null : project, session: null, all: selection.all });
+  const closeServerless = () => navigate({ ...listOrigin, session: null });
   const conversation = selection.serverless ? <ServerlessRuns onBack={desktop ? undefined : closeServerless} /> : sessionId && controller && state ? (
     <ConversationView key={`${project}/${sessionId}`} project={project} previewUrl={previewUrl} row={row} state={state} controller={controller} sessions={orderedRows} unseen={unseenFinished} onSelect={select} showProjects={selection.all} showBack={!desktop} onBack={() => navigate({ project, session: null, all: selection.all })} />
   ) : (

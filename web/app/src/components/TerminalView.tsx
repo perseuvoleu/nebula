@@ -7,8 +7,8 @@ import { Markdown } from "./Markdown";
  *  `children` (messages sent from this browser) scroll with the output, so phones get one view. */
 export function TerminalView({ project, session, children, revealKey = 0, onOutput }: {
   project: string; session: string; children?: ReactNode;
-  /** Called when the retained output changes; the terminal then shows what was sent. */
-  onOutput?: () => void;
+  /** Called with the retained output whenever it changes; `widened` when this read only reached further back. */
+  onOutput?: (output: string, widened: boolean) => void;
   /** Changes when a message is sent, so the reader lands on it under the latest output. */
   revealKey?: number;
 }) {
@@ -18,7 +18,7 @@ export function TerminalView({ project, session, children, revealKey = 0, onOutp
   const [hasMore, setHasMore] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const loadedLimit = useRef(250);
-  const expanded = useRef(false);
+  const lastFetchWidened = useRef(false);
   const [reading, setReading] = useState(true);
   const scroller = useRef<HTMLDivElement>(null);
   const positions = useRef<{ reading: number | null; raw: number | null }>({ reading: null, raw: null });
@@ -54,7 +54,7 @@ export function TerminalView({ project, session, children, revealKey = 0, onOutp
         const follow = element ? distance - element.clientHeight < 80 : true;
         const expanding = limit > loadedLimit.current;
         loadedLimit.current = limit;
-        expanded.current = expanding;
+        lastFetchWidened.current = expanding;
         setOutput(data.output); setHasMore(data.hasMore); setError(null); setLoadingOlder(false);
         if (element) requestAnimationFrame(() => {
           if (abort.signal.aborted) return;
@@ -74,8 +74,7 @@ export function TerminalView({ project, session, children, revealKey = 0, onOutp
   const lastOutput = useRef<string | null>(null);
   useEffect(() => {
     if (output === null || output === lastOutput.current) return;
-    const olderOnly = expanded.current && lastOutput.current !== null && output.endsWith(lastOutput.current);
-    if (lastOutput.current !== null && !olderOnly) onOutput?.();
+    onOutput?.(output, lastFetchWidened.current);
     lastOutput.current = output;
   }, [output, onOutput]);
 

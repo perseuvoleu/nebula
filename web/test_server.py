@@ -97,6 +97,14 @@ class GatewayTests(unittest.TestCase):
                         {**subscription, "keys": {"p256dh": "!", "auth": "x"}}]:
             with self.assertRaises(Problem): push.subscribe(invalid)
 
+    def test_host_is_named_as_nebula_names_it(self):
+        for env, system, host in [({}, "Gaitanarus-MacBook-Pro.local", "Gaitanarus-MacBook-Pro"),
+                                  ({"NEBULA_HOSTNAME": "perseu-mbp"}, "Gaitanarus-MacBook-Pro.local", "perseu-mbp")]:
+            inherited = {key: value for key, value in os.environ.items() if key != "NEBULA_HOSTNAME"}
+            with self.subTest(env=env), patch.dict("os.environ", {**inherited, **env}, clear=True), patch("server.socket.gethostname", return_value=system):
+                gateway = Gateway(TOKEN, "https://example.com", ["p"], usage_service=None)
+                self.assertEqual(gateway.get("/api/projects", {})["host"], host)
+
     def test_project_allowlist(self):
         for path in ["/api/sessions", "/api/conversation", "/api/conversation/updates", "/api/preview"]:
             with self.assertRaises(Problem) as ctx:
@@ -355,7 +363,10 @@ class GatewayTests(unittest.TestCase):
             with self.assertRaises(Problem) as ctx:
                 self.gateway.get("/api/conversation", {"project": ["project"], "id": ["one"]})
         self.assertEqual(ctx.exception.status, 503)
-        self.assertNotIn(("project", "one"), self.gateway.identities)  # nothing cached from a transient failure
+        write_session(self.gateway.pi_agent_dir, "/srv/project", SID_A, [user("u1", None, "hello")])
+        with patch.object(self.gateway, "run", side_effect=[ROWS, {**SHOW, "session_id": SID_A}]):
+            retried = self.gateway.get("/api/conversation", {"project": ["project"], "id": ["one"]})
+        self.assertEqual([m["id"] for m in retried["snapshot"]["messages"]], ["u1"])
         show = {**SHOW, "session_id": SID_A}
         rows = [{**ROWS[0], "session_id": SID_A}]
         with patch.object(self.gateway, "run", side_effect=[rows]):
@@ -375,10 +386,13 @@ class GatewayTests(unittest.TestCase):
             (directory / f"{sid}.jsonl").write_text(json.dumps({
                 "type": "user", "sessionId": sid, "uuid": "u1",
                 "message": {"content": f"{project} transcript"}}) + "\n")
-        for project, sid in sessions.items():
-            rows = [{**ROWS[0], "kind": "claude", "path": f"/srv/{project}"}]
-            show = {**SHOW, "kind": "claude", "session_id": sid}
-            with patch.object(gateway, "run", side_effect=[rows, show]):
+        def nebula(argv, *_, **__):
+            project = argv[argv.index("--project") + 1]
+            if "show" in argv:
+                return cli({**SHOW, "kind": "claude", "session_id": sessions[project]})
+            return cli([{**ROWS[0], "kind": "claude", "path": f"/srv/{project}"}])
+        for project in sessions:
+            with patch("server.subprocess.run", side_effect=nebula):
                 result = gateway.get("/api/conversation", {"project": [project], "id": ["one"]})
             self.assertTrue(result["capabilities"]["structured"], result["capabilities"]["reason"])
             self.assertEqual([p["text"] for m in result["snapshot"]["messages"] for p in m["parts"]],
@@ -725,6 +739,14 @@ class BoardTests(unittest.TestCase):
                 self.assertEqual(self.request(path)[0], 403)
         with patch("server.time.time", return_value=int(expiry) + 1):
             self.assertEqual(self.request(src)[0], 403)
+
+    def test_artifact_expires_is_when_its_src_is_refused(self):
+        with patch("server.subprocess.run", return_value=cli(fixture("card_show"))):
+            row = json.loads(self.request("/api/cards/%2312", headers=self.auth())[2])["artifacts"][0]
+        with patch("server.time.time", return_value=row["expires"] - 1):
+            self.assertEqual(self.request(row["src"])[0], 200)
+        with patch("server.time.time", return_value=row["expires"]):
+            self.assertEqual(self.request(row["src"])[0], 403)
 
     def test_artifact_traversal(self):
         grant = self.card_src().split("/")[2]

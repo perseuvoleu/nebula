@@ -56,6 +56,10 @@ function SortHead({ label, column, sort, onSort, className }: {
   );
 }
 
+function GroupLabel({ name, count }: { name: string; count: number }) {
+  return <>{name} <span className="text-muted-foreground tabular-nums">{count}</span></>;
+}
+
 export function TableView({ cards, groupByProject = false, selected, onOpen, renderActions, sort, onSort, collapsed = [], onToggleGroup }: {
   cards: BoardCard[];
   groupByProject?: boolean;
@@ -97,10 +101,10 @@ export function TableView({ cards, groupByProject = false, selected, onOpen, ren
                       <button type="button" aria-expanded={!collapsed.includes(group.name)} onClick={() => onToggleGroup(group.name!)}
                         className="inline-flex items-center gap-1.5 rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring">
                         <span aria-hidden>{collapsed.includes(group.name) ? "▸" : "▾"}</span>
-                        {group.name} <span className="text-muted-foreground tabular-nums">{group.cards.length}</span>
+                        <GroupLabel name={group.name} count={group.cards.length} />
                       </button>
                     )
-                    : <>{group.name} <span className="text-muted-foreground tabular-nums">{group.cards.length}</span></>}
+                    : <GroupLabel name={group.name} count={group.cards.length} />}
                 </th>
               </tr>
             )}

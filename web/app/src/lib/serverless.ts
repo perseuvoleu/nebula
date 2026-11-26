@@ -30,6 +30,7 @@ export function shortRepo(repo: string | null): string {
 const decimal = new Intl.NumberFormat("ro-RO", { minimumFractionDigits: 1, maximumFractionDigits: 1 });
 const pad = (value: number) => String(value).padStart(2, "0");
 
+/** `ms` milliseconds as seconds under a minute, then "m min ss s", then "h h mm min". */
 export function formatDuration(ms: number): string {
   const safe = Math.max(0, ms);
   if (safe < 60_000) return formatSeconds(safe);
@@ -38,13 +39,16 @@ export function formatDuration(ms: number): string {
   return `${Math.floor(seconds / 3600)} h ${pad(Math.floor(seconds / 60) % 60)} min`;
 }
 
+/** `ms` milliseconds as seconds with one decimal; null as "—". */
 export const formatSeconds = (ms: number | null): string => ms === null ? "—" : `${decimal.format(Math.max(0, ms) / 1000)} s`;
 
+/** Milliseconds from start to end, or to `now` (epoch ms) while the run is going. */
 export const runDuration = (run: Run, now: number): number => (run.ended_at ?? now) - run.started_at;
 
 const cost = new Intl.NumberFormat("ro-RO", { maximumSignificantDigits: 2 });
 export const formatCost = (usd: number | null): string => usd === null ? "—" : `≤ ${cost.format(usd)} $`;
 
+/** An epoch-ms instant as a short local date and time to the second. */
 export const formatStart = (ms: number): string =>
   new Date(ms).toLocaleString("ro-RO", { dateStyle: "short", timeStyle: "medium" });
 

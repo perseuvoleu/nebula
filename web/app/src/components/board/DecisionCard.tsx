@@ -1,3 +1,5 @@
+import { formatWhen } from "@/lib/status";
+
 export interface DecisionRow {
   id: string;
   title: string;
@@ -7,12 +9,6 @@ export interface DecisionRow {
   /** href is null when this gateway has no page for the session's host. */
   session: { name: string; host: string; href: string | null } | null;
   card: { ref: string; title: string; href: string } | null;
-}
-
-export function formatWhen(iso: string): string {
-  const date = new Date(iso);
-  if (Number.isNaN(date.getTime())) return "";
-  return date.toLocaleString("ro-RO", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
 }
 
 const linkCls = "min-w-0 truncate underline-offset-4 hover:text-foreground hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring rounded-sm";

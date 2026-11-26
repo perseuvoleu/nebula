@@ -3,7 +3,7 @@ import { ArrowLeftIcon, MenuIcon, PlusIcon } from "lucide-react";
 import { api, describeError } from "@/lib/api";
 import { activityAge } from "@/lib/activity-age";
 import {
-  type BoardCard, type BoardData, type Card, type CardShow, type NeedsYou, type SessionLink, type SidebarScope, type SortKey, type TableSort, type Stage, type Workspace,
+  type BoardCard, type BoardData, type Card, type CardShow, type NeedsYou, type SessionLink, type SidebarScope, type SortKey, type TableSort, type Stage, type Workspace, GRANT_RENEW_MS,
   awayDigest, byStage, cardSlug, hostProjects, inScope, projectName, sessionProject, sidebarProjects, sortCards, toBoardCard, writerSlots,
 } from "@/lib/board";
 import { cardAction, createCard, ulid } from "@/lib/board-actions";
@@ -81,32 +81,45 @@ function useCard(slug: string | null, board: BoardData | null) {
       });
     return () => { abort.abort(); clearTimeout(retry); };
   }, [slug, board, attempt]);
+  const expires = Math.min(...(state?.slug === slug ? state.show?.artifacts ?? [] : []).flatMap((a) => a.expires ?? []));
+  useEffect(() => {
+    if (!Number.isFinite(expires)) return;
+    const renew = setTimeout(() => setAttempt((n) => n + 1), Math.max(BOARD_POLL_MS, expires * 1000 - GRANT_RENEW_MS - Date.now()));
+    return () => clearTimeout(renew);
+  }, [expires]);
   return state?.slug === slug ? { ...state, refresh: () => setAttempt((n) => n + 1) } : null;
 }
 
-async function allDecisions(query: string, signal: AbortSignal): Promise<Decision[]> {
+async function readDecisions(query: string, wanted: string[] | null, signal: AbortSignal): Promise<Decision[]> {
   const items: Decision[] = [];
   let page: string | null = null;
   do {
     const data: { items: Decision[]; next: string | null } = await api("decisions", { query: query || undefined, page: page ?? undefined }, undefined, { signal });
     items.push(...data.items);
     page = data.next;
-  } while (page);
+  } while (page && !wanted?.every((id) => items.some((d) => d.id === id)));
   return items;
 }
 
-function useDecisions(enabled: boolean, query: string, board: BoardData | null) {
+function useDecisions(page: boolean, wanted: string[], query: string, board: BoardData | null) {
   const [state, setState] = useState<{ query: string; items: Decision[]; error: string | null } | null>(null);
+  const [attempt, setAttempt] = useState(0);
+  const enabled = page || wanted.length > 0;
+  const want = page ? null : wanted.join(" ");
+  const changed = page ? board : want;
   useEffect(() => {
     if (!enabled) return;
     const abort = new AbortController();
-    allDecisions(query, abort.signal)
+    let retry: ReturnType<typeof setTimeout> | undefined;
+    readDecisions(query, want === null ? null : want.split(" "), abort.signal)
       .then((items) => setState({ query, items, error: null }))
       .catch((failure) => {
-        if (!abort.signal.aborted) setState((old) => ({ query, items: old?.query === query ? old.items : [], error: describeError(failure) }));
+        if (abort.signal.aborted) return;
+        setState((old) => ({ query, items: old?.query === query ? old.items : [], error: describeError(failure) }));
+        retry = setTimeout(() => setAttempt((n) => n + 1), BOARD_POLL_MS);
       });
-    return () => abort.abort();
-  }, [enabled, query, board]);
+    return () => { abort.abort(); clearTimeout(retry); };
+  }, [enabled, query, want, changed, attempt]);
   const current = enabled && state?.query === query ? state : null;
   return { items: current?.items ?? [], error: current?.error ?? null, loading: enabled && !current };
 }
@@ -144,7 +157,7 @@ function CardPanel({ slug, board, mode, onOpenCard }: { slug: string; board: Boa
       {mode === "page" && (
         <div className="mx-auto mt-4 flex w-full max-w-3xl flex-col gap-4">
           <RecordDecision cardRef={card.show.ref} onRecorded={card.refresh} />
-          <CardArtifacts artifacts={card.show.artifacts} />
+          <CardArtifacts artifacts={card.show.artifacts} now={now} />
         </div>
       )}
     </>
@@ -154,7 +167,7 @@ function CardPanel({ slug, board, mode, onOpenCard }: { slug: string; board: Boa
 export function BoardPage({ route, workspace, onNavigate, onSessions }: {
   route: BoardRoute;
   workspace: Workspace;
-  onNavigate: (route: BoardRoute, replace?: boolean) => void;
+  onNavigate: (route: BoardRoute) => void;
   onSessions: () => void;
 }) {
   const [lastSeen, setLastSeen] = useState(loadLastSeen);
@@ -207,13 +220,15 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
   const toggle = <T,>(list: T[], name: T) => list.includes(name) ? list.filter((n) => n !== name) : [...list, name];
 
   const live = (board?.cards ?? []).map((c) => ({ ...c, ...patchOf(overlay, c.ref) })).filter((c) => !c.archived);
+  const projects = board ? sidebarProjects({ ...board, cards: live }) : [];
   const waiting = (board?.needs_you ?? []).filter((w) => !patchOf(overlay, approval(w)));
   const all = live.map((c) => ({ ...toBoardCard(c, live), needsYou: waiting.some((w) => w.card === c.id), age: activityAge(c.updated_at, Date.now()) }));
   const scoped = all.filter((c) => inScope(c, scope));
   const cards = scoped.filter((c) => !c.proposed);
   const bySlug = (slug: string | null): Card | undefined => live.find((c) => cardSlug(c.ref) === slug);
   const peeked = bySlug(route.peek);
-  const listed = useDecisions(route.decisions || !!board?.away.decisions.length, route.decisions ? decisionQuery : "", board);
+  const digestShown = !digestClosed && !route.card;
+  const listed = useDecisions(route.decisions, digestShown ? board?.away.decisions ?? [] : [], route.decisions ? decisionQuery : "", board);
   const decisions = listed.items;
   const homeSessions = useHomeSessions(route.decisions ? decisions.flatMap((d) => d.project === null && d.session ? [d.session] : []) : [], workspace);
   const digest = board && awayDigest(board, scope, decisions);
@@ -250,7 +265,7 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
   ));
 
   const sidebar = (
-    <ProjectSidebar projects={board ? sidebarProjects(board) : []} total={live.filter((c) => c.stage !== "done").length}
+    <ProjectSidebar projects={projects} total={live.length}
       scope={scope} expanded={expanded} showQuiet={showQuiet}
       query={search} onQueryChange={setSearch} onSelect={select}
       onToggleProject={(name) => setExpanded((old) => toggle(old, name))} onToggleQuiet={() => setShowQuiet((v) => !v)} />
@@ -305,7 +320,7 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
           )}
           <Button type="button" variant="ghost" size="sm" onClick={onSessions}>Sesiuni</Button>
         </header>
-        {digest && !digest.empty && !digestClosed && !route.card && (
+        {digest && !digest.empty && digestShown && (
           <AwayDigest lastSeen={new Date(lastSeen).toLocaleString("ro-RO", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}
             scope={scope.kind === "all" || scope.kind === "needs" || scope.kind === "all-decisions" ? "toate proiectele" : projectName(scope.project)}
             finished={digest.finished.map((c) => toBoardCard(c, live))} needsYou={digest.waiting.length ? digest.waiting.map((c) => toBoardCard(c, live)) : undefined} decisions={awayDecisions} onOpen={peek} onClose={() => setDigestClosed(true)}
@@ -334,7 +349,7 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
       </main>
       {newCard && (
         <NewCardDialog open onOpenChange={(open) => { if (!open) setNewCard(null); }} draft={newCard} pending={creating}
-          projects={(board ? sidebarProjects(board) : []).flatMap((p) => p.project === null ? [] : [p.project])}
+          projects={projects.flatMap((p) => p.project === null ? [] : [p.project])}
           onDraftChange={(draft) => setNewCard({ ...newCard, ...draft })} onCreate={create} error={createError} />
       )}
       <Sheet open={menuOpen} onOpenChange={setMenuOpen}>

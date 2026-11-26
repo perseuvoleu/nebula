@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { type ReactNode, useId } from "react";
 import type { BoardCard } from "@/lib/board";
 import { CardRef, StatusDot } from "./CardTile";
 
@@ -7,10 +7,11 @@ export function NeedsYouStrip({ cards, onOpen, renderActions }: {
   onOpen?: (ref: string) => void;
   renderActions?: (card: BoardCard) => ReactNode;
 }) {
+  const titleId = useId();
   if (cards.length === 0) return null;
   return (
-    <section aria-labelledby="needs-you-title" className="flex shrink-0 items-center gap-2 overflow-x-auto border-b bg-sidebar px-3 py-1.5">
-      <h2 id="needs-you-title" className="shrink-0 text-xs font-medium">
+    <section aria-labelledby={titleId} className="flex shrink-0 items-center gap-2 overflow-x-auto border-b bg-sidebar px-3 py-1.5">
+      <h2 id={titleId} className="shrink-0 text-xs font-medium">
         Te așteaptă <span className="font-mono text-muted-foreground tabular-nums">{cards.length}</span>
       </h2>
       <ul className="flex items-center gap-2">

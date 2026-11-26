@@ -6,6 +6,7 @@ import { Conversation, ConversationContent, ConversationScrollButton } from "@/c
 import { Button } from "@/components/ui/button";
 import type { Attempt, ConversationController, ConversationState } from "@/lib/conversation";
 import { draftKey, getDraft, setDraft } from "@/lib/drafts";
+import { echoWatch } from "@/lib/echo";
 import { formatTime, kindLabel, statusLabel } from "@/lib/status";
 import type { SessionRow } from "@/lib/types";
 import { Composer } from "./Composer";
@@ -128,9 +129,13 @@ export function ConversationView({ project, previewUrl, row, state, controller, 
     if (attempt.state === "failed" && !getDraft(key)) onDraft(text);
   };
   // Terminal output echoes what was typed, so a delivered bubble would only sit below newer output.
-  const dismissDelivered = useCallback(() => {
-    for (const attempt of state.attempts) if (attempt.state === "accepted") controller.dismissAttempt(attempt.id);
-  }, [state.attempts, controller]);
+  const [delivered] = useState(echoWatch);
+  useEffect(() => {
+    for (const id of delivered(state.attempts)) controller.dismissAttempt(id);
+  }, [state.attempts, delivered, controller]);
+  const dismissDelivered = useCallback((output: string, widened: boolean) => {
+    for (const id of delivered(state.attempts, output, widened)) controller.dismissAttempt(id);
+  }, [state.attempts, delivered, controller]);
   const retry = (attempt: Attempt) => { controller.dismissAttempt(attempt.id); void send(attempt.text); };
 
   const title = state.name || session?.name || "Sesiune";

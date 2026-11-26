@@ -1,4 +1,5 @@
 import { CheckIcon, ImageOffIcon, MinusIcon, XIcon } from "lucide-react";
+import { formatWhen } from "@/lib/status";
 
 export type E2eStatus = "passed" | "failed" | "skipped";
 
@@ -39,7 +40,7 @@ function summary(steps: E2eStep[]): string {
 }
 
 export function E2eRunView({ run, assetUrl }: { run: E2eRun; assetUrl: (path: string) => string }) {
-  const started = new Date(run.started_at);
+  const started = formatWhen(run.started_at);
   return (
     <div className="flex flex-col gap-3">
       <p className="flex flex-wrap items-baseline gap-x-3 gap-y-1 text-sm">
@@ -47,7 +48,7 @@ export function E2eRunView({ run, assetUrl }: { run: E2eRun; assetUrl: (path: st
         <span className="font-medium">{summary(run.steps)}</span>
         <span className="font-mono text-xs text-muted-foreground tabular-nums">
           {formatDuration(run.duration_ms)}
-          {!Number.isNaN(started.getTime()) && ` · ${started.toLocaleString("ro-RO", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}`}
+          {started && ` · ${started}`}
         </span>
       </p>
       <ol className="flex flex-col gap-2">

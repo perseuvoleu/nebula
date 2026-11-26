@@ -22,7 +22,7 @@ export function CardDetail({ card, log, mode, actions, proposalActions, onOpenCa
   mode: "peek" | "page";
   actions?: ReactNode;
   proposalActions?: ReactNode;
-  onOpenCard?: (ref: string) => void;
+  onOpenCard: (ref: string) => void;
   children?: ReactNode;
 }) {
   const sessions = card.sessions ?? [];
@@ -32,7 +32,7 @@ export function CardDetail({ card, log, mode, actions, proposalActions, onOpenCa
         <div className="flex flex-wrap items-center gap-1.5">
           <CardRef cardRef={card.ref} />
           <StagePill stage={card.stage} />
-          {card.needsYou && <Tag className="border-foreground font-medium text-foreground"><StatusDot dot="needs" label="" />Te așteaptă</Tag>}
+          {card.needsYou && <Tag className="border-foreground font-medium text-foreground"><StatusDot dot="needs" label={null} />Te așteaptă</Tag>}
           {card.proposed && <Tag className="border-dashed text-foreground">propus</Tag>}
           <span className="flex-1" />
           {actions}
@@ -67,7 +67,7 @@ export function CardDetail({ card, log, mode, actions, proposalActions, onOpenCa
         <dd className="flex min-w-0 flex-wrap items-center gap-1">
           {card.blockers.length
             ? card.blockers.map((b) => (
-              <button key={b.ref} type="button" onClick={() => onOpenCard?.(b.ref)}
+              <button key={b.ref} type="button" onClick={() => onOpenCard(b.ref)}
                 className="inline-flex max-w-56 items-center gap-1 truncate rounded-md border border-dashed px-1.5 py-0.5 text-xs outline-none hover:bg-secondary focus-visible:ring-2 focus-visible:ring-ring">
                 <span className="font-mono">{b.ref}</span><span className="truncate text-muted-foreground">{b.title}</span>
               </button>

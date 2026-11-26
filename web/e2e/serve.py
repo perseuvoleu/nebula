@@ -32,6 +32,10 @@ GATEWAY_ENV = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", 
 # Let browser tests serve an isolated build without replacing live web/static.
 SERVE = ("import os; from pathlib import Path; import server; "
          "server.STATIC = Path(os.environ.get('E2E_STATIC_DIR', str(server.STATIC))); server.main()")
+# Slow every fake-lane /a/ read by the seconds in $FAKE_NEBULA_STATE/artifact-delay, so a test can load the gateway itself.
+SLOW_ARTIFACTS = ("import os, time; from pathlib import Path; import server; "
+                  "delay = Path(os.environ['FAKE_NEBULA_STATE']) / 'artifact-delay'; read = server.Gateway.artifact_file; "
+                  "server.Gateway.artifact_file = lambda self, path: (delay.exists() and time.sleep(float(delay.read_text())), read(self, path))[1]; ")
 SID = {"pi-1": "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa", "pi-2": "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb",
        "pi-b": "cccccccc-3333-4333-8333-cccccccccccc"}
 
@@ -162,7 +166,7 @@ def main():
     os.chmod(HERE / "fake_nebula.py", 0o755)
     env = gateway_env(STATE, HERE / "fake_nebula.py", STATE / "artifacts", "alpha,beta", "nebula,vela",
                       FAKE_NEBULA_STATE=str(STATE), PATH=str(STATE / "bin") + os.pathsep + os.environ["PATH"])
-    os.execve(sys.executable, [sys.executable, "-c", SERVE], env)
+    os.execve(sys.executable, [sys.executable, "-c", SLOW_ARTIFACTS + SERVE], env)
 
 
 def owns_socket(state, daemon):

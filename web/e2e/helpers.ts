@@ -23,7 +23,7 @@ export async function login(page: Page, url = "/") {
   await page.getByRole("button", { name: "Conectare" }).click();
   await expect(page.getByLabel("Token de acces")).toHaveCount(0);
   if (/\/s\//.test(url)) await expect(page.getByLabel("Mesaj către agent")).toBeVisible();
-  else await expect(page.getByRole("combobox", { name: "Proiect", exact: true })).toBeVisible();
+  else if (!url.startsWith("/board")) await expect(page.getByRole("combobox", { name: "Proiect", exact: true })).toBeVisible();
 }
 
 export function readAgents(): Array<Record<string, unknown> & { id: string; name: string; status: string; path: string; session_id: string | null }> {
@@ -74,10 +74,13 @@ export async function noHorizontalOverflow(page: Page) {
   expect(overflow.body, "body must not scroll horizontally").toBeLessThanOrEqual(0);
 }
 
-export type BoardState = { version: number; cards: Record<string, unknown>[]; decisions: Record<string, unknown>[];
+type BoardHost = { host: string; writers: number; writer_slots: number | null; checkouts: unknown[]; needs_you: number; stale: boolean };
+
+export type BoardState = { version: number; cards: Record<string, unknown>[]; decisions: Record<string, unknown>[]; hosts: BoardHost[];
+  away: { finished: { id: unknown; at: number }[]; needs_you: Record<string, unknown>[] };
   details: Record<string, { sessions: Record<string, unknown>[]; artifacts: Record<string, unknown>[]; log: unknown[] }> };
 
-export function readBoardState(): BoardState {
+function readBoardState(): BoardState {
   return JSON.parse(fs.readFileSync(path.join(STATE, "board.json"), "utf8"));
 }
 
@@ -98,13 +101,6 @@ export function storeArtifact(id: string, files: Record<string, string | Buffer>
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(file, bytes);
   }
-}
-
-export async function openBoard(page: Page, url: string) {
-  await page.goto(url);
-  await page.getByLabel("Token de acces").fill(TOKEN);
-  await page.getByRole("button", { name: "Conectare" }).click();
-  await expect(page.getByLabel("Token de acces")).toHaveCount(0);
 }
 
 export async function shot(page: Page, name: string) {

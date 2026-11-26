@@ -82,8 +82,26 @@ test("sent message survives older-output paging", async ({ page }) => {
   await page.getByRole("button", { name: "Terminal brut", exact: true }).click();
   await content.evaluate(el => { el.scrollTop = 0; });
   await expect(content).toContainText("line 100:");
-  await page.waitForTimeout(3000);
+  await page.waitForResponse((r) => new URL(r.url()).pathname === "/api/output" && new URL(r.url()).searchParams.get("lines") === "500");
   await expect(pending).toContainText("Mesaj încă neconfirmat");
   fs.appendFileSync(retained, "> Mesaj încă neconfirmat\n");
+  await expect(pending).toHaveCount(0);
+});
+
+test("a pending send stays while a busy terminal's progress line changes, until its own echo appears", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  const retained = path.join(STATE, "output.txt");
+  fs.writeFileSync(retained, "Lucrez la migrare\n⠋ thinking 1s\n");
+  await login(page, "/p/alpha/s/claude-1");
+  const content = page.getByLabel("Conținut terminal", { exact: true });
+  await expect(content).toContainText("thinking 1s");
+  await page.getByLabel("Mesaj către agent").fill("Oprește după migrare");
+  await page.getByRole("button", { name: "Trimite", exact: true }).click();
+  const pending = page.locator("article[data-attempt=accepted]");
+  await expect(pending).toContainText("Oprește după migrare");
+  fs.writeFileSync(retained, "Lucrez la migrare\n⠙ thinking 4s\n");
+  await expect(content).toContainText("thinking 4s");
+  await expect(pending).toContainText("Oprește după migrare");
+  fs.appendFileSync(retained, "> Oprește după migrare\n");
   await expect(pending).toHaveCount(0);
 });
