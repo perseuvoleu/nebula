@@ -67,7 +67,8 @@ export function RunDialog({ open, onOpenChange, cardRef, cardTitle, branch, host
 }) {
   const set = <K extends keyof RunDraft>(key: K) => (value: RunDraft[K]) => onDraftChange({ ...draft, [key]: value });
   const target = hosts.find((h) => h.host === draft.host);
-  const overCap = draft.role === "worker" && slotsFull(target);
+  const writes = draft.role === "worker" || draft.role === "fix";
+  const overCap = writes && slotsFull(target);
   const worktrees = branch ? (["current", "new"] as const) : (["new"] as const);
   const current = draft.worktree === "current" ? branch : null;
   const worktree = current ? "current" : "new";
@@ -102,7 +103,15 @@ export function RunDialog({ open, onOpenChange, cardRef, cardTitle, branch, host
               <TriangleAlertIcon aria-hidden className="mt-0.5 size-4 shrink-0" />
               <span>
                 Sloturile de scriere de pe <span className="font-mono">@{target.host}</span> sunt ocupate ({slotText(target)}).
-                Workerul pornește oricum, peste limită; alege alt host ca să rămâi în ea.
+                Numărul e doar informativ: pornirea nu îl verifică; alege alt host ca să rămâi sub el.
+              </span>
+            </p>
+          )}
+          {writes && current && (
+            <p role="status" className="flex gap-2 rounded-lg border border-border px-3 py-2 text-sm">
+              <TriangleAlertIcon aria-hidden className="mt-0.5 size-4 shrink-0" />
+              <span>
+                Pornirea pe <span className="font-mono">{current}</span> e refuzată dacă acest checkout are deja un writer; un worktree nou nu are.
               </span>
             </p>
           )}

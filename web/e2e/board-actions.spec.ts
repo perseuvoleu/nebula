@@ -125,6 +125,19 @@ test("a worker on a host whose writer slots are full starts now, as todo run doe
   expect(sends().filter((s) => "run" in s)).toHaveLength(1);
 });
 
+test("a worker on the card's own checkout is told todo run refuses it while that checkout has a writer, apart from the host's advisory count", async ({ page }) => {
+  changeBoard((board) => { board.hosts = [{ host: "leaseweb", writers: 2, writer_slots: 2, checkouts: [], needs_you: 0, stale: false }]; });
+  await login(page, "/board/c/12%40leaseweb");
+  await page.getByRole("button", { name: "Pornește", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Pornește un agent pe card" });
+  const notes = dialog.getByRole("status");
+  await expect(notes).toContainText(["2/2"]);
+  await expect(notes).not.toContainText([/refuz/]);
+  await dialog.getByText("agent-home-02", { exact: true }).click();
+  await expect(notes.filter({ hasText: /refuz/ })).toContainText("agent-home-02");
+  await expect(notes.filter({ hasText: /oricum/ })).toHaveCount(0);
+});
+
 test("a refused new card shows why inside its dialog", async ({ page }) => {
   await page.route("**/api/cards", (route) => route.fulfill({ status: 403, contentType: "application/json", body: JSON.stringify({ error: "Project not on this board" }) }));
   await login(page, "/board/p/nebula");
