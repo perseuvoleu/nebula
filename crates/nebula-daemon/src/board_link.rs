@@ -451,24 +451,32 @@ fn relabel(result: &mut BoardResult, host: &str) {
     }
 }
 
-/// The board's own refusals name cards as `#12`; off the board host they
-/// read `#12@host`, as relabeled replies do.
-fn qualify(message: &str, host: &str) -> String {
+/// The board's own refusals name cards as `#12` and quote any text they
+/// echo, such as a worktree or project name; off the board host each label
+/// outside quotes reads `#12@host`, as relabeled replies do.
+pub(crate) fn qualify(message: &str, host: &str) -> String {
     let mut out = String::with_capacity(message.len());
-    let mut rest = message;
-    while let Some(at) = rest.find('#') {
-        let (before, from) = rest.split_at(at);
-        out.push_str(before);
-        let digits = from[1..].bytes().take_while(u8::is_ascii_digit).count();
-        let (label, after) = from.split_at(1 + digits);
-        out.push_str(label);
-        if digits > 0 && !after.starts_with('@') {
-            out.push('@');
-            out.push_str(host);
+    let mut chars = message.chars().peekable();
+    let mut quoted = false;
+    while let Some(c) = chars.next() {
+        out.push(c);
+        match c {
+            '\\' if quoted => out.extend(chars.next()),
+            '"' => quoted = !quoted,
+            '#' if !quoted => {
+                let mut digits = 0;
+                while let Some(d) = chars.next_if(char::is_ascii_digit) {
+                    out.push(d);
+                    digits += 1;
+                }
+                if digits > 0 && chars.peek() != Some(&'@') {
+                    out.push('@');
+                    out.push_str(host);
+                }
+            }
+            _ => {}
         }
-        rest = after;
     }
-    out.push_str(rest);
     out
 }
 

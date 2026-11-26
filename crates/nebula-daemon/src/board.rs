@@ -189,7 +189,7 @@ fn begin_run(tx: &Transaction, dispatch: Dispatch) -> Result<RunReceipt> {
                 )
         {
             bail!(Refusal::Conflict.message(format!(
-                "dispatch {} runs with --host {host} --role {role} --kind {kind} --worktree {worktree}; rerun it with those",
+                "dispatch {} runs with --host {host} --role {role} --kind {kind} --worktree {worktree:?}; rerun it with those",
                 dispatch.id.as_str()
             )));
         }
@@ -352,7 +352,7 @@ fn within(tx: &Transaction, scope: &BoardScope, op: &mut BoardOp) -> Result<()> 
         if let Some(project) = receipt(tx, &dispatch.id)?.and_then(|r| r.project) {
             if !in_scope(scope, Some(&project)) {
                 bail!(Refusal::NotFound.message(format!(
-                    "dispatch {} runs in project \"{project}\", outside the write scope",
+                    "dispatch {} runs in project {project:?}, outside the write scope",
                     dispatch.id.as_str()
                 )));
             }
@@ -1171,6 +1171,31 @@ mod tests {
             panic!("no receipt")
         };
         assert_eq!(receipt.state, DispatchState::Pending);
+    }
+
+    #[test]
+    fn a_relayed_refusal_keeps_the_worktree_it_names() {
+        let store = Store::open_in_memory().unwrap();
+        let links = HostLinks::default();
+        let card = add_card(&store, &links);
+        let run = |worktree: &str| {
+            serve(
+                &store,
+                &links,
+                BoardOp::BeginRun(nebula_core::board::Dispatch {
+                    id: DispatchId("d1".into()),
+                    card: card.clone(),
+                    host: nebula_core::host::hostname(),
+                    role: nebula_core::board::Role::Worker,
+                    kind: AgentKind::Claude,
+                    worktree: worktree.into(),
+                }),
+            )
+        };
+        run("fix/#42").unwrap();
+        let refused = run("other").unwrap_err().to_string();
+        let relayed = crate::board_link::qualify(&refused, "boardhost");
+        assert!(relayed.contains("fix/#42\""), "{relayed}");
     }
 
     #[test]
