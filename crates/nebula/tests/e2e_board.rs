@@ -4517,7 +4517,12 @@ fn reading_a_pending_decision_does_not_retry_its_copy() {
     };
     poll_until(Duration::from_secs(10), || (attempts() == 1).then_some(()))
         .expect("publishing never copied the decision");
-    poll_until(Duration::from_secs(1), || None::<()>);
+    let hung = env.tmp.path().join("rag-hung-pid");
+    eventually("the first copy attempt ending", || {
+        std::fs::read_to_string(&hung)
+            .ok()
+            .filter(|pid| !pid_alive(pid.trim()))
+    });
     for _ in 0..3 {
         env.json(&["decision", "show", id, "--json"]);
     }
