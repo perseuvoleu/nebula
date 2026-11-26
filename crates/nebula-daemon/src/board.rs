@@ -610,28 +610,30 @@ pub(crate) fn in_scope(scope: &BoardScope, project: Option<&str>) -> bool {
     }
 }
 
-/// Cards in `scope` from `offset` on, in number order, without blockers:
-/// `with_blockers` hydrates only the ones a page returns.
-fn scoped_cards(
+/// Cards in `scope` from `offset` on, in number order, without blockers,
+/// handed to `read` as SQLite steps through them, so a page decodes only
+/// the rows it takes; `with_blockers` hydrates only the ones it returns.
+fn scoped_cards<R>(
     tx: &Transaction,
     scope: &BoardScope,
     stage: Option<Stage>,
     include_archived: bool,
     offset: usize,
-) -> Result<Vec<Card>> {
+    read: impl FnOnce(&mut dyn Iterator<Item = Result<Card>>) -> Result<R>,
+) -> Result<R> {
     let named = match &scope.projects {
         ProjectScope::All => None,
         ProjectScope::Named(names) => Some(serde_json::to_string(names)?),
     };
-    Ok(tx
-        .prepare(&format!(
-            "SELECT {CARD_COLUMNS} FROM todos WHERE stage IS NOT NULL
-               AND (CASE WHEN project IS NULL THEN ?1
-                    ELSE ?2 IS NULL OR project IN (SELECT value FROM json_each(?2)) END)
-               AND (?3 IS NULL OR stage = ?3)
-               AND (?4 OR archived_at IS NULL)
-             ORDER BY number LIMIT -1 OFFSET ?5"
-        ))?
+    let mut stmt = tx.prepare(&format!(
+        "SELECT {CARD_COLUMNS} FROM todos WHERE stage IS NOT NULL
+           AND (CASE WHEN project IS NULL THEN ?1
+                ELSE ?2 IS NULL OR project IN (SELECT value FROM json_each(?2)) END)
+           AND (?3 IS NULL OR stage = ?3)
+           AND (?4 OR archived_at IS NULL)
+         ORDER BY number LIMIT -1 OFFSET ?5"
+    ))?;
+    let mut rows = stmt
         .query_map(
             params![
                 scope.include_home,
@@ -642,7 +644,8 @@ fn scoped_cards(
             ],
             card_from_row,
         )?
-        .collect::<rusqlite::Result<_>>()?)
+        .map(|card| card.map_err(Into::into));
+    read(&mut rows)
 }
 
 pub(crate) fn cursor(tx: &Transaction) -> Result<String> {
@@ -705,22 +708,31 @@ fn read_op(tx: &Transaction, links: &HostLinks, read: BoardRead) -> Result<Board
                 return Ok(BoardResult::Board(BoardPoll::Unchanged { version }));
             }
             let offset = page_offset(page.as_deref(), &version)?;
-            let cards = scoped_cards(tx, &scope, None, false, offset)?;
-            let (hosts, needs_you, away) = if offset == 0 {
+            let page = |cards: &mut dyn Iterator<Item = Result<Card>>, budget| {
+                let cards = cards.map(|card| with_blockers(tx, card?));
+                paged(cards, offset, &version, budget)
+            };
+            let ((cards, next), hosts, needs_you, away) = if offset == 0 {
+                let cards: Vec<Card> =
+                    scoped_cards(tx, &scope, None, false, 0, |cards| cards.collect())?;
                 let away = match away_since {
                     Some(since) => away(tx, &scope, &cards, since)?,
                     None => Away::default(),
                 };
-                (hosts(tx, links, &scope)?, waiting(tx, &cards, None)?, away)
+                let hosts = hosts(tx, links, &scope)?;
+                let needs_you = waiting(tx, &cards, None)?;
+                let reserved = serde_json::to_vec(&hosts)?.len()
+                    + serde_json::to_vec(&needs_you)?.len()
+                    + serde_json::to_vec(&away)?.len();
+                let budget = page_budget().saturating_sub(reserved);
+                let cards = page(&mut cards.into_iter().map(Ok), budget)?;
+                (cards, hosts, needs_you, away)
             } else {
-                (Vec::new(), Vec::new(), Away::default())
+                let cards = scoped_cards(tx, &scope, None, false, offset, |cards| {
+                    page(cards, page_budget())
+                })?;
+                (cards, Vec::new(), Vec::new(), Away::default())
             };
-            let reserved = serde_json::to_vec(&hosts)?.len()
-                + serde_json::to_vec(&needs_you)?.len()
-                + serde_json::to_vec(&away)?.len();
-            let budget = page_budget().saturating_sub(reserved);
-            let cards = cards.into_iter().map(|c| with_blockers(tx, c));
-            let (cards, next) = paged(cards, offset, &version, budget)?;
             Ok(BoardResult::Board(BoardPoll::Board {
                 version,
                 board: BoardPage {
@@ -740,9 +752,11 @@ fn read_op(tx: &Transaction, links: &HostLinks, read: BoardRead) -> Result<Board
         } => {
             let version = cursor(tx)?;
             let offset = page_offset(page.as_deref(), &version)?;
-            let cards = scoped_cards(tx, &scope, stage, include_archived, offset)?;
-            let cards = cards.into_iter().map(|c| with_blockers(tx, c));
-            let (items, next) = paged(cards, offset, &version, page_budget())?;
+            let (items, next) =
+                scoped_cards(tx, &scope, stage, include_archived, offset, |cards| {
+                    let cards = cards.map(|card| with_blockers(tx, card?));
+                    paged(cards, offset, &version, page_budget())
+                })?;
             Ok(BoardResult::Cards(Page { items, next }))
         }
         BoardRead::Card { scope, card } => {
@@ -1101,13 +1115,17 @@ mod tests {
     }
 
     fn add_card(store: &Store, links: &HostLinks) -> CardRef {
+        add_titled(store, links, "Card".into())
+    }
+
+    fn add_titled(store: &Store, links: &HostLinks, title: String) -> CardRef {
         let id = TodoId::generate();
         serve(
             store,
             links,
             BoardOp::AddCard(CardDraft {
                 id: id.clone(),
-                title: "Card".into(),
+                title,
                 project: Some("web".into()),
                 stage: Stage::Backlog,
                 proposed: false,
@@ -1153,6 +1171,65 @@ mod tests {
             panic!("no receipt")
         };
         assert_eq!(receipt.state, DispatchState::Pending);
+    }
+
+    #[test]
+    fn a_page_decodes_only_the_cards_it_returns() {
+        let store = Store::open_in_memory().unwrap();
+        let links = HostLinks::default();
+        for size in [1_000_000, 1_500_000, 1_000_000] {
+            add_titled(&store, &links, "x".repeat(size));
+        }
+        let CardRef::Id(unreadable) = add_card(&store, &links) else {
+            unreachable!()
+        };
+        store
+            .board_transaction(|tx| {
+                tx.execute(
+                    "UPDATE todos SET created_by = 'not json' WHERE id = ?1",
+                    params![unreadable.as_str()],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let scope = BoardScope {
+            projects: ProjectScope::All,
+            include_home: true,
+        };
+        let cards = |page: Option<String>| {
+            serve(
+                &store,
+                &links,
+                BoardOp::Read(BoardRead::Cards {
+                    scope: scope.clone(),
+                    stage: None,
+                    include_archived: false,
+                    page,
+                }),
+            )
+        };
+        let Ok(BoardResult::Cards(first)) = cards(None) else {
+            panic!("the first page read the card past it")
+        };
+        assert_eq!(first.items.len(), 1);
+        let Ok(BoardResult::Cards(second)) = cards(first.next.clone()) else {
+            panic!("a continuation read the card past it")
+        };
+        assert_eq!(second.items.len(), 1);
+        let board = serve(
+            &store,
+            &links,
+            BoardOp::Read(BoardRead::Board {
+                scope: scope.clone(),
+                since: None,
+                away_since: None,
+                page: first.next,
+            }),
+        );
+        let Ok(BoardResult::Board(BoardPoll::Board { board, .. })) = board else {
+            panic!("a board continuation read the card past it: {board:?}")
+        };
+        assert_eq!(board.cards.len(), 1);
     }
 
     #[test]
