@@ -13,18 +13,33 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite, BufReader, BufWriter};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, BufReader, BufWriter};
 use tokio::sync::{mpsc, watch, Notify};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-const REPLY_DEADLINE: Duration = Duration::from_secs(30);
+
+/// How long a written request waits for its answer before it alone ends
+/// as outcome unknown.
+fn reply_deadline() -> Duration {
+    deadline(std::env::var("NEBULA_BOARD_REPLY_MS").ok().as_deref())
+}
+
+fn deadline(ms: Option<&str>) -> Duration {
+    ms.and_then(|v| v.parse().ok())
+        .filter(|ms| *ms > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_secs(30))
+}
+/// Unanswered requests the link holds, as the relay caps its own.
+const MAX_PENDING: usize = 256;
 const RECONNECT_MIN: Duration = Duration::from_secs(2);
 const RECONNECT_MAX: Duration = Duration::from_secs(30);
 
 /// Where the link stands. `connections` counts handshakes, so a watcher
-/// sees every (re)connect; `attempts` counts finished connection attempts.
+/// sees every (re)connect; `attempts` counts connections that ended,
+/// whether or not they came up.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LinkState {
     pub up: bool,
@@ -35,8 +50,7 @@ pub struct LinkState {
 struct Pending {
     client: RelayClient,
     local: u64,
-    sent: bool,
-    admitted: Instant,
+    written: Option<Instant>,
 }
 
 pub struct BoardLink {
@@ -51,26 +65,38 @@ pub struct BoardLink {
     stop: CancellationToken,
 }
 
-static LINK: Mutex<Option<Arc<BoardLink>>> = Mutex::new(None);
+#[derive(Default)]
+pub struct LinkSlot(Mutex<Option<Arc<BoardLink>>>);
 
-/// The link to `host`, started on first use; a changed board host stops
-/// the old link.
-pub fn to(host: &str, shutdown: &CancellationToken) -> Arc<BoardLink> {
-    let mut slot = LINK.lock().unwrap();
-    if let Some(link) = slot.as_ref().filter(|link| link.host == host) {
-        return link.clone();
+impl LinkSlot {
+    /// The link to `board`'s host when that is another host, started on
+    /// first use. Any other link stops, so a board set to local or unset
+    /// leaves no reconnect loop behind.
+    pub fn for_board(
+        &self,
+        board: Option<&str>,
+        shutdown: &CancellationToken,
+    ) -> Option<Arc<BoardLink>> {
+        let host = board.filter(|board| *board != "local");
+        let mut slot = self.0.lock().unwrap();
+        if let Some(link) = slot
+            .as_ref()
+            .filter(|link| Some(link.host.as_str()) == host)
+        {
+            return Some(link.clone());
+        }
+        if let Some(old) = slot.take() {
+            old.stop.cancel();
+        }
+        let link = BoardLink::spawn(host?, shutdown.child_token());
+        *slot = Some(link.clone());
+        Some(link)
     }
-    if let Some(old) = slot.take() {
-        old.stop.cancel();
-    }
-    let link = BoardLink::spawn(host, shutdown.child_token());
-    *slot = Some(link.clone());
-    link
 }
 
 impl BoardLink {
     fn spawn(host: &str, stop: CancellationToken) -> Arc<Self> {
-        let (out, out_rx) = mpsc::channel(256);
+        let (out, out_rx) = mpsc::channel(MAX_PENDING);
         let link = Arc::new(Self {
             host: host.to_string(),
             out,
@@ -86,6 +112,10 @@ impl BoardLink {
         link
     }
 
+    /// A watch on the link's [`LinkState`]: it starts at the current state
+    /// and sees each change, so a subscriber that lags still reads the
+    /// latest `up` and the running `connections`/`attempts` counts across
+    /// reconnects.
     pub fn state(&self) -> watch::Receiver<LinkState> {
         self.state.subscribe()
     }
@@ -99,6 +129,11 @@ impl BoardLink {
             let _admission = self.admission.lock().unwrap();
             if !self.state.borrow().up {
                 Some(self.unreachable())
+            } else if self.pending.lock().unwrap().len() >= MAX_PENDING {
+                Some(Refusal::Unreachable.message(format!(
+                    "board host {} has too many requests in flight",
+                    self.host
+                )))
             } else {
                 let remote = self.next_req.fetch_add(1, Ordering::Relaxed);
                 self.pending.lock().unwrap().insert(
@@ -106,8 +141,7 @@ impl BoardLink {
                     Pending {
                         client: client.clone(),
                         local,
-                        sent: false,
-                        admitted: Instant::now(),
+                        written: None,
                     },
                 );
                 match self.out.try_send((remote, op)) {
@@ -166,12 +200,25 @@ impl BoardLink {
         )
     }
 
-    fn overdue(&self) -> bool {
-        self.pending
-            .lock()
-            .unwrap()
-            .values()
-            .any(|p| p.sent && p.admitted.elapsed() >= REPLY_DEADLINE)
+    /// Ends each request written longer than the deadline ago; the link
+    /// stays up for the rest.
+    fn expire(&self, deadline: Duration) {
+        let overdue: Vec<Pending> = {
+            let mut pending = self.pending.lock().unwrap();
+            let late: Vec<u64> = pending
+                .iter()
+                .filter(|(_, p)| p.written.is_some_and(|at| at.elapsed() >= deadline))
+                .map(|(remote, _)| *remote)
+                .collect();
+            late.iter().filter_map(|r| pending.remove(r)).collect()
+        };
+        for pending in overdue {
+            pending.client.deliver(ServerEvent::Error {
+                req_id: Some(pending.local),
+                message: Refusal::OutcomeUnknown
+                    .message(format!("board host {} did not answer in time", self.host)),
+            });
+        }
     }
 
     fn answer(&self, event: ServerEvent) {
@@ -183,7 +230,7 @@ impl BoardLink {
             ServerEvent::Error {
                 req_id: Some(req_id),
                 message,
-            } => (req_id, Err(message)),
+            } => (req_id, Err(qualify(&message, &self.host))),
             _ => return,
         };
         let Some(pending) = self.pending.lock().unwrap().remove(&remote) else {
@@ -211,7 +258,7 @@ impl BoardLink {
         while out_rx.try_recv().is_ok() {}
         let unreachable = self.unreachable();
         for (_, pending) in std::mem::take(&mut *self.pending.lock().unwrap()) {
-            let message = match pending.sent {
+            let message = match pending.written.is_some() {
                 true => Refusal::OutcomeUnknown.message(format!(
                     "board host {}: the link dropped after the request was sent",
                     self.host
@@ -234,7 +281,7 @@ async fn run(link: Arc<BoardLink>, mut out_rx: mpsc::Receiver<(u64, BoardOp)>) {
             Ok(()) => None,
             Err(e) => {
                 tracing::warn!(host = %link.host, error = %e, "board link down");
-                e.downcast_ref::<VersionRefused>().map(|r| r.0.clone())
+                e.downcast_ref::<LinkRefused>().map(|r| r.0.clone())
             }
         };
         link.teardown(&mut out_rx, refused);
@@ -254,29 +301,58 @@ async fn connect_and_pump(
     link: &BoardLink,
     out_rx: &mut mpsc::Receiver<(u64, BoardOp)>,
 ) -> Result<()> {
+    if std::env::var("NEBULA_RELAY_CMD")
+        .is_ok_and(|line| line.contains("proxy") && !line.contains("{proxy}"))
+    {
+        return Err(LinkRefused(
+            "NEBULA_RELAY_CMD runs proxy without {proxy}, which would drop the board link's --connect-only"
+                .into(),
+        )
+        .into());
+    }
     let mut child = relay_command(&link.host, "proxy --connect-only")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .context("spawn board link transport")?;
     let mut writer = BufWriter::new(child.stdin.take().context("board link stdin")?);
     let mut reader = BufReader::new(child.stdout.take().context("board link stdout")?);
-    tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(link, &mut reader, &mut writer))
+    let said = Arc::new(Mutex::new(Vec::new()));
+    let drained = tokio::spawn(drain(
+        child.stderr.take().context("board link stderr")?,
+        said.clone(),
+    ));
+    let shook = tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(link, &mut reader, &mut writer))
         .await
-        .context("board link handshake timed out")??;
+        .context("board link handshake timed out")
+        .and_then(|shook| shook);
+    if let Err(e) = shook {
+        if e.is::<LinkRefused>() {
+            return Err(e);
+        }
+        let _ = tokio::time::timeout(Duration::from_secs(1), drained).await;
+        if String::from_utf8_lossy(&said.lock().unwrap()).contains(OLD_PEER) {
+            return Err(LinkRefused(format!(
+                "board host {} runs a nebula without `proxy --connect-only` — upgrade nebula there",
+                link.host
+            ))
+            .into());
+        }
+        return Err(e);
+    }
     {
         let _admission = link.admission.lock().unwrap();
         link.state.send_modify(|s| {
             s.up = true;
             s.connections += 1;
-            s.attempts += 1;
         });
     }
     tracing::info!(host = %link.host, "board link up");
     crate::board_report::resend();
-    let mut tick = tokio::time::interval(Duration::from_secs(5));
+    let deadline = reply_deadline();
+    let mut tick = tokio::time::interval(deadline.min(Duration::from_secs(5)));
     loop {
         let frame = {
             let read = read_frame::<ServerEvent, _>(&mut reader);
@@ -284,11 +360,7 @@ async fn connect_and_pump(
             loop {
                 tokio::select! {
                     _ = link.stop.cancelled() => return Ok(()),
-                    _ = tick.tick() => {
-                        if link.overdue() {
-                            bail!("board host {} did not answer in time", link.host);
-                        }
-                    }
+                    _ = tick.tick() => link.expire(deadline),
                     frame = &mut read => break frame?,
                     queued = out_rx.recv() => {
                         let Some((remote, op)) = queued else {
@@ -299,7 +371,7 @@ async fn connect_and_pump(
                             .await
                             .context("board link write timed out")??;
                         if let Some(pending) = link.pending.lock().unwrap().get_mut(&remote) {
-                            pending.sent = true;
+                            pending.written = Some(Instant::now());
                         }
                     }
                 }
@@ -309,6 +381,23 @@ async fn connect_and_pump(
             bail!("board host {} closed the link", link.host);
         };
         link.answer(event);
+    }
+}
+
+/// What clap prints on a nebula that predates `proxy --connect-only`.
+const OLD_PEER: &str = "unexpected argument '--connect-only'";
+const STDERR_TAIL: usize = 8 * 1024;
+
+/// Keeps the transport's stderr flowing, so a verbose transport never
+/// blocks on a full pipe, and holds its last bytes to explain a failed
+/// handshake.
+async fn drain(mut errors: impl AsyncRead + Unpin, tail: Arc<Mutex<Vec<u8>>>) {
+    let mut buf = [0; 4096];
+    while let Ok(n @ 1..) = errors.read(&mut buf).await {
+        let mut tail = tail.lock().unwrap();
+        tail.extend_from_slice(&buf[..n]);
+        let over = tail.len().saturating_sub(STDERR_TAIL);
+        tail.drain(..over);
     }
 }
 
@@ -336,7 +425,7 @@ async fn handshake<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     if peer == PROTOCOL_VERSION {
         return Ok(());
     }
-    Err(VersionRefused(format!(
+    Err(LinkRefused(format!(
         "board host {} runs protocol {peer}, this daemon {PROTOCOL_VERSION} — upgrade nebula on one side",
         link.host
     ))
@@ -344,15 +433,15 @@ async fn handshake<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 }
 
 #[derive(Debug)]
-struct VersionRefused(String);
+struct LinkRefused(String);
 
-impl std::fmt::Display for VersionRefused {
+impl std::fmt::Display for LinkRefused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
 }
 
-impl std::error::Error for VersionRefused {}
+impl std::error::Error for LinkRefused {}
 
 fn localize(op: &mut BoardOp, host: &str) {
     for card in op.card_refs_mut() {
@@ -382,5 +471,45 @@ fn relabel(result: &mut BoardResult, host: &str) {
             blocker.push('@');
             blocker.push_str(host);
         }
+    }
+}
+
+/// The board's own refusals name cards as `#12` and quote any text they
+/// echo, such as a worktree or project name; off the board host each label
+/// outside quotes reads `#12@host`, as relabeled replies do.
+pub(crate) fn qualify(message: &str, host: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    let mut chars = message.chars().peekable();
+    let mut quoted = false;
+    while let Some(c) = chars.next() {
+        out.push(c);
+        match c {
+            '\\' if quoted => out.extend(chars.next()),
+            '"' => quoted = !quoted,
+            '#' if !quoted => {
+                let mut digits = 0;
+                while let Some(d) = chars.next_if(char::is_ascii_digit) {
+                    out.push(d);
+                    digits += 1;
+                }
+                if digits > 0 && chars.peek() != Some(&'@') {
+                    out.push('@');
+                    out.push_str(host);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_zero_reply_deadline_keeps_the_default() {
+        assert_eq!(deadline(Some("200")), Duration::from_millis(200));
+        assert_eq!(deadline(Some("0")), Duration::from_secs(30));
     }
 }

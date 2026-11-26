@@ -12,7 +12,7 @@ check() {
   if "$@"; then echo "ok   $what"; else echo "FAIL $what"; failures=$((failures + 1)); fi
 }
 cleanup() {
-  for s in "/tmp/nvt-$$" "/tmp/nvt-$$-reuse" "/tmp/nvt-$$-rebuilt" "/tmp/nvt-$$-hung" "/tmp/nvt-$$-other" "/tmp/nvt-$$-frozen" "/tmp/nvt-$$-seed"; do
+  for s in "/tmp/nvt-$$" "/tmp/nvt-$$-reuse" "/tmp/nvt-$$-rebuilt" "/tmp/nvt-$$-hung" "/tmp/nvt-$$-other" "/tmp/nvt-$$-frozen" "/tmp/nvt-$$-seed" "/tmp/nvt-$$-rag"; do
     NV_STATE=$s "$vn" down >/dev/null 2>&1
   done
 }
@@ -50,6 +50,41 @@ check "a second down is a no-op" "$vn" down
 if [ -n "$user_pid" ]; then
   check "the user's daemon still runs" kill -0 "$user_pid"
 fi
+
+daemon_env() {
+  if [ -r "/proc/$1/environ" ]; then tr '\0' ' ' <"/proc/$1/environ"; else ps -E -ww -p "$1" -o command=; fi
+}
+rag_disarmed() {
+  local env
+  env=" $(daemon_env "$(cat "$NV_STATE/daemon.pid")") "
+  [[ $env == *" NEBULA_RAG_LOCAL=0 "* && $env =~ \ NEBULA_RAG_HOST=[^\ ]+\.invalid\  ]]
+}
+export NV_STATE="/tmp/nvt-$$-rag"
+stubs=$(mktemp -d)
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" >>"%s/ssh.log"\nexit 255\n' "$stubs" >"$stubs/ssh"
+chmod +x "$stubs/ssh"
+env -u NEBULA_RAG_LOCAL PATH="$stubs:$PATH" NEBULA_RAG_HOST=live-rag.example NEBULA_RAG_ENV="$stubs/no-rag.env" \
+  NEBULA_RAG_COPY_MS=200 "$vn" up >/dev/null
+echo '{"board": "local", "auto_archive_after": "off"}' >"$NV_STATE/data/config.json"
+check "the daemon runs with a dead RAG host whatever the caller set" rag_disarmed
+"$vn" nebula decision add --project repo "Keep the RAG out of vn" >/dev/null
+for _ in $(seq 100); do [ -s "$stubs/ssh.log" ] && break; sleep 0.1; done
+check "a recorded decision is copied toward the RAG" test -s "$stubs/ssh.log"
+check "no ssh call of that copy names a live host" sh -c "! grep -v -- ' -- [^ ]*\.invalid ' '$stubs/ssh.log'"
+"$vn" down >/dev/null
+rm -rf "$stubs"
+vn_rag_host() { [[ " $(daemon_env "$(cat "$NV_STATE/daemon.pid")") " == *" NEBULA_RAG_HOST=vn-rag.invalid "* ]]; }
+older=$(mktemp -d)
+sed -e '/^  NEBULA_RAG_/d' -e "s|^checkout=.*|checkout=$(cd "$here/../../.." && pwd -P)|" "$vn" >"$older/vn"
+chmod +x "$older/vn"
+NEBULA_RAG_LOCAL=0 NEBULA_RAG_HOST=rag.invalid "$older/vn" up >/dev/null
+older_pid=$(cat "$NV_STATE/daemon.pid")
+check "up restarts a daemon an older vn started without its RAG env" sh -c "'$vn' up | grep -q 'vn: up at'"
+check "the older vn's daemon is gone" sh -c "! kill -0 $older_pid 2>/dev/null"
+check "the restarted daemon carries vn's RAG host" vn_rag_host
+"$vn" down >/dev/null
+rm -rf "$older"
+export NV_STATE="/tmp/nvt-$$"
 
 mkdir -p "$NV_STATE.real" && ln -s "$NV_STATE.real" "$NV_STATE"
 check "up refuses a linked state dir" sh -c "! '$vn' up >'$NV_EVIDENCE/up-link.txt' 2>&1 && grep -q 'is a link' '$NV_EVIDENCE/up-link.txt'"

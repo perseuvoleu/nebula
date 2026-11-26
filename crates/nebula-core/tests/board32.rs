@@ -1,6 +1,3 @@
-//! Protocol-33 board contract: the positional CreateAgent and Agent tails, the
-//! pure board rules, and the JSON the CLI prints, pinned to golden fixtures that
-//! web/e2e/fake_nebula.py serves.
 use nebula_core::board::*;
 use nebula_core::{
     Agent, AgentId, AgentKind, AgentStatus, ArtifactId, ClientRequest, DispatchId, NoteId, TodoId,
@@ -489,6 +486,21 @@ fn e2e_files(names: &[&str]) -> BTreeSet<String> {
     names.iter().map(|n| n.to_string()).collect()
 }
 
+/// The Playwright reporter's own output (web/e2e/e2e-run-reporter.ts,
+/// whose unit test writes exactly this file) passes the validator
+/// `artifact add` runs.
+#[test]
+fn e2e_run_reporter_output_validates() {
+    let result = include_str!("fixtures/board/e2e_run_reporter.json");
+    let run = validate_e2e_run(
+        result,
+        &e2e_files(&["result.json", "shots/001.png", "shots/002.png"]),
+    )
+    .unwrap();
+    assert_eq!(run.status, RunStatus::Failed);
+    assert_eq!(run.steps.len(), 3);
+}
+
 #[test]
 fn e2e_run_validate() {
     let result = include_str!("fixtures/board/e2e_run_result.json");
@@ -767,12 +779,11 @@ fn board_json_golden() {
             needs_you: vec![],
             away: Away::default(),
         },
-        next: Some("01JB0000000000000000000000.53:1".into()),
+        next: Some("01JB0000000000000000000000.53@1".into()),
     };
-    assert_eq!(
-        round_trip(&continued),
-        serde_json::to_value(&continued).unwrap()
-    );
+    let printed = serde_json::to_value(&continued).unwrap();
+    assert_eq!(printed["next"], "01JB0000000000000000000000.53@1");
+    assert_eq!(round_trip(&continued), printed);
 }
 
 #[test]

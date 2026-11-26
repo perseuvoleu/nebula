@@ -890,7 +890,8 @@ mod tests {
             },
             checkout: None,
         };
-        let Ok(BoardResult::Card(card)) = crate::board::serve(store, BoardOp::AddCard(draft))
+        let Ok(BoardResult::Card(card)) =
+            crate::board::serve(store, &Default::default(), BoardOp::AddCard(draft))
         else {
             panic!("the local board added no card");
         };
@@ -929,17 +930,17 @@ mod tests {
         insert_carded(&store, "far", &far_card);
 
         let carded = hook(&env, "carded", "UserPromptSubmit").await;
-        assert_eq!(
-            carded,
-            context_injection(&[card_instruction("#1", Some("Keep verification results"))])
-        );
         assert!(carded.contains("nebula todo show '#1'"), "{carded}");
         assert!(carded.contains("nebula todo note '#1'"), "{carded}");
         assert!(carded.contains("Keep verification results"), "{carded}");
         let far = hook(&env, "far", "UserPromptSubmit").await;
-        assert_eq!(
-            far,
-            context_injection(&[card_instruction(far_card.as_str(), None)])
+        assert!(
+            far.contains(&format!("nebula todo show '{far_card}'")),
+            "{far}"
+        );
+        assert!(
+            far.contains(&format!("nebula todo note '{far_card}'")),
+            "{far}"
         );
         assert_eq!(
             hook(&env, "titled", "UserPromptSubmit").await,

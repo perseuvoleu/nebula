@@ -258,7 +258,9 @@ fn app_ancestor(pid: u32, parent_of: impl Fn(u32) -> Option<(u32, String)>) -> O
     None
 }
 
-/// The `ssh` argv that runs `nebula open --session … --json` on `host`.
+/// The `ssh` argv that runs `nebula open --session …` on `host`, which
+/// prints its JSON object without `--json` (a nebula older than that flag
+/// still answers).
 pub fn open_on_argv(
     host: &str,
     session: &str,
@@ -267,7 +269,7 @@ pub fn open_on_argv(
 ) -> Result<Vec<String>> {
     let session = format!("--session={session}");
     let project = project.map(|p| format!("--project={p}"));
-    let mut words = vec!["nebula", "open", &session, "--json"];
+    let mut words = vec!["nebula", "open", &session];
     words.extend(project.as_deref());
     if !focus {
         words.push("--no-focus");
@@ -275,31 +277,41 @@ pub fn open_on_argv(
     ssh_argv(host, &words)
 }
 
-/// The BatchMode `ssh` argv that runs `words` on `host`.
+/// The BatchMode `ssh` argv that runs `words` on `host`: each word its own
+/// shell-quoted argument after the remote PATH prefix, which ssh joins with
+/// spaces into the remote command line.
 pub fn ssh_argv(host: &str, words: &[&str]) -> Result<Vec<String>> {
-    if !is_ssh_token(host) {
-        bail!("host {host:?} is not a plain name (letters, digits, . _ @ -)");
-    }
+    check_host(host)?;
     let mut argv: Vec<String> = nebula_core::remote::SSH_BATCH_OPTS
         .iter()
         .map(|s| s.to_string())
         .collect();
-    argv.extend([
-        "--".to_owned(),
-        host.to_owned(),
-        crate::remote_cli::with_remote_path(&nebula_core::remote::join_quoted(
-            words.iter().copied(),
-        )),
-    ]);
+    argv.extend(["--".to_owned(), host.to_owned()]);
+    argv.push(crate::remote_cli::REMOTE_PATH.to_owned());
+    argv.extend(words.iter().map(|w| nebula_core::remote::ssh_quote(w)));
     Ok(argv)
+}
+
+/// Refuse `host` unless it is safe as an ssh destination.
+pub fn check_host(host: &str) -> Result<()> {
+    if !is_ssh_token(host) {
+        bail!("host {host:?} is not a plain name (letters, digits, . _ @ -) or an IP address");
+    }
+    Ok(())
 }
 
 /// Safe as an ssh destination.
 fn is_ssh_token(s: &str) -> bool {
+    let ip = s
+        .rsplit_once('@')
+        .map_or(s, |(_, addr)| addr)
+        .parse::<std::net::IpAddr>()
+        .is_ok();
     !s.is_empty()
         && !s.starts_with('-')
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '@' | '-'))
+        && s.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '@' | '-') || (ip && c == ':')
+        })
 }
 
 /// Write-then-rename: the reader never sees half a file.
@@ -343,7 +355,12 @@ mod tests {
                 "ConnectTimeout=10",
                 "--",
                 "me@mbp.tail.ts.net",
-                "export PATH=\"$HOME/.local/bin:$HOME/.cargo/bin:$PATH\"; 'nebula' 'open' '--session=a1b2' '--json' '--project=alpha@findl' '--no-focus'",
+                "export PATH=\"$HOME/.local/bin:$HOME/.cargo/bin:$PATH\";",
+                "'nebula'",
+                "'open'",
+                "'--session=a1b2'",
+                "'--project=alpha@findl'",
+                "'--no-focus'",
             ]
         );
         for host in [
@@ -364,19 +381,28 @@ mod tests {
     }
 
     #[test]
+    fn open_on_accepts_ip_addresses() {
+        for host in ["::1", "me@::1", "127.0.0.1", "fe80::1"] {
+            assert!(check_host(host).is_ok(), "host {host:?}");
+        }
+    }
+
+    #[test]
     fn open_on_carries_any_session_and_project_name_as_one_word() {
         let argv = open_on_argv("findl", "renamed fixture", Some("My Project"), true).unwrap();
         assert!(
-            argv.last().unwrap().ends_with(
-                "'nebula' 'open' '--session=renamed fixture' '--json' '--project=My Project'"
-            ),
+            argv.ends_with(&[
+                "'--session=renamed fixture'".to_owned(),
+                "'--project=My Project'".to_owned()
+            ]),
             "{argv:?}"
         );
         let argv = open_on_argv("findl", "-x", Some("p;q'r"), true).unwrap();
         assert!(
-            argv.last()
-                .unwrap()
-                .ends_with("'--session=-x' '--json' '--project=p;q'\\''r'"),
+            argv.ends_with(&[
+                "'--session=-x'".to_owned(),
+                "'--project=p;q'\\''r'".to_owned()
+            ]),
             "{argv:?}"
         );
     }

@@ -27,11 +27,9 @@ Worktrees are real git worktrees, created under `<repo>/../<repo-name>-worktrees
 
 An agent is a PTY running `claude`, `codex`, `cursor-agent`, or `pi` in that worktree. Restart resumes the stored CLI session id when there is one: `claude --resume <id>`, `codex resume <id>`, `cursor-agent --resume <id>`, `pi --session <id>`.
 
-Persistence is SQLite at `~/.local/share/nebula/nebula.db`: workspaces (one flagged open), projects, worktrees, agents (kind + CLI session id), notes, links, last UI selection.
+Persistence is SQLite at `~/.local/share/nebula/nebula.db`: workspaces (one flagged open), projects, worktrees, agents (kind + CLI session id), the board's cards with their log notes and artifacts, last UI selection.
 
-Projects and worktrees each carry their own **note list**: plain notes with a done flag, edited in the TUI's `e` modal (Projects panel → the project's high-level notes; elsewhere → the selected worktree's notes) and counted as a badge on the owning row.
-
-Worktrees also carry a **link list**: URLs pinned to a checkout — the pull request, the ticket, the design doc. They're stored (daemon-side, URL normalized to http(s) on the way in) and shown as their own LINKS group in the Sessions panel, where `Enter` hands one to the browser. Above them sits a row nothing stores: the pull request on that branch, looked up client-side with `gh pr view` on the git-poll tick and cached per worktree. That row opens like the rest but can't be edited or deleted — it comes back from git on the next lookup. A saved link that matches the detected PR is shown once, as the pull-request row.
+The Sessions panel's LINKS group holds one row nothing stores: the pull request on the selected branch, looked up client-side with `gh pr view` on the git-poll tick and cached per worktree. `Enter` hands it to the browser; it can't be edited or deleted, since it comes back from git on the next lookup.
 
 ## How the pieces talk
 

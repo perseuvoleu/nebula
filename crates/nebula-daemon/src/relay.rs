@@ -455,8 +455,19 @@ async fn pump_transport<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     relay.connected.store(false, Ordering::Relaxed);
     // Admission never awaits: once this lock is held no old request can
     // arrive after the drain. The new handshake reopens admission.
-    while out_rx.try_recv().is_ok() {}
-    let pending = std::mem::take(&mut *relay.pending.lock().unwrap());
+    let mut pending = std::mem::take(&mut *relay.pending.lock().unwrap());
+    while let Ok(queued) = out_rx.try_recv() {
+        let unwritten = request_req_id(&queued.request).and_then(|r| pending.remove(&r));
+        if let Some((client, local, _)) = unwritten {
+            client.deliver(ServerEvent::Error {
+                req_id: Some(local),
+                message: nebula_core::board::Refusal::Unreachable.message(format!(
+                    "{}: connection lost before it was sent",
+                    relay.host
+                )),
+            });
+        }
+    }
     for (_, (client, local, _)) in pending {
         client.deliver(ServerEvent::Error {
             req_id: Some(local),
@@ -1583,8 +1594,8 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                // Give the relay a queued mutation and input, then EOF before it
-                // gets to send either. Neither may survive into the next pipe.
+                // The host reads the mutation and EOFs before answering; queued
+                // input after it may not survive into the next pipe either.
                 relay
                     .forward(
                         ClientRequest::CreateTerminal {
@@ -1596,6 +1607,10 @@ mod tests {
                         &client,
                     )
                     .await;
+                while !matches!(
+                    read_frame::<ClientRequest, _>(&mut host).await.unwrap(),
+                    Some(ClientRequest::CreateTerminal { .. })
+                ) {}
                 relay
                     .forward(
                         ClientRequest::Input {
@@ -1623,6 +1638,38 @@ mod tests {
                 .expect("uncertain mutation was left pending");
             assert_eq!(refusal_of(reply), Some(Refusal::OutcomeUnknown));
         }
+    }
+
+    #[tokio::test]
+    async fn connection_loss_refuses_a_request_still_queued_as_unreachable() {
+        let (daemon, relay, mut requests) = test_relay();
+        relay.connected.store(true, Ordering::Relaxed);
+        let (client, mut replies) = mpsc::channel(4);
+        let client = RelayClient::new(client, tokio_util::sync::CancellationToken::new());
+        relay
+            .forward(
+                ClientRequest::CreateTerminal {
+                    expected_branch: Some("feature".into()),
+                    req_id: 42,
+                    worktree: WorktreeId("worktree".into()),
+                    name: None,
+                },
+                &client,
+            )
+            .await;
+        let (transport, host) = tokio::io::duplex(4096);
+        drop(host);
+        let (read, write) = tokio::io::split(transport);
+        let _ = pump_transport(
+            &relay,
+            &daemon,
+            &mut requests,
+            read,
+            write,
+            Duration::from_millis(20),
+        )
+        .await;
+        assert_eq!(refusal_of(replies.recv().await), Some(Refusal::Unreachable));
     }
 
     #[tokio::test]

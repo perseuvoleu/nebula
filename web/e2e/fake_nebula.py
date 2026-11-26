@@ -189,7 +189,7 @@ def board_command(verb, args, board):
 def main(argv):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     command = tuple(argv[:2])
-    project = arg("--project", argv)
+    project = arg("--project", options(argv))
     agents = load("agents.json")
     behaviour = (STATE / "behaviour").read_text().strip() if (STATE / "behaviour").exists() else "ok"
     if argv[0] == "-C":  # read-only git checks through the harness-only PATH shim

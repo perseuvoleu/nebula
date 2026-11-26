@@ -7,6 +7,7 @@ The board (project nebula) is seeded from the golden fixtures in crates/nebula-c
 $REAL_NEBULA_BIN (both required; playwright.config.ts sets them for --project real).
 """
 import base64
+import fcntl
 import json
 import os
 import shutil
@@ -28,6 +29,13 @@ PORT = int(os.environ.get("E2E_PORT", "8790"))
 PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=")
 GATEWAY_ENV = ("PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR",
                "REAL_NEBULA_STATE", "REAL_NEBULA_BIN", "E2E_STATIC_DIR")
+# Let browser tests serve an isolated build without replacing live web/static.
+SERVE = ("import os; from pathlib import Path; import server; "
+         "server.STATIC = Path(os.environ.get('E2E_STATIC_DIR', str(server.STATIC))); server.main()")
+# Slow every fake-lane /a/ read by the seconds in $FAKE_NEBULA_STATE/artifact-delay, so a test can load the gateway itself.
+SLOW_ARTIFACTS = ("import os, time; from pathlib import Path; import server; "
+                  "delay = Path(os.environ['FAKE_NEBULA_STATE']) / 'artifact-delay'; read = server.Gateway.artifact_file; "
+                  "server.Gateway.artifact_file = lambda self, path: (delay.exists() and time.sleep(float(delay.read_text())), read(self, path))[1]; ")
 SID = {"pi-1": "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa", "pi-2": "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb",
        "pi-b": "cccccccc-3333-4333-8333-cccccccccccc"}
 
@@ -143,23 +151,30 @@ def seed():
     ])
 
 
+def gateway_env(state, binary, artifacts, projects, board_projects, **extra):
+    """The gateway's whole environment: the allowlist plus the lane's settings, so no deployment secret reaches it."""
+    return {**{k: os.environ[k] for k in GATEWAY_ENV if k in os.environ}, "NEBULA_WEB_TOKEN": TOKEN,
+            "NEBULA_WEB_PROJECTS": projects, "NEBULA_WEB_BOARD_PROJECTS": board_projects,
+            "NEBULA_WEB_ARTIFACTS": str(artifacts), "NEBULA_WEB_BINARY": str(binary),
+            "NEBULA_WEB_USAGE": "0", "NEBULA_WEB_PORT": str(PORT), "NEBULA_WEB_ORIGIN": f"http://127.0.0.1:{PORT}",
+            "NEBULA_WEB_CLAUDE_DIR": str(state / "claude"), "NEBULA_WEB_PI_AGENT_DIR": str(state / "pi"),
+            "PYTHONDONTWRITEBYTECODE": "1", "PYTHONPATH": str(WEB), **extra}
+
+
 def main():
     seed()
     os.chmod(HERE / "fake_nebula.py", 0o755)
-    env = {**os.environ, "NEBULA_WEB_TOKEN": TOKEN, "NEBULA_WEB_PROJECTS": "alpha,beta",
-           "NEBULA_WEB_CLAUDE_DIR": str(STATE / "claude"), "NEBULA_WEB_USAGE": "0", "NEBULA_WEB_PORT": str(PORT), "NEBULA_WEB_BOARD_PROJECTS": "nebula,vela",
-           "NEBULA_WEB_ARTIFACTS": str(STATE / "artifacts"), "NEBULA_WEB_ORIGIN": f"http://127.0.0.1:{PORT}",
-           "NEBULA_WEB_BINARY": str(HERE / "fake_nebula.py"), "NEBULA_WEB_PI_AGENT_DIR": str(STATE / "pi"),
-           "FAKE_NEBULA_STATE": str(STATE), "PYTHONDONTWRITEBYTECODE": "1",
-           "PYTHONPATH": str(WEB), "PATH": str(STATE / "bin") + os.pathsep + os.environ["PATH"]}
-    # Let browser tests serve an isolated build without replacing live web/static,
-    # and slow every /a/ read by the seconds in $FAKE_NEBULA_STATE/artifact-delay, so a test can load the gateway itself.
-    script = "import os, time; from pathlib import Path; import server; " \
-             "server.STATIC = Path(os.environ.get('E2E_STATIC_DIR', str(server.STATIC))); " \
-             "delay = Path(os.environ['FAKE_NEBULA_STATE']) / 'artifact-delay'; read = server.Gateway.artifact_file; " \
-             "server.Gateway.artifact_file = lambda self, path: (delay.exists() and time.sleep(float(delay.read_text())), read(self, path))[1]; " \
-             "server.main()"
-    os.execve(sys.executable, [sys.executable, "-c", script], env)
+    env = gateway_env(STATE, HERE / "fake_nebula.py", STATE / "artifacts", "alpha,beta", "nebula,vela",
+                      FAKE_NEBULA_STATE=str(STATE), PATH=str(STATE / "bin") + os.pathsep + os.environ["PATH"])
+    os.execve(sys.executable, [sys.executable, "-c", SLOW_ARTIFACTS + SERVE], env)
+
+
+def owns_socket(state, daemon):
+    """The socket is up and the pidfile names the daemon this run started, so no CLI call can spawn another."""
+    try:
+        return (state / "rt" / "daemon.sock").exists() and (state / "rt" / "daemon.pid").read_text().strip() == str(daemon.pid)
+    except FileNotFoundError:
+        return False
 
 
 def serve_real():
@@ -167,6 +182,14 @@ def serve_real():
     state, binary = Path(os.environ["REAL_NEBULA_STATE"]), Path(os.environ["REAL_NEBULA_BIN"])
     if not os.access(binary, os.X_OK):
         raise SystemExit(f"No nebula at {binary}; run `heavy web/e2e/build_real_nebula.sh` first")
+    if any(c.isspace() for c in str(state)):
+        raise SystemExit(f"{state} holds whitespace, which the daemon's agent command cannot carry; set REAL_NEBULA_STATE")
+    state.parent.mkdir(parents=True, exist_ok=True)
+    lock = open(state.with_name(state.name + ".lock"), "a")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit(f"Another real-lane run owns {state}; set REAL_NEBULA_STATE and E2E_REAL_PORT to run beside it")
     if state.exists() and not (state / ".real-e2e").exists():
         raise SystemExit(f"{state} was not made by the real lane; refusing to delete it")
     shutil.rmtree(state, ignore_errors=True)
@@ -180,7 +203,8 @@ def serve_real():
     subprocess.run(["git", "-C", str(repo), "-c", "user.email=e2e@nebula.dev", "-c", "user.name=real-e2e",
                     "commit", "-q", "--allow-empty", "-m", "init"], check=True)
     launcher = str(HERE / "real_nebula.sh")
-    replay = WEB.parent / "crates" / "nebula" / "tests" / "replay"
+    shutil.copytree(WEB.parent / "crates" / "nebula" / "tests" / "replay", state / "replay")
+    replay = state / "replay"
     env = {**os.environ, "SHELL": "/bin/sh", "CODEX_HOME": str(state / "codex"), "PI_CODING_AGENT_DIR": str(state / "pi"),
            "NEBULA_AGENT_CMD": f"{replay / 'agent'} {replay / 'turn.replay'}", "NEBULA_STATUS_TICK_MS": "100"}
     daemon = subprocess.Popen([launcher, "daemon", "--foreground"], cwd=repo, env=env,
@@ -188,19 +212,14 @@ def serve_real():
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     try:
         deadline = time.monotonic() + 15
-        while subprocess.run([launcher, "agent", "list", "--all"], env=env, capture_output=True).returncode:
+        while not owns_socket(state, daemon) or subprocess.run([launcher, "agent", "list", "--all"], env=env,
+                                                               capture_output=True).returncode:
             if time.monotonic() > deadline or daemon.poll() is not None:
                 raise SystemExit(f"The real lane's daemon never answered; see {state / 'daemon.log'}")
             time.sleep(0.1)
         subprocess.run([launcher, "add", str(repo)], cwd=repo, env=env, check=True, capture_output=True)
-        gateway = {**{k: os.environ[k] for k in GATEWAY_ENV if k in os.environ}, "NEBULA_WEB_TOKEN": TOKEN, "NEBULA_WEB_PROJECTS": "repo", "NEBULA_WEB_BOARD_PROJECTS": "repo",
-                   "NEBULA_WEB_ARTIFACTS": str(state / "data" / "artifacts"), "NEBULA_WEB_BINARY": launcher,
-                   "NEBULA_WEB_USAGE": "0", "NEBULA_WEB_PORT": str(PORT), "NEBULA_WEB_ORIGIN": f"http://127.0.0.1:{PORT}",
-                   "NEBULA_WEB_CLAUDE_DIR": str(state / "claude"), "NEBULA_WEB_PI_AGENT_DIR": str(state / "pi"),
-                   "PYTHONDONTWRITEBYTECODE": "1", "PYTHONPATH": str(WEB)}
-        script = "import os; from pathlib import Path; import server; " \
-                 "server.STATIC = Path(os.environ.get('E2E_STATIC_DIR', str(server.STATIC))); server.main()"
-        subprocess.run([sys.executable, "-c", script], env=gateway)
+        gateway = gateway_env(state, launcher, state / "data" / "artifacts", "repo", "repo")
+        subprocess.run([sys.executable, "-c", SERVE], env=gateway)
     finally:
         daemon.terminate()
         try:

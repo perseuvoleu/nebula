@@ -451,29 +451,77 @@ fn board_since_unchanged() {
 }
 
 #[test]
+fn a_local_board_with_no_other_host_keeps_its_version_after_boot() {
+    let env = Env::new();
+    env.board_local();
+    let env = env.start(&[("NEBULA_BOARD_STALE_MS", "100")]);
+    let version = || env.json(&["todo", "board", "--all", "--json"])["version"].clone();
+    let before = version();
+    let bumped = poll_until(Duration::from_millis(800), || {
+        (version() != before).then_some(())
+    });
+    assert_eq!(bumped, None, "the boot timer bumped an unchanged board");
+}
+
+#[test]
+fn edit_to_equal_values_keeps_the_version() {
+    let env = board_env();
+    add(&env, &["--project", "nebula"], "Same");
+    add(&env, &[], "Home");
+    let version = || env.json(&["todo", "board", "--all", "--json"])["version"].clone();
+    let before = version();
+    for edit in [
+        &["todo", "edit", "#1", "--title", "Same"][..],
+        &["todo", "edit", "#1", "--project", "nebula"],
+        &["todo", "edit", "#2", "--home"],
+    ] {
+        let out = env.cli(edit, None);
+        assert!(out.status.success(), "{edit:?}: {}", stderr(&out));
+        assert_eq!(version(), before, "{edit:?} bumped the version");
+    }
+}
+
+#[test]
 fn board_read_pages() {
     let env = Env::new();
     env.board_local();
-    let env = env.start(&[("NEBULA_BOARD_PAGE_BYTES", "600")]);
-    let long = "x".repeat(200);
-    for n in 1..=6 {
-        add(&env, &["--project", "nebula"], &format!("{n} {long}"));
+    let budget = 1600;
+    let env = env.start(&[("NEBULA_BOARD_PAGE_BYTES", &budget.to_string())]);
+    let long = "x".repeat(1200);
+    for title in ["1", "2", &format!("3 {long}"), "4", "5", "6"] {
+        add(&env, &["--project", "nebula"], title);
     }
     let mut pages = vec![env.json(&["todo", "board", "--all", "--json"])];
     while let Some(next) = pages.last().unwrap()["next"].as_str().map(str::to_owned) {
         assert!(pages.len() < 10, "paging never ends");
         pages.push(env.json(&["todo", "board", "--all", "--page", &next, "--json"]));
     }
-    assert!(pages.len() > 1, "six 200-byte cards fit one 600-byte page");
     let version = &pages[0]["version"];
     let mut numbers = Vec::new();
+    let mut sizes = Vec::new();
     for page in &pages {
         assert_eq!(&page["version"], version);
-        for card in page["board"]["cards"].as_array().unwrap() {
-            numbers.push(card["number"].as_u64().unwrap());
-        }
+        let cards = page["board"]["cards"].as_array().unwrap();
+        let bytes: usize = cards
+            .iter()
+            .map(|c| serde_json::to_vec(c).unwrap().len())
+            .sum();
+        assert!(
+            cards.len() == 1 || bytes <= budget,
+            "{bytes} bytes over a {budget}-byte page"
+        );
+        sizes.push(cards.len());
+        numbers.extend(cards.iter().map(|c| c["number"].as_u64().unwrap()));
     }
     assert_eq!(numbers, [1, 2, 3, 4, 5, 6]);
+    assert!(
+        pages.len() > 1,
+        "a 1200-byte card and five short ones fit one page: {sizes:?}"
+    );
+    assert!(
+        sizes.iter().any(|n| *n > 1),
+        "short cards never share a page: {sizes:?}"
+    );
 
     let continuation = pages[0]["next"].as_str().unwrap().to_string();
     add(&env, &["--project", "nebula"], "late");
@@ -503,6 +551,46 @@ fn human_reads_follow_pages() {
                 "todo {verb} dropped #{n}: {printed}"
             );
         }
+    }
+}
+
+/// A write between two pages of a human walk re-reads the board: every
+/// card prints once, the new one included.
+#[test]
+fn human_list_survives_a_write_between_pages() {
+    let env = Env::new();
+    env.board_local();
+    let env = env.start(&[("NEBULA_BOARD_PAGE_BYTES", "600")]);
+    let long = "x".repeat(200);
+    for n in 1..=5 {
+        add(&env, &["--project", "nebula"], &format!("{n} {long}"));
+    }
+    let sixth = format!("6 {long}");
+    let (_proxy, rt) = interposer(
+        &env,
+        b"BoardReply",
+        &[
+            env!("CARGO_BIN_EXE_nebula"),
+            "todo",
+            "add",
+            "--project",
+            "nebula",
+            &sixth,
+        ],
+    );
+    let out = env.cli_env(
+        &["todo", "list", "--all"],
+        None,
+        &[("NEBULA_RUNTIME_DIR", rt.to_str().unwrap())],
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let printed = String::from_utf8_lossy(&out.stdout);
+    for n in 1..=6 {
+        let lines = printed
+            .lines()
+            .filter(|l| l.starts_with(&format!("#{n} ")))
+            .count();
+        assert_eq!(lines, 1, "#{n} printed {lines} times: {printed}");
     }
 }
 
@@ -723,18 +811,8 @@ fn agent_new_card_refuses_unknown_caller() {
     assert!(agent_names(&env).is_empty());
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "host reports are debounced by a second, so the board catches up on its own clock"
-)]
-fn eventually<T>(what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
-    for _ in 0..200 {
-        if let Some(found) = probe() {
-            return found;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    panic!("{what} never happened");
+fn eventually<T>(what: &str, probe: impl FnMut() -> Option<T>) -> T {
+    poll_until(Duration::from_secs(20), probe).unwrap_or_else(|| panic!("{what} never happened"))
 }
 
 fn now_ms() -> i64 {
@@ -851,6 +929,30 @@ fn chain(env: &Env, card: &str) -> Vec<Value> {
         .as_array()
         .unwrap()
         .clone()
+}
+
+#[test]
+fn child_of_an_archived_card_joins_none() {
+    let env = board_env();
+    env.make_repo();
+    add(&env, &["--project", "repo"], "Gone");
+    let parent = json_of(
+        spawn_agent(&env, &["--card", "#1", "--name", "parent"]),
+        &["agent", "new", "parent"],
+    );
+    env.json(&["todo", "archive", "#1", "--json"]);
+    let argv = [
+        "agent",
+        "new",
+        "--project",
+        "repo",
+        "--worktree",
+        "main",
+        "--name",
+        "late",
+    ];
+    let child = json_of(env.cli(&argv, parent["id"].as_str()), &argv);
+    assert_eq!(child["card"], Value::Null);
 }
 
 #[test]
@@ -1065,7 +1167,7 @@ fn report_unchanged_keeps_version() {
 fn away_digest_sessions() {
     let env = board_env();
     let work = add(&env, &["--project", "nebula"], "Work");
-    let old = add(&env, &["--project", "nebula"], "Old");
+    add(&env, &["--project", "nebula"], "Old");
     let ask = add(&env, &["--project", "nebula"], "Ask");
     env.json(&["todo", "move", "#2", "review", "--json"]);
     let before = now_ms() - 60_000;
@@ -1102,7 +1204,6 @@ fn away_digest_sessions() {
         serde_json::json!([{"host": FAR_HOST, "id": "n2", "name": "n2", "card": ask["id"], "status_changed_at": after + 1}]),
         "{away}"
     );
-    assert_ne!(old["id"], work["id"]);
 }
 
 #[test]
@@ -1174,6 +1275,21 @@ fn host_needs_you_follows_the_read_scope() {
         far_host(&hosts_of(&env, &["--project", "other"]))["needs_you"],
         0,
         "the waiting session's card is out of scope"
+    );
+}
+
+#[test]
+fn host_needs_you_skips_a_card_not_on_this_board() {
+    let env = board_env();
+    let elsewhere = serde_json::json!({"id": nebula_core::TodoId::generate().0});
+    far_report(
+        &env,
+        vec![far_row(&elsewhere, "n1", AgentStatus::NeedsFeedback, 10)],
+    );
+    assert_eq!(
+        far_host(&hosts_of(&env, &["--include-home"]))["needs_you"],
+        0,
+        "a session waiting on another board's card counted as home"
     );
 }
 
@@ -1405,9 +1521,19 @@ fn artifact_add_links_caller() {
     let run = e2e_run(&env.tmp.path().join("run"), "shots/open.png");
     let host = nebula_core::host::hostname();
 
-    for (dir, kind, entry) in [
-        (&recap, "recap", "index.html"),
-        (&run, "e2e-run", "result.json"),
+    for (dir, kind, entry, files) in [
+        (
+            &recap,
+            "recap",
+            "index.html",
+            ["index.html", "assets/app.css"],
+        ),
+        (
+            &run,
+            "e2e-run",
+            "result.json",
+            ["result.json", "shots/open.png"],
+        ),
     ] {
         let added = publish(&env, Some(&agent), &[dir.to_str().unwrap(), "--kind", kind]);
         assert_eq!(added["kind"], kind);
@@ -1427,10 +1553,13 @@ fn artifact_add_links_caller() {
             serde_json::json!({"host": host, "entry": entry})
         );
         assert_eq!(shown, added);
-        assert!(
-            env.stored(id).join(entry).is_file(),
-            "{kind} entry not stored"
-        );
+        for file in files {
+            assert_eq!(
+                std::fs::read(env.stored(id).join(file)).ok(),
+                std::fs::read(dir.join(file)).ok(),
+                "{kind}: stored {file} differs from the fixture"
+            );
+        }
     }
     let on_card = env.json(&["todo", "show", "#1", "--json"]);
     assert_eq!(
@@ -1495,12 +1624,12 @@ fn artifact_add_refusals() {
     let invalid = tree(&root.join("invalid"), &[("result.json", b"{\"title\": 1}")]);
     let big = tree(&root.join("big"), &[("index.html", &[b'x'; 2048])]);
 
-    for (dir, kind) in [
-        (&linked, "recap"),
-        (&escape, "e2e-run"),
-        (&missing, "e2e-run"),
-        (&invalid, "e2e-run"),
-        (&big, "recap"),
+    for (dir, kind, why) in [
+        (&linked, "recap", "symlink"),
+        (&escape, "e2e-run", "not in the run"),
+        (&missing, "e2e-run", "not in the run"),
+        (&invalid, "e2e-run", "result.json"),
+        (&big, "recap", "artifact cap"),
     ] {
         let out = env.cli(
             &[
@@ -1513,8 +1642,7 @@ fn artifact_add_refusals() {
             ],
             None,
         );
-        assert!(!out.status.success(), "{dir:?} was stored");
-        assert!(out.stdout.is_empty(), "{dir:?}");
+        refused(&out, why);
     }
     assert!(artifact_ids(&env).is_empty());
     let leftovers: Vec<_> = std::fs::read_dir(env.data_dir().join("artifacts"))
@@ -1958,6 +2086,7 @@ s = socket.socket(socket.AF_UNIX)
 s.connect(sys.argv[1])
 marker = sys.argv[2] if len(sys.argv) > 2 else None
 drop = marker is not None and not os.path.exists(marker)
+swallow = os.environ.get('PUMP_SWALLOW', '').encode()
 def up():
     while True:
         b = os.read(0, 65536)
@@ -1980,6 +2109,8 @@ while True:
     if drop and b'BoardReply' in body:
         open(marker, 'w').close()
         os._exit(0)
+    if swallow and swallow in body and b'BoardReply' in body:
+        continue
     os.write(1, head + body)
 "#,
     )
@@ -2045,6 +2176,28 @@ fn link_qualifies_cleared_blockers_like_blocked_by() {
     );
 }
 
+#[test]
+fn link_refusals_name_cards_with_their_host() {
+    let board = board_env();
+    let here = viewer(&proxy_to(&board));
+    add(&board, &["--project", "nebula"], "Waits");
+    let missing = here.cli(&["todo", "show", "99@boardhost"], None);
+    assert!(
+        stderr(&missing).contains("no card #99@boardhost"),
+        "{}",
+        stderr(&missing)
+    );
+    let moved = here.cli(
+        &["todo", "move", "#1@boardhost", "doing", "--expect", "next"],
+        None,
+    );
+    assert!(
+        stderr(&moved).contains("#1@boardhost is in backlog"),
+        "{}",
+        stderr(&moved)
+    );
+}
+
 const UNREACHABLE: &str = "nebula: board host boardhost is unreachable; nothing was sent";
 
 #[test]
@@ -2103,6 +2256,26 @@ fn link_lost_after_send_exit_4() {
     let rerun = json_of(here.cli(&argv, None), &argv);
     assert_eq!(rerun["id"], id.as_str());
     assert_eq!(list(&board, &["--all"]), ["Once"]);
+}
+
+#[test]
+fn link_times_out_one_request_alone() {
+    let board = board_env();
+    let launches = board.tmp.path().join("launches");
+    let here = viewer_on(
+        &format!(
+            "echo >> '{}'; PUMP_SWALLOW=Swallowed {}",
+            launches.display(),
+            pump_to(&board, None)
+        ),
+        "here",
+        &[("NEBULA_BOARD_REPLY_MS", "500")],
+    );
+    let lost = here.cli(&["todo", "add", "--project", "nebula", "Swallowed"], None);
+    assert_eq!(lost.status.code(), Some(4), "{}", stderr(&lost));
+    add(&here, &["--project", "nebula"], "After");
+    let launched = std::fs::read_to_string(&launches).unwrap().lines().count();
+    assert_eq!(launched, 1, "the link reconnected over one late reply");
 }
 
 #[test]
@@ -2198,6 +2371,49 @@ fn link_refuses_protocol_31() {
 }
 
 #[test]
+fn link_names_a_host_without_connect_only() {
+    let here = viewer("echo \"error: unexpected argument '--connect-only' found\" >&2; exit 2");
+    let out = here.cli(&["todo", "add", "--project", "nebula", "Old peer"], None);
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("without `proxy --connect-only`"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn link_survives_a_transport_that_talks_on_stderr() {
+    let board = board_env();
+    let here = viewer(&format!(
+        "head -c 200000 /dev/zero >&2; {}",
+        proxy_to(&board)
+    ));
+    let card = add(&here, &["--project", "nebula"], "Loud");
+    assert_eq!(card["ref"], "#1@boardhost");
+}
+
+#[test]
+fn link_echoing_its_command_is_not_an_old_peer() {
+    let here = viewer("echo \"+ ssh boardhost nebula {proxy}\" >&2; exit 1");
+    let out = here.cli(&["todo", "add", "--project", "nebula", "Echo"], None);
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+    assert!(
+        !stderr(&out).contains("without `proxy --connect-only`"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn link_refuses_a_relay_template_without_proxy() {
+    let here = viewer(&proxy_to(&board_env()).replace("{proxy}", "proxy"));
+    let out = here.cli(&["todo", "add", "--project", "nebula", "Plain"], None);
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+    assert!(stderr(&out).contains("{proxy}"), "{}", stderr(&out));
+}
+
+#[test]
 fn link_refuses_hello_ok_31() {
     let env = Env::new();
     let reply = reply_file(
@@ -2245,6 +2461,65 @@ fn link_refusal_cleared_by_later_attempt() {
     let gone = here.cli(&argv, None);
     assert_eq!(gone.status.code(), Some(3), "{}", stderr(&gone));
     assert!(stderr(&gone).contains(UNREACHABLE), "{}", stderr(&gone));
+}
+
+#[test]
+fn link_stops_when_the_board_turns_local() {
+    let env = Env::new();
+    let launches = env.tmp.path().join("launches");
+    let here = viewer(&format!("echo >> '{}'; exit 0", launches.display()));
+    let count = || {
+        std::fs::read_to_string(&launches)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+    let out = here.cli(&["todo", "add", "--project", "nebula", "Away"], None);
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+
+    here.board_local();
+    let out = here.cli(&["todo", "list", "--all"], None);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let before = count();
+    assert!(before > 0, "the link never launched its transport");
+    let relaunched = poll_until(Duration::from_secs(7), || (count() > before).then_some(()));
+    assert_eq!(
+        relaunched, None,
+        "the old board host's link kept reconnecting"
+    );
+}
+
+#[test]
+fn link_stops_when_an_idle_host_unsets_its_board() {
+    let board = Env::new();
+    board.board_local();
+    let board = board.start(&[("NEBULA_BOARD_STALE_MS", "1500")]);
+    let here = viewer_on(&proxy_to(&board), "herehost", &[]);
+    reported(&board, "herehost");
+    here.write_config("{}");
+    here.make_repo();
+    eventually("the unset board's link closing", || {
+        hosts_of(&board, &["--all"])
+            .iter()
+            .any(|h| h["host"] == "herehost" && h["stale"] == true)
+            .then_some(())
+    });
+}
+
+#[test]
+fn a_host_reports_to_the_local_board_it_switched_to() {
+    let board = board_env();
+    let here = viewer_on(&proxy_to(&board), "herehost", &[]);
+    reported(&board, "herehost");
+    here.board_local();
+    let added = here.cli(&["workspace", "add", "elsewhere"], None);
+    assert!(added.status.success(), "{}", stderr(&added));
+    eventually("the host reporting to its new local board", || {
+        hosts_of(&here, &["--all"])
+            .iter()
+            .any(|h| h["host"] == "herehost")
+            .then_some(())
+    });
 }
 
 fn rerun_id(out: &Output) -> String {
@@ -2821,6 +3096,227 @@ fn approve_checks_status_timestamp() {
     assert_eq!(inputs(), before + 1);
 }
 
+struct Killed(Child);
+
+impl Drop for Killed {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// A socket the CLI reaches its daemon through (its runtime dir is
+/// returned) that forwards every frame. The first daemon frame holding
+/// `needle` is, once, held back while `run` runs and then forwarded, or
+/// with no `run` never sent: the CLI's connection closes instead.
+fn interposer(env: &Env, needle: &[u8], run: &[&str]) -> (Killed, PathBuf) {
+    let script = env.tmp.path().join("interpose.py");
+    std::fs::write(
+        &script,
+        r#"import os, socket, subprocess, sys, threading
+listen, upstream, once, needle = sys.argv[1], sys.argv[2], sys.argv[3], bytes.fromhex(sys.argv[4])
+run = sys.argv[5:]
+srv = socket.socket(socket.AF_UNIX)
+srv.bind(listen)
+srv.listen(8)
+def serve(c):
+    u = socket.socket(socket.AF_UNIX)
+    u.connect(upstream)
+    def up():
+        try:
+            while True:
+                b = c.recv(65536)
+                if not b:
+                    break
+                u.sendall(b)
+            u.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+    threading.Thread(target=up, daemon=True).start()
+    def exact(n):
+        buf = b''
+        while len(buf) < n:
+            got = u.recv(n - len(buf))
+            if not got:
+                return None
+            buf += got
+        return buf
+    while True:
+        head = exact(4)
+        body = head and exact(int.from_bytes(head, 'little'))
+        hit = body is not None and needle in body and not os.path.exists(once)
+        if hit:
+            open(once, 'w').close()
+            if run:
+                subprocess.run(run)
+        if body is None or (hit and not run):
+            c.shutdown(socket.SHUT_RDWR)
+            c.close()
+            u.close()
+            return
+        c.sendall(head + body)
+while True:
+    c, _ = srv.accept()
+    threading.Thread(target=serve, args=(c,), daemon=True).start()
+"#,
+    )
+    .unwrap();
+    let rt = env.tmp.path().join("cut-rt");
+    std::fs::create_dir_all(&rt).unwrap();
+    let hex: String = needle.iter().map(|b| format!("{b:02x}")).collect();
+    let mut cmd = Command::new("python3");
+    for k in LIVE_SESSION_ENV {
+        cmd.env_remove(k);
+    }
+    let child = cmd
+        .arg(&script)
+        .arg(rt.join("daemon.sock"))
+        .arg(env.runtime_dir().join("daemon.sock"))
+        .arg(env.tmp.path().join("ack-cut-once"))
+        .arg(hex)
+        .args(run)
+        .env("NEBULA_RUNTIME_DIR", env.runtime_dir())
+        .env("NEBULA_DATA_DIR", env.data_dir())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let child = Killed(child);
+    wait_for(&rt.join("daemon.sock"));
+    (child, rt)
+}
+
+fn ack_cutter(env: &Env) -> (Killed, PathBuf) {
+    interposer(env, b"\xa3Ack", &[])
+}
+
+/// An add whose reply is lost exits 4 naming the caller's own --id, and
+/// that rerun lands the one card.
+#[test]
+fn lost_reply_to_a_given_id_exit_4() {
+    let env = board_env();
+    let (cutter, rt) = interposer(&env, b"BoardReply", &[]);
+    let id = TodoId::generate().0;
+    let argv = [
+        "todo",
+        "add",
+        "--json",
+        "--project",
+        "nebula",
+        "--id",
+        &id,
+        "T",
+    ];
+    let lost = env.cli_env(&argv, None, &[("NEBULA_RUNTIME_DIR", rt.to_str().unwrap())]);
+    drop(cutter);
+    assert_eq!(lost.status.code(), Some(4), "{}", stderr(&lost));
+    assert!(
+        stderr(&lost).contains(&format!("--id {id}")),
+        "{}",
+        stderr(&lost)
+    );
+    assert_eq!(env.json(&argv)["id"], id.as_str());
+    assert_eq!(list(&env, &["--project", "nebula"]), ["T"]);
+}
+
+/// Run and Approve whose final Ack is lost after they took effect exit 4
+/// and name what reruns them, as a lost board reply does.
+#[test]
+fn lost_final_ack_exit_4() {
+    let replay = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/replay");
+    let agent = format!(
+        "{} {}",
+        replay.join("agent").display(),
+        replay.join("ask.replay").display()
+    );
+    let env = Env::new();
+    env.board_local();
+    let input = env.tmp.path().join("input.log");
+    let env = env.start(&[
+        ("NEBULA_AGENT_CMD", agent.as_str()),
+        ("NEBULA_STATUS_TICK_MS", "100"),
+        ("REPLAY_INPUT_LOG", input.to_str().unwrap()),
+    ]);
+    let inputs = || {
+        std::fs::read_to_string(&input)
+            .map(|log| log.lines().count())
+            .unwrap_or(0)
+    };
+    env.make_repo();
+    add(&env, &["--project", "repo"], "Ask");
+
+    let (cutter, cut_rt) = ack_cutter(&env);
+    let cut_rt = cut_rt.to_str().unwrap();
+    let dispatch = TodoId::generate().0;
+    let argv = run_argv(&env, "#1", &[], &["--dispatch", &dispatch]);
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    let lost = env.cli_env(&argv, None, &[("NEBULA_RUNTIME_DIR", cut_rt)]);
+    assert_eq!(lost.status.code(), Some(4), "{}", stderr(&lost));
+    assert!(
+        stderr(&lost).contains(&format!("--dispatch {dispatch}")),
+        "{}",
+        stderr(&lost)
+    );
+    let session = eventually("the spawned session", || {
+        agents_of(&env)
+            .first()
+            .map(|a| a["id"].as_str().unwrap().to_string())
+    });
+    let rerun = receipt(run_card(&env, "#1", &["--dispatch", &dispatch]));
+    assert_eq!(rerun["state"], "started");
+    assert_eq!(rerun["session"]["id"], session.as_str());
+    assert_eq!(agents_of(&env).len(), 1);
+
+    let name = session_row(&env, &session)["name"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for text in ["go", "on"] {
+        let sent = env.cli(&["agent", "send", &name, text, "--project", "repo"], None);
+        assert!(sent.status.success(), "{}", stderr(&sent));
+    }
+    let asked = eventually("the session asking", || {
+        let row = session_row(&env, &session);
+        (row["status"] == "needs_feedback").then_some(row)
+    });
+    let at = asked["status_changed_at"].as_i64().unwrap();
+    eventually("the asking session on the card", || {
+        chain(&env, "#1")
+            .iter()
+            .any(|s| s["id"] == session.as_str() && s["status_changed_at"] == at)
+            .then_some(())
+    });
+    let before = eventually("both prompts read", || (inputs() == 2).then_some(2));
+    drop(cutter);
+    std::fs::remove_file(env.tmp.path().join("ack-cut-once")).unwrap();
+    std::fs::remove_file(Path::new(cut_rt).join("daemon.sock")).unwrap();
+    let (cutter, _) = ack_cutter(&env);
+    let at = at.to_string();
+    let lost = env.cli_env(
+        &[
+            "todo",
+            "approve",
+            "#1",
+            "--session",
+            &session,
+            "--expected-status-at",
+            &at,
+        ],
+        None,
+        &[("NEBULA_RUNTIME_DIR", cut_rt)],
+    );
+    drop(cutter);
+    assert_eq!(lost.status.code(), Some(4), "{}", stderr(&lost));
+    assert!(
+        stderr(&lost).contains(&session)
+            && stderr(&lost).contains(&format!("--expected-status-at {at}")),
+        "{}",
+        stderr(&lost)
+    );
+    eventually("the approval's Enter", || {
+        (inputs() == before + 1).then_some(())
+    });
+}
+
 #[test]
 fn cross_host_child_keeps_parent() {
     let board = board_env();
@@ -2943,7 +3439,7 @@ fn ssh_stub_as(env: &Env, target: &Env, host: &str) -> (String, PathBuf, PathBuf
     std::fs::write(
         bin.join("ssh"),
         format!(
-            "#!/bin/sh\n[ \"$(cat '{log}' 2>/dev/null | grep -c '^BatchMode=yes$')\" -ge 3 ] && exit 255\nprintf '%s\\n' \"$@\" >> '{log}'\n[ -e '{down}' ] && {{ echo 'ssh: connect to host: Connection refused' >&2; exit 255; }}\nfor arg do script=$arg; done\nunset NEBULA_AGENT_ID\nexport HOME='{home}' NEBULA_RUNTIME_DIR='{rt}' NEBULA_DATA_DIR='{data}' NEBULA_HOSTNAME='{host}' PATH='{nebula}':\"$PATH\"\n[ -e '{lost}' ] && {{ /bin/sh -c \"$script\" >/dev/null 2>&1; . '{lost}'; echo 'Connection to host closed by remote host.' >&2; exit 255; }}\nexec /bin/sh -c \"$script\"\n",
+            "#!/bin/sh\n[ \"$(cat '{log}' 2>/dev/null | grep -c '^BatchMode=yes$')\" -ge 3 ] && exit 255\nprintf '%s\\n' \"$@\" >> '{log}'\n[ -e '{down}' ] && {{ echo 'ssh: connect to host: Connection refused' >&2; exit 255; }}\nwhile [ \"$1\" != -- ]; do shift; done\nshift 2\nscript=\"$*\"\nunset NEBULA_AGENT_ID\nexport HOME='{home}' NEBULA_RUNTIME_DIR='{rt}' NEBULA_DATA_DIR='{data}' NEBULA_HOSTNAME='{host}' PATH='{nebula}':\"$PATH\"\n[ -e '{lost}' ] && {{ /bin/sh -c \"$script\" >/dev/null 2>&1; . '{lost}'; echo 'Connection to host closed by remote host.' >&2; exit 255; }}\nexec /bin/sh -c \"$script\"\n",
             log = log.display(),
             down = down.display(),
             lost = env.tmp.path().join("ssh-lost").display(),
@@ -3623,19 +4119,18 @@ fn run_worktree_new() {
 
 const SEEDED_TODO: &str = "01JD0000000000000000000T01";
 
-fn seed_at(db: &Path, version: usize, rows: &str) {
+/// Frozen schemas of released versions, so a migration test seeds the
+/// schema users have, not the SQL under test.
+fn seed_at(db: &Path, version: i64, rows: &str) {
+    let schema = match version {
+        9 => include_str!("fixtures/schema_v9.sql"),
+        19 => include_str!("fixtures/schema_v19.sql"),
+        28 => include_str!("fixtures/schema_v28.sql"),
+        _ => panic!("no frozen schema for v{version}"),
+    };
     let conn = rusqlite::Connection::open(db).unwrap();
-    for (i, migration) in nebula_daemon::store::MIGRATIONS
-        .iter()
-        .take(version)
-        .enumerate()
-    {
-        conn.execute_batch(&format!(
-            "BEGIN; {migration}; PRAGMA user_version = {}; COMMIT;",
-            i + 1
-        ))
-        .unwrap();
-    }
+    conn.execute_batch(schema).unwrap();
+    conn.pragma_update(None, "user_version", version).unwrap();
     conn.execute_batch(rows).unwrap();
 }
 
@@ -3949,8 +4444,9 @@ fn fake_workers_ai(env: &Env) -> PathBuf {
     let attempted = env.tmp.path().join("rag-attempted");
     let hung = env.tmp.path().join("rag-hung-pid");
     let script = format!(
-        "#!/bin/sh\ncat >/dev/null\nif [ -e '{}' ]; then echo $$ > '{}'; touch '{}'; exec sleep 30; fi\nif [ -e '{}' ]; then touch '{}'; printf '%s\\n400' '{{\"errors\":[{{\"message\":\"down\"}}]}}'; exit 0; fi\nprintf '%s\\n200' '{{\"result\":{{\"data\":[[{vector}]]}}}}'\n",
+        "#!/bin/sh\nbody=$(cat)\nif [ -e '{}' ]; then echo \"$body\" >> '{}.bodies'; echo $$ > '{}'; touch '{}'; exec sleep 30; fi\nif [ -e '{}' ]; then touch '{}'; printf '%s\\n400' '{{\"errors\":[{{\"message\":\"down\"}}]}}'; exit 0; fi\nprintf '%s\\n200' '{{\"result\":{{\"data\":[[{vector}]]}}}}'\n",
         hang.display(),
+        hung.display(),
         hung.display(),
         attempted.display(),
         down.display(),
@@ -4184,6 +4680,23 @@ fn decision_add_home_ignores_the_callers_checkout() {
 }
 
 #[test]
+fn home_decision_reaches_shared_rag() {
+    let env = rag_board(None, &[]);
+    let decided = decide(
+        &env,
+        None,
+        &[
+            "--home",
+            "--why=Nobody owns the inbox",
+            "Keep a shared inbox",
+        ],
+    );
+    assert_eq!(decided["project"], Value::Null);
+    let note = rag_note(&env, decided["id"].as_str().unwrap());
+    assert_eq!(rag_hit(&env, "Nobody owns the inbox", note)["ws"], "shared");
+}
+
+#[test]
 fn decision_in_a_project_rag_cannot_name_still_reaches_rag() {
     let env = rag_board(None, &[]);
     let spaced = decide(
@@ -4256,6 +4769,55 @@ fn hung_rag_copy_is_killed_at_its_deadline() {
         !pid_alive(pid.trim()),
         "the hung rag child {pid} outlived its deadline"
     );
+}
+
+#[test]
+fn an_unanswering_rag_ends_the_copy_tick_at_the_first_decision() {
+    let env = rag_board(Some("rag-hang"), &[("NEBULA_RAG_TIMEOUT_MS", "300")]);
+    decide(&env, None, &["First decision", "--project", "repo"]);
+    decide(&env, None, &["Second decision", "--project", "repo"]);
+    let bodies = env.tmp.path().join("rag-hung-pid.bodies");
+    let tried = poll_until(Duration::from_secs(10), || {
+        std::fs::read_to_string(&bodies)
+            .ok()
+            .filter(|tried| tried.matches("First decision").count() >= 8)
+    })
+    .expect("the board stopped retrying the first decision");
+    assert!(!tried.contains("Second decision"), "{tried}");
+}
+
+#[test]
+fn reading_a_pending_decision_does_not_retry_its_copy() {
+    let env = rag_board(
+        Some("rag-hang"),
+        &[
+            ("NEBULA_RAG_TIMEOUT_MS", "300"),
+            ("NEBULA_RAG_COPY_MS", "600000"),
+        ],
+    );
+    let decided = decide(&env, None, &["Read me", "--project", "repo"]);
+    let id = decided["id"].as_str().unwrap();
+    let bodies = env.tmp.path().join("rag-hung-pid.bodies");
+    let attempts = || {
+        std::fs::read_to_string(&bodies)
+            .unwrap_or_default()
+            .matches("Read me")
+            .count()
+            / 2
+    };
+    poll_until(Duration::from_secs(10), || (attempts() == 1).then_some(()))
+        .expect("publishing never copied the decision");
+    let hung = env.tmp.path().join("rag-hung-pid");
+    eventually("the first copy attempt ending", || {
+        std::fs::read_to_string(&hung)
+            .ok()
+            .filter(|pid| !pid_alive(pid.trim()))
+    });
+    for _ in 0..3 {
+        env.json(&["decision", "show", id, "--json"]);
+    }
+    let retried = poll_until(Duration::from_secs(2), || (attempts() > 1).then_some(()));
+    assert_eq!(retried, None, "a read woke the RAG copier");
 }
 
 #[test]

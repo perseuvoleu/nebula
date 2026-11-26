@@ -67,7 +67,8 @@ enum Command {
         #[arg(long, requires = "session")]
         no_focus: bool,
         /// Run this open on HOST over ssh (BatchMode) and print its object;
-        /// an unreachable HOST exits 3. This machine's own name opens here.
+        /// an unreachable HOST exits 3, a HOST with no TUI running 5. This
+        /// machine's own name opens here.
         #[arg(long, value_name = "HOST", requires = "session")]
         on: Option<String>,
         /// Print the landed object as JSON (what --session prints anyway).
@@ -801,8 +802,8 @@ enum TodoCommand {
         #[arg(long, value_parser = parse_role)]
         role: Role,
         /// claude | codex | cursor | pi | antigravity.
-        #[arg(long)]
-        kind: String,
+        #[arg(long, value_parser = parse_kind)]
+        kind: nebula_core::AgentKind,
         /// The host to run on.
         #[arg(long, default_value = "leaseweb")]
         host: String,
@@ -999,6 +1000,16 @@ fn parse_stage(text: &str) -> Result<Stage, String> {
         .ok_or_else(|| format!("{text:?} is not a stage (backlog, next, doing, review, done)"))
 }
 
+fn parse_kind(text: &str) -> Result<nebula_core::AgentKind, String> {
+    nebula_core::AgentKind::parse(text).ok_or_else(|| {
+        let kinds: Vec<&str> = nebula_core::AgentKind::ALL
+            .iter()
+            .map(|k| k.as_str())
+            .collect();
+        format!("{text:?} is not an agent kind ({})", kinds.join(", "))
+    })
+}
+
 fn parse_role(text: &str) -> Result<Role, String> {
     Role::parse(text)
         .ok_or_else(|| format!("{text:?} is not a role (worker, review, fix, verify, research)"))
@@ -1086,6 +1097,9 @@ fn main() -> Result<()> {
             ..
         }) => {
             use std::io::IsTerminal;
+            if let Some(host) = &on {
+                nebula_tui::session_open::check_host(host)?;
+            }
             if let Some(host) = on.filter(|h| !nebula_core::host::names_this_machine(h)) {
                 let code =
                     nebula_tui::run_open_on_host(&host, &reference, project.as_deref(), !no_focus)?;

@@ -649,6 +649,34 @@ pub(crate) fn resolve_project(
         .cloned()
 }
 
+/// The connection closed or timed out after a request went out and before
+/// its reply: the request may have taken effect.
+#[derive(Debug)]
+pub struct ReplyLost(pub &'static str);
+
+impl std::fmt::Display for ReplyLost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for ReplyLost {}
+
+pub(crate) const CLOSED: ReplyLost = ReplyLost("daemon closed the connection before replying");
+
+/// The next frame after a request went out. A wait past a minute, a
+/// closed connection and a failed or cut read are all [`ReplyLost`].
+pub(crate) async fn read_reply(conn: &mut Connection) -> Result<ServerEvent> {
+    let read = read_frame::<ServerEvent, _>(&mut conn.stream);
+    match tokio::time::timeout(Duration::from_secs(60), read).await {
+        Err(_) => Err(ReplyLost("timed out waiting for the daemon's reply").into()),
+        Ok(Err(why)) => Err(anyhow::Error::new(why)
+            .context(ReplyLost("the connection failed before the daemon replied"))),
+        Ok(Ok(None)) => Err(CLOSED.into()),
+        Ok(Ok(Some(event))) => Ok(event),
+    }
+}
+
 /// Await the Ack (or Error) for `req_id`, collecting entity upserts seen on
 /// the way; the daemon broadcasts the created row just before the Ack.
 pub(crate) async fn await_ack(
@@ -657,21 +685,14 @@ pub(crate) async fn await_ack(
     upserts: &mut Vec<nebula_core::Entity>,
 ) -> Result<Option<nebula_core::EntityId>> {
     loop {
-        let event = tokio::time::timeout(
-            Duration::from_secs(60),
-            read_frame::<ServerEvent, _>(&mut conn.stream),
-        )
-        .await
-        .context("timed out waiting for the daemon's reply")??;
-        match event {
-            Some(ServerEvent::Ack { req_id: r, created }) if r == req_id => return Ok(created),
-            Some(ServerEvent::Error {
+        match read_reply(conn).await? {
+            ServerEvent::Ack { req_id: r, created } if r == req_id => return Ok(created),
+            ServerEvent::Error {
                 req_id: Some(r),
                 message,
-            }) if r == req_id => bail!("{message}"),
-            Some(ServerEvent::EntityUpserted { entity }) => upserts.push(entity),
-            Some(_) => continue,
-            None => bail!("daemon closed the connection before replying"),
+            } if r == req_id => bail!("{message}"),
+            ServerEvent::EntityUpserted { entity } => upserts.push(entity),
+            _ => continue,
         }
     }
 }
@@ -1777,7 +1798,10 @@ pub async fn spawn_agent(opts: NewAgentOpts) -> Result<serde_json::Value> {
     let card = match (opts.card.as_deref(), opts.no_card) {
         (Some(text), _) => Some(crate::board_cli::check_card(&mut conn, text).await?),
         (None, true) => None,
-        (None, false) => caller.and_then(|spawner| spawner.card),
+        (None, false) => match caller.and_then(|spawner| spawner.card) {
+            Some(card) => crate::board_cli::inherited_card(&mut conn, card).await?,
+            None => None,
+        },
     };
     if let Some(host) = &project.host {
         let cache = paths::log_dir().join("skills-check");

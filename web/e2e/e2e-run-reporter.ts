@@ -1,11 +1,15 @@
 import fs from "node:fs";
 import path from "node:path";
-import type { FullConfig, FullResult, Reporter, Suite, TestCase, TestResult } from "@playwright/test/reporter";
+import type { FullConfig, FullResult, Reporter, TestCase, TestResult } from "@playwright/test/reporter";
 
 type Status = "passed" | "failed" | "skipped";
 type Step = { name: string; status: Status; duration_ms: number; screenshot?: string; error?: string };
 
 const ANSI = /\u001b\[[0-9;]*m/g;
+
+type Case = Pick<TestCase, "id" | "title">;
+type Result = Pick<TestResult, "status" | "duration" | "attachments" | "errors">;
+type Full = Pick<FullResult, "status" | "startTime" | "duration">;
 
 function stepStatus(status: TestResult["status"]): Status {
   return status === "passed" || status === "skipped" ? status : "failed";
@@ -15,21 +19,21 @@ function stepStatus(status: TestResult["status"]): Status {
 export default class E2eRunReporter implements Reporter {
   private readonly options: { outputDir: string; title?: string };
   private root = process.cwd();
-  private readonly results = new Map<string, { test: TestCase; result: TestResult }>();
+  private readonly results = new Map<string, { test: Case; result: Result }>();
 
   constructor(options: { outputDir: string; title?: string }) {
     this.options = options;
   }
 
-  onBegin(config: FullConfig, _suite: Suite) {
+  onBegin(config: Pick<FullConfig, "configFile">) {
     if (config.configFile) this.root = path.dirname(config.configFile);
   }
 
-  onTestEnd(test: TestCase, result: TestResult) {
+  onTestEnd(test: Case, result: Result) {
     this.results.set(test.id, { test, result });
   }
 
-  async onEnd(full: FullResult) {
+  async onEnd(full: Full) {
     if (this.results.size === 0) return;
     const out = path.resolve(this.root, this.options.outputDir);
     const staging = `${out}.staging`;
@@ -43,7 +47,7 @@ export default class E2eRunReporter implements Reporter {
     }
   }
 
-  private write(out: string, full: FullResult) {
+  private write(out: string, full: Full) {
     fs.mkdirSync(path.join(out, "shots"), { recursive: true });
     const steps = [...this.results.values()].map(({ test, result }, index): Step => {
       const step: Step = { name: test.title, status: stepStatus(result.status), duration_ms: Math.max(0, Math.round(result.duration)) };

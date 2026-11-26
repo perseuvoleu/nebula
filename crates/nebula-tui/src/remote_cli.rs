@@ -103,9 +103,12 @@ pub(crate) fn ssh(host: &str, script: &str, tty: bool) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// `script` with the remote `~/.local/bin` and `~/.cargo/bin` on PATH.
+/// Puts the remote `~/.local/bin` and `~/.cargo/bin` on PATH.
+pub(crate) const REMOTE_PATH: &str = "export PATH=\"$HOME/.local/bin:$HOME/.cargo/bin:$PATH\";";
+
+/// `script` with [`REMOTE_PATH`] before it.
 pub(crate) fn with_remote_path(script: &str) -> String {
-    format!("export PATH=\"$HOME/.local/bin:$HOME/.cargo/bin:$PATH\"; {script}")
+    format!("{REMOTE_PATH} {script}")
 }
 
 async fn status(host: &str) -> Result<()> {
