@@ -15,7 +15,6 @@ import { TerminalView } from "./TerminalView";
 import { sessionKey } from "@/lib/session-list";
 import { SessionTabs } from "./SessionTabs";
 
-/** How often the terminal shows `text`'s first line; a send's echo raises the count it had when sent. */
 const echoes = (text: string, output: string): number => output.split(text.trim().split("\n")[0]).length - 1;
 
 const ATTEMPT_LABEL: Record<Attempt["state"], string> = {

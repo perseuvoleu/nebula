@@ -90,7 +90,6 @@ function useCard(slug: string | null, board: BoardData | null) {
   return state?.slug === slug ? { ...state, refresh: () => setAttempt((n) => n + 1) } : null;
 }
 
-/** Reads pages until `wanted` are all found, or every page when `wanted` is null. */
 async function readDecisions(query: string, wanted: string[] | null, signal: AbortSignal): Promise<Decision[]> {
   const items: Decision[] = [];
   let page: string | null = null;
@@ -102,7 +101,6 @@ async function readDecisions(query: string, wanted: string[] | null, signal: Abo
   return items;
 }
 
-/** The decisions page reads every page on each board change; the away digest reads only until it has the decisions it names. */
 function useDecisions(page: boolean, wanted: string[], query: string, board: BoardData | null) {
   const [state, setState] = useState<{ query: string; items: Decision[]; error: string | null } | null>(null);
   const enabled = page || wanted.length > 0;

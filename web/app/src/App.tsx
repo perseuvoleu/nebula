@@ -71,10 +71,6 @@ function PreviewButton({ url, className }: { url: string | null; className: stri
   );
 }
 
-/**
- * The list phase after a read. A read that loaded a project is ready; one that loaded none is an error,
- * or offline. A read that threw leaves a shown list as it was (offline aside); a first read becomes an error.
- */
 function phaseAfter(phase: ListPhase, read: "loaded" | "none" | "threw", online: boolean): ListPhase {
   switch (read) {
     case "loaded": return "ready";
@@ -170,8 +166,7 @@ function Routes({ workspace }: { workspace: Workspace }) {
 function Shell({ workspace, route }: { workspace: Workspace; route: ReturnType<typeof useSelection> }) {
   const [selection, navigate] = route;
   const project = selection.project && workspace.projects.includes(selection.project) ? selection.project : workspace.projects[0];
-  /** The session list a selection belongs to: one project, or All. */
-  const listOrigin = { project: selection.all ? null : project, all: selection.all };
+  const listOrigin = useMemo(() => ({ project: selection.all ? null : project, all: selection.all }), [project, selection.all]);
   const sessionId = selection.project && !workspace.projects.includes(selection.project) ? null : selection.session;
   const listProjects = useMemo(() => selection.all ? workspace.projects : [project], [selection.all, workspace.projects, project]);
   const sessions = useSessions(listProjects, !selection.all);
@@ -200,7 +195,7 @@ function Shell({ workspace, route }: { workspace: Workspace; route: ReturnType<t
     } else if (!selection.all && selection.project !== project) {
       navigate({ project, session: selection.session, all: false }, true);
     }
-  }, [project, selection.project, selection.session, selection.all, selection.serverless, workspace.projects, navigate]);
+  }, [project, listOrigin, selection.project, selection.session, selection.all, selection.serverless, workspace.projects, navigate]);
 
   const row = sessions.rows.find((r) => r.project === project && r.id === sessionId) ?? null;
   const currentPath = row?.path ?? (checkout?.project === project ? checkout.path : undefined);
