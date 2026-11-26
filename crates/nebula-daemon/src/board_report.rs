@@ -22,6 +22,10 @@ use tokio::sync::{broadcast, Notify};
 use tokio_util::sync::CancellationToken;
 
 const DEBOUNCE: Duration = Duration::from_secs(1);
+/// Debounces between checks of an idle host's report, so a config edit
+/// such as `writer_slots`, which raises no event, still reaches the board.
+const RECHECK: u32 = 30;
+const MAX_BACKOFF: u32 = 60;
 
 static RESEND: Notify = Notify::const_new();
 
@@ -32,7 +36,7 @@ pub fn resend() {
 }
 
 pub fn spawn(daemon: Arc<Daemon>) {
-    crate::board::boot(daemon.store.clone());
+    daemon.host_links.boot(daemon.store.clone());
     let events = daemon.events.subscribe();
     let shutdown = daemon.shutdown.clone();
     tokio::spawn(run(
@@ -49,7 +53,8 @@ trait Reporter {
 
 struct HostReporter {
     daemon: Arc<Daemon>,
-    sent: Option<HostReport>,
+    /// The last report a board took, with the board it went to.
+    sent: Option<(String, HostReport)>,
 }
 
 impl Reporter for HostReporter {
@@ -68,18 +73,29 @@ async fn run(
     debounce: Duration,
 ) {
     let mut full = false;
+    let mut backoff = debounce;
     loop {
-        match reporter.send(std::mem::take(&mut full)).await {
-            Err(e) => tracing::warn!(error = %e, "board report failed; retrying"),
-            Ok(()) => tokio::select! {
-                _ = shutdown.cancelled() => break,
-                _ = RESEND.notified() => full = true,
-                changed = next_change(&mut events) => if !changed { break },
-            },
-        }
+        let pause = match reporter.send(std::mem::take(&mut full)).await {
+            Err(e) => {
+                tracing::warn!(error = %e, retry_in = ?backoff, "board report failed; retrying");
+                let pause = backoff;
+                backoff = (backoff * 2).min(debounce * MAX_BACKOFF);
+                pause
+            }
+            Ok(()) => {
+                backoff = debounce;
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = RESEND.notified() => full = true,
+                    changed = next_change(&mut events) => if !changed { break },
+                    _ = tokio::time::sleep(debounce * RECHECK) => {}
+                }
+                debounce
+            }
+        };
         tokio::select! {
             _ = shutdown.cancelled() => break,
-            _ = tokio::time::sleep(debounce) => {}
+            _ = tokio::time::sleep(pause) => {}
         }
         while events.try_recv().is_ok() {}
     }
@@ -101,17 +117,25 @@ async fn next_change(events: &mut broadcast::Receiver<ServerEvent>) -> bool {
     }
 }
 
-async fn send_if_changed(daemon: &Arc<Daemon>, sent: &mut Option<HostReport>) -> Result<()> {
+async fn send_if_changed(
+    daemon: &Arc<Daemon>,
+    sent: &mut Option<(String, HostReport)>,
+) -> Result<()> {
     let config = crate::config::Config::load();
+    let link = daemon
+        .board_link
+        .for_board(config.board.as_deref(), &daemon.shutdown);
     let Some(board) = config.board else {
         return Ok(());
     };
-    let link = (board != "local").then(|| crate::board_link::to(&board, &daemon.shutdown));
     if link.as_ref().is_some_and(|link| !link.state().borrow().up) {
         return Ok(());
     }
     let report = host_report(daemon, config.writer_slots)?;
-    if sent.as_ref() == Some(&report) {
+    if sent
+        .as_ref()
+        .is_some_and(|(to, last)| *to == board && *last == report)
+    {
         return Ok(());
     }
     let op = BoardOp::Report(report.clone());
@@ -120,11 +144,14 @@ async fn send_if_changed(daemon: &Arc<Daemon>, sent: &mut Option<HostReport>) ->
             link.request(op).await?;
         }
         None => {
-            let store = daemon.store.clone();
-            tokio::task::spawn_blocking(move || crate::board::serve(&store, op)).await??;
+            let daemon = daemon.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::board::serve(&daemon.store, &daemon.host_links, op)
+            })
+            .await??;
         }
     }
-    *sent = Some(report);
+    *sent = Some((board, report));
     Ok(())
 }
 
@@ -594,5 +621,45 @@ mod tests {
             2,
             "no event came, yet the report retried once"
         );
+    }
+
+    struct Counting(Arc<AtomicUsize>, bool);
+
+    impl Reporter for Counting {
+        async fn send(&mut self, _full: bool) -> Result<()> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            match self.1 {
+                true => anyhow::bail!("board host unreachable"),
+                false => Ok(()),
+            }
+        }
+    }
+
+    async fn sends_within(reporter_fails: bool, debounce: Duration, window: Duration) -> usize {
+        let (_events, rx) = broadcast::channel(16);
+        let shutdown = CancellationToken::new();
+        let sends = Arc::new(AtomicUsize::new(0));
+        let reporter = Counting(sends.clone(), reporter_fails);
+        let task = tokio::spawn(run(reporter, rx, shutdown.clone(), debounce));
+        tokio::time::sleep(window).await;
+        shutdown.cancel();
+        task.await.unwrap();
+        sends.load(Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn an_idle_host_rechecks_its_report_for_config_edits() {
+        let sends =
+            sends_within(false, Duration::from_millis(10), Duration::from_millis(700)).await;
+        assert!(
+            sends >= 2,
+            "no event came and the report was never rechecked"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_persistent_failure_backs_off() {
+        let sends = sends_within(true, Duration::from_millis(10), Duration::from_millis(500)).await;
+        assert!(sends <= 8, "{sends} attempts in 50 debounces");
     }
 }

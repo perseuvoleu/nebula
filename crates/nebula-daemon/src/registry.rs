@@ -127,6 +127,9 @@ pub struct Daemon {
     /// daemon's tree for those projects and forwards our clients' requests
     /// to it (see `relay.rs`).
     relays: Mutex<HashMap<String, Arc<crate::relay::Relay>>>,
+    pub(crate) board_link: crate::board_link::LinkSlot,
+    /// On the board host: which hosts hold a report connection open.
+    pub(crate) host_links: crate::board::HostLinks,
 }
 
 impl Daemon {
@@ -170,6 +173,8 @@ impl Daemon {
             session_interest: Mutex::new(HashMap::new()),
             last_cwd: Mutex::new(HashMap::new()),
             relays: Mutex::new(HashMap::new()),
+            board_link: Default::default(),
+            host_links: Default::default(),
         })
     }
 
@@ -2508,17 +2513,24 @@ impl Daemon {
         };
         self.store
             .insert_agent_with_auto_title(&agent, auto_title)?;
-        if let Some(host) = &link.parent_host {
-            self.store.set_spawned_by_host(&agent.id, host)?;
+        let launched = match &link.parent_host {
+            Some(host) => self.store.set_spawned_by_host(&agent.id, host),
+            None => Ok(()),
         }
-        if adopted.is_none() {
+        .and_then(|()| match adopted.is_some() {
+            true => Ok(()),
             // Cold path: boot the CLI right away.
-            if let Err(e) =
-                self.spawn_agent_session_with_prompt(&agent, &worktree, 80, 24, prompt.as_deref())
-            {
-                self.store.delete_agent(&agent.id)?;
-                return Err(e);
+            false => self
+                .spawn_agent_session_with_prompt(&agent, &worktree, 80, 24, prompt.as_deref())
+                .map(drop),
+        });
+        if let Err(e) = launched {
+            // A dispatch rerun replays any row it finds as started.
+            self.store.delete_agent(&agent.id)?;
+            if adopted.is_some() {
+                self.kill_session(&SessionRef::Agent(agent.id.clone()));
             }
+            return Err(e);
         }
         let mut broadcast_agent = agent.clone();
         broadcast_agent.alive = true;
@@ -5993,6 +6005,108 @@ exec sleep 60
             "the retry waited for the warm PTY"
         );
         assert_eq!(git::current_branch(&repo).await.unwrap(), "feat");
+    }
+
+    #[tokio::test]
+    async fn a_failed_parent_host_write_stops_the_adopted_warm_pty() {
+        let (_script, agent) = stand_in_agent(&[]);
+        let (_tmp, _repo, daemon, _pid, primary) =
+            primary_with_feat_on(test_daemon_with(DaemonOverrides {
+                stop_deadline: Duration::from_millis(1500),
+                agent_cmd: agent,
+            }))
+            .await;
+        let warm = warm_pid(&daemon, &primary.id).await;
+        daemon
+            .store
+            .board_transaction(|tx| {
+                tx.execute_batch(
+                    "CREATE TEMP TRIGGER no_parent_host BEFORE UPDATE OF spawned_by_host ON agents
+                     BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let created = daemon
+            .create_agent(
+                &primary.id,
+                None,
+                "child",
+                AgentKind::Claude,
+                None,
+                None,
+                false,
+                None,
+                WriterClaim::Off,
+                None,
+                false,
+                CardLink {
+                    parent_host: Some("far".into()),
+                    ..CardLink::default()
+                },
+            )
+            .await;
+        assert!(created.is_err(), "{created:?}");
+        assert!(
+            process_exits(warm).await,
+            "the adopted warm PTY outlived its deleted row"
+        );
+        daemon.kill_all();
+    }
+
+    #[tokio::test]
+    async fn a_dispatch_retried_after_a_failed_parent_host_write_starts_a_live_session() {
+        let (_script, agent) = stand_in_agent(&[]);
+        let (_tmp, _repo, daemon, _pid, primary) =
+            primary_with_feat_on(test_daemon_with(DaemonOverrides {
+                stop_deadline: Duration::from_millis(1500),
+                agent_cmd: agent,
+            }))
+            .await;
+        let fail_write = |on: bool| {
+            daemon
+                .store
+                .board_transaction(|tx| {
+                    tx.execute_batch(match on {
+                        true => "CREATE TEMP TRIGGER no_parent_host BEFORE UPDATE OF spawned_by_host ON agents
+                                 BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END",
+                        false => "DROP TRIGGER no_parent_host",
+                    })?;
+                    Ok(())
+                })
+                .unwrap()
+        };
+        let create = || {
+            daemon.create_agent(
+                &primary.id,
+                None,
+                "worker",
+                AgentKind::Claude,
+                None,
+                None,
+                false,
+                None,
+                WriterClaim::Off,
+                None,
+                false,
+                CardLink {
+                    dispatch: Some(nebula_core::DispatchId("d1".into())),
+                    parent_host: Some("far".into()),
+                    ..CardLink::default()
+                },
+            )
+        };
+        fail_write(true);
+        assert!(create().await.is_err());
+        fail_write(false);
+        let EntityId::Agent(id) = create().await.unwrap() else {
+            panic!("not an agent")
+        };
+        assert!(
+            daemon.is_alive(&SessionRef::Agent(id)),
+            "the retry replayed a never-launched row as started"
+        );
+        daemon.kill_all();
     }
 
     #[tokio::test]

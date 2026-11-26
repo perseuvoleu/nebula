@@ -19,25 +19,32 @@ use std::time::{Duration, Instant};
 /// Bytes one page may carry, hosts and the away digest included; the rest
 /// of the frame is headroom for the envelope.
 pub(crate) fn page_budget() -> usize {
-    std::env::var("NEBULA_BOARD_PAGE_BYTES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(MAX_FRAME_LEN as usize / 2)
+    budget(std::env::var("NEBULA_BOARD_PAGE_BYTES").ok().as_deref())
 }
 
-pub fn serve(store: &Store, op: BoardOp) -> Result<BoardResult> {
-    let result = store.board_transaction(|tx| apply(tx, op))?;
-    if let BoardResult::Artifact(artifact) = &result {
-        if artifact.kind == "decision" && !artifact.meta.contains_key("rag_note") {
+fn budget(lowered: Option<&str>) -> usize {
+    let most = MAX_FRAME_LEN as usize / 2;
+    lowered
+        .and_then(|v| v.parse().ok())
+        .map_or(most, |v: usize| v.min(most))
+}
+
+pub(crate) fn serve(store: &Store, links: &HostLinks, op: BoardOp) -> Result<BoardResult> {
+    let publishes = matches!(op, BoardOp::Publish(_));
+    let result = store.board_transaction(|tx| apply(tx, links, op))?;
+    if let (true, BoardResult::Artifact(artifact)) = (publishes, &result) {
+        if artifact.kind == nebula_core::board::DECISION_KIND
+            && !artifact.meta.contains_key("rag_note")
+        {
             crate::rag_copy::kick();
         }
     }
     Ok(result)
 }
 
-fn apply(tx: &Transaction, op: BoardOp) -> Result<BoardResult> {
+fn apply(tx: &Transaction, links: &HostLinks, op: BoardOp) -> Result<BoardResult> {
     match op {
-        BoardOp::Read(read) => read_op(tx, read),
+        BoardOp::Read(read) => read_op(tx, links, read),
         BoardOp::AddCard(draft) => add_card(tx, draft).map(BoardResult::Card),
         BoardOp::EditCard {
             card,
@@ -48,7 +55,7 @@ fn apply(tx: &Transaction, op: BoardOp) -> Result<BoardResult> {
             if let Some(title) = title {
                 let title = non_empty(&title, "a card title")?;
                 tx.execute(
-                    "UPDATE todos SET title = ?2 WHERE id = ?1",
+                    "UPDATE todos SET title = ?2 WHERE id = ?1 AND title IS NOT ?2",
                     params![id.as_str(), title],
                 )?;
             }
@@ -58,7 +65,7 @@ fn apply(tx: &Transaction, op: BoardOp) -> Result<BoardResult> {
                     Placement::Project(name) => Some(name),
                 };
                 tx.execute(
-                    "UPDATE todos SET project = ?2 WHERE id = ?1",
+                    "UPDATE todos SET project = ?2 WHERE id = ?1 AND project IS NOT ?2",
                     params![id.as_str(), project],
                 )?;
             }
@@ -142,13 +149,18 @@ fn apply(tx: &Transaction, op: BoardOp) -> Result<BoardResult> {
         }
         BoardOp::BeginRun(dispatch) => begin_run(tx, dispatch).map(BoardResult::Run),
         BoardOp::EndRun {
+            agent: Some(_),
+            error: Some(_),
+            ..
+        } => bail!("a run ends with its session or its error, not both"),
+        BoardOp::EndRun {
             dispatch,
             agent,
             error,
         } => end_run(tx, &dispatch, agent, error).map(BoardResult::Run),
-        BoardOp::Scoped { scope, op } => {
-            within(tx, &scope, &op)?;
-            apply(tx, *op)
+        BoardOp::Scoped { scope, mut op } => {
+            within(tx, &scope, &mut op)?;
+            apply(tx, links, *op)
         }
     }
 }
@@ -177,7 +189,7 @@ fn begin_run(tx: &Transaction, dispatch: Dispatch) -> Result<RunReceipt> {
                 )
         {
             bail!(Refusal::Conflict.message(format!(
-                "dispatch {} runs with --host {host} --role {role} --kind {kind} --worktree {worktree}; rerun it with those",
+                "dispatch {} runs with --host {host} --role {role} --kind {kind} --worktree {worktree:?}; rerun it with those",
                 dispatch.id.as_str()
             )));
         }
@@ -317,9 +329,20 @@ fn receipt(tx: &Transaction, id: &DispatchId) -> Result<Option<RunReceipt>> {
         .optional()?)
 }
 
-fn within(tx: &Transaction, scope: &BoardScope, op: &BoardOp) -> Result<()> {
-    let mut named = op.clone();
-    for card in named.card_refs_mut() {
+fn within(tx: &Transaction, scope: &BoardScope, op: &mut BoardOp) -> Result<()> {
+    if !matches!(
+        op,
+        BoardOp::EditCard { .. }
+            | BoardOp::Move { .. }
+            | BoardOp::Archive { .. }
+            | BoardOp::Proposal { .. }
+            | BoardOp::Block { .. }
+            | BoardOp::AddNote { .. }
+            | BoardOp::BeginRun(_)
+    ) {
+        bail!("a scoped op wraps one card write; reads and other ops carry their own scope");
+    }
+    for card in op.card_refs_mut() {
         let id = resolve(tx, card)?;
         if !in_scope(scope, card_by_id(tx, &id)?.project.as_deref()) {
             return Err(not_found(card));
@@ -329,7 +352,7 @@ fn within(tx: &Transaction, scope: &BoardScope, op: &BoardOp) -> Result<()> {
         if let Some(project) = receipt(tx, &dispatch.id)?.and_then(|r| r.project) {
             if !in_scope(scope, Some(&project)) {
                 bail!(Refusal::NotFound.message(format!(
-                    "dispatch {} runs in project \"{project}\", outside the write scope",
+                    "dispatch {} runs in project {project:?}, outside the write scope",
                     dispatch.id.as_str()
                 )));
             }
@@ -587,25 +610,42 @@ pub(crate) fn in_scope(scope: &BoardScope, project: Option<&str>) -> bool {
     }
 }
 
-fn scoped_cards(
+/// Cards in `scope` from `offset` on, in number order, without blockers,
+/// handed to `read` as SQLite steps through them, so a page decodes only
+/// the rows it takes; `with_blockers` hydrates only the ones it returns.
+fn scoped_cards<R>(
     tx: &Transaction,
     scope: &BoardScope,
     stage: Option<Stage>,
     include_archived: bool,
-) -> Result<Vec<Card>> {
-    let cards = tx
-        .prepare(&format!(
-            "SELECT {CARD_COLUMNS} FROM todos WHERE stage IS NOT NULL ORDER BY number"
-        ))?
-        .query_map([], card_from_row)?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    cards
-        .into_iter()
-        .filter(|c| in_scope(scope, c.project.as_deref()))
-        .filter(|c| stage.is_none_or(|s| s == c.stage))
-        .filter(|c| include_archived || !c.archived)
-        .map(|c| with_blockers(tx, c))
-        .collect()
+    offset: usize,
+    read: impl FnOnce(&mut dyn Iterator<Item = Result<Card>>) -> Result<R>,
+) -> Result<R> {
+    let named = match &scope.projects {
+        ProjectScope::All => None,
+        ProjectScope::Named(names) => Some(serde_json::to_string(names)?),
+    };
+    let mut stmt = tx.prepare(&format!(
+        "SELECT {CARD_COLUMNS} FROM todos WHERE stage IS NOT NULL
+           AND (CASE WHEN project IS NULL THEN ?1
+                ELSE ?2 IS NULL OR project IN (SELECT value FROM json_each(?2)) END)
+           AND (?3 IS NULL OR stage = ?3)
+           AND (?4 OR archived_at IS NULL)
+         ORDER BY number LIMIT -1 OFFSET ?5"
+    ))?;
+    let mut rows = stmt
+        .query_map(
+            params![
+                scope.include_home,
+                named,
+                stage.map(|s| s.as_str()),
+                include_archived,
+                offset as i64
+            ],
+            card_from_row,
+        )?
+        .map(|card| card.map_err(Into::into));
+    read(&mut rows)
 }
 
 pub(crate) fn cursor(tx: &Transaction) -> Result<String> {
@@ -622,36 +662,40 @@ pub(crate) fn page_offset(page: Option<&str>, version: &str) -> Result<usize> {
     let Some(page) = page else { return Ok(0) };
     match page.rsplit_once('@') {
         Some((at, offset)) if at == version => offset
-            .parse()
-            .map_err(|_| anyhow::anyhow!("malformed page token {page:?}")),
+            .parse::<i64>()
+            .ok()
+            .and_then(|offset| usize::try_from(offset).ok())
+            .ok_or_else(|| anyhow::anyhow!("malformed page token {page:?}")),
         Some(_) => bail!(Refusal::Conflict
             .message("the board changed since that page was cut; read it again from the start")),
         None => bail!("malformed page token {page:?}"),
     }
 }
 
+/// Fills one page from `items`, which start at `offset`, and cuts a
+/// continuation when an item does not fit.
 pub(crate) fn paged<T: serde::Serialize>(
-    items: Vec<T>,
+    items: impl IntoIterator<Item = Result<T>>,
     offset: usize,
     version: &str,
     budget: usize,
 ) -> Result<(Vec<T>, Option<String>)> {
-    let total = items.len();
     let mut used = 0;
     let mut page = Vec::new();
-    for item in items.into_iter().skip(offset) {
+    for item in items {
+        let item = item?;
         let size = serde_json::to_vec(&item)?.len();
         if !page.is_empty() && used + size > budget {
-            break;
+            let end = offset + page.len();
+            return Ok((page, Some(format!("{version}@{end}"))));
         }
         used += size;
         page.push(item);
     }
-    let end = offset + page.len();
-    Ok((page, (end < total).then(|| format!("{version}@{end}"))))
+    Ok((page, None))
 }
 
-fn read_op(tx: &Transaction, read: BoardRead) -> Result<BoardResult> {
+fn read_op(tx: &Transaction, links: &HostLinks, read: BoardRead) -> Result<BoardResult> {
     match read {
         BoardRead::Board {
             scope,
@@ -664,21 +708,31 @@ fn read_op(tx: &Transaction, read: BoardRead) -> Result<BoardResult> {
                 return Ok(BoardResult::Board(BoardPoll::Unchanged { version }));
             }
             let offset = page_offset(page.as_deref(), &version)?;
-            let cards = scoped_cards(tx, &scope, None, false)?;
-            let (hosts, needs_you, away) = if offset == 0 {
+            let page = |cards: &mut dyn Iterator<Item = Result<Card>>, budget| {
+                let cards = cards.map(|card| with_blockers(tx, card?));
+                paged(cards, offset, &version, budget)
+            };
+            let ((cards, next), hosts, needs_you, away) = if offset == 0 {
+                let cards: Vec<Card> =
+                    scoped_cards(tx, &scope, None, false, 0, |cards| cards.collect())?;
                 let away = match away_since {
                     Some(since) => away(tx, &scope, &cards, since)?,
                     None => Away::default(),
                 };
-                (hosts(tx, &scope)?, waiting(tx, &cards, None)?, away)
+                let hosts = hosts(tx, links, &scope)?;
+                let needs_you = waiting(tx, &cards, None)?;
+                let reserved = serde_json::to_vec(&hosts)?.len()
+                    + serde_json::to_vec(&needs_you)?.len()
+                    + serde_json::to_vec(&away)?.len();
+                let budget = page_budget().saturating_sub(reserved);
+                let cards = page(&mut cards.into_iter().map(Ok), budget)?;
+                (cards, hosts, needs_you, away)
             } else {
-                (Vec::new(), Vec::new(), Away::default())
+                let cards = scoped_cards(tx, &scope, None, false, offset, |cards| {
+                    page(cards, page_budget())
+                })?;
+                (cards, Vec::new(), Vec::new(), Away::default())
             };
-            let reserved = serde_json::to_vec(&hosts)?.len()
-                + serde_json::to_vec(&needs_you)?.len()
-                + serde_json::to_vec(&away)?.len();
-            let budget = page_budget().saturating_sub(reserved);
-            let (cards, next) = paged(cards, offset, &version, budget)?;
             Ok(BoardResult::Board(BoardPoll::Board {
                 version,
                 board: BoardPage {
@@ -698,8 +752,11 @@ fn read_op(tx: &Transaction, read: BoardRead) -> Result<BoardResult> {
         } => {
             let version = cursor(tx)?;
             let offset = page_offset(page.as_deref(), &version)?;
-            let cards = scoped_cards(tx, &scope, stage, include_archived)?;
-            let (items, next) = paged(cards, offset, &version, page_budget())?;
+            let (items, next) =
+                scoped_cards(tx, &scope, stage, include_archived, offset, |cards| {
+                    let cards = cards.map(|card| with_blockers(tx, card?));
+                    paged(cards, offset, &version, page_budget())
+                })?;
             Ok(BoardResult::Cards(Page { items, next }))
         }
         BoardRead::Card { scope, card } => {
@@ -708,15 +765,15 @@ fn read_op(tx: &Transaction, read: BoardRead) -> Result<BoardResult> {
             if !in_scope(&scope, found.project.as_deref()) {
                 return Err(not_found(&card));
             }
+            let sessions = sessions_of(tx, links, &id)?;
+            let artifacts = crate::artifacts::of_card(tx, &id)?;
+            let reserved = serde_json::to_vec(&found)?.len()
+                + serde_json::to_vec(&sessions)?.len()
+                + serde_json::to_vec(&artifacts)?.len();
             Ok(BoardResult::Show(Box::new(CardShow {
-                sessions: sessions_of(tx, &id)?,
-                artifacts: crate::artifacts::of_card(tx, &id)?,
-                log: tx
-                    .prepare(&format!(
-                        "SELECT {NOTE_COLUMNS} FROM notes WHERE todo_id = ?1 AND author IS NOT NULL ORDER BY created_at, sort_order"
-                    ))?
-                    .query_map(params![id.as_str()], note_from_row)?
-                    .collect::<rusqlite::Result<_>>()?,
+                log: newest_notes(tx, &id, page_budget().saturating_sub(reserved))?,
+                sessions,
+                artifacts,
                 card: found,
             })))
         }
@@ -744,8 +801,30 @@ fn read_op(tx: &Transaction, read: BoardRead) -> Result<BoardResult> {
     }
 }
 
-fn sessions_of(tx: &Transaction, card: &TodoId) -> Result<Vec<CardSession>> {
-    let stale = stale_hosts(tx)?;
+/// The card's log in order, cut at the oldest note so it fits in `budget`
+/// bytes and the reply stays under the frame limit.
+fn newest_notes(tx: &Transaction, card: &TodoId, budget: usize) -> Result<Vec<CardNote>> {
+    let mut stmt = tx.prepare(&format!(
+        "SELECT {NOTE_COLUMNS} FROM notes WHERE todo_id = ?1 AND author IS NOT NULL
+         ORDER BY created_at DESC, sort_order DESC"
+    ))?;
+    let rows = stmt.query_map(params![card.as_str()], note_from_row)?;
+    let mut used = 0;
+    let mut log = Vec::new();
+    for note in rows {
+        let note = note?;
+        used += serde_json::to_vec(&note)?.len();
+        if used > budget {
+            break;
+        }
+        log.push(note);
+    }
+    log.reverse();
+    Ok(log)
+}
+
+fn sessions_of(tx: &Transaction, links: &HostLinks, card: &TodoId) -> Result<Vec<CardSession>> {
+    let stale = stale_hosts(tx, links)?;
     Ok(tx
         .prepare(
             "SELECT host, agent_id, name, role, kind, status, status_changed_at, writer, alive, parent
@@ -772,12 +851,12 @@ fn sessions_of(tx: &Transaction, card: &TodoId) -> Result<Vec<CardSession>> {
         .collect::<rusqlite::Result<_>>()?)
 }
 
-fn hosts(tx: &Transaction, scope: &BoardScope) -> Result<Vec<BoardHost>> {
-    let stale = stale_hosts(tx)?;
+fn hosts(tx: &Transaction, links: &HostLinks, scope: &BoardScope) -> Result<Vec<BoardHost>> {
+    let stale = stale_hosts(tx, links)?;
     let waiting: Vec<(String, Option<String>)> = tx
         .prepare(
-            "SELECT s.host, t.project FROM board_sessions s LEFT JOIN todos t ON t.id = s.card_id
-             WHERE s.status = 'needs_feedback' AND s.archived = 0 AND s.alive = 1",
+            "SELECT s.host, t.project FROM board_sessions s JOIN todos t ON t.id = s.card_id
+             WHERE t.stage IS NOT NULL AND s.status = 'needs_feedback' AND s.archived = 0 AND s.alive = 1",
         )?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
@@ -852,10 +931,10 @@ fn away(tx: &Transaction, scope: &BoardScope, cards: &[Card], since: i64) -> Res
     let decisions = tx
         .prepare(
             "SELECT id, project FROM artifacts
-             WHERE kind = 'decision' AND removed_at IS NULL AND created_at > ?1
+             WHERE kind = ?2 AND removed_at IS NULL AND created_at > ?1
              ORDER BY created_at",
         )?
-        .query_map(params![since], |r| {
+        .query_map(params![since, nebula_core::board::DECISION_KIND], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?
@@ -878,8 +957,8 @@ fn stale_after() -> Duration {
         .unwrap_or(Duration::from_secs(300))
 }
 
-#[derive(Default)]
 struct Links {
+    boot: Instant,
     open: HashMap<String, usize>,
     closed_at: HashMap<String, Instant>,
 }
@@ -887,49 +966,82 @@ struct Links {
 impl Links {
     fn down(&self, host: &str, after: Duration) -> bool {
         self.open.get(host).copied().unwrap_or(0) == 0
-            && self.closed_at.get(host).copied().unwrap_or(*BOOT).elapsed() >= after
+            && self
+                .closed_at
+                .get(host)
+                .copied()
+                .unwrap_or(self.boot)
+                .elapsed()
+                >= after
     }
 }
 
-static LINKS: std::sync::LazyLock<Mutex<Links>> = std::sync::LazyLock::new(Default::default);
-static BOOT: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+/// On the board host: the report connections each host holds open, so a
+/// host whose last one closed reads stale once `stale_after` passes.
+#[derive(Clone)]
+pub(crate) struct HostLinks(Arc<Mutex<Links>>);
 
-pub(crate) fn boot(store: Arc<Store>) {
-    std::sync::LazyLock::force(&BOOT);
-    tokio::spawn(async move {
-        tokio::time::sleep(stale_after()).await;
-        bump(store).await;
-    });
-}
-
-/// True when `host` read stale until this link opened: the caller bumps
-/// the board version so a poll sees it fresh again.
-pub(crate) fn link_opened(host: &str) -> bool {
-    let mut links = LINKS.lock().unwrap();
-    let was_stale = links.down(host, stale_after());
-    *links.open.entry(host.to_string()).or_default() += 1;
-    links.closed_at.remove(host);
-    was_stale
-}
-
-pub(crate) fn link_closed(host: &str, store: Arc<Store>) {
-    let closed_at = Instant::now();
-    {
-        let mut links = LINKS.lock().unwrap();
-        let open = links.open.entry(host.to_string()).or_default();
-        *open = open.saturating_sub(1);
-        if *open > 0 {
-            return;
-        }
-        links.closed_at.insert(host.to_string(), closed_at);
+impl Default for HostLinks {
+    fn default() -> Self {
+        Self(Arc::new(Mutex::new(Links {
+            boot: Instant::now(),
+            open: HashMap::new(),
+            closed_at: HashMap::new(),
+        })))
     }
-    let host = host.to_string();
-    tokio::spawn(async move {
-        tokio::time::sleep(stale_after()).await;
-        if LINKS.lock().unwrap().closed_at.get(&host) == Some(&closed_at) {
+}
+
+impl HostLinks {
+    /// Once `stale_after` passes from boot, a host that never linked reads
+    /// stale: bump the version then, only when there is such a host.
+    pub(crate) fn boot(&self, store: Arc<Store>) {
+        let links = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(stale_after()).await;
+            let stale = {
+                let store = store.clone();
+                tokio::task::spawn_blocking(move || {
+                    store.board_transaction(|tx| stale_hosts(tx, &links))
+                })
+                .await
+            };
+            if matches!(stale, Ok(Ok(hosts)) if hosts.is_empty()) {
+                return;
+            }
             bump(store).await;
+        });
+    }
+
+    /// True when `host` read stale until this link opened: the caller bumps
+    /// the board version so a poll sees it fresh again.
+    pub(crate) fn opened(&self, host: &str) -> bool {
+        let mut links = self.0.lock().unwrap();
+        let was_stale = links.down(host, stale_after());
+        *links.open.entry(host.to_string()).or_default() += 1;
+        links.closed_at.remove(host);
+        was_stale
+    }
+
+    pub(crate) fn closed(&self, host: &str, store: Arc<Store>) {
+        let closed_at = Instant::now();
+        {
+            let mut links = self.0.lock().unwrap();
+            let open = links.open.entry(host.to_string()).or_default();
+            *open = open.saturating_sub(1);
+            if *open > 0 {
+                return;
+            }
+            links.closed_at.insert(host.to_string(), closed_at);
         }
-    });
+        let host = host.to_string();
+        let links = self.0.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(stale_after()).await;
+            if links.lock().unwrap().closed_at.get(&host) == Some(&closed_at) {
+                bump(store).await;
+            }
+        });
+    }
 }
 
 pub(crate) fn bump_now(store: &Store) -> Result<()> {
@@ -946,16 +1058,262 @@ async fn bump(store: Arc<Store>) {
     }
 }
 
-fn stale_hosts(tx: &Transaction) -> Result<HashSet<String>> {
+fn stale_hosts(tx: &Transaction, links: &HostLinks) -> Result<HashSet<String>> {
     let known: Vec<String> = tx
         .prepare("SELECT host FROM board_hosts UNION SELECT host FROM board_sessions")?
         .query_map([], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
-    let links = LINKS.lock().unwrap();
+    let links = links.0.lock().unwrap();
     let here = nebula_core::host::hostname();
     let after = stale_after();
     Ok(known
         .into_iter()
         .filter(|h| *h != here && links.down(h, after))
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nebula_core::board::BoardScope;
+
+    #[test]
+    fn scoped_admits_only_the_writes_its_guard_checks() {
+        let store = Store::open_in_memory().unwrap();
+        let scope = BoardScope {
+            projects: ProjectScope::Named(vec!["web".into()]),
+            include_home: false,
+        };
+        let read = BoardOp::Read(BoardRead::Cards {
+            scope: BoardScope {
+                projects: ProjectScope::All,
+                include_home: true,
+            },
+            stage: None,
+            include_archived: false,
+            page: None,
+        });
+        let nested = BoardOp::Scoped {
+            scope: scope.clone(),
+            op: Box::new(read.clone()),
+        };
+        for op in [read, nested] {
+            let scoped = BoardOp::Scoped {
+                scope: scope.clone(),
+                op: Box::new(op),
+            };
+            assert!(serve(&store, &HostLinks::default(), scoped).is_err());
+        }
+    }
+
+    fn author() -> Author {
+        Author {
+            host: "here".into(),
+            agent: None,
+            name: "me".into(),
+        }
+    }
+
+    fn add_card(store: &Store, links: &HostLinks) -> CardRef {
+        add_titled(store, links, "Card".into())
+    }
+
+    fn add_titled(store: &Store, links: &HostLinks, title: String) -> CardRef {
+        let id = TodoId::generate();
+        serve(
+            store,
+            links,
+            BoardOp::AddCard(CardDraft {
+                id: id.clone(),
+                title,
+                project: Some("web".into()),
+                stage: Stage::Backlog,
+                proposed: false,
+                created_by: author(),
+                checkout: None,
+            }),
+        )
+        .unwrap();
+        CardRef::Id(id)
+    }
+
+    #[test]
+    fn end_run_with_both_a_session_and_an_error_is_refused() {
+        let store = Store::open_in_memory().unwrap();
+        let links = HostLinks::default();
+        let CardRef::Id(card) = add_card(&store, &links) else {
+            unreachable!()
+        };
+        let id = DispatchId::generate();
+        store
+            .board_transaction(|tx| {
+                tx.execute(
+                    "INSERT INTO dispatches (id, card_id, host, role, kind, worktree, state, created_at)
+                     VALUES (?1, ?2, 'here', 'worker', 'claude', 'new', 'pending', 0)",
+                    params![id.as_str(), card.as_str()],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let ended = serve(
+            &store,
+            &links,
+            BoardOp::EndRun {
+                dispatch: id.clone(),
+                agent: Some(AgentId::generate()),
+                error: Some("spawn failed".into()),
+            },
+        );
+        assert!(ended.is_err(), "{ended:?}");
+        let Ok(BoardResult::Run(receipt)) =
+            serve(&store, &links, BoardOp::Read(BoardRead::Dispatch { id }))
+        else {
+            panic!("no receipt")
+        };
+        assert_eq!(receipt.state, DispatchState::Pending);
+    }
+
+    #[test]
+    fn a_relayed_refusal_keeps_the_worktree_it_names() {
+        let store = Store::open_in_memory().unwrap();
+        let links = HostLinks::default();
+        let card = add_card(&store, &links);
+        let run = |worktree: &str| {
+            serve(
+                &store,
+                &links,
+                BoardOp::BeginRun(nebula_core::board::Dispatch {
+                    id: DispatchId("d1".into()),
+                    card: card.clone(),
+                    host: nebula_core::host::hostname(),
+                    role: nebula_core::board::Role::Worker,
+                    kind: AgentKind::Claude,
+                    worktree: worktree.into(),
+                }),
+            )
+        };
+        run("fix/#42").unwrap();
+        let refused = run("other").unwrap_err().to_string();
+        let relayed = crate::board_link::qualify(&refused, "boardhost");
+        assert!(relayed.contains("fix/#42\""), "{relayed}");
+    }
+
+    #[test]
+    fn a_page_decodes_only_the_cards_it_returns() {
+        let store = Store::open_in_memory().unwrap();
+        let links = HostLinks::default();
+        for size in [1_000_000, 1_500_000, 1_000_000] {
+            add_titled(&store, &links, "x".repeat(size));
+        }
+        let CardRef::Id(unreadable) = add_card(&store, &links) else {
+            unreachable!()
+        };
+        store
+            .board_transaction(|tx| {
+                tx.execute(
+                    "UPDATE todos SET created_by = 'not json' WHERE id = ?1",
+                    params![unreadable.as_str()],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let scope = BoardScope {
+            projects: ProjectScope::All,
+            include_home: true,
+        };
+        let cards = |page: Option<String>| {
+            serve(
+                &store,
+                &links,
+                BoardOp::Read(BoardRead::Cards {
+                    scope: scope.clone(),
+                    stage: None,
+                    include_archived: false,
+                    page,
+                }),
+            )
+        };
+        let Ok(BoardResult::Cards(first)) = cards(None) else {
+            panic!("the first page read the card past it")
+        };
+        assert_eq!(first.items.len(), 1);
+        let Ok(BoardResult::Cards(second)) = cards(first.next.clone()) else {
+            panic!("a continuation read the card past it")
+        };
+        assert_eq!(second.items.len(), 1);
+        let board = serve(
+            &store,
+            &links,
+            BoardOp::Read(BoardRead::Board {
+                scope: scope.clone(),
+                since: None,
+                away_since: None,
+                page: first.next,
+            }),
+        );
+        let Ok(BoardResult::Board(BoardPoll::Board { board, .. })) = board else {
+            panic!("a board continuation read the card past it: {board:?}")
+        };
+        assert_eq!(board.cards.len(), 1);
+    }
+
+    #[test]
+    fn the_page_budget_override_only_lowers() {
+        let default = MAX_FRAME_LEN as usize / 2;
+        assert_eq!(budget(Some("600")), 600);
+        assert_eq!(budget(Some(&(8 * MAX_FRAME_LEN).to_string())), default);
+        assert_eq!(budget(None), default);
+    }
+
+    #[test]
+    fn a_page_token_past_the_sqlite_offset_range_is_refused() {
+        assert_eq!(
+            page_offset(Some("v.1@9223372036854775807"), "v.1").unwrap(),
+            i64::MAX as usize
+        );
+        assert!(page_offset(Some("v.1@9223372036854775808"), "v.1").is_err());
+    }
+
+    #[test]
+    fn show_keeps_the_newest_notes_when_the_log_outgrows_a_frame() {
+        let store = Store::open_in_memory().unwrap();
+        let links = HostLinks::default();
+        let author = author();
+        let card = add_card(&store, &links);
+        let notes = 2 * MAX_FRAME_LEN as usize / 100_000;
+        for i in 0..notes {
+            serve(
+                &store,
+                &links,
+                BoardOp::AddNote {
+                    id: NoteId::generate(),
+                    card: card.clone(),
+                    text: format!("{i} {}", "x".repeat(100_000)),
+                    author: author.clone(),
+                },
+            )
+            .unwrap();
+        }
+        let scope = BoardScope {
+            projects: ProjectScope::All,
+            include_home: true,
+        };
+        let BoardResult::Show(show) = serve(
+            &store,
+            &links,
+            BoardOp::Read(BoardRead::Card { scope, card }),
+        )
+        .unwrap() else {
+            panic!("not a show")
+        };
+        let frame = rmp_serde::to_vec(&BoardResult::Show(show.clone())).unwrap();
+        assert!(
+            frame.len() < MAX_FRAME_LEN as usize,
+            "{} bytes",
+            frame.len()
+        );
+        let last = show.log.last().unwrap();
+        assert!(last.text.starts_with(&format!("{} ", notes - 1)));
+        assert!(show.log.len() < notes);
+    }
 }

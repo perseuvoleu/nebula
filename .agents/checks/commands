@@ -7,7 +7,7 @@
 [Cargo.toml,Cargo.lock,crates/nebula-core/*,crates/nebula-daemon/*,crates/nebula-tui/*,vendor/vt100/*,crates/nebula/Cargo.toml,crates/nebula/build.rs,crates/nebula/src/*,crates/nebula/tests/e2e_pty.rs,scripts/sync-skills.sh,.agents/checks/commands,.agents/checks/cargo] .agents/checks/cargo test -p nebula --test e2e_pty
 [Cargo.toml,Cargo.lock,crates/nebula-core/*,crates/nebula-daemon/*,crates/nebula-tui/*,vendor/vt100/*,crates/nebula/Cargo.toml,crates/nebula/build.rs,crates/nebula/src/*,crates/nebula/tests/e2e_tui.rs,crates/nebula/tests/replay/*,.agents/checks/commands,.agents/checks/cargo] .agents/checks/cargo test -p nebula --test e2e_tui
 [Cargo.toml,Cargo.lock,crates/nebula-core/*,crates/nebula-daemon/*,crates/nebula/Cargo.toml,crates/nebula/build.rs,crates/nebula/src/*,crates/nebula/tests/preview_cli.rs,.agents/checks/commands,.agents/checks/cargo] .agents/checks/cargo test -p nebula --test preview_cli
-[Cargo.toml,Cargo.lock,crates/nebula-core/*,crates/nebula-daemon/*,crates/nebula-tui/*,crates/nebula-rag/*,vendor/vt100/*,crates/nebula/Cargo.toml,crates/nebula/build.rs,crates/nebula/src/*,crates/nebula/tests/e2e_board.rs,.agents/checks/commands,.agents/checks/cargo] .agents/checks/cargo test -p nebula --test e2e_board
+[Cargo.toml,Cargo.lock,crates/nebula-core/*,crates/nebula-daemon/*,crates/nebula-tui/*,crates/nebula-rag/*,vendor/vt100/*,crates/nebula/Cargo.toml,crates/nebula/build.rs,crates/nebula/src/*,crates/nebula/tests/e2e_board.rs,crates/nebula/tests/fixtures/*,.agents/checks/commands,.agents/checks/cargo] .agents/checks/cargo test -p nebula --test e2e_board
 cargo fmt --check
 .agents/checks/cargo clippy --workspace --all-targets -- -D warnings
 [.githooks/**,.agents/checks/commands] sh .githooks/pre-commit.test.sh
