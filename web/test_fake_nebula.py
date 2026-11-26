@@ -6,19 +6,22 @@ import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import patch
 
-E2E = Path(__file__).resolve().parent / "e2e"
-sys.path.insert(0, str(E2E))
-import serve  # noqa: E402
+from e2e import serve
+
+E2E = Path(serve.__file__).parent
 
 SCOPE = ["--project=nebula", "--include-home"]
 
 
 class FakeBoardTests(unittest.TestCase):
     def setUp(self):
-        self.state = Path(tempfile.mkdtemp())
-        serve.STATE = self.state
-        serve.seed_board()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.state = Path(tmp.name)
+        with patch.object(serve, "STATE", self.state):
+            serve.seed_board()
         (self.state / "agents.json").write_text("[]")
         board = json.loads((self.state / "board.json").read_text())
         other = {**board["decisions"][0], "id": "01JG0000000000000000000099", "project": "other", "title": "Elsewhere"}
@@ -77,6 +80,8 @@ class FakeBoardTests(unittest.TestCase):
     def test_a_title_after_the_delimiter_is_not_a_flag(self):
         card = self.cli("todo", "add", "--project=nebula", "--json", "--", "--propose")
         self.assertEqual((card["title"], card["proposed"]), ("--propose", False))
+        card = self.cli("todo", "add", "--home", "--json", "--", "--project")
+        self.assertEqual((card["title"], card["project"]), ("--project", None))
 
     def test_concurrent_notes_all_land_and_each_bumps_the_version(self):
         version = int(self.cli("todo", "board", *SCOPE, "--json")["version"].split(".")[1])

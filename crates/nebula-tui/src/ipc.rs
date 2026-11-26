@@ -1798,7 +1798,10 @@ pub async fn spawn_agent(opts: NewAgentOpts) -> Result<serde_json::Value> {
     let card = match (opts.card.as_deref(), opts.no_card) {
         (Some(text), _) => Some(crate::board_cli::check_card(&mut conn, text).await?),
         (None, true) => None,
-        (None, false) => caller.and_then(|spawner| spawner.card),
+        (None, false) => match caller.and_then(|spawner| spawner.card) {
+            Some(card) => crate::board_cli::inherited_card(&mut conn, card).await?,
+            None => None,
+        },
     };
     if let Some(host) = &project.host {
         let cache = paths::log_dir().join("skills-check");

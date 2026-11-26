@@ -305,6 +305,22 @@ pub async fn request(conn: &mut Connection, op: BoardOp) -> Result<BoardResult> 
     }
 }
 
+/// The spawner's card while the board still holds it unarchived; a child of
+/// an archived or removed card joins none. A board that cannot answer keeps
+/// the card, as a spawn without a board does.
+pub async fn inherited_card(conn: &mut Connection, card: TodoId) -> Result<Option<TodoId>> {
+    let op = BoardOp::Read(BoardRead::Card {
+        scope: ScopeFlags::default().scope(None),
+        card: CardRef::Id(card.clone()),
+    });
+    match request(conn, op).await {
+        Ok(BoardResult::Show(show)) => Ok((!show.card.archived).then_some(show.card.id)),
+        Ok(other) => bail!("the board answered a card read with {other:?}"),
+        Err(why) if Refusal::of(&why.to_string()) == Some(Refusal::NotFound) => Ok(None),
+        Err(_) => Ok(Some(card)),
+    }
+}
+
 /// Reads the card `text` names, so a spawn linking it is refused before
 /// anything starts.
 pub async fn check_card(conn: &mut Connection, text: &str) -> Result<TodoId> {
@@ -944,7 +960,6 @@ fn result_json(result: &BoardResult) -> Result<serde_json::Value> {
         BoardResult::Show(show) => serde_json::to_value(show)?,
         BoardResult::Artifacts(page) => serde_json::to_value(page)?,
         BoardResult::Artifact(artifact) => serde_json::to_value(artifact)?,
-        BoardResult::Note(note) => serde_json::to_value(note)?,
         BoardResult::Run(receipt) => serde_json::to_value(receipt)?,
         BoardResult::Done => serde_json::Value::Null,
     })
@@ -1012,7 +1027,6 @@ fn print_human(result: &BoardResult) {
                 println!("  {}: {}", note.author.name, note.text);
             }
         }
-        BoardResult::Note(note) => println!("note added: {}", note.text),
         BoardResult::Board(BoardPoll::Unchanged { version }) => println!("unchanged at {version}"),
         BoardResult::Board(BoardPoll::Board { board, .. }) => {
             for card in &board.cards {

@@ -21,11 +21,17 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
+const MAX_BYTES: u64 = 64 << 20;
+
 fn max_bytes() -> u64 {
-    std::env::var("NEBULA_ARTIFACT_MAX_BYTES")
-        .ok()
+    cap(std::env::var("NEBULA_ARTIFACT_MAX_BYTES").ok().as_deref())
+}
+
+/// `NEBULA_ARTIFACT_MAX_BYTES` (tests) may lower the cap, never raise it.
+fn cap(lowered: Option<&str>) -> u64 {
+    lowered
         .and_then(|v| v.parse().ok())
-        .unwrap_or(64 << 20)
+        .map_or(MAX_BYTES, |v: u64| v.min(MAX_BYTES))
 }
 
 fn store_dir() -> PathBuf {
@@ -408,7 +414,20 @@ pub(crate) fn list(
                 a.title.to_lowercase().contains(q) || body.to_lowercase().contains(q)
             })
         })
-        .collect();
+        .skip(offset)
+        .map(Ok);
     let (items, next) = paged(items, offset, &version, crate::board::page_budget())?;
     Ok(Page { items, next })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_cap_override_only_lowers() {
+        assert_eq!(cap(Some("1024")), 1024);
+        assert_eq!(cap(Some(&(MAX_BYTES * 2).to_string())), MAX_BYTES);
+        assert_eq!(cap(None), MAX_BYTES);
+    }
 }

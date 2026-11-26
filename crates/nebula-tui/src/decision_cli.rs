@@ -9,7 +9,7 @@ use anyhow::{bail, Result};
 use nebula_core::board::{Artifact, ArtifactContent, BoardOp, BoardRead};
 use nebula_core::ArtifactId;
 
-const KIND: &str = "decision";
+use nebula_core::board::DECISION_KIND as KIND;
 
 /// A `nebula decision` verb, as the binary parsed it.
 pub enum DecisionVerb {

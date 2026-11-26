@@ -133,16 +133,17 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                     break;
                 }
                 ClientRequest::Board { req_id, op } => {
-                    let board = crate::config::Config::load().board;
-                    if let Some(host) = board.as_deref().filter(|board| *board != "local") {
-                        let link = crate::board_link::to(host, &daemon.shutdown);
+                    let board = tokio::task::spawn_blocking(|| crate::config::Config::load().board)
+                        .await
+                        .unwrap_or_default();
+                    if let Some(link) = daemon.board_link.for_board(board.as_deref(), &daemon.shutdown) {
                         let client = relay_client.clone();
                         tokio::spawn(async move { link.forward(req_id, op, &client).await });
                         continue;
                     }
                     let mut refreshed = false;
                     if let (Some(_), nebula_core::board::BoardOp::Report(report), None) = (&board, &op, &reporting) {
-                        refreshed = crate::board::link_opened(&report.host);
+                        refreshed = daemon.host_links.opened(&report.host);
                         reporting = Some(report.host.clone());
                     }
                     let daemon = daemon.clone();
@@ -152,8 +153,8 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
                             match board {
                                 None => Err(anyhow::anyhow!("no board configured")),
                                 Some(_) if refreshed => crate::board::bump_now(&daemon.store)
-                                    .and_then(|()| crate::board::serve(&daemon.store, op)),
-                                Some(_) => crate::board::serve(&daemon.store, op),
+                                    .and_then(|()| crate::board::serve(&daemon.store, &daemon.host_links, op)),
+                                Some(_) => crate::board::serve(&daemon.store, &daemon.host_links, op),
                             }
                         })
                         .await
@@ -757,7 +758,7 @@ async fn handle_client(daemon: Arc<Daemon>, stream: UnixStream) -> Result<()> {
         } => result,
     };
     if let Some(host) = reporting {
-        crate::board::link_closed(&host, daemon.store.clone());
+        daemon.host_links.closed(&host, daemon.store.clone());
     }
 
     for (sref, h) in attached.drain() {

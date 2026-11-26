@@ -1,6 +1,3 @@
-//! Protocol-33 board contract: the positional CreateAgent and Agent tails, the
-//! pure board rules, and the JSON the CLI prints, pinned to golden fixtures that
-//! web/e2e/fake_nebula.py serves.
 use nebula_core::board::*;
 use nebula_core::{
     Agent, AgentId, AgentKind, AgentStatus, ArtifactId, ClientRequest, DispatchId, NoteId, TodoId,
@@ -782,12 +779,11 @@ fn board_json_golden() {
             needs_you: vec![],
             away: Away::default(),
         },
-        next: Some("01JB0000000000000000000000.53:1".into()),
+        next: Some("01JB0000000000000000000000.53@1".into()),
     };
-    assert_eq!(
-        round_trip(&continued),
-        serde_json::to_value(&continued).unwrap()
-    );
+    let printed = serde_json::to_value(&continued).unwrap();
+    assert_eq!(printed["next"], "01JB0000000000000000000000.53@1");
+    assert_eq!(round_trip(&continued), printed);
 }
 
 #[test]
