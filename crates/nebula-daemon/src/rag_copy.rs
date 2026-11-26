@@ -147,10 +147,6 @@ async fn copy(decision: &Artifact, bound: Duration, shutdown: &CancellationToken
     note_id(&saved).with_context(|| format!("nebula rag add printed no note id: {saved:?}"))
 }
 
-/// The child runs in its own process group, so a deadline or shutdown
-/// kills an ssh hop and whatever it started too. The group is signalled
-/// while the pending wait still holds the leader unreaped, so its id cannot
-/// belong to a recycled process.
 /// RAG gave no answer (a timeout, or ssh's exit 255): the rest of the
 /// tick's decisions would fail the same way, so they wait for the next one.
 #[derive(Debug)]
@@ -164,6 +160,10 @@ impl std::fmt::Display for Unreachable {
 
 impl std::error::Error for Unreachable {}
 
+/// The child runs in its own process group, so a deadline or shutdown
+/// kills an ssh hop and whatever it started too. The group is signalled
+/// while the pending wait still holds the leader unreaped, so its id cannot
+/// belong to a recycled process.
 async fn rag(
     args: &[&str],
     stdin: Option<&str>,

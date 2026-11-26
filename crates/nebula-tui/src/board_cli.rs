@@ -295,8 +295,6 @@ pub async fn request(conn: &mut Connection, op: BoardOp) -> Result<BoardResult> 
 
 pub(crate) const CLOSED: &str = "daemon closed the connection before replying";
 
-/// Reads the card `text` names, so a spawn linking it is refused before
-/// anything starts.
 /// The spawner's card while the board still holds it unarchived; a child of
 /// an archived or removed card joins none. A board that cannot answer keeps
 /// the card, as a spawn without a board does.
@@ -313,6 +311,8 @@ pub async fn inherited_card(conn: &mut Connection, card: TodoId) -> Result<Optio
     }
 }
 
+/// Reads the card `text` names, so a spawn linking it is refused before
+/// anything starts.
 pub async fn check_card(conn: &mut Connection, text: &str) -> Result<TodoId> {
     Ok(read_card(conn, text).await?.id)
 }
