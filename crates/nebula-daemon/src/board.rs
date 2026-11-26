@@ -19,10 +19,14 @@ use std::time::{Duration, Instant};
 /// Bytes one page may carry, hosts and the away digest included; the rest
 /// of the frame is headroom for the envelope.
 pub(crate) fn page_budget() -> usize {
-    std::env::var("NEBULA_BOARD_PAGE_BYTES")
-        .ok()
+    budget(std::env::var("NEBULA_BOARD_PAGE_BYTES").ok().as_deref())
+}
+
+fn budget(lowered: Option<&str>) -> usize {
+    let most = MAX_FRAME_LEN as usize / 2;
+    lowered
         .and_then(|v| v.parse().ok())
-        .unwrap_or(MAX_FRAME_LEN as usize / 2)
+        .map_or(most, |v: usize| v.min(most))
 }
 
 pub(crate) fn serve(store: &Store, links: &HostLinks, op: BoardOp) -> Result<BoardResult> {
@@ -1149,6 +1153,14 @@ mod tests {
             panic!("no receipt")
         };
         assert_eq!(receipt.state, DispatchState::Pending);
+    }
+
+    #[test]
+    fn the_page_budget_override_only_lowers() {
+        let default = MAX_FRAME_LEN as usize / 2;
+        assert_eq!(budget(Some("600")), 600);
+        assert_eq!(budget(Some(&(8 * MAX_FRAME_LEN).to_string())), default);
+        assert_eq!(budget(None), default);
     }
 
     #[test]
