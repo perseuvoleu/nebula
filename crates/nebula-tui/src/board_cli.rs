@@ -8,7 +8,7 @@ use nebula_core::board::{
     CardDraft, CardRef, CardShow, Checkout, Dispatch, DispatchState, Placement, ProjectScope,
     Refusal, Role, RunReceipt, SessionAt, Stage,
 };
-use nebula_core::codec::{read_frame, write_frame};
+use nebula_core::codec::write_frame;
 use nebula_core::{
     paths, Agent, AgentId, AgentKind, ClientRequest, DispatchId, NoteId, Project, ServerEvent,
     TodoId, Worktree,
@@ -258,9 +258,9 @@ pub fn dispatch_id(text: &str) -> Result<DispatchId> {
     }
 }
 
-pub(crate) fn client_id(id: Option<String>, minted: &mut Option<String>) -> Result<String> {
+pub(crate) fn client_id(id: Option<String>) -> Result<String> {
     match id {
-        None => Ok(minted.insert(TodoId::generate().0).clone()),
+        None => Ok(TodoId::generate().0),
         Some(id) => match parse_card_ref(&id) {
             Some(CardRef::Id(canonical)) => Ok(canonical.0),
             _ => bail!("--id {id:?} is not a ULID"),
@@ -280,23 +280,20 @@ pub(crate) async fn connect() -> Result<Connection> {
 pub(crate) const REQ: u64 = 1;
 
 /// Writes `req`, sent with [`REQ`], and returns the first reply to it. An
-/// Error reply becomes Err, a connection that closes first [`ipc::CLOSED`].
+/// Error reply becomes Err, a reply that never arrives [`ipc::ReplyLost`].
 pub(crate) async fn exchange(conn: &mut Connection, req: ClientRequest) -> Result<ServerEvent> {
     write_frame(&mut conn.stream, &req).await?;
     loop {
-        match read_frame::<ServerEvent, _>(&mut conn.stream).await? {
-            Some(ServerEvent::Error {
+        match ipc::read_reply(conn).await? {
+            ServerEvent::Error {
                 req_id: Some(REQ),
                 message,
-            }) => bail!("{message}"),
-            Some(
-                reply @ (ServerEvent::BoardReply { req_id: REQ, .. }
-                | ServerEvent::ArtifactStored { req_id: REQ, .. }
-                | ServerEvent::ArtifactLocated { req_id: REQ, .. }
-                | ServerEvent::Ack { req_id: REQ, .. }),
-            ) => return Ok(reply),
-            Some(_) => continue,
-            None => return Err(ipc::CLOSED.into()),
+            } => bail!("{message}"),
+            reply @ (ServerEvent::BoardReply { req_id: REQ, .. }
+            | ServerEvent::ArtifactStored { req_id: REQ, .. }
+            | ServerEvent::ArtifactLocated { req_id: REQ, .. }
+            | ServerEvent::Ack { req_id: REQ, .. }) => return Ok(reply),
+            _ => continue,
         }
     }
 }
@@ -363,7 +360,7 @@ pub async fn run(verb: TodoVerb, json: bool) -> Result<()> {
     let mut conn = connect().await?;
     let (projects, worktrees, agents) = ipc::subscribe_snapshot(&mut conn).await?;
     let caller = Caller::resolve(&projects, &worktrees, &agents)?;
-    let mut minted = None;
+    let mut written = None;
     let mut op = match verb {
         TodoVerb::Run {
             card,
@@ -417,7 +414,7 @@ pub async fn run(verb: TodoVerb, json: bool) -> Result<()> {
             propose,
             id,
         } => BoardOp::AddCard(CardDraft {
-            id: TodoId(client_id(id, &mut minted)?),
+            id: TodoId(written.insert(client_id(id)?).clone()),
             title,
             project: match (project, home) {
                 (_, true) => None,
@@ -471,7 +468,7 @@ pub async fn run(verb: TodoVerb, json: bool) -> Result<()> {
             id,
             scope,
         } => scope.guard(BoardOp::AddNote {
-            id: NoteId(client_id(id, &mut minted)?),
+            id: NoteId(written.insert(client_id(id)?).clone()),
             card: card_ref(&card)?,
             text,
             author: caller.author.clone(),
@@ -513,7 +510,7 @@ pub async fn run(verb: TodoVerb, json: bool) -> Result<()> {
             page,
         }),
     };
-    let rerun = |why: anyhow::Error| match minted.as_deref() {
+    let rerun = |why: anyhow::Error| match written.as_deref() {
         Some(id) => with_rerun(why, &format!("with --id {id}")),
         None => why,
     };
@@ -689,7 +686,7 @@ async fn run_dispatch(
         Err(why) if Refusal::of(&why.to_string()) == Some(Refusal::WriterHeld) => {
             (None, Some(why.to_string()))
         }
-        Err(why) if why.downcast_ref::<ipc::ReplyLost>().is_some() => return Err(rerun(why)),
+        Err(why) if outcome_unknown(&why) => return Err(rerun(why)),
         Err(why) => bail!(
             "{why:#}; dispatch {} stays pending, rerun with --dispatch {}",
             id.as_str(),
@@ -899,18 +896,25 @@ async fn approve(
     Ok(())
 }
 
-/// A write whose outcome is unknown (the board said so, or the reply was
-/// lost after the request went out) names what reruns it.
+/// The board said a write's outcome is unknown, or the connection failed
+/// once the request could have gone out.
+pub(crate) fn outcome_unknown(why: &anyhow::Error) -> bool {
+    why.downcast_ref::<std::io::Error>().is_some()
+        || why.downcast_ref::<ipc::ReplyLost>().is_some()
+        || Refusal::of(&why.to_string()) == Some(Refusal::OutcomeUnknown)
+}
+
+/// A write whose outcome is unknown names what reruns it.
 fn with_rerun(why: anyhow::Error, rerun: &str) -> anyhow::Error {
-    if why.downcast_ref::<ipc::ReplyLost>().is_some() {
-        return anyhow::anyhow!(
-            "{} {rerun}",
-            Refusal::OutcomeUnknown.message(why.to_string())
-        );
+    if !outcome_unknown(&why) {
+        return why;
     }
     match Refusal::of(&why.to_string()) {
         Some(Refusal::OutcomeUnknown) => anyhow::anyhow!("{why} {rerun}"),
-        _ => why,
+        _ => anyhow::anyhow!(
+            "{} {rerun}",
+            Refusal::OutcomeUnknown.message(format!("{why:#}"))
+        ),
     }
 }
 
@@ -1075,8 +1079,82 @@ pub fn exit_on_refusal(result: Result<()>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nebula_core::codec::read_frame;
     use nebula_core::{ProjectId, WorktreeId};
     use std::path::Path;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::UnixStream;
+
+    #[test]
+    fn only_an_answer_settles_a_write() {
+        assert!(!outcome_unknown(&anyhow::anyhow!(
+            Refusal::Conflict.message("taken")
+        )));
+        assert!(!outcome_unknown(&anyhow::anyhow!("no board configured")));
+        let lost = std::io::Error::from(std::io::ErrorKind::BrokenPipe);
+        assert!(outcome_unknown(&anyhow::Error::from(lost)));
+        assert!(outcome_unknown(&anyhow::Error::from(ipc::CLOSED)));
+        assert!(outcome_unknown(&anyhow::anyhow!(
+            Refusal::OutcomeUnknown.message("link dropped")
+        )));
+    }
+
+    async fn approve_against(
+        daemon: impl FnOnce(UnixStream) -> tokio::task::JoinHandle<()>,
+    ) -> anyhow::Error {
+        let (cli, end) = UnixStream::pair().unwrap();
+        let _daemon = daemon(end);
+        let mut conn = Connection {
+            stream: cli,
+            daemon_pid: 0,
+        };
+        let req = ClientRequest::ApproveSession {
+            req_id: REQ,
+            id: AgentId("s1".into()),
+            expected_status_at: 7,
+        };
+        let why = tokio::time::timeout(
+            std::time::Duration::from_secs(3600),
+            exchange(&mut conn, req),
+        )
+        .await
+        .expect("the approve still waits an hour on")
+        .unwrap_err();
+        with_rerun(why, "for session s1 with --expected-status-at 7")
+    }
+
+    fn names_the_rerun(why: &anyhow::Error) {
+        let text = why.to_string();
+        assert_eq!(Refusal::of(&text), Some(Refusal::OutcomeUnknown), "{text}");
+        assert!(text.contains("--expected-status-at 7"), "{text}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_approve_the_daemon_never_answers_ends_outcome_unknown() {
+        names_the_rerun(
+            &approve_against(|mut end| {
+                tokio::spawn(async move {
+                    let _ = read_frame::<ClientRequest, _>(&mut end).await;
+                    std::future::pending::<()>().await;
+                })
+            })
+            .await,
+        );
+    }
+
+    #[tokio::test]
+    async fn an_approve_reply_cut_mid_frame_ends_outcome_unknown() {
+        names_the_rerun(
+            &approve_against(|mut end| {
+                tokio::spawn(async move {
+                    let _ = read_frame::<ClientRequest, _>(&mut end).await;
+                    end.write_all(&100u32.to_le_bytes()).await.unwrap();
+                    end.write_all(&[0x81; 10]).await.unwrap();
+                })
+            })
+            .await,
+        );
+    }
 
     #[test]
     fn cwd_matches_only_local_checkouts() {

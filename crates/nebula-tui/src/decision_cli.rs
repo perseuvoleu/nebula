@@ -61,7 +61,7 @@ pub async fn run(verb: DecisionVerb, json: bool) -> Result<()> {
                 (None, None) => (caller.card.clone(), caller.project.clone()),
             };
             let draft = Draft {
-                id: ArtifactId(client_id(id, &mut None)?),
+                id: ArtifactId(client_id(id)?),
                 kind: KIND.into(),
                 title: what,
                 card,

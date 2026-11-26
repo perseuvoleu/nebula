@@ -101,19 +101,13 @@ async fn store(
     }
 }
 
-fn outcome_known(why: &anyhow::Error) -> bool {
-    why.downcast_ref::<std::io::Error>().is_none()
-        && why.downcast_ref::<ipc::ReplyLost>().is_none()
-        && Refusal::of(&why.to_string()) != Some(Refusal::OutcomeUnknown)
-}
-
 pub(crate) async fn unpublished(
     conn: &mut Connection,
     id: &ArtifactId,
     created: bool,
     why: anyhow::Error,
 ) -> anyhow::Error {
-    if !outcome_known(&why) {
+    if crate::board_cli::outcome_unknown(&why) {
         return anyhow::anyhow!(Refusal::OutcomeUnknown.message(format!(
             "artifact {id} may have been published ({why:#}); rerun with --id {id}"
         )));
@@ -144,7 +138,7 @@ async fn add(conn: &mut Connection, caller: Caller, args: AddArgs) -> Result<(Bo
         CardChoice::Card(text) => Some(check_card(conn, &text).await?),
         CardChoice::None => None,
     };
-    let id = ArtifactId(client_id(id, &mut None)?);
+    let id = ArtifactId(client_id(id)?);
     let (kind, content, default_title, created) = if let Some(url) = url(&source)? {
         let content = ArtifactContent::Url { url };
         ("link".to_string(), content, source, false)
@@ -369,23 +363,4 @@ async fn open(conn: &mut Connection, a: &Artifact) -> Result<()> {
     }
     println!("{target}");
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn only_an_answer_settles_a_publish() {
-        assert!(outcome_known(&anyhow::anyhow!(
-            Refusal::Conflict.message("taken")
-        )));
-        assert!(outcome_known(&anyhow::anyhow!("no board configured")));
-        let lost = std::io::Error::from(std::io::ErrorKind::BrokenPipe);
-        assert!(!outcome_known(&anyhow::Error::from(lost)));
-        assert!(!outcome_known(&anyhow::Error::from(ipc::CLOSED)));
-        assert!(!outcome_known(&anyhow::anyhow!(
-            Refusal::OutcomeUnknown.message("link dropped")
-        )));
-    }
 }

@@ -664,6 +664,19 @@ impl std::error::Error for ReplyLost {}
 
 pub(crate) const CLOSED: ReplyLost = ReplyLost("daemon closed the connection before replying");
 
+/// The next frame after a request went out. A wait past a minute, a
+/// closed connection and a failed or cut read are all [`ReplyLost`].
+pub(crate) async fn read_reply(conn: &mut Connection) -> Result<ServerEvent> {
+    let read = read_frame::<ServerEvent, _>(&mut conn.stream);
+    match tokio::time::timeout(Duration::from_secs(60), read).await {
+        Err(_) => Err(ReplyLost("timed out waiting for the daemon's reply").into()),
+        Ok(Err(why)) => Err(anyhow::Error::new(why)
+            .context(ReplyLost("the connection failed before the daemon replied"))),
+        Ok(Ok(None)) => Err(CLOSED.into()),
+        Ok(Ok(Some(event))) => Ok(event),
+    }
+}
+
 /// Await the Ack (or Error) for `req_id`, collecting entity upserts seen on
 /// the way; the daemon broadcasts the created row just before the Ack.
 pub(crate) async fn await_ack(
@@ -672,21 +685,14 @@ pub(crate) async fn await_ack(
     upserts: &mut Vec<nebula_core::Entity>,
 ) -> Result<Option<nebula_core::EntityId>> {
     loop {
-        let event = tokio::time::timeout(
-            Duration::from_secs(60),
-            read_frame::<ServerEvent, _>(&mut conn.stream),
-        )
-        .await
-        .map_err(|_| ReplyLost("timed out waiting for the daemon's reply"))??;
-        match event {
-            Some(ServerEvent::Ack { req_id: r, created }) if r == req_id => return Ok(created),
-            Some(ServerEvent::Error {
+        match read_reply(conn).await? {
+            ServerEvent::Ack { req_id: r, created } if r == req_id => return Ok(created),
+            ServerEvent::Error {
                 req_id: Some(r),
                 message,
-            }) if r == req_id => bail!("{message}"),
-            Some(ServerEvent::EntityUpserted { entity }) => upserts.push(entity),
-            Some(_) => continue,
-            None => return Err(CLOSED.into()),
+            } if r == req_id => bail!("{message}"),
+            ServerEvent::EntityUpserted { entity } => upserts.push(entity),
+            _ => continue,
         }
     }
 }

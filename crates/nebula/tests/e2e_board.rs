@@ -2966,6 +2966,35 @@ fn ack_cutter(env: &Env) -> (Killed, PathBuf) {
     interposer(env, b"\xa3Ack", &[])
 }
 
+/// An add whose reply is lost exits 4 naming the caller's own --id, and
+/// that rerun lands the one card.
+#[test]
+fn lost_reply_to_a_given_id_exit_4() {
+    let env = board_env();
+    let (cutter, rt) = interposer(&env, b"BoardReply", &[]);
+    let id = TodoId::generate().0;
+    let argv = [
+        "todo",
+        "add",
+        "--json",
+        "--project",
+        "nebula",
+        "--id",
+        &id,
+        "T",
+    ];
+    let lost = env.cli_env(&argv, None, &[("NEBULA_RUNTIME_DIR", rt.to_str().unwrap())]);
+    drop(cutter);
+    assert_eq!(lost.status.code(), Some(4), "{}", stderr(&lost));
+    assert!(
+        stderr(&lost).contains(&format!("--id {id}")),
+        "{}",
+        stderr(&lost)
+    );
+    assert_eq!(env.json(&argv)["id"], id.as_str());
+    assert_eq!(list(&env, &["--project", "nebula"]), ["T"]);
+}
+
 /// Run and Approve whose final Ack is lost after they took effect exit 4
 /// and name what reruns them, as a lost board reply does.
 #[test]
