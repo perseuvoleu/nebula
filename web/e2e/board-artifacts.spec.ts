@@ -1,8 +1,7 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { expect, type Page } from "@playwright/test";
-import { test, STATE, changeBoard, login, storeArtifact } from "./helpers";
+import { test, STATE, TOKEN, changeBoard, login, storeArtifact } from "./helpers";
 
 const CARD = "01JD0000000000000000000012";
 const RUN = "01JG0000000000000000000001";
@@ -103,8 +102,9 @@ test("record decision", async ({ page }) => {
 });
 
 test("a decision's session link lands on that session on its host, a home decision's too", async ({ page }) => {
+  const { host } = await (await page.request.get("/api/projects", { headers: { Authorization: `Bearer ${TOKEN}` } })).json();
   changeBoard((board) => board.decisions.push({ ...board.decisions[0], id: "01JG0000000000000000000030", title: "Home chores run nightly",
-    project: null, card: null, session: { host: os.hostname(), id: "pi-1", name: "Refactor auth" }, content: { body: "" } }));
+    project: null, card: null, session: { host, id: "pi-1", name: "Refactor auth" }, content: { body: "" } }));
   await login(page, "/board/decisions");
   const row = page.getByRole("article").filter({ hasText: "Home chores run nightly" });
   const link = row.getByRole("link", { name: /sesiunea Refactor auth/ });

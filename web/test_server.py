@@ -98,7 +98,8 @@ class GatewayTests(unittest.TestCase):
     def test_host_is_named_as_nebula_names_it(self):
         for env, system, host in [({}, "Gaitanarus-MacBook-Pro.local", "Gaitanarus-MacBook-Pro"),
                                   ({"NEBULA_HOSTNAME": "perseu-mbp"}, "Gaitanarus-MacBook-Pro.local", "perseu-mbp")]:
-            with self.subTest(env=env), patch.dict("os.environ", env), patch("server.socket.gethostname", return_value=system):
+            inherited = {key: value for key, value in os.environ.items() if key != "NEBULA_HOSTNAME"}
+            with self.subTest(env=env), patch.dict("os.environ", {**inherited, **env}, clear=True), patch("server.socket.gethostname", return_value=system):
                 gateway = Gateway(TOKEN, "https://example.com", ["p"], usage_service=None)
                 self.assertEqual(gateway.get("/api/projects", {})["host"], host)
 
