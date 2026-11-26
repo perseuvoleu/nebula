@@ -655,8 +655,10 @@ pub(crate) fn page_offset(page: Option<&str>, version: &str) -> Result<usize> {
     let Some(page) = page else { return Ok(0) };
     match page.rsplit_once('@') {
         Some((at, offset)) if at == version => offset
-            .parse()
-            .map_err(|_| anyhow::anyhow!("malformed page token {page:?}")),
+            .parse::<i64>()
+            .ok()
+            .and_then(|offset| usize::try_from(offset).ok())
+            .ok_or_else(|| anyhow::anyhow!("malformed page token {page:?}")),
         Some(_) => bail!(Refusal::Conflict
             .message("the board changed since that page was cut; read it again from the start")),
         None => bail!("malformed page token {page:?}"),
@@ -1147,6 +1149,15 @@ mod tests {
             panic!("no receipt")
         };
         assert_eq!(receipt.state, DispatchState::Pending);
+    }
+
+    #[test]
+    fn a_page_token_past_the_sqlite_offset_range_is_refused() {
+        assert_eq!(
+            page_offset(Some("v.1@9223372036854775807"), "v.1").unwrap(),
+            i64::MAX as usize
+        );
+        assert!(page_offset(Some("v.1@9223372036854775808"), "v.1").is_err());
     }
 
     #[test]
