@@ -133,6 +133,11 @@ board, card and decision read (`--project=…` or `--all`, plus `--include-home`
 client asks, and checks every card write against a scoped read first. Unset, the board endpoints
 answer 503.
 
+`Gateway.run` drops every `NEBULA_*` variable from its CLI calls, so `NEBULA_RUNTIME_DIR` and
+`NEBULA_DATA_DIR` never reach the CLI and a gateway started beside a scratch daemon still talks to
+the user's own. To aim it at another daemon, point `NEBULA_WEB_BINARY` at a launcher that exports
+them and execs nebula, as `web/e2e/real_nebula.sh` does.
+
 Endpoints: `GET /api/board?since&awaySince` (one `nebula todo board` call per poll),
 `GET /api/cards/<ref>`, `GET /api/decisions?query`, `POST /api/cards`,
 `POST /api/cards/<ref>/{move,edit,note,archive,accept,dismiss,block,unblock,run,approve,open-code}`
@@ -160,7 +165,7 @@ started before Nebula's Pi extension existed have no stored id.
 ## Verification
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s web -v   # gateway + Pi adapter
+web/checks-python.sh                                               # gateway + Pi adapter, venv from requirements.txt
 pnpm --dir web/app typecheck && pnpm --dir web/app build
 pnpm --dir web/app test:unit                                       # node --test, no browser
 pnpm --dir web/app test:e2e                                        # Playwright, needs a browser
@@ -174,6 +179,25 @@ drafts, creation, offline/resume, logout, service-worker and unsafe-Markdown inv
 phone/tablet/desktop/landscape layouts with screenshots in `.scratch/mobile-chat-e2e/screenshots/`. Run it on a
 machine with a browser (`pnpm --dir web/app exec playwright install chromium` once).
 **findl has no browser: those checks stay pending until run from the laptop.**
+
+The real lane runs the same gateway against an isolated daemon built from this checkout, through
+the real CLI and its JSON (no fake), and publishes a Playwright reporter run as an artifact:
+
+```bash
+heavy web/e2e/build_real_nebula.sh                                 # target/verify-nebula/debug/nebula, no Ghostty without zig 0.15
+pnpm --dir web/app test:e2e board.spec.ts board-artifacts.spec.ts  # a reporter run with ≥ 12 screenshots
+pnpm --dir web/app test:e2e --project real                         # 127.0.0.1:8791
+```
+
+`web/e2e/serve.py --real` starts the daemon under `$REAL_NEBULA_STATE`, which `playwright.config.ts` defaults to
+`/tmp/nre-<checkout hash>` (by hand, set it and `REAL_NEBULA_BIN`), with `board = "local"` and the replay agent as its agent command, then the gateway with
+`NEBULA_WEB_BINARY=web/e2e/real_nebula.sh`. The gateway strips every `NEBULA_*` variable from its CLI calls,
+so the launcher re-exports `NEBULA_RUNTIME_DIR` and `NEBULA_DATA_DIR` from `REAL_NEBULA_STATE` and sets
+`NEBULA_RAG_LOCAL=0 NEBULA_RAG_HOST=nebula-real-e2e.invalid`, so a decision never reaches the real RAG.
+Any gateway aimed at a non-default daemon needs such a launcher. `REAL_NEBULA_BIN` picks another binary,
+`REAL_E2E_RUN` another reporter run (this lane's own: `.scratch/real-e2e/e2e-run`).
+`E2E_FAKE_PORT` and `E2E_REAL_PORT` move a run off 8790 and 8791, so checkouts on one host run side
+by side. A second real-lane run on the same `REAL_NEBULA_STATE` refuses to start; give it its own.
 
 To inspect a candidate visually from the laptop without touching production, start a
 preview on findl on a loopback port with a synthetic token and tunnel it:
@@ -223,6 +247,192 @@ on, HTTP/2 origin on. The leaseweb route it replaces is `http://127.0.0.1:8765`.
 
 **The token grants agent control as the server's OS user.** Project allowlisting is an API
 scope, not an OS sandbox. Rotate a leaked token in the env file and restart only `nebula-web`.
+
+## Board rollout (protocol 33, migration 29)
+
+Order: leaseweb, then the laptops, then findl. `nebula kill` stops every session on its host, so
+each one waits for the user's go. Build every host from the same commit `<sha>` (the merged
+agent-home release on main). Facts measured 2026-11-25: leaseweb runs `~/.local/bin/nebula`
+0.6.0 (b7dfd64), has no zig and no `config.json`; findl runs a hand-built `~/.local/bin/nebula`
+that has `rag` and no zig (never `nebula upgrade` there: the published build drops `rag`); the
+laptop runs `~/.cargo/bin/nebula`. A daemon migrated to 29 cannot be read by an older binary, so
+every host keeps a copy of its database from before the upgrade.
+
+### 1. leaseweb becomes the board host
+
+Any CLI call starts a daemon when none runs, the gateway's polls included, so the gateway stops
+first and the database is copied online before the kill. Every block runs under
+`bash -euo pipefail`, so it stops at its first failure, and it can be pasted again: a `.pre-33` copy
+is made once and never overwritten (leaseweb and findl have no `sqlite3` binary, so `backup` uses
+Python's). Build and install, no restart yet:
+
+```bash
+bash -euo pipefail <<'EOF'
+keep() { [ -e "$2" ] || { cp -p "$1" "$2.tmp" && mv "$2.tmp" "$2"; }; }
+git -C ~/nebula fetch
+[ -d ~/nebula-release-33 ] || git -C ~/nebula worktree add ~/nebula-release-33 <sha>
+keep ~/.local/bin/nebula ~/.local/bin/nebula.pre-33
+cd ~/nebula-release-33 && heavy make install-novt PREFIX=$HOME/.local/bin
+web/deploy/prep-release.sh
+EOF
+```
+
+`web/deploy/prep-release.sh` builds `~/.local/share/nebula/web-releases/<sha>` (`web/` and the board
+fixtures its suites read, the app built, `release.json` written only after the Python and
+frontend unit suites pass) and `web-releases/client-<sha>/bin/nebula`. A release without
+`release.json` is rebuilt on the next run; logs go to `~/.cache/nebula-web-build/<sha>`.
+
+Then, on the user's go (it stops every session on leaseweb and the gateway until it restarts):
+
+```bash
+bash -euo pipefail <<'EOF'
+backup() { [ -e "$2" ] || { rm -f "$2.tmp"; python3 -c 'import pathlib,sqlite3,sys; sqlite3.connect(pathlib.Path(sys.argv[1]).as_uri() + "?mode=ro", uri=True).backup(sqlite3.connect(sys.argv[2]))' "$1" "$2.tmp" && mv "$2.tmp" "$2"; }; }
+set_board() { python3 -c 'import json,os,sys; p,v=sys.argv[1:]; c=json.load(open(p)) if os.path.exists(p) else {}; c["board"]=v; json.dump(c,open(p,"w"),indent=2); assert json.load(open(p))["board"]==v; print(p,"board =",v)' "$1" "$2"; }
+D=~/.local/share/nebula
+systemctl --user stop nebula-web
+backup "$D/nebula.db" "$D/nebula.db.pre-33"
+set_board "$D/config.json" local
+nebula kill
+nebula todo board --json >/dev/null && nebula --version
+mkdir -p -m 700 "$D/artifacts"
+EOF
+```
+
+Projects: the board host serves every project findl's `NEBULA_WEB_PROJECTS` listed (14 on
+2026-11-25; leaseweb's daemon knew 4 of them). Each missing one is cloned under
+`~/Projects/<name>` from the origin findl uses, which needs the same deploy-key alias in leaseweb's
+`~/.ssh/config` that findl's has. A checkout with no origin is copied through the laptop
+(`scp -3 -r findl:<dir> leaseweb:Projects/`), since findl and leaseweb cannot ssh to each other.
+Then `nebula add ~/Projects/<name>` for each.
+
+Re-add the legacy rows: `nebula artifact add https://vela.possu.dev --project vela-hub-fork
+--title vela` (the findl link); the laptop note only if the user wants it.
+
+Gateway: in `~/.config/nebula-web.env` (keep a copy as `nebula-web.env.bak-pre-33`):
+
+```bash
+NEBULA_WEB_PROJECTS=<findl's 14>
+NEBULA_WEB_BOARD_PROJECTS=<the same 14>
+NEBULA_WEB_ARTIFACTS=/home/<user>/.local/share/nebula/artifacts
+NEBULA_WEB_BINARY=/home/<user>/.local/share/nebula/web-releases/client-<sha>/bin/nebula
+```
+
+Point `nebula-web.service.d/90-durable-release.conf` at `web-releases/<sha>`, then
+`systemctl --user daemon-reload && systemctl --user start nebula-web`. Check that the gateway
+answers with the board; the token is read from the env file and never printed or put in argv, and
+a title argument (`'Rollout check'`, step 2) also requires that card:
+
+```bash
+bash -euo pipefail -s -- <<'EOF'
+T=$(sed -n 's/^NEBULA_WEB_TOKEN=//p' ~/.config/nebula-web.env)
+curl -fsS -H 'Host: code.possu.dev' -H @<(printf 'Authorization: Bearer %s\n' "$T") http://127.0.0.1:8765/api/board |
+  python3 -c 'import json,sys; cards=json.load(sys.stdin)["board"]["cards"]; want=sys.argv[1:]; hits=[c["ref"] for c in cards if c["title"] in want]; print(len(cards), "cards", hits); sys.exit(bool(want) and not hits)' "$@"
+EOF
+```
+
+Decisions are copied to the RAG on findl over ssh. leaseweb → findl ssh fails today on host key
+verification, so the copy retries until leaseweb trusts findl (an `ssh findl true` that exits 0).
+
+### 2. The laptops
+
+Build and install first:
+
+```bash
+bash -euo pipefail <<'EOF'
+keep() { [ -e "$2" ] || { cp -p "$1" "$2.tmp" && mv "$2.tmp" "$2"; }; }
+[ -d ~/nebula-release-33 ] || git -C ~/Projects/nebula worktree add ~/nebula-release-33 <sha>
+keep ~/.cargo/bin/nebula ~/.cargo/bin/nebula.pre-33
+cd ~/nebula-release-33 && heavy make install
+EOF
+```
+
+Then quit every `ng` window (a TUI restarts the daemon it lost) and, on the user's go:
+
+```bash
+bash -euo pipefail <<'EOF'
+backup() { [ -e "$2" ] || { rm -f "$2.tmp"; python3 -c 'import pathlib,sqlite3,sys; sqlite3.connect(pathlib.Path(sys.argv[1]).as_uri() + "?mode=ro", uri=True).backup(sqlite3.connect(sys.argv[2]))' "$1" "$2.tmp" && mv "$2.tmp" "$2"; }; }
+set_board() { python3 -c 'import json,os,sys; p,v=sys.argv[1:]; c=json.load(open(p)) if os.path.exists(p) else {}; c["board"]=v; json.dump(c,open(p,"w"),indent=2); assert json.load(open(p))["board"]==v; print(p,"board =",v)' "$1" "$2"; }
+D="$HOME/Library/Application Support/dev.nebula.nebula"
+backup "$D/nebula.db" "$D/nebula.db.pre-33"
+set_board "$D/config.json" leaseweb
+nebula kill
+nebula todo add --project nebula Rollout check
+EOF
+```
+
+It prints `#<n>@leaseweb`; on leaseweb, the check block of step 1 with `'Rollout check'` after
+`-s --` finds that card through the gateway.
+
+The board link is `ssh leaseweb` in BatchMode, so `ssh -o BatchMode=yes leaseweb true` must exit 0
+first (it does from the main laptop). Run on the laptop, approve and open in code from the web
+need the reverse: Remote Login on the laptop and a `Host <laptop>` entry with its `User` in
+leaseweb's `~/.ssh/config`, checked with `ssh leaseweb ssh -o BatchMode=yes <laptop> true`.
+
+### 3. findl
+
+findl cannot reach leaseweb on port 22 (its public and its tailnet address both time out,
+measured 2026-11-25), so `board = "leaseweb"` waits for a path (a Tailscale ACL or Tailscale
+SSH, plus a `Host leaseweb` entry). Then, building beside the dirty `~/nebula` checkout:
+
+```bash
+bash -euo pipefail <<'EOF'
+keep() { [ -e "$2" ] || { cp -p "$1" "$2.tmp" && mv "$2.tmp" "$2"; }; }
+git -C ~/nebula fetch
+[ -d ~/nebula-release-33 ] || git -C ~/nebula worktree add ~/nebula-release-33 <sha>
+keep ~/.local/bin/nebula ~/.local/bin/nebula.pre-33
+cd ~/nebula-release-33 && heavy make install-novt PREFIX=$HOME/.local/bin && nebula rag --help >/dev/null
+EOF
+```
+
+Then, on the user's go:
+
+```bash
+bash -euo pipefail <<'EOF'
+backup() { [ -e "$2" ] || { rm -f "$2.tmp"; python3 -c 'import pathlib,sqlite3,sys; sqlite3.connect(pathlib.Path(sys.argv[1]).as_uri() + "?mode=ro", uri=True).backup(sqlite3.connect(sys.argv[2]))' "$1" "$2.tmp" && mv "$2.tmp" "$2"; }; }
+set_board() { python3 -c 'import json,os,sys; p,v=sys.argv[1:]; c=json.load(open(p)) if os.path.exists(p) else {}; c["board"]=v; json.dump(c,open(p,"w"),indent=2); assert json.load(open(p))["board"]==v; print(p,"board =",v)' "$1" "$2"; }
+D=~/.local/share/nebula
+backup "$D/nebula.db" "$D/nebula.db.pre-33"
+set_board "$D/config.json" leaseweb
+nebula kill
+nebula todo board --json >/dev/null && nebula --version
+EOF
+```
+
+### Rollback
+
+Per host, newest first. Quit every `ng` window first: a TUI reconnects by starting a daemon, which
+would open the database while it is restored, so the block refuses while this user's daemon runs (it
+holds the lock on `daemon.pid` in nebula's runtime dir; daemons in other runtime dirs do not count).
+`B` and `D` default to leaseweb's and findl's paths; on a laptop, start the block as
+`B=~/.cargo/bin D="$HOME/Library/Application Support/dev.nebula.nebula" bash -euo pipefail <<'EOF'`.
+
+```bash
+bash -euo pipefail <<'EOF'
+daemon_alive() { python3 -c '
+import fcntl,os,sys; e=os.environ.get; x=e("XDG_RUNTIME_DIR")
+p=os.path.join(e("NEBULA_RUNTIME_DIR") or (x and os.path.join(x,"nebula")) or "/tmp/nebula-%d" % os.geteuid(),"daemon.pid")
+if not os.path.exists(p): sys.exit(1)
+f=open(p,"r+")
+try: fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)
+except OSError: print(p,"held by pid",f.read().strip()); sys.exit(0)
+sys.exit(1)'; }
+B=${B:-$HOME/.local/bin} D=${D:-$HOME/.local/share/nebula}
+if command -v systemctl >/dev/null; then systemctl --user stop nebula-web || true; fi
+nebula kill || true
+for i in 1 2 3 4 5; do daemon_alive >/dev/null || break; sleep 1; done
+if daemon_alive; then echo "nebula daemon still runs: quit every ng window and nebula client, then rerun" >&2; exit 1; fi
+cp -p "$B/nebula.pre-33" "$B/nebula.new"
+mv "$B/nebula.new" "$B/nebula"
+rm -f "$D/nebula.db-wal" "$D/nebula.db-shm"
+cp -p "$D/nebula.db.pre-33" "$D/nebula.db"
+python3 -c 'import json,sys; p=sys.argv[1]; c=json.load(open(p)); c.pop("board",None); json.dump(c,open(p,"w"),indent=2)' "$D/config.json"
+nebula agent list --all >/dev/null
+EOF
+```
+
+On leaseweb also restore `nebula-web.env.bak-pre-33`, point the drop-in back at release
+1df2ca59b7aaea1fc536811c6dacc04c1b17b69f, `systemctl --user daemon-reload` and start `nebula-web`. Cards, artifacts and
+decisions made after the upgrade are lost with the database copy.
 
 ## Delivery semantics and limitations
 

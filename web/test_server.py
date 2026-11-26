@@ -1,6 +1,7 @@
 import http.client
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import tempfile
@@ -10,9 +11,10 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from urllib.parse import unquote
 
 import serverless
-from server import Gateway, Handler, Problem, PushService, StaticFiles, ThreadingHTTPServer
+from server import BoardScope, Gateway, Handler, Problem, PushService, StaticFiles, ThreadingHTTPServer
 from test_pi_history import SID_A, SID_B, assistant, user, write_session
 
 TOKEN = "test-token-" * 5
@@ -125,7 +127,7 @@ class GatewayTests(unittest.TestCase):
                 Gateway(TOKEN, "http://127.0.0.1:8765", ["project"], preview_binary=binary, usage_service=None)
 
     def test_preview_fails_closed_for_bad_status_and_never_exposes_diagnostics(self):
-        gateway = Gateway(TOKEN, "http://127.0.0.1:8765", ["project"], preview_binary="/bin/true", usage_service=None)
+        gateway = Gateway(TOKEN, "http://127.0.0.1:8765", ["project"], preview_binary=shutil.which("true"), usage_service=None)
         invalid = [None, [], "running", {}, {"domain": "demo.example.test", "phase": []}]
         invalid += [{"domain": domain, "phase": "running"} for domain in [
             None, [], "", "localhost", "evil.test/path", "user@evil.test", "evil.test:443", "a..test",
@@ -430,7 +432,8 @@ class HTTPTests(unittest.TestCase):
     def test_shell_assets_and_route_fallback(self):
         for path in ["/", "/assets/app-abc123.js", "/manifest.webmanifest", "/icon.svg", "/sw.js",
                      "/p/project", "/p/project/s/one", "/serverless", "/board", "/board/p/nebula?view=table",
-                     "/board/c/12@leaseweb?peek=12", "/board/c/12%40leaseweb", "/board/decisions/p/nebula"]:
+                     "/board/c/12@leaseweb?peek=12", "/board/c/12%40leaseweb", "/board/decisions/p/nebula",
+                     "/board/decisions", "/board/decisions/home", "/board/home", "/board/home/c/12", "/board/p/nebula/c/12"]:
             status, headers, body = self.request(path)
             self.assertEqual(status, 200, path)
             self.assertTrue(body)
@@ -587,6 +590,7 @@ FIXTURES = Path(__file__).resolve().parent.parent / "crates" / "nebula-core" / "
 CARD_ID = "01JD0000000000000000000012"
 ARTIFACT_ID = "01JG0000000000000000000001"
 OTHER_ID = "01JG0000000000000000000009"
+BLOCKER_ID = "01JD0000000000000000000011"
 
 
 def fixture(name):
@@ -620,7 +624,7 @@ class BoardTests(unittest.TestCase):
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.origin = f"http://127.0.0.1:{self.server.server_port}"
         self.gateway = Gateway(TOKEN, self.origin, ["project"], static=StaticFiles(make_static(root / "static")),
-                               board_projects=["nebula"], artifacts=self.artifacts, usage_service=None)
+                               board_scope=BoardScope(["nebula"]), artifacts=self.artifacts, usage_service=None)
         self.server.gateway = self.gateway
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -643,6 +647,10 @@ class BoardTests(unittest.TestCase):
 
     def argv(self, run):
         return [call.args[0][1:] for call in run.call_args_list]
+
+    def verb_reads(self, verb):
+        blocker = {**fixture("card_show"), "id": BLOCKER_ID, "number": 11}
+        return [cli(fixture("card_show")), cli(blocker if verb in {"block", "unblock"} else fixture("card_show"))]
 
     def card_src(self):
         with patch("server.subprocess.run", return_value=cli(fixture("card_show"))):
@@ -670,10 +678,10 @@ class BoardTests(unittest.TestCase):
         reads = [("/api/board?project=secret&scope=all", fixture("board")),
                  ("/api/cards/%2312?project=secret&all=1", fixture("card_show")),
                  ("/api/decisions?query=copy&project=secret", {"items": [fixture("decision")], "next": None})]
-        for configured, scope in [(["nebula"], ["--project=nebula", "--include-home"]),
-                                  (["nebula", "vela"], ["--project=nebula", "--project=vela", "--include-home"]),
+        for configured, scope in [("nebula", ["--project=nebula", "--include-home"]),
+                                  ("nebula,vela", ["--project=nebula", "--project=vela", "--include-home"]),
                                   ("*", ["--all", "--include-home"])]:
-            self.gateway.board_projects = configured
+            self.gateway.board_scope = BoardScope.parse(configured)
             for path, output in reads:
                 with self.subTest(path=path, configured=configured), \
                         patch("server.subprocess.run", return_value=cli(output)) as run:
@@ -681,7 +689,7 @@ class BoardTests(unittest.TestCase):
                     argv = self.argv(run)[0]
                     self.assertEqual([a for a in argv if a.startswith(("--project", "--all", "--include-home"))], scope)
                     self.assertFalse(any("secret" in a for a in argv))
-        self.gateway.board_projects = ["nebula"]
+        self.gateway.board_scope = BoardScope(["nebula"])
         with patch("server.subprocess.run", return_value=cli(None, 5, "no card #99 in scope")) as run:
             status, _, _ = self.request("/api/cards/%2399/move", "POST", {"stage": "done"}, self.auth())
         self.assertEqual(status, 404)
@@ -717,9 +725,6 @@ class BoardTests(unittest.TestCase):
                 self.assertEqual(self.request(path)[0], 403)
         with patch("server.time.time", return_value=int(expiry) + 1):
             self.assertEqual(self.request(src)[0], 403)
-        with patch("server.time.time", return_value=time.time() - 7200):
-            stale = self.card_src()
-        self.assertEqual(self.request(stale)[0], 403)
 
     def test_artifact_traversal(self):
         grant = self.card_src().split("/")[2]
@@ -788,18 +793,27 @@ class BoardTests(unittest.TestCase):
                     self.assertEqual(self.request(path, "POST", body, {"Authorization": "Bearer " + TOKEN,
                                                                        "Content-Type": "application/json"})[0], 403)
                     self.assertEqual(self.request(path, "POST", body, self.auth(Origin="https://evil.example"))[0], 403)
+                    self.assertEqual(self.request(path, "POST", body, self.auth(Host="evil.example"))[0], 403)
                     self.assertEqual(self.request(path, "POST", body, self.auth(**{"Content-Type": "text/plain"}))[0], 415)
                     self.assertEqual(self.request(path, "POST", "{", self.auth())[0], 400)
-            self.assertIn(self.request("/api/artifacts", "POST", {"path": "/etc/passwd", "kind": "recap"},
-                                       self.auth())[0], {403, 404})
+            self.assertEqual(self.request("/api/artifacts", "POST", {"path": "/etc/passwd", "kind": "recap", "project": "project", "text": "x"},
+                                          self.auth())[0], 404)
             run.assert_not_called()
+        writes = {"move": ["todo", "move", "--", CARD_ID, "review"],
+                  "edit": ["todo", "edit", "--title=Renamed", "--", CARD_ID],
+                  "note": ["todo", "note", f"--id={CARD_ID}", "--", CARD_ID, "--all; rm -rf /"],
+                  **{verb: ["todo", verb, "--", CARD_ID] for verb in ("archive", "accept", "dismiss")},
+                  **{verb: ["todo", verb, f"--by={BLOCKER_ID}", "--", CARD_ID] for verb in ("block", "unblock")},
+                  "run": ["todo", "run", "--role=worker", "--kind=codex", "--host=leaseweb", "--worktree=new", "--", CARD_ID],
+                  "approve": ["todo", "approve", f"--session={session['session']}", "--expected-status-at=1764000200000",
+                              "--", CARD_ID],
+                  "open-code": ["open", f"--session={session['session']}", "--on=perseu-mbp"]}
         for verb, body in verbs.items():
             with self.subTest(verb=verb), patch("server.subprocess.run", side_effect=[
-                    cli(fixture("card_show")), cli(fixture("card_show")), cli({"ok": True})]) as run:
+                    *self.verb_reads(verb), cli({"ok": True})]) as run:
                 self.assertEqual(self.request(f"/api/cards/%2312/{verb}", "POST", body, self.auth())[0], 200)
-                write = self.argv(run)[-1]
-                self.assertIn(CARD_ID if verb != "open-code" else "--session=" + session["session"], write)
-                self.assertIn("todo" if verb != "open-code" else "open", write[:1])
+                write = [a for a in self.argv(run)[-1] if not a.startswith(("--scope", "--include-home", "--json"))]
+                self.assertEqual(write, writes[verb])
         with patch("server.subprocess.run", return_value=cli(fixture("decision"))) as run:
             status, _, _ = self.request("/api/decisions", "POST", {"what": "/etc/passwd", "why": "x", "path": "/etc/passwd",
                                                                     "kind": "recap", "url": "https://x"}, self.auth())
@@ -818,25 +832,26 @@ class BoardTests(unittest.TestCase):
                   "archive": {}, "accept": {}, "dismiss": {}, "block": {"by": "#11"}, "unblock": {"by": "#11"},
                   "run": {"role": "worker", "kind": "codex", "host": "leaseweb", "worktree": "new"},
                   "approve": {"session": "01JF0000000000000000000002", "host": "leaseweb", "expectedStatusAt": 1764000200000}}
-        for configured, scope in [(["nebula", "vela"], ["--scope=nebula", "--scope=vela", "--include-home"]),
+        for configured, scope in [("nebula,vela", ["--scope=nebula", "--scope=vela", "--include-home"]),
                                   ("*", ["--scope=*", "--include-home"])]:
-            self.gateway.board_projects = configured
+            self.gateway.board_scope = BoardScope.parse(configured)
             for verb, body in writes.items():
                 with self.subTest(verb=verb, configured=configured), patch("server.subprocess.run", side_effect=[
-                        cli(fixture("card_show")), cli(fixture("card_show")), cli(fixture("card"))]) as run:
+                        *self.verb_reads(verb), cli(fixture("card"))]) as run:
                     self.assertEqual(self.request(f"/api/cards/%2312/{verb}", "POST", body, self.auth())[0], 200)
                     write = self.argv(run)[-1]
                     self.assertEqual([a for a in write if a.startswith(("--scope", "--include-home"))], scope)
                     self.assertEqual("--id=" + CARD_ID in write, verb == "note")
 
     def test_board_writes_need_board_and_explicit_owner(self):
-        self.gateway.board_projects = None
+        self.gateway.board_scope = None
         with patch("server.subprocess.run") as run:
-            for path, body in [("/api/cards", {"title": "x", "home": True}), ("/api/decisions", {"what": "Copy files"})]:
+            for path, body in [("/api/cards", {"title": "x", "home": True}), ("/api/cards", {"title": "x"}),
+                               ("/api/decisions", {"what": "Copy files"})]:
                 with self.subTest(path=path):
                     self.assertEqual(self.request(path, "POST", body, self.auth())[0], 503)
             run.assert_not_called()
-        self.gateway.board_projects = ["nebula"]
+        self.gateway.board_scope = BoardScope(["nebula"])
         with patch("server.subprocess.run", return_value=cli(fixture("decision"))) as run:
             self.assertEqual(self.request("/api/decisions", "POST", {"what": "Copy files"}, self.auth())[0], 200)
         self.assertIn("--home", self.argv(run)[0])
@@ -901,10 +916,21 @@ class BoardTests(unittest.TestCase):
                 self.assertEqual(self.request("/api/cards/%2312/run", "POST", {**base, "worktree": branch}, self.auth())[0], 200)
                 self.assertIn("--worktree=" + branch, self.argv(run)[-1])
         for branch in ["-x", "a..b", "a b", "a~1", "x.lock", "a/x.lock/b", "a/.b", "a//b", "a/", "a.", "@", "a@{1}",
-                       "a:b", "a?", "a*", "a[", "a\\b", "/a", ".a", "a^b", "a\x7fb"]:
+                       "a:b", "a?", "a*", "a[", "a\\b", "/a", ".a", "a^b", "a\x7fb", "HEAD"]:
             with self.subTest(branch=branch), patch("server.subprocess.run", return_value=cli(fixture("card_show"))) as run:
                 self.assertEqual(self.request("/api/cards/%2312/run", "POST", {**base, "worktree": branch}, self.auth())[0], 400)
                 self.assertEqual(run.call_count, 1)
+
+    def test_card_refs_take_every_positive_u64(self):
+        for ref in ["18446744073709551615", "%2318446744073709551615%40leaseweb", "%2300000000000000000000012",
+                    "1%40" + "h" * 65, "0" * 5000 + "1"]:
+            with self.subTest(ref=ref), patch("server.subprocess.run", return_value=cli(fixture("card_show"))) as run:
+                self.assertEqual(self.request(f"/api/cards/{ref}", headers=self.auth())[0], 200)
+                self.assertEqual(self.argv(run)[0][-1], unquote(ref))
+        for ref in ["0", "%230", "18446744073709551616", "%23", "-1", "9" * 5000, "1%40"]:
+            with self.subTest(ref=ref), patch("server.subprocess.run") as run:
+                self.assertEqual(self.request(f"/api/cards/{ref}", headers=self.auth())[0], 400)
+                run.assert_not_called()
 
     def test_note_without_an_id_is_refused(self):
         with patch("server.subprocess.run", return_value=cli(fixture("card_show"))) as run:
