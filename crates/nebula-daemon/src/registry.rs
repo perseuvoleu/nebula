@@ -2527,6 +2527,9 @@ impl Daemon {
         if let Err(e) = launched {
             // A dispatch rerun replays any row it finds as started.
             self.store.delete_agent(&agent.id)?;
+            if adopted.is_some() {
+                self.kill_session(&SessionRef::Agent(agent.id.clone()));
+            }
             return Err(e);
         }
         let mut broadcast_agent = agent.clone();
@@ -6002,6 +6005,53 @@ exec sleep 60
             "the retry waited for the warm PTY"
         );
         assert_eq!(git::current_branch(&repo).await.unwrap(), "feat");
+    }
+
+    #[tokio::test]
+    async fn a_failed_parent_host_write_stops_the_adopted_warm_pty() {
+        let (_script, agent) = stand_in_agent(&[]);
+        let (_tmp, _repo, daemon, _pid, primary) =
+            primary_with_feat_on(test_daemon_with(DaemonOverrides {
+                stop_deadline: Duration::from_millis(1500),
+                agent_cmd: agent,
+            }))
+            .await;
+        let warm = warm_pid(&daemon, &primary.id).await;
+        daemon
+            .store
+            .board_transaction(|tx| {
+                tx.execute_batch(
+                    "CREATE TEMP TRIGGER no_parent_host BEFORE UPDATE OF spawned_by_host ON agents
+                     BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let created = daemon
+            .create_agent(
+                &primary.id,
+                None,
+                "child",
+                AgentKind::Claude,
+                None,
+                None,
+                false,
+                None,
+                WriterClaim::Off,
+                None,
+                false,
+                CardLink {
+                    parent_host: Some("far".into()),
+                    ..CardLink::default()
+                },
+            )
+            .await;
+        assert!(created.is_err(), "{created:?}");
+        assert!(
+            process_exits(warm).await,
+            "the adopted warm PTY outlived its deleted row"
+        );
+        daemon.kill_all();
     }
 
     #[tokio::test]
