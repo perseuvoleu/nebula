@@ -4,9 +4,10 @@ import { api, describeError } from "@/lib/api";
 import { activityAge, compactAge } from "@/lib/activity-age";
 import {
   type BoardCard, type BoardData, type Card, type CardShow, type NeedsYou, type SessionLink, type SidebarScope, type SortKey, type TableSort, type Stage, type Workspace, GRANT_RENEW_MS,
-  awayDigest, byStage, cardSlug, filterCards, hostProjects, knownHosts, openTarget, inScope, projectName, sessionProject, sidebarProjects, sortCards, toBoardCard, writerSlots,
+  awayDigest, byStage, cardSlug, filterCards, firstWait, hostProjects, knownHosts, openTarget, inScope, projectName, sessionProject, sidebarProjects, sortCards, toBoardCard, writerSlots,
 } from "@/lib/board";
 import { cardAction, createCard, ulid } from "@/lib/board-actions";
+import { openCode as openCodeStore } from "@/lib/open-code";
 import { type Pending, drop, patchOf, propose, reconcile, settle } from "@/lib/optimistic";
 import { type BoardRoute, selectionPath } from "@/lib/route";
 import { BOARD_POLL_MS, useBoard } from "@/lib/useBoard";
@@ -15,7 +16,7 @@ import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
 import { AwayDigest, type AwayDecision } from "./AwayDigest";
 import { BoardColumns } from "./BoardColumns";
-import { CardActions, OpenCodeButton, OpenCodeDialog, OpenCodeToast, RunButton } from "./CardActions";
+import { CardActions, OpenCodeButton, OpenCodeDialog, OpenCodeResult, OpenCodeToast, RunButton } from "./CardActions";
 import { CardArtifacts } from "./CardArtifacts";
 import { CardDetail } from "./CardDetail";
 import type { DecisionRow } from "./DecisionCard";
@@ -198,6 +199,8 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
   const [createError, setCreateError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   useEffect(() => setOverlay((old) => reconcile(old, readAt, (key) => (board?.needs_you ?? []).some((w) => approval(w) === key))), [readAt, board]);
+  const routeKey = boardHref(route);
+  useEffect(() => () => openCodeStore.leave(), [routeKey]);
   const optimistic = (key: string, patch: Partial<RawCard>, request: Promise<unknown>) => {
     const token = ulid();
     setActionError(null);
@@ -286,7 +289,7 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
   ));
 
   const hosts = knownHosts(board);
-  const waitingOn = (card: BoardCard) => waiting.find((w) => w.card === live.find((c) => c.ref === card.ref)?.id) ?? null;
+  const waitingOn = (card: BoardCard) => firstWait(waiting.filter((w) => w.card === live.find((c) => c.ref === card.ref)?.id));
   const resolveTarget = (ref: string) => () => api<CardShow>(`cards/${encodeURIComponent(cardSlug(ref))}`).then((show) => openTarget(show.sessions));
   const openCode = (card: BoardCard) => {
     const target = waitingOn(card);
@@ -304,7 +307,6 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
   );
   const waitingOf = (card: BoardCard) => waiting.filter((w) => w.card === live.find((c) => c.ref === card.ref)?.id);
   const digestCount = digest ? digest.finished.length + digest.waiting.length + digest.decisions.length : 0;
-  const cardRefOf = (slug: string | null) => bySlug(slug)?.ref ?? null;
   const scopeTitle = scope.kind === "needs" ? "Te așteaptă" : null;
   const slots = board && board.hosts.length > 0 && <WriterSlots hosts={writerSlots(board.hosts)} className="max-w-full overflow-x-auto" />;
 
@@ -318,6 +320,7 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
   const main = route.card ? (
     <div className="min-h-0 flex-1 overflow-y-auto p-4">
       <Button type="button" variant="ghost" size="sm" className="mb-3" onClick={() => go({})}><ArrowLeftIcon aria-hidden />Board</Button>
+      <div className="mx-auto mb-3 w-full max-w-3xl empty:hidden"><OpenCodeResult cardRef={`#${route.card}`} /></div>
       <CardPanel slug={route.card} board={board} mode="page" onOpenCard={openPage} />
     </div>
   ) : route.decisions ? (
@@ -329,7 +332,9 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
       {stale ? "Board-ul nu poate fi citit acum." : "Se încarcă board-ul…"}
     </p>
   ) : scope.kind === "needs" && cards.length === 0 ? (
-    <p role="status" className="p-6 text-sm text-muted-foreground">Nimic nu te așteaptă acum.</p>
+    <p role="status" className="p-6 text-sm text-muted-foreground">
+      {filter.trim() && needsCount > 0 ? "Niciun card care te așteaptă nu se potrivește filtrului." : "Nimic nu te așteaptă acum."}
+    </p>
   ) : route.table ? (
     <TableView cards={sortCards(cards, sort)} groupByProject={scope.kind === "all"} selected={peeked?.ref} onOpen={openCard}
       sort={sort} onSort={(key: SortKey) => setSort((old) => ({ key, asc: old.key === key ? !old.asc : true }))}
@@ -409,7 +414,7 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
             <Button type="button" variant="ghost" size="sm" onClick={() => setActionError(null)}>Închide</Button>
           </p>
         )}
-        <OpenCodeToast shown={route.card ?? route.peek ? cardRefOf(route.card ?? route.peek) : null} cardHref={(ref) => boardHref(cardPage(ref))} onCardPage={openPage} />
+        <OpenCodeToast shown={route.card ? `#${route.card}` : null} cardHref={(ref) => boardHref(cardPage(ref))} onCardPage={openPage} />
         {!route.card && !route.decisions && (
           <NeedsYouStrip cards={waitingCards} onOpen={openCard}
             renderActions={(card) => <>{approveButtons(card)}{openCode(card)}</>} />
@@ -421,7 +426,7 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
         )}
         {main}
       </main>
-      <OpenCodeDialog hosts={hosts.map((h) => h.host)} fallback={() => document.getElementById("board-main")} />
+      <OpenCodeDialog fallback={() => document.getElementById("board-main")} />
       {newCard && (
         <NewCardDialog open onOpenChange={(open) => { if (!open) setNewCard(null); }} draft={newCard} pending={creating}
           projects={projects.flatMap((p) => p.project === null ? [] : [p.project])}

@@ -268,9 +268,14 @@ export function filterCards<T extends { ref: string; title: string; project: str
   return cards.filter((c) => [c.ref, c.title, projectName(c.project)].some((field) => field.toLowerCase().includes(needle)));
 }
 
-/** The session Open in code opens: one asking for an answer, else the live writer, else the latest session. */
+/** "The waiting session" everywhere (tile, strip, card page): waiting longest, then lowest id. */
+export function firstWait<T extends { id: string; status_changed_at: number }>(waits: T[]): T | null {
+  return [...waits].sort((a, b) => a.status_changed_at - b.status_changed_at || a.id.localeCompare(b.id))[0] ?? null;
+}
+
+/** The session Open in code opens: the first wait, else the live writer, else the latest session. */
 export const openTarget = (sessions: CardSession[]): { id: string; host: string } | null => {
-  const s = sessions.find((x) => x.alive && x.status === "needs_feedback") ?? sessions.find((x) => x.writer && x.alive) ?? sessions.at(-1);
+  const s = firstWait(sessions.filter((x) => x.alive && x.status === "needs_feedback")) ?? sessions.find((x) => x.writer && x.alive) ?? sessions.at(-1);
   return s ? { id: s.id, host: s.host } : null;
 };
 

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { awayDigest, byStage, cardDot, hostProjects, inScope, isBlocked, sessionProject, sidebarProjects, toBoardCard, filterCards, openTarget, type CardSession, writerSlots, type BoardData, type Card, type SidebarScope } from "./board.ts";
+import { awayDigest, byStage, cardDot, hostProjects, inScope, isBlocked, sessionProject, sidebarProjects, toBoardCard, filterCards, openTarget, firstWait, type CardSession, writerSlots, type BoardData, type Card, type SidebarScope } from "./board.ts";
 
 const card = (number: number, stage: Card["stage"], blocked_by: string[] = []): Card => ({
   id: `01JD${String(number).padStart(22, "0")}`, number, ref: `#${number}@leaseweb`, title: `Card ${number}`, stage,
@@ -116,4 +116,13 @@ test("Open in code targets the session asking for an answer first, then the live
   assert.deepEqual(openTarget([writer, s("x", {})]), { id: "w", host: "leaseweb" });
   assert.deepEqual(openTarget([s("a", { alive: false }), s("b", { alive: false })]), { id: "b", host: "leaseweb" });
   assert.equal(openTarget([]), null);
+});
+
+test("the waiting session is the one that has waited longest, ties broken by id, whatever order the reads list them in", () => {
+  const w = (id: string, at: number) => ({ id, host: "leaseweb", status_changed_at: at });
+  assert.equal(firstWait([w("b", 900), w("c", 800), w("a", 800)])?.id, "a");
+  assert.equal(firstWait([]), null);
+  const s = (id: string, at: number): CardSession => ({ host: "leaseweb", id, name: id, role: null, kind: "claude", status: "needs_feedback",
+    status_changed_at: at, writer: id === "w", alive: true, stale: false });
+  assert.deepEqual(openTarget([s("w", 900), s("r", 800)]), { id: "r", host: "leaseweb" });
 });

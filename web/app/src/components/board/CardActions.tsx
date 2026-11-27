@@ -1,7 +1,7 @@
 import { useRef, useState } from "react";
 import { CodeIcon, CopyIcon, PlayIcon, XIcon } from "lucide-react";
 import { describeError } from "@/lib/api";
-import { type OpenResult, type Target, openCode, rememberedLaptop, useOpenCode } from "@/lib/open-code";
+import { type OpenDialog, type Target, focusBack, openCode, rememberedLaptop, useOpenCode } from "@/lib/open-code";
 import { cn } from "@/lib/utils";
 import { type BoardData, type CardShow, STAGES, STAGE_LABEL, type Stage, knownHosts, openTarget } from "@/lib/board";
 import { cardAction, ulid } from "@/lib/board-actions";
@@ -64,30 +64,40 @@ export function RunButton({ cardRef, cardTitle, branch, hosts, disabled, size = 
 export function OpenCodeButton({ cardRef, target, resolve, hosts, size = "sm", label, compact = false }: {
   cardRef: string; target?: Target | null; resolve?: () => Promise<Target | null>; hosts: string[]; size?: "sm" | "xs"; label?: string; compact?: boolean;
 }) {
-  const { pending, results } = useOpenCode();
+  const { pending } = useOpenCode();
   const [looking, setLooking] = useState(false);
   const [lookupError, setLookupError] = useState<string | null>(null);
   const busy = looking || pending.includes(cardRef);
   const unavailable = !target && !resolve;
   const pick = async (opener: HTMLElement) => {
     if (busy || unavailable) return;
+    const token = openCode.begin();
     setLookupError(null);
     let session = target ?? null;
+    let failed: string | null = null;
     if (!session && resolve) {
       setLooking(true);
       try {
         session = await resolve();
-        if (!session) setLookupError("Cardul nu are încă nicio sesiune.");
+        if (!session) failed = "Cardul nu are încă nicio sesiune.";
       } catch (failure) {
-        setLookupError(describeError(failure));
+        failed = describeError(failure);
       } finally {
         setLooking(false);
       }
     }
+    if (!openCode.current(token)) return;
+    if (failed) {
+      if (opener.isConnected) setLookupError(failed);
+      else {
+        openCode.report(cardRef, failed);
+        focusBack(null, label ?? null, () => document.getElementById("board-main"));
+      }
+      return;
+    }
     const on = rememberedLaptop() ?? hosts.find((h) => h !== DEFAULT_HOST) ?? hosts[0];
-    if (session && on) openCode.open({ cardRef, target: session, on, opener });
+    if (session && on) openCode.open(token, { cardRef, target: session, on, hosts, opener, label: label ?? null });
   };
-  const result = compact ? null : results.find((r) => r.cardRef === cardRef);
   return (
     <>
       <Button type="button" size={size} variant="hud" aria-label={label} aria-disabled={busy || unavailable || undefined} aria-busy={busy || undefined}
@@ -97,17 +107,19 @@ export function OpenCodeButton({ cardRef, target, resolve, hosts, size = "sm", l
       {lookupError && (compact
         ? <span role="alert" title={lookupError} className="max-w-full basis-full truncate text-right text-[11px] text-err">{lookupError}</span>
         : <p role="alert" className="basis-full text-sm text-err">{lookupError}</p>)}
-      {result && <OpenResultBlock result={result} />}
     </>
   );
 }
 
-function OpenResultBlock({ result }: { result: OpenResult }) {
-  if (result.error) return <p role="alert" className="basis-full text-sm text-err">{result.error}</p>;
-  if (result.command === null) return <p role="status" className="basis-full text-sm">Deschis în cod pe <span className="font-mono">@{result.on}</span>.</p>;
+/** The card page's full result, keyed by the route's card so it shows while the card read loads or fails. */
+export function OpenCodeResult({ cardRef }: { cardRef: string }) {
+  const result = useOpenCode().results.find((r) => r.cardRef === cardRef);
+  if (!result) return null;
+  if (result.error) return <p role="alert" className="text-sm text-err">{result.error}</p>;
+  if (result.command === null) return <p role="status" className="text-sm">Deschis în cod pe <span className="font-mono">@{result.on}</span>.</p>;
   const command = result.command;
   return (
-    <div className="flex basis-full flex-col gap-1.5 text-sm">
+    <div className="flex flex-col gap-1.5 rounded-md border border-line-warn bg-bg0 px-[11px] py-[9px] text-sm">
       <p>Nebula nu răspunde pe <span className="font-mono">@{result.on}</span>. Rulează comanda pe laptop:</p>
       <div className="flex min-w-0 items-center gap-2">
         <code className="min-w-0 flex-1 overflow-x-auto rounded-sm border bg-bg0 px-2 py-1.5 font-mono text-xs whitespace-nowrap">{command}</code>
@@ -120,26 +132,27 @@ function OpenResultBlock({ result }: { result: OpenResult }) {
   );
 }
 
-/** Mounted once per page; fallback takes focus when the opener left the page while the dialog was open. */
-export function OpenCodeDialog({ hosts, fallback }: { hosts: string[]; fallback?: () => HTMLElement | null }) {
+/** Mounted once per page; fallback takes focus when neither the opener nor its replacement is on the page. */
+export function OpenCodeDialog({ fallback }: { fallback: () => HTMLElement | null }) {
   const { dialog } = useOpenCode();
-  const [opener, setOpener] = useState<HTMLElement | null>(null);
-  if (dialog && dialog.opener !== opener) setOpener(dialog.opener);
+  const [last, setLast] = useState<OpenDialog | null>(null);
+  if (dialog && dialog !== last) setLast(dialog);
+  const shown = dialog ?? last;
   const remembered = rememberedLaptop();
-  const laptops = [...new Set([...hosts, ...(remembered ? [remembered] : []), ...(dialog ? [dialog.on] : [])])];
+  const laptops = [...new Set([...(shown?.hosts ?? []), ...(remembered ? [remembered] : []), ...(shown ? [shown.on] : [])])];
   return (
     <Dialog open={dialog !== null} onOpenChange={(next) => { if (!next) openCode.cancel(); }}>
       <DialogContent className="sm:max-w-sm" onCloseAutoFocus={(e) => {
         e.preventDefault();
-        (opener?.isConnected ? opener : fallback?.())?.focus();
+        focusBack(shown?.opener ?? null, shown?.label ?? null, fallback);
       }}>
         <DialogHeader>
-          <DialogTitle>Deschide în cod</DialogTitle>
+          <DialogTitle>Deschide în cod <span className="font-mono">{shown?.cardRef}</span></DialogTitle>
           <DialogDescription>Laptopul pe care TUI-ul deschide sesiunea.</DialogDescription>
         </DialogHeader>
         <label className="flex flex-col gap-1.5 text-sm">
           <span className="font-medium">Laptop</span>
-          <select value={dialog?.on ?? ""} onChange={(e) => openCode.choose(e.target.value)} className={`${fieldCls} font-mono`}>
+          <select value={shown?.on ?? ""} onChange={(e) => openCode.choose(e.target.value)} className={`${fieldCls} font-mono`}>
             {laptops.map((h) => <option key={h} value={h}>@{h}</option>)}
           </select>
         </label>
@@ -152,22 +165,28 @@ export function OpenCodeDialog({ hosts, fallback }: { hosts: string[]; fallback?
   );
 }
 
-/** One line for results of tiles and the strip; the card page (shown) prints its own block instead. */
+const plainClick = (e: MouseEvent) => e.button === 0 && !e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey;
+
+/** One line for results of tiles, the strip and peeks; the card page (shown) prints its own block instead. Mounted empty so it is announced. */
 export function OpenCodeToast({ shown, cardHref, onCardPage }: { shown: string | null; cardHref: (ref: string) => string; onCardPage: (ref: string) => void }) {
   const { results } = useOpenCode();
   const result = results.filter((r) => r.cardRef !== shown).at(-1);
-  if (!result) return null;
-  const tone = result.error ? "text-err" : result.command ? "text-warn" : "text-ok";
+  const tone = !result ? "" : result.error ? "text-err" : result.command ? "text-warn" : "text-ok";
   return (
-    <div role="status" className={cn("flex shrink-0 items-center gap-2 border-b bg-bg1 px-3.5 py-1 text-xs", tone)}>
-      <span className="min-w-0 flex-1 truncate">
-        <span className="font-mono">{result.cardRef}</span>{" · "}
-        {result.error ? result.error : result.command === null ? <>Deschis pe <span className="font-mono">@{result.on}</span></> : (
-          <>@{result.on} nu răspunde: <a href={cardHref(result.cardRef)} onClick={(e) => { e.preventDefault(); onCardPage(result.cardRef); }}
-            className="underline underline-offset-2">comanda, pe pagina cardului</a></>
-        )}
-      </span>
-      <Button type="button" variant="ghost" size="icon-xs" aria-label="Închide mesajul" onClick={() => openCode.dismiss(result.cardRef)}><XIcon aria-hidden /></Button>
+    <div id="open-code-status" role="status" className="shrink-0">
+      {result && (
+        <div className={cn("flex items-center gap-2 border-b bg-bg1 px-3.5 py-1 text-xs", tone)}>
+          <span className="min-w-0 flex-1 truncate">
+            <span className="font-mono">{result.cardRef}</span>{" · "}
+            {result.error ? result.error : result.command === null ? <>Deschis pe <span className="font-mono">@{result.on}</span></> : (
+              <>@{result.on} nu răspunde: <a href={cardHref(result.cardRef)}
+                onClick={(e) => { if (plainClick(e.nativeEvent)) { e.preventDefault(); onCardPage(result.cardRef); } }}
+                className="underline underline-offset-2">comanda, pe pagina cardului</a></>
+            )}
+          </span>
+          <Button type="button" variant="ghost" size="icon-xs" aria-label="Închide mesajul" onClick={() => openCode.dismiss(result.cardRef)}><XIcon aria-hidden /></Button>
+        </div>
+      )}
     </div>
   );
 }

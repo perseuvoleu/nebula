@@ -13,6 +13,13 @@ function safeRead(): string {
   }
 }
 
+const cleared = new Set<() => void>();
+
+/** Runs on logout and on a rejected token, for state that must not outlive the signed-in session. */
+export function onTokenCleared(fn: () => void): void {
+  cleared.add(fn);
+}
+
 export function getToken(): string {
   return token;
 }
@@ -25,6 +32,7 @@ export function setToken(value: string): void {
   } catch {
     // Session storage unavailable: keep the token in memory for this page only.
   }
+  if (!value) cleared.forEach((fn) => fn());
   listeners.forEach((fn) => fn());
 }
 

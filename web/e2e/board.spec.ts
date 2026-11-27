@@ -427,3 +427,12 @@ test("the filter's placeholder reads at 4.5:1", async ({ page }) => {
   });
   expect(ratio).toBeGreaterThanOrEqual(4.5);
 });
+
+test("in the attention scope a filter that matches nothing says so, apart from nothing waiting", async ({ page }) => {
+  waitingWorker();
+  await login(page, "/board");
+  await page.getByRole("navigation", { name: "Proiecte" }).getByRole("button", { name: /Te așteaptă/ }).click();
+  await page.getByRole("searchbox", { name: "Filtrează cardurile" }).fill("zzz");
+  await expect(page.getByText("Niciun card care te așteaptă nu se potrivește filtrului.")).toBeVisible();
+  await expect(page.getByText("Nimic nu te așteaptă acum.")).toHaveCount(0);
+});

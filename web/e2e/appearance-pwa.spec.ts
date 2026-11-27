@@ -56,7 +56,7 @@ test("scrolling up loads older retained terminal output beyond the initial 250 l
   await output.evaluate(el => { el.scrollTop = 0; });
   await expect(output).toContainText("line 100:");
   // The reader remains anchored after prepending instead of being pushed to the bottom.
-  expect(await output.evaluate(el => el.scrollTop > 100 && el.scrollTop < el.scrollHeight - el.clientHeight - 80)).toBe(true);
+  await expect.poll(() => output.evaluate(el => el.scrollTop > 100 && el.scrollTop < el.scrollHeight - el.clientHeight - 80), { timeout: 1000 }).toBe(true);
   await output.evaluate(el => { el.scrollTop = 0; });
   await expect(output).toContainText("line 1:");
   await expect(page.getByRole("button", { name: "Output mai vechi" })).toHaveCount(0);
