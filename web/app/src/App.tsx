@@ -165,8 +165,13 @@ function Routes({ workspace }: { workspace: Workspace }) {
     <AgentApp selection={selection} navigate={navigate} workspace={workspace} phone={!desktop}
       code={<><UsageNavbar /><Shell workspace={workspace} route={route} /></>} />
   );
-  return <BoardPage route={selection.board} workspace={workspace} onSessions={() => navigate({ project: null, session: null, all: false })}
-    onNavigate={(board) => navigate({ project: null, session: null, all: false, board })} />;
+  return (
+    <>
+      <UsageNavbar />
+      <BoardPage route={selection.board} workspace={workspace} onSessions={() => navigate({ project: null, session: null, all: false })}
+        onNavigate={(board) => navigate({ project: null, session: null, all: false, board })} />
+    </>
+  );
 }
 
 function Shell({ workspace, route }: { workspace: Workspace; route: ReturnType<typeof useSelection> }) {

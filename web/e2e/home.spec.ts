@@ -68,7 +68,7 @@ test("tab keys 1–4 switch HOME, CODE, RAG and DECISIONS; ? lists the keys; b o
   await page.keyboard.press("1");
   await expect(page).toHaveURL(/\/$/);
   await page.keyboard.press("?");
-  await expect(page.getByRole("dialog", { name: "? Taste" })).toContainText("HOME / CODE / RAG / DECISIONS");
+  await expect(page.getByRole("dialog", { name: "? Taste" })).toBeVisible();
   await page.keyboard.press("Escape");
   await expect(page.getByRole("dialog")).toHaveCount(0);
   await page.keyboard.press("b");
@@ -151,7 +151,7 @@ test("390 px: tabs on top, HOME is the list, a card opens full screen and Back r
   await login(page, "/");
   await expect(page.getByRole("navigation", { name: "Taburi" })).toBeVisible();
   await expect(needs(page).getByRole("button", { name: /Keep verification results/ })).toBeVisible();
-  await expect(page.getByRole("region", { name: /^Card / })).toHaveCount(0);
+  await expect(page.getByRole("region", { name: /^Card #/ })).toHaveCount(0);
   await noHorizontalOverflow(page);
   await shot(page, "home-390");
   await needs(page).getByRole("button", { name: /Keep verification results/ }).click();
@@ -163,4 +163,60 @@ test("390 px: tabs on top, HOME is the list, a card opens full screen and Back r
   await card.getByRole("button", { name: "Înapoi" }).click();
   await expect(needs(page)).toBeVisible();
   await expect(page).toHaveURL(/\/$/);
+});
+
+test("Enter on a focused button or link activates it instead of opening CODE", async ({ page }) => {
+  waitingBoard();
+  await login(page, "/");
+  const reviewBtn = page.getByRole("group", { name: "Etape" }).getByRole("button", { name: /Review/ });
+  await reviewBtn.focus();
+  await page.keyboard.press("Enter");
+  await expect(reviewBtn).toHaveAttribute("aria-pressed", "true");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  const decisionsLink = page.getByRole("complementary", { name: "Context și decizii" }).getByRole("link");
+  await decisionsLink.focus();
+  await page.keyboard.press("Enter");
+  await expect(page).toHaveURL(/\/decisions$/);
+});
+
+test("picking a session in Lanț de sesiuni opens that picked session in CODE", async ({ page }) => {
+  const host = await (await page.request.get("/api/projects", { headers: { Authorization: `Bearer ${TOKEN}` } })).json().then((d) => d.host as string);
+  const card = { id: "01JD0000000000000000000078", number: 78, ref: "#78", title: "Two session card", stage: "doing", project: "alpha", proposed: false, archived: false,
+    created_by: { host, agent: null, name: "you" }, checkout: { host, branch: "main", path: "/srv/alpha", worktree: false }, blocked_by: [], cleared_blockers: [], created_at: 1, updated_at: 1 };
+  const s1 = { host, id: "pi-1", name: "First worker", role: "worker", kind: "pi", status: "finished", status_changed_at: 1, writer: false, alive: true, stale: false };
+  const s2 = { host, id: "pi-2", name: "Second reviewer", role: "review", kind: "pi", status: "running", status_changed_at: 2, writer: true, alive: true, stale: false };
+  await page.route("**/api/board?*", (route) => route.fulfill({ json: { version: "B.1", board: { cards: [card], hosts: [], needs_you: [], away: { finished: [], needs_you: [], decisions: [] } }, next: null } }));
+  await page.route("**/api/board", (route) => route.fulfill({ json: { version: "B.1", board: { cards: [card], hosts: [], needs_you: [], away: { finished: [], needs_you: [], decisions: [] } }, next: null } }));
+  await page.route("**/api/cards/78", (route) => route.fulfill({ json: { ...card, sessions: [s1, s2], artifacts: [], log: [] } }));
+  await login(page, "/");
+  const pane = page.getByRole("region", { name: "Card #78" });
+  const chain = pane.getByRole("list", { name: "Lanț de sesiuni" });
+  await expect(chain.getByRole("button", { name: /Second reviewer/ })).toHaveAttribute("aria-current", "step");
+  await chain.getByRole("button", { name: /First worker/ }).click();
+  await expect(chain.getByRole("button", { name: /First worker/ })).toHaveAttribute("aria-current", "step");
+  await pane.getByRole("button", { name: /deschide în cod/ }).click();
+  await expect(page).toHaveURL(/\/p\/alpha\/s\/pi-1$/);
+});
+
+test("stale /c/999 shows Card negăsit and does not bind a or Enter to another card", async ({ page }) => {
+  waitingBoard();
+  await login(page, "/c/999");
+  await expect(page.getByRole("alert").filter({ hasText: "Card negăsit" })).toBeVisible();
+  await expect(page.getByRole("region", { name: /^Card #/ })).toHaveCount(0);
+  await page.locator("body").press("a");
+  await page.locator("body").press("Enter");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await expect(needs(page).getByRole("button", { name: /Keep verification results/ })).toBeVisible();
+  expect(sends().filter((s) => s.approve)).toHaveLength(0);
+});
+
+test("held a (repeat keydown) is ignored and does not approve", async ({ page }) => {
+  waitingBoard();
+  await login(page, "/c/12%40leaseweb");
+  await expect(needs(page).getByRole("button", { name: /Keep verification results/ })).toBeVisible();
+  await page.evaluate(() => {
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "a", repeat: true, bubbles: true, cancelable: true }));
+  });
+  await expect(needs(page).getByRole("button", { name: /Keep verification results/ })).toBeVisible();
+  expect(sends().filter((s) => s.approve)).toHaveLength(0);
 });

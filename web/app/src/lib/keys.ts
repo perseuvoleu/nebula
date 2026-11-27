@@ -5,10 +5,11 @@ export const TAB_KEYS: Record<string, Tab> = { 1: "home", 2: "code", 3: "rag", 4
 
 /** A key belongs to the page only when nothing is being typed and no dialog is open. */
 export function pageKey(e: KeyboardEvent): boolean {
-  if (e.metaKey || e.ctrlKey || e.altKey || e.defaultPrevented) return false;
-  const target = e.target instanceof HTMLElement ? e.target : null;
-  if (target?.closest("input,textarea,select,[contenteditable=true],[role=dialog]")) return false;
-  return !document.querySelector("[role=dialog],[role=alertdialog]");
+  if (e.metaKey || e.ctrlKey || e.altKey || e.defaultPrevented || e.repeat) return false;
+  const target = e.target as { closest?: (selector: string) => unknown } | null;
+  if (target?.closest?.("input,textarea,select,[contenteditable=true],[role=dialog]")) return false;
+  if ((e.key === "Enter" || e.key === " ") && target?.closest?.('button,a,[role="button"],[role="link"]')) return false;
+  return typeof document === "undefined" || !document.querySelector("[role=dialog],[role=alertdialog]");
 }
 
 /** Calls handler for page keys; a handler returning true consumed the key. */

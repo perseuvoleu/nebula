@@ -445,7 +445,8 @@ class HTTPTests(unittest.TestCase):
 
     def test_shell_assets_and_route_fallback(self):
         for path in ["/", "/assets/app-abc123.js", "/manifest.webmanifest", "/icon.svg", "/sw.js",
-                     "/p/project", "/p/project/s/one", "/serverless", "/board", "/board/p/nebula?view=table",
+                     "/p/project", "/p/project/s/one", "/p/alpha@findl/s/one", "/p/alpha%40findl/s/one",
+                     "/serverless", "/board", "/board/p/nebula?view=table", "/board/p/alpha%40findl",
                      "/board/c/12@leaseweb?peek=12", "/board/c/12%40leaseweb", "/board/decisions/p/nebula",
                      "/board/decisions", "/board/decisions/home", "/board/home", "/board/home/c/12", "/board/p/nebula/c/12",
                      "/code", "/rag", "/decisions", "/c/12%40leaseweb", "/c/3"]:

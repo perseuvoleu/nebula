@@ -28,10 +28,11 @@ export function homeBoard(board: BoardData | null, approved: ReadonlySet<string>
     counts: { all: cards.length, needs: needs.length, working: byStage.doing.length + byStage.review.length } };
 }
 
-/** The order j/k walks: the NEEDS list, then the stages in board order, each card once. */
-export function homeOrder(home: HomeBoard): Card[] {
+/** The order j/k walks: the NEEDS list, then the visible stages in board order, each card once. */
+export function homeOrder(home: HomeBoard, stage: Stage | null = null): Card[] {
   const seen = new Set<string>();
-  return [...home.needs, ...STAGES.flatMap((s) => home.byStage[s])].filter((c) => !seen.has(c.id) && !!seen.add(c.id));
+  const stages = stage ? [stage] : STAGES;
+  return [...home.needs, ...stages.flatMap((s) => home.byStage[s])].filter((c) => !seen.has(c.id) && !!seen.add(c.id));
 }
 
 /** The host part of a ref, shown where the prototype shows @host: "#12@leaseweb" → "leaseweb". */

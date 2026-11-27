@@ -1,6 +1,6 @@
 import { type ReactNode, useState } from "react";
 import { api, describeError } from "@/lib/api";
-import { type Card, type CardSession, type CardShow, type NeedsYou, type Workspace, STAGE_LABEL, cardSlug, firstWait, knownHosts, openTarget, sessionProject } from "@/lib/board";
+import { type Card, type CardSession, type CardShow, type NeedsYou, type Stage, type Workspace, STAGE_LABEL, cardSlug, firstWait, hostProjects, knownHosts, openTarget, sessionProject } from "@/lib/board";
 import { cardAction } from "@/lib/board-actions";
 import { decisionRow, useCard, useDecisions, useHomeSessions } from "@/lib/board-reads";
 import { approvalKey, homeBoard, homeOrder } from "@/lib/home";
@@ -48,6 +48,21 @@ function RagTab() {
   );
 }
 
+async function findSessionProject(host: string, id: string, workspace: Workspace): Promise<string | null> {
+  const projects = hostProjects(host, workspace);
+  if (!projects.length) return null;
+  const results = await Promise.allSettled(
+    projects.map(async (project) => {
+      const data = await api<{ sessions: { id: string }[] }>("sessions", { project });
+      return data.sessions.some((s) => s.id === id) ? project : null;
+    }),
+  );
+  for (const r of results) {
+    if (r.status === "fulfilled" && r.value) return r.value;
+  }
+  return null;
+}
+
 export function AgentApp({ selection, navigate, workspace, phone, code }: {
   selection: Selection;
   navigate: (next: Selection, replace?: boolean) => void;
@@ -58,13 +73,16 @@ export function AgentApp({ selection, navigate, workspace, phone, code }: {
   const tab = tabOf(selection) ?? "home";
   const { board, stale, readAt } = useBoard(null);
   const [approved, setApproved] = useState<Set<string>>(new Set());
+  const [stage, setStage] = useState<Stage | null>(null);
+  const [picked, setPicked] = useState<{ card: string; idx: number } | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [help, setHelp] = useState(false);
   const home = homeBoard(board, approved);
-  const order = homeOrder(home);
+  const order = homeOrder(home, stage);
   const bySlug = (slug: string) => home.cards.find((c) => cardSlug(c.ref) === slug || c.id === slug) ?? null;
   const routed = tab === "home" && selection.card ? bySlug(selection.card) : null;
-  const card = routed ?? (phone ? null : order[0] ?? null);
+  const missingCard = tab === "home" && !!selection.card && !!board && !routed;
+  const card = selection.card ? routed : (phone ? null : order[0] ?? null);
   const shown = useCard(tab === "home" && card ? cardSlug(card.ref) : null, board);
   const show = shown?.show ?? null;
   const decisions = useDecisions(tab === "home", [], "", board).items;
@@ -82,7 +100,7 @@ export function AgentApp({ selection, navigate, workspace, phone, code }: {
         setNotice(describeError(failure));
       });
   };
-  const openInCode = async (target: Card, known: CardSession[] | null) => {
+  const openInCode = async (target: Card, known: CardSession[] | null, chosen: CardSession | null = null) => {
     setNotice(null);
     let sessions = known;
     if (!sessions) {
@@ -93,9 +111,11 @@ export function AgentApp({ selection, navigate, workspace, phone, code }: {
         return;
       }
     }
-    const session = firstWait(home.waiting.filter((w) => w.card === target.id)) ?? openTarget(sessions);
+    const session = chosen ?? firstWait(home.waiting.filter((w) => w.card === target.id)) ?? openTarget(sessions);
     if (!session) { setNotice(`${target.ref} · cardul nu are încă nicio sesiune.`); return; }
-    const project = target.project ? sessionProject(target.project, session.host, workspace) : null;
+    const project = target.project
+      ? sessionProject(target.project, session.host, workspace)
+      : await findSessionProject(session.host, session.id, workspace);
     if (project) { navigate({ project, session: session.id, all: false }); return; }
     const hosts = knownHosts(board, sessions.map((s) => s.host)).map((h) => h.host);
     const on = rememberedLaptop() ?? hosts.find((h) => h !== "leaseweb") ?? hosts[0];
@@ -116,7 +136,12 @@ export function AgentApp({ selection, navigate, workspace, phone, code }: {
       return !!next;
     }
     if (!card) return false;
-    if (key === "Enter") { void openInCode(card, show?.id === card.id ? show.sessions : null); return true; }
+    if (key === "Enter") {
+      const sessions = show?.id === card.id ? show.sessions : null;
+      const chosen = sessions && picked?.card === card.id && picked.idx < sessions.length ? sessions[picked.idx] : null;
+      void openInCode(card, sessions, chosen);
+      return true;
+    }
     const wait = firstWait(home.waiting.filter((w) => w.card === card.id));
     if (key === "a" && wait) { approve(card, wait); return true; }
     if (key === "v") { document.querySelector<HTMLElement>("[data-artifact]")?.click(); return true; }
@@ -150,8 +175,9 @@ export function AgentApp({ selection, navigate, workspace, phone, code }: {
       )}
       <main id="board-main" tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
         {tab === "home" && (
-          <HomePage home={home} card={card} show={show} workspace={workspace} decisions={decisions} phone={phone} stale={stale} loaded={!!board}
-            onSelect={(c) => select(c)} onBack={() => goTab("home")} onApprove={approve} onOpenCode={(c, sessions) => void openInCode(c, sessions)} onDecisions={() => goTab("decisions")} version={readAt} />
+          <HomePage home={home} card={card} missingCard={missingCard} show={show} workspace={workspace} decisions={decisions} phone={phone} stale={stale} loaded={!!board}
+            stage={stage} onStage={setStage} picked={picked} onPick={setPicked}
+            onSelect={(c) => select(c)} onBack={() => goTab("home")} onApprove={approve} onOpenCode={(c, sessions, session) => void openInCode(c, sessions, session ?? null)} onDecisions={() => goTab("decisions")} version={readAt} />
         )}
         {tab === "code" && code}
         {tab === "rag" && <RagTab />}

@@ -25,9 +25,10 @@ test("an approved wait leaves NEEDS at once, and a new wait of the same session 
   assert.deepEqual(homeBoard(board(cards, [wait("c1", 99)]), approved).needs.map((c) => c.ref), ["#1"]);
 });
 
-test("j/k walks NEEDS first, then the stages, each card once", () => {
+test("j/k walks NEEDS first, then the visible stages, each card once", () => {
   const home = homeBoard(board([card(1, "review"), card(2, "doing"), card(3, "backlog"), card(6, "done")]), new Set());
   assert.deepEqual(homeOrder(home).map((c) => c.ref), ["#1", "#3", "#2", "#6"]);
+  assert.deepEqual(homeOrder(home, "doing").map((c) => c.ref), ["#1", "#3", "#2"]);
   assert.equal(refHost("#12@leaseweb"), "leaseweb");
   assert.equal(refHost("#12"), null);
 });

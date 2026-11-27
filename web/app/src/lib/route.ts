@@ -75,7 +75,7 @@ export function parseSelection(path: string): Selection {
   if (card) return { project: null, session: null, all: false, view: "home", card: card[1] };
   if (/^\/(rag|decisions)\/?$/.test(pathname)) return { project: null, session: null, all: false, view: pathname.replace(/\//g, "") as "rag" | "decisions" };
   if (/^\/code\/?$/.test(pathname)) return { project: null, session: null, all };
-  const match = PATTERN.exec(pathname);
+  const match = PATTERN.exec(pathname.replace(/%40/gi, "@"));
   return { project: match?.[1] ?? null, session: match?.[2] ?? null,
     all: new URLSearchParams(query).get("view") === "all" };
 }

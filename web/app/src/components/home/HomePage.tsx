@@ -3,7 +3,7 @@ import { ArrowLeftIcon } from "lucide-react";
 import { api } from "@/lib/api";
 import { compactAge } from "@/lib/activity-age";
 import { type Artifact, type Card, type CardSession, type CardShow, type NeedsYou, STAGES, STAGE_LABEL, type Stage, type Workspace, firstWait, openTarget, projectName, sessionProject } from "@/lib/board";
-import type { Decision } from "@/lib/board-reads";
+import { type Decision, useHomeSessions } from "@/lib/board-reads";
 import { type HomeBoard, STAGE_LETTER, STAGE_TEXT, refHost } from "@/lib/home";
 import { sessionDot, statusLabel } from "@/lib/status";
 import type { ConversationResponse } from "@/lib/types";
@@ -40,13 +40,12 @@ function CardRow({ card, selected, needs, onSelect }: { card: Card; selected: bo
   );
 }
 
-function HomeLeft({ home, selected, onSelect }: { home: HomeBoard; selected: string | null; onSelect: (card: Card) => void }) {
-  const [stage, setStage] = useState<Stage | null>(null);
+function HomeLeft({ home, selected, stage, onStage, onSelect }: { home: HomeBoard; selected: string | null; stage: Stage | null; onStage: (stage: Stage | null) => void; onSelect: (card: Card) => void }) {
   const shown = stage ? [stage] : STAGES;
   return (
-    <div className="flex min-h-0 w-full flex-col md:w-[245px] md:shrink-0 md:border-r">
+    <div className="flex min-h-0 w-full flex-1 flex-col overflow-y-auto md:w-[245px] md:flex-none md:shrink-0 md:overflow-hidden md:border-r">
       {home.needs.length > 0 && (
-        <section aria-label="Te așteaptă" className="shrink-0 border-b bg-bg1">
+        <section aria-label="Te așteaptă" className="shrink-0 border-b bg-bg1 md:max-h-[40%] md:overflow-y-auto">
           <SecHead><StatusDot dot="needs" label={null} className="size-1.5" />needs<span className="font-semibold text-muted-foreground tabular-nums">{home.needs.length}</span></SecHead>
           <ul>
             {home.needs.map((c) => (
@@ -66,14 +65,14 @@ function HomeLeft({ home, selected, onSelect }: { home: HomeBoard; selected: str
       </div>
       <div role="group" aria-label="Etape" className="grid shrink-0 grid-cols-5 border-b bg-bg1">
         {STAGES.map((s) => (
-          <button key={s} type="button" aria-pressed={stage === s} aria-label={`${STAGE_LABEL[s]} ${home.byStage[s].length}`} onClick={() => setStage(stage === s ? null : s)}
+          <button key={s} type="button" aria-pressed={stage === s} aria-label={`${STAGE_LABEL[s]} ${home.byStage[s].length}`} onClick={() => onStage(stage === s ? null : s)}
             className={cn("flex h-[22px] items-center justify-center gap-[3px] border-b-2 text-[9.5px] outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset max-md:h-9",
               stage === s ? "border-primary bg-sel2 font-bold text-foreground" : "border-transparent text-dim hover:bg-bg2 hover:text-foreground")}>
             <span className={STAGE_TEXT[s]}>{STAGE_LETTER[s]}</span><span className="tabular-nums">{home.byStage[s].length}</span>
           </button>
         ))}
       </div>
-      <div className="min-h-0 flex-1 overflow-y-auto">
+      <div className="md:min-h-0 md:flex-1 md:overflow-y-auto">
         {shown.map((s) => (
           <section key={s} aria-label={STAGE_LABEL[s]}>
             <SecHead><span className={STAGE_TEXT[s]}>■ {STAGE_LABEL[s]}</span><span className="font-semibold text-muted-foreground tabular-nums">{home.byStage[s].length}</span></SecHead>
@@ -127,14 +126,16 @@ function ArtifactDialog({ artifact, onClose }: { artifact: Artifact | null; onCl
   );
 }
 
-export function CardPane({ card, show, home, workspace, decisions, onApprove, onOpenCode, onBack, version }: {
+export function CardPane({ card, show, home, workspace, decisions, picked, onPick, onApprove, onOpenCode, onBack, version }: {
   card: Card;
   show: CardShow | null;
   home: HomeBoard;
   workspace: Workspace;
   decisions: Decision[];
+  picked: { card: string; idx: number } | null;
+  onPick: (next: { card: string; idx: number } | null) => void;
   onApprove: (card: Card, wait: NeedsYou) => void;
-  onOpenCode: (card: Card, sessions: CardSession[] | null) => void;
+  onOpenCode: (card: Card, sessions: CardSession[] | null, session?: CardSession | null) => void;
   onBack?: () => void;
   version: unknown;
 }) {
@@ -142,10 +143,12 @@ export function CardPane({ card, show, home, workspace, decisions, onApprove, on
   const wait = firstWait(home.waiting.filter((w) => w.card === card.id));
   const target = wait ?? openTarget(sessions);
   const defaultIdx = Math.max(0, sessions.findIndex((s) => target && s.id === target.id && s.host === target.host));
-  const [picked, setPicked] = useState<{ card: string; idx: number } | null>(null);
   const idx = picked?.card === card.id && picked.idx < sessions.length ? picked.idx : defaultIdx;
   const session = sessions[idx] ?? null;
-  const project = session && card.project ? sessionProject(card.project, session.host, workspace) : null;
+  const homeSessions = useHomeSessions(!card.project && session ? [session] : [], workspace);
+  const project = session
+    ? (card.project ? sessionProject(card.project, session.host, workspace) : homeSessions.get(`${session.host}/${session.id}`) ?? null)
+    : null;
   const latest = useLatest(project, session, version);
   const [openArt, setOpenArt] = useState<Artifact | null>(null);
   const artifacts = (show?.artifacts ?? []).filter((a) => a.kind !== "decision");
@@ -153,7 +156,7 @@ export function CardPane({ card, show, home, workspace, decisions, onApprove, on
   const cardDecisions = decisions.filter((d) => d.card === card.id);
   const dot = wait ? "needs" : card.stage === "done" ? "done" : sessions.some((s) => s.status === "running") ? "running" : card.stage === "review" ? "done" : "off";
   const branch = card.checkout?.branch ?? "main";
-  const openCode = () => onOpenCode(card, show ? sessions : null);
+  const openCode = () => onOpenCode(card, show ? sessions : null, session);
   return (
     <section aria-label={`Card ${card.ref}`} className="flex min-h-0 min-w-0 flex-1 flex-col">
       <div className="flex min-h-[27px] shrink-0 items-center gap-1.5 border-b px-2 py-1 max-md:flex-wrap">
@@ -178,7 +181,7 @@ export function CardPane({ card, show, home, workspace, decisions, onApprove, on
           {sessions.map((s, k) => (
             <li key={`${s.host}/${s.id}`} className="contents">
               {k > 0 && <span aria-hidden>→</span>}
-              <button type="button" onClick={() => setPicked({ card: card.id, idx: k })} aria-current={k === idx ? "step" : undefined}
+              <button type="button" onClick={() => onPick({ card: card.id, idx: k })} aria-current={k === idx ? "step" : undefined}
                 className={cn("inline-flex h-[18px] items-center gap-1 rounded-xs px-[5px] whitespace-nowrap outline-none focus-visible:ring-2 focus-visible:ring-ring max-md:h-8",
                   k === idx ? "bg-sel2 text-foreground" : "hover:bg-bg1 hover:text-foreground")}>
                 <StatusDot dot={wait && wait.id === s.id ? "needs" : sessionDot(s.status)} className="size-1.5" />{s.name}
@@ -304,34 +307,49 @@ function DecisionsRail({ card, cards, decisions, workspace, onDecisions, onSelec
   );
 }
 
-export function HomePage({ home, card, show, workspace, decisions, phone, stale, loaded, onSelect, onBack, onApprove, onOpenCode, onDecisions, version }: {
+export function HomePage({ home, card, missingCard, show, workspace, decisions, phone, stale, loaded, stage, onStage, picked, onPick, onSelect, onBack, onApprove, onOpenCode, onDecisions, version }: {
   home: HomeBoard;
   card: Card | null;
+  missingCard: boolean;
   show: CardShow | null;
   workspace: Workspace;
   decisions: Decision[];
   phone: boolean;
   stale: boolean;
   loaded: boolean;
+  stage: Stage | null;
+  onStage: (stage: Stage | null) => void;
+  picked: { card: string; idx: number } | null;
+  onPick: (next: { card: string; idx: number } | null) => void;
   onSelect: (card: Card) => void;
   onBack: () => void;
   onApprove: (card: Card, wait: NeedsYou) => void;
-  onOpenCode: (card: Card, sessions: CardSession[] | null) => void;
+  onOpenCode: (card: Card, sessions: CardSession[] | null, session?: CardSession | null) => void;
   onDecisions: () => void;
   version: unknown;
 }) {
   if (!loaded) return (
     <p role={stale ? "alert" : undefined} aria-busy={!stale} className="p-4 font-mono text-dim">{stale ? "Board-ul nu poate fi citit acum." : "Se încarcă…"}</p>
   );
-  const pane = card && (
+  const pane = card ? (
     <CardPane key={card.id} card={card} show={show?.id === card.id ? show : null} home={home} workspace={workspace} decisions={decisions}
-      onApprove={onApprove} onOpenCode={onOpenCode} onBack={phone ? onBack : undefined} version={version} />
-  );
-  if (phone) return <div className="flex min-h-0 flex-1 flex-col font-mono text-[12.5px] leading-[1.35]">{pane ?? <HomeLeft home={home} selected={null} onSelect={onSelect} />}</div>;
+      picked={picked} onPick={onPick} onApprove={onApprove} onOpenCode={onOpenCode} onBack={phone ? onBack : undefined} version={version} />
+  ) : null;
+  const missing = missingCard ? (
+    <section aria-label="Card negăsit" className="flex min-h-0 flex-1 flex-col p-4">
+      {phone && (
+        <button type="button" onClick={onBack} className="-ml-1 mb-2 inline-flex size-9 items-center justify-center self-start rounded-xs outline-none focus-visible:ring-2 focus-visible:ring-ring" aria-label="Înapoi">
+          <ArrowLeftIcon aria-hidden className="size-4" />
+        </button>
+      )}
+      <p role="alert" className="text-dim">Card negăsit.</p>
+    </section>
+  ) : null;
+  if (phone) return <div className="flex min-h-0 flex-1 flex-col font-mono text-[12.5px] leading-[1.35]">{pane ?? missing ?? <HomeLeft home={home} selected={null} stage={stage} onStage={onStage} onSelect={onSelect} />}</div>;
   return (
     <div className="flex min-h-0 flex-1 font-mono text-[11.5px] leading-[1.35]">
-      <HomeLeft home={home} selected={card?.id ?? null} onSelect={onSelect} />
-      {pane ?? <p className="flex-1 p-4 text-dim">Niciun card încă. Agenții le adaugă cu <code>nebula todo add</code>.</p>}
+      <HomeLeft home={home} selected={card?.id ?? null} stage={stage} onStage={onStage} onSelect={onSelect} />
+      {pane ?? missing ?? <p className="flex-1 p-4 text-dim">Niciun card încă. Agenții le adaugă cu <code>nebula todo add</code>.</p>}
       <DecisionsRail card={card} cards={home.cards} decisions={decisions} workspace={workspace} onDecisions={onDecisions} onSelect={onSelect} />
     </div>
   );
