@@ -1,7 +1,7 @@
 import { useRef, useState } from "react";
 import { CodeIcon, CopyIcon, PlayIcon, XIcon } from "lucide-react";
 import { describeError } from "@/lib/api";
-import { type OpenDialog, type Target, focusBack, openCode, rememberedLaptop, useOpenCode } from "@/lib/open-code";
+import { type OpenDialog, type Target, focusBack, openCode, rememberedLaptop, resultFor, useOpenCode } from "@/lib/open-code";
 import { cn } from "@/lib/utils";
 import { type BoardData, type CardShow, STAGES, STAGE_LABEL, type Stage, knownHosts, openTarget } from "@/lib/board";
 import { cardAction, ulid } from "@/lib/board-actions";
@@ -22,6 +22,7 @@ export function RunButton({ cardRef, cardTitle, branch, hosts, disabled, size = 
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const open = () => {
+    openCode.invalidate();
     setError(null);
     setRun({
       draft: { role: "worker", kind: "claude", host: hosts.some((h) => h.host === DEFAULT_HOST) ? DEFAULT_HOST : hosts[0]?.host ?? DEFAULT_HOST, worktree: "new" },
@@ -61,8 +62,8 @@ export function RunButton({ cardRef, cardTitle, branch, hosts, disabled, size = 
 }
 
 /** The opener stays focusable while busy (aria-disabled), so focus can return to it after the dialog or a failed lookup. */
-export function OpenCodeButton({ cardRef, target, resolve, hosts, size = "sm", label, compact = false }: {
-  cardRef: string; target?: Target | null; resolve?: () => Promise<Target | null>; hosts: string[]; size?: "sm" | "xs"; label?: string; compact?: boolean;
+export function OpenCodeButton({ cardRef, cardId = null, target, resolve, hosts, size = "sm", label, compact = false }: {
+  cardRef: string; cardId?: string | null; target?: Target | null; resolve?: () => Promise<Target | null>; hosts: string[]; size?: "sm" | "xs"; label?: string; compact?: boolean;
 }) {
   const { pending } = useOpenCode();
   const [looking, setLooking] = useState(false);
@@ -72,6 +73,7 @@ export function OpenCodeButton({ cardRef, target, resolve, hosts, size = "sm", l
   const pick = async (opener: HTMLElement) => {
     if (busy || unavailable) return;
     const token = openCode.begin();
+    const scope = opener.closest("[data-open-scope]")?.getAttribute("data-open-scope") ?? null;
     setLookupError(null);
     let session = target ?? null;
     let failed: string | null = null;
@@ -90,13 +92,13 @@ export function OpenCodeButton({ cardRef, target, resolve, hosts, size = "sm", l
     if (failed) {
       if (opener.isConnected) setLookupError(failed);
       else {
-        openCode.report(cardRef, failed);
-        focusBack(null, label ?? null, () => document.getElementById("board-main"));
+        openCode.report(cardRef, cardId, failed);
+        focusBack(null, label ?? null, scope, () => document.getElementById("board-main"));
       }
       return;
     }
     const on = rememberedLaptop() ?? hosts.find((h) => h !== DEFAULT_HOST) ?? hosts[0];
-    if (session && on) openCode.open(token, { cardRef, target: session, on, hosts, opener, label: label ?? null });
+    if (session && on) openCode.open(token, { cardRef, cardId, target: session, on, hosts, opener, label: label ?? null, scope });
   };
   return (
     <>
@@ -111,12 +113,17 @@ export function OpenCodeButton({ cardRef, target, resolve, hosts, size = "sm", l
   );
 }
 
-/** The card page's full result, keyed by the route's card so it shows while the card read loads or fails. */
-export function OpenCodeResult({ cardRef }: { cardRef: string }) {
-  const result = useOpenCode().results.find((r) => r.cardRef === cardRef);
+/** The card page's full result, keyed by the route's card (slug or id) so it shows while the card read loads or fails. */
+export function OpenCodeResult({ cardKey }: { cardKey: string }) {
+  const result = useOpenCode().results.find((r) => resultFor(r, cardKey));
   if (!result) return null;
   if (result.error) return <p role="alert" className="text-sm text-err">{result.error}</p>;
-  if (result.command === null) return <p role="status" className="text-sm">Deschis în cod pe <span className="font-mono">@{result.on}</span>.</p>;
+  if (result.command === null) return (
+    <p role="status" className="flex items-center gap-2 text-sm">
+      <span className="flex-1">Deschis în cod pe <span className="font-mono">@{result.on}</span>.</span>
+      <Button type="button" variant="ghost" size="icon-xs" aria-label="Închide mesajul" onClick={() => openCode.dismiss(result.cardRef)}><XIcon aria-hidden /></Button>
+    </p>
+  );
   const command = result.command;
   return (
     <div className="flex flex-col gap-1.5 rounded-md border border-line-warn bg-bg0 px-[11px] py-[9px] text-sm">
@@ -144,7 +151,7 @@ export function OpenCodeDialog({ fallback }: { fallback: () => HTMLElement | nul
     <Dialog open={dialog !== null} onOpenChange={(next) => { if (!next) openCode.cancel(); }}>
       <DialogContent className="sm:max-w-sm" onCloseAutoFocus={(e) => {
         e.preventDefault();
-        focusBack(shown?.opener ?? null, shown?.label ?? null, fallback);
+        focusBack(shown?.opener ?? null, shown?.label ?? null, shown?.scope ?? null, fallback, true);
       }}>
         <DialogHeader>
           <DialogTitle>Deschide în cod <span className="font-mono">{shown?.cardRef}</span></DialogTitle>
@@ -167,13 +174,18 @@ export function OpenCodeDialog({ fallback }: { fallback: () => HTMLElement | nul
 
 const plainClick = (e: MouseEvent) => e.button === 0 && !e.metaKey && !e.ctrlKey && !e.shiftKey && !e.altKey;
 
-/** One line for results of tiles, the strip and peeks; the card page (shown) prints its own block instead. Mounted empty so it is announced. */
-export function OpenCodeToast({ shown, cardHref, onCardPage }: { shown: string | null; cardHref: (ref: string) => string; onCardPage: (ref: string) => void }) {
+/**
+ * One line per result, mounted empty so it is announced. The board's line skips the cards shown elsewhere (exclude);
+ * a peek sheet passes only, so its line sits inside the sheet where it can be reached.
+ */
+export function OpenCodeToast({ id, only, exclude = [], cardHref, onCardPage }: {
+  id?: string; only?: string; exclude?: (string | null)[]; cardHref: (ref: string) => string; onCardPage: (ref: string) => void;
+}) {
   const { results } = useOpenCode();
-  const result = results.filter((r) => r.cardRef !== shown).at(-1);
+  const result = results.filter((r) => (only === undefined || resultFor(r, only)) && !exclude.some((key) => resultFor(r, key))).at(-1);
   const tone = !result ? "" : result.error ? "text-err" : result.command ? "text-warn" : "text-ok";
   return (
-    <div id="open-code-status" role="status" className="shrink-0">
+    <div id={id} {...(id ? { role: "status" } : { "aria-live": "polite" as const })} className="shrink-0">
       {result && (
         <div className={cn("flex items-center gap-2 border-b bg-bg1 px-3.5 py-1 text-xs", tone)}>
           <span className="min-w-0 flex-1 truncate">
@@ -228,10 +240,10 @@ export function CardActions({ show, board }: { show: CardShow; board: BoardData 
   };
 
   return (
-    <section aria-label="Acțiuni" className="flex flex-col gap-3 rounded-md border bg-bg0 px-[11px] py-[9px]">
+    <section aria-label="Acțiuni" data-open-scope="card" className="flex flex-col gap-3 rounded-md border bg-bg0 px-[11px] py-[9px]">
       <div className="flex flex-wrap items-center gap-2">
         <RunButton cardRef={show.ref} cardTitle={show.title} branch={branch} hosts={hosts} disabled={show.archived} />
-        <OpenCodeButton cardRef={show.ref} target={target} hosts={hosts.map((h) => h.host)} />
+        <OpenCodeButton cardRef={show.ref} cardId={show.id} target={target} hosts={hosts.map((h) => h.host)} />
         <label className="ml-auto flex items-center gap-1.5 text-xs text-muted-foreground">
           Etapă
           <select value={show.stage} className={fieldCls} disabled={pending === "move"}

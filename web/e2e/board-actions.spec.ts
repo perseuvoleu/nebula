@@ -624,7 +624,7 @@ test("a peek shows the compact result, not the command block", async ({ page }) 
   const peek = page.getByRole("dialog", { name: "Keep verification results" });
   await peek.getByRole("button", { name: "Deschide în cod" }).click();
   await confirmOpen(page);
-  await expect(page.locator("#open-code-status")).toContainText("pagina cardului");
+  await expect(peek.getByRole("link", { name: /pagina cardului/ })).toBeVisible();
   await expect(page.getByText(/nebula open --session/)).toHaveCount(0);
 });
 
@@ -679,4 +679,153 @@ test("a success line sits in a status region mounted beforehand, can be closed, 
   await confirmOpen(page);
   await expect(region).toContainText("Deschis pe");
   await expect(region).toHaveText("", { timeout: 20_000 });
+});
+
+
+const held = () => {
+  let release = () => {};
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  return { gate, release };
+};
+const COMMAND_409 = { status: 409, contentType: "application/json",
+  body: JSON.stringify({ error: "Nebula not reachable on perseu-mbp", command: "nebula open --session=01JF0000000000000000000002 --on perseu-mbp" }) };
+const backToBoard = (page: Page) => page.getByRole("link", { name: "Board" }).or(page.getByRole("button", { name: "Board", exact: true })).filter({ visible: true }).first().click();
+
+test("an Open answer that lands after logout leaves no result behind", async ({ page }) => {
+  withLaptop();
+  const post = held();
+  let answered = () => {};
+  const done = new Promise<void>((resolve) => { answered = resolve; });
+  await page.route("**/api/cards/*/open-code", async (route) => { await post.gate; await route.fulfill(COMMAND_409).catch(() => undefined); answered(); });
+  await login(page, "/board");
+  await tile(page, "Keep verification results").getByRole("button", { name: "Deschide în cod #12@leaseweb" }).click();
+  await confirmOpen(page);
+  await page.getByRole("button", { name: "Sesiuni", exact: true }).click();
+  await page.getByRole("button", { name: "Deconectare" }).filter({ visible: true }).click();
+  await expect(page.getByLabel("Token de acces")).toBeVisible();
+  post.release();
+  await done;
+  await page.waitForTimeout(300);
+  await page.getByLabel("Token de acces").fill(TOKEN);
+  await page.getByRole("button", { name: "Conectare" }).click();
+  await backToBoard(page);
+  await expect(tile(page, "Keep verification results")).toBeVisible();
+  await expect(page.locator("#open-code-status")).toHaveText("");
+  expect(await page.evaluate(() => sessionStorage.getItem("nebula-open-results") ?? "")).not.toContain("nebula open");
+});
+
+test("an Open refused with 401 leaves no error behind once signed in again", async ({ page }) => {
+  withLaptop();
+  await login(page, "/board");
+  await page.route("**/api/cards/*/open-code", (route) => route.fulfill({ status: 401, contentType: "application/json", body: JSON.stringify({ error: "Token respins" }) }));
+  await tile(page, "Keep verification results").getByRole("button", { name: "Deschide în cod #12@leaseweb" }).click();
+  await confirmOpen(page);
+  await expect(page.getByLabel("Token de acces")).toBeVisible();
+  await page.unroute("**/api/cards/*/open-code");
+  await page.getByLabel("Token de acces").fill(TOKEN);
+  await page.getByRole("button", { name: "Conectare" }).click();
+  await expect(page.getByLabel("Token de acces")).toHaveCount(0);
+  await page.goto("/board");
+  await expect(tile(page, "Keep verification results")).toBeVisible();
+  await expect(page.locator("#open-code-status")).toHaveText("");
+});
+
+test("opening Card nou while a lookup runs drops that lookup and keeps the draft focused", async ({ page }) => {
+  withLaptop();
+  const lookup = held();
+  await page.route("**/api/cards/12%40leaseweb", async (route) => { await lookup.gate; await route.continue(); });
+  await login(page, "/board");
+  await tile(page, "Keep verification results").getByRole("button", { name: "Deschide în cod #12@leaseweb" }).click();
+  await page.getByRole("button", { name: "Card nou", exact: true }).click();
+  const title = page.getByRole("dialog", { name: "Card nou" }).getByLabel("Titlu");
+  await title.fill("Draft in progress");
+  lookup.release();
+  await page.waitForTimeout(800);
+  await expect(page.getByRole("dialog", { name: /Deschide în cod/ })).toHaveCount(0);
+  await expect(title).toBeFocused();
+  await expect(title).toHaveValue("Draft in progress");
+});
+
+test("choosing another sidebar scope drops a lookup still in flight", async ({ page }) => {
+  withLaptop();
+  startedCard(13, "Asks for an answer", "01JF0000000000000000000013");
+  changeBoard((board) => { Object.assign(board.details["01JD0000000000000000000013"].sessions[0], { status: "needs_feedback", status_changed_at: 1764000600000 }); });
+  const lookup = held();
+  await page.route("**/api/cards/12%40leaseweb", async (route) => { await lookup.gate; await route.continue(); });
+  await login(page, "/board");
+  await tile(page, "Keep verification results").getByRole("button", { name: "Deschide în cod #12@leaseweb" }).click();
+  await page.getByRole("navigation", { name: "Proiecte" }).getByRole("button", { name: /Te așteaptă/ }).click();
+  await expect(tile(page, "Keep verification results")).toHaveCount(0);
+  lookup.release();
+  await page.waitForTimeout(800);
+  await expect(page.getByRole("dialog", { name: /Deschide în cod/ })).toHaveCount(0);
+});
+
+test("in an open peek the 409 line sits inside the sheet and its link leads to the command", async ({ page }) => {
+  withLaptop();
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.route("**/api/cards/*/open-code", (route) => route.fulfill(COMMAND_409));
+  await login(page, "/board?peek=12%40leaseweb");
+  const peek = page.getByRole("dialog", { name: "Keep verification results" });
+  await peek.getByRole("button", { name: "Deschide în cod" }).click();
+  await confirmOpen(page);
+  await peek.getByRole("link", { name: /pagina cardului/ }).click();
+  await expect(page).toHaveURL(/\/board\/c\/12%40leaseweb$/);
+  await expect(page.getByText("nebula open --session=01JF0000000000000000000002 --on perseu-mbp")).toBeVisible();
+});
+
+test("on a card page opened by its id, the 409 command shows there, also after a failed card read", async ({ page }) => {
+  withLaptop();
+  await page.route("**/api/cards/*/open-code", (route) => route.fulfill(COMMAND_409));
+  await login(page, "/board/c/01JD0000000000000000000012");
+  await page.getByRole("region", { name: "Acțiuni" }).getByRole("button", { name: "Deschide în cod" }).click();
+  await confirmOpen(page);
+  await expect(page.getByRole("button", { name: "Copiază comanda" })).toBeVisible();
+  await expect(page.getByRole("link", { name: /pagina cardului/ })).toHaveCount(0);
+  await page.route("**/api/cards/01JD0000000000000000000012", (route) => route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ error: "Gateway busy" }) }));
+  await page.reload();
+  await expect(page.getByRole("button", { name: "Copiază comanda" })).toBeVisible();
+});
+
+test("the card page's success line can be closed", async ({ page }) => {
+  withLaptop();
+  await login(page, "/board/c/12%40leaseweb");
+  await page.getByRole("region", { name: "Acțiuni" }).getByRole("button", { name: "Deschide în cod" }).click();
+  await confirmOpen(page);
+  const line = page.getByRole("status").filter({ hasText: "Deschis în cod pe" });
+  await expect(line).toBeVisible();
+  await line.getByRole("button", { name: "Închide mesajul" }).click();
+  await expect(page.getByText("Deschis în cod pe")).toHaveCount(0);
+});
+
+test("a failed lookup does not pull focus away from where the user moved it", async ({ page }) => {
+  const lookup = held();
+  await page.route("**/api/cards/12%40leaseweb", async (route) => {
+    await lookup.gate;
+    await route.fulfill({ status: 503, contentType: "application/json", body: JSON.stringify({ error: "Gateway busy" }) });
+  });
+  await login(page, "/board");
+  await column(page, "În lucru").getByRole("button", { name: "Deschide în cod #12@leaseweb" }).click();
+  const filter = page.getByRole("searchbox", { name: "Filtrează cardurile" });
+  await filter.focus();
+  changeBoard((board) => { board.cards.find((c: { id: string }) => c.id === CARD)!.stage = "review"; });
+  await expect(column(page, "Review").getByRole("button", { name: "Deschide în cod #12@leaseweb" })).toBeVisible({ timeout: 15_000 });
+  lookup.release();
+  await expect(page.getByRole("status").filter({ hasText: "Gateway busy" })).toBeVisible();
+  await expect(filter).toBeFocused();
+});
+
+test("closing a dialog whose tile was re-rendered focuses the tile's copy, not the strip's", async ({ page }) => {
+  withLaptop();
+  waiting(1764000600000);
+  await login(page, "/board");
+  await column(page, "În lucru").getByRole("button", { name: "Deschide în cod #12@leaseweb" }).click();
+  const dialog = page.getByRole("dialog", { name: /Deschide în cod/ });
+  await expect(dialog).toBeVisible();
+  changeBoard((board) => { board.cards.find((c: { id: string }) => c.id === CARD)!.stage = "review"; });
+  const moved = page.getByRole("region", { name: "Review", exact: true, includeHidden: true }).getByRole("button", { name: "Deschide în cod #12@leaseweb", includeHidden: true });
+  await expect(moved).toHaveCount(1, { timeout: 15_000 });
+  await page.keyboard.press("Escape");
+  await expect(dialog).toHaveCount(0);
+  await expect(moved).toBeFocused();
 });

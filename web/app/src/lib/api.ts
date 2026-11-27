@@ -14,6 +14,10 @@ function safeRead(): string {
 }
 
 const cleared = new Set<() => void>();
+let generation = 0;
+
+/** Changes whenever the signed-in session ends; work started under an older value must not write anything. */
+export const authGeneration = (): number => generation;
 
 /** Runs on logout and on a rejected token, for state that must not outlive the signed-in session. */
 export function onTokenCleared(fn: () => void): void {
@@ -32,7 +36,10 @@ export function setToken(value: string): void {
   } catch {
     // Session storage unavailable: keep the token in memory for this page only.
   }
-  if (!value) cleared.forEach((fn) => fn());
+  if (!value) {
+    generation += 1;
+    cleared.forEach((fn) => fn());
+  }
   listeners.forEach((fn) => fn());
 }
 

@@ -28,7 +28,7 @@ export function CardTile({ card, selected = false, showProject = false, waiting 
   const dot = card.needsYou ? "needs" : cardDot(card);
   const sessions = card.sessions ?? waiting.map((w) => ({ ...w, status: "needs_feedback" }));
   return (
-    <article className={cn(
+    <article data-open-scope="tile" className={cn(
       "relative flex flex-col gap-[5px] rounded-md border bg-bg2 px-[9px] py-2 text-card-foreground transition-[border-color,background-color,opacity] hover:border-edge-hover hover:bg-bg2-hover has-[button:focus-visible]:ring-2 has-[button:focus-visible]:ring-ring",
       selected && "border-primary bg-sel2 hover:border-primary hover:bg-sel2",
       card.needsYou && "border-l-[3px] border-l-err hover:border-l-err",

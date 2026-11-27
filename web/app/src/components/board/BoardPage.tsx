@@ -225,6 +225,7 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
     setMenuOpen(false);
   };
   const select = (next: SidebarScope) => {
+    openCodeStore.leave();
     setLocal(next);
     go(routed(next));
   };
@@ -265,6 +266,7 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
     if (card && card.stage !== stage) optimistic(ref, { stage }, cardAction(ref, "move", { stage, expect: card.stage }));
   };
   const openNew = (stage: Stage = "backlog") => {
+    openCodeStore.invalidate();
     setCreateError(null);
     setNewCard({ title: "", project: scope.kind === "all" || scope.kind === "needs" || scope.kind === "all-decisions" ? null : scope.project, stage, id: ulid() });
   };
@@ -294,7 +296,7 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
   const openCode = (card: BoardCard) => {
     const target = waitingOn(card);
     return (
-      <OpenCodeButton size="xs" compact cardRef={card.ref} target={target} resolve={target ? undefined : resolveTarget(card.ref)}
+      <OpenCodeButton size="xs" compact cardRef={card.ref} cardId={live.find((c) => c.ref === card.ref)?.id ?? null} target={target} resolve={target ? undefined : resolveTarget(card.ref)}
         hosts={hosts.map((h) => h.host)} label={`Deschide în cod ${card.ref}`} />
     );
   };
@@ -320,7 +322,7 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
   const main = route.card ? (
     <div className="min-h-0 flex-1 overflow-y-auto p-4">
       <Button type="button" variant="ghost" size="sm" className="mb-3" onClick={() => go({})}><ArrowLeftIcon aria-hidden />Board</Button>
-      <div className="mx-auto mb-3 w-full max-w-3xl empty:hidden"><OpenCodeResult cardRef={`#${route.card}`} /></div>
+      <div className="mx-auto mb-3 w-full max-w-3xl empty:hidden"><OpenCodeResult cardKey={route.card} /></div>
       <CardPanel slug={route.card} board={board} mode="page" onOpenCard={openPage} />
     </div>
   ) : route.decisions ? (
@@ -349,7 +351,7 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
       <div className="hidden min-h-0 md:flex">{sidebar}</div>
       <main id="board-main" tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
         <header className="flex min-h-[42px] shrink-0 flex-wrap items-center gap-x-2 gap-y-1.5 border-b bg-bg0 px-3.5 py-1.5">
-          <Button type="button" variant="ghost" size="icon-lg" aria-label="Meniu" onClick={() => setMenuOpen(true)} className="-ml-2 size-11 md:hidden">
+          <Button type="button" variant="ghost" size="icon-lg" aria-label="Meniu" onClick={() => { openCodeStore.invalidate(); setMenuOpen(true); }} className="-ml-2 size-11 md:hidden">
             <MenuIcon aria-hidden className="size-5" />
           </Button>
           <span aria-hidden className="grid size-5 place-items-center rounded-sm border border-primary bg-sel2 text-[11px] text-primary">◫</span>
@@ -414,7 +416,7 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
             <Button type="button" variant="ghost" size="sm" onClick={() => setActionError(null)}>Închide</Button>
           </p>
         )}
-        <OpenCodeToast shown={route.card ? `#${route.card}` : null} cardHref={(ref) => boardHref(cardPage(ref))} onCardPage={openPage} />
+        <OpenCodeToast id="open-code-status" exclude={[route.card, route.peek]} cardHref={(ref) => boardHref(cardPage(ref))} onCardPage={openPage} />
         {!route.card && !route.decisions && (
           <NeedsYouStrip cards={waitingCards} onOpen={openCard}
             renderActions={(card) => <>{approveButtons(card)}{openCode(card)}</>} />
@@ -445,6 +447,7 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
             <>
               <a href={boardHref(cardPage(route.peek))} onClick={(e) => { e.preventDefault(); openPage(route.peek!); }}
                 className="self-start text-sm underline underline-offset-4 outline-none focus-visible:ring-2 focus-visible:ring-ring">Deschide pagina</a>
+              <OpenCodeToast only={route.peek} cardHref={(ref) => boardHref(cardPage(ref))} onCardPage={openPage} />
               <CardPanel slug={route.peek} board={board} mode="peek" onOpenCard={peek} />
             </>
           )}

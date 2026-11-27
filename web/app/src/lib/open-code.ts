@@ -1,11 +1,17 @@
 import { useSyncExternalStore } from "react";
-import { ApiError, describeError, onTokenCleared } from "./api.ts";
+import { ApiError, authGeneration, describeError, onTokenCleared } from "./api.ts";
 import { cardAction } from "./board-actions.ts";
 
 export type Target = { id: string; host: string };
-/** label names the opener, so focus can find a replacement button when a poll re-rendered the row. */
-export type OpenDialog = { cardRef: string; target: Target; on: string; hosts: string[]; opener: HTMLElement | null; label: string | null };
-export type OpenResult = { cardRef: string; on: string; command: string | null; error: string | null; at: number };
+/**
+ * label and scope (the opener's data-open-scope: tile, strip, card) let focus find the opener's copy
+ * when a poll re-rendered its row; cardId lets a card page reached by id find the result.
+ */
+export type OpenDialog = { cardRef: string; cardId: string | null; target: Target; on: string; hosts: string[]; opener: HTMLElement | null; label: string | null; scope: string | null };
+export type OpenResult = { cardRef: string; cardId: string | null; on: string; command: string | null; error: string | null; at: number };
+
+/** key is a card route slug: "12@leaseweb" or the card's id. */
+export const resultFor = (r: OpenResult, key: string | null) => key !== null && (r.cardId === key || r.cardRef === `#${key}`);
 type State = { dialog: OpenDialog | null; pending: string[]; results: OpenResult[] };
 
 const LAPTOP = "nebula-open-laptop";
@@ -60,7 +66,9 @@ export const openCode = {
     set({ dialog });
     return true;
   },
-  report: (cardRef: string, error: string) => keep({ cardRef, on: "", command: null, error, at: Date.now() }),
+  report: (cardRef: string, cardId: string | null, error: string) => keep({ cardRef, cardId, on: "", command: null, error, at: Date.now() }),
+  /** Another board dialog opened: a lookup still running must not open over it. */
+  invalidate: () => { gesture += 1; },
   /** The route the dialog or lookup started on is gone: nothing it started may surface on the next one. */
   leave: () => {
     gesture += 1;
@@ -73,17 +81,19 @@ export const openCode = {
   async confirm() {
     const dialog = state.dialog;
     if (!dialog) return;
-    const { cardRef, target, on } = dialog;
+    const { cardRef, cardId, target, on } = dialog;
+    const signedIn = authGeneration();
     try { localStorage.setItem(LAPTOP, on); } catch { /* Without storage the choice lasts this visit. */ }
     set({ dialog: null, pending: [...state.pending, cardRef], results: state.results.filter((r) => r.cardRef !== cardRef) });
     let result: OpenResult;
     try {
       await cardAction(cardRef, "open-code", { session: target.id, host: target.host, on });
-      result = { cardRef, on, command: null, error: null, at: Date.now() };
+      result = { cardRef, cardId, on, command: null, error: null, at: Date.now() };
     } catch (failure) {
       const command = failure instanceof ApiError && failure.status === 409 && typeof failure.data.command === "string" ? failure.data.command : null;
-      result = { cardRef, on, command, error: command ? null : describeError(failure), at: Date.now() };
+      result = { cardRef, cardId, on, command, error: command ? null : describeError(failure), at: Date.now() };
     }
+    if (signedIn !== authGeneration()) return;
     set({ pending: state.pending.filter((r) => r !== cardRef) });
     keep(result);
   },
@@ -96,8 +106,13 @@ const subscribe = (listener: () => void) => {
 
 export const useOpenCode = () => useSyncExternalStore(subscribe, () => state);
 
-/** Where focus goes when the opener left the page: its replacement by name, else the fallback. */
-export function focusBack(opener: HTMLElement | null, label: string | null, fallback: () => HTMLElement | null) {
-  const replacement = label ? [...document.querySelectorAll<HTMLElement>("[aria-label]")].find((el) => el.getAttribute("aria-label") === label) : undefined;
+/**
+ * Where focus goes when the opener left the page: its copy in the same kind of place, then any copy, then the fallback.
+ * Without force it moves focus only when focus was lost (on body); a closing dialog passes force.
+ */
+export function focusBack(opener: HTMLElement | null, label: string | null, scope: string | null, fallback: () => HTMLElement | null, force = false) {
+  if (!force && document.activeElement && document.activeElement !== document.body) return;
+  const copies = label ? [...document.querySelectorAll<HTMLElement>("[aria-label]")].filter((el) => el.getAttribute("aria-label") === label) : [];
+  const replacement = copies.find((el) => scope !== null && el.closest("[data-open-scope]")?.getAttribute("data-open-scope") === scope) ?? copies[0];
   (opener?.isConnected ? opener : replacement ?? fallback())?.focus();
 }
