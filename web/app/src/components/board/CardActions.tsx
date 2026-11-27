@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { CodeIcon, CopyIcon, PlayIcon } from "lucide-react";
 import { ApiError, describeError } from "@/lib/api";
-import { type BoardData, type CardShow, STAGES, STAGE_LABEL, type Stage } from "@/lib/board";
+import { type BoardData, type CardShow, STAGES, STAGE_LABEL, type Stage, knownHosts } from "@/lib/board";
 import { cardAction, ulid } from "@/lib/board-actions";
 import { Button } from "@/components/ui/button";
 import {
@@ -20,19 +20,6 @@ function rememberedLaptop(): string | null {
   }
 }
 const fieldCls = "field h-9 min-w-0 px-2 text-sm";
-
-/** Every host this board knows of: the ones reporting, the ones in card refs and authors, and the card's own sessions' hosts. */
-export function knownHosts(board: BoardData | null, sessionHosts: string[] = []): RunHost[] {
-  const known = [...new Set([
-    ...(board?.hosts ?? []).map((h) => h.host),
-    ...(board?.cards ?? []).flatMap((c) => [c.created_by.host, ...c.ref.split("@").slice(1)]),
-    ...sessionHosts,
-  ])];
-  return known.map((host) => {
-    const reported = board?.hosts.find((h) => h.host === host);
-    return { host, writers: reported?.writers ?? 0, writerSlots: reported?.writer_slots ?? null };
-  });
-}
 
 export function RunButton({ cardRef, cardTitle, branch, hosts, disabled, size = "sm", label }: {
   cardRef: string; cardTitle: string; branch: string | null; hosts: RunHost[]; disabled?: boolean; size?: "sm" | "xs"; label?: string;

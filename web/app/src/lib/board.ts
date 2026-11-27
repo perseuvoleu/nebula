@@ -162,6 +162,19 @@ export function openBlockers(card: Card, cards: Card[]): BlockerRef[] {
 
 export const isBlocked = (card: Card, cards: Card[]): boolean => openBlockers(card, cards).length > 0;
 
+/** Every host this board knows of: the ones reporting, the ones in card refs and authors, and the card's own sessions' hosts. */
+export function knownHosts(board: BoardData | null, sessionHosts: string[] = []): { host: string; writers: number; writerSlots: number | null }[] {
+  const known = [...new Set([
+    ...(board?.hosts ?? []).map((h) => h.host),
+    ...(board?.cards ?? []).flatMap((c) => [c.created_by.host, ...c.ref.split("@").slice(1)]),
+    ...sessionHosts,
+  ])];
+  return known.map((host) => {
+    const reported = board?.hosts.find((h) => h.host === host);
+    return { host, writers: reported?.writers ?? 0, writerSlots: reported?.writer_slots ?? null };
+  });
+}
+
 export const writerSlots = (hosts: BoardHost[]): HostSlots[] =>
   hosts.map((h) => ({ host: h.host, writers: h.writers, slots: h.writer_slots }));
 

@@ -4,7 +4,7 @@ import { api, describeError } from "@/lib/api";
 import { activityAge, compactAge } from "@/lib/activity-age";
 import {
   type BoardCard, type BoardData, type Card, type CardShow, type NeedsYou, type SessionLink, type SidebarScope, type SortKey, type TableSort, type Stage, type Workspace, GRANT_RENEW_MS,
-  awayDigest, byStage, cardSlug, hostProjects, inScope, projectName, sessionProject, sidebarProjects, sortCards, toBoardCard, writerSlots,
+  awayDigest, byStage, cardSlug, hostProjects, knownHosts, inScope, projectName, sessionProject, sidebarProjects, sortCards, toBoardCard, writerSlots,
 } from "@/lib/board";
 import { cardAction, createCard, ulid } from "@/lib/board-actions";
 import { type Pending, drop, patchOf, propose, reconcile, settle } from "@/lib/optimistic";
@@ -15,7 +15,7 @@ import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
 import { AwayDigest, type AwayDecision } from "./AwayDigest";
 import { BoardColumns } from "./BoardColumns";
-import { CardActions, OpenCodeButton, RunButton, knownHosts } from "./CardActions";
+import { CardActions, OpenCodeButton, RunButton } from "./CardActions";
 import { CardArtifacts } from "./CardArtifacts";
 import { CardDetail } from "./CardDetail";
 import type { DecisionRow } from "./DecisionCard";
