@@ -7,7 +7,9 @@ import { Button } from "@/components/ui/button";
 import type { Attempt, ConversationController, ConversationState } from "@/lib/conversation";
 import { draftKey, getDraft, setDraft } from "@/lib/drafts";
 import { echoWatch } from "@/lib/echo";
-import { formatTime, kindLabel, statusLabel } from "@/lib/status";
+import { formatTime, kindLabel, sessionDot, statusLabel } from "@/lib/status";
+import { StatusDot } from "@/components/ui/status-dot";
+import { BranchTag } from "./board/CardTile";
 import type { SessionRow } from "@/lib/types";
 import { Composer } from "./Composer";
 import { MessageItem } from "./MessageItem";
@@ -26,7 +28,7 @@ const ATTEMPT_LABEL: Record<Attempt["state"], string> = {
 function PendingAttempt({ attempt, onDismiss, onRetry, snapshotOnly = false }: { attempt: Attempt; onDismiss: () => void; onRetry: () => void; snapshotOnly?: boolean }) {
   return (
     <article className="flex flex-col items-end gap-1" data-attempt={attempt.state} aria-live="polite">
-      <div className="max-w-[min(85%,72ch)] rounded-2xl rounded-br-md border border-dashed border-border bg-white px-4 py-2.5 text-[15px] leading-relaxed whitespace-pre-wrap break-words text-black">
+      <div className="max-w-[min(85%,72ch)] rounded-lg rounded-br-sm border border-dashed border-line-info bg-sel2 px-4 py-2.5 text-[15px] leading-relaxed whitespace-pre-wrap break-words text-foreground">
         {attempt.text}
       </div>
       <div className="flex flex-wrap items-center justify-end gap-2 px-1 text-[11px] text-muted-foreground">
@@ -91,8 +93,8 @@ function ConnectionLine({ state }: { state: ConversationState }) {
   else if (working) text = state.capabilities?.liveText ? "Agentul scrie…" : "Agentul lucrează · răspunsul apare când se încheie fiecare mesaj";
   else text = `Sincronizat ${formatTime(state.lastSync)}`;
   return (
-    <p role="status" aria-live="polite" className="flex min-h-7 items-center gap-2 px-4 text-[12px] text-muted-foreground">
-      {working && state.connection === "live" && <span aria-hidden className="inline-block size-1.5 animate-pulse rounded-full bg-foreground" />}
+    <p role="status" aria-live="polite" className="flex min-h-7 items-center gap-2 px-4 font-mono text-[11px] text-dim">
+      {working && state.connection === "live" && <span aria-hidden className="inline-block size-[7px] animate-pulse rounded-full bg-warn" />}
       <span className="truncate">{text}</span>
     </p>
   );
@@ -145,7 +147,7 @@ export function ConversationView({ project, previewUrl, row, state, controller, 
 
   return (
     <section id="conversation-panel" role="tabpanel" className="flex min-h-0 min-w-0 flex-1 flex-col" aria-label={`Conversație: ${title}`}>
-      <header className="flex min-h-14 items-center gap-2 border-b border-border px-2 sm:px-4">
+      <header className="flex min-h-14 items-center gap-2 border-b bg-bg0 px-2 sm:px-4">
         {showBack && (
           <Button type="button" variant="ghost" size="icon-lg" aria-label="Înapoi la sesiuni" onClick={onBack} className="size-11">
             <ArrowLeftIcon aria-hidden className="size-5" />
@@ -154,8 +156,11 @@ export function ConversationView({ project, previewUrl, row, state, controller, 
         <div className="min-w-0 flex-1">
           <h1 className={`truncate text-[15px] font-semibold leading-tight ${session?.status === "running" ? "session-working" : ""}`}>{title}</h1>
           {session && (
-            <p className="truncate text-xs text-muted-foreground">
-              {kindLabel(session.kind)} · <span className="font-mono">{session.worktree}</span> · {statusLabel(session.status)}
+            <p className="mt-0.5 flex min-w-0 items-center gap-1.5 text-[11px] text-muted-foreground">
+              <StatusDot dot={sessionDot(session.status)} label={null} />
+              <span>{kindLabel(session.kind)}</span>
+              <BranchTag branch={session.worktree} />
+              <span>{statusLabel(session.status)}</span>
               {showTerminal && <span title={state.capabilities?.reason ?? "Output brut al sesiunii, nu istoric de chat"}> · Terminal</span>}
             </p>
           )}
@@ -180,7 +185,7 @@ export function ConversationView({ project, previewUrl, row, state, controller, 
         <div className="flex-1 space-y-4 px-4 py-6" aria-busy="true" aria-label="Se încarcă conversația">
           <div className="ml-auto h-10 w-2/3 animate-pulse rounded-2xl bg-muted/60" />
           <div className="h-24 w-full max-w-[72ch] animate-pulse rounded-lg bg-muted/40" />
-          <div className="ml-auto h-10 w-1/2 animate-pulse rounded-2xl bg-muted/60" />
+          <div className="ml-auto h-10 w-1/2 animate-pulse rounded-lg bg-muted/60" />
         </div>
       )}
 

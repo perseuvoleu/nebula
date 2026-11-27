@@ -73,8 +73,10 @@ test("phone: follow-output only near the bottom, jump-to-latest otherwise; keybo
   const log = page.getByRole("log");
   await expect(log.locator("pre code", { hasText: "def verify" })).toBeVisible();
   const scroller = log.locator("> div").first();
-  // Reading an earlier answer: scroll to the top, then a new message arrives.
-  await scroller.evaluate((el) => { el.scrollTop = 0; });
+  // Reading an earlier answer: scroll to the top the way a reader does, then a new message arrives.
+  await scroller.hover();
+  await page.mouse.wheel(0, -5000);
+  await expect.poll(() => scroller.evaluate((el) => el.scrollTop)).toBe(0);
   await page.waitForTimeout(300);
   appendEntry("pi-1", assistantText("Mesaj nou în timp ce citeai mai sus."));
   await expect(page.getByRole("button", { name: "Sari la ultimul mesaj" })).toBeVisible({ timeout: 15_000 });

@@ -85,15 +85,15 @@ export function TerminalView({ project, session, children, revealKey = 0, onOutp
 
   return (
     <section className="flex min-h-0 min-w-0 flex-1 flex-col" aria-label="Output de terminal">
-      <div className="flex shrink-0 flex-wrap items-center gap-1 border-b border-border px-2 py-1">
-        <div className="flex shrink-0 gap-1" role="group" aria-label="Afișare output">
-          <Button type="button" variant="ghost" size="sm" className="min-h-9" aria-pressed={reading} onClick={() => changeView(true)}>Lectură</Button>
-          <Button type="button" variant="ghost" size="sm" className="min-h-9" aria-pressed={!reading} onClick={() => changeView(false)}>Terminal brut</Button>
+      <div className="flex shrink-0 flex-wrap items-center gap-1 border-b bg-bg0 px-2 py-1">
+        <div className="flex shrink-0 gap-0.5 rounded-sm border bg-bg1 p-0.5" role="group" aria-label="Afișare output">
+          <Button type="button" variant="ghost" size="sm" className="min-h-8 aria-pressed:bg-bg3 aria-pressed:text-foreground" aria-pressed={reading} onClick={() => changeView(true)}>Lectură</Button>
+          <Button type="button" variant="ghost" size="sm" className="min-h-8 aria-pressed:bg-bg3 aria-pressed:text-foreground" aria-pressed={!reading} onClick={() => changeView(false)}>Terminal brut</Button>
         </div>
       </div>
       {error && <p role="alert" className="shrink-0 px-4 py-1 text-xs">{error}</p>}
       <div ref={scroller} aria-label="Conținut terminal" tabIndex={0} aria-live="off" onScroll={event => { if (event.currentTarget.scrollTop < 80) more(); }}
-        className="min-h-0 min-w-0 flex-1 overflow-auto bg-black px-3 py-2 text-foreground">
+        className="min-h-0 min-w-0 flex-1 overflow-auto bg-term px-3 py-2 text-foreground">
         <div className="mb-2 flex justify-center text-xs text-muted-foreground">
           {hasMore ? <Button type="button" size="xs" variant="ghost" disabled={loadingOlder} onClick={more}>
             {loadingOlder ? "Se încarcă…" : "Output mai vechi"}

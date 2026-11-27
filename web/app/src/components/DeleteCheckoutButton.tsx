@@ -36,16 +36,16 @@ export function DeleteCheckoutButton({ project, tree, onDeleted }: {
           <DialogDescription>Se elimină doar directorul checkout-ului și înregistrarea Nebula. Branch-ul se păstrează. Nu se opresc sesiuni automat.</DialogDescription>
         </DialogHeader>
         {target && <div className="space-y-2 break-all text-sm">
-          <p>{project} · <strong>{target.branch}</strong></p><p className="font-mono">{target.path}</p><p>ID: {target.id}</p>
+          <p>{project} · <strong>{target.branch}</strong></p><p className="font-mono text-info">{target.path}</p><p>ID: {target.id}</p>
           <p>Sesiuni: {target.sessions.length ? target.sessions.map(s => `${s.name} (${s.alive ? "activă" : s.status})`).join(", ") : "niciuna în lista curentă"}.</p>
           <p>Se refuză modificări necomise, fișiere untracked/ignored, commituri neintegrate în main/master și orice sesiune (inclusiv arhivate și terminale).</p>
         </div>}
         {phase === "checking" && <p role="status">Se verifică siguranța…</p>}
         {phase === "ready" && <p role="status">Curat, integrat în main/master, fără sesiuni. Verificarea se repetă la confirmare.</p>}
-        {error && <p role="alert">{error}</p>}
+        {error && <p role="alert" className="text-err">{error}</p>}
         <DialogFooter>
           <Button variant="ghost" disabled={phase === "deleting" || phase === "checking"} onClick={() => setTarget(null)}>Anulează</Button>
-          <Button disabled={phase !== "ready"} onClick={() => void remove()}>{phase === "deleting" ? "Se elimină…" : "Confirmă eliminarea worktree-ului"}</Button>
+          <Button variant="destructive" disabled={phase !== "ready"} onClick={() => void remove()}>{phase === "deleting" ? "Se elimină…" : "Confirmă eliminarea worktree-ului"}</Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>

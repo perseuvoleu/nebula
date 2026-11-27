@@ -78,16 +78,16 @@ export function NewAgentDialog({ project, initialWorktree, open, onOpenChange, o
             {selected && <span className="truncate font-mono text-xs text-muted-foreground">{selected.path}</span>}
           </label>
           {existing.length > 0 && (
-            <p role="status" className="rounded-lg border border-border px-3 py-2 text-sm">
+            <p role="status" className="rounded-sm border border-line-warn bg-tint-warn px-2.5 py-2 text-xs text-warn">
               Pe acest checkout lucrează deja: {existing.map((s) => `${s.name} (${kindLabel(s.kind)}, ${statusLabel(s.status)})`).join(", ")}.
               Evită doi agenți care scriu pe același branch.
             </p>
           )}
           <fieldset className="flex flex-col gap-1.5 text-sm">
             <legend className="mb-1.5 font-medium">Agent</legend>
-            <div className="grid grid-cols-4 gap-1 rounded-lg border border-border p-1">
+            <div className="grid grid-cols-4 gap-1">
               {KINDS.map((k) => (
-                <label key={k} className={`flex h-9 cursor-pointer items-center justify-center rounded-md text-sm ${kind === k ? "bg-primary font-medium text-primary-foreground" : "hover:bg-muted"}`}>
+                <label key={k} className={`flex h-9 cursor-pointer items-center justify-center rounded-sm border text-meta ${kind === k ? "border-primary bg-sel2 font-semibold text-foreground" : "bg-bg0 text-muted-foreground hover:border-edge-hover hover:text-foreground"}`}>
                   <input type="radio" name="kind" value={k} checked={kind === k} onChange={() => setKind(k)} className="sr-only" />
                   {kindLabel(k)}
                 </label>

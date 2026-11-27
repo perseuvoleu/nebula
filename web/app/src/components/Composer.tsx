@@ -38,7 +38,7 @@ export function Composer({ draft, onDraft, onSend, disabled, busy, placeholder, 
 
   return (
     <form
-      className="flex items-end gap-2 border-t border-border bg-background px-3 pt-2 pb-[max(0.5rem,env(safe-area-inset-bottom))]"
+      className="flex items-end gap-2 border-t bg-bg0 px-3 pt-2 pb-[max(0.5rem,env(safe-area-inset-bottom))]"
       onSubmit={(event) => { event.preventDefault(); submit(); }}
       aria-label="Trimite un mesaj agentului"
     >
@@ -55,7 +55,7 @@ export function Composer({ draft, onDraft, onSend, disabled, busy, placeholder, 
         placeholder={placeholder ?? (touch ? "Scrie un mesaj…" : "Scrie un mesaj… (Enter trimite, Shift+Enter rând nou)")}
         enterKeyHint={touch ? "enter" : "send"}
         autoCapitalize="sentences"
-        className="field-sizing-content max-h-40 min-h-11 w-full flex-1 resize-none rounded-xl border border-input bg-white px-3.5 py-2.5 text-base leading-relaxed text-black outline-none placeholder:text-neutral-500 focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/60 disabled:opacity-60"
+        className="field field-sizing-content max-h-40 min-h-11 w-full flex-1 resize-none rounded-md bg-bg1 px-3.5 py-2.5 text-base leading-relaxed"
       />
       <Button type="submit" size="icon-lg" aria-label="Trimite" disabled={!canSend} className="size-11 shrink-0 rounded-full">
         <ArrowUpIcon aria-hidden className="size-5" />

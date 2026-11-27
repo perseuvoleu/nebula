@@ -49,11 +49,11 @@ export function CheckoutPanel({ project, currentPath, onSelect }: {
 
   return (
     <div className="border-b border-sidebar-border px-3 py-2">
-      <label className="block text-xs text-muted-foreground">
-        <span>Branch / worktree</span>
+      <label className="block">
+        <span className="label-caps">Branch / worktree</span>
         <select aria-label="Branch / worktree" value={current?.path ?? ""} disabled={!trees.length}
           onChange={e => { const w = trees.find(t => t.path === e.target.value); if (w) onSelect(w); }}
-          className="mt-1 h-10 w-full min-w-0 field px-2 font-mono text-sm">
+          className="field mt-1 h-10 w-full min-w-0 px-2 font-mono text-[13px] text-info">
           {!trees.length && <option value="">Se încarcă…</option>}
           {trees.map(w => <option key={w.path} value={w.path}>{w.branch}{w.is_main ? " · principal" : " · wt"}</option>)}
         </select>
@@ -70,7 +70,7 @@ export function CheckoutPanel({ project, currentPath, onSelect }: {
         void api<{ worktrees: Worktree[] }>("worktrees", { project }).then(data => setTrees(data.worktrees))
           .catch(failure => setError(`Worktree eliminat. Reîncărcarea listei a eșuat: ${describeError(failure)}`));
       }} />}
-      {!open && error && <p role="alert" className="mt-1 text-xs text-muted-foreground">{error}</p>}
+      {!open && error && <p role="alert" className="mt-1 text-xs text-err">{error}</p>}
       <Dialog open={open} onOpenChange={setOpen}>
         <DialogContent className="max-h-[90dvh] overflow-y-auto">
           <DialogHeader>
@@ -99,7 +99,7 @@ export function CheckoutPanel({ project, currentPath, onSelect }: {
             <p className="text-xs text-muted-foreground">{mode === "worktree" ? "Director separat, potrivit pentru lucru în paralel. Sesiunile existente nu sunt mutate." : occupied
               ? "Checkout-ul principal are sesiuni deschise. Alege Worktree pentru a nu le schimba fișierele."
               : "Schimbă branch-ul în directorul principal. Este refuzat dacă există modificări necomise sau sesiuni deschise."}</p>
-            {error && <p role="alert" className="text-sm">{error}</p>}
+            {error && <p role="alert" className="text-sm text-err">{error}</p>}
             <DialogFooter>
               <Button type="button" variant="ghost" onClick={() => setOpen(false)}>Închide</Button>
               <Button type="submit" disabled={phase !== "idle" || !valid || !source || (mode === "branch" && occupied)}>

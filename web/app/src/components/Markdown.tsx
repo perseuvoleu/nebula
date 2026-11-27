@@ -41,8 +41,8 @@ function textOf(node: ReactNode): string {
 
 export function CodeBlock({ code, language }: { code: string; language?: string }) {
   return (
-    <div className="group/code relative my-2 max-w-full overflow-hidden rounded-lg border border-border bg-card">
-      <div className="flex h-8 items-center justify-between border-b border-border px-3 text-xs text-muted-foreground">
+    <div className="group/code relative my-2 max-w-full overflow-hidden rounded-md border bg-bg0">
+      <div className="flex h-8 items-center justify-between border-b bg-bg2 px-3 text-xs text-muted-foreground">
         <span className="font-mono">{language || "cod"}</span>
         <CopyButton text={code} label="Copiază codul" />
       </div>

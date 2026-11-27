@@ -3,9 +3,11 @@ import { ChevronRightIcon } from "lucide-react";
 import { api, describeError } from "@/lib/api";
 import type { ToolPart, ToolResult } from "@/lib/types";
 import { Button } from "@/components/ui/button";
+import { Pill, type PillTone } from "@/components/ui/pill";
 import { CopyButton } from "./Markdown";
 
 const STATE_LABEL: Record<ToolPart["state"], string> = { pending: "în lucru", done: "gata", error: "eroare" };
+const STATE_TONE: Record<ToolPart["state"], PillTone> = { pending: "doing", done: "done", error: "needs" };
 
 function summary(part: ToolPart): string {
   try {
@@ -43,30 +45,30 @@ export const ToolActivity = memo(function ToolActivity({ part, project, session 
   };
 
   return (
-    <div className="my-1 rounded-lg border border-border bg-card text-sm" data-tool-state={part.state}>
+    <div className="my-1 rounded-md border bg-bg1 text-sm" data-tool-state={part.state}>
       <button type="button" onClick={() => setOpen((v) => !v)} aria-expanded={open}
-        className="flex min-h-11 w-full items-center gap-2 px-3 py-2 text-left hover:bg-muted/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+        className="flex min-h-11 w-full items-center gap-2 px-3 py-2 text-left hover:bg-bg2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
         <ChevronRightIcon aria-hidden className={`size-4 shrink-0 text-muted-foreground transition-transform ${open ? "rotate-90" : ""}`} />
-        <span className="font-mono text-[13px] font-medium">{part.name}</span>
+        <Pill tone="artifact" className="text-[11px]">{part.name}</Pill>
         {hint && <span className="min-w-0 flex-1 truncate font-mono text-[13px] text-muted-foreground">{hint}</span>}
-        <span className="ml-auto shrink-0 text-xs text-muted-foreground">
-          {part.state === "pending" && <span className="mr-1 inline-block size-1.5 animate-pulse rounded-full bg-foreground align-middle" aria-hidden />}
+        <Pill tone={STATE_TONE[part.state]} className="ml-auto">
+          {part.state === "pending" && <span className="inline-block size-[7px] animate-pulse rounded-full bg-warn" aria-hidden />}
           {STATE_LABEL[part.state]}
-        </span>
+        </Pill>
       </button>
       {open && (
-        <div className="border-t border-border px-3 py-2">
+        <div className="border-t px-3 py-2">
           <div className="mb-1 flex items-center justify-between text-xs text-muted-foreground">
             <span>Argumente</span><CopyButton text={part.args} label="Copiază argumentele" />
           </div>
-          <pre className="max-h-48 overflow-auto rounded bg-muted/60 p-2 font-mono text-xs leading-relaxed">{part.args}{part.argsTruncated ? "\n…" : ""}</pre>
+          <pre className="max-h-48 overflow-auto rounded-sm border bg-bg0 p-2 font-mono text-xs leading-relaxed">{part.args}{part.argsTruncated ? "\n…" : ""}</pre>
           {(output || part.state !== "pending") && (
             <>
               <div className="mt-2 mb-1 flex items-center justify-between text-xs text-muted-foreground">
                 <span>Rezultat{part.outputLength ? ` · ${part.outputLength.toLocaleString("ro-RO")} caractere` : ""}</span>
                 {output && <CopyButton text={output} label="Copiază rezultatul" />}
               </div>
-              <pre className="max-h-80 overflow-auto rounded bg-muted/60 p-2 font-mono text-xs leading-relaxed whitespace-pre-wrap break-words">
+              <pre className="max-h-80 overflow-auto rounded-sm border bg-bg0 p-2 font-mono text-xs leading-relaxed whitespace-pre-wrap break-words">
                 {output || "(fără rezultat)"}
               </pre>
               {truncated && (

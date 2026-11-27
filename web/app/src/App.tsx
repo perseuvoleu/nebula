@@ -10,6 +10,7 @@ import type { NewResponse, SessionRow, Worktree } from "@/lib/types";
 import { unsubscribePush } from "@/lib/push";
 import { loadUnseen, reconcileUnseen, saveUnseen } from "@/lib/unseen";
 import { Button } from "@/components/ui/button";
+import { Pill } from "@/components/ui/pill";
 import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
 import { ConversationView } from "./components/ConversationView";
 import { Login } from "./components/Login";
@@ -246,14 +247,14 @@ function Shell({ workspace, route }: { workspace: Workspace; route: ReturnType<t
   const openServerless = () => { navigate({ ...listOrigin, session: null, serverless: true }); setMenuOpen(false); };
   const serverlessLink = (
     <button type="button" onClick={openServerless} aria-current={selection.serverless ? "page" : undefined}
-      className={`flex min-h-11 items-center gap-2 border-t border-sidebar-border px-3 text-left text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${selection.serverless ? "bg-secondary font-medium" : "hover:bg-muted/60"}`}>
-      <CloudIcon aria-hidden className="size-4" />Rulări serverless
+      className={`flex min-h-11 items-center gap-2 border-t border-sidebar-border px-3 text-left text-[12.5px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${selection.serverless ? "bg-sel2 font-semibold" : "text-muted-foreground hover:bg-bg2 hover:text-foreground"}`}>
+      <CloudIcon aria-hidden className="size-3.5 text-info" />Rulări serverless
     </button>
   );
   const boardLink = (
     <button type="button" onClick={() => navigate({ project: null, session: null, all: false, board: { project: null, card: null, decisions: false, table: false, peek: null } })}
-      className="flex min-h-11 items-center gap-2 border-t border-sidebar-border px-3 text-left text-sm hover:bg-muted/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
-      <KanbanIcon aria-hidden className="size-4" />Board
+      className="flex min-h-11 items-center gap-2 border-t border-sidebar-border px-3 text-left text-[12.5px] text-muted-foreground hover:bg-bg2 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+      <KanbanIcon aria-hidden className="size-3.5 text-primary" />Board
     </button>
   );
   const targetNotice = chooseProject && <p role="status" className="px-3 py-2 text-sm">Alege un proiect din selector pentru agentul nou.</p>;
@@ -264,12 +265,12 @@ function Shell({ workspace, route }: { workspace: Workspace; route: ReturnType<t
         <label className="min-w-0 flex-1 text-sm">
           <span className="sr-only">Proiect</span>
           <select value={selection.all ? "" : project} onChange={(e) => changeProject(e.target.value)} aria-label="Proiect"
-            className="h-10 w-full field px-2.5 text-[15px] font-medium">
+            className="field h-10 w-full px-2.5 font-mono text-[13px] font-medium">
             <option value="">All</option>
             {workspace.projects.map((p) => <option key={p} value={p}>{p}</option>)}
           </select>
         </label>
-        <span className="max-w-24 shrink-0 truncate rounded border border-border px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground" title={`Execuția are loc pe ${workspace.host}`}>@{workspace.host}</span>
+        <Pill tone="remote" className="max-w-24 truncate" title={`Execuția are loc pe ${workspace.host}`}>@{workspace.host}</Pill>
         <PreviewButton url={previewUrl} className="size-10" />
         <Button type="button" variant="ghost" size="icon-lg" aria-label="Deconectare" onClick={logout} className="size-10"><LogOutIcon aria-hidden /></Button>
       </div>
@@ -281,7 +282,7 @@ function Shell({ workspace, route }: { workspace: Workspace; route: ReturnType<t
       {serverlessLink}
       {desktop && <PushNotifications />}
       <InstallApp />
-      <p className="border-t border-sidebar-border px-3 py-2 text-[11px] text-muted-foreground">Telefonul se poate deconecta. Agenții rămân pe server.</p>
+      <p className="border-t border-sidebar-border px-3 py-2 text-[11px] text-dim">Telefonul se poate deconecta. Agenții rămân pe server.</p>
     </aside>
   );
 
@@ -325,14 +326,14 @@ function Shell({ workspace, route }: { workspace: Workspace; route: ReturnType<t
         <main className="flex min-h-0 flex-1 flex-col">
           <header className="flex min-h-14 items-center gap-2 border-b border-border px-3">
             <h1 className="text-[15px] font-semibold">Sesiuni</h1>
-            <span className="rounded border border-border px-1.5 py-0.5 font-mono text-[11px] text-muted-foreground">@{workspace.host}</span>
+            <Pill tone="remote">@{workspace.host}</Pill>
             <Button type="button" variant="ghost" size="icon-lg" aria-label="Deconectare" onClick={logout} className="ml-auto size-11"><LogOutIcon aria-hidden /></Button>
           </header>
           <div className="flex items-center gap-2 border-b border-border px-3 py-2">
             <label className="min-w-0 flex-1 text-sm">
               <span className="sr-only">Proiect</span>
               <select value={selection.all ? "" : project} onChange={(e) => changeProject(e.target.value)} aria-label="Proiect"
-                className="h-11 w-full field px-3 text-base font-medium">
+                className="field h-11 w-full px-3 font-mono text-base font-medium">
                 <option value="">All</option>
                 {workspace.projects.map((p) => <option key={p} value={p}>{p}</option>)}
               </select>

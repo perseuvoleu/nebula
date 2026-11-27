@@ -81,7 +81,7 @@ test("priority and activity ordering survives polls, project filters, and persis
   writeAgents(rows);
   const blue = page.getByRole("button", { name: "beta: Beta migration, finalizată și nevizualizată", exact: true });
   await expect(blue).toBeVisible({ timeout: 15000 });
-  await expect(blue.getByText("Beta migration", { exact: true })).toHaveCSS("color", "rgb(56, 189, 248)");
+  await expect(blue.getByText("Beta migration", { exact: true })).toHaveCSS("color", "rgb(127, 180, 202)");
   await page.reload();
   await expect(blue).toBeVisible();
   await page.getByRole("combobox", { name: "Proiect", exact: true }).selectOption("alpha");

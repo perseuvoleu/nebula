@@ -2,15 +2,15 @@ import { expect } from "@playwright/test";
 import { test, login, STATE } from "./helpers";
 import { writeFileSync } from "node:fs";
 
-test("outgoing messages and composer are white/black; terminal scrolling has no visible bar", async ({ page }) => {
+test("outgoing messages and composer use the board palette; terminal scrolling has no visible bar", async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 500 });
   await login(page, "/p/alpha/s/pi-1");
   const bubble = page.locator("article[data-role=user] > div").first();
-  await expect(bubble).toHaveCSS("background-color", "rgb(255, 255, 255)");
-  await expect(bubble).toHaveCSS("color", "rgb(0, 0, 0)");
+  await expect(bubble).toHaveCSS("background-color", "rgb(33, 48, 68)");
+  await expect(bubble).toHaveCSS("color", "rgb(220, 215, 186)");
   const input = page.getByLabel("Mesaj către agent");
-  await expect(input).toHaveCSS("background-color", "rgb(255, 255, 255)");
-  await expect(input).toHaveCSS("color", "rgb(0, 0, 0)");
+  await expect(input).toHaveCSS("background-color", "rgb(26, 26, 35)");
+  await expect(input).toHaveCSS("color", "rgb(220, 215, 186)");
   await page.goto("/p/alpha/s/claude-1");
   await page.getByRole("button", { name: "Terminal brut", exact: true }).click();
   const output = page.getByLabel("Conținut terminal", { exact: true });
@@ -23,15 +23,15 @@ test("outgoing messages and composer are white/black; terminal scrolling has no 
   const sent = page.locator("article[data-attempt=accepted]");
   await expect(sent).toContainText("Mesaj vizibil către Claude");
   await expect(sent).toContainText("Trimis către sesiune");
-  await expect(sent.locator("div").first()).toHaveCSS("background-color", "rgb(255, 255, 255)");
+  await expect(sent.locator("div").first()).toHaveCSS("background-color", "rgb(33, 48, 68)");
 });
 
-test("chat tabs navigate without losing drafts; working session names are yellow", async ({ page }) => {
-  // With motion allowed the yellow comes from an animated text gradient and `color` is transparent.
+test("chat tabs navigate without losing drafts; working session names are amber", async ({ page }) => {
+  // With motion allowed the amber comes from an animated text gradient and `color` is transparent.
   await page.emulateMedia({ reducedMotion: "reduce" });
   await login(page, "/p/alpha/s/pi-1");
   const nav = page.getByRole("navigation", { name: "Sesiuni în alpha" });
-  await expect(nav.getByText("A doua sesiune Pi", { exact: true })).toHaveCSS("color", "rgb(250, 204, 21)");
+  await expect(nav.getByText("A doua sesiune Pi", { exact: true })).toHaveCSS("color", "rgb(230, 195, 132)");
   await page.getByLabel("Mesaj către agent").fill("Ciornă păstrată prin taburi");
   await page.getByRole("tab", { name: "A doua sesiune Pi", exact: true }).click();
   await expect(page).toHaveURL(/\/s\/pi-2$/);

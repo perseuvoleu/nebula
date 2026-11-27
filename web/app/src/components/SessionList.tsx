@@ -3,10 +3,15 @@ import { PlusIcon, SearchIcon } from "lucide-react";
 import type { SessionRow } from "@/lib/types";
 import { activityAge } from "@/lib/activity-age";
 import { sessionKey } from "@/lib/session-list";
-import { kindLabel, statusLabel } from "@/lib/status";
+import { kindLabel, sessionDot, statusLabel } from "@/lib/status";
+import { Pill, type PillTone } from "@/components/ui/pill";
+import { StatusDot } from "@/components/ui/status-dot";
+import { BranchTag, ProjectTag } from "./board/CardTile";
 import { Button } from "@/components/ui/button";
 
 import { DeleteSessionButton } from "./DeleteSessionButton";
+
+const STATUS_TONE: Record<string, PillTone> = { running: "doing", needs_feedback: "needs", finished: "done", fresh: "next" };
 
 export type ListPhase = "loading" | "ready" | "error" | "offline";
 
@@ -37,9 +42,9 @@ export function SessionList({ sessions, phase, error, selected, unseen, onSelect
       <div className="flex items-center gap-2 px-3 pt-3 pb-2">
         <label className="relative flex-1">
           <span className="sr-only">Caută sesiuni</span>
-          <SearchIcon aria-hidden className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground" />
+          <SearchIcon aria-hidden className="pointer-events-none absolute top-1/2 left-3 size-3.5 -translate-y-1/2 text-dim" />
           <input value={filter} onChange={(e) => setFilter(e.target.value)} type="search" placeholder="Caută sesiuni"
-            className="h-10 w-full field pl-9 pr-3 text-sm" />
+            className="field h-10 w-full bg-bg1 pr-3 pl-8 text-sm" />
         </label>
         <Button type="button" variant="outline" size="icon-lg" aria-label="Agent nou" onClick={onNew} className="size-10">
           <PlusIcon aria-hidden />
@@ -61,7 +66,7 @@ export function SessionList({ sessions, phase, error, selected, unseen, onSelect
           </div>
         )}
         {phase === "ready" && sessions.length > 0 && visible.length === 0 && <p className="px-2 py-3 text-sm text-muted-foreground">Nicio sesiune nu se potrivește.</p>}
-        <ul className="space-y-0.5">
+        <ul className="space-y-1">
           {visible.map((row) => {
             const active = sessionKey(row) === selected;
             const isUnseen = unseen.has(sessionKey(row));
@@ -71,21 +76,18 @@ export function SessionList({ sessions, phase, error, selected, unseen, onSelect
                 <button type="button" onClick={() => onSelect(row)} aria-current={active ? "page" : undefined}
                   aria-description={`Ultima schimbare de stare: ${age}`}
                   aria-label={isUnseen ? `${showProject ? `${row.project}: ` : ""}${row.name}, finalizată și nevizualizată` : undefined}
-                  className={`flex min-h-14 min-w-0 flex-1 flex-col gap-0.5 rounded-lg px-3 py-2 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${active ? "bg-secondary" : "hover:bg-muted/60"}`}>
-                  <span className="flex items-center gap-2">
-                    <span className={`min-w-0 flex-1 truncate text-[15px] font-medium ${isUnseen ? "text-unseen" : row.status === "running" ? "session-working" : ""}`}>{row.name}</span>
-                    <span className={`shrink-0 text-[11px] ${row.status === "needs_feedback" ? "rounded border border-foreground px-1.5 py-px font-medium" : "text-muted-foreground"}`}>
-                      {row.status === "running" && <span aria-hidden className="mr-1 inline-block size-1.5 animate-pulse rounded-full bg-foreground align-middle" />}
-                      {statusLabel(row.status)}
-                    </span>
+                  className={`flex min-h-14 min-w-0 flex-1 flex-col gap-1 rounded-md border px-[9px] py-2 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${active ? "border-primary bg-sel2" : "border-transparent hover:border-edge hover:bg-bg2"} ${row.status === "needs_feedback" ? "border-l-[3px] border-l-err" : ""}`}>
+                  <span className="flex items-center gap-1.5">
+                    <StatusDot dot={sessionDot(row.status)} label={null} />
+                    <span className={`min-w-0 flex-1 truncate text-[14px] font-semibold ${isUnseen ? "text-unseen" : row.status === "running" ? "session-working" : ""}`}>{row.name}</span>
+                    <Pill tone={STATUS_TONE[row.status] ?? "neutral"}>{statusLabel(row.status)}</Pill>
                   </span>
-                  <span className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
-                    {showProject && <><span className="truncate">{row.project}</span><span aria-hidden>·</span></>}
-                    <span>{kindLabel(row.kind)}</span>
-                    <span aria-hidden>·</span>
-                    <span className="min-w-0 truncate font-mono">{row.worktree}</span>
+                  <span className="flex min-w-0 items-center gap-1 text-[11px] text-muted-foreground">
+                    {showProject && <ProjectTag project={row.project} />}
+                    <span className="shrink-0">{kindLabel(row.kind)}</span>
+                    <BranchTag branch={row.worktree} />
+                    <span className="ml-auto min-w-0 truncate pl-1 font-mono text-[10.5px] text-dim" title="Ultima schimbare de stare">{age}</span>
                   </span>
-                  <span className="text-xs text-muted-foreground" title="Ultima schimbare de stare">{age}</span>
                 </button>
                 <DeleteSessionButton project={row.project} row={row} onDeleted={() => onDeleted(row)} />
               </li>

@@ -12,7 +12,7 @@ test.describe("selection and structured conversation", () => {
     await page.emulateMedia({ reducedMotion: "reduce" });
     for (const name of await names.all()) {
       await expect(name).toHaveCSS("animation-name", "none");
-      await expect(name).toHaveCSS("color", "rgb(250, 204, 21)");
+      await expect(name).toHaveCSS("color", "rgb(230, 195, 132)");
     }
     const rows = readAgents();
     rows.find((r) => r.id === "pi-2")!.status = "finished";

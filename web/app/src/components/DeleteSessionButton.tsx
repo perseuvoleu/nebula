@@ -20,8 +20,8 @@ export function DeleteSessionButton({ project, row, onDeleted }: {
     finally { busy.current = false; setPending(false); }
   };
   return <div className="shrink-0 self-center">
-    <Button type="button" variant="ghost" className="size-11" aria-label="Șterge sesiunea" aria-description={`${row.name} · ${row.worktree} · ${row.id}`} disabled={pending} onClick={() => void remove()}><Trash2Icon aria-hidden /></Button>
+    <Button type="button" variant="ghost" className="size-11 text-dim hover:text-err" aria-label="Șterge sesiunea" aria-description={`${row.name} · ${row.worktree} · ${row.id}`} disabled={pending} onClick={() => void remove()}><Trash2Icon aria-hidden /></Button>
     {pending && <span role="status" className="sr-only">Se șterge…</span>}
-    {error && <p role="alert" className="max-w-40 text-xs">{error}</p>}
+    {error && <p role="alert" className="max-w-40 text-xs text-err">{error}</p>}
   </div>;
 }

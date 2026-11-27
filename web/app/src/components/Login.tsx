@@ -30,17 +30,17 @@ export function Login({ onAuthenticated }: { onAuthenticated: (projects: string[
   return (
     <main className="flex min-h-full flex-1 items-center justify-center px-5 py-10">
       <form onSubmit={(e) => { e.preventDefault(); void submit(); }} className="w-full max-w-sm">
-        <p className="text-xs font-medium tracking-[0.2em] text-muted-foreground uppercase">Nebula</p>
+        <p className="flex items-center gap-2 text-[13.5px] font-bold tracking-[-0.01em]"><span aria-hidden className="grid size-5 place-items-center rounded-sm border border-primary bg-sel2 text-[11px] text-primary">◫</span>Nebula</p>
         <h1 className="mt-3 text-3xl leading-tight font-semibold tracking-tight">Agenții continuă.<br />Tu alegi de unde.</h1>
         <p className="mt-3 text-sm text-muted-foreground">Sesiunile rulează pe server chiar și cu laptopul închis.</p>
         <label className="mt-8 block text-sm">
           <span className="font-medium">Token de acces</span>
           <input type="password" autoComplete="off" required minLength={8} value={value} onChange={(e) => setValue(e.target.value)}
             aria-describedby="token-help" aria-invalid={error ? true : undefined}
-            className="mt-1.5 h-12 w-full field px-3.5 text-base" />
+            className="field mt-1.5 h-12 w-full bg-bg1 px-3.5 font-mono text-base" />
         </label>
-        <p id="token-help" className="mt-2 text-xs text-muted-foreground">Rămâne doar în această sesiune de browser. Nu este trimis nicăieri altundeva.</p>
-        {error && <p role="alert" className="mt-3 rounded-lg border border-border px-3 py-2 text-sm">{error}</p>}
+        <p id="token-help" className="mt-2 text-xs text-dim">Rămâne doar în această sesiune de browser. Nu este trimis nicăieri altundeva.</p>
+        {error && <p role="alert" className="mt-3 rounded-sm border border-line-err bg-tint-err px-3 py-2 text-sm text-err">{error}</p>}
         <Button type="submit" size="lg" className="mt-6 h-12 w-full text-base" disabled={busy || value.trim().length < 8}>
           {busy ? "Se conectează…" : "Conectare"}
         </Button>

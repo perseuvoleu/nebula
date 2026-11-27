@@ -19,6 +19,8 @@
     --color-bg2: var(--bg2);
     --color-bg3: var(--bg3);
     --color-bg2-hover: var(--bg2-hover);
+    --color-term: var(--term-bg);
+    --color-scrim: var(--scrim);
     --color-edge: var(--edge);
     --color-edge-hover: var(--edge-hover);
     --color-hair: var(--hair);
@@ -111,6 +113,8 @@
     --backlog: #9393ad;
     --sel: #2d4f67;
     --sel2: #213044;
+    --term-bg: #111117;
+    --scrim: #0a0a0fcc;
     --tint-ok: #1f2b1f;
     --tint-warn: #2d281f;
     --tint-err: #321e24;

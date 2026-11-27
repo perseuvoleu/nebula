@@ -44,13 +44,13 @@ export function UsageNavbar() {
   }, []);
   const data = normalizeUsage(snapshot, now);
   return (
-    <header className="shrink-0 border-b border-border bg-background px-2" aria-label="Cote săptămânale de cont">
+    <header className="shrink-0 border-b bg-bg0 px-2" aria-label="Cote săptămânale de cont">
       <Dialog>
         <DialogTrigger asChild>
-          <button type="button" className="mx-auto flex min-h-11 w-full max-w-lg items-center justify-between gap-2 rounded-md px-2 py-1 text-xs focus-visible:outline-2 focus-visible:outline-ring" aria-label="Detalii cote săptămânale Codex și Claude">
-            <span className="text-left text-muted-foreground">Săptămână<span className="block text-[10px]">rămase</span></span>
-            <span className="font-medium tabular-nums">{quotaLabel('Codex', data.codex)}</span>
-            <span className="font-medium tabular-nums">{quotaLabel('Claude', data.claude)}</span>
+          <button type="button" className="mx-auto flex min-h-9 w-full max-w-lg items-center justify-center gap-2 rounded-sm px-2 py-1 text-xs hover:bg-bg1 focus-visible:outline-2 focus-visible:outline-ring" aria-label="Detalii cote săptămânale Codex și Claude">
+            <span className="label-caps">Săptămână rămase</span>
+            <span className="rounded-full border bg-bg1 px-2 py-0.5 font-mono text-[11px] text-muted-foreground tabular-nums">{quotaLabel('Codex', data.codex)}</span>
+            <span className="rounded-full border bg-bg1 px-2 py-0.5 font-mono text-[11px] text-muted-foreground tabular-nums">{quotaLabel('Claude', data.claude)}</span>
           </button>
         </DialogTrigger>
         <DialogContent showCloseButton={false} className="max-h-[85dvh] overflow-y-auto">
@@ -58,11 +58,11 @@ export function UsageNavbar() {
           <DialogDescription>Abonamentele conturilor de pe server. Ora resetării este afișată în fusul tău orar.</DialogDescription>
           {(['codex', 'claude'] as const).map(provider => {
             const quota = data[provider];
-            return <section key={provider} className="space-y-1 rounded-lg border border-border p-3">
+            return <section key={provider} className="space-y-1 rounded-md border bg-bg0 p-3">
               <h2 className="font-medium">{quotaLabel(provider === 'codex' ? 'Codex' : 'Claude', quota)}{quota.remainingPercent !== null && ' rămase'}</h2>
               <p className="text-xs text-muted-foreground">{quota.status === 'loading' ? 'Se verifică…' : quota.status === 'unavailable' ? 'Indisponibil' : quota.status === 'stale' ? 'Valoare veche — neconfirmată' : 'Verificat'}</p>
-              <p className="text-xs">Resetare: {formatDate(quota.resetAt)}</p>
-              <p className="text-xs">Ultima verificare reușită: {formatDate(quota.updatedAt)}</p>
+              <p className="text-xs">Resetare: <span className="font-mono text-muted-foreground">{formatDate(quota.resetAt)}</span></p>
+              <p className="text-xs">Ultima verificare reușită: <span className="font-mono text-muted-foreground">{formatDate(quota.updatedAt)}</span></p>
               {quota.reason && <p className="text-xs text-muted-foreground">{reasons[quota.reason] ?? reasons.provider_error}</p>}
             </section>;
           })}

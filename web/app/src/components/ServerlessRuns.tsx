@@ -12,7 +12,7 @@ function Steps({ run }: { run: Run }) {
   return (
     <ol className="mx-3 mb-3 divide-y divide-border rounded-md border border-border text-xs">
       {run.steps.map((step, index) => (
-        <li key={index} className={`flex items-center gap-3 px-2.5 py-1.5 ${index === failed ? "bg-foreground font-medium text-background" : ""}`}>
+        <li key={index} className={`flex items-center gap-3 px-2.5 py-1.5 ${index === failed ? "bg-tint-err font-medium text-err" : ""}`}>
           <span className="min-w-0 flex-1 truncate font-mono">{step.name}</span>
           <span className="tabular-nums">{formatSeconds(step.ms)}</span>
           <span className="w-16 text-right tabular-nums">{step.exitCode === null ? "cod —" : `cod ${step.exitCode}`}</span>
@@ -33,7 +33,7 @@ function RunRow({ run, now, open, onToggle }: { run: Run; now: number; open: boo
           <span className={`min-w-0 flex-1 truncate font-medium ${running ? "text-working" : ""}`} title={run.repo ?? undefined}>{shortRepo(run.repo)}</span>
           <span className="min-w-0 truncate font-mono text-xs text-muted-foreground">{run.ref ?? "implicit"}</span>
           <span className={`shrink-0 text-[11px] md:text-xs ${bad ? "rounded border border-foreground px-1.5 py-px font-medium" : "text-muted-foreground md:text-foreground"}`}>
-            {running && <span aria-hidden className="mr-1 inline-block size-1.5 animate-pulse rounded-full bg-foreground align-middle" />}
+            {running && <span aria-hidden className="mr-1 inline-block size-1.5 animate-pulse rounded-full bg-warn align-middle" />}
             {RUN_STATUS_LABEL[run.status]}
           </span>
         </span>

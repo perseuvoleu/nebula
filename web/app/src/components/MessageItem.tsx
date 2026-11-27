@@ -12,16 +12,16 @@ export const MessageItem = memo(function MessageItem({ message, project, session
   if (message.role === "user") {
     return (
       <article className="flex flex-col items-end gap-1" data-role="user" aria-label="Mesajul tău">
-        <div className="max-w-[min(85%,72ch)] rounded-2xl rounded-br-md bg-white text-black px-4 py-2.5 text-[15px] leading-relaxed whitespace-pre-wrap break-words">
+        <div className="max-w-[min(85%,72ch)] rounded-lg rounded-br-sm border border-line-info bg-sel2 px-4 py-2.5 text-[15px] text-foreground leading-relaxed whitespace-pre-wrap break-words">
           {text || <span className="text-muted-foreground">[conținut fără text]</span>}
         </div>
-        <time className="px-1 text-[11px] text-muted-foreground">{formatTime(message.timestamp)}</time>
+        <time className="px-1 font-mono text-[11px] text-dim">{formatTime(message.timestamp)}</time>
       </article>
     );
   }
   if (message.role === "notice") {
     return (
-      <aside className="mx-auto max-w-[72ch] rounded-lg border border-dashed border-border px-3 py-2 text-[13px] text-muted-foreground" data-role="notice">
+      <aside className="mx-auto max-w-[72ch] rounded-sm border-l-2 border-l-special bg-bg1 px-3 py-2 text-[13px] text-muted-foreground" data-role="notice">
         <span className="font-medium">{message.label === "compaction" ? "Context comprimat" : message.label === "branch" ? "Ramură abandonată" : message.label || "Notă"}</span>
         {text && <span> · {text.length > 400 ? `${text.slice(0, 400)}…` : text}</span>}
       </aside>
@@ -35,8 +35,8 @@ export const MessageItem = memo(function MessageItem({ message, project, session
         if (part.type === "image") return <p key={index} className="text-sm text-muted-foreground">[imagine {part.mimeType}]</p>;
         return <ToolActivity key={part.callId || index} part={part} project={project} session={session} />;
       })}
-      {message.error && <p role="alert" className="rounded-lg border border-border px-3 py-2 text-sm">Eroare model: {message.error}</p>}
-      <div className="flex min-h-6 items-center gap-2 text-[11px] text-muted-foreground">
+      {message.error && <p role="alert" className="rounded-sm border border-line-err bg-tint-err px-3 py-2 text-sm text-err">Eroare model: {message.error}</p>}
+      <div className="flex min-h-6 items-center gap-2 font-mono text-[11px] text-dim">
         <time>{formatTime(message.timestamp)}</time>
         {message.model && <span className="hidden sm:inline">{message.model}</span>}
         {tools.length > 0 && <span>{tools.length} {tools.length === 1 ? "unealtă" : "unelte"}</span>}
