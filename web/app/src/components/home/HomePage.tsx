@@ -165,13 +165,18 @@ function InlineReply({ project, session, onSent }: { project: string; session: C
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const mounted = useRef(true);
-  useEffect(() => () => { mounted.current = false; }, []);
+  const inFlight = useRef(false);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
 
   const canSend = !sending && text.trim().length > 0 && text.length <= MAX_MESSAGE;
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
-    if (!canSend) return;
+    if (!canSend || inFlight.current) return;
+    inFlight.current = true;
     const payload = text;
     setSending(true);
     setError(null);
@@ -184,6 +189,7 @@ function InlineReply({ project, session, onSent }: { project: string; session: C
       if (!mounted.current) return;
       setError(describeError(failure));
     } finally {
+      inFlight.current = false;
       if (mounted.current) setSending(false);
     }
   };
