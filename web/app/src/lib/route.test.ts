@@ -1,10 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parseSelection, selectionPath, type BoardRoute } from "./route.ts";
+import { parseSelection, selectionPath, tabOf, type BoardRoute } from "./route.ts";
 
 test("All is a virtual list route; opening preserves real project identity and aggregate context", () => {
-  assert.equal(selectionPath({ project: null, session: null, all: true }), "/?view=all");
-  assert.deepEqual(parseSelection("/?view=all"), { project: null, session: null, all: true });
+  assert.equal(selectionPath({ project: null, session: null, all: true }), "/code?view=all");
+  assert.deepEqual(parseSelection("/code?view=all"), { project: null, session: null, all: true });
+  assert.deepEqual(parseSelection("/?view=all"), { project: null, session: null, all: true }, "an old All link still opens the list");
   for (const project of ["alpha", "beta"]) {
     const selection = { project, session: "same", all: true };
     assert.equal(selectionPath(selection), `/p/${project}/s/same?view=all`);
@@ -52,4 +53,26 @@ test("board routes do not shadow session routes, and a malformed board path fall
   assert.deepEqual(parseSelection("/p/board/s/one"), { project: "board", session: "one", all: false });
   assert.deepEqual(parseSelection("/p/alpha"), { project: "alpha", session: null, all: false });
   assert.deepEqual(parseSelection("/board/x/y"), { project: null, session: null, all: false });
+});
+
+test("the app's tabs: / is HOME, a selected card is /c/<ref>, CODE is /code and the session routes, RAG and DECISIONS have their own", () => {
+  const home = (card: string | null) => ({ project: null, session: null, all: false, view: "home" as const, card });
+  const cases: [string, ReturnType<typeof parseSelection>][] = [
+    ["/", home(null)],
+    ["/c/12%40leaseweb", home("12@leaseweb")],
+    ["/c/3", home("3")],
+    ["/code", { project: null, session: null, all: false }],
+    ["/rag", { project: null, session: null, all: false, view: "rag" }],
+    ["/decisions", { project: null, session: null, all: false, view: "decisions" }],
+  ];
+  for (const [path, selection] of cases) {
+    assert.deepEqual(parseSelection(path), selection, path);
+    assert.equal(selectionPath(selection), path);
+  }
+  assert.equal(tabOf(parseSelection("/")), "home");
+  assert.equal(tabOf(parseSelection("/p/alpha/s/one")), "code");
+  assert.equal(tabOf(parseSelection("/serverless")), "code");
+  assert.equal(tabOf(parseSelection("/rag")), "rag");
+  assert.equal(tabOf(parseSelection("/decisions")), "decisions");
+  assert.equal(tabOf(parseSelection("/board")), null);
 });

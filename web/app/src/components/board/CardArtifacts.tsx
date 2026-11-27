@@ -27,7 +27,7 @@ async function fetched(kind: string, entry: string, src: string, signal: AbortSi
 }
 
 /** Each card read mints a new grant; the URL first used is kept until it gets a 403 or its grant is about to lapse, so a frame does not reload under its reader. */
-function ArtifactItem({ artifact, now }: { artifact: Artifact; now: number }) {
+export function ArtifactItem({ artifact, now }: { artifact: Artifact; now: number }) {
   const [held, setHeld] = useState({ src: artifact.src ?? null, expires: artifact.expires });
   const [loaded, setLoaded] = useState<{ src: string; content?: ArtifactContent; error?: string; expired?: boolean } | null>(null);
   const refused = loaded?.expired && loaded.src === held.src;

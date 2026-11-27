@@ -64,9 +64,9 @@ test("serverless back returns to the originating list", async ({ page }) => {
   await expect(page).toHaveURL(/\/p\/beta$/);
   await expect(project).toHaveValue("beta");
   await project.selectOption("");
-  await expect(page).toHaveURL(/\/\?view=all$/);
+  await expect(page).toHaveURL(/\/code\?view=all$/);
   await roundTrip();
-  await expect(page).toHaveURL(/\/\?view=all$/);
+  await expect(page).toHaveURL(/\/code\?view=all$/);
   await expect(project).toHaveValue("");
   await page.goto("/serverless");
   await page.getByRole("button", { name: "Înapoi la sesiuni" }).click();

@@ -17,13 +17,14 @@ export const test = base.extend({
   },
 });
 
-export async function login(page: Page, url = "/") {
+export async function login(page: Page, url = "/code") {
   await page.goto(url);
   await page.getByLabel("Token de acces").fill(TOKEN);
   await page.getByRole("button", { name: "Conectare" }).click();
   await expect(page.getByLabel("Token de acces")).toHaveCount(0);
   if (/\/s\//.test(url)) await expect(page.getByLabel("Mesaj către agent")).toBeVisible();
-  else if (!url.startsWith("/board")) await expect(page.getByRole("combobox", { name: "Proiect", exact: true })).toBeVisible();
+  else if (/^\/(code|p\/|\?view=all)/.test(url)) await expect(page.getByRole("combobox", { name: "Proiect", exact: true })).toBeVisible();
+  else if (!url.startsWith("/board")) await expect(page.getByRole("navigation", { name: "Taburi" })).toBeVisible();
 }
 
 export function readAgents(): Array<Record<string, unknown> & { id: string; name: string; status: string; path: string; session_id: string | null }> {

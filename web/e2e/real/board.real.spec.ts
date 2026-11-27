@@ -100,3 +100,16 @@ test("a reporter run published with nebula artifact add opens with every screens
   await expect(frame).toHaveAttribute("sandbox", "allow-scripts");
   await expect(page.frameLocator('iframe[title="Real recap"]').getByText("recap script ran")).toBeVisible();
 });
+
+test("HOME at / reads the daemon's board: a CLI card is listed by stage, opens in the card pane, and its decision is in the rail", async ({ page }) => {
+  const card = add("Land on HOME");
+  nebula("decision", "add", "HOME is the landing page", "--why", "Agent first", "--card", String(card.number));
+  await login(page, "/");
+  await page.getByRole("region", { name: "Backlog", exact: true }).getByRole("button", { name: /Land on HOME/ }).click();
+  const pane = page.getByRole("region", { name: `Card #${card.number}` });
+  await expect(pane.getByRole("heading", { name: "Land on HOME" })).toBeVisible();
+  await expect(pane.getByRole("region", { name: "Jurnal" })).toContainText("HOME is the landing page");
+  await expect(page.getByRole("complementary", { name: "Context și decizii" })).toContainText("HOME is the landing page");
+  await page.keyboard.press("2");
+  await expect(page.getByRole("combobox", { name: "Proiect", exact: true })).toBeVisible();
+});

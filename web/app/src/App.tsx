@@ -22,6 +22,7 @@ import { UsageNavbar } from "./components/UsageNavbar";
 import { PushNotifications } from "./components/PushNotifications";
 import { ServerlessRuns } from "./components/ServerlessRuns";
 import { BoardPage } from "./components/board/BoardPage";
+import { AgentApp } from "./components/home/AgentApp";
 
 interface Workspace { projects: string[]; host: string }
 
@@ -153,13 +154,17 @@ export default function App() {
     if (authed) return <main className="flex flex-1 items-center justify-center text-sm text-muted-foreground" aria-busy="true">{notice ?? "Se conectează…"}</main>;
     return <Login onAuthenticated={(projects, host) => setWorkspace({ projects, host })} />;
   }
-  return <><UsageNavbar /><Routes workspace={workspace} /></>;
+  return <Routes workspace={workspace} />;
 }
 
 function Routes({ workspace }: { workspace: Workspace }) {
   const route = useSelection();
   const [selection, navigate] = route;
-  if (!selection.board) return <Shell workspace={workspace} route={route} />;
+  const desktop = useMediaQuery("(min-width: 768px)");
+  if (!selection.board) return (
+    <AgentApp selection={selection} navigate={navigate} workspace={workspace} phone={!desktop}
+      code={<><UsageNavbar /><Shell workspace={workspace} route={route} /></>} />
+  );
   return <BoardPage route={selection.board} workspace={workspace} onSessions={() => navigate({ project: null, session: null, all: false })}
     onNavigate={(board) => navigate({ project: null, session: null, all: false, board })} />;
 }

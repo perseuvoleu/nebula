@@ -1,4 +1,5 @@
-// Selection ↔ URL: /p/<project>/s/<session id> or /serverless. Non-secret identifiers only.
+// Selection ↔ URL. HOME is / (a selected card /c/<ref>), CODE is /code, /p/<project>/s/<session id> and /serverless,
+// then /rag, /decisions and the kanban under /board. Non-secret identifiers only.
 import { useCallback, useEffect, useState } from "react";
 
 export interface Selection {
@@ -10,7 +11,16 @@ export interface Selection {
   /** The serverless runs section; the URL keeps only the list it was opened from (`?from=<project>` or `?view=all`). */
   serverless?: boolean;
   board?: BoardRoute;
+  /** HOME, RAG or DECISIONS; absent for CODE and the board. */
+  view?: "home" | "rag" | "decisions";
+  /** HOME's selected card, without the ref's leading "#". */
+  card?: string | null;
 }
+
+export type Tab = "home" | "code" | "rag" | "decisions";
+
+/** The tab a route belongs to; null for the kanban, which has no tab. */
+export const tabOf = (selection: Selection): Tab | null => selection.board ? null : selection.view ?? "code";
 
 export interface BoardRoute {
   project: string | null;
@@ -59,6 +69,12 @@ export function parseSelection(path: string): Selection {
   }
   const board = parseBoard(pathname, new URLSearchParams(query));
   if (board) return { project: null, session: null, all: false, board };
+  const all = new URLSearchParams(query).get("view") === "all";
+  if (/^\/?$/.test(pathname) && !all) return { project: null, session: null, all: false, view: "home", card: null };
+  const card = /^\/c\/([A-Za-z0-9._@-]{1,80})\/?$/.exec(pathname.replace(/%40/gi, "@"));
+  if (card) return { project: null, session: null, all: false, view: "home", card: card[1] };
+  if (/^\/(rag|decisions)\/?$/.test(pathname)) return { project: null, session: null, all: false, view: pathname.replace(/\//g, "") as "rag" | "decisions" };
+  if (/^\/code\/?$/.test(pathname)) return { project: null, session: null, all };
   const match = PATTERN.exec(pathname);
   return { project: match?.[1] ?? null, session: match?.[2] ?? null,
     all: new URLSearchParams(query).get("view") === "all" };
@@ -71,8 +87,10 @@ export function selectionPath(selection: Selection): string {
     return selection.project ? `/serverless?from=${encodeURIComponent(selection.project)}` : "/serverless";
   }
   if (selection.board) return boardPath(selection.board);
-  if (selection.all && !selection.session) return "/?view=all";
-  if (!selection.project) return "/";
+  if (selection.view === "home") return selection.card ? `/c/${encodeURIComponent(selection.card)}` : "/";
+  if (selection.view) return `/${selection.view}`;
+  if (selection.all && !selection.session) return "/code?view=all";
+  if (!selection.project) return "/code";
   return `/p/${encodeURIComponent(selection.project)}${selection.session ? `/s/${encodeURIComponent(selection.session)}` : ""}${selection.all ? "?view=all" : ""}`;
 }
 

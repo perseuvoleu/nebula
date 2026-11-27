@@ -75,7 +75,7 @@ test.describe("reconnection, logout and PWA/security invariants", () => {
   });
 
   test("a bad token gets a specific explanation and nothing is stored", async ({ page }) => {
-    await page.goto("/");
+    await page.goto("/code");
     await page.getByLabel("Token de acces").fill("x".repeat(40));
     await page.getByRole("button", { name: "Conectare" }).click();
     await expect(page.getByRole("alert")).toContainText("NEBULA_WEB_TOKEN");
