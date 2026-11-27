@@ -1,15 +1,52 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
-@import "@fontsource-variable/geist";
 
 @custom-variant dark (&:is(.dark *));
 
 @theme inline {
-    --font-heading: var(--font-sans);
-    --color-working: #facc15;
-    --color-unseen: #38bdf8;
-    --font-sans: 'Geist Variable', sans-serif;
+    --font-sans: var(--ui);
+    --font-heading: var(--ui);
+    --font-mono: var(--mono);
+    --text-tag: 10.5px;
+    --text-tag--line-height: 1.35;
+    --text-meta: 11.5px;
+    --text-meta--line-height: 1.4;
+    --text-ui: 12.5px;
+    --text-ui--line-height: 1.42;
+    --color-bg0: var(--bg0);
+    --color-bg1: var(--bg1);
+    --color-bg2: var(--bg2);
+    --color-bg3: var(--bg3);
+    --color-bg2-hover: var(--bg2-hover);
+    --color-edge: var(--edge);
+    --color-edge-hover: var(--edge-hover);
+    --color-hair: var(--hair);
+    --color-dim: var(--dim);
+    --color-sel: var(--sel);
+    --color-sel2: var(--sel2);
+    --color-ok: var(--ok);
+    --color-warn: var(--warn);
+    --color-err: var(--err);
+    --color-info: var(--info);
+    --color-special: var(--special);
+    --color-remote: var(--remote);
+    --color-backlog: var(--backlog);
+    --color-tint-ok: var(--tint-ok);
+    --color-tint-warn: var(--tint-warn);
+    --color-tint-err: var(--tint-err);
+    --color-tint-need: var(--tint-need);
+    --color-tint-info: var(--tint-info);
+    --color-tint-special: var(--tint-special);
+    --color-tint-accent: var(--tint-accent);
+    --color-tint-remote: var(--tint-remote);
+    --color-tint-backlog: var(--tint-backlog);
+    --color-line-ok: var(--line-ok);
+    --color-line-warn: var(--line-warn);
+    --color-line-err: var(--line-err);
+    --color-line-info: var(--line-info);
+    --color-working: var(--warn);
+    --color-unseen: var(--info);
     --color-sidebar-ring: var(--sidebar-ring);
     --color-sidebar-border: var(--sidebar-border);
     --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
@@ -41,50 +78,87 @@
     --color-card: var(--card);
     --color-foreground: var(--foreground);
     --color-background: var(--background);
-    --radius-sm: calc(var(--radius) * 0.6);
-    --radius-md: calc(var(--radius) * 0.8);
-    --radius-lg: var(--radius);
-    --radius-xl: calc(var(--radius) * 1.4);
-    --radius-2xl: calc(var(--radius) * 1.8);
-    --radius-3xl: calc(var(--radius) * 2.2);
-    --radius-4xl: calc(var(--radius) * 2.6);
+    --radius-sm: 4px;
+    --radius-md: 6px;
+    --radius-lg: 8px;
+    --radius-xl: 10px;
+    --radius-2xl: 12px;
+    --radius-3xl: 16px;
+    --radius-4xl: 20px;
 }
 
-/* One monochrome theme: true black ground, white text, neutral gray surfaces. No light theme. */
+/* The one palette of the whole app (board and agents), measured from .scratch/prototypes/final/board.html. No light theme. */
 :root {
     color-scheme: dark;
-    --background: oklch(0 0 0);
-    --foreground: oklch(0.97 0 0);
-    --card: oklch(0.13 0 0);
-    --card-foreground: oklch(0.97 0 0);
-    --popover: oklch(0.13 0 0);
-    --popover-foreground: oklch(0.97 0 0);
-    --primary: oklch(0.985 0 0);
-    --primary-foreground: oklch(0.08 0 0);
-    --secondary: oklch(0.2 0 0);
-    --secondary-foreground: oklch(0.97 0 0);
-    --muted: oklch(0.18 0 0);
-    --muted-foreground: oklch(0.72 0 0);
-    --accent: oklch(0.22 0 0);
-    --accent-foreground: oklch(0.985 0 0);
-    --destructive: oklch(0.85 0 0);
-    --border: oklch(0.26 0 0);
-    --input: oklch(0.3 0 0);
-    --ring: oklch(0.85 0 0);
-    --chart-1: oklch(0.9 0 0);
-    --chart-2: oklch(0.75 0 0);
-    --chart-3: oklch(0.6 0 0);
-    --chart-4: oklch(0.45 0 0);
-    --chart-5: oklch(0.3 0 0);
-    --sidebar: oklch(0.07 0 0);
-    --sidebar-foreground: oklch(0.97 0 0);
-    --sidebar-primary: oklch(0.985 0 0);
-    --sidebar-primary-foreground: oklch(0.08 0 0);
-    --sidebar-accent: oklch(0.18 0 0);
-    --sidebar-accent-foreground: oklch(0.985 0 0);
-    --sidebar-border: oklch(0.2 0 0);
-    --sidebar-ring: oklch(0.85 0 0);
-    --radius: 0.625rem;
+    --bg0: #16161d;
+    --bg1: #1a1a23;
+    --bg2: #20202b;
+    --bg3: #272734;
+    --bg2-hover: #242431;
+    --edge: #2b2b3a;
+    --edge-hover: #3e3e54;
+    --hair: #21212d;
+    --text: #dcd7ba;
+    --text-muted: #a3a097;
+    --dim: #6b6b84;
+    --accent-ink: #7aa89f;
+    --ok: #98bb6c;
+    --warn: #e6c384;
+    --err: #e46876;
+    --info: #7fb4ca;
+    --special: #957fb8;
+    --remote: #d27e99;
+    --backlog: #9393ad;
+    --sel: #2d4f67;
+    --sel2: #213044;
+    --tint-ok: #1f2b1f;
+    --tint-warn: #2d281f;
+    --tint-err: #321e24;
+    --tint-need: #261a20;
+    --tint-info: #1d2b36;
+    --tint-special: #282233;
+    --tint-accent: #1c2928;
+    --tint-remote: #301f29;
+    --tint-backlog: #232330;
+    --line-ok: #3b5436;
+    --line-warn: #6a5634;
+    --line-err: #4e2b35;
+    --line-info: #2f4e63;
+    --ui: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", system-ui, sans-serif;
+    --mono: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
+
+    --background: var(--bg0);
+    --foreground: var(--text);
+    --card: var(--bg2);
+    --card-foreground: var(--text);
+    --popover: var(--bg1);
+    --popover-foreground: var(--text);
+    --primary: var(--accent-ink);
+    --primary-foreground: var(--bg0);
+    --secondary: var(--bg3);
+    --secondary-foreground: var(--text);
+    --muted: var(--bg2);
+    --muted-foreground: var(--text-muted);
+    --accent: var(--bg2);
+    --accent-foreground: var(--text);
+    --destructive: var(--err);
+    --border: var(--edge);
+    --input: var(--edge);
+    --ring: var(--accent-ink);
+    --chart-1: var(--accent-ink);
+    --chart-2: var(--info);
+    --chart-3: var(--warn);
+    --chart-4: var(--special);
+    --chart-5: var(--ok);
+    --sidebar: var(--bg1);
+    --sidebar-foreground: var(--text);
+    --sidebar-primary: var(--accent-ink);
+    --sidebar-primary-foreground: var(--bg0);
+    --sidebar-accent: var(--sel2);
+    --sidebar-accent-foreground: var(--text);
+    --sidebar-border: var(--edge);
+    --sidebar-ring: var(--accent-ink);
+    --radius: 8px;
 }
 
 @layer base {
@@ -113,8 +187,8 @@
     overflow: hidden;
   }
   ::selection {
-    background: oklch(0.9 0 0);
-    color: oklch(0.05 0 0);
+    background: var(--sel);
+    color: var(--text);
   }
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after {
@@ -126,14 +200,35 @@
   }
 }
 
-/* Yellow sweep across working session names, matching the terminal UI. */
+/* Every text input, select and textarea: the prototype's .field look. */
+@utility field {
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--edge);
+  background-color: var(--bg0);
+  color: var(--text);
+  outline: none;
+  &::placeholder { color: var(--dim); }
+  &:focus-visible { border-color: var(--accent-ink); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-ink) 35%, transparent); }
+  &:disabled { opacity: 0.6; }
+}
+
+/* Section labels: uppercase, bold, dim (the prototype's .sec-lbl and .sb-sec). */
+@utility label-caps {
+  font-size: 10.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--dim);
+}
+
+/* Amber sweep across working session names, matching the terminal UI. */
 .session-working {
-  color: #facc15;
+  color: var(--warn);
 }
 @media (prefers-reduced-motion: no-preference) {
   @supports (background-clip: text) {
     .session-working {
-      background-image: linear-gradient(110deg, #facc15 35%, #ffffaf 50%, #facc15 65%);
+      background-image: linear-gradient(110deg, var(--warn) 35%, #fff3d0 50%, var(--warn) 65%);
       background-size: 250% 100%;
       background-clip: text;
       -webkit-background-clip: text;
@@ -147,7 +242,7 @@
   to { background-position: -100% 0; }
 }
 
-/* Prose inside messages: readable measure, no color, monochrome code. */
+/* Prose inside messages: readable measure, monospace code on the palette. */
 .prose-mono {
   max-width: 72ch;
   overflow-wrap: anywhere;

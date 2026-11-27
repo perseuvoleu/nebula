@@ -15,6 +15,25 @@ export const KIND_LABEL: Record<string, string> = {
   cursor: "Cursor",
 };
 
+/** The coloured dot a status shows, shared by board tiles and session rows. */
+export type Dot = "needs" | "running" | "done" | "queued" | "off";
+
+export const DOT_LABEL: Record<Dot, string> = {
+  needs: STATUS_LABEL.needs_feedback,
+  running: STATUS_LABEL.running,
+  done: STATUS_LABEL.finished,
+  queued: STATUS_LABEL.fresh,
+  off: "Inactiv",
+};
+
+export function sessionDot(status: string): Dot {
+  if (status === "needs_feedback") return "needs";
+  if (status === "running") return "running";
+  if (status === "finished") return "done";
+  if (status === "fresh") return "queued";
+  return "off";
+}
+
 export const statusLabel = (status: string): string => STATUS_LABEL[status] ?? status;
 export const kindLabel = (kind: string): string => KIND_LABEL[kind] ?? kind;
 

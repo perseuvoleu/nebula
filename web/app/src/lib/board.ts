@@ -1,4 +1,4 @@
-import { STATUS_LABEL } from "./status.ts";
+import type { Dot } from "./status.ts";
 
 export const STAGES = ["backlog", "next", "doing", "review", "done"] as const;
 export type Stage = (typeof STAGES)[number];
@@ -43,23 +43,7 @@ export type BoardCard = {
 
 export type LogEntry = { id: string; author: string; text: string; age: string };
 
-export type Dot = "needs" | "running" | "done" | "queued" | "off";
-
-export const DOT_LABEL: Record<Dot, string> = {
-  needs: STATUS_LABEL.needs_feedback,
-  running: STATUS_LABEL.running,
-  done: STATUS_LABEL.finished,
-  queued: STATUS_LABEL.fresh,
-  off: "Inactiv",
-};
-
-export function sessionDot(status: string): Dot {
-  if (status === "needs_feedback") return "needs";
-  if (status === "running") return "running";
-  if (status === "finished") return "done";
-  if (status === "fresh") return "queued";
-  return "off";
-}
+export { type Dot, DOT_LABEL, sessionDot } from "./status.ts";
 
 /** Null when the card's sessions are unknown (a list row, not a card read), so the tile makes no status claim. */
 export function cardDot(card: BoardCard): Dot | null {

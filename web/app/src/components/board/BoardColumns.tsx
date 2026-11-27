@@ -16,7 +16,7 @@ export function BoardColumns({ columns, selected, showProject = false, onOpen, o
   renderActions?: (card: BoardCard) => ReactNode;
 }) {
   return (
-    <div className="flex min-h-0 flex-1 snap-x snap-mandatory gap-2 overflow-x-auto p-3">
+    <div className="flex min-h-0 flex-1 snap-x snap-mandatory gap-[9px] overflow-x-auto px-3 py-2.5">
       {STAGES.map((stage) => {
         const cards = columns[stage];
         return (
@@ -28,18 +28,18 @@ export function BoardColumns({ columns, selected, showProject = false, onOpen, o
               e.preventDefault();
               onMove(ref, stage);
             }}
-            className="flex min-h-0 w-72 shrink-0 snap-start flex-col rounded-xl border bg-sidebar md:w-auto md:max-w-84 md:min-w-52 md:flex-1 md:shrink">
-            <header className="flex shrink-0 items-center gap-1.5 border-b px-2.5 py-2">
+            className="flex min-h-0 w-72 shrink-0 snap-start flex-col rounded-lg border bg-bg1 md:w-auto md:max-w-[340px] md:min-w-[196px] md:flex-1 md:shrink">
+            <header className="flex shrink-0 items-center gap-1.5 border-b border-hair px-2.5 pt-2 pb-[7px]">
               <StagePill stage={stage} />
-              <span className="font-mono text-xs text-muted-foreground tabular-nums">{cards.length}</span>
+              <span className="font-mono text-[11px] text-dim tabular-nums">{cards.length}</span>
               <span className="flex-1" />
               {onAdd && (
-                <Button type="button" variant="ghost" size="icon-xs" aria-label={`Card nou în ${STAGE_LABEL[stage]}`} onClick={() => onAdd(stage)}>
+                <Button type="button" variant="ghost" size="icon-xs" className="text-dim" aria-label={`Card nou în ${STAGE_LABEL[stage]}`} onClick={() => onAdd(stage)}>
                   <PlusIcon aria-hidden />
                 </Button>
               )}
             </header>
-            <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto p-2">
+            <div className="flex min-h-0 flex-1 flex-col gap-[7px] overflow-y-auto p-[7px]">
               {cards.length
                 ? cards.map((card) => (
                   <div key={card.ref} draggable={!!onMove} onDragStart={(e) => e.dataTransfer.setData(DRAGGED, card.ref)}>
@@ -47,7 +47,7 @@ export function BoardColumns({ columns, selected, showProject = false, onOpen, o
                       onOpen={onOpen} actions={renderActions?.(card)} />
                   </div>
                 ))
-                : <p className="p-3 text-center text-xs text-muted-foreground">Gol</p>}
+                : <p className="p-3 text-center text-xs text-dim">Gol</p>}
             </div>
           </section>
         );

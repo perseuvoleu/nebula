@@ -37,7 +37,7 @@ export function Login({ onAuthenticated }: { onAuthenticated: (projects: string[
           <span className="font-medium">Token de acces</span>
           <input type="password" autoComplete="off" required minLength={8} value={value} onChange={(e) => setValue(e.target.value)}
             aria-describedby="token-help" aria-invalid={error ? true : undefined}
-            className="mt-1.5 h-12 w-full rounded-lg border border-input bg-card px-3.5 text-base outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/60" />
+            className="mt-1.5 h-12 w-full field px-3.5 text-base" />
         </label>
         <p id="token-help" className="mt-2 text-xs text-muted-foreground">Rămâne doar în această sesiune de browser. Nu este trimis nicăieri altundeva.</p>
         {error && <p role="alert" className="mt-3 rounded-lg border border-border px-3 py-2 text-sm">{error}</p>}

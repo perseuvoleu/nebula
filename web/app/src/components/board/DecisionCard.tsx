@@ -1,4 +1,5 @@
 import { formatWhen } from "@/lib/status";
+import { Pill } from "@/components/ui/pill";
 
 export interface DecisionRow {
   id: string;
@@ -15,16 +16,16 @@ const linkCls = "min-w-0 truncate underline-offset-4 hover:text-foreground hover
 
 export function DecisionCard({ decision, showProject = true }: { decision: DecisionRow; showProject?: boolean }) {
   return (
-    <article className="flex flex-col gap-1.5 rounded-lg border border-border border-l-2 border-l-foreground/50 bg-card px-3 py-2.5">
+    <article className="flex flex-col gap-[5px] rounded-md border border-l-[3px] border-l-special bg-bg1 px-3 py-2.5">
       <div className="flex items-baseline gap-3">
-        <h3 className="min-w-0 flex-1 text-sm font-medium break-words">{decision.title}</h3>
-        <time dateTime={decision.createdAt} className="shrink-0 font-mono text-xs text-muted-foreground tabular-nums">{formatWhen(decision.createdAt)}</time>
+        <h3 className="flex min-w-0 flex-1 items-baseline gap-1.5 text-sm font-semibold break-words"><span aria-hidden className="size-2 shrink-0 translate-y-[-1px] rotate-45 rounded-[1px] bg-special" />{decision.title}</h3>
+        <time dateTime={decision.createdAt} className="shrink-0 font-mono text-[11px] text-dim tabular-nums">{formatWhen(decision.createdAt)}</time>
       </div>
       {decision.why && <p className="text-sm text-muted-foreground">{decision.why}</p>}
       <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
-        {showProject && <span className="font-mono">{decision.project ? `@${decision.project}` : "fără proiect"}</span>}
+        {showProject && <Pill tone="project">{decision.project ?? "fără proiect"}</Pill>}
         {decision.card
-          ? <a href={decision.card.href} className={linkCls}><span className="font-mono">{decision.card.ref}</span> {decision.card.title}</a>
+          ? <a href={decision.card.href} className={linkCls}><span className="font-mono text-dim">{decision.card.ref}</span> {decision.card.title}</a>
           : <span>la nivel de proiect</span>}
         {!decision.session ? <span>de tine</span>
           : decision.session.href ? <a href={decision.session.href} className={linkCls}>sesiunea <span className="font-mono">{decision.session.name}</span></a>

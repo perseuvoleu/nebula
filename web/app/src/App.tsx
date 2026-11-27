@@ -264,7 +264,7 @@ function Shell({ workspace, route }: { workspace: Workspace; route: ReturnType<t
         <label className="min-w-0 flex-1 text-sm">
           <span className="sr-only">Proiect</span>
           <select value={selection.all ? "" : project} onChange={(e) => changeProject(e.target.value)} aria-label="Proiect"
-            className="h-10 w-full rounded-lg border border-input bg-card px-2.5 text-[15px] font-medium outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/60">
+            className="h-10 w-full field px-2.5 text-[15px] font-medium">
             <option value="">All</option>
             {workspace.projects.map((p) => <option key={p} value={p}>{p}</option>)}
           </select>
@@ -332,7 +332,7 @@ function Shell({ workspace, route }: { workspace: Workspace; route: ReturnType<t
             <label className="min-w-0 flex-1 text-sm">
               <span className="sr-only">Proiect</span>
               <select value={selection.all ? "" : project} onChange={(e) => changeProject(e.target.value)} aria-label="Proiect"
-                className="h-11 w-full rounded-lg border border-input bg-card px-3 text-base font-medium outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/60">
+                className="h-11 w-full field px-3 text-base font-medium">
                 <option value="">All</option>
                 {workspace.projects.map((p) => <option key={p} value={p}>{p}</option>)}
               </select>

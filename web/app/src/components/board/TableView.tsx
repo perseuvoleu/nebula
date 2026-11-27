@@ -2,9 +2,10 @@ import type { ReactNode } from "react";
 import { cn } from "@/lib/utils";
 import { statusLabel } from "@/lib/status";
 import { type BoardCard, type SortKey, type TableSort, cardDot, projectName, sessionDot } from "@/lib/board";
-import { CardRef, StagePill, StatusDot } from "./CardTile";
+import { Pill } from "@/components/ui/pill";
+import { BranchTag, CardRef, ProjectTag, StagePill, StatusDot } from "./CardTile";
 
-const Empty = () => <span className="text-muted-foreground">—</span>;
+const Empty = () => <span className="text-dim">—</span>;
 
 function Row({ card, selected, onOpen, hasActions, actions }: {
   card: BoardCard; selected: boolean; onOpen?: (ref: string) => void; hasActions: boolean; actions?: ReactNode;
@@ -13,7 +14,7 @@ function Row({ card, selected, onOpen, hasActions, actions }: {
   const blocked = card.blockers.length > 0;
   const dot = cardDot(card);
   return (
-    <tr className={cn("border-b hover:bg-card", selected && "bg-secondary", blocked && "opacity-60")}>
+    <tr className={cn("border-b border-hair hover:bg-bg1", selected && "bg-sel2 hover:bg-sel2", blocked && "opacity-68")}>
       <td className="px-2 py-1.5"><CardRef cardRef={card.ref} /></td>
       <td className="w-full px-2 py-1.5">
         <span className="flex min-w-48 items-center gap-1.5">
@@ -22,18 +23,18 @@ function Row({ card, selected, onOpen, hasActions, actions }: {
             className="min-w-0 truncate rounded-sm text-left font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring">
             {card.title}
           </button>
-          {blocked && <span className="shrink-0 rounded-md border border-dashed px-1.5 py-0.5 font-mono text-xs">{card.blockers[0].ref}</span>}
+          {blocked && <Pill tone="blocked" className="font-mono">{card.blockers[0].ref}</Pill>}
         </span>
       </td>
       <td className="px-2 py-1.5"><StagePill stage={card.stage} /></td>
-      <td className="hidden max-w-36 truncate px-2 py-1.5 font-mono text-xs text-muted-foreground md:table-cell">{projectName(card.project)}</td>
-      <td className="hidden max-w-40 truncate px-2 py-1.5 font-mono text-xs lg:table-cell">{card.checkout ? card.checkout.branch : <Empty />}</td>
+      <td className="hidden max-w-36 px-2 py-1.5 md:table-cell"><ProjectTag project={card.project} /></td>
+      <td className="hidden max-w-40 px-2 py-1.5 lg:table-cell">{card.checkout ? <BranchTag branch={card.checkout.branch} /> : <Empty />}</td>
       <td className="hidden max-w-36 px-2 py-1.5 lg:table-cell">
         {last
           ? <span className="flex min-w-0 items-center gap-1.5"><StatusDot dot={sessionDot(last.status)} label={statusLabel(last.status)} /><span className="truncate">{last.name}</span></span>
           : <Empty />}
       </td>
-      <td className="hidden px-2 py-1.5 font-mono text-xs tabular-nums lg:table-cell">{card.artifacts || <Empty />}</td>
+      <td className="hidden px-2 py-1.5 font-mono text-meta tabular-nums lg:table-cell">{card.artifacts || <Empty />}</td>
       {hasActions && <td className="px-2 py-1.5"><span className="flex items-center gap-1">{actions}</span></td>}
     </tr>
   );
@@ -57,7 +58,7 @@ function SortHead({ label, column, sort, onSort, className }: {
 }
 
 function GroupLabel({ name, count }: { name: string; count: number }) {
-  return <>{name} <span className="text-muted-foreground tabular-nums">{count}</span></>;
+  return <>{name} <span className="text-dim tabular-nums">{count}</span></>;
 }
 
 export function TableView({ cards, groupByProject = false, selected, onOpen, renderActions, sort, onSort, collapsed = [], onToggleGroup }: {
@@ -75,10 +76,10 @@ export function TableView({ cards, groupByProject = false, selected, onOpen, ren
   const groups = groupByProject
     ? [...new Set(cards.map((c) => projectName(c.project)))].map((name) => ({ name, cards: cards.filter((c) => projectName(c.project) === name) }))
     : [{ name: null, cards }];
-  const head = "sticky top-0 z-10 bg-background px-2 py-2 text-left text-xs font-medium text-muted-foreground";
+  const head = "label-caps sticky top-0 z-10 bg-bg0 px-2 py-2 text-left font-semibold tracking-[0.04em] hover:text-foreground";
   return (
-    <div className="min-h-0 flex-1 overflow-auto px-3 pb-3">
-      <table className="w-full border-collapse text-sm whitespace-nowrap">
+    <div className="min-h-0 flex-1 overflow-auto px-3.5 pb-3.5">
+      <table className="w-full border-collapse text-xs whitespace-nowrap">
         <thead>
           <tr className="border-b">
             <SortHead label="ID" column="ref" sort={sort} onSort={onSort} className={head} />
@@ -94,8 +95,8 @@ export function TableView({ cards, groupByProject = false, selected, onOpen, ren
         {groups.map((group) => (
           <tbody key={group.name ?? ""}>
             {group.name !== null && (
-              <tr className="border-y bg-card">
-                <th scope="colgroup" colSpan={columns} className="px-2 py-1.5 text-left font-mono text-xs font-medium">
+              <tr className="border-y bg-bg1">
+                <th scope="colgroup" colSpan={columns} className="px-2 py-1.5 text-left font-mono text-xs font-semibold">
                   {onToggleGroup
                     ? (
                       <button type="button" aria-expanded={!collapsed.includes(group.name)} onClick={() => onToggleGroup(group.name!)}

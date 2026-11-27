@@ -297,5 +297,5 @@ test("blocking from the card page dims the card, and a note appears in its log",
   await expect(page.getByRole("listitem").filter({ hasText: "Waits on the contract" })).toBeVisible();
   await expect(page.getByRole("button", { name: /#12@leaseweb\s*Keep verification results/ })).toBeVisible();
   await page.getByRole("button", { name: "Board" }).click();
-  await expect(tile(page, "Wait for verification")).toHaveCSS("opacity", "0.6");
+  await expect(tile(page, "Wait for verification")).toHaveCSS("opacity", "0.66");
 });

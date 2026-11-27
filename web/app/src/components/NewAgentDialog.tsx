@@ -71,7 +71,7 @@ export function NewAgentDialog({ project, initialWorktree, open, onOpenChange, o
           <label className="flex flex-col gap-1.5 text-sm">
             <span className="font-medium">Checkout</span>
             <select aria-label="Checkout" value={worktree} onChange={(e) => setWorktree(e.target.value)} required disabled={!trees}
-              className="h-11 rounded-lg border border-input bg-card px-3 text-base outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/60">
+              className="h-11 field px-3 text-base">
               {!trees && <option value="">Se încarcă…</option>}
               {trees?.map((w) => <option key={w.path} value={w.path}>{w.branch}{w.is_main ? " (principal)" : ""} · {w.sessions.length} sesiuni</option>)}
             </select>
@@ -98,7 +98,7 @@ export function NewAgentDialog({ project, initialWorktree, open, onOpenChange, o
             <span className="font-medium">Prima sarcină</span>
             <textarea value={prompt} onChange={(e) => setPrompt(e.target.value)} required maxLength={MAX_MESSAGE} rows={4}
               placeholder="Ce vrei să facă agentul?"
-              className="field-sizing-content max-h-60 min-h-24 rounded-lg border border-input bg-card px-3 py-2 text-base outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/60" />
+              className="field-sizing-content max-h-60 min-h-24 field px-3 py-2 text-base" />
           </label>
           {error && <p role="alert" className="text-sm">{error}</p>}
           <DialogFooter>

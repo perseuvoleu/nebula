@@ -28,7 +28,7 @@ export function NewCardDialog({ open, onOpenChange, projects, draft, onDraftChan
   error?: string | null;
 }) {
   const formId = useId();
-  const fieldCls = "h-11 rounded-lg border border-input bg-card px-3 text-base outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/60";
+  const fieldCls = "field h-11 px-3 text-base";
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="max-h-[90dvh] overflow-y-auto sm:max-w-lg">
@@ -40,7 +40,7 @@ export function NewCardDialog({ open, onOpenChange, projects, draft, onDraftChan
           <label className="flex flex-col gap-1.5 text-sm">
             <span className="font-medium">Titlu</span>
             <input value={draft.title} onChange={(e) => onDraftChange({ ...draft, title: e.target.value })} required autoComplete="off"
-              placeholder="Ce trebuie făcut" className={`${fieldCls} placeholder:text-muted-foreground`} />
+              placeholder="Ce trebuie făcut" className={fieldCls} />
           </label>
           <div className="grid gap-4 sm:grid-cols-[1fr_9rem]">
             <label className="flex min-w-0 flex-col gap-1.5 text-sm">

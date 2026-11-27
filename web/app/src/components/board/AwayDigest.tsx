@@ -12,8 +12,8 @@ const CAP = 3;
 function Column({ title, count, empty, children }: { title: ReactNode; count: number; empty: string; children: ReactNode[] }) {
   const [all, setAll] = useState(false);
   return (
-    <section className="flex min-w-0 flex-col gap-1 rounded-lg border bg-card p-2.5">
-      <h3 className="flex items-center gap-1.5 px-1 text-xs font-medium text-muted-foreground">
+    <section className="flex min-w-0 flex-col gap-[5px] rounded-md border bg-bg1 px-2.5 py-2">
+      <h3 className="label-caps flex items-center gap-1.5 px-1">
         {title} <span className="font-mono tabular-nums">{count}</span>
       </h3>
       {count ? <ul className="flex flex-col">{all ? children : children.slice(0, CAP)}</ul> : <p className="px-1 text-xs text-muted-foreground">{empty}</p>}
@@ -26,7 +26,7 @@ function Column({ title, count, empty, children }: { title: ReactNode; count: nu
 
 function Row({ cardRef, title, trailing, onOpen }: { cardRef: string | null; title: string; trailing?: ReactNode; onOpen?: (ref: string) => void }) {
   return (
-    <li className="flex min-w-0 items-center gap-1.5 rounded-md px-1 py-1 text-sm hover:bg-secondary">
+    <li className="flex min-w-0 items-center gap-1.5 rounded-sm px-[5px] py-[3px] text-xs hover:bg-bg2">
       {cardRef && <CardRef cardRef={cardRef} />}
       {cardRef && onOpen
         ? <button type="button" onClick={() => onOpen(cardRef)} className="min-w-0 flex-1 truncate rounded-sm text-left outline-none focus-visible:ring-2 focus-visible:ring-ring">{title}</button>
@@ -48,12 +48,12 @@ export function AwayDigest({ lastSeen, scope, finished, needsYou, decisions, onO
   renderNeedsActions?: (card: BoardCard) => ReactNode;
 }) {
   const titleId = useId();
-  const age = (text: string) => <span className="shrink-0 font-mono text-xs text-muted-foreground tabular-nums">{text}</span>;
+  const age = (text: string) => <span className="shrink-0 font-mono text-[11px] text-dim tabular-nums">{text}</span>;
   return (
-    <section aria-labelledby={titleId} className="flex shrink-0 flex-col gap-2 border-b bg-sidebar px-3 py-2.5">
+    <section aria-labelledby={titleId} className="flex shrink-0 flex-col gap-2 border-b border-b-primary bg-bg1 px-3.5 py-2.5">
       <div className="flex flex-wrap items-center gap-2">
-        <h2 id={titleId} className="text-sm font-medium">De când ai lipsit</h2>
-        <span className="font-mono text-xs text-muted-foreground">ultima vizită {lastSeen} · {scope}</span>
+        <h2 id={titleId} className="text-sm font-semibold">De când ai lipsit</h2>
+        <span className="font-mono text-[11px] text-dim">ultima vizită {lastSeen} · {scope}</span>
         <span className="flex-1" />
         {onCaughtUp && <Button type="button" variant="outline" size="xs" onClick={onCaughtUp}>Am văzut tot</Button>}
         {onClose && <Button type="button" variant="ghost" size="icon-xs" aria-label="Închide rezumatul" onClick={onClose}><XIcon aria-hidden /></Button>}

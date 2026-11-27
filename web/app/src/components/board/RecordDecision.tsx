@@ -2,7 +2,7 @@ import { type FormEvent, useState } from "react";
 import { api, describeError, isUncertain } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 
-const fieldCls = "rounded-lg border border-input bg-card px-3 py-2 text-base outline-none placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/60 sm:text-sm";
+const fieldCls = "field px-3 py-2 text-base sm:text-sm";
 
 export function RecordDecision({ cardRef, onRecorded }: { cardRef: string; onRecorded: () => void }) {
   const [what, setWhat] = useState("");

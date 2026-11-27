@@ -39,10 +39,10 @@ function Segmented<T extends string>({ legend, name, options, value, onChange, l
 }) {
   return (
     <fieldset className="flex flex-col gap-1.5 text-sm">
-      <legend className="mb-1.5 font-medium">{legend}</legend>
-      <div className="flex flex-wrap gap-1 rounded-lg border border-border p-1">
+      <legend className="mb-1.5 text-[11px] font-semibold text-muted-foreground">{legend}</legend>
+      <div className="flex flex-wrap gap-1">
         {options.map((option) => (
-          <label key={option} className={`flex h-9 flex-auto cursor-pointer items-center justify-center gap-1.5 rounded-md px-2.5 text-sm whitespace-nowrap has-focus-visible:ring-2 has-focus-visible:ring-ring ${value === option ? "bg-primary font-medium text-primary-foreground" : "hover:bg-muted"}`}>
+          <label key={option} className={`flex h-9 flex-auto cursor-pointer items-center justify-center gap-1.5 rounded-sm border px-[9px] text-meta whitespace-nowrap has-focus-visible:ring-2 has-focus-visible:ring-ring ${value === option ? "border-primary bg-sel2 font-semibold text-foreground" : "bg-bg0 text-muted-foreground hover:border-edge-hover hover:text-foreground"}`}>
             <input type="radio" name={name} value={option} checked={value === option} onChange={() => onChange(option)} className="sr-only" />
             {label ? label(option) : option}
           </label>
@@ -99,7 +99,7 @@ export function RunDialog({ open, onOpenChange, cardRef, cardTitle, branch, host
           <Segmented legend="Checkout" name="run-worktree" options={worktrees} value={worktree} onChange={set("worktree")}
             label={(w) => w === "new" ? "Worktree nou" : <span className="truncate font-mono">{branch}</span>} />
           {overCap && target && (
-            <p role="status" className="flex gap-2 rounded-lg border border-border px-3 py-2 text-sm">
+            <p role="status" className="flex gap-2 rounded-sm border border-line-warn bg-tint-warn px-2.5 py-2 text-xs text-warn">
               <TriangleAlertIcon aria-hidden className="mt-0.5 size-4 shrink-0" />
               <span>
                 Sloturile de scriere de pe <span className="font-mono">@{target.host}</span> sunt ocupate ({slotText(target)}).
@@ -108,17 +108,17 @@ export function RunDialog({ open, onOpenChange, cardRef, cardTitle, branch, host
             </p>
           )}
           {writes && current && (
-            <p role="status" className="flex gap-2 rounded-lg border border-border px-3 py-2 text-sm">
+            <p role="status" className="flex gap-2 rounded-sm border border-line-warn bg-tint-warn px-2.5 py-2 text-xs text-warn">
               <TriangleAlertIcon aria-hidden className="mt-0.5 size-4 shrink-0" />
               <span>
                 Pornirea pe <span className="font-mono">{current}</span> e refuzată dacă acest checkout are deja un writer; un worktree nou nu are.
               </span>
             </p>
           )}
-          <pre className="overflow-x-auto rounded-lg border border-border bg-card px-3 py-2 font-mono text-xs leading-relaxed whitespace-pre-wrap wrap-anywhere text-muted-foreground">
+          <pre className="overflow-x-auto rounded-sm border bg-bg0 px-3 py-2 font-mono text-[11px] leading-relaxed whitespace-pre-wrap wrap-anywhere text-muted-foreground">
             <span aria-hidden>$ </span>{runCommand(cardRef, draft, current ?? "new")}
           </pre>
-          {error && <p role="alert" className="text-sm">{error}</p>}
+          {error && <p role="alert" className="text-sm text-err">{error}</p>}
         </div>
         <DialogFooter>
           <Button type="button" variant="ghost" onClick={() => onOpenChange(false)}>Renunță</Button>

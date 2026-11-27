@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
-import { ArrowLeftIcon, MenuIcon, PlusIcon } from "lucide-react";
+import { ArrowLeftIcon, CheckIcon, MenuIcon, PlusIcon } from "lucide-react";
 import { api, describeError } from "@/lib/api";
-import { activityAge } from "@/lib/activity-age";
+import { activityAge, compactAge } from "@/lib/activity-age";
 import {
   type BoardCard, type BoardData, type Card, type CardShow, type NeedsYou, type SessionLink, type SidebarScope, type SortKey, type TableSort, type Stage, type Workspace, GRANT_RENEW_MS,
   awayDigest, byStage, cardSlug, hostProjects, inScope, projectName, sessionProject, sidebarProjects, sortCards, toBoardCard, writerSlots,
@@ -15,7 +15,7 @@ import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
 import { AwayDigest, type AwayDecision } from "./AwayDigest";
 import { BoardColumns } from "./BoardColumns";
-import { CardActions } from "./CardActions";
+import { CardActions, OpenCodeButton, RunButton, knownHosts } from "./CardActions";
 import { CardArtifacts } from "./CardArtifacts";
 import { CardDetail } from "./CardDetail";
 import type { DecisionRow } from "./DecisionCard";
@@ -222,7 +222,7 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
   const live = (board?.cards ?? []).map((c) => ({ ...c, ...patchOf(overlay, c.ref) })).filter((c) => !c.archived);
   const projects = board ? sidebarProjects({ ...board, cards: live }) : [];
   const waiting = (board?.needs_you ?? []).filter((w) => !patchOf(overlay, approval(w)));
-  const all = live.map((c) => ({ ...toBoardCard(c, live), needsYou: waiting.some((w) => w.card === c.id), age: activityAge(c.updated_at, Date.now()) }));
+  const all = live.map((c) => ({ ...toBoardCard(c, live), needsYou: waiting.some((w) => w.card === c.id), age: compactAge(c.updated_at, Date.now()) }));
   const scoped = all.filter((c) => inScope(c, scope));
   const cards = scoped.filter((c) => !c.proposed);
   const bySlug = (slug: string | null): Card | undefined => live.find((c) => cardSlug(c.ref) === slug);
@@ -261,8 +261,21 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
   const approve = (ref: string, session: NeedsYou) =>
     optimistic(approval(session), {}, cardAction(ref, "approve", { session: session.id, host: session.host, expectedStatusAt: session.status_changed_at }));
   const approveButtons = (card: BoardCard) => waiting.filter((w) => w.card === live.find((c) => c.ref === card.ref)?.id).map((w) => (
-    <Button key={`${w.host}/${w.id}`} type="button" variant="outline" size="xs" onClick={() => approve(card.ref, w)}>Aprobă {w.name}</Button>
+    <Button key={`${w.host}/${w.id}`} type="button" variant="ok" size="xs" onClick={() => approve(card.ref, w)}><CheckIcon aria-hidden />Aprobă {w.name}</Button>
   ));
+
+  const hosts = knownHosts(board);
+  const waitingOn = (card: BoardCard) => waiting.find((w) => w.card === live.find((c) => c.ref === card.ref)?.id) ?? null;
+  const openCode = (card: BoardCard) => {
+    const target = waitingOn(card);
+    return target && <OpenCodeButton size="xs" cardRef={card.ref} target={target} hosts={hosts.map((h) => h.host)} label={`Deschide în cod ${card.ref}`} />;
+  };
+  const tileActions = (card: BoardCard) => (
+    <>
+      <RunButton size="xs" cardRef={card.ref} cardTitle={card.title} branch={card.checkout?.branch ?? null} hosts={hosts} label={`Pornește ${card.ref}`} />
+      {openCode(card)}
+    </>
+  );
 
   const sidebar = (
     <ProjectSidebar projects={projects} total={live.length}
@@ -289,37 +302,44 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
       sort={sort} onSort={(key: SortKey) => setSort((old) => ({ key, asc: old.key === key ? !old.asc : true }))}
       collapsed={collapsed} onToggleGroup={(name) => setCollapsed((old) => toggle(old, name))} />
   ) : (
-    <BoardColumns columns={byStage(cards)} selected={peeked?.ref} showProject={scope.kind === "all"} onOpen={peek} onAdd={openNew} onMove={move} />
+    <BoardColumns columns={byStage(cards)} selected={peeked?.ref} showProject={scope.kind === "all"} onOpen={peek} onAdd={openNew} onMove={move} renderActions={tileActions} />
   );
 
   return (
     <div className="flex min-h-0 flex-1">
       <div className="hidden min-h-0 md:flex">{sidebar}</div>
       <main className="flex min-h-0 min-w-0 flex-1 flex-col">
-        <header className="flex min-h-14 flex-wrap items-center gap-2 border-b px-3 py-2">
-          <Button type="button" variant="ghost" size="icon-lg" aria-label="Meniu" onClick={() => setMenuOpen(true)} className="size-11 md:hidden">
+        <header className="flex min-h-[42px] shrink-0 items-center gap-2 border-b bg-bg0 px-3.5 py-1.5">
+          <Button type="button" variant="ghost" size="icon-lg" aria-label="Meniu" onClick={() => setMenuOpen(true)} className="-ml-2 size-11 md:hidden">
             <MenuIcon aria-hidden className="size-5" />
           </Button>
-          <h1 className="text-[15px] font-semibold">Board</h1>
-          {route.project && <span className="font-mono text-xs text-muted-foreground">{route.project}</span>}
-          {stale && board && <span role="status" className="rounded-md border border-dashed px-1.5 py-0.5 text-xs">Date neactualizate</span>}
+          <span aria-hidden className="grid size-5 place-items-center rounded-sm border border-primary bg-sel2 text-[11px] text-primary">◫</span>
+          <h1 className="text-[13.5px] font-bold tracking-[-0.01em] whitespace-nowrap">Nebula Board</h1>
+          {stale && board && <span role="status" className="rounded-full border border-dashed border-line-warn px-1.5 py-0.5 text-[11px] text-warn">Date neactualizate</span>}
+          {board && board.hosts.length > 0 && <WriterSlots hosts={writerSlots(board.hosts)} className="max-sm:hidden" />}
           <span className="flex-1" />
-          {board && board.hosts.length > 0 && <WriterSlots hosts={writerSlots(board.hosts)} />}
           {board && !route.card && !route.decisions && (
-            <Button type="button" variant="outline" size="sm" onClick={() => openNew()}><PlusIcon aria-hidden />Card nou</Button>
+            <Button type="button" size="sm" onClick={() => openNew()}><PlusIcon aria-hidden />Card nou</Button>
           )}
-          {!route.card && !route.decisions && (
-            <div role="group" aria-label="Vizualizare" className="flex rounded-lg border p-0.5">
+          <Button type="button" variant="outline" size="sm" onClick={onSessions}>Sesiuni</Button>
+        </header>
+        {!route.card && !route.decisions && (
+          <div className="flex shrink-0 items-center gap-2 border-b bg-bg0 px-3.5 py-1.5">
+            <h2 className="min-w-0 truncate text-sm font-semibold">
+              {route.project ? <span className="font-mono">{route.project}</span> : route.home ? <span className="font-mono">{projectName(null)}</span> : "Toate proiectele"}
+            </h2>
+            <span className="flex-1" />
+            {board && board.hosts.length > 0 && <WriterSlots hosts={writerSlots(board.hosts)} className="sm:hidden" />}
+            <div role="group" aria-label="Vizualizare" className="flex items-center gap-0.5 rounded-sm border bg-bg1 p-0.5">
               {([false, true] as const).map((table) => (
                 <button key={String(table)} type="button" aria-pressed={route.table === table} onClick={() => onNavigate({ ...route, table })}
-                  className={cn("h-8 rounded-md px-2.5 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring", route.table === table ? "bg-secondary font-medium" : "text-muted-foreground hover:text-foreground")}>
+                  className={cn("h-7 rounded-[3px] px-[9px] text-xs font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring", route.table === table ? "bg-bg3 text-foreground" : "text-muted-foreground hover:text-foreground")}>
                   {table ? "Tabel" : "Coloane"}
                 </button>
               ))}
             </div>
-          )}
-          <Button type="button" variant="ghost" size="sm" onClick={onSessions}>Sesiuni</Button>
-        </header>
+          </div>
+        )}
         {digest && !digest.empty && digestShown && (
           <AwayDigest lastSeen={new Date(lastSeen).toLocaleString("ro-RO", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}
             scope={scope.kind === "all" || scope.kind === "needs" || scope.kind === "all-decisions" ? "toate proiectele" : projectName(scope.project)}
@@ -338,7 +358,7 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
         )}
         {!route.card && !route.decisions && (
           <NeedsYouStrip cards={waitingCards} onOpen={peek}
-            renderActions={approveButtons} />
+            renderActions={(card) => <>{approveButtons(card)}{openCode(card)}</>} />
         )}
         {!route.card && !route.decisions && (
           <ProposalTray proposals={scoped.filter((c) => c.proposed).map((c) => ({ id: c.ref, ref: c.ref, title: c.title, project: c.project, proposedBy: c.proposedBy ?? "agent" }))}

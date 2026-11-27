@@ -53,7 +53,7 @@ export function CheckoutPanel({ project, currentPath, onSelect }: {
         <span>Branch / worktree</span>
         <select aria-label="Branch / worktree" value={current?.path ?? ""} disabled={!trees.length}
           onChange={e => { const w = trees.find(t => t.path === e.target.value); if (w) onSelect(w); }}
-          className="mt-1 h-10 w-full min-w-0 rounded-lg border border-input bg-card px-2 font-mono text-sm text-foreground">
+          className="mt-1 h-10 w-full min-w-0 field px-2 font-mono text-sm">
           {!trees.length && <option value="">Se încarcă…</option>}
           {trees.map(w => <option key={w.path} value={w.path}>{w.branch}{w.is_main ? " · principal" : " · wt"}</option>)}
         </select>
@@ -80,13 +80,13 @@ export function CheckoutPanel({ project, currentPath, onSelect }: {
           <form className="flex flex-col gap-4" onSubmit={e => { e.preventDefault(); void create(); }}>
             <label className="flex flex-col gap-1.5 text-sm">Branch de bază
               <select value={sourcePath} onChange={e => setSourcePath(e.target.value)} disabled={phase !== "idle"}
-                className="h-11 min-w-0 rounded-lg border border-input bg-card px-3 font-mono text-sm">
+                className="h-11 min-w-0 field px-3 font-mono text-sm">
                 {trees.map(w => <option key={w.path} value={w.path}>{w.branch}{w.is_main ? " · principal" : " · wt"}</option>)}
               </select>
             </label>
             <label className="flex flex-col gap-1.5 text-sm">Nume branch nou
               <input value={name} onChange={e => setName(e.target.value)} required maxLength={80} autoCapitalize="none" autoCorrect="off" spellCheck={false}
-                placeholder="fix-login" disabled={phase !== "idle"} className="h-11 rounded-lg border border-input bg-card px-3 text-base" />
+                placeholder="fix-login" disabled={phase !== "idle"} className="h-11 field px-3 text-base" />
               <span className="text-xs text-muted-foreground">Litere mici, cifre și cratime. Numele trebuie să fie nou.</span>
             </label>
             <fieldset className="flex gap-4 text-sm" disabled={phase !== "idle"}>

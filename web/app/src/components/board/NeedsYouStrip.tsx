@@ -10,13 +10,13 @@ export function NeedsYouStrip({ cards, onOpen, renderActions }: {
   const titleId = useId();
   if (cards.length === 0) return null;
   return (
-    <section aria-labelledby={titleId} className="flex shrink-0 items-center gap-2 overflow-x-auto border-b bg-sidebar px-3 py-1.5">
-      <h2 id={titleId} className="shrink-0 text-xs font-medium">
-        Te așteaptă <span className="font-mono text-muted-foreground tabular-nums">{cards.length}</span>
+    <section aria-labelledby={titleId} className="flex shrink-0 items-center gap-2 overflow-x-auto border-b bg-bg1 px-3.5 py-[5px]">
+      <h2 id={titleId} className="shrink-0 text-[11px] font-bold tracking-[0.05em] text-err uppercase">
+        Te așteaptă <span className="font-mono tabular-nums">({cards.length})</span>
       </h2>
       <ul className="flex items-center gap-2">
         {cards.map((card) => (
-          <li key={card.ref} className="flex shrink-0 items-center gap-1.5 rounded-md border border-foreground/40 py-1 pr-1 pl-2 text-xs">
+          <li key={card.ref} className="flex shrink-0 items-center gap-[5px] rounded-sm border border-line-err bg-tint-need py-[3px] pr-1 pl-[7px] text-meta hover:border-err">
             <StatusDot dot="needs" />
             <CardRef cardRef={card.ref} />
             <button type="button" onClick={() => onOpen?.(card.ref)}
