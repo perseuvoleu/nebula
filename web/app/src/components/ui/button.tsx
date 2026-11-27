@@ -15,7 +15,7 @@ const buttonVariants = cva(
           "border-primary bg-sel2 text-foreground hover:bg-sel aria-expanded:bg-sel",
         ghost:
           "text-muted-foreground hover:bg-bg2 hover:text-foreground aria-expanded:bg-bg2 aria-expanded:text-foreground",
-        hud: "border-line-info bg-tint-info text-info hover:border-info",
+        hud: "border-line-info bg-tint-hud text-info hover:border-info",
         ok: "border-line-ok bg-tint-ok text-ok hover:border-ok",
         warn: "border-line-warn bg-tint-warn text-warn hover:border-warn",
         destructive:

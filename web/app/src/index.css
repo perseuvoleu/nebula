@@ -43,6 +43,10 @@
     --color-tint-accent: var(--tint-accent);
     --color-tint-remote: var(--tint-remote);
     --color-tint-backlog: var(--tint-backlog);
+    --color-tint-branch: var(--tint-branch);
+    --color-tint-blocked: var(--tint-blocked);
+    --color-tint-proposed: var(--tint-proposed);
+    --color-tint-hud: var(--tint-hud);
     --color-line-ok: var(--line-ok);
     --color-line-warn: var(--line-warn);
     --color-line-err: var(--line-err);
@@ -124,6 +128,10 @@
     --tint-accent: #1c2928;
     --tint-remote: #301f29;
     --tint-backlog: #232330;
+    --tint-branch: #1c2731;
+    --tint-blocked: #2c2026;
+    --tint-proposed: #29241d;
+    --tint-hud: #1d2c36;
     --line-ok: #3b5436;
     --line-warn: #6a5634;
     --line-err: #4e2b35;
