@@ -10,16 +10,15 @@ const buttonVariants = cva(
       variant: {
         default: "border-primary bg-primary font-semibold text-primary-foreground hover:brightness-106",
         outline:
-          "border-edge bg-bg1 text-foreground hover:border-edge-hover hover:bg-bg2 aria-expanded:bg-bg2",
+          "border-edge bg-bg1 text-foreground hover:border-edge-btn-hover hover:bg-bg2 aria-expanded:bg-bg2",
         secondary:
           "border-primary bg-sel2 text-foreground hover:bg-sel aria-expanded:bg-sel",
         ghost:
           "text-muted-foreground hover:bg-bg2 hover:text-foreground aria-expanded:bg-bg2 aria-expanded:text-foreground",
-        hud: "border-line-info bg-tint-hud text-info hover:border-info",
-        ok: "border-line-ok bg-tint-ok text-ok hover:border-ok",
-        warn: "border-line-warn bg-tint-warn text-warn hover:border-warn",
+        hud: "border-line-info bg-tint-hud text-info hover:border-info hover:bg-tint-hud-hover",
+        ok: "border-line-ok bg-btn-ok text-ok hover:border-ok",
         destructive:
-          "border-line-err bg-tint-err text-err hover:border-err focus-visible:border-err focus-visible:ring-err/30",
+          "border-line-danger bg-btn-danger text-err hover:border-err focus-visible:border-err focus-visible:ring-err/30",
         link: "text-primary underline-offset-4 hover:underline",
       },
       size: {

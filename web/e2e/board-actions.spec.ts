@@ -299,3 +299,53 @@ test("blocking from the card page dims the card, and a note appears in its log",
   await page.getByRole("button", { name: "Board" }).click();
   await expect(tile(page, "Wait for verification")).toHaveCSS("opacity", "0.66");
 });
+
+test("open in code sends the session that was waiting when its dialog opened, even after a poll replaces the wait", async ({ page }) => {
+  changeBoard((board) => { board.hosts.push({ ...board.hosts[0], host: "perseu-mbp" }); });
+  waiting(1764000600000);
+  await login(page, "/board");
+  const strip = page.getByRole("region", { name: /Te așteaptă/ });
+  await strip.getByRole("button", { name: "Deschide în cod #12@leaseweb" }).click();
+  const dialog = page.getByRole("dialog", { name: "Deschide în cod" });
+  await expect(dialog).toBeVisible();
+  const polled = page.waitForResponse((r) => r.url().includes("/api/board?"));
+  changeBoard((board) => {
+    const sessions = board.details[CARD].sessions;
+    Object.assign(sessions[0], { status: "running", status_changed_at: 1764000700000 });
+    sessions.push({ ...sessions[0], id: REVIEWER, name: "reviewer", role: "review", writer: false, status: "needs_feedback", status_changed_at: 1764000700000 });
+  });
+  await polled;
+  await expect(page.getByRole("button", { name: "Aprobă reviewer", includeHidden: true })).toHaveCount(1);
+  const posted = page.waitForRequest((r) => r.url().endsWith("/open-code"));
+  await dialog.getByRole("button", { name: "Deschide", exact: true }).click();
+  expect((await posted).postDataJSON()).toMatchObject({ session: "01JF0000000000000000000002", host: "leaseweb" });
+});
+
+test("a tile's Open in code finds the card's live session itself, and a tile reports the result in one line", async ({ page }) => {
+  changeBoard((board) => { board.hosts.push({ ...board.hosts[0], host: "perseu-mbp" }); });
+  await page.route("**/api/cards/*/open-code", (route) => route.fulfill({ status: 409, contentType: "application/json",
+    body: JSON.stringify({ error: "Nebula not reachable on perseu-mbp", command: "nebula open --session=01JF0000000000000000000002 # long command from the gateway" }) }));
+  await login(page, "/board");
+  const card = tile(page, "Keep verification results");
+  await card.getByRole("button", { name: "Deschide în cod #12@leaseweb" }).click();
+  const dialog = page.getByRole("dialog", { name: "Deschide în cod" });
+  const posted = page.waitForRequest((r) => r.url().endsWith("/open-code"));
+  await dialog.getByRole("button", { name: "Deschide", exact: true }).click();
+  expect((await posted).postDataJSON()).toMatchObject({ session: "01JF0000000000000000000002", host: "leaseweb" });
+  await expect(card.getByRole("link", { name: /pagina cardului/ })).toBeVisible();
+  await expect(card.getByText(/nebula open --session/)).toHaveCount(0);
+  const box = await card.boundingBox();
+  const column = await page.getByRole("region", { name: "În lucru", exact: true }).boundingBox();
+  expect(box!.x + box!.width).toBeLessThanOrEqual(column!.x + column!.width);
+});
+
+test("closing a tile's Run dialog puts focus back on its Pornește button", async ({ page }) => {
+  await login(page, "/board");
+  const run = page.getByRole("button", { name: "Pornește #12@leaseweb" });
+  await run.focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("dialog", { name: "Pornește un agent pe card" })).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await expect(run).toBeFocused();
+});

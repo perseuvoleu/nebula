@@ -1,10 +1,10 @@
 import { useEffect, useState } from "react";
-import { ArrowLeftIcon, CheckIcon, MenuIcon, PlusIcon } from "lucide-react";
+import { ArrowLeftIcon, CheckIcon, MenuIcon, PanelRightIcon, PlusIcon, SearchIcon, SparklesIcon } from "lucide-react";
 import { api, describeError } from "@/lib/api";
 import { activityAge, compactAge } from "@/lib/activity-age";
 import {
   type BoardCard, type BoardData, type Card, type CardShow, type NeedsYou, type SessionLink, type SidebarScope, type SortKey, type TableSort, type Stage, type Workspace, GRANT_RENEW_MS,
-  awayDigest, byStage, cardSlug, hostProjects, knownHosts, inScope, projectName, sessionProject, sidebarProjects, sortCards, toBoardCard, writerSlots,
+  awayDigest, byStage, cardSlug, filterCards, hostProjects, knownHosts, openTarget, inScope, projectName, sessionProject, sidebarProjects, sortCards, toBoardCard, writerSlots,
 } from "@/lib/board";
 import { cardAction, createCard, ulid } from "@/lib/board-actions";
 import { type Pending, drop, patchOf, propose, reconcile, settle } from "@/lib/optimistic";
@@ -29,6 +29,15 @@ import { TableView } from "./TableView";
 import { WriterSlots } from "./WriterSlots";
 
 const LAST_SEEN = "nebula-board-last-seen";
+const PEEK = "nebula-board-peek";
+
+function loadPeek(): boolean {
+  try {
+    return localStorage.getItem(PEEK) !== "0";
+  } catch {
+    return true;
+  }
+}
 
 /** An approval answers one waiting state, so it stays hidden until the session leaves needs_you or waits anew. */
 const approval = (w: NeedsYou) => `approve:${w.host}/${w.id}@${w.status_changed_at}`;
@@ -177,6 +186,8 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
   const [expanded, setExpanded] = useState<(string | null)[]>([]);
   const [showQuiet, setShowQuiet] = useState(false);
   const [search, setSearch] = useState("");
+  const [filter, setFilter] = useState("");
+  const [peekMode, setPeekMode] = useState(loadPeek);
   const [sort, setSort] = useState<TableSort>({ key: "ref", asc: true });
   const [collapsed, setCollapsed] = useState<string[]>([]);
   const [digestClosed, setDigestClosed] = useState(false);
@@ -217,18 +228,26 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
   const peek = (ref: string) => onNavigate({ ...route, peek: cardSlug(ref) });
   const cardPage = (ref: string): BoardRoute => ({ ...route, peek: null, decisions: false, card: cardSlug(ref) });
   const openPage = (ref: string) => go(cardPage(ref));
+  const openCard = peekMode ? peek : openPage;
+  const togglePeek = () => {
+    const next = !peekMode;
+    try { localStorage.setItem(PEEK, next ? "1" : "0"); } catch { /* Without storage the choice lasts this visit. */ }
+    setPeekMode(next);
+  };
   const toggle = <T,>(list: T[], name: T) => list.includes(name) ? list.filter((n) => n !== name) : [...list, name];
 
   const live = (board?.cards ?? []).map((c) => ({ ...c, ...patchOf(overlay, c.ref) })).filter((c) => !c.archived);
-  const projects = board ? sidebarProjects({ ...board, cards: live }) : [];
   const waiting = (board?.needs_you ?? []).filter((w) => !patchOf(overlay, approval(w)));
+  const waitingIds = new Set(waiting.map((w) => w.card));
+  const projects = board ? sidebarProjects({ ...board, cards: live }, waitingIds) : [];
   const all = live.map((c) => ({ ...toBoardCard(c, live), needsYou: waiting.some((w) => w.card === c.id), age: compactAge(c.updated_at, Date.now()) }));
   const scoped = all.filter((c) => inScope(c, scope));
-  const cards = scoped.filter((c) => !c.proposed);
+  const cards = filterCards(scoped.filter((c) => !c.proposed), filter);
+  const needsCount = all.filter((c) => c.needsYou && !c.proposed).length;
   const bySlug = (slug: string | null): Card | undefined => live.find((c) => cardSlug(c.ref) === slug);
   const peeked = bySlug(route.peek);
   const digestShown = !digestClosed && !route.card;
-  const listed = useDecisions(route.decisions, digestShown ? board?.away.decisions ?? [] : [], route.decisions ? decisionQuery : "", board);
+  const listed = useDecisions(route.decisions, route.card ? [] : board?.away.decisions ?? [], route.decisions ? decisionQuery : "", board);
   const decisions = listed.items;
   const homeSessions = useHomeSessions(route.decisions ? decisions.flatMap((d) => d.project === null && d.session ? [d.session] : []) : [], workspace);
   const digest = board && awayDigest(board, scope, decisions);
@@ -266,19 +285,23 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
 
   const hosts = knownHosts(board);
   const waitingOn = (card: BoardCard) => waiting.find((w) => w.card === live.find((c) => c.ref === card.ref)?.id) ?? null;
-  const openCode = (card: BoardCard) => {
-    const target = waitingOn(card);
-    return target && <OpenCodeButton size="xs" cardRef={card.ref} target={target} hosts={hosts.map((h) => h.host)} label={`Deschide în cod ${card.ref}`} />;
-  };
+  const resolveTarget = (ref: string) => () => api<CardShow>(`cards/${encodeURIComponent(cardSlug(ref))}`).then((show) => openTarget(show.sessions));
+  const openCode = (card: BoardCard, target: { id: string; host: string } | null) => (
+    <OpenCodeButton size="xs" cardRef={card.ref} target={target} resolve={target ? undefined : resolveTarget(card.ref)}
+      hosts={hosts.map((h) => h.host)} label={`Deschide în cod ${card.ref}`} cardHref={boardHref(cardPage(card.ref))} />
+  );
   const tileActions = (card: BoardCard) => (
     <>
       <RunButton size="xs" cardRef={card.ref} cardTitle={card.title} branch={card.checkout?.branch ?? null} hosts={hosts} label={`Pornește ${card.ref}`} />
-      {openCode(card)}
+      {openCode(card, null)}
     </>
   );
+  const waitingNames = (card: BoardCard) => waiting.filter((w) => w.card === live.find((c) => c.ref === card.ref)?.id).map((w) => w.name);
+  const digestCount = digest && !digest.empty ? digest.finished.length + digest.waiting.length + digest.decisions.length : 0;
+  const slots = board && board.hosts.length > 0 && <WriterSlots hosts={writerSlots(board.hosts)} className="max-w-full overflow-x-auto" />;
 
   const sidebar = (
-    <ProjectSidebar projects={projects} total={live.length}
+    <ProjectSidebar projects={projects} total={live.length} needsCount={needsCount > 0 ? needsCount : undefined}
       scope={scope} expanded={expanded} showQuiet={showQuiet}
       query={search} onQueryChange={setSearch} onSelect={select}
       onToggleProject={(name) => setExpanded((old) => toggle(old, name))} onToggleQuiet={() => setShowQuiet((v) => !v)} />
@@ -298,30 +321,47 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
       {stale ? "Board-ul nu poate fi citit acum." : "Se încarcă board-ul…"}
     </p>
   ) : route.table ? (
-    <TableView cards={sortCards(cards, sort)} groupByProject={scope.kind === "all"} selected={peeked?.ref} onOpen={peek}
+    <TableView cards={sortCards(cards, sort)} groupByProject={scope.kind === "all"} selected={peeked?.ref} onOpen={openCard}
       sort={sort} onSort={(key: SortKey) => setSort((old) => ({ key, asc: old.key === key ? !old.asc : true }))}
       collapsed={collapsed} onToggleGroup={(name) => setCollapsed((old) => toggle(old, name))} />
   ) : (
-    <BoardColumns columns={byStage(cards)} selected={peeked?.ref} showProject={scope.kind === "all"} onOpen={peek} onAdd={openNew} onMove={move} renderActions={tileActions} />
+    <BoardColumns columns={byStage(cards)} selected={peeked?.ref} showProject={scope.kind === "all"} onOpen={openCard} onAdd={openNew} onMove={move}
+      renderActions={tileActions} waiting={waitingNames} />
   );
 
   return (
     <div className="flex min-h-0 flex-1">
       <div className="hidden min-h-0 md:flex">{sidebar}</div>
       <main className="flex min-h-0 min-w-0 flex-1 flex-col">
-        <header className="flex min-h-[42px] shrink-0 items-center gap-2 border-b bg-bg0 px-3.5 py-1.5">
+        <header className="flex min-h-[42px] shrink-0 flex-wrap items-center gap-x-2 gap-y-1.5 border-b bg-bg0 px-3.5 py-1.5">
           <Button type="button" variant="ghost" size="icon-lg" aria-label="Meniu" onClick={() => setMenuOpen(true)} className="-ml-2 size-11 md:hidden">
             <MenuIcon aria-hidden className="size-5" />
           </Button>
           <span aria-hidden className="grid size-5 place-items-center rounded-sm border border-primary bg-sel2 text-[11px] text-primary">◫</span>
           <h1 className="text-[13.5px] font-bold tracking-[-0.01em] whitespace-nowrap">Nebula Board</h1>
           {stale && board && <span role="status" className="rounded-full border border-dashed border-line-warn px-1.5 py-0.5 text-[11px] text-warn">Date neactualizate</span>}
-          {board && board.hosts.length > 0 && <WriterSlots hosts={writerSlots(board.hosts)} className="max-sm:hidden" />}
-          <span className="flex-1" />
-          {board && !route.card && !route.decisions && (
-            <Button type="button" size="sm" onClick={() => openNew()}><PlusIcon aria-hidden />Card nou</Button>
+          <div className="order-last flex min-w-0 basis-full items-center gap-2 sm:contents">
+            {slots && <div className="min-w-0 shrink sm:order-1">{slots}</div>}
+            {!route.card && !route.decisions && (
+              <label className="relative min-w-0 flex-1 sm:order-3 sm:max-w-[210px] sm:min-w-[150px]">
+                <span className="sr-only">Filtrează cardurile</span>
+                <SearchIcon aria-hidden className="pointer-events-none absolute top-1/2 left-2 size-3 -translate-y-1/2 text-dim" />
+                <input type="search" value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Filtrează carduri…"
+                  className="field h-7 w-full bg-bg1 pr-2 pl-6 text-xs" />
+              </label>
+            )}
+          </div>
+          <span className="flex-1 sm:order-2" />
+          {digestCount > 0 && !route.card && !route.decisions && (
+            <Button type="button" variant="outline" size="sm" aria-pressed={digestShown} aria-label={`Absență ${digestCount}`}
+              onClick={() => setDigestClosed((closed) => !closed)} className="sm:order-4">
+              <SparklesIcon aria-hidden /><span className="max-sm:sr-only">Absență</span><span className="tabular-nums">{digestCount}</span>
+            </Button>
           )}
-          <Button type="button" variant="outline" size="sm" onClick={onSessions}>Sesiuni</Button>
+          {board && !route.card && !route.decisions && (
+            <Button type="button" size="sm" onClick={() => openNew()} className="sm:order-4"><PlusIcon aria-hidden />Card nou</Button>
+          )}
+          <Button type="button" variant="outline" size="sm" onClick={onSessions} className="sm:order-4">Sesiuni</Button>
         </header>
         {!route.card && !route.decisions && (
           <div className="flex shrink-0 items-center gap-2 border-b bg-bg0 px-3.5 py-1.5">
@@ -329,21 +369,24 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
               {route.project ? <span className="font-mono">{route.project}</span> : route.home ? <span className="font-mono">{projectName(null)}</span> : "Toate proiectele"}
             </h2>
             <span className="flex-1" />
-            {board && board.hosts.length > 0 && <WriterSlots hosts={writerSlots(board.hosts)} className="sm:hidden" />}
-            <div role="group" aria-label="Vizualizare" className="flex items-center gap-0.5 rounded-sm border bg-bg1 p-0.5">
+            <div role="group" aria-label="Vizualizare" className="flex shrink-0 items-center gap-0.5 rounded-sm border bg-bg1 p-0.5">
               {([false, true] as const).map((table) => (
                 <button key={String(table)} type="button" aria-pressed={route.table === table} onClick={() => onNavigate({ ...route, table })}
-                  className={cn("h-7 rounded-[3px] px-[9px] text-xs font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring", route.table === table ? "bg-bg3 text-foreground" : "text-muted-foreground hover:text-foreground")}>
+                  className={cn("h-7 rounded-xs px-[9px] text-xs font-medium outline-none focus-visible:ring-2 focus-visible:ring-ring", route.table === table ? "bg-bg3 text-foreground" : "text-muted-foreground hover:text-foreground")}>
                   {table ? "Tabel" : "Coloane"}
                 </button>
               ))}
             </div>
+            <Button type="button" variant={peekMode ? "secondary" : "outline"} size="sm" aria-pressed={peekMode} aria-label="Panou lateral"
+              title="Deschide cardurile în panoul lateral; oprit, se deschide pagina cardului" onClick={togglePeek} className="shrink-0">
+              <PanelRightIcon aria-hidden /><span className="max-sm:sr-only">Panou</span>
+            </Button>
           </div>
         )}
         {digest && !digest.empty && digestShown && (
           <AwayDigest lastSeen={new Date(lastSeen).toLocaleString("ro-RO", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}
             scope={scope.kind === "all" || scope.kind === "needs" || scope.kind === "all-decisions" ? "toate proiectele" : projectName(scope.project)}
-            finished={digest.finished.map((c) => toBoardCard(c, live))} needsYou={digest.waiting.length ? digest.waiting.map((c) => toBoardCard(c, live)) : undefined} decisions={awayDecisions} onOpen={peek} onClose={() => setDigestClosed(true)}
+            finished={digest.finished.map((c) => toBoardCard(c, live))} needsYou={digest.waiting.length ? digest.waiting.map((c) => toBoardCard(c, live)) : undefined} decisions={awayDecisions} onOpen={openCard} onClose={() => setDigestClosed(true)}
             onCaughtUp={() => {
               const seen = Date.now();
               try { localStorage.setItem(LAST_SEEN, String(seen)); } catch { /* The digest still resets for this visit. */ }
@@ -357,12 +400,12 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
           </p>
         )}
         {!route.card && !route.decisions && (
-          <NeedsYouStrip cards={waitingCards} onOpen={peek}
-            renderActions={(card) => <>{approveButtons(card)}{openCode(card)}</>} />
+          <NeedsYouStrip cards={waitingCards} onOpen={openCard}
+            renderActions={(card) => <>{approveButtons(card)}{openCode(card, waitingOn(card))}</>} />
         )}
         {!route.card && !route.decisions && (
           <ProposalTray proposals={scoped.filter((c) => c.proposed).map((c) => ({ id: c.ref, ref: c.ref, title: c.title, project: c.project, proposedBy: c.proposedBy ?? "agent" }))}
-            onOpen={peek} onAccept={(ref) => optimistic(ref, { proposed: false }, cardAction(ref, "accept", {}))}
+            onOpen={openCard} onAccept={(ref) => optimistic(ref, { proposed: false }, cardAction(ref, "accept", {}))}
             onDismiss={(ref) => optimistic(ref, { archived: true }, cardAction(ref, "dismiss", {}))} />
         )}
         {main}

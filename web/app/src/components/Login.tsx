@@ -39,7 +39,7 @@ export function Login({ onAuthenticated }: { onAuthenticated: (projects: string[
             aria-describedby="token-help" aria-invalid={error ? true : undefined}
             className="field mt-1.5 h-12 w-full bg-bg1 px-3.5 font-mono text-base" />
         </label>
-        <p id="token-help" className="mt-2 text-xs text-dim">Rămâne doar în această sesiune de browser. Nu este trimis nicăieri altundeva.</p>
+        <p id="token-help" className="mt-2 text-xs text-muted-foreground">Rămâne doar în această sesiune de browser. Nu este trimis nicăieri altundeva.</p>
         {error && <p role="alert" className="mt-3 rounded-sm border border-line-err bg-tint-err px-3 py-2 text-sm text-err">{error}</p>}
         <Button type="submit" size="lg" className="mt-6 h-12 w-full text-base" disabled={busy || value.trim().length < 8}>
           {busy ? "Se conectează…" : "Conectare"}

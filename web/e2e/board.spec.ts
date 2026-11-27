@@ -268,3 +268,78 @@ test("board, peek and card page are usable at 390 px", async ({ page }) => {
   await page.getByRole("button", { name: "Meniu" }).click();
   await expect(page.getByRole("navigation", { name: "Proiecte" })).toBeVisible();
 });
+
+function waitingWorker() {
+  changeBoard((board) => { Object.assign(board.details["01JD0000000000000000000012"].sessions[0], { status: "needs_feedback", status_changed_at: 1764000600000 }); });
+}
+
+test("a waiting card lights the sidebar: a Te așteaptă row with its count and a red dot on its project", async ({ page }) => {
+  waitingWorker();
+  await login(page, "/board");
+  const sidebar = page.getByRole("navigation", { name: "Proiecte" });
+  const needs = sidebar.getByRole("button", { name: /Te așteaptă\s*1$/ });
+  await expect(needs).toBeVisible();
+  await expect(sidebar.getByRole("button", { name: /nebula/ }).getByRole("img", { name: "Așteaptă răspuns" })).toBeVisible();
+  addCard(13, "Not waiting", "next");
+  await expect(tile(page, "Not waiting")).toBeVisible();
+  await needs.click();
+  await expect(tile(page, "Keep verification results")).toBeVisible();
+  await expect(tile(page, "Not waiting")).toHaveCount(0);
+});
+
+test("the header filter keeps the cards whose title, ref or project match", async ({ page }) => {
+  addCard(13, "Another card", "next");
+  await login(page, "/board");
+  const filter = page.getByRole("searchbox", { name: "Filtrează cardurile" });
+  await filter.fill("verification");
+  await expect(tile(page, "Keep verification results")).toBeVisible();
+  await expect(tile(page, "Another card")).toHaveCount(0);
+  await filter.fill("#13");
+  await expect(tile(page, "Another card")).toBeVisible();
+  await expect(tile(page, "Keep verification results")).toHaveCount(0);
+  await filter.fill("nebula");
+  await expect(tile(page, "Another card")).toBeVisible();
+  await expect(tile(page, "Keep verification results")).toBeVisible();
+});
+
+test("the Absență button reopens a closed away digest", async ({ page }) => {
+  await awayFrom(page);
+  await login(page, "/board");
+  const digest = page.getByRole("region", { name: "De când ai lipsit" });
+  await expect(digest).toBeVisible();
+  await digest.getByRole("button", { name: "Închide rezumatul" }).click();
+  await expect(digest).toHaveCount(0);
+  await page.getByRole("button", { name: /^Absență \d+/ }).click();
+  await expect(digest).toBeVisible();
+});
+
+test("with the side panel off a tile opens the full card page", async ({ page }) => {
+  await login(page, "/board");
+  const toggle = page.getByRole("button", { name: "Panou lateral" });
+  await expect(toggle).toHaveAttribute("aria-pressed", "true");
+  await toggle.click();
+  await expect(toggle).toHaveAttribute("aria-pressed", "false");
+  await tile(page, "Keep verification results").getByRole("button", { name: "Keep verification results" }).click();
+  await expect(page).toHaveURL(/\/board\/c\/12%40leaseweb$/);
+  await expect(page.getByRole("heading", { name: "Keep verification results" })).toBeVisible();
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+});
+
+test("at 390 px the scope title, view switch and every host's writer slots stay visible, on the card and decisions routes too", async ({ page }) => {
+  changeBoard((board) => { board.hosts = ["leaseweb", "findl", "perseu-mbp"].map((host) => ({ ...board.hosts[0], host, writers: 1, writer_slots: 4 })); });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await login(page, "/board");
+  const slots = page.getByTitle("Sesiuni care scriu acum, pe fiecare host");
+  const title = page.getByRole("heading", { name: "Toate proiectele" });
+  await expect(title).toBeInViewport();
+  expect((await title.boundingBox())!.width).toBeGreaterThan(60);
+  await expect(page.getByRole("button", { name: "Tabel" })).toBeInViewport();
+  await expect(slots).toHaveCount(1);
+  await expect(slots).toContainText("perseu-mbp");
+  await noHorizontalOverflow(page);
+  for (const route of ["/board/c/12%40leaseweb", "/board/decisions"]) {
+    await page.goto(route);
+    await expect(slots).toBeVisible();
+    await noHorizontalOverflow(page);
+  }
+});

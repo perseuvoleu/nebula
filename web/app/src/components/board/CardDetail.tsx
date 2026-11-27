@@ -1,10 +1,12 @@
 import type { ReactNode } from "react";
 import { PenLineIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { kindLabel, statusLabel } from "@/lib/status";
-import { type BoardCard, type LogEntry, sessionDot } from "@/lib/board";
+import { kindLabel, sessionDot, statusLabel } from "@/lib/status";
+import type { BoardCard, LogEntry } from "@/lib/board";
+import { StatusDot } from "@/components/ui/status-dot";
+import { BranchTag, ProjectTag, StagePill } from "@/components/ui/tags";
 import { Pill } from "@/components/ui/pill";
-import { BranchTag, CardRef, ProjectTag, StagePill, StatusDot } from "./CardTile";
+import { CardRef } from "./CardTile";
 
 function Section({ title, count, children }: { title: string; count?: number; children: ReactNode }) {
   return (
@@ -49,11 +51,11 @@ export function CardDetail({ card, log, mode, actions, proposalActions, onOpenCa
       )}
 
       <dl className="grid grid-cols-[92px_1fr] items-center gap-x-2.5 gap-y-[5px] rounded-md border bg-bg0 px-[11px] py-[9px] text-xs">
-        <dt className="text-meta text-dim">Etapă</dt>
+        <dt className="text-meta text-muted-foreground">Etapă</dt>
         <dd><StagePill stage={card.stage} /></dd>
-        <dt className="text-meta text-dim">Proiect</dt>
+        <dt className="text-meta text-muted-foreground">Proiect</dt>
         <dd className="min-w-0"><ProjectTag project={card.project} /></dd>
-        <dt className="text-meta text-dim">Checkout</dt>
+        <dt className="text-meta text-muted-foreground">Checkout</dt>
         <dd className="flex min-w-0 flex-wrap items-center gap-1">
           {card.checkout
             ? <>
@@ -64,7 +66,7 @@ export function CardDetail({ card, log, mode, actions, proposalActions, onOpenCa
             </>
             : <span className="text-muted-foreground">Niciunul</span>}
         </dd>
-        <dt className="text-meta text-dim">Blocat de</dt>
+        <dt className="text-meta text-muted-foreground">Blocat de</dt>
         <dd className="flex min-w-0 flex-wrap items-center gap-1">
           {card.blockers.length
             ? card.blockers.map((b) => (
@@ -110,7 +112,7 @@ export function CardDetail({ card, log, mode, actions, proposalActions, onOpenCa
                 {log.map((entry) => (
                   <li key={entry.id} className="rounded-r-sm border-l-2 border-l-edge bg-bg0 px-[9px] py-1.5 text-xs">
                     <span className="font-medium text-muted-foreground">{entry.author}:</span> {entry.text}
-                    <span className="ml-1.5 font-mono text-tag text-dim tabular-nums">{entry.age}</span>
+                    <span className="ml-1.5 font-mono text-tag text-muted-foreground tabular-nums">{entry.age}</span>
                   </li>
                 ))}
               </ul>

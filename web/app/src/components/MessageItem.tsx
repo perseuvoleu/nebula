@@ -15,7 +15,7 @@ export const MessageItem = memo(function MessageItem({ message, project, session
         <div className="max-w-[min(85%,72ch)] rounded-lg rounded-br-sm border border-line-info bg-sel2 px-4 py-2.5 text-[15px] text-foreground leading-relaxed whitespace-pre-wrap break-words">
           {text || <span className="text-muted-foreground">[conținut fără text]</span>}
         </div>
-        <time className="px-1 font-mono text-[11px] text-dim">{formatTime(message.timestamp)}</time>
+        <time className="px-1 font-mono text-[11px] text-muted-foreground">{formatTime(message.timestamp)}</time>
       </article>
     );
   }
@@ -36,7 +36,7 @@ export const MessageItem = memo(function MessageItem({ message, project, session
         return <ToolActivity key={part.callId || index} part={part} project={project} session={session} />;
       })}
       {message.error && <p role="alert" className="rounded-sm border border-line-err bg-tint-err px-3 py-2 text-sm text-err">Eroare model: {message.error}</p>}
-      <div className="flex min-h-6 items-center gap-2 font-mono text-[11px] text-dim">
+      <div className="flex min-h-6 items-center gap-2 font-mono text-[11px] text-muted-foreground">
         <time>{formatTime(message.timestamp)}</time>
         {message.model && <span className="hidden sm:inline">{message.model}</span>}
         {tools.length > 0 && <span>{tools.length} {tools.length === 1 ? "unealtă" : "unelte"}</span>}

@@ -6,7 +6,7 @@ import { sessionKey } from "@/lib/session-list";
 import { kindLabel, sessionDot, statusLabel } from "@/lib/status";
 import { Pill, type PillTone } from "@/components/ui/pill";
 import { StatusDot } from "@/components/ui/status-dot";
-import { BranchTag, ProjectTag } from "./board/CardTile";
+import { BranchTag, ProjectTag } from "@/components/ui/tags";
 import { Button } from "@/components/ui/button";
 
 import { DeleteSessionButton } from "./DeleteSessionButton";
@@ -85,8 +85,8 @@ export function SessionList({ sessions, phase, error, selected, unseen, onSelect
                   <span className="flex min-w-0 items-center gap-1 text-[11px] text-muted-foreground">
                     {showProject && <ProjectTag project={row.project} />}
                     <span className="shrink-0">{kindLabel(row.kind)}</span>
-                    <BranchTag branch={row.worktree} />
-                    <span className="ml-auto min-w-0 truncate pl-1 font-mono text-[10.5px] text-dim" title="Ultima schimbare de stare">{age}</span>
+                    <BranchTag branch={row.worktree} className="min-w-0 shrink" />
+                    <span className="ml-auto shrink-0 pl-1 font-mono text-tag text-muted-foreground" title="Ultima schimbare de stare">{age}</span>
                   </span>
                 </button>
                 <DeleteSessionButton project={row.project} row={row} onDeleted={() => onDeleted(row)} />

@@ -1,7 +1,8 @@
 import { CheckIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Pill } from "@/components/ui/pill";
-import { CardRef, ProjectTag } from "./CardTile";
+import { ProjectTag } from "@/components/ui/tags";
+import { CardRef } from "./CardTile";
 
 export interface Proposal {
   id: string;

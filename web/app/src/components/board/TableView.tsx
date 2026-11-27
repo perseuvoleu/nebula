@@ -1,9 +1,12 @@
 import type { ReactNode } from "react";
 import { cn } from "@/lib/utils";
 import { statusLabel } from "@/lib/status";
-import { type BoardCard, type SortKey, type TableSort, cardDot, projectName, sessionDot } from "@/lib/board";
+import { type BoardCard, type SortKey, type TableSort, cardDot, projectName } from "@/lib/board";
+import { sessionDot } from "@/lib/status";
+import { StatusDot } from "@/components/ui/status-dot";
+import { BranchTag, ProjectTag, StagePill } from "@/components/ui/tags";
 import { Pill } from "@/components/ui/pill";
-import { BranchTag, CardRef, ProjectTag, StagePill, StatusDot } from "./CardTile";
+import { CardRef } from "./CardTile";
 
 const Empty = () => <span className="text-dim">—</span>;
 
@@ -58,7 +61,7 @@ function SortHead({ label, column, sort, onSort, className }: {
 }
 
 function GroupLabel({ name, count }: { name: string; count: number }) {
-  return <>{name} <span className="text-dim tabular-nums">{count}</span></>;
+  return <>{name} <span className="text-muted-foreground tabular-nums">{count}</span></>;
 }
 
 export function TableView({ cards, groupByProject = false, selected, onOpen, renderActions, sort, onSort, collapsed = [], onToggleGroup }: {

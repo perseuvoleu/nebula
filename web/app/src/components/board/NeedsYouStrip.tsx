@@ -1,6 +1,7 @@
 import { type ReactNode, useId } from "react";
 import type { BoardCard } from "@/lib/board";
-import { CardRef, StatusDot } from "./CardTile";
+import { StatusDot } from "@/components/ui/status-dot";
+import { CardRef } from "./CardTile";
 
 export function NeedsYouStrip({ cards, onOpen, renderActions }: {
   cards: BoardCard[];

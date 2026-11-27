@@ -96,6 +96,29 @@ test("phone: follow-output only near the bottom, jump-to-latest otherwise; keybo
   await expect(page.getByRole("button", { name: "Trimite" })).toBeFocused();
 });
 
+test.describe("touch", () => {
+  test.use({ hasTouch: true });
+
+  test("phone: a swipe up holds the reading position when new output arrives, and jump-to-latest reveals it", async ({ page }) => {
+    await page.setViewportSize(VIEWPORTS["phone-390"]);
+    await login(page, "/p/alpha/s/pi-1");
+    const log = page.getByRole("log");
+    await expect(log.locator("pre code", { hasText: "def verify" })).toBeVisible();
+    const scroller = log.locator("> div").first();
+    await expect.poll(() => scroller.evaluate((el) => el.scrollHeight - el.clientHeight - el.scrollTop)).toBeLessThan(2);
+    const box = (await scroller.boundingBox())!;
+    const cdp = await page.context().newCDPSession(page);
+    await cdp.send("Input.synthesizeScrollGesture", { x: box.x + box.width / 2, y: box.y + box.height / 2, yDistance: 4000, speed: 4000, gestureSourceType: "touch" });
+    await expect.poll(() => scroller.evaluate((el) => el.scrollTop)).toBe(0);
+    await page.waitForTimeout(300);
+    appendEntry("pi-1", assistantText("Mesaj nou după swipe."));
+    await expect(page.getByRole("button", { name: "Sari la ultimul mesaj" })).toBeVisible({ timeout: 15_000 });
+    expect(await scroller.evaluate((el) => el.scrollTop)).toBeLessThan(80);
+    await page.getByRole("button", { name: "Sari la ultimul mesaj" }).tap();
+    await expect(log.getByText("Mesaj nou după swipe.")).toBeInViewport();
+  });
+});
+
 test("desktop: Enter sends, Shift+Enter inserts a newline, sidebar stays beside the conversation", async ({ page }) => {
   await page.setViewportSize(VIEWPORTS["desktop-1440"]);
   await login(page, "/p/alpha/s/pi-2");

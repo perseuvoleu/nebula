@@ -1,7 +1,7 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { CodeIcon, CopyIcon, PlayIcon } from "lucide-react";
 import { ApiError, describeError } from "@/lib/api";
-import { type BoardData, type CardShow, STAGES, STAGE_LABEL, type Stage, knownHosts } from "@/lib/board";
+import { type BoardData, type CardShow, STAGES, STAGE_LABEL, type Stage, knownHosts, openTarget } from "@/lib/board";
 import { cardAction, ulid } from "@/lib/board-actions";
 import { Button } from "@/components/ui/button";
 import {
@@ -21,9 +21,12 @@ function rememberedLaptop(): string | null {
 }
 const fieldCls = "field h-9 min-w-0 px-2 text-sm";
 
+type Target = { id: string; host: string };
+
 export function RunButton({ cardRef, cardTitle, branch, hosts, disabled, size = "sm", label }: {
   cardRef: string; cardTitle: string; branch: string | null; hosts: RunHost[]; disabled?: boolean; size?: "sm" | "xs"; label?: string;
 }) {
+  const opener = useRef<HTMLButtonElement>(null);
   const [run, setRun] = useState<{ draft: RunDraft; dispatch: string } | null>(null);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -34,6 +37,10 @@ export function RunButton({ cardRef, cardTitle, branch, hosts, disabled, size = 
       dispatch: ulid(),
     });
   };
+  const close = () => {
+    setRun(null);
+    setTimeout(() => opener.current?.focus());
+  };
   const start = async () => {
     if (!run) return;
     const worktree = run.draft.worktree === "current" && branch ? branch : "new";
@@ -41,7 +48,7 @@ export function RunButton({ cardRef, cardTitle, branch, hosts, disabled, size = 
     setError(null);
     try {
       await cardAction(cardRef, "run", { ...run.draft, worktree, dispatch: run.dispatch });
-      setRun(null);
+      close();
     } catch (failure) {
       setError(describeError(failure));
     } finally {
@@ -50,11 +57,11 @@ export function RunButton({ cardRef, cardTitle, branch, hosts, disabled, size = 
   };
   return (
     <>
-      <Button type="button" size={size} variant={size === "xs" ? "outline" : "default"} aria-label={label} onClick={open} disabled={disabled}>
-        {size !== "xs" && <PlayIcon aria-hidden />}Pornește
+      <Button ref={opener} type="button" size={size} variant={size === "xs" ? "outline" : "default"} aria-label={label} onClick={open} disabled={disabled}>
+        <PlayIcon aria-hidden />Pornește
       </Button>
       {run && (
-        <RunDialog open onOpenChange={(next) => { if (!next) setRun(null); }} cardRef={cardRef} cardTitle={cardTitle} branch={branch}
+        <RunDialog open onOpenChange={(next) => { if (!next) close(); }} cardRef={cardRef} cardTitle={cardTitle} branch={branch}
           hosts={hosts} draft={run.draft} onDraftChange={(draft) => setRun({ draft, dispatch: ulid() })} onRun={start} pending={pending}
           error={error} />
       )}
@@ -62,26 +69,54 @@ export function RunButton({ cardRef, cardTitle, branch, hosts, disabled, size = 
   );
 }
 
-export function OpenCodeButton({ cardRef, target, hosts, size = "sm", label }: {
-  cardRef: string; target: { id: string; host: string } | null; hosts: string[]; size?: "sm" | "xs"; label?: string;
+/**
+ * The session is fixed when the dialog opens: from target, or from resolve() when the caller only knows the card.
+ * cardHref marks a cramped placement (tile, needs-you strip): feedback stays one line and the recovery command is left to the card page.
+ */
+export function OpenCodeButton({ cardRef, target, resolve, hosts, size = "sm", label, cardHref }: {
+  cardRef: string; target?: Target | null; resolve?: () => Promise<Target | null>; hosts: string[]; size?: "sm" | "xs"; label?: string; cardHref?: string;
 }) {
-  const [opening, setOpening] = useState<string | null>(null);
+  const opener = useRef<HTMLButtonElement>(null);
+  const [opening, setOpening] = useState<{ on: string; target: Target } | null>(null);
   const [opened, setOpened] = useState<{ on: string; command: string | null } | null>(null);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const remembered = rememberedLaptop();
   const laptops = remembered && !hosts.includes(remembered) ? [...hosts, remembered] : hosts;
-  const pickLaptop = () => setOpening(remembered ?? hosts.find((h) => h !== DEFAULT_HOST) ?? hosts[0] ?? null);
-  const openCode = async () => {
-    const on = opening;
-    if (!target || !on) return;
-    try { localStorage.setItem(LAPTOP, on); } catch { /* Without storage the choice lasts this visit. */ }
-    setOpening(null);
-    setOpened(null);
-    setPending(true);
+  const pick = async () => {
     setError(null);
+    setOpened(null);
+    let session = target ?? null;
+    if (!session && resolve) {
+      setPending(true);
+      try {
+        session = await resolve();
+      } catch (failure) {
+        setError(describeError(failure));
+        return;
+      } finally {
+        setPending(false);
+      }
+      if (!session) {
+        setError("Cardul nu are încă nicio sesiune.");
+        return;
+      }
+    }
+    const on = remembered ?? hosts.find((h) => h !== DEFAULT_HOST) ?? hosts[0];
+    if (session && on) setOpening({ on, target: session });
+  };
+  const close = () => {
+    setOpening(null);
+    setTimeout(() => opener.current?.focus());
+  };
+  const openCode = async () => {
+    if (!opening) return;
+    const { on, target: session } = opening;
+    try { localStorage.setItem(LAPTOP, on); } catch { /* Without storage the choice lasts this visit. */ }
+    close();
+    setPending(true);
     try {
-      await cardAction(cardRef, "open-code", { session: target.id, host: target.host, on });
+      await cardAction(cardRef, "open-code", { session: session.id, host: session.host, on });
       setOpened({ on, command: null });
     } catch (failure) {
       const command = failure instanceof ApiError && failure.status === 409 && typeof failure.data.command === "string" ? failure.data.command : null;
@@ -91,11 +126,18 @@ export function OpenCodeButton({ cardRef, target, hosts, size = "sm", label }: {
       setPending(false);
     }
   };
-  return (
+  const compact = cardHref !== undefined;
+  const feedback = compact ? (
     <>
-      <Button type="button" size={size} variant="hud" aria-label={label} onClick={pickLaptop} disabled={!target || pending}>
-        {size !== "xs" && <CodeIcon aria-hidden />}Deschide în cod
-      </Button>
+      {opened && (opened.command === null
+        ? <span role="status" className="max-w-full basis-full truncate text-right text-[11px] text-ok">Deschis pe <span className="font-mono">@{opened.on}</span></span>
+        : <span role="status" className="max-w-full basis-full truncate text-right text-[11px] text-warn">
+          @{opened.on} nu răspunde: <a href={cardHref} className="underline underline-offset-2">comanda, pe pagina cardului</a>
+        </span>)}
+      {error && <span role="alert" title={error} className="max-w-full basis-full truncate text-right text-[11px] text-err">{error}</span>}
+    </>
+  ) : (
+    <>
       {opened && (opened.command === null
         ? <p role="status" className="basis-full text-sm">Deschis în cod pe <span className="font-mono">@{opened.on}</span>.</p>
         : (
@@ -111,7 +153,15 @@ export function OpenCodeButton({ cardRef, target, hosts, size = "sm", label }: {
           </div>
         ))}
       {error && <p role="alert" className="basis-full text-sm text-err">{error}</p>}
-      <Dialog open={opening !== null} onOpenChange={(next) => { if (!next) setOpening(null); }}>
+    </>
+  );
+  return (
+    <>
+      <Button ref={opener} type="button" size={size} variant="hud" aria-label={label} onClick={() => void pick()} disabled={(!target && !resolve) || pending}>
+        {size !== "xs" && <CodeIcon aria-hidden />}Deschide în cod
+      </Button>
+      {feedback}
+      <Dialog open={opening !== null} onOpenChange={(next) => { if (!next) close(); }}>
         <DialogContent className="sm:max-w-sm">
           <DialogHeader>
             <DialogTitle>Deschide în cod</DialogTitle>
@@ -119,12 +169,12 @@ export function OpenCodeButton({ cardRef, target, hosts, size = "sm", label }: {
           </DialogHeader>
           <label className="flex flex-col gap-1.5 text-sm">
             <span className="font-medium">Laptop</span>
-            <select value={opening ?? ""} onChange={(e) => setOpening(e.target.value)} className={`${fieldCls} font-mono`}>
+            <select value={opening?.on ?? ""} onChange={(e) => setOpening((old) => old && { ...old, on: e.target.value })} className={`${fieldCls} font-mono`}>
               {laptops.map((h) => <option key={h} value={h}>@{h}</option>)}
             </select>
           </label>
           <DialogFooter>
-            <Button type="button" variant="ghost" onClick={() => setOpening(null)}>Renunță</Button>
+            <Button type="button" variant="ghost" onClick={close}>Renunță</Button>
             <Button type="button" onClick={openCode}>Deschide</Button>
           </DialogFooter>
         </DialogContent>
@@ -156,7 +206,7 @@ export function CardActions({ show, board }: { show: CardShow; board: BoardData 
   };
 
   const sessions = show.sessions;
-  const target = sessions.find((s) => s.writer && s.alive) ?? sessions.at(-1);
+  const target = openTarget(sessions);
   const candidates = (board?.cards ?? []).filter((c) => !c.archived && c.id !== show.id && !show.blocked_by.includes(c.ref));
 
   const addNote = async () => {
@@ -173,7 +223,7 @@ export function CardActions({ show, board }: { show: CardShow; board: BoardData 
     <section aria-label="Acțiuni" className="flex flex-col gap-3 rounded-md border bg-bg0 px-[11px] py-[9px]">
       <div className="flex flex-wrap items-center gap-2">
         <RunButton cardRef={show.ref} cardTitle={show.title} branch={branch} hosts={hosts} disabled={show.archived} />
-        <OpenCodeButton cardRef={show.ref} target={target ?? null} hosts={hosts.map((h) => h.host)} />
+        <OpenCodeButton cardRef={show.ref} target={target} hosts={hosts.map((h) => h.host)} />
         <label className="ml-auto flex items-center gap-1.5 text-xs text-muted-foreground">
           Etapă
           <select value={show.stage} className={fieldCls} disabled={pending === "move"}

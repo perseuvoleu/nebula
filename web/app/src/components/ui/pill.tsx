@@ -19,7 +19,7 @@ const pillVariants = cva(
         remote: "bg-tint-remote font-mono text-tag text-remote",
         blocked: "border border-line-err bg-tint-blocked text-tag text-err hover:border-err",
         proposed: "border border-dashed border-line-warn bg-tint-proposed text-tag text-warn",
-        artifact: "bg-tint-accent font-mono text-[10px] text-primary",
+        artifact: "bg-tint-art font-mono text-[10px] text-primary",
       },
     },
     defaultVariants: { tone: "neutral" },

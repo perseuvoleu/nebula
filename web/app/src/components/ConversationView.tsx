@@ -9,7 +9,7 @@ import { draftKey, getDraft, setDraft } from "@/lib/drafts";
 import { echoWatch } from "@/lib/echo";
 import { formatTime, kindLabel, sessionDot, statusLabel } from "@/lib/status";
 import { StatusDot } from "@/components/ui/status-dot";
-import { BranchTag } from "./board/CardTile";
+import { BranchTag } from "@/components/ui/tags";
 import type { SessionRow } from "@/lib/types";
 import { Composer } from "./Composer";
 import { MessageItem } from "./MessageItem";
@@ -93,7 +93,7 @@ function ConnectionLine({ state }: { state: ConversationState }) {
   else if (working) text = state.capabilities?.liveText ? "Agentul scrie…" : "Agentul lucrează · răspunsul apare când se încheie fiecare mesaj";
   else text = `Sincronizat ${formatTime(state.lastSync)}`;
   return (
-    <p role="status" aria-live="polite" className="flex min-h-7 items-center gap-2 px-4 font-mono text-[11px] text-dim">
+    <p role="status" aria-live="polite" className="flex min-h-7 items-center gap-2 px-4 font-mono text-[11px] text-muted-foreground">
       {working && state.connection === "live" && <span aria-hidden className="inline-block size-[7px] animate-pulse rounded-full bg-warn" />}
       <span className="truncate">{text}</span>
     </p>

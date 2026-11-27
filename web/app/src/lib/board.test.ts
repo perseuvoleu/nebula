@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { awayDigest, byStage, cardDot, hostProjects, inScope, isBlocked, sessionProject, sidebarProjects, toBoardCard, writerSlots, type BoardData, type Card, type SidebarScope } from "./board.ts";
+import { awayDigest, byStage, cardDot, hostProjects, inScope, isBlocked, sessionProject, sidebarProjects, toBoardCard, filterCards, writerSlots, type BoardData, type Card, type SidebarScope } from "./board.ts";
 
 const card = (number: number, stage: Card["stage"], blocked_by: string[] = []): Card => ({
   id: `01JD${String(number).padStart(22, "0")}`, number, ref: `#${number}@leaseweb`, title: `Card ${number}`, stage,
@@ -89,4 +89,20 @@ test("a session is listed under its bare project on this gateway's host and unde
   assert.equal(sessionProject("nebula", "findl", workspace), null, "a host the gateway does not anchor has no session page here");
   assert.deepEqual(hostProjects("findl", workspace), ["vela@findl"]);
   assert.deepEqual(hostProjects("leaseweb", workspace), ["nebula"]);
+});
+
+test("a project with a waiting card is marked as needing you; the others are not", () => {
+  const waitingCard = card(1, "doing");
+  const other = { ...card(2, "next"), project: "vela" };
+  const board: BoardData = { cards: [waitingCard, other], hosts: [], needs_you: [], away: { finished: [], needs_you: [], decisions: [] } };
+  const marked = sidebarProjects(board, new Set([waitingCard.id]));
+  assert.deepEqual(marked.map((p) => [p.name, p.needsYou]), [["nebula", true], ["vela", false]]);
+});
+
+test("the card filter matches title, ref and project, case-insensitively, and an empty filter keeps everything", () => {
+  const cards = [{ ref: "#1@leaseweb", title: "Keep Results", project: "nebula" }, { ref: "#13@leaseweb", title: "Other", project: "vela" }];
+  assert.deepEqual(filterCards(cards, "results").map((c) => c.ref), ["#1@leaseweb"]);
+  assert.deepEqual(filterCards(cards, "#13").map((c) => c.ref), ["#13@leaseweb"]);
+  assert.deepEqual(filterCards(cards, "VELA").map((c) => c.ref), ["#13@leaseweb"]);
+  assert.deepEqual(filterCards(cards, "  ").map((c) => c.ref), ["#1@leaseweb", "#13@leaseweb"]);
 });

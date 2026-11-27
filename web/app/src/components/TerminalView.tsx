@@ -100,7 +100,7 @@ export function TerminalView({ project, session, children, revealKey = 0, onOutp
           </Button> : <span title="Doar scrollback-ul păstrat de daemon; nu reconstruim mesaje din text">Istoric păstrat de terminal</span>}
         </div>
         {reading ? <Markdown text={output ?? "Se încarcă outputul…"} /> :
-          <pre className="font-mono text-[12.5px] leading-[1.45] whitespace-pre-wrap break-words">{output ?? "Se încarcă outputul…"}</pre>}
+          <pre className="font-mono text-ui leading-[1.45] whitespace-pre-wrap break-words">{output ?? "Se încarcă outputul…"}</pre>}
         {children}
       </div>
     </section>

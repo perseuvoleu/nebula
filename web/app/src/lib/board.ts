@@ -43,7 +43,6 @@ export type BoardCard = {
 
 export type LogEntry = { id: string; author: string; text: string; age: string };
 
-export { type Dot, DOT_LABEL, sessionDot } from "./status.ts";
 
 /** Null when the card's sessions are unknown (a list row, not a card read), so the tile makes no status claim. */
 export function cardDot(card: BoardCard): Dot | null {
@@ -229,7 +228,8 @@ export type SidebarScope =
   | { kind: "all-decisions" };
 
 /** One entry per project with cards or checkouts, counting every unarchived card (Done included), sorted by name. */
-export function sidebarProjects(board: BoardData): SidebarProject[] {
+/** waiting: ids of the cards a session waits on, the same set the needs-you strip shows. */
+export function sidebarProjects(board: BoardData, waiting: ReadonlySet<string> = new Set()): SidebarProject[] {
   const projects = new Map<string | null, SidebarProject>();
   const project = (key: string | null) => {
     if (!projects.has(key)) projects.set(key, { project: key, name: projectName(key), host: null, cards: 0, needsYou: false, running: false, checkouts: [] });
@@ -245,6 +245,7 @@ export function sidebarProjects(board: BoardData): SidebarProject[] {
     const p = project(card.project);
     p.cards += 1;
     if (card.stage === "doing") p.running = true;
+    if (waiting.has(card.id)) p.needsYou = true;
     if (card.checkout) checkout(p, { branch: card.checkout.branch, host: card.checkout.host, primary: !card.checkout.worktree });
   }
   return [...projects.values()].sort((a, b) => a.name.localeCompare(b.name));
@@ -260,6 +261,18 @@ export function inScope(card: BoardCard, scope: SidebarScope): boolean {
     default: return card.project === scope.project;
   }
 }
+
+export function filterCards<T extends { ref: string; title: string; project: string | null }>(cards: T[], query: string): T[] {
+  const needle = query.trim().toLowerCase();
+  if (!needle) return cards;
+  return cards.filter((c) => [c.ref, c.title, projectName(c.project)].some((field) => field.toLowerCase().includes(needle)));
+}
+
+/** The session Open in code opens: the live writer, else the latest session. */
+export const openTarget = (sessions: CardSession[]): { id: string; host: string } | null => {
+  const s = sessions.find((x) => x.writer && x.alive) ?? sessions.at(-1);
+  return s ? { id: s.id, host: s.host } : null;
+};
 
 export type SortKey = "ref" | "title" | "stage" | "project";
 export type TableSort = { key: SortKey; asc: boolean };

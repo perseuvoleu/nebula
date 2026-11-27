@@ -247,13 +247,13 @@ function Shell({ workspace, route }: { workspace: Workspace; route: ReturnType<t
   const openServerless = () => { navigate({ ...listOrigin, session: null, serverless: true }); setMenuOpen(false); };
   const serverlessLink = (
     <button type="button" onClick={openServerless} aria-current={selection.serverless ? "page" : undefined}
-      className={`flex min-h-11 items-center gap-2 border-t border-sidebar-border px-3 text-left text-[12.5px] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${selection.serverless ? "bg-sel2 font-semibold" : "text-muted-foreground hover:bg-bg2 hover:text-foreground"}`}>
+      className={`flex min-h-11 items-center gap-2 border-t border-sidebar-border px-3 text-left text-ui focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${selection.serverless ? "bg-sel2 font-semibold" : "text-muted-foreground hover:bg-bg2 hover:text-foreground"}`}>
       <CloudIcon aria-hidden className="size-3.5 text-info" />Rulări serverless
     </button>
   );
   const boardLink = (
     <button type="button" onClick={() => navigate({ project: null, session: null, all: false, board: { project: null, card: null, decisions: false, table: false, peek: null } })}
-      className="flex min-h-11 items-center gap-2 border-t border-sidebar-border px-3 text-left text-[12.5px] text-muted-foreground hover:bg-bg2 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+      className="flex min-h-11 items-center gap-2 border-t border-sidebar-border px-3 text-left text-ui text-muted-foreground hover:bg-bg2 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
       <KanbanIcon aria-hidden className="size-3.5 text-primary" />Board
     </button>
   );
@@ -282,7 +282,7 @@ function Shell({ workspace, route }: { workspace: Workspace; route: ReturnType<t
       {serverlessLink}
       {desktop && <PushNotifications />}
       <InstallApp />
-      <p className="border-t border-sidebar-border px-3 py-2 text-[11px] text-dim">Telefonul se poate deconecta. Agenții rămân pe server.</p>
+      <p className="border-t border-sidebar-border px-3 py-2 text-[11px] text-muted-foreground">Telefonul se poate deconecta. Agenții rămân pe server.</p>
     </aside>
   );
 

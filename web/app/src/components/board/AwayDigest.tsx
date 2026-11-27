@@ -3,7 +3,8 @@ import { XIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import type { BoardCard } from "@/lib/board";
-import { CardRef, StatusDot } from "./CardTile";
+import { StatusDot } from "@/components/ui/status-dot";
+import { CardRef } from "./CardTile";
 
 export type AwayDecision = { id: string; title: string; age: string; cardRef: string | null };
 
@@ -48,12 +49,12 @@ export function AwayDigest({ lastSeen, scope, finished, needsYou, decisions, onO
   renderNeedsActions?: (card: BoardCard) => ReactNode;
 }) {
   const titleId = useId();
-  const age = (text: string) => <span className="shrink-0 font-mono text-[11px] text-dim tabular-nums">{text}</span>;
+  const age = (text: string) => <span className="shrink-0 font-mono text-[11px] text-muted-foreground tabular-nums">{text}</span>;
   return (
     <section aria-labelledby={titleId} className="flex shrink-0 flex-col gap-2 border-b border-b-primary bg-bg1 px-3.5 py-2.5">
       <div className="flex flex-wrap items-center gap-2">
         <h2 id={titleId} className="text-sm font-semibold">De când ai lipsit</h2>
-        <span className="font-mono text-[11px] text-dim">ultima vizită {lastSeen} · {scope}</span>
+        <span className="font-mono text-[11px] text-muted-foreground">ultima vizită {lastSeen} · {scope}</span>
         <span className="flex-1" />
         {onCaughtUp && <Button type="button" variant="outline" size="xs" onClick={onCaughtUp}>Am văzut tot</Button>}
         {onClose && <Button type="button" variant="ghost" size="icon-xs" aria-label="Închide rezumatul" onClick={onClose}><XIcon aria-hidden /></Button>}

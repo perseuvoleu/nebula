@@ -49,7 +49,7 @@ export const ToolActivity = memo(function ToolActivity({ part, project, session 
       <button type="button" onClick={() => setOpen((v) => !v)} aria-expanded={open}
         className="flex min-h-11 w-full items-center gap-2 px-3 py-2 text-left hover:bg-bg2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
         <ChevronRightIcon aria-hidden className={`size-4 shrink-0 text-muted-foreground transition-transform ${open ? "rotate-90" : ""}`} />
-        <Pill tone="artifact" className="text-[11px]">{part.name}</Pill>
+        <Pill className="font-mono text-[11px]">{part.name}</Pill>
         {hint && <span className="min-w-0 flex-1 truncate font-mono text-[13px] text-muted-foreground">{hint}</span>}
         <Pill tone={STATE_TONE[part.state]} className="ml-auto">
           {part.state === "pending" && <span className="inline-block size-[7px] animate-pulse rounded-full bg-warn" aria-hidden />}

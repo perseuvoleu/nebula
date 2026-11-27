@@ -19,13 +19,13 @@ export function DecisionCard({ decision, showProject = true }: { decision: Decis
     <article className="flex flex-col gap-[5px] rounded-md border border-l-[3px] border-l-special bg-bg1 px-3 py-2.5">
       <div className="flex items-baseline gap-3">
         <h3 className="flex min-w-0 flex-1 items-baseline gap-1.5 text-sm font-semibold break-words"><span aria-hidden className="size-2 shrink-0 translate-y-[-1px] rotate-45 rounded-[1px] bg-special" />{decision.title}</h3>
-        <time dateTime={decision.createdAt} className="shrink-0 font-mono text-[11px] text-dim tabular-nums">{formatWhen(decision.createdAt)}</time>
+        <time dateTime={decision.createdAt} className="shrink-0 font-mono text-[11px] text-muted-foreground tabular-nums">{formatWhen(decision.createdAt)}</time>
       </div>
       {decision.why && <p className="text-sm text-muted-foreground">{decision.why}</p>}
       <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
         {showProject && <Pill tone="project">{decision.project ?? "fără proiect"}</Pill>}
         {decision.card
-          ? <a href={decision.card.href} className={linkCls}><span className="font-mono text-dim">{decision.card.ref}</span> {decision.card.title}</a>
+          ? <a href={decision.card.href} className={linkCls}><span className="font-mono text-muted-foreground">{decision.card.ref}</span> {decision.card.title}</a>
           : <span>la nivel de proiect</span>}
         {!decision.session ? <span>de tine</span>
           : decision.session.href ? <a href={decision.session.href} className={linkCls}>sesiunea <span className="font-mono">{decision.session.name}</span></a>

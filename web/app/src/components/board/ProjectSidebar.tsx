@@ -1,11 +1,12 @@
 import { ChevronDownIcon, ChevronRightIcon, CircleDotIcon, GitBranchIcon, LayersIcon, SearchIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
-import type { Dot, SidebarProject, SidebarScope } from "@/lib/board";
-import { StatusDot } from "./CardTile";
+import type { SidebarProject, SidebarScope } from "@/lib/board";
+import type { Dot } from "@/lib/status";
+import { StatusDot } from "@/components/ui/status-dot";
 
-const item = "flex min-h-7 w-full min-w-0 items-center gap-1.5 rounded-sm px-2 text-left text-[12.5px] outline-none hover:bg-bg2 hover:text-foreground focus-visible:ring-2 focus-visible:ring-sidebar-ring";
+const item = "flex min-h-7 w-full min-w-0 items-center gap-1.5 rounded-sm px-2 text-left text-ui outline-none hover:bg-bg2 hover:text-foreground focus-visible:ring-2 focus-visible:ring-sidebar-ring";
 const on = "bg-sel2 font-semibold text-foreground hover:bg-sel2";
-const count = "ml-auto shrink-0 font-mono text-[11px] font-normal text-dim tabular-nums";
+const count = "ml-auto shrink-0 font-mono text-[11px] font-normal text-muted-foreground tabular-nums";
 const sub = "min-h-6 pl-[26px] font-mono text-[11px]";
 
 function projectDot(p: SidebarProject): Dot {
@@ -34,8 +35,8 @@ function ProjectNode({ project, scope, expanded, onSelect, onToggle }: {
         <button type="button" aria-current={selected ? "page" : undefined} onClick={() => onSelect?.({ kind: "project", project: project.project })}
           className={cn(item, "pl-1", !selected && "text-muted-foreground hover:text-foreground")}>
           <StatusDot dot={projectDot(project)} />
-          <span className="min-w-0 flex-1 truncate font-mono text-[12.5px]">{project.name}</span>
-          {project.host && <span className="shrink-0 font-mono text-[10.5px] text-remote">@{project.host}</span>}
+          <span className="min-w-0 flex-1 truncate font-mono text-ui">{project.name}</span>
+          {project.host && <span className="shrink-0 font-mono text-tag text-remote">@{project.host}</span>}
           <span className={count}>{project.cards}</span>
         </button>
       </div>
@@ -48,7 +49,7 @@ function ProjectNode({ project, scope, expanded, onSelect, onToggle }: {
               <li key={`${co.host ?? ""}:${co.branch}`}>
                 <button type="button" aria-current={current ? "page" : undefined}
                   onClick={() => onSelect?.({ kind: "checkout", project: project.project, host: co.host, branch: co.branch })}
-                  className={cn(item, sub, current ? on : "text-dim")}>
+                  className={cn(item, sub, current ? on : "text-muted-foreground")}>
                   <Icon aria-hidden className="size-3 shrink-0" />
                   <span className="min-w-0 flex-1 truncate">{co.branch}</span>
                   <span className="shrink-0 text-tag text-info">{co.primary ? "main" : "wt"}</span>
