@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 import { PlusIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { type BoardCard, type Stage, STAGES, STAGE_LABEL } from "@/lib/board";
+import { type BoardCard, type NeedsYou, type Stage, STAGES, STAGE_LABEL } from "@/lib/board";
 import { StagePill } from "@/components/ui/tags";
 import { CardTile } from "./CardTile";
 
@@ -15,7 +15,7 @@ export function BoardColumns({ columns, selected, showProject = false, onOpen, o
   onAdd?: (stage: Stage) => void;
   onMove?: (ref: string, stage: Stage) => void;
   renderActions?: (card: BoardCard) => ReactNode;
-  waiting?: (card: BoardCard) => string[];
+  waiting?: (card: BoardCard) => NeedsYou[];
 }) {
   return (
     <div className="flex min-h-0 flex-1 snap-x snap-mandatory gap-[9px] overflow-x-auto px-3 py-2.5">

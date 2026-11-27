@@ -1,6 +1,8 @@
 import { useRef, useState } from "react";
-import { CodeIcon, CopyIcon, PlayIcon } from "lucide-react";
-import { ApiError, describeError } from "@/lib/api";
+import { CodeIcon, CopyIcon, PlayIcon, XIcon } from "lucide-react";
+import { describeError } from "@/lib/api";
+import { type OpenResult, type Target, openCode, rememberedLaptop, useOpenCode } from "@/lib/open-code";
+import { cn } from "@/lib/utils";
 import { type BoardData, type CardShow, STAGES, STAGE_LABEL, type Stage, knownHosts, openTarget } from "@/lib/board";
 import { cardAction, ulid } from "@/lib/board-actions";
 import { Button } from "@/components/ui/button";
@@ -10,18 +12,7 @@ import {
 import { RunDialog, type RunDraft, type RunHost } from "./RunDialog";
 
 const DEFAULT_HOST = "leaseweb";
-const LAPTOP = "nebula-open-laptop";
-
-function rememberedLaptop(): string | null {
-  try {
-    return localStorage.getItem(LAPTOP);
-  } catch {
-    return null;
-  }
-}
 const fieldCls = "field h-9 min-w-0 px-2 text-sm";
-
-type Target = { id: string; host: string };
 
 export function RunButton({ cardRef, cardTitle, branch, hosts, disabled, size = "sm", label }: {
   cardRef: string; cardTitle: string; branch: string | null; hosts: RunHost[]; disabled?: boolean; size?: "sm" | "xs"; label?: string;
@@ -69,117 +60,115 @@ export function RunButton({ cardRef, cardTitle, branch, hosts, disabled, size = 
   );
 }
 
-/**
- * The session is fixed when the dialog opens: from target, or from resolve() when the caller only knows the card.
- * cardHref marks a cramped placement (tile, needs-you strip): feedback stays one line and the recovery command is left to the card page.
- */
-export function OpenCodeButton({ cardRef, target, resolve, hosts, size = "sm", label, cardHref }: {
-  cardRef: string; target?: Target | null; resolve?: () => Promise<Target | null>; hosts: string[]; size?: "sm" | "xs"; label?: string; cardHref?: string;
+/** The opener stays focusable while busy (aria-disabled), so focus can return to it after the dialog or a failed lookup. */
+export function OpenCodeButton({ cardRef, target, resolve, hosts, size = "sm", label, compact = false }: {
+  cardRef: string; target?: Target | null; resolve?: () => Promise<Target | null>; hosts: string[]; size?: "sm" | "xs"; label?: string; compact?: boolean;
 }) {
-  const opener = useRef<HTMLButtonElement>(null);
-  const [opening, setOpening] = useState<{ on: string; target: Target } | null>(null);
-  const [opened, setOpened] = useState<{ on: string; command: string | null } | null>(null);
-  const [pending, setPending] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const remembered = rememberedLaptop();
-  const laptops = remembered && !hosts.includes(remembered) ? [...hosts, remembered] : hosts;
-  const pick = async () => {
-    setError(null);
-    setOpened(null);
+  const { pending, results } = useOpenCode();
+  const [looking, setLooking] = useState(false);
+  const [lookupError, setLookupError] = useState<string | null>(null);
+  const busy = looking || pending.includes(cardRef);
+  const unavailable = !target && !resolve;
+  const pick = async (opener: HTMLElement) => {
+    if (busy || unavailable) return;
+    setLookupError(null);
     let session = target ?? null;
     if (!session && resolve) {
-      setPending(true);
+      setLooking(true);
       try {
         session = await resolve();
+        if (!session) setLookupError("Cardul nu are încă nicio sesiune.");
       } catch (failure) {
-        setError(describeError(failure));
-        return;
+        setLookupError(describeError(failure));
       } finally {
-        setPending(false);
-      }
-      if (!session) {
-        setError("Cardul nu are încă nicio sesiune.");
-        return;
+        setLooking(false);
       }
     }
-    const on = remembered ?? hosts.find((h) => h !== DEFAULT_HOST) ?? hosts[0];
-    if (session && on) setOpening({ on, target: session });
+    const on = rememberedLaptop() ?? hosts.find((h) => h !== DEFAULT_HOST) ?? hosts[0];
+    if (session && on) openCode.open({ cardRef, target: session, on, opener });
   };
-  const close = () => {
-    setOpening(null);
-    setTimeout(() => opener.current?.focus());
-  };
-  const openCode = async () => {
-    if (!opening) return;
-    const { on, target: session } = opening;
-    try { localStorage.setItem(LAPTOP, on); } catch { /* Without storage the choice lasts this visit. */ }
-    close();
-    setPending(true);
-    try {
-      await cardAction(cardRef, "open-code", { session: session.id, host: session.host, on });
-      setOpened({ on, command: null });
-    } catch (failure) {
-      const command = failure instanceof ApiError && failure.status === 409 && typeof failure.data.command === "string" ? failure.data.command : null;
-      if (command) setOpened({ on, command });
-      else setError(describeError(failure));
-    } finally {
-      setPending(false);
-    }
-  };
-  const compact = cardHref !== undefined;
-  const feedback = compact ? (
-    <>
-      {opened && (opened.command === null
-        ? <span role="status" className="max-w-full basis-full truncate text-right text-[11px] text-ok">Deschis pe <span className="font-mono">@{opened.on}</span></span>
-        : <span role="status" className="max-w-full basis-full truncate text-right text-[11px] text-warn">
-          @{opened.on} nu răspunde: <a href={cardHref} className="underline underline-offset-2">comanda, pe pagina cardului</a>
-        </span>)}
-      {error && <span role="alert" title={error} className="max-w-full basis-full truncate text-right text-[11px] text-err">{error}</span>}
-    </>
-  ) : (
-    <>
-      {opened && (opened.command === null
-        ? <p role="status" className="basis-full text-sm">Deschis în cod pe <span className="font-mono">@{opened.on}</span>.</p>
-        : (
-          <div className="flex basis-full flex-col gap-1.5 text-sm">
-            <p>Nebula nu răspunde pe <span className="font-mono">@{opened.on}</span>. Rulează comanda pe laptop:</p>
-            <div className="flex min-w-0 items-center gap-2">
-              <code className="min-w-0 flex-1 overflow-x-auto rounded-sm border bg-bg0 px-2 py-1.5 font-mono text-xs whitespace-nowrap">{opened.command}</code>
-              <Button type="button" size="icon-sm" variant="outline" aria-label="Copiază comanda"
-                onClick={() => navigator.clipboard?.writeText(opened.command!).catch(() => undefined)}>
-                <CopyIcon aria-hidden />
-              </Button>
-            </div>
-          </div>
-        ))}
-      {error && <p role="alert" className="basis-full text-sm text-err">{error}</p>}
-    </>
-  );
+  const result = compact ? null : results.find((r) => r.cardRef === cardRef);
   return (
     <>
-      <Button ref={opener} type="button" size={size} variant="hud" aria-label={label} onClick={() => void pick()} disabled={(!target && !resolve) || pending}>
+      <Button type="button" size={size} variant="hud" aria-label={label} aria-disabled={busy || unavailable || undefined} aria-busy={busy || undefined}
+        onClick={(e) => void pick(e.currentTarget)} className={cn((busy || unavailable) && "opacity-50")}>
         {size !== "xs" && <CodeIcon aria-hidden />}Deschide în cod
       </Button>
-      {feedback}
-      <Dialog open={opening !== null} onOpenChange={(next) => { if (!next) close(); }}>
-        <DialogContent className="sm:max-w-sm">
-          <DialogHeader>
-            <DialogTitle>Deschide în cod</DialogTitle>
-            <DialogDescription>Laptopul pe care TUI-ul deschide sesiunea.</DialogDescription>
-          </DialogHeader>
-          <label className="flex flex-col gap-1.5 text-sm">
-            <span className="font-medium">Laptop</span>
-            <select value={opening?.on ?? ""} onChange={(e) => setOpening((old) => old && { ...old, on: e.target.value })} className={`${fieldCls} font-mono`}>
-              {laptops.map((h) => <option key={h} value={h}>@{h}</option>)}
-            </select>
-          </label>
-          <DialogFooter>
-            <Button type="button" variant="ghost" onClick={close}>Renunță</Button>
-            <Button type="button" onClick={openCode}>Deschide</Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      {lookupError && (compact
+        ? <span role="alert" title={lookupError} className="max-w-full basis-full truncate text-right text-[11px] text-err">{lookupError}</span>
+        : <p role="alert" className="basis-full text-sm text-err">{lookupError}</p>)}
+      {result && <OpenResultBlock result={result} />}
     </>
+  );
+}
+
+function OpenResultBlock({ result }: { result: OpenResult }) {
+  if (result.error) return <p role="alert" className="basis-full text-sm text-err">{result.error}</p>;
+  if (result.command === null) return <p role="status" className="basis-full text-sm">Deschis în cod pe <span className="font-mono">@{result.on}</span>.</p>;
+  const command = result.command;
+  return (
+    <div className="flex basis-full flex-col gap-1.5 text-sm">
+      <p>Nebula nu răspunde pe <span className="font-mono">@{result.on}</span>. Rulează comanda pe laptop:</p>
+      <div className="flex min-w-0 items-center gap-2">
+        <code className="min-w-0 flex-1 overflow-x-auto rounded-sm border bg-bg0 px-2 py-1.5 font-mono text-xs whitespace-nowrap">{command}</code>
+        <Button type="button" size="icon-sm" variant="outline" aria-label="Copiază comanda"
+          onClick={() => navigator.clipboard?.writeText(command).catch(() => undefined)}>
+          <CopyIcon aria-hidden />
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+/** Mounted once per page; fallback takes focus when the opener left the page while the dialog was open. */
+export function OpenCodeDialog({ hosts, fallback }: { hosts: string[]; fallback?: () => HTMLElement | null }) {
+  const { dialog } = useOpenCode();
+  const [opener, setOpener] = useState<HTMLElement | null>(null);
+  if (dialog && dialog.opener !== opener) setOpener(dialog.opener);
+  const remembered = rememberedLaptop();
+  const laptops = [...new Set([...hosts, ...(remembered ? [remembered] : []), ...(dialog ? [dialog.on] : [])])];
+  return (
+    <Dialog open={dialog !== null} onOpenChange={(next) => { if (!next) openCode.cancel(); }}>
+      <DialogContent className="sm:max-w-sm" onCloseAutoFocus={(e) => {
+        e.preventDefault();
+        (opener?.isConnected ? opener : fallback?.())?.focus();
+      }}>
+        <DialogHeader>
+          <DialogTitle>Deschide în cod</DialogTitle>
+          <DialogDescription>Laptopul pe care TUI-ul deschide sesiunea.</DialogDescription>
+        </DialogHeader>
+        <label className="flex flex-col gap-1.5 text-sm">
+          <span className="font-medium">Laptop</span>
+          <select value={dialog?.on ?? ""} onChange={(e) => openCode.choose(e.target.value)} className={`${fieldCls} font-mono`}>
+            {laptops.map((h) => <option key={h} value={h}>@{h}</option>)}
+          </select>
+        </label>
+        <DialogFooter>
+          <Button type="button" variant="ghost" onClick={openCode.cancel}>Renunță</Button>
+          <Button type="button" onClick={() => void openCode.confirm()}>Deschide</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/** One line for results of tiles and the strip; the card page (shown) prints its own block instead. */
+export function OpenCodeToast({ shown, cardHref, onCardPage }: { shown: string | null; cardHref: (ref: string) => string; onCardPage: (ref: string) => void }) {
+  const { results } = useOpenCode();
+  const result = results.filter((r) => r.cardRef !== shown).at(-1);
+  if (!result) return null;
+  const tone = result.error ? "text-err" : result.command ? "text-warn" : "text-ok";
+  return (
+    <div role="status" className={cn("flex shrink-0 items-center gap-2 border-b bg-bg1 px-3.5 py-1 text-xs", tone)}>
+      <span className="min-w-0 flex-1 truncate">
+        <span className="font-mono">{result.cardRef}</span>{" · "}
+        {result.error ? result.error : result.command === null ? <>Deschis pe <span className="font-mono">@{result.on}</span></> : (
+          <>@{result.on} nu răspunde: <a href={cardHref(result.cardRef)} onClick={(e) => { e.preventDefault(); onCardPage(result.cardRef); }}
+            className="underline underline-offset-2">comanda, pe pagina cardului</a></>
+        )}
+      </span>
+      <Button type="button" variant="ghost" size="icon-xs" aria-label="Închide mesajul" onClick={() => openCode.dismiss(result.cardRef)}><XIcon aria-hidden /></Button>
+    </div>
   );
 }
 

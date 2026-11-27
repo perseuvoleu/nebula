@@ -17,6 +17,28 @@ async function polledAfterThis(page: Page) {
 
 const REVIEWER = "01JF0000000000000000000003";
 
+async function contrast(locator: Locator): Promise<number> {
+  return locator.evaluate((el) => {
+    const parse = (c: string) => (c.match(/[\d.]+/g) ?? []).map(Number);
+    const mix = (top: number[], under: number[]) => { const a = top[3] ?? 1; return [0, 1, 2].map((i) => top[i] * a + under[i] * (1 - a)); };
+    const layers: number[][] = [];
+    let opacity = 1;
+    for (let n: Element | null = el; n; n = n.parentElement) {
+      const s = getComputedStyle(n);
+      opacity *= Number(s.opacity);
+      const bg = parse(s.backgroundColor);
+      if ((bg[3] ?? 1) > 0) layers.push(bg);
+      if ((bg[3] ?? 1) === 1) break;
+    }
+    const bg = layers.reverse().reduce((under, top) => mix(top, under), [0, 0, 0]);
+    const fg = mix([...mix(parse(getComputedStyle(el).color), bg), opacity], bg);
+    const lum = (c: number[]) => { const [r, g, b] = c.map((v) => { v /= 255; return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4; }); return 0.2126 * r + 0.7152 * g + 0.0722 * b; };
+    const [hi, lo] = [lum(fg), lum(bg)].sort((x, y) => y - x);
+    return (hi + 0.05) / (lo + 0.05);
+  });
+}
+
+
 function waiting(since: number, reviewer = false) {
   changeBoard((board) => {
     const sessions = board.details[CARD].sessions;
@@ -297,7 +319,9 @@ test("blocking from the card page dims the card, and a note appears in its log",
   await expect(page.getByRole("listitem").filter({ hasText: "Waits on the contract" })).toBeVisible();
   await expect(page.getByRole("button", { name: /#12@leaseweb\s*Keep verification results/ })).toBeVisible();
   await page.getByRole("button", { name: "Board" }).click();
-  await expect(tile(page, "Wait for verification")).toHaveCSS("opacity", "0.66");
+  const blocked = tile(page, "Wait for verification");
+  await expect(blocked).toHaveCSS("border-top-style", "dashed");
+  for (const text of [blocked.getByText("#13"), blocked.getByRole("button", { name: "Wait for verification" })]) expect(await contrast(text)).toBeGreaterThanOrEqual(4.5);
 });
 
 test("open in code sends the session that was waiting when its dialog opened, even after a poll replaces the wait", async ({ page }) => {
@@ -332,8 +356,9 @@ test("a tile's Open in code finds the card's live session itself, and a tile rep
   const posted = page.waitForRequest((r) => r.url().endsWith("/open-code"));
   await dialog.getByRole("button", { name: "Deschide", exact: true }).click();
   expect((await posted).postDataJSON()).toMatchObject({ session: "01JF0000000000000000000002", host: "leaseweb" });
-  await expect(card.getByRole("link", { name: /pagina cardului/ })).toBeVisible();
-  await expect(card.getByText(/nebula open --session/)).toHaveCount(0);
+  const recovery = page.getByRole("link", { name: /pagina cardului/ });
+  await expect(recovery).toBeVisible();
+  await expect(page.getByText(/nebula open --session/)).toHaveCount(0);
   const box = await card.boundingBox();
   const column = await page.getByRole("region", { name: "În lucru", exact: true }).boundingBox();
   expect(box!.x + box!.width).toBeLessThanOrEqual(column!.x + column!.width);
@@ -348,4 +373,124 @@ test("closing a tile's Run dialog puts focus back on its Pornește button", asyn
   await page.keyboard.press("Escape");
   await expect(page.getByRole("dialog")).toHaveCount(0);
   await expect(run).toBeFocused();
+});
+
+const withWait = (session: number) => changeBoard((board) => {
+  const sessions = board.details[CARD].sessions;
+  sessions.push({ ...sessions[0], id: REVIEWER, host: "findl", name: "reviewer", role: "review", writer: false, status: "needs_feedback", status_changed_at: 1764000700000 + session });
+});
+
+test("a tile with a known wait opens the waiting session, as the strip and the card page do", async ({ page }) => {
+  withWait(0);
+  await login(page, "/board");
+  const opened: unknown[] = [];
+  page.on("request", (r) => { if (r.url().endsWith("/open-code")) opened.push(r.postDataJSON()); });
+  const confirm = async () => {
+    const posted = page.waitForRequest((r) => r.url().endsWith("/open-code"));
+    await page.getByRole("dialog", { name: "Deschide în cod" }).getByRole("button", { name: "Deschide", exact: true }).click();
+    await posted;
+  };
+  await tile(page, "Keep verification results").getByRole("button", { name: "Deschide în cod #12@leaseweb" }).click();
+  await confirm();
+  await page.getByRole("region", { name: /Te așteaptă/ }).getByRole("button", { name: "Deschide în cod #12@leaseweb" }).click();
+  await confirm();
+  await page.goto("/board/c/12%40leaseweb");
+  await page.getByRole("region", { name: "Acțiuni" }).getByRole("button", { name: "Deschide în cod" }).click();
+  await confirm();
+  expect(opened).toEqual([0, 1, 2].map(() => expect.objectContaining({ session: REVIEWER, host: "findl" })));
+});
+
+test("focus comes back to Open in code after confirming it, and after a lookup that finds no session", async ({ page }) => {
+  addCard(13, "Started without sessions", { stage: "doing" });
+  changeBoard((board) => { board.details["01JD0000000000000000000013"] = { ...board.details[CARD], sessions: [] }; });
+  await page.route("**/api/cards/*/open-code", async (route) => { await new Promise((r) => setTimeout(r, 600)); await route.fulfill({ status: 200, contentType: "application/json", body: "{}" }); });
+  await login(page, "/board");
+  const open = page.getByRole("button", { name: "Deschide în cod #12@leaseweb" }).last();
+  await open.focus();
+  await page.keyboard.press("Enter");
+  const dialog = page.getByRole("dialog", { name: "Deschide în cod" });
+  await dialog.getByRole("button", { name: "Deschide", exact: true }).focus();
+  await page.keyboard.press("Enter");
+  await expect(dialog).toHaveCount(0);
+  await expect(page.getByRole("status").filter({ hasText: /Deschis pe/ })).toBeVisible();
+  await expect(open).toBeFocused();
+  const empty = page.getByRole("button", { name: "Deschide în cod #13@leaseweb" });
+  await empty.focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("alert").filter({ hasText: /nicio sesiune/ })).toBeVisible();
+  await expect(empty).toBeFocused();
+});
+
+test("the 409 recovery link shows the returned command on the card page without asking the gateway again", async ({ page }) => {
+  changeBoard((board) => { board.hosts.push({ ...board.hosts[0], host: "perseu-mbp" }); });
+  let posts = 0;
+  await page.route("**/api/cards/*/open-code", (route) => { posts += 1; return route.fulfill({ status: 409, contentType: "application/json",
+    body: JSON.stringify({ error: "Nebula not reachable on perseu-mbp", command: "nebula open --session=01JF0000000000000000000002 --on perseu-mbp" }) }); });
+  await login(page, "/board");
+  await tile(page, "Keep verification results").getByRole("button", { name: "Deschide în cod #12@leaseweb" }).click();
+  await page.getByRole("dialog", { name: "Deschide în cod" }).getByRole("button", { name: "Deschide", exact: true }).click();
+  await page.getByRole("link", { name: /pagina cardului/ }).click();
+  await expect(page).toHaveURL(/\/board\/c\/12%40leaseweb$/);
+  await expect(page.getByText("nebula open --session=01JF0000000000000000000002 --on perseu-mbp")).toBeVisible();
+  await expect(page.getByText("@perseu-mbp", { exact: false }).first()).toBeVisible();
+  expect(posts).toBe(1);
+});
+
+test("a laptop chosen in the dialog stays selected and is the one sent, even after a poll drops it", async ({ page }) => {
+  changeBoard((board) => { board.hosts.push({ ...board.hosts[0], host: "findl" }); });
+  await login(page, "/board");
+  await tile(page, "Keep verification results").getByRole("button", { name: "Deschide în cod #12@leaseweb" }).click();
+  const dialog = page.getByRole("dialog", { name: "Deschide în cod" });
+  const laptop = dialog.getByLabel("Laptop");
+  await laptop.selectOption("findl");
+  const polled = page.waitForResponse((r) => r.url().includes("/api/board?"));
+  changeBoard((board) => { board.hosts = board.hosts.filter((h) => h.host !== "findl"); });
+  await polled;
+  addCard(90, "Poll marker");
+  await expect(page.getByRole("article", { includeHidden: true }).filter({ hasText: "Poll marker" })).toHaveCount(1);
+  await expect(laptop).toHaveValue("findl");
+  const posted = page.waitForRequest((r) => r.url().endsWith("/open-code"));
+  await dialog.getByRole("button", { name: "Deschide", exact: true }).click();
+  expect((await posted).postDataJSON()).toMatchObject({ on: "findl" });
+});
+
+test("a dialog opened from the strip survives its row leaving and sends the captured session", async ({ page }) => {
+  changeBoard((board) => { board.hosts.push({ ...board.hosts[0], host: "perseu-mbp" }); });
+  waiting(1764000600000);
+  await login(page, "/board");
+  const strip = page.getByRole("region", { name: /Te așteaptă/ });
+  await strip.getByRole("button", { name: "Deschide în cod #12@leaseweb" }).click();
+  const dialog = page.getByRole("dialog", { name: "Deschide în cod" });
+  changeBoard((board) => { Object.assign(board.details[CARD].sessions[0], { status: "running", status_changed_at: 1764000700000 }); });
+  await expect(page.getByRole("button", { name: /^Aprobă/, includeHidden: true })).toHaveCount(0, { timeout: 15_000 });
+  await expect(dialog).toBeVisible();
+  const posted = page.waitForRequest((r) => r.url().endsWith("/open-code"));
+  await dialog.getByRole("button", { name: "Deschide", exact: true }).click();
+  expect((await posted).postDataJSON()).toMatchObject({ session: "01JF0000000000000000000002", host: "leaseweb" });
+  await expect(page.getByRole("status").filter({ hasText: /Deschis pe/ })).toBeVisible();
+});
+
+test("Open in code sits only on tiles with a wait, a known session or a Doing/Review stage", async ({ page }) => {
+  addCard(13, "Never started");
+  addCard(14, "Under review", { stage: "review" });
+  await login(page, "/board");
+  await expect(tile(page, "Never started").getByRole("button", { name: /Pornește/ })).toBeVisible();
+  await expect(tile(page, "Never started").getByRole("button", { name: /Deschide în cod/ })).toHaveCount(0);
+  await expect(tile(page, "Under review").getByRole("button", { name: /Deschide în cod/ })).toBeVisible();
+  await expect(tile(page, "Keep verification results").getByRole("button", { name: /Deschide în cod/ })).toBeVisible();
+});
+
+test("two waiting sessions with the same name keep one footer dot each, and a resumed one drops its dot", async ({ page }) => {
+  changeBoard((board) => {
+    const sessions = board.details[CARD].sessions;
+    Object.assign(sessions[0], { status: "needs_feedback", status_changed_at: 1764000600000 });
+    sessions.push({ ...sessions[0], id: "01JF0000000000000000000004", host: "findl" }, { ...sessions[0], id: REVIEWER, name: "reviewer", writer: false });
+  });
+  await login(page, "/board");
+  const footer = tile(page, "Keep verification results").getByRole("img", { name: /: Așteaptă răspuns$/ });
+  await expect(footer).toHaveCount(3);
+  changeBoard((board) => { Object.assign(board.details[CARD].sessions[0], { status: "running", status_changed_at: 1764000700000 }); });
+  await expect(page.getByRole("button", { name: /^Aprobă/ })).toHaveCount(2, { timeout: 15_000 });
+  await expect(footer).toHaveCount(2);
+  await expect(tile(page, "Keep verification results").getByRole("img", { name: /^worker:/ })).toHaveCount(1);
 });

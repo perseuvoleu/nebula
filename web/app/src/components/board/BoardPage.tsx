@@ -15,7 +15,7 @@ import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
 import { AwayDigest, type AwayDecision } from "./AwayDigest";
 import { BoardColumns } from "./BoardColumns";
-import { CardActions, OpenCodeButton, RunButton } from "./CardActions";
+import { CardActions, OpenCodeButton, OpenCodeDialog, OpenCodeToast, RunButton } from "./CardActions";
 import { CardArtifacts } from "./CardArtifacts";
 import { CardDetail } from "./CardDetail";
 import type { DecisionRow } from "./DecisionCard";
@@ -190,7 +190,7 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
   const [peekMode, setPeekMode] = useState(loadPeek);
   const [sort, setSort] = useState<TableSort>({ key: "ref", asc: true });
   const [collapsed, setCollapsed] = useState<string[]>([]);
-  const [digestClosed, setDigestClosed] = useState(false);
+  const [digestOpen, setDigestOpen] = useState<boolean | null>(null);
   const [decisionQuery, setDecisionQuery] = useState("");
   const [overlay, setOverlay] = useState<Pending<Partial<RawCard>>[]>([]);
   const [newCard, setNewCard] = useState<(CardDraft & { id: string }) | null>(null);
@@ -237,20 +237,22 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
   const toggle = <T,>(list: T[], name: T) => list.includes(name) ? list.filter((n) => n !== name) : [...list, name];
 
   const live = (board?.cards ?? []).map((c) => ({ ...c, ...patchOf(overlay, c.ref) })).filter((c) => !c.archived);
-  const waiting = (board?.needs_you ?? []).filter((w) => !patchOf(overlay, approval(w)));
+  const proposedIds = new Set(live.filter((c) => c.proposed).map((c) => c.id));
+  const waiting = (board?.needs_you ?? []).filter((w) => !patchOf(overlay, approval(w)) && !proposedIds.has(w.card));
   const waitingIds = new Set(waiting.map((w) => w.card));
   const projects = board ? sidebarProjects({ ...board, cards: live }, waitingIds) : [];
   const all = live.map((c) => ({ ...toBoardCard(c, live), needsYou: waiting.some((w) => w.card === c.id), age: compactAge(c.updated_at, Date.now()) }));
   const scoped = all.filter((c) => inScope(c, scope));
-  const cards = filterCards(scoped.filter((c) => !c.proposed), filter);
+  const filtered = filterCards(scoped, filter);
+  const cards = filtered.filter((c) => !c.proposed);
   const needsCount = all.filter((c) => c.needsYou && !c.proposed).length;
   const bySlug = (slug: string | null): Card | undefined => live.find((c) => cardSlug(c.ref) === slug);
   const peeked = bySlug(route.peek);
-  const digestShown = !digestClosed && !route.card;
   const listed = useDecisions(route.decisions, route.card ? [] : board?.away.decisions ?? [], route.decisions ? decisionQuery : "", board);
   const decisions = listed.items;
   const homeSessions = useHomeSessions(route.decisions ? decisions.flatMap((d) => d.project === null && d.session ? [d.session] : []) : [], workspace);
   const digest = board && awayDigest(board, scope, decisions);
+  const digestShown = !!digest && !route.card && (digestOpen ?? !digest.empty);
   const now = Date.now();
   const awayDecisions: AwayDecision[] = (digest?.decisions ?? [])
     .map((d) => ({ id: d.id, title: d.title, age: activityAge(d.created_at, now), cardRef: live.find((c) => c.id === d.card)?.ref ?? null }));
@@ -286,22 +288,28 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
   const hosts = knownHosts(board);
   const waitingOn = (card: BoardCard) => waiting.find((w) => w.card === live.find((c) => c.ref === card.ref)?.id) ?? null;
   const resolveTarget = (ref: string) => () => api<CardShow>(`cards/${encodeURIComponent(cardSlug(ref))}`).then((show) => openTarget(show.sessions));
-  const openCode = (card: BoardCard, target: { id: string; host: string } | null) => (
-    <OpenCodeButton size="xs" cardRef={card.ref} target={target} resolve={target ? undefined : resolveTarget(card.ref)}
-      hosts={hosts.map((h) => h.host)} label={`Deschide în cod ${card.ref}`} cardHref={boardHref(cardPage(card.ref))} />
-  );
+  const openCode = (card: BoardCard) => {
+    const target = waitingOn(card);
+    return (
+      <OpenCodeButton size="xs" compact cardRef={card.ref} target={target} resolve={target ? undefined : resolveTarget(card.ref)}
+        hosts={hosts.map((h) => h.host)} label={`Deschide în cod ${card.ref}`} />
+    );
+  };
+  const mayHaveSession = (card: BoardCard) => !!waitingOn(card) || !!card.sessions?.length || card.stage === "doing" || card.stage === "review";
   const tileActions = (card: BoardCard) => (
     <>
       <RunButton size="xs" cardRef={card.ref} cardTitle={card.title} branch={card.checkout?.branch ?? null} hosts={hosts} label={`Pornește ${card.ref}`} />
-      {openCode(card, null)}
+      {mayHaveSession(card) && openCode(card)}
     </>
   );
-  const waitingNames = (card: BoardCard) => waiting.filter((w) => w.card === live.find((c) => c.ref === card.ref)?.id).map((w) => w.name);
-  const digestCount = digest && !digest.empty ? digest.finished.length + digest.waiting.length + digest.decisions.length : 0;
+  const waitingOf = (card: BoardCard) => waiting.filter((w) => w.card === live.find((c) => c.ref === card.ref)?.id);
+  const digestCount = digest ? digest.finished.length + digest.waiting.length + digest.decisions.length : 0;
+  const cardRefOf = (slug: string | null) => bySlug(slug)?.ref ?? null;
+  const scopeTitle = scope.kind === "needs" ? "Te așteaptă" : null;
   const slots = board && board.hosts.length > 0 && <WriterSlots hosts={writerSlots(board.hosts)} className="max-w-full overflow-x-auto" />;
 
   const sidebar = (
-    <ProjectSidebar projects={projects} total={live.length} needsCount={needsCount > 0 ? needsCount : undefined}
+    <ProjectSidebar projects={projects} total={live.length} needsCount={needsCount > 0 || scope.kind === "needs" ? needsCount : undefined}
       scope={scope} expanded={expanded} showQuiet={showQuiet}
       query={search} onQueryChange={setSearch} onSelect={select}
       onToggleProject={(name) => setExpanded((old) => toggle(old, name))} onToggleQuiet={() => setShowQuiet((v) => !v)} />
@@ -320,19 +328,21 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
     <p role={stale ? "alert" : undefined} aria-busy={!stale} className="p-6 text-sm text-muted-foreground">
       {stale ? "Board-ul nu poate fi citit acum." : "Se încarcă board-ul…"}
     </p>
+  ) : scope.kind === "needs" && cards.length === 0 ? (
+    <p role="status" className="p-6 text-sm text-muted-foreground">Nimic nu te așteaptă acum.</p>
   ) : route.table ? (
     <TableView cards={sortCards(cards, sort)} groupByProject={scope.kind === "all"} selected={peeked?.ref} onOpen={openCard}
       sort={sort} onSort={(key: SortKey) => setSort((old) => ({ key, asc: old.key === key ? !old.asc : true }))}
       collapsed={collapsed} onToggleGroup={(name) => setCollapsed((old) => toggle(old, name))} />
   ) : (
     <BoardColumns columns={byStage(cards)} selected={peeked?.ref} showProject={scope.kind === "all"} onOpen={openCard} onAdd={openNew} onMove={move}
-      renderActions={tileActions} waiting={waitingNames} />
+      renderActions={tileActions} waiting={waitingOf} />
   );
 
   return (
     <div className="flex min-h-0 flex-1">
       <div className="hidden min-h-0 md:flex">{sidebar}</div>
-      <main className="flex min-h-0 min-w-0 flex-1 flex-col">
+      <main id="board-main" tabIndex={-1} className="flex min-h-0 min-w-0 flex-1 flex-col outline-none">
         <header className="flex min-h-[42px] shrink-0 flex-wrap items-center gap-x-2 gap-y-1.5 border-b bg-bg0 px-3.5 py-1.5">
           <Button type="button" variant="ghost" size="icon-lg" aria-label="Meniu" onClick={() => setMenuOpen(true)} className="-ml-2 size-11 md:hidden">
             <MenuIcon aria-hidden className="size-5" />
@@ -340,10 +350,10 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
           <span aria-hidden className="grid size-5 place-items-center rounded-sm border border-primary bg-sel2 text-[11px] text-primary">◫</span>
           <h1 className="text-[13.5px] font-bold tracking-[-0.01em] whitespace-nowrap">Nebula Board</h1>
           {stale && board && <span role="status" className="rounded-full border border-dashed border-line-warn px-1.5 py-0.5 text-[11px] text-warn">Date neactualizate</span>}
-          <div className="order-last flex min-w-0 basis-full items-center gap-2 sm:contents">
-            {slots && <div className="min-w-0 shrink sm:order-1">{slots}</div>}
+          <div className="order-last flex min-w-0 basis-full flex-col items-stretch gap-1.5 sm:contents">
+            {slots && <div className="flex min-w-0 shrink sm:order-1">{slots}</div>}
             {!route.card && !route.decisions && (
-              <label className="relative min-w-0 flex-1 sm:order-3 sm:max-w-[210px] sm:min-w-[150px]">
+              <label className="relative min-w-0 sm:order-3 sm:max-w-[210px] sm:min-w-[150px] sm:flex-1">
                 <span className="sr-only">Filtrează cardurile</span>
                 <SearchIcon aria-hidden className="pointer-events-none absolute top-1/2 left-2 size-3 -translate-y-1/2 text-dim" />
                 <input type="search" value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Filtrează carduri…"
@@ -352,21 +362,21 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
             )}
           </div>
           <span className="flex-1 sm:order-2" />
-          {digestCount > 0 && !route.card && !route.decisions && (
+          {digest && !route.card && (
             <Button type="button" variant="outline" size="sm" aria-pressed={digestShown} aria-label={`Absență ${digestCount}`}
-              onClick={() => setDigestClosed((closed) => !closed)} className="sm:order-4">
+              onClick={() => setDigestOpen(!digestShown)} className="sm:order-4">
               <SparklesIcon aria-hidden /><span className="max-sm:sr-only">Absență</span><span className="tabular-nums">{digestCount}</span>
             </Button>
           )}
           {board && !route.card && !route.decisions && (
-            <Button type="button" size="sm" onClick={() => openNew()} className="sm:order-4"><PlusIcon aria-hidden />Card nou</Button>
+            <Button type="button" size="sm" onClick={() => openNew()} className="sm:order-4"><PlusIcon aria-hidden /><span className="max-sm:sr-only">Card nou</span></Button>
           )}
           <Button type="button" variant="outline" size="sm" onClick={onSessions} className="sm:order-4">Sesiuni</Button>
         </header>
         {!route.card && !route.decisions && (
           <div className="flex shrink-0 items-center gap-2 border-b bg-bg0 px-3.5 py-1.5">
             <h2 className="min-w-0 truncate text-sm font-semibold">
-              {route.project ? <span className="font-mono">{route.project}</span> : route.home ? <span className="font-mono">{projectName(null)}</span> : "Toate proiectele"}
+              {scopeTitle ?? (route.project ? <span className="font-mono">{route.project}</span> : route.home ? <span className="font-mono">{projectName(null)}</span> : "Toate proiectele")}
             </h2>
             <span className="flex-1" />
             <div role="group" aria-label="Vizualizare" className="flex shrink-0 items-center gap-0.5 rounded-sm border bg-bg1 p-0.5">
@@ -383,10 +393,10 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
             </Button>
           </div>
         )}
-        {digest && !digest.empty && digestShown && (
+        {digest && digestShown && (
           <AwayDigest lastSeen={new Date(lastSeen).toLocaleString("ro-RO", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" })}
             scope={scope.kind === "all" || scope.kind === "needs" || scope.kind === "all-decisions" ? "toate proiectele" : projectName(scope.project)}
-            finished={digest.finished.map((c) => toBoardCard(c, live))} needsYou={digest.waiting.length ? digest.waiting.map((c) => toBoardCard(c, live)) : undefined} decisions={awayDecisions} onOpen={openCard} onClose={() => setDigestClosed(true)}
+            finished={digest.finished.map((c) => toBoardCard(c, live))} needsYou={digest.waiting.length ? digest.waiting.map((c) => toBoardCard(c, live)) : undefined} decisions={awayDecisions} onOpen={openCard} onClose={() => setDigestOpen(false)}
             onCaughtUp={() => {
               const seen = Date.now();
               try { localStorage.setItem(LAST_SEEN, String(seen)); } catch { /* The digest still resets for this visit. */ }
@@ -399,17 +409,19 @@ export function BoardPage({ route, workspace, onNavigate, onSessions }: {
             <Button type="button" variant="ghost" size="sm" onClick={() => setActionError(null)}>Închide</Button>
           </p>
         )}
+        <OpenCodeToast shown={route.card ?? route.peek ? cardRefOf(route.card ?? route.peek) : null} cardHref={(ref) => boardHref(cardPage(ref))} onCardPage={openPage} />
         {!route.card && !route.decisions && (
           <NeedsYouStrip cards={waitingCards} onOpen={openCard}
-            renderActions={(card) => <>{approveButtons(card)}{openCode(card, waitingOn(card))}</>} />
+            renderActions={(card) => <>{approveButtons(card)}{openCode(card)}</>} />
         )}
         {!route.card && !route.decisions && (
-          <ProposalTray proposals={scoped.filter((c) => c.proposed).map((c) => ({ id: c.ref, ref: c.ref, title: c.title, project: c.project, proposedBy: c.proposedBy ?? "agent" }))}
+          <ProposalTray proposals={filtered.filter((c) => c.proposed).map((c) => ({ id: c.ref, ref: c.ref, title: c.title, project: c.project, proposedBy: c.proposedBy ?? "agent" }))}
             onOpen={openCard} onAccept={(ref) => optimistic(ref, { proposed: false }, cardAction(ref, "accept", {}))}
             onDismiss={(ref) => optimistic(ref, { archived: true }, cardAction(ref, "dismiss", {}))} />
         )}
         {main}
       </main>
+      <OpenCodeDialog hosts={hosts.map((h) => h.host)} fallback={() => document.getElementById("board-main")} />
       {newCard && (
         <NewCardDialog open onOpenChange={(open) => { if (!open) setNewCard(null); }} draft={newCard} pending={creating}
           projects={projects.flatMap((p) => p.project === null ? [] : [p.project])}

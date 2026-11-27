@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { awayDigest, byStage, cardDot, hostProjects, inScope, isBlocked, sessionProject, sidebarProjects, toBoardCard, filterCards, writerSlots, type BoardData, type Card, type SidebarScope } from "./board.ts";
+import { awayDigest, byStage, cardDot, hostProjects, inScope, isBlocked, sessionProject, sidebarProjects, toBoardCard, filterCards, openTarget, type CardSession, writerSlots, type BoardData, type Card, type SidebarScope } from "./board.ts";
 
 const card = (number: number, stage: Card["stage"], blocked_by: string[] = []): Card => ({
   id: `01JD${String(number).padStart(22, "0")}`, number, ref: `#${number}@leaseweb`, title: `Card ${number}`, stage,
@@ -105,4 +105,15 @@ test("the card filter matches title, ref and project, case-insensitively, and an
   assert.deepEqual(filterCards(cards, "#13").map((c) => c.ref), ["#13@leaseweb"]);
   assert.deepEqual(filterCards(cards, "VELA").map((c) => c.ref), ["#13@leaseweb"]);
   assert.deepEqual(filterCards(cards, "  ").map((c) => c.ref), ["#1@leaseweb", "#13@leaseweb"]);
+});
+
+test("Open in code targets the session asking for an answer first, then the live writer, then the latest", () => {
+  const s = (id: string, extra: Partial<CardSession>): CardSession => ({ host: "leaseweb", id, name: id, role: null, kind: "claude", status: "running",
+    status_changed_at: 0, writer: false, alive: true, stale: false, ...extra });
+  const writer = s("w", { writer: true });
+  const asking = s("r", { host: "findl", status: "needs_feedback" });
+  assert.deepEqual(openTarget([writer, asking]), { id: "r", host: "findl" });
+  assert.deepEqual(openTarget([writer, s("x", {})]), { id: "w", host: "leaseweb" });
+  assert.deepEqual(openTarget([s("a", { alive: false }), s("b", { alive: false })]), { id: "b", host: "leaseweb" });
+  assert.equal(openTarget([]), null);
 });

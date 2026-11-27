@@ -116,6 +116,7 @@ test.describe("touch", () => {
     expect(await scroller.evaluate((el) => el.scrollTop)).toBeLessThan(80);
     await page.getByRole("button", { name: "Sari la ultimul mesaj" }).tap();
     await expect(log.getByText("Mesaj nou după swipe.")).toBeInViewport();
+    await expect(page.getByRole("button", { name: "Sari la ultimul mesaj" })).toHaveCount(0);
   });
 });
 

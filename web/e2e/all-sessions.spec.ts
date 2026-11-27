@@ -101,3 +101,18 @@ test("priority and activity ordering survives polls, project filters, and persis
   writeAgents(rows);
   await expect(blue).toBeVisible({ timeout: 15000 });
 });
+
+test("in All a row's age never runs under its Delete button", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  const rows = readAgents();
+  for (const r of rows) Object.assign(r, { kind: "claude", path: "/srv/alpha-wt" });
+  writeAgents(rows);
+  await login(page, "/?view=all");
+  const list = page.getByRole("navigation", { name: "Sesiuni în All" });
+  await expect(list.getByRole("listitem").first()).toBeVisible();
+  for (const item of await list.getByRole("listitem").all()) {
+    const age = await item.getByTitle("Ultima schimbare de stare").boundingBox();
+    const del = await item.getByRole("button", { name: "Șterge sesiunea" }).boundingBox();
+    expect(age!.x + age!.width).toBeLessThanOrEqual(del!.x);
+  }
+});

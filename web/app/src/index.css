@@ -233,7 +233,7 @@
   background-color: var(--bg0);
   color: var(--text);
   outline: none;
-  &::placeholder { color: var(--dim); }
+  &::placeholder { color: var(--text-muted); }
   &:focus-visible { border-color: var(--accent-ink); box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-ink) 35%, transparent); }
   &:disabled { opacity: 0.6; }
 }

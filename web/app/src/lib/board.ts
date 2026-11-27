@@ -268,9 +268,9 @@ export function filterCards<T extends { ref: string; title: string; project: str
   return cards.filter((c) => [c.ref, c.title, projectName(c.project)].some((field) => field.toLowerCase().includes(needle)));
 }
 
-/** The session Open in code opens: the live writer, else the latest session. */
+/** The session Open in code opens: one asking for an answer, else the live writer, else the latest session. */
 export const openTarget = (sessions: CardSession[]): { id: string; host: string } | null => {
-  const s = sessions.find((x) => x.writer && x.alive) ?? sessions.at(-1);
+  const s = sessions.find((x) => x.alive && x.status === "needs_feedback") ?? sessions.find((x) => x.writer && x.alive) ?? sessions.at(-1);
   return s ? { id: s.id, host: s.host } : null;
 };
 

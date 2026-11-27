@@ -82,7 +82,7 @@ export function SessionList({ sessions, phase, error, selected, unseen, onSelect
                     <span className={`min-w-0 flex-1 truncate text-[14px] font-semibold ${isUnseen ? "text-unseen" : row.status === "running" ? "session-working" : ""}`}>{row.name}</span>
                     <Pill tone={STATUS_TONE[row.status] ?? "neutral"}>{statusLabel(row.status)}</Pill>
                   </span>
-                  <span className="flex min-w-0 items-center gap-1 text-[11px] text-muted-foreground">
+                  <span className="flex min-w-0 flex-wrap items-center gap-x-1 gap-y-0.5 text-[11px] text-muted-foreground">
                     {showProject && <ProjectTag project={row.project} />}
                     <span className="shrink-0">{kindLabel(row.kind)}</span>
                     <BranchTag branch={row.worktree} className="min-w-0 shrink" />

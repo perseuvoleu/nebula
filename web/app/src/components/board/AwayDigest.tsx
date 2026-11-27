@@ -59,19 +59,23 @@ export function AwayDigest({ lastSeen, scope, finished, needsYou, decisions, onO
         {onCaughtUp && <Button type="button" variant="outline" size="xs" onClick={onCaughtUp}>Am văzut tot</Button>}
         {onClose && <Button type="button" variant="ghost" size="icon-xs" aria-label="Închide rezumatul" onClick={onClose}><XIcon aria-hidden /></Button>}
       </div>
-      <div className={cn("grid gap-2", needsYou ? "md:grid-cols-3" : "md:grid-cols-2")}>
-        <Column title={<><StatusDot dot="done" label={null} />Terminate</>} count={finished.length} empty="Nimic terminat.">
-          {finished.map((c) => <Row key={c.ref} cardRef={c.ref} title={c.title} trailing={age(c.age)} onOpen={onOpen} />)}
-        </Column>
-        {needsYou && (
-          <Column title={<><StatusDot dot="needs" label={null} />Te așteaptă</>} count={needsYou.length} empty="Nimic în așteptare.">
-            {needsYou.map((c) => <Row key={c.ref} cardRef={c.ref} title={c.title} trailing={renderNeedsActions?.(c)} onOpen={onOpen} />)}
-          </Column>
+      {finished.length + (needsYou?.length ?? 0) + decisions.length === 0
+        ? <p className="text-xs text-muted-foreground">Nimic nou de la ultima vizită.</p>
+        : (
+          <div className={cn("grid gap-2", needsYou ? "md:grid-cols-3" : "md:grid-cols-2")}>
+            <Column title={<><StatusDot dot="done" label={null} />Terminate</>} count={finished.length} empty="Nimic terminat.">
+              {finished.map((c) => <Row key={c.ref} cardRef={c.ref} title={c.title} trailing={age(c.age)} onOpen={onOpen} />)}
+            </Column>
+            {needsYou && (
+              <Column title={<><StatusDot dot="needs" label={null} />Te așteaptă</>} count={needsYou.length} empty="Nimic în așteptare.">
+                {needsYou.map((c) => <Row key={c.ref} cardRef={c.ref} title={c.title} trailing={renderNeedsActions?.(c)} onOpen={onOpen} />)}
+              </Column>
+            )}
+            <Column title="Decizii noi" count={decisions.length} empty="Nicio decizie nouă.">
+              {decisions.map((d) => <Row key={d.id} cardRef={d.cardRef} title={d.title} trailing={age(d.age)} onOpen={onOpen} />)}
+            </Column>
+          </div>
         )}
-        <Column title="Decizii noi" count={decisions.length} empty="Nicio decizie nouă.">
-          {decisions.map((d) => <Row key={d.id} cardRef={d.cardRef} title={d.title} trailing={age(d.age)} onOpen={onOpen} />)}
-        </Column>
-      </div>
     </section>
   );
 }

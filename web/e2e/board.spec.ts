@@ -154,9 +154,11 @@ test("a failed card read is retried on the next poll, and a stale detail is mark
 test("blocked card dimmed", async ({ page }) => {
   addCard(13, "Wait for verification", "next", ["#12@leaseweb"]);
   await login(page, "/board");
-  const opacity = (title: string) => tile(page, title).evaluate((el) => Number(getComputedStyle(el).opacity));
+  const look = (title: string) => tile(page, title).evaluate((el) => { const s = getComputedStyle(el); return { bg: s.backgroundColor, border: s.borderTopStyle }; });
   await expect(tile(page, "Wait for verification")).toBeVisible();
-  expect(await opacity("Wait for verification")).toBeLessThan(await opacity("Keep verification results"));
+  const [blocked, plain] = [await look("Wait for verification"), await look("Keep verification results")];
+  expect(blocked.border).toBe("dashed");
+  expect(blocked.bg).not.toBe(plain.bg);
 });
 
 test("sidebar counts and quiet projects", async ({ page }) => {
@@ -336,10 +338,92 @@ test("at 390 px the scope title, view switch and every host's writer slots stay 
   await expect(page.getByRole("button", { name: "Tabel" })).toBeInViewport();
   await expect(slots).toHaveCount(1);
   await expect(slots).toContainText("perseu-mbp");
+  const filter = page.getByRole("searchbox", { name: "Filtrează cardurile" });
+  expect(await filter.evaluate((el) => { const s = getComputedStyle(el); return el.clientWidth - parseFloat(s.paddingLeft) - parseFloat(s.paddingRight); })).toBeGreaterThanOrEqual(160);
+  await expect(filter).toBeInViewport({ ratio: 1 });
   await noHorizontalOverflow(page);
   for (const route of ["/board/c/12%40leaseweb", "/board/decisions"]) {
     await page.goto(route);
     await expect(slots).toBeVisible();
     await noHorizontalOverflow(page);
   }
+});
+
+const proposal = (number: number, title: string) => changeBoard((board) => board.cards.push({ ...board.cards[1], id: `01JD${String(number).padStart(22, "0")}`, number,
+  ref: `#${number}@leaseweb`, title, stage: "backlog", checkout: null, blocked_by: [], proposed: true }));
+
+test("the header filter narrows tiles, the strip and proposals alike, and leaves the sidebar counts whole", async ({ page }) => {
+  waitingWorker();
+  proposal(13, "Proposed elsewhere");
+  await login(page, "/board");
+  const sidebar = page.getByRole("navigation", { name: "Proiecte" });
+  await expect(page.getByRole("button", { name: /Proposed elsewhere/ }).first()).toBeVisible();
+  await page.getByRole("searchbox", { name: "Filtrează cardurile" }).fill("zzz");
+  await expect(page.getByText("Proposed elsewhere")).toHaveCount(0);
+  await expect(page.getByRole("button", { name: /^Acceptă/ })).toHaveCount(0);
+  await expect(page.getByRole("region", { name: /Te așteaptă/ })).toHaveCount(0);
+  await expect(sidebar.getByRole("button", { name: /Te așteaptă\s*1$/ })).toBeVisible();
+  await expect(sidebar.getByRole("button", { name: /Toate proiectele/ })).toContainText(/\d+/);
+});
+
+test("the attention scope names itself, stays selected, and says so when nothing waits any more", async ({ page }) => {
+  waitingWorker();
+  await login(page, "/board");
+  const sidebar = page.getByRole("navigation", { name: "Proiecte" });
+  await sidebar.getByRole("button", { name: /Te așteaptă/ }).click();
+  await expect(page.getByRole("heading", { level: 2, name: "Te așteaptă", exact: true })).toBeVisible();
+  const row = sidebar.getByRole("button", { name: /Te așteaptă/ });
+  await expect(row).toHaveAttribute("aria-current", "page");
+  changeBoard((board) => { Object.assign(board.details["01JD0000000000000000000012"].sessions[0], { status: "running", status_changed_at: 1764000700000 }); });
+  await expect(page.getByText("Nimic nu te așteaptă acum.")).toBeVisible({ timeout: 15_000 });
+  await expect(row).toHaveAttribute("aria-current", "page");
+  await expect(row).toContainText("0");
+});
+
+test("a wait on a proposed card lights nothing: no project dot, no count, no strip", async ({ page }) => {
+  proposal(13, "Proposed and waiting");
+  changeBoard((board) => { board.details["01JD0000000000000000000013"] = { sessions: [{ ...board.details["01JD0000000000000000000012"].sessions[0], id: "01JF0000000000000000000013", status: "needs_feedback", status_changed_at: 1764000600000 }], artifacts: [], log: [] }; });
+  await login(page, "/board");
+  const sidebar = page.getByRole("navigation", { name: "Proiecte" });
+  await expect(page.getByText("Proposed and waiting").first()).toBeVisible();
+  await expect(sidebar.getByRole("img", { name: "Așteaptă răspuns" })).toHaveCount(0);
+  await expect(sidebar.getByRole("button", { name: /Te așteaptă/ })).toHaveCount(0);
+  await expect(page.getByRole("region", { name: /Te așteaptă/ })).toHaveCount(0);
+});
+
+test("Absență is in the header wherever the digest can show, and opens an empty digest that says so", async ({ page }) => {
+  await login(page, "/board");
+  const away = page.getByRole("button", { name: /^Absență/ });
+  const digest = page.getByRole("region", { name: "De când ai lipsit" });
+  await expect(digest).toHaveCount(0);
+  await away.click();
+  await expect(digest).toBeVisible();
+  await expect(digest.getByText("Nimic nou de la ultima vizită.")).toBeVisible();
+  await page.goto("/board/decisions");
+  await expect(away).toBeVisible();
+});
+
+test("at 1280 px every tile's age stays inside its tile", async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await login(page, "/board");
+  const tiles = page.getByRole("article");
+  await expect(tiles.first()).toBeVisible();
+  for (const t of await tiles.all()) {
+    const edges = await t.evaluate((el) => {
+      const age = [...el.querySelectorAll("span")].find((s) => /^\d+[a-zăîșț]+$/.test(s.textContent ?? ""))!;
+      return { age: age.getBoundingClientRect().right, tile: el.getBoundingClientRect().right };
+    });
+    expect(edges.age).toBeLessThanOrEqual(edges.tile - 4);
+  }
+});
+
+test("the filter's placeholder reads at 4.5:1", async ({ page }) => {
+  await login(page, "/board");
+  const ratio = await page.getByRole("searchbox", { name: "Filtrează cardurile" }).evaluate((el) => {
+    const parse = (c: string) => (c.match(/[\d.]+/g) ?? []).map(Number);
+    const lum = (c: number[]) => { const [r, g, b] = c.slice(0, 3).map((v) => { v /= 255; return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4; }); return 0.2126 * r + 0.7152 * g + 0.0722 * b; };
+    const [hi, lo] = [lum(parse(getComputedStyle(el, "::placeholder").color)), lum(parse(getComputedStyle(el).backgroundColor))].sort((x, y) => y - x);
+    return (hi + 0.05) / (lo + 0.05);
+  });
+  expect(ratio).toBeGreaterThanOrEqual(4.5);
 });
