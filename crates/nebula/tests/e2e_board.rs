@@ -822,6 +822,15 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
+/// The digest counts changes strictly after `--away-since`, so the clock must
+/// leave that millisecond before the board records anything as "while away".
+fn left_at() -> i64 {
+    let left = now_ms();
+    eventually("the clock to pass the away mark", || {
+        (now_ms() > left).then_some(left)
+    })
+}
+
 fn board_op(env: &Env, op: BoardOp) -> Result<BoardResult, String> {
     use nebula_core::codec::{read_frame, write_frame};
     use nebula_core::{ClientRequest, ServerEvent, PROTOCOL_VERSION};
@@ -1175,7 +1184,7 @@ fn away_digest_sessions() {
         &env,
         vec![far_row(&ask, "n1", AgentStatus::NeedsFeedback, before)],
     );
-    let since = now_ms();
+    let since = left_at();
     let after = since + 1;
     far_report(
         &env,
@@ -1394,7 +1403,7 @@ fn human_show_and_away_name_sessions() {
     let env = board_env();
     let work = add(&env, &["--project", "nebula"], "Work");
     let ask = add(&env, &["--project", "nebula"], "Ask");
-    let since = now_ms();
+    let since = left_at();
     let writer = |status, at| SessionRow {
         writer: true,
         ..far_row(&work, "w1", status, at)

@@ -1,4 +1,5 @@
 import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,7 +19,7 @@ class RealLaneStartTests(unittest.TestCase):
         self.root = Path(tmp.name)
 
     def start(self, state):
-        env = {"REAL_NEBULA_STATE": str(state), "REAL_NEBULA_BIN": "/bin/true"}
+        env = {"REAL_NEBULA_STATE": str(state), "REAL_NEBULA_BIN": shutil.which("true")}
         with patch.dict(os.environ, env), patch.object(serve.subprocess, "run", side_effect=Launched):
             serve.serve_real()
 
