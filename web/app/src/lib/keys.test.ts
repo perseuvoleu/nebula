@@ -42,5 +42,15 @@ test("pageKey does not intercept Enter or Space on focused buttons or links", ()
 test("pageKey ignores typing targets and dialogs", () => {
   for (const selector of ["input", "textarea", "select", "[contenteditable=true]", "[role=dialog]"]) {
     assert.equal(pageKey(fakeEvent({ key: "j", matches: [selector] })), false, selector);
+    assert.equal(pageKey(fakeEvent({ key: "i", matches: [selector] })), false, `i on ${selector}`);
+    assert.equal(pageKey(fakeEvent({ key: "0", matches: [selector] })), false, `0 on ${selector}`);
+  }
+});
+
+test("pageKey allows i and 0 on page targets and ignores repeats", () => {
+  for (const key of ["i", "0"]) {
+    assert.equal(pageKey(fakeEvent({ key })), true, key);
+    assert.equal(pageKey(fakeEvent({ key, matches: ["button"] })), true, `${key} on button`);
+    assert.equal(pageKey(fakeEvent({ key, repeat: true })), false, `${key} repeat`);
   }
 });

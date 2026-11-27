@@ -1,13 +1,14 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { ArrowLeftIcon } from "lucide-react";
-import { api } from "@/lib/api";
+import { api, attemptId, describeError } from "@/lib/api";
 import { compactAge } from "@/lib/activity-age";
 import { type Artifact, type Card, type CardSession, type CardShow, type NeedsYou, STAGES, STAGE_LABEL, type Stage, type Workspace, firstWait, openTarget, projectName, sessionProject } from "@/lib/board";
 import { type Decision, useHomeSessions } from "@/lib/board-reads";
-import { type HomeBoard, STAGE_LETTER, STAGE_TEXT, refHost } from "@/lib/home";
+import { type HomeBoard, type HomeProject, STAGE_LETTER, STAGE_TEXT, refHost } from "@/lib/home";
 import { sessionDot, statusLabel } from "@/lib/status";
-import type { ConversationResponse } from "@/lib/types";
+import type { ConversationResponse, SendResponse } from "@/lib/types";
 import { cn } from "@/lib/utils";
+import { MAX_MESSAGE } from "@/components/Composer";
 import { StatusDot } from "@/components/ui/status-dot";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import { ArtifactItem } from "@/components/board/CardArtifacts";
@@ -40,7 +41,18 @@ function CardRow({ card, selected, needs, onSelect }: { card: Card; selected: bo
   );
 }
 
-function HomeLeft({ home, selected, stage, onStage, onSelect }: { home: HomeBoard; selected: string | null; stage: Stage | null; onStage: (stage: Stage | null) => void; onSelect: (card: Card) => void }) {
+function HomeLeft({ home, projects, totalCount, projectScope, onProjectScope, selected, stage, onStage, onSelect }: {
+  home: HomeBoard;
+  projects: HomeProject[];
+  totalCount: number;
+  projectScope: string | null;
+  onProjectScope: (project: string | null) => void;
+  selected: string | null;
+  stage: Stage | null;
+  onStage: (stage: Stage | null) => void;
+  onSelect: (card: Card) => void;
+}) {
+  const [leftTab, setLeftTab] = useState<"board" | "projects">("board");
   const shown = stage ? [stage] : STAGES;
   return (
     <div className="flex min-h-0 w-full flex-1 flex-col overflow-y-auto md:w-[245px] md:flex-none md:shrink-0 md:overflow-hidden md:border-r">
@@ -60,38 +72,74 @@ function HomeLeft({ home, selected, stage, onStage, onSelect }: { home: HomeBoar
           </ul>
         </section>
       )}
-      <div className="flex h-[22px] shrink-0 items-center gap-0.5 border-b bg-bg1 px-1">
-        <span className="border-b-2 border-primary px-1.5 py-0.5 text-[10px] font-semibold text-foreground">BOARD</span>
+      <div role="tablist" aria-label="Mod listă" className="flex h-[22px] shrink-0 items-center gap-0.5 border-b bg-bg1 px-1 max-md:h-9">
+        <button type="button" role="tab" aria-selected={leftTab === "board"} onClick={() => setLeftTab("board")}
+          className={cn("inline-flex h-full items-center border-b-2 px-1.5 text-[10px] font-semibold outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
+            leftTab === "board" ? "border-primary text-foreground" : "border-transparent text-dim hover:text-foreground")}>
+          BOARD
+        </button>
+        <button type="button" role="tab" aria-selected={leftTab === "projects"} onClick={() => setLeftTab("projects")}
+          className={cn("inline-flex h-full items-center border-b-2 px-1.5 text-[10px] font-semibold outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
+            leftTab === "projects" ? "border-primary text-foreground" : "border-transparent text-dim hover:text-foreground")}>
+          PROIECTE
+        </button>
       </div>
-      <div role="group" aria-label="Etape" className="grid shrink-0 grid-cols-5 border-b bg-bg1">
-        {STAGES.map((s) => (
-          <button key={s} type="button" aria-pressed={stage === s} aria-label={`${STAGE_LABEL[s]} ${home.byStage[s].length}`} onClick={() => onStage(stage === s ? null : s)}
-            className={cn("flex h-[22px] items-center justify-center gap-[3px] border-b-2 text-[9.5px] outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset max-md:h-9",
-              stage === s ? "border-primary bg-sel2 font-bold text-foreground" : "border-transparent text-dim hover:bg-bg2 hover:text-foreground")}>
-            <span className={STAGE_TEXT[s]}>{STAGE_LETTER[s]}</span><span className="tabular-nums">{home.byStage[s].length}</span>
-          </button>
-        ))}
-      </div>
-      <div className="md:min-h-0 md:flex-1 md:overflow-y-auto">
-        {shown.map((s) => (
-          <section key={s} aria-label={STAGE_LABEL[s]}>
-            <SecHead><span className={STAGE_TEXT[s]}>■ {STAGE_LABEL[s]}</span><span className="font-semibold text-muted-foreground tabular-nums">{home.byStage[s].length}</span></SecHead>
-            <ul>
-              {home.byStage[s].map((c) => (
-                <CardRow key={c.id} card={c} selected={selected === c.id} needs={home.waiting.some((w) => w.card === c.id)} onSelect={() => onSelect(c)} />
-              ))}
-            </ul>
-          </section>
-        ))}
-      </div>
+      {leftTab === "board" ? (
+        <>
+          <div role="group" aria-label="Etape" className="grid shrink-0 grid-cols-5 border-b bg-bg1">
+            {STAGES.map((s) => (
+              <button key={s} type="button" aria-pressed={stage === s} aria-label={`${STAGE_LABEL[s]} ${home.byStage[s].length}`} onClick={() => onStage(stage === s ? null : s)}
+                className={cn("flex h-[22px] items-center justify-center gap-[3px] border-b-2 text-[9.5px] outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset max-md:h-9",
+                  stage === s ? "border-primary bg-sel2 font-bold text-foreground" : "border-transparent text-dim hover:bg-bg2 hover:text-foreground")}>
+                <span className={STAGE_TEXT[s]}>{STAGE_LETTER[s]}</span><span className="tabular-nums">{home.byStage[s].length}</span>
+              </button>
+            ))}
+          </div>
+          <div className="md:min-h-0 md:flex-1 md:overflow-y-auto">
+            {shown.map((s) => (
+              <section key={s} aria-label={STAGE_LABEL[s]}>
+                <SecHead><span className={STAGE_TEXT[s]}>■ {STAGE_LABEL[s]}</span><span className="font-semibold text-muted-foreground tabular-nums">{home.byStage[s].length}</span></SecHead>
+                <ul>
+                  {home.byStage[s].map((c) => (
+                    <CardRow key={c.id} card={c} selected={selected === c.id} needs={home.waiting.some((w) => w.card === c.id)} onSelect={() => onSelect(c)} />
+                  ))}
+                </ul>
+              </section>
+            ))}
+          </div>
+        </>
+      ) : (
+        <section aria-label="Proiecte" className="md:min-h-0 md:flex-1 md:overflow-y-auto">
+          <ul>
+            <li>
+              <button type="button" onClick={() => onProjectScope(null)} aria-current={projectScope === null ? "true" : undefined} className={rowCls(projectScope === null)}>
+                <span className="min-w-0 flex-1 truncate text-foreground">All projects</span>
+                <span className="shrink-0 text-[10px] text-dim tabular-nums">{totalCount}</span>
+              </button>
+            </li>
+            {projects.map((p) => {
+              const dot = p.needs > 0 ? "needs" : p.working > 0 ? "running" : "off";
+              return (
+                <li key={p.name}>
+                  <button type="button" onClick={() => onProjectScope(p.name)} aria-current={projectScope === p.name ? "true" : undefined} className={rowCls(projectScope === p.name)}>
+                    <StatusDot dot={dot} label={null} className="size-1.5" />
+                    <span className="min-w-0 flex-1 truncate text-foreground">{p.name}</span>
+                    <span className="shrink-0 text-[10px] text-dim tabular-nums">{p.cards}</span>
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        </section>
+      )}
     </div>
   );
 }
 
-type Latest = { key: string; text: string | null; at: string | null };
+type Latest = { key: string; text: string | null; at: string | null; role: "assistant" | "user" | null };
 
-/** The latest assistant text of a session this gateway lists; null when it lists none or shows only a terminal. */
-function useLatest(project: string | null, session: CardSession | null, version: unknown): Latest | null {
+/** The latest text message of a session this gateway lists; null when it lists none or shows only a terminal. */
+function useLatest(project: string | null, session: CardSession | null, version: unknown, refreshTick: number): Latest | null {
   const key = project && session ? `${project}/${session.id}` : null;
   const [latest, setLatest] = useState<Latest | null>(null);
   useEffect(() => {
@@ -99,14 +147,74 @@ function useLatest(project: string | null, session: CardSession | null, version:
     const abort = new AbortController();
     api<ConversationResponse>("conversation", { project, id: session.id, limit: "6" }, undefined, { signal: abort.signal })
       .then((data) => {
-        const message = "snapshot" in data ? data.snapshot.messages.filter((m) => m.role === "assistant" && m.parts.some((p) => p.type === "text")).at(-1) : undefined;
+        const message = "snapshot" in data
+          ? data.snapshot.messages.filter((m) => (m.role === "assistant" || m.role === "user") && m.parts.some((p) => p.type === "text")).at(-1)
+          : undefined;
         const text = message?.parts.flatMap((p) => p.type === "text" ? [p.text] : []).join("\n") ?? null;
-        setLatest({ key, text, at: message?.timestamp ?? null });
+        const role = message?.role === "user" || message?.role === "assistant" ? message.role : null;
+        setLatest({ key, text, at: message?.timestamp ?? null, role });
       })
-      .catch(() => { if (!abort.signal.aborted) setLatest({ key, text: null, at: null }); });
+      .catch(() => { if (!abort.signal.aborted) setLatest({ key, text: null, at: null, role: null }); });
     return () => abort.abort();
-  }, [key, project, session, version]);
+  }, [key, project, session, version, refreshTick]);
   return latest?.key === key ? latest : null;
+}
+
+function InlineReply({ project, session, onSent }: { project: string; session: CardSession; onSent: () => void }) {
+  const [text, setText] = useState("");
+  const [sending, setSending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const mounted = useRef(true);
+  useEffect(() => () => { mounted.current = false; }, []);
+
+  const canSend = !sending && text.trim().length > 0 && text.length <= MAX_MESSAGE;
+
+  const submit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!canSend) return;
+    const payload = text;
+    setSending(true);
+    setError(null);
+    try {
+      await api<SendResponse>("send", {}, { project, id: session.id, text: payload, attempt: attemptId() });
+      if (!mounted.current) return;
+      setText("");
+      onSent();
+    } catch (failure) {
+      if (!mounted.current) return;
+      setError(describeError(failure));
+    } finally {
+      if (mounted.current) setSending(false);
+    }
+  };
+
+  return (
+    <div className="shrink-0 border-t bg-bg1">
+      {error && <p role="alert" className="border-b border-line-err bg-tint-need px-2 py-0.5 text-[10.5px] text-err">{error}</p>}
+      <form onSubmit={submit} aria-label={`Răspunde lui ${session.name}`} className="flex h-7 items-center gap-1.5 px-2 max-md:h-11">
+        <span aria-hidden className="text-primary">›</span>
+        <input
+          type="text"
+          data-home-reply=""
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Escape") e.currentTarget.blur(); }}
+          disabled={sending}
+          maxLength={MAX_MESSAGE}
+          aria-label={`Răspunde lui ${session.name}`}
+          placeholder={`Răspunde lui ${session.name}… (i)`}
+          className="min-w-0 flex-1 bg-transparent text-foreground outline-none placeholder:text-dim disabled:opacity-60"
+        />
+        <button
+          type="submit"
+          disabled={!canSend}
+          className="inline-flex h-5 shrink-0 items-center rounded-xs border border-primary/50 bg-sel2 px-2 text-[10px] font-semibold text-foreground outline-none hover:border-primary focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-40 max-md:h-8 max-md:px-3"
+        >
+          Trimite
+        </button>
+      </form>
+    </div>
+  );
 }
 
 const actCls = "inline-flex h-5 items-center gap-1 rounded-xs border px-1.5 text-[10px] whitespace-nowrap text-foreground outline-none hover:border-primary hover:bg-bg1 focus-visible:ring-2 focus-visible:ring-ring max-md:h-9 max-md:px-2.5";
@@ -149,7 +257,8 @@ export function CardPane({ card, show, home, workspace, decisions, picked, onPic
   const project = session
     ? (card.project ? sessionProject(card.project, session.host, workspace) : homeSessions.get(`${session.host}/${session.id}`) ?? null)
     : null;
-  const latest = useLatest(project, session, version);
+  const [refreshTick, setRefreshTick] = useState(0);
+  const latest = useLatest(project, session, version, refreshTick);
   const [openArt, setOpenArt] = useState<Artifact | null>(null);
   const artifacts = (show?.artifacts ?? []).filter((a) => a.kind !== "decision");
   const now = Date.now();
@@ -195,7 +304,7 @@ export function CardPane({ card, show, home, workspace, decisions, picked, onPic
         {session && (
           <div className="max-w-[820px] px-2.5 py-[5px]">
             <div className="mb-px flex items-center gap-1.5 text-[10px] text-dim">
-              <span>{session.name}</span><span>{compactAge(latest?.at ? Date.parse(latest.at) : session.status_changed_at, now)}</span>
+              <span>{latest?.role === "user" ? "tu" : session.name}</span><span>{compactAge(latest?.at ? Date.parse(latest.at) : session.status_changed_at, now)}</span>
               <span>· {statusLabel(wait && wait.id === session.id ? "needs_feedback" : session.status)}</span>
             </div>
             <p className="leading-[1.45] break-words whitespace-pre-wrap text-foreground">
@@ -255,10 +364,14 @@ export function CardPane({ card, show, home, workspace, decisions, picked, onPic
           </section>
         )}
       </div>
-      <button type="button" onClick={openCode}
-        className="flex h-6 shrink-0 items-center gap-1.5 border-t bg-bg1 px-2 text-left text-dim outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset max-md:h-11">
-        <span className="text-primary">›</span>{session ? `Răspunde lui ${session.name} în CODE… (Enter)` : "Deschide în CODE… (Enter)"}
-      </button>
+      {session && project ? (
+        <InlineReply key={`${project}/${session.id}`} project={project} session={session} onSent={() => setRefreshTick((n) => n + 1)} />
+      ) : (
+        <button type="button" onClick={openCode}
+          className="flex h-6 shrink-0 items-center gap-1.5 border-t bg-bg1 px-2 text-left text-dim outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset max-md:h-11">
+          <span className="text-primary">›</span>{session ? `Răspunde lui ${session.name} în CODE… (Enter)` : "Deschide în CODE… (Enter)"}
+        </button>
+      )}
       <ArtifactDialog artifact={openArt} onClose={() => setOpenArt(null)} />
     </section>
   );
@@ -307,8 +420,12 @@ function DecisionsRail({ card, cards, decisions, workspace, onDecisions, onSelec
   );
 }
 
-export function HomePage({ home, card, missingCard, show, workspace, decisions, phone, stale, loaded, stage, onStage, picked, onPick, onSelect, onBack, onApprove, onOpenCode, onDecisions, version }: {
+export function HomePage({ home, projects, totalCount, projectScope, onProjectScope, card, missingCard, show, workspace, decisions, phone, stale, loaded, stage, onStage, picked, onPick, onSelect, onBack, onApprove, onOpenCode, onDecisions, version }: {
   home: HomeBoard;
+  projects: HomeProject[];
+  totalCount: number;
+  projectScope: string | null;
+  onProjectScope: (project: string | null) => void;
   card: Card | null;
   missingCard: boolean;
   show: CardShow | null;
@@ -345,10 +462,23 @@ export function HomePage({ home, card, missingCard, show, workspace, decisions, 
       <p role="alert" className="text-dim">Card negăsit.</p>
     </section>
   ) : null;
-  if (phone) return <div className="flex min-h-0 flex-1 flex-col font-mono text-[12.5px] leading-[1.35]">{pane ?? missing ?? <HomeLeft home={home} selected={null} stage={stage} onStage={onStage} onSelect={onSelect} />}</div>;
+  const left = (
+    <HomeLeft
+      home={home}
+      projects={projects}
+      totalCount={totalCount}
+      projectScope={projectScope}
+      onProjectScope={onProjectScope}
+      selected={phone ? null : card?.id ?? null}
+      stage={stage}
+      onStage={onStage}
+      onSelect={onSelect}
+    />
+  );
+  if (phone) return <div className="flex min-h-0 flex-1 flex-col font-mono text-[12.5px] leading-[1.35]">{pane ?? missing ?? left}</div>;
   return (
     <div className="flex min-h-0 flex-1 font-mono text-[11.5px] leading-[1.35]">
-      <HomeLeft home={home} selected={card?.id ?? null} stage={stage} onStage={onStage} onSelect={onSelect} />
+      {left}
       {pane ?? missing ?? <p className="flex-1 p-4 text-dim">Niciun card încă. Agenții le adaugă cu <code>nebula todo add</code>.</p>}
       <DecisionsRail card={card} cards={home.cards} decisions={decisions} workspace={workspace} onDecisions={onDecisions} onSelect={onSelect} />
     </div>

@@ -52,7 +52,7 @@ test("tab keys 1–4 switch HOME, CODE, RAG and DECISIONS; ? lists the keys; b o
   await login(page, "/");
   await expect(page.getByRole("region", { name: /^Card / })).toBeVisible();
   await page.keyboard.press("2");
-  await expect(page).toHaveURL(/\/p\/alpha$/);
+  await expect(page).toHaveURL(/\/code\?view=all$/);
   await expect(page.getByRole("combobox", { name: "Proiect", exact: true })).toBeVisible();
   await expect(page.getByRole("button", { name: /Refactor auth/ })).toBeVisible();
   await shot(page, "code-1440");
@@ -219,4 +219,76 @@ test("held a (repeat keydown) is ignored and does not approve", async ({ page })
   });
   await expect(needs(page).getByRole("button", { name: /Keep verification results/ })).toBeVisible();
   expect(sends().filter((s) => s.approve)).toHaveLength(0);
+});
+
+test("inline reply on HOME focuses with i, sends to gateway-listed session, clears input and refreshes latest", async ({ page }) => {
+  const host = await (await page.request.get("/api/projects", { headers: { Authorization: `Bearer ${TOKEN}` } })).json().then((d) => d.host as string);
+  const card = { id: "01JD0000000000000000000079", number: 79, ref: "#79", title: "Inline reply card", stage: "doing", project: "alpha", proposed: false, archived: false,
+    created_by: { host, agent: null, name: "you" }, checkout: { host, branch: "main", path: "/srv/alpha", worktree: false }, blocked_by: [], cleared_blockers: [], created_at: 1, updated_at: 1 };
+  const session = { host, id: "pi-1", name: "Refactor auth", role: "worker", kind: "pi", status: "running", status_changed_at: 1, writer: true, alive: true, stale: false };
+  await page.route("**/api/board?*", (route) => route.fulfill({ json: { version: "B.1", board: { cards: [card], hosts: [], needs_you: [], away: { finished: [], needs_you: [], decisions: [] } }, next: null } }));
+  await page.route("**/api/board", (route) => route.fulfill({ json: { version: "B.1", board: { cards: [card], hosts: [], needs_you: [], away: { finished: [], needs_you: [], decisions: [] } }, next: null } }));
+  await page.route("**/api/cards/79", (route) => route.fulfill({ json: { ...card, sessions: [session], artifacts: [], log: [] } }));
+  await login(page, "/");
+  const pane = page.getByRole("region", { name: "Card #79" });
+  const input = pane.getByPlaceholder("Răspunde lui Refactor auth… (i)");
+  await expect(input).toBeVisible();
+  await page.locator("body").press("i");
+  await expect(input).toBeFocused();
+  await expect(input).toHaveValue("");
+  const before = sends().length;
+  await input.fill("Salut direct din HOME");
+  await pane.getByRole("button", { name: "Trimite" }).click();
+  await expect.poll(() => sends().slice(before).some((s) => s.text === "Salut direct din HOME")).toBe(true);
+  await expect(input).toHaveValue("");
+  await expect(pane).toContainText("Salut direct din HOME");
+});
+
+test("project scope via PROIECTE and topbar picker filters HOME, persists across DECISIONS/RAG/CODE, and resets via × or 0", async ({ page }) => {
+  changeBoard((board) => {
+    const base = board.cards.find((c) => c.id === CARD12)!;
+    board.cards.push({ ...base, id: "01JD0000000000000000000081", number: 81, ref: "#81@leaseweb", title: "Vela billing polish", stage: "doing", project: "vela", checkout: null, blocked_by: [] });
+    board.decisions.push({ ...board.decisions[0], id: "01JG0000000000000000000081", title: "Vela invoice format", card: "01JD0000000000000000000081", project: "vela",
+      content: { body: "Keep invoice PDF deterministic" }, created_at: 1764000700000 });
+  });
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await login(page, "/");
+
+  await page.getByRole("tab", { name: "PROIECTE" }).click();
+  await page.getByRole("region", { name: "Proiecte" }).getByRole("button", { name: /vela/ }).click();
+  await expect(page.getByRole("button", { name: "Filtru proiect" })).toContainText("@vela");
+  await expect(page.getByRole("region", { name: "Card #81@leaseweb" })).toBeVisible();
+  const rail = page.getByRole("complementary", { name: "Context și decizii" });
+  await expect(rail).toContainText("Vela invoice format");
+  await expect(rail).not.toContainText("Copy published files");
+
+  await page.keyboard.press("4");
+  await expect(page).toHaveURL(/\/decisions$/);
+  await expect(page.getByRole("article").filter({ hasText: "Vela invoice format" })).toBeVisible();
+  await expect(page.getByRole("article").filter({ hasText: "Copy published files" })).toHaveCount(0);
+
+  await page.keyboard.press("3");
+  await expect(page).toHaveURL(/\/rag$/);
+  await expect(page.getByRole("region", { name: "RAG" })).toContainText("@vela");
+
+  await page.getByRole("button", { name: "Filtru proiect" }).click();
+  await page.getByRole("menu", { name: "Proiecte" }).getByRole("menuitemradio", { name: /alpha/ }).click();
+  await expect(page.getByRole("button", { name: "Filtru proiect" })).toContainText("@alpha");
+  await page.keyboard.press("2");
+  await expect(page).toHaveURL(/\/p\/alpha$/);
+  await expect(page.getByRole("button", { name: "Filtru proiect" })).toContainText("@alpha");
+
+  await page.getByRole("button", { name: "Resetează filtrul de proiect" }).click();
+  await expect(page).toHaveURL(/\/code\?view=all$/);
+  await expect(page.getByRole("button", { name: "Filtru proiect" })).toContainText("all");
+  await expect(page.getByRole("button", { name: "Resetează filtrul de proiect" })).toHaveCount(0);
+
+  await page.keyboard.press("1");
+  await expect(page).toHaveURL(/\/$/);
+  await page.getByRole("button", { name: "Filtru proiect" }).click();
+  await page.getByRole("menu", { name: "Proiecte" }).getByRole("menuitemradio", { name: /vela/ }).click();
+  await expect(page.getByRole("button", { name: "Filtru proiect" })).toContainText("@vela");
+  await page.keyboard.press("0");
+  await expect(page.getByRole("button", { name: "Filtru proiect" })).toContainText("all");
+  await expect(rail).toContainText("Copy published files");
 });

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { BoardData, Card } from "./board.ts";
-import { approvalKey, homeBoard, homeOrder, refHost } from "./home.ts";
+import { approvalKey, filterByProject, homeBoard, homeOrder, homeProjects, refHost } from "./home.ts";
 
 const card = (n: number, stage: Card["stage"], extra: Partial<Card> = {}): Card => ({
   id: `c${n}`, number: n, ref: `#${n}`, title: `Card ${n}`, stage, project: "nebula", proposed: false, archived: false,
@@ -31,4 +31,30 @@ test("j/k walks NEEDS first, then the visible stages, each card once", () => {
   assert.deepEqual(homeOrder(home, "doing").map((c) => c.ref), ["#1", "#3", "#2"]);
   assert.equal(refHost("#12@leaseweb"), "leaseweb");
   assert.equal(refHost("#12"), null);
+});
+
+test("projectScope filters cards, NEEDS, counts, order and decisions; homeProjects merges board and workspace projects", () => {
+  const cards = [
+    card(1, "review", { project: "nebula" }),
+    card(2, "doing", { project: "alpha" }),
+    card(3, "backlog", { project: "nebula" }),
+    card(4, "done", { project: "alpha", archived: true }),
+    card(5, "next", { project: null }),
+  ];
+  const b = board(cards, [wait("c1", 10), wait("c2", 20)]);
+  const scoped = homeBoard(b, new Set(), "alpha");
+  assert.deepEqual(scoped.cards.map((c) => c.ref), ["#2"]);
+  assert.deepEqual(scoped.needs.map((c) => c.ref), ["#2"]);
+  assert.deepEqual(scoped.counts, { all: 1, needs: 1, working: 1 });
+  assert.deepEqual(homeOrder(scoped).map((c) => c.ref), ["#2"]);
+
+  assert.deepEqual(homeProjects(b, new Set(), ["beta", "alpha"]), [
+    { name: "alpha", cards: 1, needs: 1, working: 1 },
+    { name: "beta", cards: 0, needs: 0, working: 0 },
+    { name: "nebula", cards: 2, needs: 1, working: 1 },
+  ]);
+
+  const items = [{ id: "d1", project: "alpha" }, { id: "d2", project: "nebula" }, { id: "d3", project: null }];
+  assert.deepEqual(filterByProject(items, null).map((d) => d.id), ["d1", "d2", "d3"]);
+  assert.deepEqual(filterByProject(items, "alpha").map((d) => d.id), ["d1"]);
 });

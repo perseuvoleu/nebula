@@ -17,15 +17,52 @@ export type HomeBoard = {
   counts: { all: number; needs: number; working: number };
 };
 
+export type HomeProject = {
+  name: string;
+  cards: number;
+  needs: number;
+  working: number;
+};
+
 /** HOME's reading of the board: live cards, the waits not yet approved here, and the cards they wait on, oldest wait first. */
-export function homeBoard(board: BoardData | null, approved: ReadonlySet<string>): HomeBoard {
-  const cards = (board?.cards ?? []).filter((c) => !c.archived && !c.proposed);
+export function homeBoard(board: BoardData | null, approved: ReadonlySet<string>, projectScope: string | null = null): HomeBoard {
+  const cards = (board?.cards ?? []).filter((c) => !c.archived && !c.proposed && (projectScope === null || c.project === projectScope));
   const waiting = (board?.needs_you ?? []).filter((w) => !approved.has(approvalKey(w)) && cards.some((c) => c.id === w.card));
   const needs = cards.filter((c) => waiting.some((w) => w.card === c.id))
     .sort((a, b) => firstWait(waiting.filter((w) => w.card === a.id))!.status_changed_at - firstWait(waiting.filter((w) => w.card === b.id))!.status_changed_at);
   const byStage = Object.fromEntries(STAGES.map((s) => [s, cards.filter((c) => c.stage === s)])) as Record<Stage, Card[]>;
   return { cards, waiting, needs, byStage,
     counts: { all: cards.length, needs: needs.length, working: byStage.doing.length + byStage.review.length } };
+}
+
+/** Every named project present in live cards or the gateway's workspace, with its live card counts. */
+export function homeProjects(board: BoardData | null, approved: ReadonlySet<string>, workspaceProjects: readonly string[] = []): HomeProject[] {
+  const live = (board?.cards ?? []).filter((c) => !c.archived && !c.proposed);
+  const waitingCards = new Set(
+    (board?.needs_you ?? []).filter((w) => !approved.has(approvalKey(w))).map((w) => w.card),
+  );
+  const map = new Map<string, HomeProject>();
+  const ensure = (name: string) => {
+    let entry = map.get(name);
+    if (!entry) {
+      entry = { name, cards: 0, needs: 0, working: 0 };
+      map.set(name, entry);
+    }
+    return entry;
+  };
+  for (const name of workspaceProjects) ensure(name);
+  for (const card of live) {
+    if (!card.project) continue;
+    const entry = ensure(card.project);
+    entry.cards += 1;
+    if (waitingCards.has(card.id)) entry.needs += 1;
+    if (card.stage === "doing" || card.stage === "review") entry.working += 1;
+  }
+  return [...map.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+export function filterByProject<T extends { project: string | null }>(items: T[], projectScope: string | null): T[] {
+  return projectScope === null ? items : items.filter((item) => item.project === projectScope);
 }
 
 /** The order j/k walks: the NEEDS list, then the visible stages in board order, each card once. */
