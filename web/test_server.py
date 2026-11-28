@@ -247,6 +247,29 @@ class GatewayTests(unittest.TestCase):
         self.assertIn("--prompt=--help", new_call.args)
         self.assertEqual(result["id"], "fresh-id")
 
+    def test_new_links_the_session_to_a_board_card(self):
+        def fake_run(*args, **kwargs):
+            if args[:2] == ("worktree", "list"):
+                return TREES
+            if args[:2] == ("todo", "show"):
+                return {"id": CARD_ID, "project": "project"}
+            if args[:2] == ("agent", "new"):
+                return "ok"
+            return []
+        self.gateway.board_scope = BoardScope(["project"])
+        body = {"project": "project", "worktree": "/srv/project", "kind": "claude", "text": "start"}
+        with patch.object(self.gateway, "run", side_effect=fake_run) as run:
+            self.gateway.post("/api/new", {**body, "card": "#12"})
+        new_call = next(c for c in run.call_args_list if c.args[:2] == ("agent", "new"))
+        self.assertIn(f"--card={CARD_ID}", new_call.args)
+        with patch.object(self.gateway, "run", side_effect=fake_run) as run:
+            self.gateway.post("/api/new", body)
+        self.assertFalse(any(a.startswith("--card") for c in run.call_args_list for a in c.args))
+        for bad in ["--help", "#12;rm", ""]:
+            with self.subTest(card=bad), patch.object(self.gateway, "run", side_effect=fake_run) as run:
+                with self.assertRaises(Problem): self.gateway.post("/api/new", {**body, "card": bad})
+                self.assertFalse(any(c.args[:2] == ("agent", "new") for c in run.call_args_list))
+
     def test_create_worktree_uses_selected_checkout_branch_not_primary(self):
         trees = TREES + [{**TREES[0], "path": "/srv/feature", "branch": "feature-base", "is_main": False}]
         created = {"project": "project", "branch": "fresh-task", "path": "/srv/new-wt"}

@@ -211,7 +211,7 @@ export function AgentApp({ selection, navigate, workspace, phone, code }: {
           <HomePage home={home} projects={projects} totalCount={allHome.counts.all} projectScope={projectScope} onProjectScope={setScope}
             card={card} missingCard={missingCard} show={show} workspace={workspace} decisions={decisions} phone={phone} stale={stale} loaded={!!board}
             stage={stage} onStage={setStage} picked={picked} onPick={setPicked}
-            onSelect={(c) => select(c)} onBack={() => goTab("home")} onApprove={approve} onOpenCode={(c, sessions, session) => void openInCode(c, sessions, session ?? null)} onDecisions={() => goTab("decisions")} version={readAt} />
+            onSelect={(c) => select(c)} onBack={() => goTab("home")} onApprove={approve} onOpenCode={(c, sessions, session) => void openInCode(c, sessions, session ?? null)} onRefresh={() => shown?.refresh()} onDecisions={() => goTab("decisions")} version={readAt} />
         )}
         {tab === "code" && code}
         {tab === "rag" && <RagTab projectScope={projectScope} />}

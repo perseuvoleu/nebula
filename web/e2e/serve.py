@@ -164,7 +164,7 @@ def gateway_env(state, binary, artifacts, projects, board_projects, **extra):
 def main():
     seed()
     os.chmod(HERE / "fake_nebula.py", 0o755)
-    env = gateway_env(STATE, HERE / "fake_nebula.py", STATE / "artifacts", "alpha,beta", "nebula,vela",
+    env = gateway_env(STATE, HERE / "fake_nebula.py", STATE / "artifacts", "alpha,beta", "nebula,vela,alpha",
                       FAKE_NEBULA_STATE=str(STATE), PATH=str(STATE / "bin") + os.pathsep + os.environ["PATH"])
     os.execve(sys.executable, [sys.executable, "-c", SLOW_ARTIFACTS + SERVE], env)
 

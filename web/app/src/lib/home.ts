@@ -1,4 +1,5 @@
 import { type BoardData, type Card, type NeedsYou, STAGES, type Stage, firstWait } from "./board.ts";
+import type { Message } from "./types.ts";
 
 export const STAGE_LETTER: Record<Stage, string> = { backlog: "B", next: "N", doing: "D", review: "R", done: "✓" };
 
@@ -74,3 +75,14 @@ export function homeOrder(home: HomeBoard, stage: Stage | null = null): Card[] {
 
 /** The host part of a ref, shown where the prototype shows @host: "#12@leaseweb" → "leaseweb". */
 export const refHost = (ref: string): string | null => ref.split("@")[1] ?? null;
+
+export type ChatLine = { id: string; role: "user" | "assistant"; text: string; at: string | null };
+
+/** The last `limit` user and assistant turns that carry text, for the compact thread on a HOME card. */
+export function chatThread(messages: Message[], limit = 6): ChatLine[] {
+  return messages.flatMap((m): ChatLine[] => {
+    if (m.role !== "user" && m.role !== "assistant") return [];
+    const text = m.parts.flatMap((p) => p.type === "text" && p.text.trim() ? [p.text] : []).join("\n");
+    return text ? [{ id: m.id, role: m.role, text, at: m.timestamp }] : [];
+  }).slice(-limit);
+}

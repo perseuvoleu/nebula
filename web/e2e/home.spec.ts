@@ -241,7 +241,9 @@ test("inline reply on HOME focuses with i, sends to gateway-listed session, clea
   await pane.getByRole("button", { name: "Trimite" }).click();
   await expect.poll(() => sends().slice(before).some((s) => s.text === "Salut direct din HOME")).toBe(true);
   await expect(input).toHaveValue("");
-  await expect(pane).toContainText("Salut direct din HOME");
+  const chat = pane.getByRole("region", { name: "Chat" });
+  await expect(chat).toContainText("Salut direct din HOME");
+  await expect(chat).toContainText("Da — am adăugat");
 });
 
 test("project scope via PROIECTE and topbar picker filters HOME, persists across DECISIONS/RAG/CODE, and resets via × or 0", async ({ page }) => {
@@ -291,4 +293,37 @@ test("project scope via PROIECTE and topbar picker filters HOME, persists across
   await page.keyboard.press("0");
   await expect(page.getByRole("button", { name: "Filtru proiect" })).toContainText("all");
   await expect(rail).toContainText("Copy published files");
+});
+
+test("a card with no session starts one from HOME's chat: i focuses, Enter sends the first prompt on the card, and the session joins the chain", async ({ page }) => {
+  changeBoard((board) => {
+    const base = board.cards.find((c) => c.id === CARD12)!;
+    board.cards.push({ ...base, id: "01JD0000000000000000000090", number: 90, ref: "#90", title: "Rollout check", stage: "backlog", project: "alpha", checkout: null, blocked_by: [] });
+  });
+  await login(page, "/c/90");
+  const pane = page.getByRole("region", { name: "Card #90" });
+  const input = pane.getByRole("textbox", { name: "Pornește o sesiune pe #90" });
+  await expect(input).toBeEnabled();
+  await expect(pane.getByRole("list", { name: "Lanț de sesiuni" })).toHaveCount(0);
+  await page.locator("body").press("i");
+  await expect(input).toBeFocused();
+  await input.fill("Verifică rollout-ul");
+  await input.press("Enter");
+  await expect.poll(() => sends().find((s) => s.new && s.text === "Verifică rollout-ul")).toMatchObject({ kind: "claude", card: "01JD0000000000000000000090" });
+  await expect(pane.getByRole("list", { name: "Lanț de sesiuni" }).getByRole("button")).toHaveCount(1);
+  await expect(pane.getByRole("textbox", { name: /^Răspunde lui Mobile / })).toBeVisible();
+  expect(page.url()).not.toMatch(/\/p\//);
+});
+
+test("a card whose session this gateway cannot reach still chats on HOME: the message lands in the card log", async ({ page }) => {
+  await login(page, "/");
+  const pane = page.getByRole("region", { name: "Card #12@leaseweb" });
+  const input = pane.getByRole("textbox", { name: "Mesaj pe #12@leaseweb" });
+  await expect(input).toBeEnabled();
+  await page.locator("body").press("i");
+  await expect(input).toBeFocused();
+  await input.fill("Notă din HOME");
+  await pane.getByRole("button", { name: "Trimite" }).click();
+  await expect(input).toHaveValue("");
+  await expect(pane.getByRole("region", { name: "Jurnal" })).toContainText("Notă din HOME");
 });

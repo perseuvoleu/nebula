@@ -720,10 +720,12 @@ class Gateway:
                     break
             if selector is None:
                 raise Problem(409, "Checkout has no unambiguous CLI selector")
+            card = field(body, "card", BOARD_REF, optional=True)
+            linked = (f"--card={self.card(card)['id']}",) if card else ()
             # Unique names also avoid CLI name-resolution ambiguity on creation.
             name = "Mobile " + secrets.token_hex(6)
             self.run("agent", "new", "--project", project, f"--worktree={selector}",
-                     f"--kind={kind}", f"--name={name}", f"--prompt={text}", json_output=False)
+                     f"--kind={kind}", f"--name={name}", f"--prompt={text}", *linked, json_output=False)
             for attempt in range(3):
                 matches = [r for r in self.sessions(project) if r["name"] == name and not r["archived"]]
                 if len(matches) == 1:

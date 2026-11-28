@@ -1,7 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { BoardData, Card } from "./board.ts";
-import { approvalKey, filterByProject, homeBoard, homeOrder, homeProjects, refHost } from "./home.ts";
+import { approvalKey, chatThread, filterByProject, homeBoard, homeOrder, homeProjects, refHost } from "./home.ts";
+import type { Message } from "./types.ts";
 
 const card = (n: number, stage: Card["stage"], extra: Partial<Card> = {}): Card => ({
   id: `c${n}`, number: n, ref: `#${n}`, title: `Card ${n}`, stage, project: "nebula", proposed: false, archived: false,
@@ -57,4 +58,18 @@ test("projectScope filters cards, NEEDS, counts, order and decisions; homeProjec
   const items = [{ id: "d1", project: "alpha" }, { id: "d2", project: "nebula" }, { id: "d3", project: null }];
   assert.deepEqual(filterByProject(items, null).map((d) => d.id), ["d1", "d2", "d3"]);
   assert.deepEqual(filterByProject(items, "alpha").map((d) => d.id), ["d1"]);
+});
+
+test("chatThread keeps the last text turns of user and assistant, joining text parts and dropping tools and notices", () => {
+  const msg = (id: string, role: Message["role"], parts: Message["parts"]): Message => ({ id, role, timestamp: null, parts });
+  const text = (t: string) => ({ type: "text" as const, text: t });
+  const thread = chatThread([
+    msg("u1", "user", [text("first")]),
+    msg("a1", "assistant", [text("one"), text("two")]),
+    msg("t1", "tool", [text("tool output")]),
+    msg("n1", "notice", [text("notice")]),
+    msg("a2", "assistant", [text("  ")]),
+    msg("u2", "user", [text("latest")]),
+  ], 2);
+  assert.deepEqual(thread.map((l) => [l.id, l.role, l.text]), [["a1", "assistant", "one\ntwo"], ["u2", "user", "latest"]]);
 });

@@ -9,6 +9,7 @@ to simulate the host.
 import fcntl
 import json
 import os
+import socket
 import sys
 import time
 import uuid
@@ -273,12 +274,19 @@ def main(argv):
                "worktree": tree["branch"], "path": tree["path"], "archived": False, "session_id": sid if kind == "pi" else None}
         agents.append(row)
         save("agents.json", agents)
+        if arg("--card", argv):
+            board = load("board.json")
+            card = find_card(board, arg("--card", argv), ["--all", "--include-home"])
+            board["details"].setdefault(card["id"], {"sessions": [], "artifacts": [], "log": []})["sessions"].append(
+                {"host": socket.gethostname().split(".")[0], "id": row["id"], "name": name, "role": "worker", "kind": kind,
+                 "status": "running", "status_changed_at": int(time.time() * 1000), "writer": False, "alive": True, "stale": False})
+            save("board.json", board)
         if kind == "pi":
             from test_pi_history import assistant, user, write_session
             write_session(STATE / "pi", tree["path"], sid,
                           [user("n1", None, prompt), assistant("n2", "n1", [{"type": "text", "text": "Am început sarcina."}])])
         with open(STATE / "sends.log", "a") as handle:
-            handle.write(json.dumps({"new": name, "kind": kind, "text": prompt}) + "\n")
+            handle.write(json.dumps({"new": name, "kind": kind, "text": prompt, "card": arg("--card", argv)}) + "\n")
         print(json.dumps({"ok": True}))
     elif command == ("worktree", "new") or argv[0] == "switch":
         name, base = positionals(argv)[-1], arg("--from", argv)
