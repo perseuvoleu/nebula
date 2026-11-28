@@ -170,14 +170,14 @@ function CardChat({ label, placeholder, disabled = false, send }: { label: strin
     if (!canSend || inFlight.current) return;
     inFlight.current = true;
     const payload = text;
+    setText("");
     setSending(true);
     setError(null);
     try {
       await send(payload);
-      if (!mounted.current) return;
-      setText("");
     } catch (failure) {
       if (!mounted.current) return;
+      setText(payload);
       setError(describeError(failure));
     } finally {
       inFlight.current = false;
@@ -264,10 +264,22 @@ export function CardPane({ card, show, home, workspace, decisions, picked, onPic
     ? (card.project ? sessionProject(card.project, session.host, workspace) : homeSessions.get(`${session.host}/${session.id}`) ?? null)
     : null;
   const [refreshTick, setRefreshTick] = useState(0);
+  const [pendingMsgs, setPendingMsgs] = useState<{ id: string; text: string; state: "sending" | "sent" }[]>([]);
   const thread = useThread(project, session, version, refreshTick);
   const startProject = card.project
     ? sessionProject(card.project, card.checkout?.host ?? workspace.host, workspace) ?? sessionProject(card.project, workspace.host, workspace)
     : null;
+  const visiblePending = pendingMsgs.filter((p) => {
+    const norm = p.text.trim();
+    return !(thread ?? []).some((line) => line.role === "user" && line.text.trim() === norm);
+  });
+  const agentWorking = visiblePending.length > 0 || (session?.status === "running" && !wait);
+  useEffect(() => {
+    if (!project || !session) return;
+    if (visiblePending.length === 0 && session.status !== "running") return;
+    const timer = window.setInterval(() => setRefreshTick((n) => n + 1), 1500);
+    return () => window.clearInterval(timer);
+  }, [project, session, visiblePending.length]);
   const [openArt, setOpenArt] = useState<Artifact | null>(null);
   const artifacts = (show?.artifacts ?? []).filter((a) => a.kind !== "decision");
   const now = Date.now();
@@ -275,6 +287,17 @@ export function CardPane({ card, show, home, workspace, decisions, picked, onPic
   const dot = wait ? "needs" : card.stage === "done" ? "done" : sessions.some((s) => s.status === "running") ? "running" : card.stage === "review" ? "done" : "off";
   const branch = card.checkout?.branch ?? "main";
   const openCode = () => onOpenCode(card, show ? sessions : null, session);
+  const sendWithOptimistic = async (text: string, run: () => Promise<void>) => {
+    const id = ulid();
+    setPendingMsgs((prev) => [...prev, { id, text, state: "sending" }]);
+    try {
+      await run();
+      setPendingMsgs((prev) => prev.map((p) => p.id === id ? { ...p, state: "sent" } : p));
+    } catch (err) {
+      setPendingMsgs((prev) => prev.filter((p) => p.id !== id));
+      throw err;
+    }
+  };
   return (
     <section aria-label={`Card ${card.ref}`} className="flex min-h-0 min-w-0 flex-1 flex-col">
       <div className="flex min-h-[27px] shrink-0 items-center gap-1.5 border-b px-2 py-1 max-md:flex-wrap">
@@ -310,20 +333,53 @@ export function CardPane({ card, show, home, workspace, decisions, picked, onPic
         </ol>
       )}
       <div className="min-h-0 flex-1 overflow-y-auto">
-        {session && (
-          <section aria-label="Chat" className="max-w-[820px] px-2.5 py-[5px]">
-            <div className="mb-0.5 flex items-center gap-1.5 text-[10px] text-dim">
-              <span>{session.name}</span><span>{compactAge(session.status_changed_at, now)}</span>
-              <span>· {statusLabel(wait && wait.id === session.id ? "needs_feedback" : session.status)}</span>
-            </div>
-            {!project && <p className="text-dim">Mesajele sesiunii se văd în CODE, pe laptopul ei.</p>}
-            <ol className="flex flex-col gap-1">
-              {thread?.map((line) => (
-                <li key={line.id} className={cn("border-l-2 px-2 py-px", line.role === "user" ? "border-l-primary" : "border-l-edge")}>
-                  <div className="text-[10px] text-dim">{line.role === "user" ? "tu" : session.name}{line.at && ` · ${compactAge(Date.parse(line.at), now)}`}</div>
-                  <p className="leading-[1.45] break-words whitespace-pre-wrap text-foreground">{line.text}</p>
+        {(session || visiblePending.length > 0) && (
+          <section aria-label="Chat" className="max-w-[820px] px-2.5 py-2">
+            {session && (
+              <div className="mb-1.5 flex items-center gap-1.5 text-[10px] text-dim">
+                <span>{session.name}</span><span>{compactAge(session.status_changed_at, now)}</span>
+                <span>· {statusLabel(wait && wait.id === session.id ? "needs_feedback" : session.status)}</span>
+              </div>
+            )}
+            {session && !project && <p className="mb-1.5 text-dim">Mesajele sesiunii se văd în CODE, pe laptopul ei.</p>}
+            <ol className="flex flex-col gap-1.5">
+              {thread?.map((line) => {
+                const isUser = line.role === "user";
+                return (
+                  <li key={line.id} data-role={line.role}
+                    className={cn(
+                      "max-w-[85%] rounded-sm border px-2.5 py-1.5",
+                      isUser ? "self-end border-primary/40 bg-sel2" : "self-start border-edge bg-bg1",
+                    )}>
+                    <div className={cn("mb-0.5 text-[10px]", isUser ? "text-right text-primary/80" : "text-dim")}>
+                      {isUser ? "tu" : (session?.name ?? "agent")}{line.at && ` · ${compactAge(Date.parse(line.at), now)}`}
+                    </div>
+                    <p className="leading-[1.45] break-words whitespace-pre-wrap text-foreground">{line.text}</p>
+                  </li>
+                );
+              })}
+              {visiblePending.map((p) => (
+                <li key={p.id} data-role="user" data-pending=""
+                  className="max-w-[85%] self-end rounded-sm border border-primary/40 bg-sel2 px-2.5 py-1.5">
+                  <div className="mb-0.5 text-right text-[10px] text-primary/80">
+                    tu · {p.state === "sending" ? "se trimite…" : "acum"}
+                  </div>
+                  <p className="leading-[1.45] break-words whitespace-pre-wrap text-foreground">{p.text}</p>
                 </li>
               ))}
+              {agentWorking && (
+                <li role="status" aria-live="polite" data-role="assistant-loader"
+                  className="max-w-[85%] self-start rounded-sm border border-edge bg-bg1 px-2.5 py-1.5 text-muted-foreground">
+                  <div className="flex items-center gap-1.5 text-[10.5px]">
+                    <span aria-hidden className="inline-flex items-center gap-1">
+                      <span className="size-1.5 animate-pulse rounded-full bg-warn motion-reduce:animate-none" />
+                      <span className="size-1.5 animate-pulse rounded-full bg-warn [animation-delay:200ms] motion-reduce:animate-none" />
+                      <span className="size-1.5 animate-pulse rounded-full bg-warn [animation-delay:400ms] motion-reduce:animate-none" />
+                    </span>
+                    <span>{session ? `${session.name} lucrează…` : "Se pornește agentul…"}</span>
+                  </div>
+                </li>
+              )}
             </ol>
           </section>
         )}
@@ -383,16 +439,16 @@ export function CardPane({ card, show, home, workspace, decisions, picked, onPic
         <CardChat key="loading" label="Mesaj" placeholder="Se încarcă…" disabled send={async () => {}} />
       ) : session && project ? (
         <CardChat key={`${project}/${session.id}`} label={`Răspunde lui ${session.name}`} placeholder={`Răspunde lui ${session.name}… (i)`}
-          send={async (text) => {
+          send={(text) => sendWithOptimistic(text, async () => {
             await api<SendResponse>("send", {}, { project, id: session.id, text, attempt: attemptId() });
             setRefreshTick((n) => n + 1);
-          }} />
+          })} />
       ) : !session && startProject ? (
         <CardChat key={`start/${startProject}`} label={`Pornește o sesiune pe ${card.ref}`} placeholder={`Scrie primul mesaj, pornește o sesiune în ${startProject}… (i)`}
-          send={async (text) => {
+          send={(text) => sendWithOptimistic(text, async () => {
             await startOnCard(card, startProject, text);
             onRefresh();
-          }} />
+          })} />
       ) : (
         <CardChat key="note" label={`Mesaj pe ${card.ref}`} placeholder="Adaugă un mesaj pe card… (i)"
           send={async (text) => {

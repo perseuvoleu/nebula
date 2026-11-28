@@ -327,3 +327,31 @@ test("a card whose session this gateway cannot reach still chats on HOME: the me
   await expect(input).toHaveValue("");
   await expect(pane.getByRole("region", { name: "Jurnal" })).toContainText("Notă din HOME");
 });
+
+test("HOME chat shows the user message instantly on the right and an agent loader on the left while in flight", async ({ page }) => {
+  changeBoard((board) => {
+    const base = board.cards.find((c) => c.id === CARD12)!;
+    board.cards.push({ ...base, id: "01JD0000000000000000000091", number: 91, ref: "#91", title: "Instant chat check", stage: "backlog", project: "alpha", checkout: null, blocked_by: [] });
+  });
+  let release!: () => void;
+  const hold = new Promise<void>((r) => { release = r; });
+  await page.route("**/api/new", async (route) => {
+    await hold;
+    await route.continue();
+  });
+  await login(page, "/c/91");
+  const pane = page.getByRole("region", { name: "Card #91" });
+  const input = pane.getByRole("textbox", { name: "Pornește o sesiune pe #91" });
+  await input.fill("Salut instant");
+  await input.press("Enter");
+  await expect(input).toHaveValue("");
+  const userBubble = pane.locator('li[data-role="user"][data-pending]');
+  const loader = pane.locator('li[data-role="assistant-loader"]');
+  await expect(userBubble).toContainText("Salut instant");
+  await expect(loader).toContainText("Se pornește agentul…");
+  const userBox = await userBubble.boundingBox();
+  const loaderBox = await loader.boundingBox();
+  expect(userBox!.x).toBeGreaterThan(loaderBox!.x);
+  release();
+  await expect(pane.getByRole("list", { name: "Lanț de sesiuni" }).getByRole("button")).toHaveCount(1);
+});
